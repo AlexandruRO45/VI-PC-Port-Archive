@@ -526,9 +526,9 @@ HINT_LIMITS = {"s_clause": 0x3f, "s_setprio": 3, "s_sleep": 0x7f}
 # 0 is round to nearest even, which the binary16 lowerings assume and shader entry is taken to hold, and 3 is
 # round toward zero. The directed modes 1 and 2 are refused.
 HALF_ROUNDING = {"0": "nearest even", "3": "toward zero"}
-# Under round toward zero no rounding binary16 or binary64 form has a lowering. These two do not depend on the
-# mode: the widening is exact and the pack always truncates.
-HALF_ROUNDING_EXEMPT = ("v_cvt_f32_f16", "v_cvt_pkrtz_f16_f32")
+# Under round toward zero no rounding binary16 or binary64 form has a lowering. These conversions do not depend on the
+# mode: widening is exact, float-to-integer uses instruction-defined truncation, and the pack always truncates.
+HALF_ROUNDING_EXEMPT = ("v_cvt_f32_f16", "v_cvt_i16_f16", "v_cvt_u16_f16", "v_cvt_pkrtz_f16_f32")
 # MODE[7:6] (FP_DENORM_DP/16) value 3 keeps binary16 and binary64 inputs and results denormal. The state is not
 # tracked: the caller declares it for the shader entry with lower(half_denorm="preserve"), taking it from validated
 # guest state. None (the default) means unknown, and the plain binary16 arithmetic forms are then refused. Every
@@ -1634,6 +1634,19 @@ def f16_round_result(name, bits):
     return sign | ((top + 15) << 10) | fraction
 
 
+def f16_to_int_result(signed: bool, bits: int):
+    """Truncated i16/u16 result of one finite binary16 encoding, or None when out of range."""
+    sign = bits & 0x8000
+    exponent, mantissa = (bits >> 10) & 0x1f, bits & 0x3ff
+    if exponent == 0x1f:
+        raise ValueError(f"binary16 operand is not finite: {bits:#06x}")
+    magnitude = Fraction(mantissa, 1 << 24) if exponent == 0 else Fraction(mantissa | 0x400) * Fraction(2) ** (exponent - 25)
+    value = math.trunc(-magnitude if sign else magnitude)
+    if not (-0x8000 <= value <= 0x7fff if signed else 0 <= value <= 0xffff):
+        return None
+    return value & 0xffff
+
+
 def f16_cvt_int_result(signed, value):
     """Exact binary16 result bits of v_cvt_f16_i16 (signed) or v_cvt_f16_u16 of the low 16 bits of value, or None when
     the result overflows to infinity.
@@ -1697,7 +1710,7 @@ def half16_name(token, vector):
 
 
 def half16_arith_source(token, scalar, vector, pending, sample_dest, known_ssa_bits, known_half):
-    """Return (HLSL word expression, binary16 bits) of one source of a plain binary16 VOP2 op.
+    """Return (HLSL word expression, binary16 bits) for a statically proven finite binary16 source.
 
     Only a source whose low half is statically known and finite is accepted: a binary16 inline constant, a 16-bit
     literal, a tracked SGPR integer, a VGPR copied from a known constant, or the result of an earlier accepted op.
@@ -1830,9 +1843,10 @@ def f32_comparison(op, tokens, scalar, vector, pending, sample_dest):
 def low16_name(token, vector):
     """Return the HLSL variable of a VGPR that holds only a defined low half, else None.
 
-    The non-packed 16-bit integer VOP3 ops store ("low16", name). The variable holds a 32-bit word whose
-    bits 15:0 are the result; bits 31:16 are unspecified and no accepted reader may observe them. Only the
-    16-bit integer ops, the 16-bit integer compares and v_mov_b32_sdwa with a low-half selection read it.
+    The non-packed 16-bit integer VOP3 ops and the float-to-integer VOP1 conversions store ("low16", name).
+    The variable holds a 32-bit word whose bits 15:0 are the result; bits 31:16 are unspecified and no accepted
+    reader may observe them. Only the 16-bit integer ops, the 16-bit integer compares and v_mov_b32_sdwa with a
+    low-half selection read it.
     Every other reader sees a tuple and refuses it.
     """
     value = vector.get(token) if re.fullmatch(r"v\d+", token) else None
@@ -4896,6 +4910,28 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector[dst] = ("half16", f"alu{i}")
             if result is not None:
                 known_half[f"alu{i}"] = result
+        elif m := match(r"v_cvt_(i16|u16)_f16(_e32|_e64)? (v\d+), ([^,\s]+)"):
+            # Half to integer conversion truncates toward zero independently of MODE[3:2] (RDNA 2 ISA §12.8,
+            # VOP1 entries 82 and 83). Require a proven finite source and preserved half denormals, then range-check
+            # the truncated result. Only the low 16 result bits are defined and observable.
+            kind, _encoding, dst, token = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid binary16-to-integer conversion operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            word, proven = half16_arith_source(token, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            signed = kind == "i16"
+            result = f16_to_int_result(signed, proven)
+            if result is None:
+                raise ValueError(f"binary16-to-integer result out of range: v_cvt_{kind}_f16")
+            lines.append(f"    uint hf{i}_0 = ({word}) & 0xffffu;")
+            lines.append(f"    {'int' if signed else 'uint'} cv{i}_0 = {'int' if signed else 'uint'}(trunc(widen16(hf{i}_0)));")
+            lines.append(f"    precise float alu{i} = asfloat(asuint(cv{i}_0) & 0xffffu);")
+            vector[dst] = ("low16", f"alu{i}")
         elif m := match(r"v_cvt_off_f32_i4(?:_e32|_e64)? (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|\d+)( clamp)?"):
             # Bits 3:0 of the source as a signed nibble in units of 1/16, so 0x7 gives 0.4375
             # and 0x8 gives -0.5. The source is read as bits, so float modifiers do not apply.

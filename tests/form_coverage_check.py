@@ -514,7 +514,7 @@ def check_pack_b32_forms():
 def check_int16_vop3_forms():
     """The 12 non-packed 16-bit integer VOP3 forms count as covered once the translator accepts their fixtures.
     The unsuffixed spellings match the reference; the _e64 control does not count (gfx_forms keeps _e64 names), and
-    the nearby VOP3 forms that stay rejected (f16 ops) stay uncovered."""
+    the nearby VOP3 binary16 min form stays uncovered."""
     import pixel_aot
     import pixel_aot_check as pixel  # tests/ is on sys.path when this file runs
     saved = set(pixel.ACCEPTED)
@@ -524,7 +524,7 @@ def check_int16_vop3_forms():
             pixel.translate_int(pixel.int16_vop3_ops(group))
         forms = {("VOP3", f"v_{name}") for name in pixel_aot.VOP3_INT16}
         assert len(forms) == 12
-        neighbours = {("VOP3", "v_min_f16_e64"), ("VOP3", "v_cvt_i16_f16_e64")}
+        neighbours = {("VOP3", "v_min_f16_e64")}
         for name in ("gfx1013.tsv", "rdna2.tsv"):
             reference = fc.load_reference(name)
             assert forms <= reference, (name, forms - reference)
@@ -600,9 +600,7 @@ def check_f16_round_forms():
 
 
 def check_f16_cvt_int16_forms():
-    """The four integer to binary16 conversion forms (e32 and e64 spellings of v_cvt_f16_i16 and v_cvt_f16_u16) count as
-    covered once the translator accepts their fixtures; the opposite conversions v_cvt_i16_f16 and v_cvt_u16_f16 and the DPP and SDWA
-    spellings stay uncovered."""
+    """The four integer-to-binary16 conversion forms count as covered; DPP and SDWA spellings stay uncovered."""
     import pixel_aot_check as pixel
     saved = set(pixel.ACCEPTED)
     pixel.ACCEPTED.clear()
@@ -611,8 +609,7 @@ def check_f16_cvt_int16_forms():
         for key in pixel.F16_CVT_INT_PROGRAMS:
             pixel.translate_f16(pixel.f16_cvt_int_program(*key))
         forms = {("VOP1", "v_cvt_f16_i16"), ("VOP1", "v_cvt_f16_u16"), ("VOP3", "v_cvt_f16_i16_e64"), ("VOP3", "v_cvt_f16_u16_e64")}
-        neighbours = {("VOP1", "v_cvt_i16_f16"), ("VOP1", "v_cvt_u16_f16"), ("VOP3", "v_cvt_i16_f16_e64"),
-                      ("VOP3", "v_cvt_u16_f16_e64"), ("SDWA", "v_cvt_f16_i16_sdwa"), ("SDWA", "v_cvt_f16_u16_sdwa"),
+        neighbours = {("SDWA", "v_cvt_f16_i16_sdwa"), ("SDWA", "v_cvt_f16_u16_sdwa"),
                       ("DPP16", "v_cvt_f16_i16_dpp"), ("DPP16", "v_cvt_f16_u16_dpp"), ("DPP8", "v_cvt_f16_i16_dpp"),
                       ("DPP8", "v_cvt_f16_u16_dpp")}
         for name in ("gfx1013.tsv", "rdna2.tsv"):
@@ -635,6 +632,33 @@ def check_f16_cvt_int16_forms():
         covered = fc.gfx_forms(pixel.ACCEPTED, fc.load_reference("gfx1013.tsv"))
         assert {("VOP1", "v_cvt_f16_i16"), ("VOP3", "v_cvt_f16_i16_e64")} <= covered
         assert not {("VOP1", "v_cvt_f16_u16"), ("VOP3", "v_cvt_f16_u16_e64")} & covered
+        assert not {("VOP1", "v_cvt_i16_f16"), ("VOP1", "v_cvt_u16_f16"),
+                    ("VOP3", "v_cvt_i16_f16_e64"), ("VOP3", "v_cvt_u16_f16_e64")} & covered
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
+def check_f16_to_int_forms():
+    """The two half-to-integer VOP1 forms count as covered for e32 and e64 spellings only."""
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for index in range(len(pixel.F16_TO_INT_DRAW_CASES)):
+            pixel.translate_f16(pixel.f16_to_int_program(index))
+        forms = {("VOP1", "v_cvt_i16_f16"), ("VOP1", "v_cvt_u16_f16"),
+                 ("VOP3", "v_cvt_i16_f16_e64"), ("VOP3", "v_cvt_u16_f16_e64")}
+        neighbours = {("SDWA", "v_cvt_i16_f16_sdwa"), ("SDWA", "v_cvt_u16_f16_sdwa"),
+                      ("DPP16", "v_cvt_i16_f16_dpp"), ("DPP16", "v_cvt_u16_f16_dpp"),
+                      ("DPP8", "v_cvt_i16_f16_dpp"), ("DPP8", "v_cvt_u16_f16_dpp")}
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, forms - reference)
+            assert neighbours <= reference, (name, neighbours - reference)
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, forms - covered)
+            assert not neighbours & covered, (name, neighbours & covered)
     finally:
         pixel.ACCEPTED.clear()
         pixel.ACCEPTED.update(saved)
@@ -1179,6 +1203,7 @@ if __name__ == "__main__":
     check_f16_arith_forms()
     check_f16_round_forms()
     check_f16_cvt_int16_forms()
+    check_f16_to_int_forms()
     check_swap_coverage()
     check_pk_fmac_coverage()
     check_sopk_wait_forms()

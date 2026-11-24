@@ -11177,7 +11177,9 @@ def check_f16_cvt_int_controls():
                  "v_cvt_f16_i16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
                  "v_cvt_f16_u16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
                  "v_cvt_f16_i16 v24, v18, v19", "v_cvt_f16_i16 v24",
-                 "v_cvt_i16_f16_e32 v24, v18", "v_cvt_u16_f16_e64 v24, v18", "v_cvt_f16_i32 v24, v18",
+                 "v_cvt_i16_f16_dpp v24, v18 quad_perm:[0,1,2,3]",
+                 "v_cvt_u16_f16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+                 "v_cvt_f16_i32 v24, v18",
                  "v_cvt_f16_f16_e32 v24, v18"):
         refuse(line, "Unsupported instruction")
 
@@ -11237,6 +11239,167 @@ def check_f16_cvt_int_controls():
         export[next(i for i, line in enumerate(export) if line.startswith("exp ")):] = [
             f"exp mrt0 {registers} done vm", "s_endpgm"]
         expect_value_error(translate_f16, export, "Unsupported export")
+
+
+F16_TO_INT_DRAW_CASES = (
+    (("i16", 0x77ff), ("i16", 0xf800), ("i16", 0x3e00), ("i16", 0xbe00)),
+    (("i16", 0x0000), ("i16", 0x8000), ("i16", 0x0001), ("i16", 0x8001)),
+    (("u16", 0xb800), ("u16", 0x0001), ("u16", 0x7bff), ("u16", 0x3e00)),
+)
+F16_TO_INT_JUNK = (0x3c00, 0x4000, 0x4200, 0x4400)
+F16_TO_INT_MUTATIONS = ("round", "source_high", "drop_sign")
+
+
+def f16_to_int_reference(kind, word, *, mutation=None):
+    """Raw low-16 result of a finite binary16 to i16/u16 conversion, or None if out of range."""
+    bits = ((word >> 16) if mutation == "source_high" else word) & 0xffff
+    if (bits >> 10) & 0x1f == 0x1f:
+        return None
+    value = struct.unpack("<e", struct.pack("<H", bits))[0]
+    if mutation == "drop_sign":
+        value = abs(value)
+    integer = round(value) if mutation == "round" else math.trunc(value)
+    if not (-0x8000 <= integer <= 0x7fff if kind == "i16" else 0 <= integer <= 0xffff):
+        return None
+    return integer & 0xffff
+
+
+def f16_to_int_program(index):
+    """Four constant finite halves converted to integer and read back only through SDWA WORD_0."""
+    body = []
+    for slot, (kind, bits) in enumerate(F16_TO_INT_DRAW_CASES[index]):
+        src, result, readback = 18 + slot, 24 + slot, 12 + slot
+        word = (F16_TO_INT_JUNK[slot] << 16) | bits
+        body += [f"v_mov_b32_e32 v{src}, {word:#x}",
+                 f"v_cvt_{kind}_f16_e{32 if slot % 2 == 0 else 64} v{result}, v{src}",
+                 f"v_mov_b32_sdwa v{readback}, v{result} dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0"]
+    return uncompressed_export(body)
+
+
+def f16_to_int_expected(index, mutation=None):
+    return tuple(f16_to_int_reference(kind, (F16_TO_INT_JUNK[slot] << 16) | bits, mutation=mutation)
+                 for slot, (kind, bits) in enumerate(F16_TO_INT_DRAW_CASES[index]))
+
+
+def f16_to_int_mutated(mutation, program):
+    text = translate_f16(program)
+    if mutation == "round":
+        mutated = re.sub(r"trunc\(widen16\((hf\d+_0)\)\)", r"round(widen16(\1))", text)
+    elif mutation == "source_high":
+        mutated = re.sub(r"(uint hf\d+_0 = \()(asuint\(alu\d+\))(\) & 0xffffu;)",
+                         r"\1(\2 >> 16u)\3", text)
+    else:
+        mutated = re.sub(r"(int cv\d+_0 = int\()trunc\(widen16\((hf\d+_0)\)\)(\);)",
+                         r"\1abs(trunc(widen16(\2)))\3", text)
+    assert mutated != text, mutation
+    return mutated
+
+
+def f16_to_int_detecting_program(mutation):
+    for index in range(len(F16_TO_INT_DRAW_CASES)):
+        if f16_to_int_expected(index, mutation) != f16_to_int_expected(index):
+            return index
+    raise AssertionError(f"No conversion program separates {mutation}")
+
+
+def check_f16_to_int_reference():
+    """Independent binary16 decode and truncation checks over all 16-bit encodings."""
+    assert f16_to_int_reference("i16", 0x77ff) == 0x7ff0  # 32752
+    assert f16_to_int_reference("i16", 0xf800) == 0x8000  # -32768
+    assert f16_to_int_reference("i16", 0x3e00) == 1
+    assert f16_to_int_reference("i16", 0xbe00) == 0xffff
+    assert f16_to_int_reference("u16", 0xb800) == 0  # -0.5 truncates to negative zero
+    assert f16_to_int_reference("u16", 0x7bff) == 65504
+    assert f16_to_int_reference("u16", 0xbc00) is None  # -1 is outside u16
+    assert f16_to_int_reference("i16", 0x7800) is None  # 32768 is outside i16
+    assert f16_to_int_reference("i16", 0xf801) is None  # -32800 is outside i16
+    assert f16_to_int_reference("i16", 0x7c00) is None
+    assert f16_to_int_reference("i16", 0x7e00) is None
+    assert f16_to_int_reference("i16", 0x3e00, mutation="round") == 2
+    assert f16_to_int_reference("i16", 0xbe00, mutation="round") == 0xfffe
+    assert f16_to_int_reference("i16", 0xbe00, mutation="drop_sign") == 1
+    assert f16_to_int_reference("i16", 0x40003e00, mutation="source_high") == 2
+    for bits in range(0x10000):
+        if (bits >> 10) & 0x1f == 0x1f:
+            assert f16_to_int_reference("i16", bits) is None and f16_to_int_reference("u16", bits) is None
+            continue
+        value = struct.unpack("<e", struct.pack("<H", bits))[0]
+        integer = math.trunc(value)
+        expected = integer & 0xffff if -0x8000 <= integer <= 0x7fff else None
+        assert f16_to_int_reference("i16", bits) == expected
+        assert pixel_aot.f16_to_int_result(True, bits) == expected, ("i16", hex(bits))
+        integer = math.trunc(value)
+        expected = integer if 0 <= integer <= 0xffff else None
+        assert f16_to_int_reference("u16", bits) == expected
+        assert pixel_aot.f16_to_int_result(False, bits) == expected, ("u16", hex(bits))
+
+
+def check_f16_to_int_controls():
+    """Source-built VOP1 form, proof, truncation, range, mode, and low16 reader controls."""
+    check_f16_to_int_reference()
+
+    def program(*lines):
+        return uncompressed_export(["v_mov_b32_e32 v18, 0x40003e00", "s_mov_b32 s60, 0x3e00", *lines])
+
+    def refuse(line, message):
+        expect_value_error(translate_f16, program(line), message)
+
+    for kind in ("i16", "u16"):
+        spelled = [translate_f16(program(f"v_cvt_{kind}_f16{suffix} v24, 0x3e00"))
+                   for suffix in ("", "_e32", "_e64")]
+        assert spelled[0] == spelled[1] == spelled[2], kind
+        body = spelled[0].split("uint4 main", 1)[1]
+        assert re.search(r"trunc\(widen16\(hf\d+_0\)\)", body), body
+        assert "round(widen16(" not in body
+        for token in ("0x3e00", "v18", "s60"):
+            translate_f16(program(f"v_cvt_{kind}_f16_e64 v24, {token}"))
+    translate_f16(program("v_cvt_u16_f16 v24, 0xb800"))  # -0.5 truncates to unsigned zero
+    for line, message in (
+            ("v_cvt_i16_f16 v24, 0x7800", "binary16-to-integer result out of range: v_cvt_i16_f16"),
+            ("v_cvt_i16_f16_e64 v24, 0xf801", "binary16-to-integer result out of range: v_cvt_i16_f16"),
+            ("v_cvt_u16_f16 v24, 0xbc00", "binary16-to-integer result out of range: v_cvt_u16_f16"),
+            ("v_cvt_i16_f16 v24, 0x7c00", "binary16 operand is not finite: 0x7c00"),
+            ("v_cvt_u16_f16 v24, 0x7e00", "binary16 operand is not finite: 0x7e00"),
+            ("v_cvt_i16_f16 v24, s44", "binary16 operand lacks a finite proof: s44"),
+            ("v_cvt_u16_f16 v24, v30", "binary16 operand lacks a finite proof: v30")):
+        refuse(line, message)
+    for line in ("v_cvt_i16_f16 v24, 0x77ff", "v_cvt_i16_f16 v24, 0xf800",
+                 "v_cvt_u16_f16 v24, 0xb800", "v_cvt_u16_f16 v24, 0x7bff"):
+        translate_f16(program(line))
+
+    for kind in ("i16", "u16"):
+        expect_value_error(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True),
+                           program(f"v_cvt_{kind}_f16 v24, v18"), "binary16 denormal mode unknown at entry")
+    for state in ("flush", "ftz", "", False):
+        expect_value_error(lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
+                                           half_denorm=state), program("v_cvt_i16_f16 v24, v18"),
+                           "Invalid binary16 denormal entry state")
+    # This conversion truncates by instruction definition, not the floating-point MODE rounding field.
+    rtz = "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3"
+    translate_f16(program(rtz, "v_cvt_i16_f16 v24, 0xbe00"))
+
+    source = program("v_cvt_i16_f16 v24, 0xbe00")
+    export_index = next(i for i, line in enumerate(source) if line.startswith("exp "))
+    translate_f16(source[:export_index] +
+                  ["v_mov_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+                   *source[export_index:]])
+    expect_value_error(translate_f16, program("v_cvt_i16_f16 v24, 0xbe00", "v_mov_b32_e32 v12, v24"),
+                       "Expected a numeric register")
+    expect_value_error(translate_f16, program("v_cvt_i16_f16 v24, 0xbe00",
+                                               "v_mov_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1"),
+                       "Reads the undefined high half of a 16-bit result")
+    translate_f16(program("v_cvt_i16_f16 v24, 0xbe00", "v_add_nc_i16 v25, v24, 1"))
+
+    for line, message in (("v_cvt_i16_f16_e64 v24, -v18", "Unsupported binary16 source modifier -v18"),
+                          ("v_cvt_u16_f16_e64 v24, |v18|", "Unsupported binary16 source modifier |v18|")):
+        refuse(line, message)
+    for line in ("v_cvt_i16_f16_dpp v24, v18 quad_perm:[0,1,2,3]",
+                 "v_cvt_u16_f16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+                 "v_cvt_i16_f16 v24, v18, v19"):
+        refuse(line, "Unsupported instruction")
+    for mutation in F16_TO_INT_MUTATIONS:
+        f16_to_int_detecting_program(mutation)
+        f16_to_int_mutated(mutation, f16_to_int_program(f16_to_int_detecting_program(mutation)))
 
 
 def check_controls(directory):
@@ -12950,6 +13113,7 @@ def check_controls(directory):
     check_f16_arith_controls()
     check_f16_round_controls()
     check_f16_cvt_int_controls()
+    check_f16_to_int_controls()
 
 
 def check_program_extent(directory, library):
@@ -13112,11 +13276,32 @@ def check_f16_cvt_int16_binary(directory, assembler, objcopy, library):
                        "binary16 result overflows: v_cvt_f16_u16")
 
 
+def check_f16_to_int_binary(directory, assembler, objcopy, library):
+    """LLVM 15 gfx1013 round-trips for the plain half-to-i16/u16 VOP1 forms and modifier spellings."""
+    source, obj, binary = directory / "cvt_from_f16.s", directory / "cvt_from_f16.o", directory / "cvt_from_f16.bin"
+
+    def assemble(line):
+        source.write_text(line + chr(10) + "s_endpgm" + chr(10), encoding="ascii")
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", source, "-o", obj], check=True)
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
+        code = binary.read_bytes()
+        return code[:-4], disassemble(code, library)[0]
+
+    for line in (
+            "v_cvt_i16_f16_e32 v1, v2", "v_cvt_u16_f16_e32 v1, v2",
+            "v_cvt_i16_f16_e64 v1, v2", "v_cvt_u16_f16_e64 v1, v2",
+            "v_cvt_i16_f16_e64 v1, -v2", "v_cvt_u16_f16_e64 v1, |v2|",
+            "v_cvt_i16_f16_e64 v1, v2 mul:2", "v_cvt_u16_f16_e64 v1, v2 div:2"):
+        code, decoded = assemble(line)
+        assert code and decoded == line, (line, code.hex(), decoded)
+
+
 def check_binary(directory, assembler, objcopy, library):
     check_program_extent(directory, library)
     check_f16_literal_fold(directory, assembler, objcopy, library)
     check_f16_round_binary(directory, assembler, objcopy, library)
     check_f16_cvt_int16_binary(directory, assembler, objcopy, library)
+    check_f16_to_int_binary(directory, assembler, objcopy, library)
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (rounding(), translate), (arithmetic(), translate), (with_scalar_constant_reads(), translate), (with_scalar_pair_reads(), translate),
                 (with_three_constant_buffers(), translate_three_buffers), (smem_pointer_loads(), translate_smem_pointers),
@@ -18051,6 +18236,35 @@ def check_f16_cvt_int16_draw(directory, compiler, renderer, backend):
     expect_value_error(translate_f16, refused, "Reads the undefined high half of a 16-bit result")
 
 
+def check_f16_to_int_draw(directory, compiler, renderer, backend):
+    """Source-built half-to-i16/u16 conversions against raw integer readback and independent mutations."""
+    check_f16_to_int_reference()
+    programs = [f16_to_int_program(index) for index in range(len(F16_TO_INT_DRAW_CASES))]
+    source = directory / "f16_to_int.hlsl"
+    shader = directory / "f16_to_int.cso"
+
+    def build(text):
+        source.write_text(text, encoding="ascii")
+        compile_shader(compiler, source, shader)
+
+    def case(index, tag, mutation=None):
+        path = directory / f"f16_to_int-{tag}-{index}.case"
+        write_case(path, bytes(256), tuple(as_float(word) for word in f16_to_int_expected(index, mutation)),
+                   integer_rt=True)
+        return path
+
+    for index, program in enumerate(programs):
+        build(translate_f16(program))
+        run_pixel_batch(renderer, backend, shader, [(case(index, "ref"), "pass")])
+    for mutation in F16_TO_INT_MUTATIONS:
+        index = f16_to_int_detecting_program(mutation)
+        build(f16_to_int_mutated(mutation, programs[index]))
+        statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, [case(index, "mut")])
+        print(f"f16_to_int mutation {mutation}: program {index} statuses {statuses}")
+        if "mismatch" not in statuses:
+            raise AssertionError(f"Mutating {mutation} escaped detection")
+
+
 def check_e64_render(directory, compiler, renderer, backend):
     """The e64 draw cases on their own, so they run as a separate CTest entry per backend. A renderer that reports an
     unavailable adapter (exit 77) makes this a skip, as for the other pixel draws."""
@@ -18091,7 +18305,8 @@ def main():
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
                     "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-region-body", "draw-region-waits", "draw-div-fmas", "draw-cmp64", "draw-shift64",
-                    "draw-f16-arith", "draw-f16-round", "draw-f16-cvt-int16", "draw-flat-scratch", "draw-smem-pointers",
+                    "draw-f16-arith", "draw-f16-round", "draw-f16-cvt-int16", "draw-f16-to-int",
+                    "draw-flat-scratch", "draw-smem-pointers",
                     "draw-dpp-cvt", "draw-dpp-movrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
@@ -18119,6 +18334,7 @@ def main():
                         "draw-f16-arith": check_f16_arith_draw,
                         "draw-f16-round": check_f16_round_draw,
                         "draw-f16-cvt-int16": check_f16_cvt_int16_draw,
+                        "draw-f16-to-int": check_f16_to_int_draw,
                         "draw-compressed-export": check_compressed_export_draw,
                         "draw-uncompressed-export": check_uncompressed_export_draw,
                         "draw-uncompressed-integer-export": check_uncompressed_integer_export_draw,
