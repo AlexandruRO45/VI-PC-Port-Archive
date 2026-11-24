@@ -4,6 +4,8 @@
 # VICTORY_CONFIG selects a different config file (the file, not its folder;
 # a leading ~ is your home folder).
 # Relative paths here are relative to this file; a leading ~ is your home folder.
+# Variables ($HOME, ${XDG_DATA_HOME}, %LOCALAPPDATA%) are not expanded here or in
+# an env file; write the path out in full.
 # An empty variable counts as unset.
 # The paths below are Windows examples; on Linux or macOS change them to paths
 # on that machine (a D:\ path there is refused, not read as relative).

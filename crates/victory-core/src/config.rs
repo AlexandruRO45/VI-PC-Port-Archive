@@ -444,14 +444,77 @@ fn lexical(path: &Path) -> PathBuf {
 
 /// The checks every configured path goes through before it is used: no
 /// control characters ([`ensure_no_control`]), no surrounding quotes
-/// ([`ensure_unquoted`]), no surrounding whitespace ([`ensure_trimmed`])
-/// and no Windows drive path off Windows ([`ensure_native`]). `what` names
-/// the setting for the error.
+/// ([`ensure_unquoted`]), no surrounding whitespace ([`ensure_trimmed`]),
+/// no unexpanded variable ([`ensure_no_variable`]) and no Windows drive
+/// path off Windows ([`ensure_native`]). `what` names the setting for the
+/// error.
 fn check_setting(what: &str, path: &Path) -> Result<()> {
     ensure_no_control(what, path)?;
     ensure_unquoted(what, path)?;
     ensure_trimmed(what, path)?;
+    ensure_no_variable(what, path)?;
     ensure_native(what, path, cfg!(windows))
+}
+
+/// Refuses a path that names an environment variable instead of its value:
+/// `$HOME/Games/gta`, `${XDG_DATA_HOME}/victory` or
+/// `%LOCALAPPDATA%\victory` (the form `victory.example.toml` uses for the
+/// defaults, so an easy one to copy). Only a shell (or `cmd` for `%...%`)
+/// expands these; TOML, an env file read by `docker run --env-file` or
+/// systemd, and a launcher or IDE run configuration keep them literally.
+/// The path is then relative, so it would be taken as a folder named
+/// `$HOME` under the config file's folder or the working directory (often
+/// the repository) and reported later only as "does not exist" or "inside
+/// the repository". Real folders like `$Recycle.Bin` or `100%` are left
+/// alone: a `$` part must be a whole variable name (`$HOME`, not
+/// `$HOME.old`), and `%` must enclose one.
+fn ensure_no_variable(what: &str, path: &Path) -> Result<()> {
+    let text = path.to_string_lossy();
+    let Some(var) = text.split(['/', '\\']).find_map(variable_in) else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "{what} is {}, which names the variable {var}; variables are not expanded in \
+         the config file or when the value comes from an env file or a launcher rather \
+         than a shell, so write the path out in full (a leading ~ is the home directory)",
+        path.display()
+    );
+}
+
+/// The variable reference in one path component, as written: the whole
+/// component `$NAME`, or `${NAME}` or `%NAME%` anywhere in it.
+fn variable_in(part: &str) -> Option<&str> {
+    let is_name = |s: &str| {
+        let mut chars = s.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    if part.strip_prefix('$').is_some_and(is_name) {
+        return Some(part);
+    }
+    if let Some(start) = part.find("${") {
+        let rest = &part[start + 2..];
+        if let Some(end) = rest.find('}')
+            && is_name(&rest[..end])
+        {
+            return Some(&part[start..start + 2 + end + 1]);
+        }
+    }
+    // `%ProgramFiles(x86)%` is a real Windows variable.
+    let mut pieces = part.split('%');
+    pieces.next();
+    let mut offset = part.find('%')?;
+    for piece in pieces {
+        let name = piece.replace("(x86)", "");
+        let closed = offset + 1 + piece.len() < part.len();
+        if closed && is_name(&name) {
+            return Some(&part[offset..offset + piece.len() + 2]);
+        }
+        offset += piece.len() + 1;
+    }
+    None
 }
 
 /// Refuses a path that starts or ends with whitespace (a space, or a
@@ -1045,6 +1108,82 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("[paths].data_dir"), "{err}");
+    }
+
+    #[test]
+    fn unexpanded_variables_in_paths_are_refused() {
+        // An env file or the config file keeps `$HOME` literally.
+        let err = ensure_no_variable("VICTORY_GAME_DIR", Path::new("$HOME/Games/gta"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VICTORY_GAME_DIR"), "{err}");
+        assert!(err.contains("the variable $HOME;"), "{err}");
+        assert!(err.contains("~ is the home directory"), "{err}");
+        for (path, var) in [
+            ("${XDG_DATA_HOME}/victory", "${XDG_DATA_HOME}"),
+            ("/srv/${USER}-victory/cache", "${USER}"),
+            ("/home/$USER/gta", "$USER"),
+            ("%LOCALAPPDATA%\\victory\\cache", "%LOCALAPPDATA%"),
+            ("%LocalAppData%/victory", "%LocalAppData%"),
+            ("%ProgramFiles(x86)%\\gta", "%ProgramFiles(x86)%"),
+            ("~/%USERNAME%-gta", "%USERNAME%"),
+        ] {
+            let err = ensure_no_variable("x", Path::new(path))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("the variable {var};")),
+                "{path}: {err}"
+            );
+        }
+        // Real folder names with `$` or `%` in them.
+        for ok in [
+            "/games/gta",
+            "C:\\$Recycle.Bin\\x",
+            "/mnt/share$/gta",
+            "/games/$HOME.old",
+            "/games/100%",
+            "/games/50% off/x",
+            "/a/${}/b",
+            "/a/$/b",
+            "/a/%%/b",
+            "~/games",
+            "",
+        ] {
+            assert!(ensure_no_variable("x", Path::new(ok)).is_ok(), "{ok}");
+        }
+
+        // Every way in: each path variable, VICTORY_CONFIG and the file.
+        for var in [
+            "VICTORY_GAME_DIR",
+            "VICTORY_CACHE_DIR",
+            "VICTORY_DATA_DIR",
+            "VICTORY_TEST_TITLES",
+        ] {
+            let env = |k: &str| match k {
+                k if k == var => Some(OsString::from("$HOME/victory/x")),
+                "HOME" => Some(abs("home")),
+                _ => None,
+            };
+            let err = Config::resolve(FilePaths::default(), None, env)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(var), "{err}");
+            assert!(err.contains("$HOME"), "{err}");
+        }
+        let env = |k: &str| {
+            (k == "VICTORY_CONFIG").then(|| OsString::from("${XDG_CONFIG_HOME}/victory.toml"))
+        };
+        let err = explicit_config(env, None).unwrap_err().to_string();
+        assert!(err.contains("VICTORY_CONFIG"), "{err}");
+        let parsed: FileConfig =
+            toml::from_str("[paths]\ndata_dir = '%LOCALAPPDATA%\\victory\\data'\n").unwrap();
+        let err = parsed
+            .anchored_at(Path::new("/configs"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[paths].data_dir"), "{err}");
+        assert!(err.contains("%LOCALAPPDATA%"), "{err}");
     }
 
     #[test]
