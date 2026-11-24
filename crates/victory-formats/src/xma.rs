@@ -2281,4 +2281,191 @@ mod tests {
             Err(Error("run level coefficients"))
         );
     }
+
+    /// The bits of `sym` in `vlc`.
+    fn vlc_code(vlc: &Vlc, sym: i32) -> String {
+        let &(c, len, _) = vlc.codes.iter().find(|c| c.2 == sym).unwrap();
+        format!("{:032b}", c)[..len as usize].to_string()
+    }
+
+    /// Bits from a string of `0`/`1`, with zero padding past the end.
+    fn bits_of(bits: &str) -> Vec<u8> {
+        let mut data = vec![0u8; bits.len() / 8 + 8];
+        for (i, c) in bits.bytes().enumerate() {
+            data[i / 8] |= u8::from(c == b'1') << (7 - i % 8);
+        }
+        data
+    }
+
+    /// `subframe` reads, for a subframe every channel shares: an optional
+    /// fill (`1`, then 2 bits, or `00`, 4 bits of width and that many bits
+    /// of length - 1), a reserved `0`, the channel transform, one "transmit"
+    /// bit per channel and, if any is set, an optional vector coefficient
+    /// count, a 6-bit signed quantisation step around 90 (with 5-bit
+    /// extensions at -32 and 31), per-channel step modifiers for stereo, and
+    /// the scale factors.
+    #[test]
+    fn subframe_headers_read_fill_quantisation_and_modifiers() {
+        fn read(d: &mut Decoder, bits: &str, end: usize) -> (Result<(), Error>, usize) {
+            for c in 0..d.channels {
+                let ch = &mut d.ch[c];
+                ch.num_subframes = 1;
+                ch.subframe_len[0] = FRAME_SAMPLES;
+                ch.decoded_samples = 0;
+                ch.cur_subframe = 0;
+                ch.reuse_sf = false;
+            }
+            d.parsed_all_subframes = false;
+            let data = bits_of(bits);
+            let mut b = Bits {
+                data: &data,
+                pos: 0,
+                end,
+            };
+            (d.subframe(&mut b), b.consumed())
+        }
+        // Scale factors for one channel: step 1, then no change per band.
+        let scales =
+            |d: &Decoder| format!("00{}", vlc_code(&codes().scale, 0).repeat(d.num_sfb[0]));
+
+        let mut d = Decoder::new(1, 44_100);
+        assert_eq!(read(&mut d, "000", 3), (Ok(()), 3));
+        assert!(d.parsed_all_subframes);
+        assert_eq!((d.ch[0].cur_subframe, d.ch[0].prev_block_len), (1, 512));
+        assert!(!d.ch[0].transmit_coefs);
+        assert_eq!((d.table_idx, d.num_bands, d.esc_len), (0, d.num_sfb[0], 9));
+
+        assert_eq!(read(&mut d, "01", 2).0, Err(Error("reserved bit")));
+        // A 2-bit fill of 1 bit.
+        assert_eq!(read(&mut d, "101100", 6), (Ok(()), 6));
+        // A 3-bit length of 5 + 1 = 6 fill bits.
+        assert_eq!(read(&mut d, "100001110111111100", 18), (Ok(()), 18));
+        // A fill past the end of the data.
+        assert_eq!(read(&mut d, "11100", 5).0, Err(Error("subframe overread")));
+
+        // An 8-bit count of 129 * 4 is past the 512 samples.
+        assert_eq!(
+            read(&mut d, &format!("0011{:08b}", 129), 12).0,
+            Err(Error("vector coefficient count"))
+        );
+        let bits = format!("0011{:08b}000000{}", 128, scales(&d));
+        assert_eq!(read(&mut d, &bits, bits.len()), (Ok(()), bits.len()));
+        assert_eq!((d.ch[0].num_vec_coeffs, d.ch[0].quant_step), (512, 90));
+
+        for (step, want) in [
+            ("000101", 95),
+            ("111011", 85),
+            // 31, then 31 and 2: 90 + 31 + 33.
+            ("011111", 154),
+            // -32, then 3: 90 - 32 - 3.
+            ("100000", 55),
+        ] {
+            let ext = match step {
+                "011111" => "1111100010",
+                "100000" => "00011",
+                _ => "",
+            };
+            let bits = format!("0010{step}{ext}{}", scales(&d));
+            assert_eq!(
+                read(&mut d, &bits, bits.len()),
+                (Ok(()), bits.len()),
+                "{step}"
+            );
+            assert_eq!(d.ch[0].quant_step, want, "{step}");
+            assert_eq!(d.ch[0].num_vec_coeffs, 512);
+        }
+
+        let mut d = Decoder::new(2, 44_100);
+        // No transform; both transmit; step 0; 2-bit modifiers: +3 + 1 for
+        // channel 0, none for channel 1.
+        let bits = format!(
+            "0 0 0 10 11 0 000000 010 111 0 {}",
+            scales(&d) + &scales(&d)
+        )
+        .replace(' ', "");
+        assert_eq!(read(&mut d, &bits, bits.len()), (Ok(()), bits.len()));
+        assert!(!d.transform);
+        assert_eq!((d.ch[0].quant_step, d.ch[1].quant_step), (94, 90));
+        // A zero-width modifier adds 1.
+        let bits =
+            format!("0 0 0 10 11 0 000000 000 0 1 {}", scales(&d) + &scales(&d)).replace(' ', "");
+        assert_eq!(read(&mut d, &bits, bits.len()), (Ok(()), bits.len()));
+        assert_eq!((d.ch[0].quant_step, d.ch[1].quant_step), (90, 91));
+    }
+
+    /// `decode` reads a 15-bit length, the tile header, the stereo
+    /// post-processing matrix, an 8-bit gain and the optional trims before
+    /// the subframes; a frame that reads past its length is an error but
+    /// still yields a frame of samples.
+    #[test]
+    fn frames_read_their_header_and_check_their_length() {
+        // Mono: fixed, one whole-frame subframe; gain; no trim; an empty
+        // subframe.
+        let body = format!("10{:08b}0000", 0xa5);
+        for (len, want) in [
+            (29, Ok(())),
+            (40, Ok(())),
+            (28, Err(Error("frame overread"))),
+        ] {
+            let bits = format!("{len:015b}{body}");
+            let mut d = Decoder::new(1, 44_100);
+            let mut out = Vec::new();
+            assert_eq!(
+                d.decode(&bits_of(&bits), bits.len(), &mut out),
+                want,
+                "{len}"
+            );
+            assert_eq!(out, [0; FRAME_SAMPLES]);
+        }
+
+        // Stereo: a 16-bit post-processing matrix, both trims of 10 bits,
+        // then a subframe both channels share without a transform.
+        let body = format!(
+            "10 11{:016b} {:08b} 1 1{:010b} 1{:010b} 000 10 00",
+            0xffff, 0, 3, 5
+        )
+        .replace(' ', "");
+        let bits = format!("{:015b}{body}", 15 + body.len());
+        let mut d = Decoder::new(2, 44_100);
+        let mut out = Vec::new();
+        assert_eq!(d.decode(&bits_of(&bits), bits.len(), &mut out), Ok(()));
+        assert_eq!(out.len(), 2 * FRAME_SAMPLES);
+        assert!(
+            d.ch.iter()
+                .all(|ch| ch.cur_subframe == 1 && ch.num_subframes == 1)
+        );
+
+        // Cut one bit short, the last subframe bit reads as a zero past the
+        // end and the frame is lost.
+        let mut d = Decoder::new(2, 44_100);
+        assert_eq!(
+            d.decode(&bits_of(&bits), bits.len() - 1, &mut out),
+            Err(Error("subframe overread"))
+        );
+        assert_eq!(out.len(), 4 * FRAME_SAMPLES);
+    }
+
+    /// Samples in [-1, 1) scale to 16 bits, rounding half away from zero and
+    /// saturating; NaN becomes silence.
+    #[test]
+    fn samples_round_and_saturate_to_16_bits() {
+        let s = 1.0 / 32768.0;
+        for (v, want) in [
+            (0.0, 0),
+            (0.5 * s, 1),
+            (-0.5 * s, -1),
+            (0.49 * s, 0),
+            (-0.4 * s, 0),
+            (100.0 * s, 100),
+            (1.0, 32767),
+            (-1.0, -32768),
+            (7.5, 32767),
+            (-7.5, -32768),
+            (f32::INFINITY, 32767),
+            (f32::NEG_INFINITY, -32768),
+            (f32::NAN, 0),
+        ] {
+            assert_eq!(to_i16(v), want, "{v}");
+        }
+    }
 }
