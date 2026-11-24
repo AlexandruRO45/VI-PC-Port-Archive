@@ -189,6 +189,7 @@ fn program() -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        gs: None,
     })
     .expect("lower");
     assert!(l.memory && l.memory_writes && l.view_addresses);
@@ -418,6 +419,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        gs: None,
     })
     .expect("lower");
     assert!(l.root_srvs.is_empty() && !l.memory, "no root descriptor, no title memory");
