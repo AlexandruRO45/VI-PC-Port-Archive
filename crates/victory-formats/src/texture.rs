@@ -1576,4 +1576,163 @@ mod tests {
             }
         }
     }
+
+    /// Each dimension takes only the modes it can use: 1D needs a height of
+    /// 1, 3D takes linear, the `S` modes and the 64 KiB `_X` modes (not 256 B
+    /// or plain `D`), and only 2D can be multisampled. 3D `S` and `D` modes
+    /// are thick: one block spans several depth slices, and the depth rounds
+    /// up to whole blocks. 3D `Z_X`/`R_X` are thin: one slice per block.
+    #[test]
+    fn dimensions_take_only_their_modes() {
+        let known = [0, 1, 2, 5, 6, 9, 10, 17, 18, 21, 22, 23, 24, 25, 26, 27];
+        let three_d = [0, 5, 9, 17, 21, 24, 25, 26, 27];
+        let with = |dimension, w, h, depth, samples, n| Desc {
+            dimension,
+            depth,
+            samples,
+            ..desc(w, h, 1, 4, Swizzle(n))
+        };
+        for n in known {
+            let s = Swizzle(n);
+            let log2 = s.block_log2().unwrap();
+            assert!(
+                Layout::new(&with(Dimension::Tex1d, 64, 1, 3, 1, n)).is_ok(),
+                "{n}"
+            );
+            for bad in [
+                with(Dimension::Tex1d, 64, 2, 1, 1, n),
+                with(Dimension::Tex1d, 64, 1, 1, 2, n),
+                with(Dimension::Tex3d, 8, 8, 8, 2, n),
+            ] {
+                assert_eq!(Layout::new(&bad), Err(Error::Invalid), "{bad:?}");
+            }
+            assert!(
+                Layout::new(&with(Dimension::Tex2d, 8, 8, 1, 2, n)).is_ok(),
+                "{n}"
+            );
+
+            let d = with(Dimension::Tex3d, 20, 12, 9, 1, n);
+            let Ok(l) = Layout::new(&d) else {
+                assert!(!three_d.contains(&n), "{n} refused for 3D");
+                continue;
+            };
+            assert!(three_d.contains(&n), "{n} accepted for 3D");
+            assert_eq!(l.thick, s.standard() || s.display(), "{n}");
+            let [bw, bh, bd] = l.block;
+            if n == 0 {
+                // Linear 3D: every depth slice holds the chain.
+                assert_eq!((l.block, l.slices), ([64, 1, 1], 9));
+            } else if l.thick {
+                assert!(bd > 1, "{n}");
+                assert_eq!(u64::from(bw * bh * bd * 4), 1u64 << log2, "{n}");
+                assert_eq!(l.slices, 9u32.div_ceil(bd), "{n}");
+                assert_eq!(l.mips[0].depth_pitch, 9u32.next_multiple_of(bd), "{n}");
+            } else {
+                assert_eq!(bd, 1, "{n}");
+                assert_eq!(u64::from(bw * bh * 4), 1u64 << log2, "{n}");
+                assert_eq!(l.slices, 9, "{n}");
+            }
+            assert_eq!(l.size, l.slice_size * u64::from(l.slices), "{n}");
+            assert_eq!(l.mips[0].depth, 9, "{n}");
+        }
+    }
+
+    /// Linear layouts (`HwlComputeSurfaceInfoLinear`): each row pads to 256
+    /// bytes, mips pack smallest first with no gaps, every array or depth
+    /// slice holds the whole chain, and an element's address is its row and
+    /// column inside that. Hand-checked sizes for odd extents, BC blocks and
+    /// 3D.
+    #[test]
+    fn linear_layouts_pack_rows_and_mips() {
+        // (desc, per mip (pitch, rows, offset, width, height, depth), slice size)
+        let cases = [
+            (
+                Desc {
+                    depth: 3,
+                    ..desc(30, 20, 3, 4, Swizzle::LINEAR)
+                },
+                vec![
+                    (64, 20, 3840, 30, 20, 1),
+                    (64, 10, 1280, 15, 10, 1),
+                    (64, 5, 0, 7, 5, 1),
+                ],
+                8960,
+            ),
+            // Odd extents: placement rounds up, data rounds down.
+            (
+                desc(7, 5, 2, 16, Swizzle::LINEAR),
+                vec![(16, 5, 768, 7, 5, 1), (16, 3, 0, 3, 2, 1)],
+                2048,
+            ),
+            // BC1-sized 4x4 blocks: 64 texels are 16 elements.
+            (
+                Desc {
+                    block: 4,
+                    ..desc(64, 64, 2, 8, Swizzle::LINEAR)
+                },
+                vec![(32, 16, 2048, 16, 16, 1), (32, 8, 0, 8, 8, 1)],
+                6144,
+            ),
+            (
+                Desc {
+                    dimension: Dimension::Tex3d,
+                    depth: 4,
+                    ..desc(8, 4, 3, 4, Swizzle::LINEAR)
+                },
+                vec![
+                    (64, 4, 768, 8, 4, 4),
+                    (64, 2, 256, 4, 2, 2),
+                    (64, 1, 0, 2, 1, 1),
+                ],
+                1792,
+            ),
+        ];
+        for (d, mips, slice_size) in cases {
+            let l = Layout::new(&d).unwrap();
+            let got: Vec<_> = l
+                .mips
+                .iter()
+                .map(|m| (m.pitch, m.rows, m.offset, m.width, m.height, m.depth))
+                .collect();
+            assert_eq!(got, mips, "{d:?}");
+            assert!(l.mips.iter().all(|m| m.tail.is_none()), "{d:?}");
+            assert_eq!(l.slice_size, slice_size, "{d:?}");
+            assert_eq!(
+                (l.slices, l.size, l.alignment),
+                (d.depth, slice_size * u64::from(d.depth), 256)
+            );
+            assert_eq!(l.first_tail_mip, d.mips, "{d:?}");
+            assert!(l.addressable());
+            let bpe = u64::from(d.element_bytes);
+            for (i, m) in l.mips.iter().enumerate() {
+                assert_eq!(u64::from(m.pitch) * bpe % 256, 0, "{d:?} mip {i}");
+                let slices = if d.dimension == Dimension::Tex3d {
+                    m.depth
+                } else {
+                    d.depth
+                };
+                for z in 0..slices {
+                    for (x, y) in [
+                        (0, 0),
+                        (m.width - 1, 0),
+                        (0, m.height - 1),
+                        (m.width - 1, m.height - 1),
+                    ] {
+                        let row = u64::from(y) * u64::from(m.pitch) + u64::from(x);
+                        let expected = u64::from(z) * slice_size + m.offset + row * bpe;
+                        assert_eq!(l.offset(i as u32, x, y, z), Ok(expected), "{d:?} mip {i}");
+                    }
+                }
+            }
+        }
+        // One 3D element by hand: depth slice 1 of mip 1, element (1, 1).
+        let l = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 4,
+            ..desc(8, 4, 3, 4, Swizzle::LINEAR)
+        })
+        .unwrap();
+        assert_eq!(l.offset(1, 1, 1, 1), Ok(1792 + 256 + 65 * 4));
+        assert_eq!(l.offset(1, 0, 0, 2), Err(Error::Invalid));
+    }
 }
