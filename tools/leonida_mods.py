@@ -68,11 +68,9 @@ class ModInfo:
 
 
 def joaat(name: str) -> int:
-    """RAGE's joaat over the name's UTF-8 bytes, ASCII-lowercased like the C++ runtime."""
+    """RAGE's joaat over the lower-cased Latin-1 bytes, matching tools/hashdict.py."""
     h = 0
-    for byte in name.encode("utf-8"):
-        if 0x41 <= byte <= 0x5A:
-            byte += 0x20
+    for byte in name.lower().encode("latin-1", "replace"):
         h = (h + byte) & 0xFFFFFFFF
         h = (h + (h << 10)) & 0xFFFFFFFF
         h ^= h >> 6
