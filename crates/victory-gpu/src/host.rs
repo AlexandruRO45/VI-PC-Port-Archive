@@ -307,6 +307,23 @@ mod tests {
     }
 
     #[test]
+    fn indirect_arguments_reuse_only_the_first_chunk() {
+        let list = host().expect("D3D12 host").new_list().unwrap();
+        let (first, at) = list.argument_space(ARGUMENT_CHUNK).unwrap();
+        assert_eq!(at, 0);
+        let (growth, at) = list.argument_space(32).unwrap();
+        assert_ne!(growth, first);
+        assert_eq!(at, 0);
+        let (dedicated, at) = list.argument_space(ARGUMENT_CHUNK + 1).unwrap();
+        assert_ne!(dedicated, growth);
+        assert_eq!(at, 0);
+        list.reset();
+        let a = list.arguments.lock().unwrap();
+        assert_eq!(a.chunks.as_slice(), &[first]);
+        assert_eq!((a.current, a.first_free), (0, 0));
+    }
+
+    #[test]
     fn first_scratch_is_small_and_growth_is_not_retained() {
         let h = host().expect("D3D12 host");
         let list = h.new_list().unwrap();
@@ -359,6 +376,7 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    arguments: Mutex<Arguments>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -451,6 +469,15 @@ unsafe impl Send for Scratch {}
 const SCRATCH_FIRST: u64 = 256 << 10;
 const SCRATCH_CHUNK: u64 = 4 << 20;
 static SCRATCH_BYTES: AtomicU64 = AtomicU64::new(0);
+
+const ARGUMENT_CHUNK: u64 = 64 << 10;
+
+#[derive(Default)]
+struct Arguments {
+    chunks: Vec<ID3D12Resource>,
+    first_free: u64,
+    current: usize,
+}
 
 struct ScratchChunk {
     resource: ID3D12Resource,
@@ -626,6 +653,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                arguments: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 rebind: false.into(),
@@ -1197,6 +1225,11 @@ impl HostList {
             (scratch.current, scratch.used) = (0, 0);
             scratch.chunks.truncate(1);
         }
+        {
+            let mut args = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+            args.chunks.truncate(1);
+            (args.current, args.first_free) = (0, 0);
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1570,6 +1603,33 @@ impl HostList {
         s.used += len;
         let c = &s.chunks[s.current];
         Some((c.resource.clone(), at, c.gpu + at, (c.cpu + at as usize) as *mut u8))
+    }
+
+    /// Space written by fallback compute and read by ExecuteIndirect.
+    /// The fallback owns any barriers for this buffer.
+    #[allow(dead_code)] // callsite comes from the up-mesh port
+    pub(crate) fn argument_space(&self, bytes: u64) -> Option<(ID3D12Resource, u64)> {
+        let bytes = bytes.max(1).checked_next_multiple_of(16)?;
+        let host = host()?;
+        if bytes > ARGUMENT_CHUNK {
+            let (buffer, _) = host.shared_buffer(bytes)?;
+            name(&buffer, || "dedicated indirect arguments".into());
+            self.keep(&buffer);
+            return Some((buffer, 0));
+        }
+        let mut a = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+        if a.first_free + bytes > ARGUMENT_CHUNK {
+            a.current += 1;
+            a.first_free = 0;
+        }
+        if a.current == a.chunks.len() {
+            let (buffer, _) = host.shared_buffer(ARGUMENT_CHUNK)?;
+            name(&buffer, || "indirect argument chunk".into());
+            a.chunks.push(buffer);
+        }
+        let at = a.first_free;
+        a.first_free += bytes;
+        Some((a.chunks[a.current].clone(), at))
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
