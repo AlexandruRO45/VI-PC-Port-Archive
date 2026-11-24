@@ -3584,6 +3584,18 @@ impl<'a> Lower<'a> {
                 }
                 (props, None)
             }
+            Fields::Smem { .. } if un.starts_with("s_buffer_") => {
+                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                let stride = used.map_or(0, |u| u.stride);
+                let props = if stride >= 4 && stride.is_multiple_of(4) {
+                    (12 | u, stride)
+                } else {
+                    (11 | u, 0)
+                };
+                (props, None)
+            }
             _ => return Err("a scalar memory read as data"),
         };
         let h = self.handle(site, &src, false, props)?;
