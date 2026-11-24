@@ -19,6 +19,15 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    #[cfg(feature = "diagnostics")]
+    if execute && std::env::var_os("VICTORY_CAPTURE_FSR").is_some() {
+        let folder = std::env::var_os("VICTORY_CAPTURE")
+            .context("VICTORY_CAPTURE_FSR requires VICTORY_CAPTURE")?;
+        let folder = Path::new(&folder);
+        victory_core::ensure_outside_repo(folder)?;
+        std::fs::create_dir_all(folder)
+            .with_context(|| format!("creating {}", folder.display()))?;
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();

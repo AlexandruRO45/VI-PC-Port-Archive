@@ -117,6 +117,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
+| `VICTORY_CAPTURE_FSR=1` | with `VICTORY_CAPTURE` outside the checkout, saves the first successful FSR dispatch's input and output and the next presented back buffer |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
@@ -156,6 +157,20 @@ Look for `ffx framegen: generated game frames` after world loading. That line re
 generated frames and DXGI presents. The boot screens run at the usual frame rate. The current test uses the
 legacy frame-generation provider. AMD Frame Generation 4 requires camera data the FSR calls do not carry.
 The Series X test logged both effects before the graphics ring timed out.
+
+To verify the picture on Series S, run twice from the same save. Keep
+`VICTORY_FFX_DIR` set for both runs and set `VICTORY_FFX_FRAMEGEN=1` only
+for the second. Set `VICTORY_CAPTURE_FSR=1` and give each run a fresh
+`VICTORY_CAPTURE` directory outside the checkout. Under Proton, use a
+Windows path visible to the runner. Set
+`VICTORY_LOG=error,victory_gpu::ffx=info,victory_gpu::capture=info` for a
+focused log, and keep standard output and standard error.
+
+Compare `fsr-input.png`, `fsr-output.png`, and the `frame-<n>.png`
+named by the `ffx capture: first present` log line. The input and output
+are copied from the dispatch's command list after it records the upscale.
+The last image is the next back buffer sent to Present. Check the generated
+frame and DXGI present counts separately in the frame generation log.
 
 ## License
 

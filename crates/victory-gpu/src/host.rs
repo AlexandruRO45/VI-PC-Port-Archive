@@ -288,6 +288,8 @@ pub(crate) struct HostList {
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     pub(crate) framegen_inputs: Mutex<Option<crate::ffx::framegen::Inputs>>,
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fsr_capture: Mutex<Option<crate::capture::FsrCapture>>,
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
@@ -481,6 +483,8 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 framegen_inputs: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
+                fsr_capture: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
@@ -610,6 +614,8 @@ impl Host {
         if crate::ffx::framegen::enabled() {
             crate::ffx::framegen::submitted(runs);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::capture::fsr_submitted(runs);
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
@@ -893,6 +899,8 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        #[cfg(feature = "diagnostics")]
+        self.fsr_capture.lock().unwrap_or_else(|e| e.into_inner()).take();
         if crate::ffx::framegen::enabled() {
             self.framegen_inputs.lock().unwrap_or_else(|e| e.into_inner()).take();
         }
@@ -1819,6 +1827,8 @@ impl Host {
             // The inputs belong to submitted game work. Keep the submit lock until our
             // preparation and copy finish, so a title submission cannot rewrite them.
             let mut submitted = p.framegen.as_ref().map(|_| self.submitted.lock().unwrap_or_else(|e| e.into_inner()));
+            #[cfg(feature = "diagnostics")]
+            let fsr_present = crate::capture::take_fsr_present();
             let mut generated = false;
             if let Some(fg) = &mut p.framegen {
                 let inputs = crate::ffx::framegen::take_inputs();
@@ -1843,7 +1853,7 @@ impl Host {
                 list.ResourceBarrier(&before);
                 list.CopyResource(&back, texture);
                 #[cfg(feature = "diagnostics")]
-                let capture = crate::capture::wanted(frame)
+                let capture = (fsr_present || crate::capture::wanted(frame))
                     .then(|| crate::capture::read_back(&self.device, list, texture))
                     .flatten();
                 #[cfg(feature = "diagnostics")]
@@ -1967,7 +1977,7 @@ impl Host {
                         D3D12_RESOURCE_STATE_RENDER_TARGET,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
                     )]);
-                    let capture = crate::capture::wanted(frame)
+                    let capture = (fsr_present || crate::capture::wanted(frame))
                         .then(|| crate::capture::read_back(&self.device, list, &back))
                         .flatten();
                     let probe = crate::capture::probe(&self.device, list, &back);
@@ -2011,10 +2021,18 @@ impl Host {
                 self.execute(&[&p.copy]);
             }
             #[cfg(feature = "diagnostics")]
+            if fsr_present && capture.is_none() {
+                tracing::warn!(frame, "ffx capture: could not record present readback");
+            }
+            #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let result = p.swap_chain.Present(u32::from(generated), DXGI_PRESENT(0));
+            #[cfg(feature = "diagnostics")]
+            if fsr_present {
+                crate::capture::finish_fsr_present(frame, result.is_ok());
+            }
             if generated && let Some(fg) = &mut p.framegen {
                 if result.is_ok() {
                     fg.presented(&p.swap_chain, frame);

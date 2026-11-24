@@ -551,6 +551,13 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
         {
             crate::capture::note_target(input);
             crate::capture::note_target(output);
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_DEST;
+            let output_state = if packed_output.is_some() {
+                D3D12_RESOURCE_STATE_COPY_DEST.0 as u32
+            } else {
+                HOST_UNORDERED_ACCESS
+            };
+            crate::capture::record_fsr(list, input, output, output_state);
         }
         if let Some((Some(depth), Some(motion))) = geometry {
             // SAFETY: the SDK just accepted this context.
