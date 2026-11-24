@@ -656,6 +656,38 @@ mod tests {
         }
     }
 
+    /// [`translate`] runs after the container parses: one without a `DXIL`
+    /// part is refused before native code is read.
+    #[test]
+    fn translate_refuses_a_container_with_no_dxil_part() {
+        use crate::ShaderError;
+        use crate::dxbc::{build, FourCC};
+        let bytes = build(&[(FourCC::SFI0, &[0; 8]), (FourCC::HASH, &[0; 20])]);
+        assert_eq!(
+            translate(&bytes).unwrap_err(),
+            ShaderError::Malformed("no DXIL part")
+        );
+    }
+
+    /// A PC-layout `DXIL` part with no `XDAT` native entry is not one of the
+    /// stage programs [`translate`] looks for.
+    #[test]
+    fn translate_refuses_a_dxil_part_with_no_native_program() {
+        use crate::ShaderError;
+        use crate::dxbc::{build, FourCC};
+        use crate::dxil::build_standard;
+        let bitcode = [0x42, 0x43, 0xC0, 0xDE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let dxil = build_standard(0, (6, 0), 0x100, &bitcode);
+        let bytes = build(&[(FourCC::DXIL, &dxil[..])]);
+        assert_eq!(
+            translate(&bytes).unwrap_err(),
+            ShaderError::Unsupported {
+                offset: 0,
+                what: "a container without a vertex, pixel, compute or mesh program",
+            }
+        );
+    }
+
     /// A mesh group id strides by the HLSL group's whole thread count, not
     /// its x size alone: `numthreads(8, 8, 1)` is 64 threads. A group
     /// D3D12 cannot run is refused before its sizes are multiplied.
