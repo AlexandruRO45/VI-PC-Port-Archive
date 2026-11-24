@@ -906,6 +906,10 @@ impl State {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
+            #[cfg(feature = "diagnostics")]
+            if compute {
+                self.trace_table_writes(&p.name, &t.used, &made);
+            }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
@@ -1851,6 +1855,42 @@ impl State {
             &self.compute
         } else {
             &self.graphics
+        }
+    }
+
+    /// Sample a named compute pipeline's table UAVs after table placement.
+    #[cfg(feature = "diagnostics")]
+    fn trace_table_writes(&self, name: &str, used: &[UsedResource], made: &[(u8, u32)]) {
+        static SELECT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let Some(pattern) = SELECT.get_or_init(|| std::env::var("VICTORY_TRACE_TABLE_WRITES").ok().filter(|s| !s.is_empty())) else {
+            return;
+        };
+        if !name.contains(pattern) {
+            return;
+        }
+        static SAMPLES: AtomicU64 = AtomicU64::new(0);
+        let sample = SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+        if sample > 8 && !sample.is_power_of_two() {
+            return;
+        }
+        for u in used.iter().filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table) {
+            let binding = (|| {
+                let Root::Table(table) = *self.roots_ref(true).get(usize::from(u.slot))? else { return None };
+                let heap = self.heap_of(table)?;
+                let host = heap.host()?;
+                let handle = table.checked_add(u64::from(u.table_offset_dwords) * 4)?;
+                let title_index = heap.index(handle)?;
+                let host_index = match made.iter().find(|(slot, _)| *slot == u.slot) {
+                    Some((_, bytes)) => (bytes / 32).checked_add(u.table_offset_dwords / 8)?,
+                    None => title_index,
+                };
+                let copy = crate::descriptor::view(handle)
+                    .and_then(|v| crate::descriptor::host::buffer_copy(&v))
+                    .map(|(s, address, len)| (address, len, s.id(), host.shows(host_index, &s.buffer)));
+                Some((title_index, host_index, copy))
+            })();
+            tracing::info!(sample, name, register = u.lower_bound, ?binding,
+                "compute table UAV: title slot, host slot, optional (address, bytes, copy id, matches)");
         }
     }
 
