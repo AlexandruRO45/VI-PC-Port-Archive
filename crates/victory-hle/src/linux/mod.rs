@@ -15,6 +15,8 @@ use crate::HleModule;
 pub(crate) mod handles;
 mod kernel32_process;
 mod kernel32_sync;
+mod kernel32_system;
+mod kernel32_thread;
 mod kernel32_wait;
 
 fn modules() -> Vec<HleModule> {
@@ -22,6 +24,8 @@ fn modules() -> Vec<HleModule> {
         kernel32_wait::module(),
         kernel32_sync::module(),
         kernel32_process::module(),
+        kernel32_system::module(),
+        kernel32_thread::module(),
     ]
 }
 

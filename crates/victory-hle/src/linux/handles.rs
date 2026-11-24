@@ -646,6 +646,17 @@ pub(crate) fn adopt(thread: &Arc<Thread>) {
     SELF.with(|s| s.set(Arc::as_ptr(thread)));
 }
 
+/// Gives a thread `CreateThread` just started its id, so its handle and
+/// `OpenThread` work before the thread itself has run.
+pub(crate) fn register(thread: &Arc<Thread>, id: u32) {
+    thread.id.store(id, Ordering::Release);
+    let mut threads = lock(&THREADS);
+    // Under the registry lock: `finish` marks it exited before it locks.
+    if !thread.has_exited() {
+        threads.insert(id, thread.clone());
+    }
+}
+
 /// The object of a live thread by id (`OpenThread`).
 pub(crate) fn thread_by_id(id: u32) -> Option<Arc<Thread>> {
     lock(&THREADS).get(&id).cloned()
