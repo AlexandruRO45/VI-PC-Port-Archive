@@ -86,6 +86,8 @@ struct UnifiedResourceState {
 }
 
 /// A persistently mapped suballocation in the arena's placed buffer.
+/// The D3D12 state is shared by every suballocation because they all refer
+/// to the same underlying placed resource.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct UnifiedBuffer {
     pub(crate) resource: ID3D12Resource,
@@ -653,12 +655,11 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
-    /// Host texture states the list assumes, by host copy: at its start and
-    /// at its end. Lists are recorded on many threads and run in submission
-    /// order, so the transitions from a texture's real state are made at
-    /// submission, in `prelude`. Holding the copies keeps every texture the
-    /// list names alive until it is reset, even if the title releases the
-    /// resource first.
+    /// Host resource states the list assumes at its start and end: texture
+    /// host copies and the shared placed-buffer arena. Lists are recorded on
+    /// many threads and run in submission order, so the transitions from
+    /// each resource's real state are made at submission, in `prelude`.
+    /// Holding the state entries keeps every named resource alive until reset.
     states: Mutex<States>,
     /// Shared placed-buffer arena states, tracked once per underlying resource.
     unified_states: Mutex<UnifiedStates>,
@@ -1300,10 +1301,11 @@ impl HostList {
         }
     }
 
-    /// Moves a suballocation's shared arena resource to `wanted` in this
-    /// list. The returned previous state, when present, must be transitioned
-    /// in the command list at this point. The first transition is deferred to
-    /// the prelude so it starts from the resource's real submission-order state.
+    /// Moves the one shared arena resource to `wanted` for this suballocation.
+    /// Call for every use. The first transition is deferred to the prelude,
+    /// which knows the real submission-order state. If a later use in this
+    /// list requests a different state, the returned previous state must be
+    /// transitioned in the command list at that point.
     pub(crate) fn transition_unified(
         &self,
         buffer: &UnifiedBuffer,
