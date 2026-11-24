@@ -4,7 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GTA6 PC Port Archive</title>
-<meta name="description" content="Archive of five open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory and Xbox2Windows. How far each gets, plus code, issues and comments.">
+<meta name="description" content="Archive of five open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory and Xbox2Windows. How far each gets, plus code, issues and comments to download.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
 <script>
   // old links pointed issues at index.html#project/number; they live on browse.html now ("leonida" is now "leonida-old")
   if (/^#(leonida|leonida-old|leonida-new|xcl|victory|xbox2windows)(\/\d+)?$/.test(location.hash))
@@ -18,46 +19,62 @@
 .sr { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
 
 /* hero */
-.hero { padding:48px 0 0; }
-.kicker { font-size:14px; font-weight:500; color:var(--muted); }
-.hero h1 { font-size:clamp(30px, 4.4vw, 42px); line-height:1.1; margin:6px 0 10px; }
+.hero { padding:56px 0 0; }
+.kicker { display:inline-flex; align-items:center; gap:8px; font-size:13.5px; font-weight:500; color:var(--ink2); background:var(--panel); border:1px solid var(--line); border-radius:99px; padding:4px 12px 4px 10px; }
+.kicker::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--open); box-shadow:0 0 0 3px color-mix(in srgb, var(--open) 22%, transparent); }
+.hero h1 { font-size:clamp(32px, 4.6vw, 46px); line-height:1.08; margin:16px 0 10px; }
 .hero .lede { font-size:17px; color:var(--ink2); max-width:56ch; margin:0; }
+.answer { margin-top:26px; display:flex; gap:14px; align-items:flex-start; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px 18px; max-width:640px; }
+.answer .no { flex:none; display:grid; place-items:center; width:40px; height:40px; border-radius:10px; background:var(--soft); font:700 15px/1 var(--display); }
+.answer b { display:block; font-size:18px; margin-bottom:2px; }
+.answer span { color:var(--ink2); font-size:15px; }
 .cta { display:flex; gap:10px; flex-wrap:wrap; margin-top:22px; }
-.answer { margin-top:28px; background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--ink); border-radius:12px; padding:16px 18px; }
-.answer b { display:block; font-size:19px; margin-bottom:2px; }
-.answer span { color:var(--ink2); }
 
-/* how far each gets */
-.ladder { display:flex; flex-direction:column; gap:10px; }
-.prow { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; display:grid; grid-template-columns:170px minmax(0, 1fr); gap:10px 16px; align-items:center; }
-.prow .nm { display:flex; align-items:center; gap:8px; font-weight:600; }
-.prow .nm small { font-weight:400; color:var(--muted); font-size:13px; }
-.steps { list-style:none; margin:0; padding:0; display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:6px; }
-.steps li { font-size:13px; line-height:1.25; text-align:center; padding:7px 4px; border-radius:7px; border:1.5px dashed var(--line); color:var(--muted); }
+/* projects, with how far each gets */
+.projs { display:flex; flex-direction:column; gap:14px; }
+.proj { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px 20px; display:flex; flex-direction:column; gap:12px; position:relative; overflow:hidden; }
+.proj::before { content:""; position:absolute; inset:0 auto 0 0; width:4px; background:var(--pc); }
+.proj .hd { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+.proj .ttl { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.proj h3 { font-family:Inter, system-ui, sans-serif; font-size:19px; letter-spacing:-.01em; }
+.proj h3 small { font-weight:500; color:var(--muted); font-size:15px; }
+.proj .desc { margin:-4px 0 0; color:var(--ink2); font-size:15px; }
+.score { display:inline-flex; align-items:center; gap:8px; font-size:14px; font-weight:600; white-space:nowrap; }
+.score i { font-style:normal; font:600 12.5px/1 var(--mono); padding:4px 7px; border-radius:6px; background:var(--soft); color:var(--ink2); }
+.score.some i { background:color-mix(in srgb, var(--open) 16%, transparent); color:var(--ink); }
+.steps { list-style:none; margin:2px 0 0; padding:0; display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:6px; }
+.steps li { font-size:13px; line-height:1.25; text-align:center; padding:8px 4px; border-radius:8px; border:1.5px dashed var(--line); color:var(--muted); }
 .steps li.ok { border:1.5px solid var(--open); background:color-mix(in srgb, var(--open) 14%, transparent); color:var(--ink); font-weight:600; }
 .steps li.ok::before { content:"✓ "; color:var(--open); }
-.prow .note { grid-column:2; margin:0; font-size:14.5px; color:var(--ink2); }
-.prow .note a { color:var(--muted); white-space:nowrap; }
-@media (max-width:700px) {
-  .prow { grid-template-columns:minmax(0, 1fr); }
-  .prow .note { grid-column:1; }
-  .steps li { font-size:12px; padding:6px 2px; }
+.proj .note { margin:0; font-size:14.5px; color:var(--ink2); }
+.proj .note a { color:var(--muted); white-space:nowrap; }
+.proj .foot { display:flex; align-items:center; justify-content:space-between; gap:10px 16px; flex-wrap:wrap; border-top:1px solid var(--line); padding-top:12px; margin-top:2px; }
+.proj .foot .meta { font-size:13px; }
+.proj .actions { display:flex; flex-wrap:wrap; gap:8px; }
+@media (max-width:640px) {
+  .proj { padding:16px; }
+  .steps { gap:4px; }
+  .steps li { font-size:11.5px; padding:6px 2px; }
 }
-.src { margin-top:10px; font-size:13px; color:var(--muted); }
+.src { margin:12px 0 0; font-size:13px; color:var(--muted); }
 
-/* project cards */
-.projs { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; }
-@media (max-width:760px) { .projs { grid-template-columns:minmax(0, 1fr); } }
-.proj { background:var(--panel); border:1px solid var(--line); border-top:3px solid var(--pc); border-radius:12px; padding:18px; display:flex; flex-direction:column; gap:12px; }
-.proj .hd { display:flex; align-items:center; justify-content:space-between; gap:10px; }
-.proj h3 { font-family:Inter, system-ui, sans-serif; font-size:19px; letter-spacing:-.01em; }
-.proj p { margin:0; color:var(--ink2); font-size:15px; }
-.proj .reach { font-size:14px; font-weight:600; }
-.proj .reach span { font-weight:400; color:var(--muted); }
-.proj .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:auto; }
-
-/* get the code */
-.code { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
+/* download */
+.dl { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px; }
+@media (max-width:860px) { .dl { grid-template-columns:repeat(2, minmax(0, 1fr)); } }
+@media (max-width:540px) { .dl { grid-template-columns:minmax(0, 1fr); } }
+.dlc { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; display:flex; flex-direction:column; gap:10px; }
+.dlc h3 { display:flex; align-items:center; gap:8px; font-family:Inter, system-ui, sans-serif; font-size:16px; letter-spacing:-.01em; }
+.dlc h3 small { font-weight:500; color:var(--muted); font-size:14px; }
+.dlc p { margin:0; font-size:13.5px; color:var(--muted); }
+.dlc .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:auto; }
+.dlc.all { background:var(--ink); color:var(--bg); border-color:var(--ink); }
+.dlc.all p { color:color-mix(in srgb, var(--bg) 70%, transparent); }
+.dlc.all .btn { background:var(--bg); color:var(--ink); border-color:var(--bg); }
+.dlc.all .btn:hover { opacity:.9; }
+.git { margin-top:14px; background:var(--panel); border:1px solid var(--line); border-radius:14px; }
+.git summary { cursor:pointer; padding:14px 16px; font-weight:600; font-size:15px; }
+.git summary span { font-weight:400; color:var(--muted); }
+.git .in { padding:0 16px 16px; }
 .cmdline { display:flex; gap:8px; align-items:stretch; }
 .cmdline pre { flex:1; min-width:0; margin:0; font-family:var(--mono); font-size:13px; background:var(--soft); border-radius:8px; padding:11px 12px; white-space:pre-wrap; overflow-wrap:anywhere; }
 .one .btn[aria-pressed="true"] { border-color:var(--ink); background:var(--soft); box-shadow:inset 0 0 0 1px var(--ink); }
@@ -66,7 +83,7 @@
 /* important links */
 .ilinks { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
 @media (max-width:760px) { .ilinks { grid-template-columns:minmax(0, 1fr); } }
-.ilink { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:13px 16px; border:1px solid var(--line); border-radius:10px; text-decoration:none; background:var(--panel); font-weight:600; min-width:0; }
+.ilink { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:13px 16px; border:1px solid var(--line); border-radius:12px; text-decoration:none; background:var(--panel); font-weight:600; min-width:0; }
 .ilink:hover { border-color:var(--ink); }
 .ilink span:first-child { overflow-wrap:anywhere; min-width:0; }
 .ilink .arrow { color:var(--muted); flex:none; }
@@ -76,40 +93,37 @@
 <nav class="nav" aria-label="Site"><div class="wrap">
   <a class="brand" href="./"><i aria-hidden="true"><b></b><b></b><b></b><b></b></i><span>GTA6 PC Port Archive</span></a>
   <ul>
-    <li><a href="#progress">Progress</a></li><li><a href="#projects">Projects</a></li>
-    <li><a href="#code">Code</a></li><li><a href="#links">Links</a></li><li><a class="go" href="browse.html">Browse issues</a></li>
+    <li><a href="#projects">Projects</a></li><li><a href="#download">Download</a></li>
+    <li class="opt"><a href="#links">Links</a></li><li><a class="go" href="browse.html">Browse issues</a></li>
   </ul>
 </div></nav>
 
 <main class="wrap">
   <header class="hero">
-    <div class="kicker">Code and issues sync with GitHub every 6 hours</div>
+    <div class="kicker">Synced with GitHub every 6 hours</div>
     <h1>GTA6 PC Port Archive</h1>
     <p class="lede">Saved copies of five open-source projects trying to run GTA VI on PC: their code, issues and comments. No game files.</p>
     <div class="answer" role="note">
-      <b>Can you play it on PC yet? No.</b>
-      <span>Furthest so far: VIctory loads into the world, but the screen stays dark there.</span>
+      <span class="no" aria-hidden="true">No</span>
+      <div><b>Can you play it on PC yet? No.</b>
+      <span>Furthest so far: VIctory loads into the world, but the screen stays dark there.</span></div>
     </div>
     <div class="cta">
-      <a class="btn solid" href="#progress">See how far each one gets</a>
-      <a class="btn" href="browse.html">Browse issues and PRs</a>
+      <a class="btn solid" href="#projects">See how far each one gets</a>
+      <a class="btn" href="#download">Download</a>
     </div>
   </header>
 
-  <section class="sec" id="progress" aria-labelledby="prog-h">
-    <div class="sec-head"><h2 id="prog-h">How far each one gets</h2><p>Green means that part works.</p></div>
-    <div class="ladder" id="ladder"></div>
-    <p class="src">From each project's own README on 24 Nov 2026. Tested by the developers on their own PCs.</p>
-  </section>
-
   <section class="sec" id="projects" aria-labelledby="proj-h">
-    <div class="sec-head"><h2 id="proj-h">Projects</h2></div>
+    <div class="sec-head"><h2 id="proj-h">Projects and how far they get</h2><p>Green means that part works.</p></div>
     <div class="projs" id="projlist"></div>
+    <p class="src">Progress is from each project's own README on 24 Nov 2026, tested by its developers on their own PCs.</p>
   </section>
 
-  <section class="sec" id="code" aria-labelledby="code-h">
-    <div class="sec-head"><h2 id="code-h">Get the code</h2></div>
-    <div class="code" id="cmds"></div>
+  <section class="sec" id="download" aria-labelledby="dl-h">
+    <div class="sec-head"><h2 id="dl-h">Download</h2><p>Zip files straight from GitHub. Source code only, no game files.</p></div>
+    <div class="dl" id="dl"></div>
+    <details class="git"><summary>Using git? <span>Copy a clone command</span></summary><div class="in" id="cmds"></div></details>
   </section>
 
   <section class="sec" id="links" aria-labelledby="links-h">
@@ -135,7 +149,7 @@ const PROJECTS = {
   "leonida-new": { name: "Leonida", tag: "new", lic: "GPL-3.0", branch: "leonida-new", up: "https://github.com/ubiquitarianism/leonida",
     desc: "Leonida Continued: picks up the original Leonida with its full history.", reached: 0,
     note: "The game doesn't start yet. Its tools already unpack the game's shaders, models, textures and audio.", src: "https://github.com/ubiquitarianism/leonida#project-status" },
-  "leonida-old": { name: "Leonida", tag: "old", lic: "GPL-3.0", branch: "leonida", up: null,
+  "leonida-old": { name: "Leonida", tag: "old", lic: "GPL-3.0", branch: "leonida", up: null, frozen: "Final copy, 23 Nov 2026",
     desc: "The original. Removed from GitHub on 23 Nov 2026; this is the last copy saved.", reached: 0,
     note: "Stopped before the game starts. The new Leonida carries on from here.", src: `${REPO}/tree/main/leonida-old#project-status` },
   xcl: { name: "xcl", lic: "GPL-2.0", branch: "xcl", up: "https://github.com/ivall/xcl",
@@ -148,47 +162,63 @@ const PROJECTS = {
     desc: "Turns Xbox Series code into a Windows program.", reached: 1,
     note: "With a modified test EXE it plays the intro and reaches a loading screen. Menus not checked yet.", src: "https://github.com/R0Y00/Xbox2Windows#readme" },
 };
-const KEYS = Object.keys(PROJECTS);
+// show the furthest first
+const KEYS = Object.keys(PROJECTS).sort((a, b) => PROJECTS[b].reached - PROJECTS[a].reached);
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
 const label = P => P.tag ? `${P.name} <small>(${P.tag})</small>` : P.name;
+const plain = P => P.name + (P.tag ? ` (${P.tag})` : "");
 const date = t => new Date(t * 1000).toLocaleDateString("en-GB", { day:"numeric", month:"short", year:"numeric", timeZone:"UTC" });
 const reach = P => P.reached ? `Gets to: ${STEPS[P.reached - 1]}` : "Doesn't start yet";
-
-function ladder() {
-  $("ladder").innerHTML = KEYS.map(k => {
-    const P = PROJECTS[k];
-    return `<div class="prow p-${k}">
-      <div class="nm"><i class="dot"></i>${label(P)}</div>
-      <ol class="steps" aria-label="${esc(P.name + (P.tag ? " " + P.tag : ""))}: ${esc(reach(P))}">${STEPS.map((s, i) =>
-        `<li${i < P.reached ? ' class="ok"' : ""}>${s}<span class="sr">${i < P.reached ? ": works" : ": not yet"}</span></li>`).join("")}</ol>
-      <p class="note">${esc(P.note)} <a href="${P.src}" target="_blank" rel="noopener">Source</a></p>
-    </div>`;
-  }).join("");
-}
+const zip = (P, what) => `${REPO}/archive/refs/heads/${P.branch}/${what}.zip`;
 
 function projects(st) {
   $("projlist").innerHTML = KEYS.map(k => {
     const P = PROJECTS[k], s = (st || {})[k] || {};
-    return `<article class="proj p-${k}">
-      <div class="hd"><h3>${label(P)}</h3><span class="chip">${P.lic}</span></div>
-      <p>${esc(P.desc)}</p>
-      <div class="reach">${esc(reach(P))}${s.updated ? ` <span>· last code change ${date(s.updated)}</span>` : ""}</div>
-      <div class="actions">
-        <a class="btn solid sm" href="browse.html#${k}">Issues and PRs</a>
-        <a class="btn sm" href="${REPO}/tree/main/${k}">Code</a>
-        <a class="btn sm" href="${REPO}/archive/refs/heads/${P.branch}/main.zip">Download zip</a>
-        ${P.up ? `<a class="btn sm" href="${P.up}" target="_blank" rel="noopener">Original ↗</a>` : ""}
+    return `<article class="proj p-${k}" aria-labelledby="h-${k}">
+      <div class="hd">
+        <div class="ttl"><h3 id="h-${k}">${label(P)}</h3><span class="chip">${P.lic}</span></div>
+        <span class="score${P.reached ? " some" : ""}"><i>${P.reached}/5</i>${esc(reach(P))}</span>
+      </div>
+      <p class="desc">${esc(P.desc)}</p>
+      <ol class="steps" aria-label="${esc(plain(P))}: ${esc(reach(P))}">${STEPS.map((step, i) =>
+        `<li${i < P.reached ? ' class="ok"' : ""}>${step}<span class="sr">${i < P.reached ? ": works" : ": not yet"}</span></li>`).join("")}</ol>
+      <p class="note">${esc(P.note)} <a href="${P.src}" target="_blank" rel="noopener">Source</a></p>
+      <div class="foot">
+        <span class="meta">${s.updated ? `Last code change ${date(s.updated)}` : ""}</span>
+        <div class="actions">
+          <a class="btn solid sm" href="browse.html#${k}">Issues and PRs</a>
+          <a class="btn sm" href="${REPO}/tree/main/${k}">Code</a>
+          ${P.up ? `<a class="btn sm" href="${P.up}" target="_blank" rel="noopener">Original ↗</a>` : ""}
+        </div>
       </div>
     </article>`;
   }).join("");
+}
+
+function downloads() {
+  $("dl").innerHTML = Object.keys(PROJECTS).map(k => {
+    const P = PROJECTS[k];
+    return `<div class="dlc p-${k}">
+      <h3><i class="dot"></i>${label(P)}</h3>
+      <p>${P.frozen || "Latest code, synced every 6 hours"}</p>
+      <div class="actions">
+        <a class="btn solid sm" href="${zip(P, "main")}" aria-label="Download ${esc(plain(P))} code (zip)">Code .zip</a>
+        <a class="btn sm" href="${zip(P, "github-export")}" aria-label="Download ${esc(plain(P))} issues and comments (zip)">Issues .zip</a>
+      </div>
+    </div>`;
+  }).join("") + `<div class="dlc all">
+      <h3>Everything</h3>
+      <p>All five projects in one zip, plus this site.</p>
+      <div class="actions"><a class="btn sm" href="${REPO}/archive/refs/heads/main.zip">All .zip</a></div>
+    </div>`;
 }
 
 function cmds() {
   const all = `git clone ${REPO}.git`;
   const one = k => `git clone --branch ${PROJECTS[k].branch}/main --single-branch ${REPO}.git ${k}`;
   $("cmds").innerHTML = `<div class="cmdline"><pre id="cmd">${esc(all)}</pre><button type="button" class="btn sm" data-copy>Copy</button></div>
-    <div class="one">Only one project: ${KEYS.map(k => `<button type="button" class="btn sm p-${k}" data-k="${k}" aria-pressed="false"><i class="dot"></i>${label(PROJECTS[k])}</button>`).join("")}
+    <div class="one">Only one project: ${Object.keys(PROJECTS).map(k => `<button type="button" class="btn sm p-${k}" data-k="${k}" aria-pressed="false"><i class="dot"></i>${label(PROJECTS[k])}</button>`).join("")}
       <button type="button" class="btn sm" data-k="" aria-pressed="true">All</button></div>`;
   $("cmds").addEventListener("click", async e => {
     const pick = e.target.closest("[data-k]");
@@ -204,10 +234,22 @@ function cmds() {
   });
 }
 
+// highlight the nav item of the section on screen
+function spy() {
+  const links = new Map([...document.querySelectorAll('.nav a[href^="#"]')].map(a => [a.hash.slice(1), a]));
+  const io = new IntersectionObserver(entries => entries.forEach(e => {
+    if (!e.isIntersecting) return;
+    links.forEach(a => a.removeAttribute("aria-current"));
+    links.get(e.target.id)?.setAttribute("aria-current", "true");
+  }), { rootMargin: "-45% 0px -50% 0px" });
+  links.forEach((_, id) => $(id) && io.observe($(id)));
+}
+
 (async () => {
-  ladder();
-  cmds();
   projects(null);
+  downloads();
+  cmds();
+  spy();
   try { const r = await fetch("data/stats.json"); if (r.ok) projects(await r.json()); } catch {}
 })();
 </script>
