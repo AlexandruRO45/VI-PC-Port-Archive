@@ -1324,6 +1324,18 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// Since the last frame-rate line, why [`Shadow::merge_under_writes`] left
+/// a settle due: a copy not write-watched, title writes not known (the
+/// kernel and the guards had no answer), more changed runs than are put
+/// in by copies in the card's memory (and the runs of the page that
+/// passed the limit), a copy without its snapshot.
+static UNMERGED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// [`UNMERGED`], taken.
+pub(crate) fn unmerged_stats() -> [u64; 5] {
+    [0, 1, 2, 3, 4].map(|i| UNMERGED[i].swap(0, Ordering::Relaxed))
+}
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
@@ -2249,6 +2261,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            UNMERGED[0].fetch_add(1, Ordering::Relaxed);
             return true;
         }
         let base = start / PAGE;
@@ -2261,6 +2274,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                UNMERGED[1].fetch_add(1, Ordering::Relaxed);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -2300,6 +2314,8 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = changed_runs(title, held);
                     if runs.len() > *runs_left {
+                        UNMERGED[2].fetch_add(1, Ordering::Relaxed);
+                        UNMERGED[3].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         return true;
                     }
                     *runs_left -= runs.len();
@@ -2311,6 +2327,7 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        UNMERGED[4].fetch_add(1, Ordering::Relaxed);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
