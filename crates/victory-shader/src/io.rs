@@ -1226,6 +1226,53 @@ mod tests {
         }
     }
 
+    /// A parameter export names `param - 32` of the stage data's low seven
+    /// bits: `param31` (target 63) is the last, an entry whose number only
+    /// the bits past 31 tell apart is never the one exported, and once any
+    /// output is listed `param0` must be one of them too.
+    #[test]
+    fn parameter_exports_match_the_low_parameter_bits() {
+        // exp param<t - 32>, v0, off, off, off done
+        let export = |t: u32| program(&[0xF800_0801 | t << 4, 0x0000_0000, S_ENDPGM]);
+        let out = |row, param| crate::native::VsOutput {
+            usage: Usage::Generic,
+            row,
+            param,
+            fp16: false,
+            pack2: false,
+        };
+        let target = |t, outputs| {
+            let vs = NativeProgram {
+                io: StageIo::Vs {
+                    inputs: vec![],
+                    outputs,
+                },
+                ..vertex(vec![])
+            };
+            raise(&export(t), &vs).map(|io| io.exports[0].target)
+        };
+        let param = |row| {
+            Ok(Target::Param {
+                usage: Usage::Generic,
+                row,
+            })
+        };
+        let unlisted = Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a parameter export the stage data does not list",
+        });
+        assert_eq!(target(63, vec![out(4, 31)]), param(4));
+        assert_eq!(target(63, vec![out(4, 30)]), unlisted);
+        // 0x20 and 0x40 are no parameter a target reaches: not param0.
+        assert_eq!(target(32, vec![out(4, 0x20)]), unlisted);
+        assert_eq!(target(32, vec![out(4, 0x40)]), unlisted);
+        assert_eq!(target(32, vec![out(4, 0x20), out(5, 0)]), param(5));
+        // param0 is unread only while nothing is listed.
+        assert_eq!(target(32, vec![]), Ok(Target::Unread));
+        assert_eq!(target(32, vec![out(4, 1)]), unlisted);
+        assert_eq!(target(33, vec![out(4, 1)]), param(4));
+    }
+
     /// `COMPUTE_PGM_RSRC2` enables one to three thread id VGPRs; the
     /// field's fourth value would load a component past z into v3.
     #[test]
