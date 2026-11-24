@@ -1403,7 +1403,7 @@ pub fn probe_int64_atomics(dev: &ID3D12Device) {
         Ok(m) => {
             super::set_split_int64_atomics(true);
             crate::xlog_warn!(
-                "recompiler: a program with a 64-bit atomic writes nothing on this GPU (probe: {:x?}) – add / sub / and / or / xor and unsigned min / max without a returned value become 32-bit atomics; the other 64-bit atomics still do nothing",
+                "recompiler: a program with a 64-bit atomic writes nothing on this GPU (probe: {:x?}) – add / sub / and / or / xor and unsigned min / max without a returned value become 32-bit atomics; the other 64-bit atomics (and any whose old value is returned) still do nothing",
                 &m[..3]
             );
         }

@@ -495,9 +495,9 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
-    /// 64-bit atomics on `mem` that 32-bit ones can replace with the same memory afterwards (add,
-    /// sub, and, or, xor; unsigned min / max without a returned value) are emitted as those
-    /// (`split_int64_atomics`): on a host where a program with a 64-bit atomic writes nothing
+    /// 64-bit atomics on `mem` whose old value is not returned and that 32-bit ones can replace
+    /// with the same memory afterwards (add, sub, and, or, xor; unsigned min / max) are emitted as
+    /// those (`split_int64_atomics`): on a host where a program with a 64-bit atomic writes nothing
     pub split_int64_atomics: bool,
 }
 

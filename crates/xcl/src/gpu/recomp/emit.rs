@@ -5068,13 +5068,17 @@ fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<St
     Some(format!("mem.{f}({a}, {val}, {old});"))
 }
 
-/// `rmw64` as 32-bit atomics that leave the same memory (`Options::split_int64_atomics`): add /
-/// sub as the low dword's add, then the high dword's with the carry the low one's old value shows
-/// (adds commute, so the end state is exact); and / or / xor per dword; unsigned min / max as the
-/// 64-bit atomic without a returned value. With `glc`, the old value is the two dwords' old values,
-/// which another lane's update can come between. None: no such form (swap, cmpswap, signed min /
-/// max, inc / dec, float min / max, unsigned min / max with a returned value).
+/// `rmw64` as 32-bit atomics that leave the same memory (`Options::split_int64_atomics`), for an
+/// atomic whose old value is not returned: add / sub as the low dword's add, then the high dword's
+/// with the carry the low one's old value shows (adds commute, so the end state is exact); and /
+/// or / xor per dword; unsigned min / max as the 64-bit atomic without a returned value. None with
+/// `glc` (two 32-bit old values are not one 64-bit snapshot: another lane's update can come
+/// between them and give a value memory never held) and for swap, cmpswap, signed min / max,
+/// inc / dec and float min / max.
 fn rmw64_split(op: &str, a: &str, v: &str, old: &str, glc: bool, t: &str) -> Option<String> {
+    if glc {
+        return None;
+    }
     let halves = |f: &str, n: &str| {
         format!(
             "uint {t}_l = 0u, {t}_h = 0u; mem.{f}({a}, (uint){n}, {t}_l); mem.{f}({a} + 4u, (uint)({n} >> 32), {t}_h); {old} = (uint64_t){t}_l | ((uint64_t){t}_h << 32);"
@@ -5090,7 +5094,7 @@ fn rmw64_split(op: &str, a: &str, v: &str, old: &str, glc: bool, t: &str) -> Opt
         "and" => halves("InterlockedAnd", v),
         "or" => halves("InterlockedOr", v),
         "xor" => halves("InterlockedXor", v),
-        "umin" | "umax" if !glc => format!("mem.{}({a}, {v});", if op == "umin" { "InterlockedMin64" } else { "InterlockedMax64" }),
+        "umin" | "umax" => format!("mem.{}({a}, {v});", if op == "umin" { "InterlockedMin64" } else { "InterlockedMax64" }),
         _ => return None,
     })
 }

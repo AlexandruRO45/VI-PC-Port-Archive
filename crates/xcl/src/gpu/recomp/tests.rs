@@ -7603,8 +7603,9 @@ fn int64_atomics_program(cmpswap: bool) -> Vec<u8> {
     code
 }
 
-/// `Options::split_int64_atomics`: the `_x2` add / sub / and / or / xor become two 32-bit atomics,
-/// unsigned max without GLC the 64-bit atomic without a returned value; cmpswap stays 64-bit.
+/// `Options::split_int64_atomics`: without GLC the `_x2` add / sub / and / or / xor become two
+/// 32-bit atomics and unsigned max the 64-bit atomic without a returned value; cmpswap, and every
+/// one with GLC, stays 64-bit.
 #[test]
 fn split_int64_atomics_emit_32_bit_atomics() {
     let code = int64_atomics_program(true);
@@ -7621,6 +7622,20 @@ fn split_int64_atomics_emit_32_bit_atomics() {
     assert!(split.hlsl.contains("? 1u : 0u)"), "{}", split.hlsl);
     assert_eq!(split.hlsl.matches("mem.InterlockedMax64(").count(), 1, "{}", split.hlsl);
     assert!(split.hlsl.contains("mem.InterlockedCompareExchange64("), "{}", split.hlsl);
+    // with GLC the old value would be two 32-bit snapshots, not one 64-bit one: no split
+    let glbl = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_FLAT_GLBL", f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut glc = Vec::new();
+    glc.extend(glbl("GLOBAL_ATOMIC_ADD_X2", &[("VDST", 60), ("ADDR", 30), ("DATA", 40), ("SADDR", 2), ("GLC", 1)]));
+    glc.extend(glbl("GLOBAL_ATOMIC_AND_X2", &[("VDST", 62), ("ADDR", 30), ("DATA", 46), ("SADDR", 2), ("OFFSET", 8), ("GLC", 1)]));
+    glc.extend(glbl("GLOBAL_ATOMIC_UMAX_X2", &[("VDST", 64), ("ADDR", 30), ("DATA", 48), ("SADDR", 2), ("OFFSET", 16), ("GLC", 1)]));
+    glc.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let returned = translate(&glc, &Options { split_int64_atomics: true, ..Default::default() }).unwrap();
+    assert!(returned.complete(), "{:?}", returned.unsupported_why);
+    for f in ["mem.InterlockedAdd64(", "mem.InterlockedAnd64(", "mem.InterlockedMax64("] {
+        assert_eq!(returned.hlsl.matches(f).count(), 1, "{f}\n{}", returned.hlsl);
+    }
+    let unsplit = translate(&glc, &Options { split_int64_atomics: false, ..Default::default() }).unwrap();
+    assert_eq!(returned.hlsl, unsplit.hlsl, "with GLC the option changes nothing");
     // through the window accessors as well
     let windows = translate(&code, &Options { split_int64_atomics: true, mem_windows: 2, ..Default::default() }).unwrap();
     // the accessors are all defined; the 64-bit add's is never called
@@ -7628,7 +7643,7 @@ fn split_int64_atomics_emit_32_bit_atomics() {
     assert_eq!(windows.hlsl.matches("xcl_mInterlockedAdd64(").count(), 1, "{}", windows.hlsl);
     assert!(windows.hlsl.matches("xcl_mInterlockedAdd(").count() >= 4, "{}", windows.hlsl);
     if super::dxc::location().is_ok() {
-        for t in [&split, &native, &windows] {
+        for t in [&split, &native, &windows, &returned] {
             super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
         }
     }
