@@ -72,15 +72,24 @@ const UNIFIED_ALIGNMENT: u64 = 256;
 struct UnifiedArena {
     _heap: ID3D12Heap,
     resource: ID3D12Resource,
+    state: Arc<UnifiedResourceState>,
     data: *mut u8,
     gpu: u64,
     next: Mutex<u64>,
+}
+
+/// The state belongs to the one placed resource, not to its suballocations.
+/// Every UnifiedBuffer from this arena shares this tracker.
+struct UnifiedResourceState {
+    resource: ID3D12Resource,
+    actual: AtomicU32,
 }
 
 /// A persistently mapped suballocation in the arena's placed buffer.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct UnifiedBuffer {
     pub(crate) resource: ID3D12Resource,
+    state: Arc<UnifiedResourceState>,
     pub(crate) data: *mut u8,
     pub(crate) gpu: u64,
     pub(crate) offset: u64,
@@ -161,9 +170,14 @@ impl UnifiedArena {
         if gpu == 0 {
             return Err(windows::core::Error::empty());
         }
+        let state = Arc::new(UnifiedResourceState {
+            resource: resource.clone(),
+            actual: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
+        });
         Ok(Self {
             _heap: heap,
             resource,
+            state,
             data: data.cast(),
             gpu,
             next: Mutex::new(0),
@@ -191,6 +205,7 @@ impl UnifiedArena {
         *next = end;
         Some(UnifiedBuffer {
             resource: self.resource.clone(),
+            state: self.state.clone(),
             data,
             gpu,
             offset,
@@ -531,16 +546,36 @@ void main() {
         }
         .expect("create compute pipeline");
 
+        // Prove that distinct suballocations share one state tracker: a
+        // request through the second allocation must observe the first
+        // allocation's requested state and return the required transition.
+        {
+            let probe = host.new_list().expect("create state-tracking probe list");
+            let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+            let copy_source = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+            assert!(Arc::ptr_eq(&source.state, &destination.state));
+            assert!(probe.transition_unified(&source, uav).is_none());
+            assert_eq!(
+                probe.transition_unified(&destination, copy_source),
+                Some(uav),
+                "second suballocation must see the one shared resource state"
+            );
+        }
+
         let list = host.new_list().expect("create command list");
-        let to_uav = transition(
-            &source.resource,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        );
+        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let before = list.transition_unified(&source, uav.0 as u32);
         // The arena is one D3D12 resource, so both suballocations use UAV
-        // access while the resource is in UNORDERED_ACCESS state.
+        // access while the shared resource is in UNORDERED_ACCESS state.
+        assert!(list.transition_unified(&destination, uav.0 as u32).is_none());
         unsafe {
-            list.list.ResourceBarrier(&[to_uav]);
+            if let Some(before) = before {
+                list.list.ResourceBarrier(&[transition(
+                    &source.resource,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    uav,
+                )]);
+            }
             list.list.SetComputeRootSignature(&root);
             list.list.SetPipelineState(&pso);
             list.list.SetComputeRootUnorderedAccessView(0, destination.gpu);
@@ -603,6 +638,8 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Shared placed-buffer arena states, tracked once per underlying resource.
+    unified_states: Mutex<UnifiedStates>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -632,6 +669,8 @@ type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
+type UnifiedStates =
+    std::collections::HashMap<usize, (u32, u32, std::sync::Arc<UnifiedResourceState>)>;
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -787,6 +826,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                unified_states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -1191,6 +1231,10 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.unified_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1234,12 +1278,37 @@ impl HostList {
         }
     }
 
-    /// At submission: the list that moves each texture this list uses from
-    /// its real state to the one the list starts with; the textures' real
+    /// Moves a suballocation's shared arena resource to `wanted` in this
+    /// list. The returned previous state, when present, must be transitioned
+    /// in the command list at this point. The first transition is deferred to
+    /// the prelude so it starts from the resource's real submission-order state.
+    pub(crate) fn transition_unified(
+        &self,
+        buffer: &UnifiedBuffer,
+        wanted: u32,
+    ) -> Option<u32> {
+        let mut states = self
+            .unified_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match states.entry(Arc::as_ptr(&buffer.state) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, buffer.state.clone()));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                (before != wanted).then_some(before)
+            }
+        }
+    }
+
+    /// At submission: the list that moves every resource this list uses from
+    /// its real state to the one the list starts with; the resources' real
     /// states become those the list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
+        let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
                 let real = copy.state.swap(*last, Ordering::Relaxed);
@@ -1252,6 +1321,20 @@ impl HostList {
                 })
             })
             .collect();
+        let unified = self
+            .unified_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        barriers.extend(unified.values().filter_map(|(first, last, state)| {
+            let real = state.actual.swap(*last, Ordering::Relaxed);
+            (real != *first).then(|| {
+                transition(
+                    &state.resource,
+                    D3D12_RESOURCE_STATES(real as i32),
+                    D3D12_RESOURCE_STATES(*first as i32),
+                )
+            })
+        }));
         if barriers.is_empty() {
             return None;
         }
