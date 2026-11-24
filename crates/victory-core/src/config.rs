@@ -4811,6 +4811,158 @@ mod tests {
     }
 
     #[test]
+    fn config_text_locates_short_truncated_and_crlf_stray_bytes() {
+        let err = |bytes: &[u8]| format!("{:#}", config_text(bytes.to_vec()).unwrap_err());
+        // One stray byte is too short to be UTF-16, marked or not: it is
+        // reported as text that is not UTF-8, on line 1 at byte 0.
+        for lone in [&b"\xFF"[..], b"\xFE", b"\xE9"] {
+            let e = err(lone);
+            assert!(
+                e.contains("line 1 is not UTF-8 text (byte 0"),
+                "{lone:?}: {e}"
+            );
+            assert!(!e.contains("UTF-16"), "{lone:?}: {e}");
+        }
+        // CRLF line endings count one line per `\n`, as an editor shows them.
+        let e = err(b"[paths]\r\ncache_dir = 'c'\r\ngame_dir = '\xE9'\r\n");
+        assert!(e.contains("line 3 "), "{e}");
+        // A sequence cut off at the end of the file (a copy that stopped
+        // mid-character) names the last line and where the cut begins.
+        let cut = b"[paths]\ndata_dir = 'd\xC3";
+        let e = err(cut);
+        assert!(e.contains("line 2 "), "{e}");
+        assert!(e.contains(&format!("byte {}", cut.len() - 1)), "{e}");
+        // After a UTF-8 mark, bytes are counted from the start of the text.
+        let e = err(b"\xEF\xBB\xBF\xFF");
+        assert!(e.contains("line 1 is not UTF-8 text (byte 0"), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_file_whose_name_is_not_utf8_is_found_read_and_named() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        // Scratch folder under the system temp folder, removed when dropped.
+        let scratch = tempfile::tempdir().unwrap();
+        // A Latin-1 `é` (0xE9): a valid Linux name that is not UTF-8.
+        let odd = |name: &[u8]| scratch.path().join(OsString::from_vec(name.to_vec()));
+        let file = odd(b"r\xE9glages.toml");
+        std::fs::write(&file, "[paths]\ngame_dir = 'g'\n").unwrap();
+
+        // VICTORY_CONFIG passes the setting checks and keeps its bytes,
+        // through `~` expansion too.
+        let home = scratch.path();
+        let tilde = {
+            let mut v = b"~/".to_vec();
+            v.extend_from_slice(file.file_name().unwrap().as_bytes());
+            OsString::from_vec(v)
+        };
+        for value in [file.clone().into_os_string(), tilde] {
+            let env = |k: &str| (k == "VICTORY_CONFIG").then(|| value.clone());
+            assert_eq!(
+                explicit_config(env, Some(home)).unwrap(),
+                Some(file.clone())
+            );
+        }
+        assert_eq!(config_file(Some(file.clone())).unwrap(), Some(file.clone()));
+        assert_eq!(read_config(&file).unwrap(), "[paths]\ngame_dir = 'g'\n");
+
+        // A file under the odd name named with a trailing slash is refused
+        // with the plain name, spelt the lossy way.
+        let mut slashed = file.clone().into_os_string().into_vec();
+        slashed.push(b'/');
+        let err = config_file(Some(PathBuf::from(OsString::from_vec(slashed))))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("trailing slash"), "{err}");
+        assert!(err.ends_with(&file.display().to_string()), "{err}");
+        assert!(err.contains('\u{FFFD}'), "{err}");
+
+        // A folder under an odd name holding victory.toml earns the hint.
+        let folder = odd(b"dossier\xE9");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("victory.toml"), "").unwrap();
+        let err = config_file(Some(folder.clone())).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!(
+                "did you mean {}?",
+                folder.join("victory.toml").display()
+            )),
+            "{err}"
+        );
+
+        // A link that leads nowhere names its odd target.
+        let gone = odd(b"parti\xE9.toml");
+        let link = odd(b"lien\xE9.toml");
+        std::os::unix::fs::symlink(&gone, &link).unwrap();
+        let err = config_file(Some(link.clone())).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!(
+                "a link to {}, which does not exist",
+                gone.display()
+            )),
+            "{err}"
+        );
+        // Once the target is there, the link is read under its own name.
+        std::fs::write(&gone, "").unwrap();
+        assert_eq!(config_file(Some(link.clone())).unwrap(), Some(link));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn victory_config_under_a_folder_link_is_read_where_the_link_leads() {
+        // Scratch folder under the system temp folder, removed when dropped.
+        let scratch = tempfile::tempdir().unwrap();
+        let real = scratch.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("victory.toml"), "").unwrap();
+
+        // A folder link, absolute or relative to the link's own folder: the
+        // file under it is read and its path kept as given, so relative
+        // settings anchor beside the link, not the target.
+        let absolute = scratch.path().join("absolute");
+        std::os::unix::fs::symlink(&real, &absolute).unwrap();
+        let relative = scratch.path().join("relative");
+        std::os::unix::fs::symlink("real", &relative).unwrap();
+        for link in [&absolute, &relative] {
+            let through = link.join("victory.toml");
+            assert_eq!(config_file(Some(through.clone())).unwrap(), Some(through));
+        }
+
+        // A folder link that leads nowhere: the file is only missing. The
+        // link is a folder above it, not the file, so no target is named.
+        let dangling = scratch.path().join("dangling");
+        std::os::unix::fs::symlink("moved-away", &dangling).unwrap();
+        let through = dangling.join("victory.toml");
+        let err = config_file(Some(through.clone())).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "VICTORY_CONFIG points at {}, which does not exist",
+                through.display()
+            )
+        );
+        // The default file under it is no config file at all, as for any
+        // missing ./victory.toml.
+        assert_eq!(config_file_or(None, &through).unwrap(), None);
+
+        // A link to a file used as a folder: the OS error with what was
+        // being checked, not "does not exist".
+        let to_file = scratch.path().join("to-file");
+        std::os::unix::fs::symlink(real.join("victory.toml"), &to_file).unwrap();
+        let through = to_file.join("victory.toml");
+        let err = config_file(Some(through.clone())).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("checking VICTORY_CONFIG at {}", through.display())
+        );
+        assert!(config_file_or(None, &through).is_err());
+    }
+
+    #[test]
     fn test_titles_env_splits_paths() {
         // The empty entry between them (`first::second`) is skipped, not
         // read as the working directory.
