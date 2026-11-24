@@ -2489,6 +2489,12 @@ impl State {
                 (bounded, 0)
             }
         };
+        #[cfg(feature = "diagnostics")]
+        let sample = {
+            let frame = crate::queue::presented() + 1;
+            (kind == MESH && max == 1 && count.is_none() && crate::capture::requested_target_frame(frame))
+                .then(|| (frame, p.name.to_string()))
+        };
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -2521,6 +2527,10 @@ impl State {
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some((frame, name)) = sample {
+            list.capture_mesh_args(frame, arguments as u64, name, &bounded, at);
         }
         crate::indirect::done(list, &bounded);
         if kind == DISPATCH {

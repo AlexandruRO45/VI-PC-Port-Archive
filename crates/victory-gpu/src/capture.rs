@@ -47,7 +47,7 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    requested_target_frame(n) || named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -340,6 +340,28 @@ pub(crate) fn save_read_back(
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
+// A file in the capture directory requests the next complete frame.
+static REQUESTED_TARGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+pub(crate) fn requested_target_frame(frame: u64) -> bool {
+    REQUESTED_TARGET.load(std::sync::atomic::Ordering::Relaxed) == frame
+}
+
+pub(crate) fn check_target_request(frame: u64) {
+    static REQUEST: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let path = REQUEST.get_or_init(|| {
+        std::env::var_os("VICTORY_TARGET_TRIGGER")?;
+        Some(folder()?.join("request-targets"))
+    });
+    if let Some(path) = path
+        && path.is_file()
+        && std::fs::remove_file(path).is_ok()
+    {
+        REQUESTED_TARGET.store(frame + 1, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(frame = frame + 1, "requested render target capture");
+    }
+}
+
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
@@ -347,7 +369,8 @@ fn dump_on() -> bool {
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    let frame = crate::queue::presented() + 1;
+    if resource.is_null() || !(requested_target_frame(frame) || (dump_on() && listed(frame))) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());

@@ -809,6 +809,7 @@ extern "system" fn present(
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
+        crate::capture::check_target_request(frame);
         crate::capture::frame_drew(frame, crate::draw::drawn());
         if crate::capture::listed(frame) {
             crate::capture::dump_targets(frame);

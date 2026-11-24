@@ -1571,6 +1571,31 @@ enum Step {
     Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
+#[cfg(feature = "diagnostics")]
+struct MeshSamples {
+    buffer: ID3D12Resource,
+    records: Vec<(u64, u64, String)>,
+}
+
+#[cfg(feature = "diagnostics")]
+impl MeshSamples {
+    const CAPACITY: usize = 4096;
+    fn report(&self) {
+        let mut ptr = std::ptr::null_mut();
+        // The submission fence has completed. Each recorded copy wrote three u32s.
+        unsafe {
+            if self.buffer.Map(0, None, Some(&mut ptr)).is_err() { return; }
+            if !ptr.is_null() {
+                for (i, (frame, address, pipeline)) in self.records.iter().enumerate() {
+                    let groups = ptr.cast::<[u32; 3]>().add(i).read();
+                    tracing::info!(frame, address, pipeline, ?groups, "captured mesh arguments after clamp");
+                }
+            }
+            self.buffer.Unmap(0, None);
+        }
+    }
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -1598,6 +1623,8 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    #[cfg(feature = "diagnostics")]
+    mesh_samples: Vec<MeshSamples>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -2640,6 +2667,10 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    #[cfg(feature = "diagnostics")]
+    for samples in &list.deferred().mesh_samples {
+        samples.report();
+    }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -4913,6 +4944,24 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn capture_mesh_args(&self, frame: u64, address: u64, name: String, src: &ID3D12Resource, offset: u64) {
+        let mut deferred = self.deferred();
+        if deferred.mesh_samples.last().is_none_or(|s| s.records.len() == MeshSamples::CAPACITY) {
+            let Some(buffer) = host().and_then(|h| h.read_back_buffer((MeshSamples::CAPACITY * 12) as u64)) else { return };
+            deferred.mesh_samples.push(MeshSamples { buffer, records: Vec::new() });
+        }
+        let sample = deferred.mesh_samples.last_mut().unwrap();
+        let dest = (sample.records.len() * 12) as u64;
+        sample.records.push((frame, address, name));
+        // The indirect execution used this exact scratch range. Restore its state for the caller.
+        unsafe {
+            self.list.ResourceBarrier(&[transition(src, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            self.list.CopyBufferRegion(&sample.buffer, dest, src, offset, 12);
+            self.list.ResourceBarrier(&[transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)]);
+        }
+    }
+
     /// A read back: once the list has run, `rows` rows of `row` bytes go
     /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
@@ -6487,5 +6536,35 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+#[test]
+fn captured_mesh_records_preserve_the_arguments_before_scratch_reuse() {
+    let host = host().expect("D3D12 device for local diagnostics");
+    let list = host.new_list().unwrap();
+    let (buffer, data) = host.shared_buffer(256).unwrap();
+    let input = [3u32, 1, 1, 0, 1, 1];
+    // SAFETY: the shared mapping is 256 bytes and the queue is idle.
+    unsafe { std::ptr::copy_nonoverlapping(input.as_ptr(), data.cast::<u32>(), input.len()) };
+    for offset in [0, 12] {
+        let scratch = crate::indirect::bound(&list, (&buffer, offset), None, (10, 12, 1)).unwrap();
+        list.capture_mesh_args(42, offset, "probe".into(), &scratch, 0);
+        crate::indirect::done(&list, &scratch);
+    }
+    list.close();
+    host.execute(&[&list]);
+    let deferred = list.deferred();
+    let sample = &deferred.mesh_samples[0];
+    assert_eq!(sample.records.len(), 2);
+    let mut ptr = std::ptr::null_mut();
+    // SAFETY: the list has completed both copies into this live readback resource.
+    unsafe {
+        sample.buffer.Map(0, None, Some(&mut ptr)).unwrap();
+        let output = std::slice::from_raw_parts(ptr.cast::<u32>(), 6).to_vec();
+        sample.buffer.Unmap(0, None);
+        assert_eq!(output[..3], input[..3]);
+        assert_eq!(output[3], 0);
     }
 }
