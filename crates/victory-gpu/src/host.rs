@@ -1,3 +1,5 @@
+--- Start Of File crates/victory-gpu/src/host.rs ---
+```rust
 //! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
@@ -1441,7 +1443,7 @@ impl Host {
 fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
         27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
-        87 | 90 | 91 => DXGI_FORMAT_B8G8B8A8_UNORM,
+        87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
         23..=25 => DXGI_FORMAT_R10G10B10A2_UNORM,
         9..=14 => DXGI_FORMAT_R16G16B16A16_FLOAT,
         _ => return None,
@@ -2050,3 +2052,4 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         );
     }
 }
+```
