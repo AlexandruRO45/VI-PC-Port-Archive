@@ -5500,4 +5500,66 @@ mod tests {
         assert!(matches!(&p[0].io, StageIo::Ps { inputs, patches, .. }
             if inputs.len() == 1 && patches.len() == 2));
     }
+
+    #[test]
+    fn record_words_between_its_fields_are_never_read() {
+        // 0x10, 0x18-0x27 and 0x40-0x4b of a record name nothing, and 0x4c
+        // is a mesh program's LDS alone (compute states its own in RSRC2):
+        // whatever they hold, every other program reads the same.
+        for (stage, _) in SLOTS {
+            let good = fssm(&[(stage, &VS_CODE)]);
+            let want = native_programs(&part(&[(KIND_NATIVE, &xbch(&good))])).unwrap();
+            let record = FSSM_HEADER + u64_at(&good, FSSM_HEADER + slot(stage)).unwrap() as usize;
+            for fill in [0xFF, 0xDE] {
+                let mut blob = good.clone();
+                blob[record + 0x10..][..4].fill(fill);
+                blob[record + 0x18..record + RECORD_LAYOUT].fill(fill);
+                blob[record + 0x40..record + RECORD_LDS].fill(fill);
+                let read = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]));
+                assert_eq!(read.unwrap(), want, "{stage:?}: {fill:#x}");
+                blob[record + RECORD_LDS..][..4].fill(fill);
+                let read = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]));
+                if stage == HwStage::Ms {
+                    assert_eq!(why_refused(read), "implausible LDS size", "{fill:#x}");
+                } else {
+                    assert_eq!(read.unwrap(), want, "{stage:?}: {fill:#x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stage_registers_are_carried_whole_and_only_clip_cntl_of_a_mesh() {
+        // A pixel program's input and depth-control words keep every bit.
+        let mut ps = fssm(&[(HwStage::Ps, &PS_CODE)]);
+        let e = stage_data_at(&ps, HwStage::Ps);
+        ps[e + PS_INPUT_ADDR..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        ps[e + PS_DB_SHADER_CONTROL..][..4].copy_from_slice(&0x8000_0001u32.to_le_bytes());
+        let p = native_programs(&part(&[(KIND_NATIVE, &xbch(&ps))])).unwrap();
+        assert!(matches!(
+            &p[0].io,
+            StageIo::Ps {
+                input_addr: u32::MAX,
+                db_shader_control: 0x8000_0001,
+                ..
+            }
+        ));
+        // Of a mesh program's eight registers only PA_CL_VS_OUT_CNTL is
+        // read, whole; the other seven change nothing whatever they hold.
+        let ms = fssm(&[(HwStage::Ms, &VS_CODE)]);
+        let e = stage_data_at(&ms, HwStage::Ms);
+        let regs = VS_OUTPUT_COUNT + 4;
+        let read = |fill: u8, clip: u32| {
+            let mut blob = ms.clone();
+            blob[e + regs..][..32].fill(fill);
+            blob[e + MS_CLIP_CNTL..][..4].copy_from_slice(&clip.to_le_bytes());
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()
+        };
+        let want = read(0, u32::MAX);
+        assert!(matches!(&want[0].io, StageIo::Ms(m) if m.clip_cntl == u32::MAX));
+        for fill in [0xFF, 0xDE] {
+            assert_eq!(read(fill, u32::MAX), want, "{fill:#x}");
+        }
+        assert!(matches!(&read(0xFF, 0)[0].io, StageIo::Ms(m) if m.clip_cntl == 0));
+    }
 }
