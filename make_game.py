@@ -69,7 +69,7 @@ if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an old
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
-from mc_command import mc_command  # noqa: E402
+from mc_command import install_hint as mc_install_hint, mc_command  # noqa: E402
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
@@ -299,6 +299,14 @@ def appdata_hint(cmd: str) -> str:
     return ""
 
 
+def spirv_tools_hint() -> str:
+    """Where spirv-as and spirv-val come from on this OS."""
+    if os.name == "nt" or sys.platform == "darwin":
+        return "install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)"
+    return ("install your distribution's SPIRV-Tools package (Debian and Ubuntu: sudo apt install spirv-tools), "
+            "or the Vulkan SDK, https://vulkan.lunarg.com/")
+
+
 def need(exe: str, hint: str) -> str:
     if not tool_available(exe):
         fail(f"'{exe}' was not found on PATH. {hint}")
@@ -319,6 +327,17 @@ def versions() -> list:
 PROBES = ("MicrosoftGame.Config", "Catalog000.bin", "appdata0.rpf")
 
 
+def other_case(folder: str, name: str) -> "str | None":
+    """A file in folder whose name differs from name only in letter case, or None. Only reached when name itself is
+    missing, which on a case-insensitive file system (Windows, macOS by default) means no variant exists either;
+    on Linux a copy whose names were lower-cased on the way is otherwise reported as just missing."""
+    try:
+        with os.scandir(folder) as it:
+            return next((e.name for e in it if e.name != name and e.name.casefold() == name.casefold()), None)
+    except OSError:
+        return None
+
+
 def probe_mismatches(game: str, version: dict) -> list[str]:
     """Describe which probe files prevent a version match, using only filesystem metadata."""
     files = version["files"]
@@ -332,7 +351,11 @@ def probe_mismatches(game: str, version: dict) -> list[str]:
         try:
             info = os.stat(os.path.join(game, name))
         except (FileNotFoundError, NotADirectoryError):
-            mismatches.append(f"Missing {name}.")
+            other = other_case(game, name)
+            mismatches.append(f"Missing {name}." if other is None else
+                              f"Missing {name}: there is {other}, but file names are case-sensitive on this file "
+                              f"system and the build opens the package's files by their exact names. Rename it "
+                              f"to {name}, or copy the package again with its names unchanged.")
             continue
         except OSError as error:
             mismatches.append(f"Cannot read file metadata for {name} ({error.strerror}).")
@@ -838,14 +861,11 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if "shaders" in stages:
         mc = mc_command()[0]
         if not (os.path.isfile(mc) or shutil.which(mc)):
-            missing.append(
-                "llvm-mc (LLVM 21+ with the AMDGPU target). The official Windows LLVM build has no AMDGPU "
-                "target: build a native one with scripts\\build_llvm_mc.ps1, or install llvm-21 in WSL and set "
-                "LLVM_MC to the whole command, e.g. "
-                "LLVM_MC=\"wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc\" (docs/design.md)." + appdata_hint(mc))
+            missing.append("llvm-mc (LLVM 21+ with the AMDGPU target). " + mc_install_hint().replace("\n", " ")
+                           + " (docs/design.md)." + appdata_hint(mc))
         for t in ("spirv-as", "spirv-val"):
             if not shutil.which(t):
-                missing.append(f"{t}: install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)")
+                missing.append(f"{t}: " + spirv_tools_hint())
     if "assets" in stages:
         if not dotnet_sdk_ok():
             missing.append(".NET 8 SDK (the .NET runtime alone can't build rpf9dump): "
