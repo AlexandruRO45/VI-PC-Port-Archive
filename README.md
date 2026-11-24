@@ -62,8 +62,12 @@ Speed and memory:
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 
 Most of the newer speed changes sit behind environment switches that are off
-by default (`VICTORY_LATE_WAIT`, `VICTORY_WIDE_BACK`,
-`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
+by default (`VICTORY_LATE_WAIT`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
+On by default (each turned off with `=0`): `VICTORY_WIDE_BACK`,
+`VICTORY_WIDE_MERGE` and `VICTORY_CARD_REHASH_RUNS`; title buffers of 1 MiB
+or more go to the card (up to 2048 MiB) on cards with a VRAM budget of 6 GiB
+or more (`VICTORY_CARD_BUFFERS_MIN_MB` / `VICTORY_CARD_BUFFERS_MB` override).
+Together they took an 8 GB card from about 4.5 to 6.5 fps in the world.
 Independent host-copy refreshes are the exception: they use parallel workers
 automatically on systems with at least four logical CPUs. Each switch is
 described in a comment where it is read.
