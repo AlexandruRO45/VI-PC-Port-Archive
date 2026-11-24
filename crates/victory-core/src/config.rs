@@ -2841,6 +2841,77 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn config_link_hops_through_a_folder_link_resolve_dot_dot_where_it_leads() {
+        // `nested/victory.toml -> via/current.toml` with `nested/via` a
+        // folder link to `../profiles`, and `profiles/current.toml ->
+        // ../store/main.toml`: the OS takes that `..` from `profiles`, where
+        // the folder link leads, not lexically from `nested/via`. The hops
+        // must follow the same way, or a chain whose end is gone names a
+        // decoy, or stops early. Scratch folder under the system temp
+        // folder, removed when dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let mkdir = |name: &str| {
+            let p = dir.path().join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        };
+        let (nested, profiles, store) = (mkdir("nested"), mkdir("profiles"), mkdir("store"));
+        // Where a lexical `nested/via/..` would land: a decoy link there.
+        std::fs::create_dir(nested.join("store")).unwrap();
+        std::os::unix::fs::symlink("decoy.toml", nested.join("store/main.toml")).unwrap();
+        std::os::unix::fs::symlink("../profiles", nested.join("via")).unwrap();
+        std::os::unix::fs::symlink("../store/main.toml", profiles.join("current.toml")).unwrap();
+        // The end of the chain is itself a link, to `gone.toml` beside it.
+        std::os::unix::fs::symlink("gone.toml", store.join("main.toml")).unwrap();
+        let link = nested.join("victory.toml");
+        std::os::unix::fs::symlink("via/current.toml", &link).unwrap();
+        // The same chain entered by an absolute first hop: the relative
+        // hops after it are read from the folder it names.
+        let absolute = nested.join("absolute.toml");
+        std::os::unix::fs::symlink(profiles.join("current.toml"), &absolute).unwrap();
+
+        let tail = [
+            PathBuf::from("../store/main.toml"),
+            PathBuf::from("gone.toml"),
+        ];
+        let mut hops = vec![PathBuf::from("via/current.toml")];
+        hops.extend(tail.clone());
+        assert_eq!(link_hops(&link), hops);
+        let mut abs_hops = vec![profiles.join("current.toml")];
+        abs_hops.extend(tail);
+        assert_eq!(link_hops(&absolute), abs_hops);
+
+        // Gone: every hop as written, ending at the name that is missing,
+        // never the decoy.
+        for (start, hops) in [(&link, &hops), (&absolute, &abs_hops)] {
+            let shown: Vec<String> = hops
+                .iter()
+                .map(|h| format!("a link to {}", h.display()))
+                .collect();
+            let want = format!(
+                "the config file {}, {}, which does not exist",
+                start.display(),
+                shown.join(", ")
+            );
+            let err = config_file_or(None, start).unwrap_err().to_string();
+            assert_eq!(err, want);
+            assert!(!err.contains("decoy"), "{err}");
+        }
+
+        // Made whole where the OS looks: found under each first link's own
+        // name, the decoy still dangling beside the folder link.
+        std::fs::write(store.join("gone.toml"), "").unwrap();
+        for start in [&link, &absolute] {
+            assert_eq!(config_file_or(None, start).unwrap(), Some(start.clone()));
+            assert_eq!(
+                config_file(Some(start.clone())).unwrap(),
+                Some(start.clone())
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn victory_config_with_a_trailing_slash_names_the_file_or_the_link() {
         // A scratch folder under the system temp folder, never the
         // repository or the working directory; removed at the end.
