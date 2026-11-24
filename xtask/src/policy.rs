@@ -1871,6 +1871,53 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// Only a component that is exactly `.git` is passed over: `.GIT` (git
+    /// compares case only under `core.ignoreCase`, which a Unix checkout
+    /// leaves off), `.gitx`, `x.git` and `.git ` are ordinary directories
+    /// git lists, so a TMPDIR under any of them is refused and left empty,
+    /// and the one under `sub/.git` is taken. What is written in the
+    /// lookalikes afterwards is listed and checked.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_in_git_lookalikes_are_refused() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        git_str(root, &["config", "core.ignoreCase", "false"]);
+        let lookalikes: Vec<_> = [".GIT", ".gitx", "x.git", ".git "]
+            .iter()
+            .map(|name| root.join("sub").join(name).join("scratch"))
+            .collect();
+        let scratch = root.join("sub/.git/scratch");
+        for dir in lookalikes.iter().chain([&scratch]) {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let tmp = tempdir_in_first(root, lookalikes.iter().cloned().chain([scratch.clone()]));
+        assert_eq!(tmp.path().parent(), Some(scratch.as_path()));
+        for dir in &lookalikes {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0, "{dir:?}");
+        }
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        assert!(names(root, false).is_empty());
+        super::run(root, false).unwrap();
+
+        for dir in &lookalikes {
+            std::fs::write(dir.join("a.rs"), b"fn a() {}\n").unwrap();
+        }
+        assert_eq!(
+            names(root, false),
+            [
+                "sub/.GIT/scratch/a.rs",
+                "sub/.git /scratch/a.rs",
+                "sub/.gitx/scratch/a.rs",
+                "sub/x.git/scratch/a.rs"
+            ]
+        );
+        std::fs::write(lookalikes[0].join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        assert!(super::run(root, false).is_err());
+    }
+
     /// A TMPDIR that is the checkout itself (`TMPDIR=.` run from it, or a
     /// link from elsewhere to it) puts each temporary directory at the top
     /// of the checkout, where nothing ignores it: it is refused, and the
