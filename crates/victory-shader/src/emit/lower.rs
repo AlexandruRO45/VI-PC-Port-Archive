@@ -86,6 +86,9 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
+/// View slots of the title's shader-visible heap (0x2e00000 bytes of the host heap
+/// less its 2^18 dynamic slots, at 32 bytes each); a larger index is out of the heap.
+const VIEW_HEAP_SLOTS: u32 = 0x13_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Numeric {
@@ -3917,7 +3920,18 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        if sampler {
+            return Ok(index);
+        }
+        // A descriptor address read from stale or unwritten title memory
+        // (0xa92ac000 in the world) indexes the host heap tens of millions
+        // of slots past its end: a GPU page fault, the device removed. Every
+        // host slot starts null (`HostHeap::fill_null`), so slot 0 stands in.
+        let limit = self.s.m.i32(VIEW_HEAP_SLOTS);
+        let valid = self.s.m.cmp(c, pred::IULT, index, limit);
+        let zero = self.s.m.i32(0);
+        Ok(self.s.m.select(c, valid, index, zero))
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
