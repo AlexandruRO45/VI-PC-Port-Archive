@@ -113,7 +113,8 @@ impl Tracker {
         }
 
         let had_queued_dependency_wait = state.has_queued_dependency_wait();
-        let had_all_registered_workers_waiting_with_queue = state.has_all_registered_workers_waiting_with_queue();
+        let had_all_registered_workers_waiting_with_queue =
+            state.has_all_registered_workers_waiting_with_queue();
 
         state.last_event = now;
         change(&mut state);
@@ -122,8 +123,9 @@ impl Tracker {
             state.queued_with_dependency_wait_periods =
                 state.queued_with_dependency_wait_periods.saturating_add(1);
         }
-        let entered_all_registered_workers_backlog = !had_all_registered_workers_waiting_with_queue
-            && state.has_all_registered_workers_waiting_with_queue();
+        let entered_all_registered_workers_backlog =
+            !had_all_registered_workers_waiting_with_queue
+                && state.has_all_registered_workers_waiting_with_queue();
         if entered_all_registered_workers_backlog {
             state.all_registered_workers_waiting_with_queue_periods = state
                 .all_registered_workers_waiting_with_queue_periods
@@ -171,8 +173,8 @@ fn tracker() -> &'static Tracker {
     TRACKER.get_or_init(Tracker::new)
 }
 
-/// Applies a state change and reports immediately when every worker becomes
-/// dependency-blocked while at least one pipeline remains queued.
+/// Applies a state change and reports immediately when every registered
+/// worker becomes dependency-blocked while at least one pipeline remains queued.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn update(change: impl FnOnce(&mut State)) {
     if tracker().update(change) {
