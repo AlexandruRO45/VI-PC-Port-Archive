@@ -418,21 +418,31 @@ fn rebase(bytes: &mut [u8], delta: u64) {
     if rva == 0 || size == 0 {
         return;
     }
-    // The headers are mapped at the RVA equal to their file offset.
-    let start = match info.rva_to_file_offset(rva) {
-        Some(offset) => offset as usize,
-        None if (rva as usize) < SECTION_FILE => rva as usize,
+    // The loader reads the table from the mapped image, by RVA: section
+    // bytes from their file offset, the headers at the RVA equal to their
+    // file offset, and zero fill everywhere else in the image.
+    let headers = layout::read_u32(bytes, OPT + layout::OPT_SIZE_OF_HEADERS).unwrap() as usize;
+    let byte = |b: &[u8], rva: u32| match info.rva_to_file_offset(rva) {
+        Some(offset) => b[offset as usize],
+        None if (rva as usize) < headers => b[rva as usize],
+        None if rva < info.size_of_image => 0,
         None => panic!("relocation table at RVA {rva:#x} is not mapped"),
     };
-    let end = start + size as usize;
-    let mut at = start;
+    let read16 = |b: &[u8], rva: u32| u16::from_le_bytes([byte(b, rva), byte(b, rva + 1)]);
+    let read32 =
+        |b: &[u8], rva: u32| u32::from(read16(b, rva)) | (u32::from(read16(b, rva + 2)) << 16);
+    let end = rva + size;
+    let mut at = rva;
     while at + 8 <= end {
-        let page = layout::read_u32(bytes, at).unwrap();
-        let block = layout::read_u32(bytes, at + 4).unwrap() as usize;
+        let page = read32(bytes, at);
+        let block = read32(bytes, at + 4);
+        if block == 0 {
+            break; // zero fill
+        }
         assert!(block >= 8 && at + block <= end, "well-formed blocks only");
         let mut entry = at + 8;
         while entry < at + block {
-            let e = u16::from_le_bytes([bytes[entry], bytes[entry + 1]]);
+            let e = read16(bytes, entry);
             entry += 2;
             if e >> 12 == 0 {
                 continue;
@@ -1062,18 +1072,29 @@ fn a_relocation_table_in_the_headers_stops_at_size_of_headers() {
         &original[SECTION_FILE..file(TLS)]
     );
 
-    // A block that would cross `SizeOfHeaders` is not read at all, so the
-    // only thing that still clears the callback pointer is the TLS write.
+    // A block that crosses `SizeOfHeaders` is still a block to the loader:
+    // past the headers it reads the page's zero fill, which ends the block
+    // in ABSOLUTE padding, and it applies the entries before that. The
+    // callback entry among them is cleared; nothing else changes.
     // Only its first 12 bytes fit; the header still claims all 16.
     let mut crossing = image();
     let at = SECTION_FILE - 12;
     put(&mut crossing, at, &block[..12]);
     set_dir(&mut crossing, dir::BASERELOC, at as u32, 16);
     let prepared = prepare(&crossing).unwrap();
-    assert_eq!(&prepared.bytes[at..at + 12], &crossing[at..at + 12]);
+    assert_eq!(&prepared.bytes[at + 10..at + 12], &[0, 0]);
+    assert_eq!(&prepared.bytes[at..at + 10], &crossing[at..at + 10]);
     assert_eq!(
-        layout::read_u64(&prepared.bytes, file(callbacks_field())),
-        Some(0)
+        &prepared.bytes[SECTION_FILE..file(TLS)],
+        &crossing[SECTION_FILE..file(TLS)]
+    );
+    let delta = 0x6_0000_0000;
+    let mut mapped = prepared.bytes;
+    rebase(&mut mapped, delta);
+    assert_eq!(layout::read_u64(&mapped, file(callbacks_field())), Some(0));
+    assert_eq!(
+        layout::read_u64(&mapped, file(TLS) + 16),
+        Some(IMAGE_BASE + u64::from(TLS_INDEX) + delta)
     );
 }
 
@@ -1199,4 +1220,119 @@ fn bytes_after_the_last_whole_block_end_the_walk_but_not_the_patch() {
             "{what}: the bytes past the last block are left as they were"
         );
     }
+}
+
+/// The synthetic image with `.data` grown to fill its page (0x1000 bytes of
+/// raw data, so the next section's RVA follows its last byte), then `.rsrc`
+/// at RVA 0x3000 and `.reloc` at RVA 0x2000, in that order in the file: the
+/// file bytes after `.data` are `.rsrc`'s, not those mapped after it.
+const RSRC_FILE: usize = SECTION_FILE + 0x1000;
+const RELOC2_FILE: usize = RSRC_FILE + 0x200;
+fn image_with_sections_out_of_file_order() -> Vec<u8> {
+    let mut b = image();
+    b.resize(RELOC2_FILE + 0x200, 0);
+    put32(&mut b, SECTIONS + 8, 0x1000); // .data virtual size
+    put32(&mut b, SECTIONS + 16, 0x1000); // .data raw size
+    put16(&mut b, FILE_HEADER + 2, 3); // sections
+    put32(&mut b, OPT + 56, 0x4000); // size of image
+    for (i, (name, rva, file_at)) in [
+        (b".rsrc\0\0\0", 0x3000u32, RSRC_FILE),
+        (b".reloc\0\0", 0x2000, RELOC2_FILE),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sec = SECTIONS + 40 * (i + 1);
+        put(&mut b, sec, name);
+        put32(&mut b, sec + 8, 0x200);
+        put32(&mut b, sec + 12, rva);
+        put32(&mut b, sec + 16, 0x200);
+        put32(&mut b, sec + 20, file_at as u32);
+        put32(&mut b, sec + 36, 0x4000_0040); // data, read
+    }
+    b
+}
+
+#[test]
+fn a_relocation_table_is_read_by_rva_across_sections_out_of_file_order() {
+    // A block that starts in the last bytes of `.data` and runs on into
+    // `.reloc`. The loader reads its entries from the mapped image, so the
+    // callback entry is the one in `.reloc`. The file bytes that follow
+    // `.data` belong to `.rsrc`: a callback-shaped word there is resource
+    // data, and must neither be cleared nor stand in for the real entry.
+    const TABLE: u32 = 0x1FF0;
+    let mut original = image_with_sections_out_of_file_order();
+    let at = file(TABLE);
+    put32(&mut original, at, SECTION_RVA);
+    put32(&mut original, at + 4, 0x20);
+    put16(&mut original, at + 8, dir64(TLS + 16));
+    put16(&mut original, RELOC2_FILE, dir64(callbacks_field()));
+    put16(&mut original, RELOC2_FILE + 2, dir64(CALLBACKS));
+    put16(&mut original, RSRC_FILE, dir64(callbacks_field())); // decoy
+    put16(&mut original, RSRC_FILE + 2, 0x5A5A);
+    set_dir(&mut original, dir::BASERELOC, TABLE, 0x20);
+    // The old table in `.data` is no longer the directory's.
+    put(&mut original, file(RELOCS), &[0; 16]);
+
+    let info = ImageInfo::parse(&original).unwrap();
+    assert_eq!(info.sections.len(), 3);
+    assert_eq!(info.rva_to_file_offset(0x2000), Some(RELOC2_FILE as u32));
+    assert_eq!(info.rva_to_file_offset(0x3000), Some(RSRC_FILE as u32));
+
+    let prepared = prepare(&original).unwrap();
+    assert_eq!(&prepared.bytes[RELOC2_FILE..][..2], &[0, 0]);
+    let mut expected = original.clone();
+    put64(&mut expected, file(callbacks_field()), 0);
+    put16(&mut expected, RELOC2_FILE, 0);
+    put32(&mut expected, OPT + layout::OPT_CHECKSUM, 0);
+    assert_eq!(
+        &prepared.bytes[SECTION_FILE..],
+        &expected[SECTION_FILE..],
+        "only the TLS field and the callback entry change past the headers"
+    );
+
+    let delta = 0x7_0000_0000;
+    let mut mapped = prepared.bytes;
+    rebase(&mut mapped, delta);
+    assert_eq!(layout::read_u64(&mapped, file(callbacks_field())), Some(0));
+    assert_eq!(
+        layout::read_u64(&mapped, file(TLS) + 16),
+        Some(IMAGE_BASE + u64::from(TLS_INDEX) + delta)
+    );
+    assert_eq!(
+        layout::read_u64(&mapped, file(CALLBACKS)),
+        Some(IMAGE_BASE + u64::from(CODE) + delta)
+    );
+}
+
+#[test]
+fn a_relocation_table_that_runs_into_zero_fill_stops_there() {
+    // `.data` keeps its full virtual size but only 0x400 bytes of raw data:
+    // RVAs from 0x1400 are zero fill to the loader, which ends the table.
+    // The directory claims more, and the file bytes past `.data`'s raw data
+    // hold a callback-shaped decoy that must stay as it is.
+    const TABLE: u32 = 0x13F0;
+    let mut original = image_with_sections_out_of_file_order();
+    put32(&mut original, SECTIONS + 16, SECTION_SIZE as u32); // .data raw size
+    let block = original[file(RELOCS)..file(RELOCS) + 16].to_vec();
+    put(&mut original, file(TABLE), &block);
+    put(&mut original, file(RELOCS), &[0; 16]);
+    set_dir(&mut original, dir::BASERELOC, TABLE, 0x20);
+    // What a walk through the file would read next.
+    let decoy = file(TABLE) + 16;
+    assert_eq!(decoy, SECTION_FILE + SECTION_SIZE);
+    put32(&mut original, decoy, SECTION_RVA);
+    put32(&mut original, decoy + 4, 12);
+    put16(&mut original, decoy + 8, dir64(callbacks_field()));
+
+    let info = ImageInfo::parse(&original).unwrap();
+    assert_eq!(info.rva_to_file_offset(0x1400), None);
+
+    let prepared = prepare(&original).unwrap();
+    assert_eq!(&prepared.bytes[file(TABLE) + 10..][..2], &[0, 0]);
+    assert_eq!(&prepared.bytes[decoy..], &original[decoy..]);
+    let delta = 0x8_0000_0000;
+    let mut mapped = prepared.bytes;
+    rebase(&mut mapped, delta);
+    assert_eq!(layout::read_u64(&mapped, file(callbacks_field())), Some(0));
 }

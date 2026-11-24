@@ -109,7 +109,12 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         for reloc in relocations(&bytes, &info) {
             if reloc.overlaps(field_rva, 8) {
                 for slot in 0..reloc.slots {
-                    write_u16(&mut bytes, reloc.entry + 2 * slot, 0)?; // ABSOLUTE
+                    // Every slot is mapped from the file (a slot the loader
+                    // reads as zero-fill is ABSOLUTE already).
+                    let rva = reloc.entry.checked_add(2 * slot as u32);
+                    if let Some(at) = rva.and_then(|rva| mapped_file_offset(&bytes, &info, rva)) {
+                        write_u16(&mut bytes, at, 0)?; // ABSOLUTE
+                    }
                 }
             }
         }
@@ -141,8 +146,9 @@ const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
 /// One base relocation entry that patches something.
 #[derive(Debug, PartialEq, Eq)]
 struct Relocation {
-    /// File offset of the entry.
-    entry: usize,
+    /// Where the entry is read from: its RVA in the mapped image (or, in
+    /// the unit tests below, its offset in a plain buffer).
+    entry: u32,
     /// 16-bit slots it occupies: two for HIGHADJ, whose second slot holds
     /// the low half of the adjusted value rather than an entry of its own.
     slots: usize,
@@ -165,6 +171,14 @@ impl Relocation {
 
 /// Every base relocation that patches something (all but ABSOLUTE
 /// padding). Empty if the image has no readable relocation table.
+///
+/// The loaders read the table from the mapped image, by RVA, so it is read
+/// here the same way: a table that runs past the file-backed bytes of its
+/// section continues in whatever the image maps at the following RVAs (the
+/// next section's data, at its own file offset) or stops where nothing is
+/// mapped (zero fill, which ends the walk). Reading on through the file
+/// instead would take another section's bytes for entries, clearing them,
+/// and miss the entries the loader applies.
 fn relocations(bytes: &[u8], info: &ImageInfo) -> Vec<Relocation> {
     let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
         return Vec::new();
@@ -176,25 +190,28 @@ fn relocations(bytes: &[u8], info: &ImageInfo) -> Vec<Relocation> {
     if size == 0 {
         return Vec::new();
     }
-    if let Some(start) = info.rva_to_file_offset(rva) {
-        let start = start as usize;
-        return relocation_entries(bytes, start, start.saturating_add(size as usize));
+    let end = rva.saturating_add(size);
+    relocation_entries(
+        |at| {
+            let lo = mapped_file_offset(bytes, info, at)?;
+            let hi = mapped_file_offset(bytes, info, at.checked_add(1)?)?;
+            Some(u16::from_le_bytes([*bytes.get(lo)?, *bytes.get(hi)?]))
+        },
+        rva,
+        end,
+    )
+}
+
+/// The file offset the loader maps at `rva`: a section's file-backed bytes,
+/// or else the headers, which are mapped at the RVA equal to their file
+/// offset. `None` for zero fill and for RVAs nothing is mapped at.
+fn mapped_file_offset(bytes: &[u8], info: &ImageInfo, rva: u32) -> Option<usize> {
+    if let Some(at) = info.rva_to_file_offset(rva) {
+        return Some(at as usize).filter(|&at| at < bytes.len());
     }
-    // The loaders read the table wherever the directory points in the
-    // mapped image, and that includes the headers, which are mapped at the
-    // RVA equal to their file offset. A table there that went unread would
-    // leave the callback field's relocation armed.
-    match header_bytes(bytes) {
-        Some(headers) if (rva as usize) < headers => {
-            let start = rva as usize;
-            relocation_entries(
-                bytes,
-                start,
-                start.saturating_add(size as usize).min(headers),
-            )
-        }
-        _ => Vec::new(),
-    }
+    // A table in the headers that went unread would leave the callback
+    // field's relocation armed.
+    Some(rva as usize).filter(|&at| at < header_bytes(bytes).unwrap_or(0))
 }
 
 /// How many bytes at the start of the file are mapped as the headers:
@@ -205,36 +222,45 @@ fn header_bytes(bytes: &[u8]) -> Option<usize> {
     Some((size as usize).min(bytes.len()))
 }
 
-/// The entries of the relocation blocks in `bytes[start..end]`, ABSOLUTE
-/// padding left out. An entry whose target does not fit in an RVA (a
-/// damaged block near the top of the address space) patches nothing the
-/// image could hold, so it is left out rather than wrapped around to the
-/// RVA of some other field.
-fn relocation_entries(bytes: &[u8], start: usize, end: usize) -> Vec<Relocation> {
+/// The entries of the relocation blocks at `start..end`, read 16 bits at a
+/// time through `read16` (`None` where nothing is mapped, which ends the
+/// walk), ABSOLUTE padding left out. An entry whose target does not fit in
+/// an RVA (a damaged block near the top of the address space) patches
+/// nothing the image could hold, so it is left out rather than wrapped
+/// around to the RVA of some other field.
+fn relocation_entries(
+    read16: impl Fn(u32) -> Option<u16>,
+    start: u32,
+    end: u32,
+) -> Vec<Relocation> {
     const ABSOLUTE: u16 = 0;
     const HIGH: u16 = 1;
     const LOW: u16 = 2;
     const HIGHLOW: u16 = 3;
     const HIGHADJ: u16 = 4;
     const DIR64: u16 = 10;
+    let read32 = |at: u32| -> Option<u32> {
+        let lo = read16(at)?;
+        let hi = read16(at.checked_add(2)?)?;
+        Some(u32::from(lo) | (u32::from(hi) << 16))
+    };
+    let (start, end) = (u64::from(start), u64::from(end));
     let mut out = Vec::new();
     let mut at = start;
     while at + 8 <= end {
-        let (Some(page), Some(block)) =
-            (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
-        else {
+        // `at + 8 <= end <= u32::MAX`, so these fit.
+        let (Some(page), Some(block)) = (read32(at as u32), read32(at as u32 + 4)) else {
             break;
         };
-        let block = block as usize;
+        let block = u64::from(block);
         if block < 8 || at + block > end {
             break;
         }
         let mut entry = at + 8;
         while entry + 2 <= at + block {
-            let Some(e) = bytes.get(entry..entry + 2) else {
+            let Some(e) = read16(entry as u32) else {
                 break;
             };
-            let e = u16::from_le_bytes([e[0], e[1]]);
             let (kind, offset) = (e >> 12, u32::from(e & 0xFFF));
             let (width, slots) = match kind {
                 ABSOLUTE => (0, 1),
@@ -249,15 +275,15 @@ fn relocation_entries(bytes: &[u8], start: usize, end: usize) -> Vec<Relocation>
             {
                 // A HIGHADJ whose parameter slot is past the block still
                 // has its own slot cleared, and only that one.
-                let slots = slots.min((at + block - entry) / 2);
+                let slots = slots.min(((at + block - entry) / 2) as usize);
                 out.push(Relocation {
-                    entry,
+                    entry: entry as u32,
                     slots,
                     target,
                     width,
                 });
             }
-            entry += 2 * slots;
+            entry += 2 * slots as u64;
         }
         at += block;
     }
@@ -391,9 +417,19 @@ mod tests {
         b
     }
 
+    /// The relocations in a plain buffer, addressed by offset.
+    fn walk(bytes: &[u8], end: u32) -> Vec<Relocation> {
+        let read16 = |at: u32| {
+            let at = at as usize;
+            let e = bytes.get(at..at.checked_add(2)?)?;
+            Some(u16::from_le_bytes([e[0], e[1]]))
+        };
+        relocation_entries(read16, 0, end)
+    }
+
     /// (entry, slots, target, width) of each relocation, for comparing.
-    fn entries(bytes: &[u8], end: usize) -> Vec<(usize, usize, u32, u32)> {
-        relocation_entries(bytes, 0, end)
+    fn entries(bytes: &[u8], end: u32) -> Vec<(u32, usize, u32, u32)> {
+        walk(bytes, end)
             .into_iter()
             .map(|r| (r.entry, r.slots, r.target, r.width))
             .collect()
@@ -405,7 +441,7 @@ mod tests {
         let mut bytes = block(0x1000, &[0xA010, 0x0000, 0x3020, 0xA018]);
         bytes.extend(block(0x2000, &[0xA000, 0x0000]));
         assert_eq!(
-            entries(&bytes, bytes.len()),
+            entries(&bytes, bytes.len() as u32),
             [
                 (8, 1, 0x1010, 8),
                 (12, 1, 0x1020, 4),
@@ -416,7 +452,7 @@ mod tests {
         // A block that claims more than the directory holds ends the walk.
         let mut bytes = block(0x1000, &[0xA010, 0x0000]);
         bytes[4] = 0x40;
-        assert!(relocation_entries(&bytes, 0, bytes.len()).is_empty());
+        assert!(walk(&bytes, bytes.len() as u32).is_empty());
     }
 
     #[test]
@@ -426,7 +462,7 @@ mod tests {
         // do not define, taken as pointer-wide.
         let bytes = block(0x1000, &[0x1002, 0x2004, 0x4006, 0xA040, 0x5008, 0x0000]);
         assert_eq!(
-            entries(&bytes, bytes.len()),
+            entries(&bytes, bytes.len() as u32),
             [
                 (8, 1, 0x1002, 2),
                 (10, 1, 0x1004, 2),
@@ -437,7 +473,7 @@ mod tests {
         // A HIGHADJ in the last slot of its block owns only that slot.
         let bytes = block(0x1000, &[0xA010, 0x4006]);
         assert_eq!(
-            entries(&bytes, bytes.len()),
+            entries(&bytes, bytes.len() as u32),
             [(8, 1, 0x1010, 8), (10, 1, 0x1006, 2)]
         );
     }
@@ -468,13 +504,16 @@ mod tests {
         // belongs to some other field. Entries whose target fits are kept.
         let bytes = block(0xFFFF_F000, &[0xA000, 0xAFFF, 0x0000]);
         assert_eq!(
-            entries(&bytes, bytes.len()),
+            entries(&bytes, bytes.len() as u32),
             [(8, 1, 0xFFFF_F000, 8), (10, 1, 0xFFFF_FFFF, 8)]
         );
         let bytes = block(0xFFFF_FFF0, &[0xA00F, 0xA010, 0xAFFF]);
-        assert_eq!(entries(&bytes, bytes.len()), [(8, 1, 0xFFFF_FFFF, 8)]);
+        assert_eq!(
+            entries(&bytes, bytes.len() as u32),
+            [(8, 1, 0xFFFF_FFFF, 8)]
+        );
         // An end past the buffer stops at the bytes there are.
-        assert_eq!(relocation_entries(&bytes, 0, usize::MAX).len(), 1);
+        assert_eq!(walk(&bytes, u32::MAX).len(), 1);
     }
 
     #[test]
