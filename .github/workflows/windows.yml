@@ -7,6 +7,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: windows-checks-${{ github.event_name }}-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && github.run_id) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -131,14 +135,22 @@ jobs:
           .\tools\dev.ps1
           cmake --preset dev
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build --preset dev
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          ctest --preset dev --no-tests=error -E '_hardware$' --output-junit "$PWD/out/test-results.xml"
+          if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+            cmake --build --preset pr
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            ctest --preset pr --no-tests=error --output-junit "$PWD/out/test-results.xml"
+          } else {
+            cmake --build --preset dev
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            ctest --preset dev --no-tests=error -E '_hardware$' --output-junit "$PWD/out/test-results.xml"
+          }
+          exit $LASTEXITCODE
       - name: Require the SPIR-V bridge WARP tests
         if: ${{ !cancelled() }}
         shell: pwsh
         run: ./out/pe-env/Scripts/python.exe -B tests/spirv_window/require_warp_results.py out/test-results.xml
       - name: Draw the coverage dashboard
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: |
           ./out/pe-env/Scripts/python.exe -B tools/form_coverage.py out/test-results.xml --json out/coverage/coverage.json
@@ -146,6 +158,7 @@ jobs:
           ./out/pe-env/Scripts/python.exe -B tools/coverage_svg.py out/coverage/coverage.json out/coverage/dashboard.svg `
             --source "$($env:GITHUB_SHA.Substring(0, 7)), Windows CI run $env:GITHUB_RUN_ID, WARP"
       - name: Upload coverage dashboard
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-dashboard
@@ -153,6 +166,7 @@ jobs:
           if-no-files-found: error
           overwrite: true
       - name: Build and smoke-test the standalone GPU check
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: .\tools\package-gpu-check.ps1
       - name: Upload verified GPU check
@@ -166,6 +180,7 @@ jobs:
           if-no-files-found: error
   build-and-test-release:
     name: Build and test on Windows at /O2
+    if: github.event_name != 'pull_request'
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
