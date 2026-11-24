@@ -180,7 +180,7 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
-fn create() -> windows::core::Result<Host> {
+fn create() -> anyhow::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -223,6 +223,25 @@ fn create() -> windows::core::Result<Host> {
         }
         let (device, adapter_desc) = create_device()?;
         let caps = probe_caps(&device, &adapter_desc);
+        let mut device: Option<ID3D12Device> = None;
+        // Diagnostics: the software adapter, on which a shader's wild access
+        // is an access violation in this process (a crash report with the
+        // address and instruction) instead of a GPU fault and driver reset.
+        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+            let adapter = warp_adapter()?;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            tracing::info!("host device on the software adapter (WARP)");
+        } else {
+            // Not `D3D12CreateDevice(None, …)`: the adapter DXGI calls the
+            // default is the one driving the primary output, which on a
+            // hybrid laptop is the integrated GPU and can be a display-only
+            // adapter on a machine with a remote-desktop or emulator driver.
+            // `adapter` picks one that can run the title and says what every
+            // adapter offers when none can.
+            let (chosen, _) = crate::adapter::open()?;
+            device = Some(chosen);
+        }
+        let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
