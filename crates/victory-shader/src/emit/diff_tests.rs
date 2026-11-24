@@ -1214,7 +1214,7 @@ fn translated_compute_matches_pc() {
         // Our root views follow the user data in root parameter order.
         let mut roots = vec![(0, Root::Constants(user_data(&cs_c, &k)))];
         let mut root_views: Vec<(u16, bool)> =
-            cs_c.root_cbvs.iter().map(|&s| (s, false)).collect();
+            cs_c.root_cbvs.iter().map(|&s| (u16::from(s), false)).collect();
         root_views.extend(cs_c.root_srvs.iter().map(|&s| (s, true)));
         root_views.sort_unstable();
         for (n, (reg, srv)) in root_views.into_iter().enumerate() {

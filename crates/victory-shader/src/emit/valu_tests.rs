@@ -936,6 +936,7 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
 
 /// SMEM `s_load_dwordx2 s[dst:dst+1], s[base:base+1], byte_off`.
 const fn s_load_dwordx2(dst: u8, base: u8, byte_off: u32) -> [u32; 2] {
@@ -1015,9 +1016,10 @@ fn pointer_chase_shader() -> HostShader {
     };
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let lowered = lower::lower(&lower::Parts {
         native: &native,
         p: &p,

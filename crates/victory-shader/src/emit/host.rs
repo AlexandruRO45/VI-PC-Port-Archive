@@ -135,7 +135,7 @@ impl Host {
         let mut views: Vec<(u16, bool)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, false));
+                let cbvs = s.root_cbvs.iter().map(|&r| (u16::from(r), false));
                 cbvs.chain(s.root_srvs.iter().map(|&r| (r, true)))
             })
             .collect();
@@ -533,6 +533,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
 
 /// A root argument for [`Host::draw`].
 #[cfg(test)]
+#[derive(Clone)]
 pub enum Root {
     Constants(Vec<u32>),
     /// A table starting at this heap index.
