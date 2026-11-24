@@ -1541,6 +1541,10 @@ mod host {
     /// in a release build — a person and a bot both stuck, and only in the
     /// build the person runs.
     fn held_keys() -> Vec<u8> {
+        // A key held while the foreground left us stays held until a key event
+        // arrives, and an alt-tab by mouse sends none: the set is emptied here,
+        // on the read the title makes every frame.
+        victory_gpu::keys::release_if_not_foreground();
         #[cfg(feature = "diagnostics")]
         let scripted = super::script::down();
         #[cfg(not(feature = "diagnostics"))]
