@@ -479,23 +479,49 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     }
     if content.contains(&0) {
         problems.push("binary content (NUL bytes)".to_owned());
-    } else if let Some(run) = longest_encoded_run(content)
-        && run > MAX_ENCODED_RUN
-    {
-        problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
+    } else {
+        let run = longest_encoded_run(content);
+        if run > MAX_ENCODED_RUN {
+            problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
+        }
     }
     problems
 }
 
 /// Longest run of characters that could be hex or base64 payload.
-fn longest_encoded_run(content: &[u8]) -> Option<usize> {
+///
+/// A single line break (LF or CRLF) between two payload characters does not
+/// end a run: `base64` wraps its output at 76 columns, PEM and
+/// `openssl base64` at 64, `xxd -p` at 60, so data encoded by any of them
+/// would otherwise pass as many short runs. The break itself is not counted.
+fn longest_encoded_run(content: &[u8]) -> usize {
     let is_payload = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
-    content.split(|b| !is_payload(b)).map(<[u8]>::len).max()
+    let (mut longest, mut run, mut i) = (0, 0, 0);
+    while let Some(b) = content.get(i) {
+        if is_payload(b) {
+            run += 1;
+            longest = longest.max(run);
+            i += 1;
+            continue;
+        }
+        let line_break = match &content[i..] {
+            [b'\r', b'\n', ..] => 2,
+            [b'\n', ..] => 1,
+            _ => 0,
+        };
+        if line_break > 0 && run > 0 && content.get(i + line_break).is_some_and(is_payload) {
+            i += line_break;
+            continue;
+        }
+        run = 0;
+        i += 1;
+    }
+    longest
 }
 
 #[cfg(test)]
 mod tests {
-    use super::check;
+    use super::{MAX_ENCODED_RUN, check};
 
     /// Enforces the policy wherever tests run, even in clones without the hook.
     #[test]
@@ -1204,5 +1230,61 @@ mod tests {
     fn rejects_data_smuggled_into_text() {
         let blob = format!("const DATA: &str = \"{}\";", "A1".repeat(400));
         assert!(!check("src/blob.rs", blob.as_bytes()).is_empty());
+    }
+
+    /// `base64` output wrapped at 76 columns, PEM-style 64-column lines and
+    /// `xxd -p` hex at 60, with LF or CRLF: each line is short, the run is not.
+    #[test]
+    fn rejects_encoded_data_wrapped_across_lines() {
+        for (width, alphabet, eol) in [
+            (
+                76,
+                &b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[..],
+                "\n",
+            ),
+            (
+                64,
+                &b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[..],
+                "\r\n",
+            ),
+            (60, &b"0123456789abcdef"[..], "\n"),
+        ] {
+            let line: String = (0..width)
+                .map(|i| alphabet[i * 7 % alphabet.len()] as char)
+                .collect();
+            let lines = MAX_ENCODED_RUN / width + 1;
+            let blob = format!("{line}{eol}").repeat(lines) + "QUJD==" + eol;
+            assert_eq!(
+                super::longest_encoded_run(blob.as_bytes()),
+                lines * width + 6,
+                "width {width}, eol {eol:?}"
+            );
+            assert!(
+                check("strings.txt", blob.as_bytes())
+                    .iter()
+                    .any(|p| p.contains("hex/base64 run")),
+                "width {width}, eol {eol:?}"
+            );
+        }
+    }
+
+    /// Only a single line break joins: prose, code, a blank line or
+    /// indentation between payload characters still ends the run.
+    #[test]
+    fn line_breaks_join_only_payload_lines() {
+        let run = super::longest_encoded_run;
+        assert_eq!(run(b"ab\ncd"), 4);
+        assert_eq!(run(b"ab\r\ncd"), 4);
+        assert_eq!(run(b"ab\n\ncd"), 2, "a blank line ends the run");
+        assert_eq!(run(b"ab\n cd"), 2, "indentation ends the run");
+        assert_eq!(run(b"ab\r\rcd"), 2);
+        assert_eq!(
+            run(b"\nab\n"),
+            2,
+            "leading and trailing breaks count nothing"
+        );
+        assert_eq!(run(b""), 0);
+        let paragraph = "The quick brown fox\njumps over the lazy dog\n".repeat(200);
+        assert!(run(paragraph.as_bytes()) < 20);
     }
 }

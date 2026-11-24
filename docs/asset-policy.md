@@ -46,8 +46,9 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
 2. `cargo xtask policy` (run by the pre-commit hook; install with
    `cargo xtask install-hooks`) is an allowlist: files must have an allowed
    type, be under 512 KiB, contain no binary data or known binary
-   signatures, and hold no long hex/base64 runs. File names must be UTF-8,
-   and submodules, like untracked git repositories nested in the
+   signatures, and hold no long hex/base64 runs (a run wrapped onto
+   several lines, as `base64` writes it, is one run). File names must
+   be UTF-8, and submodules, like untracked git repositories nested in the
    checkout, are refused. A symlink is checked as git stores it, as
    its target path. Git LFS pointers are refused: what they stand for is
    stored outside the repository, where no check reads it. Exceptions need
