@@ -410,6 +410,91 @@ mod tests {
         }
     }
 
+    /// Seeded random files: gaps of noise and of near-miss markers between
+    /// records, some records stored as is (level 0) and holding records of
+    /// their own. Exactly the planted records are found, each with its
+    /// container, and [`in_record`] agrees with a scan of their spans.
+    #[test]
+    fn random_files_yield_exactly_the_planted_records() {
+        let mut x = 0x9E37_79B9_u32;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for seed in 0..200 {
+            let mut file = MAGIC.to_vec();
+            // (offset of the marker, name, container)
+            let mut planted: Vec<(usize, String, Vec<u8>)> = Vec::new();
+            for i in 0..1 + next() % 6 {
+                // A gap: noise, then sometimes a marker whose sizes disagree
+                // or that no deflate stream could have.
+                for _ in 0..next() % 40 {
+                    file.push(next() as u8);
+                }
+                match next() % 3 {
+                    0 => {
+                        for v in [20_u32, 0x000D_DCE7, 21, 8] {
+                            file.extend_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                    1 => {
+                        for v in [u32::MAX, 0x000D_DCE7, u32::MAX, 16] {
+                            file.extend_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                    _ => {}
+                }
+                // A name's length byte follows the gap; a long name's is
+                // printable, so noise right before it is kept non-printable.
+                file.push(0x01);
+                let name = format!("PS_{seed}_{i}_{}", "w".repeat(next() as usize % 50));
+                let mut payload: Vec<u8> = (0..next() % 300).map(|_| next() as u8).collect();
+                let level = if next() % 2 == 0 {
+                    // Stored as is, holding a record and a container's magic.
+                    payload.extend(record_bytes("PS_stored", 0x32, b"stored"));
+                    payload.extend_from_slice(b"DXBC");
+                    0
+                } else {
+                    6
+                };
+                let packed = miniz_oxide::deflate::compress_to_vec(&payload, level);
+                let n = (packed.len() + 12) as u32;
+                file.push(name.len() as u8 + 1);
+                file.extend_from_slice(name.as_bytes());
+                file.extend_from_slice(&[0, 0x32]);
+                planted.push((file.len() + 4, name, payload.clone()));
+                for v in [n, 0x000D_DCE7, n, payload.len() as u32] {
+                    file.extend_from_slice(&v.to_le_bytes());
+                }
+                file.extend_from_slice(&packed);
+            }
+            for _ in 0..next() % 40 {
+                file.push(next() as u8);
+            }
+
+            let found: Vec<_> = records(&file).collect();
+            let got: Vec<_> = found
+                .iter()
+                .map(|r| (r.offset, r.name.map(str::to_owned), r.unpack()))
+                .collect();
+            let want: Vec<_> = planted
+                .iter()
+                .map(|(at, name, payload)| (*at, Some(name.clone()), Some(payload.clone())))
+                .collect();
+            assert_eq!(got, want, "seed {seed}");
+            for offset in 0..=file.len() {
+                let linear = found.iter().any(|r| r.span().contains(&offset));
+                assert_eq!(
+                    in_record(&found, offset),
+                    linear,
+                    "seed {seed}, offset {offset}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn corrupt_stream_does_not_unpack() {
         let mut file = MAGIC.to_vec();
