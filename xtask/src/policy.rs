@@ -25,6 +25,8 @@ const ALLOWED_NAMES: &[&str] = &[
     ".editorconfig",
     ".victory-root",
     "pre-commit",
+    "pre-merge-commit",
+    "pre-applypatch",
     "LICENSE",
     "LICENSE-MIT",
     "LICENSE-APACHE",
@@ -1949,6 +1951,98 @@ mod tests {
 
     /// A Git LFS pointer is small, allowlisted text, but the file it stands
     /// for goes to LFS storage, which no check reads.
+    /// `git commit` runs `pre-commit`, but a merge made without conflicts
+    /// runs `pre-merge-commit` instead, and `git am` runs `pre-applypatch`:
+    /// with only `pre-commit` installed, a branch committed with
+    /// `--no-verify` merged its files, and a mailed patch applied its
+    /// files, past the check. Every tracked hook is run here in place of the
+    /// real one (which builds xtask), and each way of committing must run
+    /// at least one of them; the staged check then sees what it brings in.
+    #[cfg(unix)]
+    #[test]
+    fn every_way_of_committing_runs_a_tracked_hook() {
+        use std::os::unix::fs::PermissionsExt;
+        let checkout = crate::workspace_root();
+        let Some(out) = super::git_command(&checkout)
+            .args(["ls-files", "-z", "--", ".githooks"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+        else {
+            eprintln!("skipped: not a git checkout");
+            return;
+        };
+        let hooks: Vec<String> = out
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                String::from_utf8_lossy(s)
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+
+        let tmp = tempdir();
+        let root = tmp.path().join("repo");
+        let hooks_dir = tmp.path().join("hooks");
+        let ran = tmp.path().join("ran");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&hooks_dir).unwrap();
+        for hook in &hooks {
+            let path = hooks_dir.join(hook);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\necho {hook} >> '{}'\n", ran.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let hooked = format!("core.hooksPath={}", hooks_dir.display());
+        let ran_hooks = || {
+            let log = std::fs::read_to_string(&ran).unwrap_or_default();
+            let _ = std::fs::remove_file(&ran);
+            log
+        };
+
+        git_str(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.rs"), b"fn a() {}\n").unwrap();
+        git_str(&root, &["add", "a.rs"]);
+        git_str(&root, &["-c", &hooked, "commit", "-q", "-m", "a"]);
+        assert!(!ran_hooks().is_empty(), "git commit ran no tracked hook");
+
+        git_str(&root, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(root.join("data.rs"), b"MZ\x90\0binary").unwrap();
+        git_str(&root, &["add", "data.rs"]);
+        git_str(&root, &["commit", "-q", "--no-verify", "-m", "data"]);
+        let patch = git_str(&root, &["format-patch", "-1", "--stdout"]);
+        git_str(&root, &["checkout", "-q", "main"]);
+        std::fs::write(root.join("b.rs"), b"fn b() {}\n").unwrap();
+        git_str(&root, &["add", "b.rs"]);
+        git_str(&root, &["commit", "-q", "--no-verify", "-m", "b"]);
+
+        git_str(&root, &["merge", "-q", "--no-commit", "side"]);
+        assert!(
+            super::run(&root, true).is_err(),
+            "the merged file is staged"
+        );
+        git_str(&root, &["merge", "--abort"]);
+        git_str(
+            &root,
+            &["-c", &hooked, "merge", "-q", "-m", "merge", "side"],
+        );
+        assert!(!ran_hooks().is_empty(), "git merge ran no tracked hook");
+
+        git_str(&root, &["reset", "-q", "--hard", "HEAD~1"]);
+        let patch_file = tmp.path().join("data.patch");
+        std::fs::write(&patch_file, patch).unwrap();
+        let patch_file = patch_file.to_str().unwrap();
+        git_str(&root, &["-c", &hooked, "am", "-q", patch_file]);
+        assert!(!ran_hooks().is_empty(), "git am ran no tracked hook");
+    }
+
     #[test]
     fn rejects_lfs_pointers() {
         assert!(!check("assets/model.txt", LFS_POINTER).is_empty());

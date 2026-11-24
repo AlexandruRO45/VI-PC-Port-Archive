@@ -42,7 +42,9 @@ fn main() -> Result<()> {
                 status.success(),
                 "git config failed (is this a git repository?)"
             );
-            println!("hooks installed: commits now run `cargo xtask policy --staged`");
+            println!(
+                "hooks installed: commits, merges and `git am` now run `cargo xtask policy --staged`"
+            );
             Ok(())
         }
     }

@@ -1,0 +1,4 @@
+#!/bin/sh
+# `git am` runs this hook, not pre-commit, once a mailed patch is applied to
+# the index and before it is committed. Same check.
+exec cargo xtask policy --staged

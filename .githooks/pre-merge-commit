@@ -1,0 +1,4 @@
+#!/bin/sh
+# `git merge` runs this hook, not pre-commit, before it records a merge it
+# made without conflicts; the merged files are staged. Same check.
+exec cargo xtask policy --staged

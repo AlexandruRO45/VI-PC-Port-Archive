@@ -43,8 +43,10 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
 ## Enforcement
 
 1. `.gitignore` keeps common data types out of `git status`.
-2. `cargo xtask policy` (run by the pre-commit hook; install with
-   `cargo xtask install-hooks`) is an allowlist: files must have an allowed
+2. `cargo xtask policy` (run by the `pre-commit` hook, and by
+   `pre-merge-commit` and `pre-applypatch`, which `git merge` and `git am`
+   run instead of it; install with `cargo xtask install-hooks`) is an
+   allowlist: files must have an allowed
    type, be under 512 KiB (a bigger file is refused after reading its
    first 512 KiB only, so a multi-gigabyte dump is never held in memory), be UTF-8 text without control characters
    (so binary data with its NUL bytes stuffed away is still refused),
