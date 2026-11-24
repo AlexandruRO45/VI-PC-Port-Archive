@@ -13,9 +13,12 @@ on:
 permissions:
   contents: read
 
+# A newer push to a PR cancels its older run. Runs on main are never
+# cancelled: only main saves the rust-cache, so a cancelled main run would
+# leave PRs restoring a stale cache.
 concurrency:
   group: linux-subset-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -134,3 +137,9 @@ jobs:
         run: >
           cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc
           --manifest-path tests/fixtures/hle-probe/Cargo.toml -- -D warnings
+
+      # The fixture is outside the workspace, so `cargo fmt --all` never reaches
+      # it. It is rustfmt-clean today; keep it that way. (The workspace itself
+      # is not rustfmt-clean on main yet, so it is not checked here.)
+      - name: rustfmt (hle-probe fixture)
+        run: cargo fmt --check --manifest-path tests/fixtures/hle-probe/Cargo.toml
