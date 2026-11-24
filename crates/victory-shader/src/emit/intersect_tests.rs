@@ -162,7 +162,12 @@ fn build(
     wide: bool,
     descriptor: Descriptor,
 ) -> Result<(HostShader, resource::Resources), ShaderError> {
-    let native = native(&program(wide, descriptor));
+    build_words(&program(wide, descriptor))
+}
+
+/// Lowers `words`, a variant of [`program`]; validated as [`build`] does.
+fn build_words(words: &[u32]) -> Result<(HostShader, resource::Resources), ShaderError> {
+    let native = native(words);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
@@ -686,5 +691,126 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
             assert_eq!(what, "a ray-tracing structure that returns triangle ids");
         }
         other => panic!("{:?}", other.map(|_| ())),
+    }
+}
+
+/// [`program`] (64-bit form, nodes from the table) with the instruction in
+/// a loop of `rounds` passes. Each pass adds a zero read from the record
+/// (dword 13) to the ray's origin, direction and inverse direction, so the
+/// host compiler cannot move any part of the test out of the loop, and XORs
+/// all four result dwords into v19, stored in the first one's place. With
+/// an odd `rounds` that is the XOR of the reference's four.
+fn looped_program(rounds: u16) -> Vec<u32> {
+    const INSTRUCTION: u32 = 0xF19C_9F07;
+    let mut w = program(true, Descriptor::Table);
+    let at = w
+        .iter()
+        .position(|&x| x == INSTRUCTION)
+        .expect("the instruction");
+    let test: Vec<u32> = w.drain(at..at + 5).collect();
+    let mut body = vec![
+        0xE030_1034,
+        0x8002_1214, // buffer_load_dword v18, v20, s[8:11], 0 offen offset:52
+        0x7E26_0280, // v_mov_b32 v19, 0
+        0xB01E_0000 | u32::from(rounds), // s_movk_i32 s30, rounds
+    ];
+    let start = body.len();
+    body.extend(&test);
+    // v_xor_b32 v19, v19, v13..v16
+    body.extend((13..17u32).map(|v| 0x1D << 25 | 19 << 17 | v << 9 | 0x113));
+    // v_add_f32 v4..v12, v18, v4..v12: origin, direction, inverse
+    body.extend((4..13u32).map(|v| 0x03 << 25 | v << 17 | v << 9 | 0x112));
+    body.extend([
+        0x8080_0000 | 30 << 16 | 0x81 << 8 | 30, // s_sub_u32 s30, s30, 1
+        0xBF07_0000 | 0x80 << 8 | 30,            // s_cmp_lg_u32 s30, 0
+    ]);
+    let back = (start as i32 - body.len() as i32 - 1) as u16;
+    body.push(0xBF85_0000 | u32::from(back)); // s_cbranch_scc1 (back to the test)
+    body.push(0x7E1A_0313); // v_mov_b32 v13, v19
+    w.splice(at..at, body);
+    w
+}
+
+/// What one node test costs on the hardware adapter, by node kind: the
+/// time of a dispatch whose threads run the test `ROUNDS` times, less that
+/// of one that runs it once, over the tests added. Each dispatch stays well
+/// under the two seconds after which Windows resets the GPU. Run by hand:
+/// `cargo test -p victory-shader --lib intersect_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn intersect_cost_on_the_card() {
+    const GROUPS: u32 = 65535;
+    const ROUNDS: u16 = 1025;
+    const RUNS: usize = 5;
+    let (scene, batches) = scene();
+    let all: Vec<(usize, u32, Ray)> = batches.into_iter().flatten().flatten().collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not measured");
+        return;
+    };
+    let pipelines: Vec<_> = [1u16, ROUNDS]
+        .map(|rounds| {
+            let (shader, _) = build_words(&looped_program(rounds)).expect("the program lowers");
+            host.compute_pipeline(&shader).expect("compute_pipeline")
+        })
+        .into_iter()
+        .collect();
+    for (name, kinds) in [
+        ("box node, 32-bit bounds", 5..=5),
+        ("box node, 16-bit bounds", 4..=4),
+        ("triangle node", 0..=3),
+    ] {
+        let cases: Vec<Case> = all
+            .iter()
+            .filter(|c| kinds.contains(&c.1))
+            .cycle()
+            .take(THREADS as usize)
+            .map(|&c| Some(c))
+            .collect();
+        let data = buffer(&scene, &cases, u64::from(NODES));
+        let time = |p: usize| {
+            let (root, pso) = &pipelines[p];
+            let mut best = f64::MAX;
+            for _ in 0..RUNS {
+                let start = std::time::Instant::now();
+                let out = host
+                    .dispatch(
+                        root,
+                        pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(vec![0; 5]))],
+                            views: &[
+                                View::Buffer {
+                                    data: &data,
+                                    stride: Stride::Raw,
+                                },
+                                View::RawUav(4 * THREADS),
+                            ],
+                            samplers: &[],
+                            groups: [GROUPS, 1, 1],
+                        },
+                    )
+                    .expect("dispatch");
+                best = best.min(start.elapsed().as_secs_f64());
+                for (t, case) in cases.iter().enumerate() {
+                    let want = expected(&scene, case, true).iter().fold(0, |a, x| a ^ x);
+                    assert_eq!(out[0][4 * t], want, "{name}, thread {t}");
+                }
+            }
+            best
+        };
+        let (once, many) = (time(0), time(1));
+        let tests = f64::from(ROUNDS - 1) * f64::from(GROUPS) * f64::from(THREADS);
+        let added = many - once;
+        println!(
+            "{name}: {:.1} G tests/s over the card, {:.1} ps a test ({:.1} ms for {:.0} M)",
+            tests / added / 1e9,
+            added * 1e12 / tests,
+            added * 1e3,
+            tests / 1e6,
+        );
     }
 }

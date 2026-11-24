@@ -72,7 +72,13 @@ shaders and emulates the one instruction.
 - Not publicly documented, and assumed: the instruction's rounding, the order
   of two boxes entered at the same distance, and the result for a ray exactly
   through an edge.
-- Cost on the GPU is unmeasured.
+- Cost on the GPU is measured for the node test alone, not for traversal or
+  the builder. On an RTX 5070 (driver 621.40) the emulated test runs 72 to
+  88 G box tests and 82 to 114 G triangle tests a second over the whole card
+  (about 150 to 250 lane-cycles a test), with the nodes in cache; the range
+  is over runs, as the clock and other work on the card move it. A million
+  rays testing 40 nodes each is about 0.5 ms. To measure another GPU:
+  `cargo test -p victory-shader --lib intersect_cost -- --ignored --nocapture`.
 
 ## Where to look
 
