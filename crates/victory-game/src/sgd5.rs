@@ -1412,4 +1412,56 @@ mod tests {
         assert_eq!(found[0].unpack().as_deref(), Some(&payload[..]));
         assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
     }
+
+    #[test]
+    fn files_too_short_for_a_header_yield_nothing() {
+        // Nothing, part of the magic, the magic alone, and the magic with
+        // fewer bytes than a header and marker: no records, no truncated
+        // one, and no out-of-bounds read, whatever those bytes are.
+        assert_eq!(records(b"").count(), 0);
+        for cut in 1..MAGIC.len() {
+            assert!(!is_sgd5(&MAGIC[..cut]));
+            assert_eq!(records(&MAGIC[..cut]).count(), 0, "{cut} bytes");
+        }
+        let record = bare_record(0, 0x32, b"cut");
+        for keep in 0..10 {
+            let mut file = MAGIC.to_vec();
+            file.extend_from_slice(&record[..keep]);
+            assert!(is_sgd5(&file));
+            assert_eq!(records(&file).count(), 0, "{keep} bytes");
+        }
+        // Marker bytes right after the magic have no header before them.
+        let mut file = MAGIC.to_vec();
+        file.extend_from_slice(&MARKER);
+        file.extend_from_slice(&record[6..]);
+        assert_eq!(records(&file).count(), 0);
+    }
+
+    #[test]
+    fn magic_inside_a_record_does_not_restart_the_search() {
+        // A whole SGD5 file stored as is (level 0) in a record's packed
+        // bytes: its magic and records are that record's container, and the
+        // search goes on after the packed bytes, not from the inner magic.
+        let mut inner = MAGIC.to_vec();
+        inner.extend(record_bytes("PS_inner", 0x32, b"inner container"));
+        let packed = miniz_oxide::deflate::compress_to_vec(&inner, 0);
+        assert!(memchr::memmem::find(&packed, MAGIC).is_some());
+        let n = (packed.len() + 12) as u32;
+        let mut file = MAGIC.to_vec();
+        file.extend_from_slice(b"\x09PS_outer\0\x32");
+        for v in [n, 0x000D_DCE7, n, inner.len() as u32] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&packed);
+        file.extend(record_bytes("PS_after", 0x32, b"after"));
+
+        let found: Vec<_> = records(&file).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_outer"), Some("PS_after")]);
+        assert_eq!(found[0].unpack(), Some(inner.clone()));
+        assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+        // The stored file, read on its own, is one record.
+        let nested: Vec<_> = records(&inner).map(|r| r.name).collect();
+        assert_eq!(nested, [Some("PS_inner")]);
+    }
 }
