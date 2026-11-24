@@ -619,6 +619,15 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
         if (offset as usize + size) * 4 > code_len {
             return Err(Malformed("export patch outside the code"));
         }
+        // `patched_code` writes the patches in MRT order: a later one over an
+        // earlier one's dwords would clobber that export with no error.
+        let (start, end) = (offset as usize, offset as usize + size);
+        if patches
+            .iter()
+            .any(|p: &ExportPatch| start < p.offset as usize + size && (p.offset as usize) < end)
+        {
+            return Err(Malformed("export patches overlap"));
+        }
         let full = at + 4 + PATCH_FULL * PATCH_SLOT_DWORDS * 4;
         let code = (0..size)
             .map(|i| u32_at(data, full + 4 * i))
@@ -1269,6 +1278,34 @@ mod tests {
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_ok());
         blob[e + PS_PATCHES..][..4].copy_from_slice(&last.to_le_bytes());
         assert_eq!(refused_blob(&xbch(&blob)), "export patch outside the code");
+        // Two-dword patches for MRT0 and MRT1: adjacent fits, sharing a
+        // dword does not; with no dwords to patch, nothing can overlap.
+        let code: Vec<u8> = [0xBF80_0000u32; 4] // s_nop
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let ps4 = fssm(&[(HwStage::Ps, &code)]);
+        let patches = |size: u32, offsets: [u32; 2]| {
+            let mut blob = ps4.clone();
+            blob[e + PS_PATCH_SIZE..][..4].copy_from_slice(&size.to_le_bytes());
+            for (mrt, offset) in offsets.into_iter().enumerate() {
+                let at = e + PS_PATCHES + mrt * PATCH_BYTES;
+                blob[at..][..4].copy_from_slice(&offset.to_le_bytes());
+            }
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        assert!(patches(2, [0, 2]).is_ok());
+        assert!(patches(2, [2, 0]).is_ok());
+        assert!(patches(0, [1, 1]).is_ok());
+        for offsets in [[0, 1], [1, 0], [1, 1]] {
+            assert!(
+                matches!(
+                    patches(2, offsets),
+                    Err(Malformed("export patches overlap"))
+                ),
+                "{offsets:?}"
+            );
+        }
 
         // numthreads at each limit fits; past one, or a zero component, does
         // not. 65536 x 65536 would overflow lowering's u32 thread count.
