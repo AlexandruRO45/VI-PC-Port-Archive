@@ -635,7 +635,7 @@ fn lexical(path: &Path) -> PathBuf {
 /// control characters ([`ensure_no_control`]), no surrounding quotes
 /// ([`ensure_unquoted`]), no surrounding whitespace ([`ensure_trimmed`]),
 /// no `file:` URI ([`ensure_not_uri`]), no unexpanded variable
-/// ([`ensure_no_variable`]) and no Windows drive path off Windows
+/// ([`ensure_no_variable`]) and no Windows drive or network path off Windows
 /// ([`ensure_native`]). `what` names the setting for the error.
 fn check_setting(what: &str, path: &Path) -> Result<()> {
     ensure_no_control(what, path)?;
@@ -854,15 +854,41 @@ fn ensure_no_control(what: &str, path: &Path) -> Result<()> {
 /// config ships such a path, so copying it unedited on Linux is an easy way
 /// to get here; the error names the setting instead of a confusing
 /// "inside the repository" or "does not exist" later on.
+///
+/// A Windows network path (`\\nas\games\gta`, or the `\\?\` and
+/// `\\.\` device forms) is refused the same way: off Windows the
+/// backslashes are ordinary characters, so it would be one relative folder
+/// named `\\nas\games\gta`. The error says to mount the share and use the
+/// mount point instead.
 fn ensure_native(what: &str, path: &Path, on_windows: bool) -> Result<()> {
-    if on_windows || !is_drive_path(path) {
+    if on_windows {
         return Ok(());
     }
-    anyhow::bail!(
-        "{what} is {}, a Windows path, but this host is not Windows; set it to a \
-         path on this machine",
-        path.display()
-    );
+    if is_drive_path(path) {
+        anyhow::bail!(
+            "{what} is {}, a Windows path, but this host is not Windows; set it to a \
+             path on this machine",
+            path.display()
+        );
+    }
+    if is_unc_path(path) {
+        anyhow::bail!(
+            "{what} is {}, a Windows network path, but this host is not Windows; mount \
+             the share and set it to the folder under the mount point",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// `\\` followed by a server name, `?` or `.` (`\\nas\games`, `\\?\C:\x`,
+/// `\\.\pipe`). Only backslashes count: `//nas/games` is an absolute path
+/// on a Unix host.
+fn is_unc_path(path: &Path) -> bool {
+    match path.as_os_str().as_encoded_bytes() {
+        [b'\\', b'\\', next, ..] => !matches!(next, b'\\' | b'/'),
+        _ => false,
+    }
 }
 
 /// `X:` followed by nothing, `\` or `/`.
@@ -2053,6 +2079,66 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(var), "{err}");
+        }
+    }
+
+    #[test]
+    fn windows_network_paths_are_refused_off_windows() {
+        for p in [
+            "\\\\nas\\games\\gta",
+            "\\\\nas",
+            "\\\\?\\C:\\games",
+            "\\\\.\\pipe\\x",
+            "\\\\nas/games",
+        ] {
+            assert!(is_unc_path(Path::new(p)), "{p}");
+            let err = ensure_native("VICTORY_GAME_DIR", Path::new(p), false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("VICTORY_GAME_DIR"), "{err}");
+            assert!(err.contains("network path"), "{err}");
+            assert!(err.contains("mount"), "{err}");
+            assert!(ensure_native("VICTORY_GAME_DIR", Path::new(p), true).is_ok());
+        }
+        // A Unix `//host` path, a single backslash, a lone `\\` and a
+        // backslash later in the name are left alone.
+        for p in [
+            "//nas/games",
+            "\\games",
+            "\\\\",
+            "\\\\\\x",
+            "\\\\/x",
+            "games\\\\gta",
+            "",
+        ] {
+            assert!(!is_unc_path(Path::new(p)), "{p}");
+            assert!(ensure_native("x", Path::new(p), false).is_ok(), "{p}");
+        }
+        if cfg!(windows) {
+            return;
+        }
+        // Through the file and the variables, naming the setting.
+        let parsed: FileConfig = toml::from_str("[paths]\ngame_dir = '\\\\nas\\games'\n").unwrap();
+        let err = parsed
+            .anchored_at(Path::new("/configs"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[paths].game_dir"), "{err}");
+        assert!(err.contains("network path"), "{err}");
+        for var in ["VICTORY_CACHE_DIR", "VICTORY_TEST_TITLES", "VICTORY_CONFIG"] {
+            let env = |k: &str| match k {
+                k if k == var => Some(OsString::from("\\\\nas\\victory")),
+                "HOME" => Some(abs("home")),
+                _ => None,
+            };
+            let err = if var == "VICTORY_CONFIG" {
+                explicit_config(env, None).unwrap_err()
+            } else {
+                Config::resolve(FilePaths::default(), None, env).unwrap_err()
+            }
+            .to_string();
+            assert!(err.contains(var), "{err}");
+            assert!(err.contains("network path"), "{err}");
         }
     }
 
