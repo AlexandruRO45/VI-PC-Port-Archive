@@ -2464,6 +2464,64 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// An ignore file git cannot read holds no rules: a `.gitignore` made
+    /// `000` only draws a warning, and the directory it names stays visible
+    /// and is refused, left empty. Nor is a directory named `.gitignore` an
+    /// ignore file, so a sibling it was meant to cover is refused too. The
+    /// directory a readable rule ignores is taken.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_judged_without_ignore_files_git_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "/kept/\n").unwrap();
+        let kept = root.join("kept");
+        let locked = root.join("locked/scratch");
+        let shaped = root.join("shaped/scratch");
+        for dir in [&kept, &locked, &shaped] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let rules = root.join("locked/.gitignore");
+        std::fs::write(&rules, "/scratch/\n").unwrap();
+        std::fs::create_dir(root.join("shaped/.gitignore")).unwrap();
+        std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let restore = || {
+            std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o644)).unwrap();
+        };
+        if std::fs::read(&rules).is_ok() {
+            // Root, or a capability like it, reads through the mode bits.
+            restore();
+            return;
+        }
+
+        let tmp = tempdir_in_first(root, [locked.clone(), shaped.clone(), kept.clone()]);
+        assert_eq!(tmp.path().parent(), Some(kept.as_path()));
+        for dir in [&locked, &shaped] {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        std::fs::write(locked.join("a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(shaped.join("b.rs"), b"fn b() {}\n").unwrap();
+        assert_eq!(
+            names(root, false),
+            [
+                ".gitignore",
+                "locked/.gitignore",
+                "locked/scratch/a.rs",
+                "shaped/scratch/b.rs"
+            ]
+        );
+        // Readable again, its rule holds.
+        restore();
+        assert_eq!(
+            names(root, false),
+            [".gitignore", "locked/.gitignore", "shaped/scratch/b.rs"]
+        );
+        super::run(root, false).unwrap();
+    }
+
     /// A tracked `.gitignore` is read from disk, not from `HEAD` or the
     /// index: rewritten there and left unstaged, its rule for `fresh` holds
     /// and `fresh` is taken, while `stale`, named only in the commit, and
