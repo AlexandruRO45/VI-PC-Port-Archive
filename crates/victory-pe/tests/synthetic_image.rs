@@ -862,3 +862,65 @@ fn rva_to_file_offset_stops_at_the_virtual_size_and_never_overflows() {
     assert_eq!(info.rva_to_file_offset(SECTION_RVA + 0x10), Some(u32::MAX));
     assert_eq!(info.rva_to_file_offset(SECTION_RVA + 0x11), None);
 }
+
+#[test]
+fn delay_import_slots_follow_the_name_table_eight_bytes_apart() {
+    // Move the delay name table and IAT to the free tail so each holds two
+    // entries: a name, then an ordinal, then the terminator.
+    const NAMES: u32 = 0x1350;
+    const SLOTS: u32 = 0x1370;
+    let mut d = image();
+    add_delay_import(&mut d);
+    put32(&mut d, at(DELAY_DESCRIPTORS) + 12, SLOTS);
+    put32(&mut d, at(DELAY_DESCRIPTORS) + 16, NAMES);
+    put64(&mut d, at(NAMES), u64::from(DELAY_HINT_NAME));
+    put64(&mut d, at(NAMES) + 8, (1 << 63) | 4);
+    let info = ImageInfo::parse(&d).unwrap();
+    let entries: Vec<_> = info.delay_imports[0]
+        .entries
+        .iter()
+        .map(|e| (e.symbol.clone(), e.iat_slot_rva))
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            (
+                ImportSymbol::Name {
+                    hint: 7,
+                    name: "MessageBoxW".into()
+                },
+                SLOTS
+            ),
+            (ImportSymbol::Ordinal(4), SLOTS + 8),
+        ]
+    );
+    // Ordinary imports are reported apart from delay imports.
+    assert_eq!(info.import_count(), 2);
+}
+
+#[test]
+fn an_iat_that_ends_exactly_at_the_size_of_image_is_inside_it() {
+    // Two slots, the second's last byte the image's last byte: accepted.
+    // One slot further is the case `rejects_iat_outside_image` covers.
+    let mut d = image();
+    let iat = SIZE_OF_IMAGE - 16;
+    put32(&mut d, at(IMPORT_DESCRIPTORS) + 16, iat);
+    let info = ImageInfo::parse(&d).unwrap();
+    let slots: Vec<_> = info.imports[0]
+        .entries
+        .iter()
+        .map(|e| e.iat_slot_rva)
+        .collect();
+    assert_eq!(slots, [iat, iat + 8]);
+}
+
+#[test]
+fn section_names_that_are_not_utf8_are_read_lossily() {
+    let mut d = image();
+    let name = OPT + 240;
+    d[name..name + 8].copy_from_slice(b".t\xFFxt\0\0\0");
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.sections[0].name, ".t\u{FFFD}xt");
+    // The rest of the image is unaffected by the name.
+    assert_eq!(info.rva_to_file_offset(ENTRY), Some(SECTION_FILE_OFFSET));
+}

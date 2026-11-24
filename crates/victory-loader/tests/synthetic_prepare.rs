@@ -814,3 +814,33 @@ fn a_section_table_that_hides_the_tls_directory_is_an_error() {
         Err(victory_loader::PrepareError::Patch(_))
     ));
 }
+
+#[test]
+fn only_the_relocation_of_the_callback_field_itself_is_cleared() {
+    // DIR64 entries four and eight bytes past the callbacks pointer (a
+    // misaligned one and one for SizeOfZeroFill, as a damaged table might
+    // hold) patch other RVAs, so they are not the pointer's and stay.
+    let mut original = image();
+    let block = file(RELOCS);
+    put32(&mut original, block + 4, 20);
+    let near = block + 14;
+    put16(&mut original, near, dir64(callbacks_field() + 4));
+    put16(&mut original, near + 2, dir64(callbacks_field() + 8));
+    put16(&mut original, near + 4, 0); // ABSOLUTE padding
+    set_dir(&mut original, dir::BASERELOC, RELOCS, 20);
+
+    let prepared = prepare(&original).unwrap();
+    assert_eq!(&prepared.bytes[callbacks_reloc()..][..2], &[0, 0]);
+    assert_eq!(
+        &prepared.bytes[near..near + 6],
+        &original[near..near + 6],
+        "neighbouring entries are left alone"
+    );
+    assert_eq!(
+        &prepared.bytes[block + 8..block + 10],
+        &original[block + 8..block + 10],
+        "so is the index pointer's entry"
+    );
+    let patched = ImageInfo::parse(&prepared.bytes).unwrap();
+    assert_eq!(patched.tls.unwrap().callbacks_va, 0);
+}

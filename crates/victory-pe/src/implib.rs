@@ -384,4 +384,33 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn ordinal_imports_keep_their_dll_and_kind() {
+        // By-ordinal objects still carry a symbol name; it is not the export,
+        // so two objects with one ordinal and different names are one entry.
+        let lib = ImportLibrary::parse(&archive(&[
+            short_import("b.dll", "x", 1, DATA, BY_ORDINAL),
+            short_import("a.dll", "y", 1, CODE, BY_ORDINAL),
+            short_import("a.dll", "z", 1, CODE, BY_ORDINAL),
+            short_import("a.dll", "w", 2, CODE, BY_ORDINAL),
+            short_import("a.dll", "Named", 1, CODE, BY_NAME),
+        ]))
+        .unwrap();
+        let ordinal = |dll: &str, o: u16, kind| LibImport {
+            dll: dll.into(),
+            export: ImportSymbol::Ordinal(o),
+            kind,
+        };
+        assert_eq!(
+            lib.imports,
+            [
+                name("a.dll", "Named", LibImportKind::Code),
+                ordinal("a.dll", 1, LibImportKind::Code),
+                ordinal("a.dll", 2, LibImportKind::Code),
+                ordinal("b.dll", 1, LibImportKind::Data),
+            ]
+        );
+        assert_eq!(lib.other_members, 0);
+    }
 }
