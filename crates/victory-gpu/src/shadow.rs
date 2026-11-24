@@ -202,9 +202,12 @@ impl Shadow {
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
             // From the pool: this runs once per range and submission, and a
-            // fresh 64 KiB buffer per call was an allocation and a memset of
-            // it for bytes `read_into` overwrites anyway.
+            // fresh 64 KiB buffer per call was an allocation. It comes back
+            // empty (the pool clears it), so it is sized here: the pieces are
+            // sliced out of it and `read_into` fills them, but a slice of an
+            // empty vector is a panic, not uninitialised bytes.
             let mut piece = pooled(PIECE);
+            piece.resize(PIECE, 0);
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
@@ -572,5 +575,118 @@ mod cost {
             );
         }
         println!();
+    }
+}
+
+#[cfg(test)]
+mod parallel_cost {
+    use super::*;
+    use std::time::Instant;
+
+    const RANGES: usize = 16;
+    const MIB: usize = 4;
+    const THREADS: usize = 8;
+
+    /// `RANGES` independent copies of `MIB`, each with 640 bytes of every
+    /// 64 KiB piece written as a shader would.
+    fn setup(size: usize) -> Option<(Vec<Vec<u8>>, Vec<Shadow>)> {
+        let host = crate::host::host()?;
+        let mut titles = Vec::new();
+        let mut shadows = Vec::new();
+        for _ in 0..RANGES {
+            let mut title = vec![0u8; size];
+            for (i, b) in title.iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+            let (buffer, data) = host.shared_buffer(size as u64)?;
+            // SAFETY: the mapping is `size` bytes.
+            let gpu = unsafe {
+                std::ptr::copy_nonoverlapping(title.as_ptr(), data, size);
+                buffer.GetGPUVirtualAddress()
+            };
+            let start = title.as_ptr() as usize;
+            shadows.push(Shadow::new(buffer, data.cast(), gpu, start as u64, size as u64));
+            titles.push(title);
+        }
+        Some((titles, shadows))
+    }
+
+    /// Copy-back of many independent ranges, one thread against eight: the
+    /// ranges a submission wrote are independent, so the work can be spread.
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture shadow_parallel`
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn shadow_parallel() {
+        let size = MIB << 20;
+        let dirty = |shadow: &Shadow| {
+            for at in (0..size).step_by(64 << 10) {
+                // SAFETY: inside the mapping.
+                unsafe {
+                    let piece = std::slice::from_raw_parts_mut(shadow.data.add(at).cast::<u8>(), 640);
+                    for b in piece.iter_mut() {
+                        *b = b.wrapping_add(1);
+                    }
+                }
+            }
+        };
+        let Some((titles, shadows)) = setup(size) else {
+            eprintln!("no host device or buffer");
+            return;
+        };
+        let starts: Vec<usize> = titles.iter().map(|t| t.as_ptr() as usize).collect();
+        for (shadow, start) in shadows.iter().zip(&starts) {
+            shadow.writing(*start, size);
+        }
+        for shadow in &shadows {
+            dirty(shadow);
+        }
+        for (i, shadow) in shadows.iter().enumerate() {
+            let b = shadow.before.lock().unwrap_or_else(|e| e.into_inner());
+            println!("shadow {i}: start={} len={} before={:?} writing start arg {}", shadow.start, shadow.len, b.as_ref().map(|(a, v)| (*a, v.len())), starts[i]);
+        }
+        let t = Instant::now();
+        let mut one = 0usize;
+        for (shadow, start) in shadows.iter().zip(&starts) {
+            one += shadow.copy_back(*start, size);
+        }
+        let sequential = t.elapsed();
+
+        let Some((titles2, shadows2)) = setup(size) else {
+            return;
+        };
+        let starts2: Vec<usize> = titles2.iter().map(|t| t.as_ptr() as usize).collect();
+        for (shadow, start) in shadows2.iter().zip(&starts2) {
+            shadow.writing(*start, size);
+        }
+        for shadow in &shadows2 {
+            dirty(shadow);
+        }
+        let per = RANGES.div_ceil(THREADS);
+        let t = Instant::now();
+        let many: usize = std::thread::scope(|s| {
+            let handles: Vec<_> = shadows2
+                .chunks(per)
+                .enumerate()
+                .map(|(i, part)| {
+                    let starts = &starts2;
+                    s.spawn(move || {
+                        part.iter()
+                            .enumerate()
+                            .map(|(k, shadow)| shadow.copy_back(starts[i * per + k], size))
+                            .sum::<usize>()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
+        });
+        let parallel = t.elapsed();
+        println!(
+            "\n{RANGES} x {MIB} MiB: sequential {:.1} ms, {THREADS} threads {:.1} ms, {:.2}x ({} vs {} bytes)\n",
+            sequential.as_secs_f64() * 1e3,
+            parallel.as_secs_f64() * 1e3,
+            sequential.as_secs_f64() / parallel.as_secs_f64(),
+            one,
+            many
+        );
     }
 }
