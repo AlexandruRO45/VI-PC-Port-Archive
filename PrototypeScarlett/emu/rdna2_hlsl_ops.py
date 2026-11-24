@@ -94,11 +94,11 @@ uint FmaLegacyF32(uint a, uint b, uint c) {
 // Round_ne d'une valeur connue à la compilation en arrondi « moitié loin de zéro » (2.5 → 3.0).
 uint RndneF32(uint a) {
   precise float x = asfloat(a);
-  if (!(abs(x) < 8388608.0f)) return a;                     // déjà entier, infini ou NaN
   precise float fl = floor(x);
   precise float rest = x - fl;
   bool up = rest > 0.5f || (rest == 0.5f && ((int)fl & 1) != 0);
-  return asuint(up ? fl + 1.0f : fl) | (a & 0x80000000u);   // signe gardé : -0.25 → -0.0
+  uint r = asuint(up ? fl + 1.0f : fl) | (a & 0x80000000u); // signe gardé : -0.25 → -0.0
+  return (abs(x) < 8388608.0f) ? r : a;                     // sinon déjà entier, infini ou NaN
 }
 uint PermB32(uint a, uint b, uint c) {
   uint r = 0u;

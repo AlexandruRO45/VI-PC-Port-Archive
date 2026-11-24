@@ -256,3 +256,12 @@ def test_v_rndne_f32_rounds_ties_to_even_on_gpu():
              for slot in range(len(values))]
     assert tuple(bits_float(bits) for bits in lane0) == rounded
     assert actual == expected
+
+
+def test_rndne_helper_has_a_single_return():
+    # Un return anticipé dans RndneF32 faisait mal compiler un v_bfrev_b32 voisin (bit 30 en trop) par le pilote
+    # AMD de la RX 9070 XT (rapporté sur la PR #160) : le résultat est calculé, puis choisi à la fin.
+    from emu.rdna2_hlsl_ops import HELPERS
+    start = HELPERS.index("uint RndneF32(")
+    body = HELPERS[start:HELPERS.index("\n}", start)]
+    assert body.count("return") == 1
