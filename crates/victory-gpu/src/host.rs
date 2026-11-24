@@ -5125,6 +5125,14 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
+            // The hold on the title-memory lock lasts for a run of texture
+            // refreshes and no longer: the lock's own contract is that it is
+            // never held across anything that maps title memory, and a hold
+            // reaching the end of the walk would span list execution and
+            // submission for the whole submission.
+            if !matches!(step, Step::Texture(_)) {
+                batch.reading = None;
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -5162,11 +5170,8 @@ impl HostList {
                         batch.title_written();
                     }
                     // A host step may take the title-memory read lock itself (a
-                    // rectangle's vertices are read in place at submission),
-                    // and a read taken twice on one thread with a writer
-                    // waiting is a deadlock: let go of ours first, and the next
-                    // texture takes it again.
-                    batch.reading = None;
+                    // rectangle's vertices are read in place at submission); the
+                    // hold was let go above for that reason.
                     work();
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
@@ -5198,6 +5203,12 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
+                    // The hold lasts for the run of texture refreshes it was
+                    // taken for and nothing else: the lock's own contract is
+                    // that it is not held across anything that maps title
+                    // memory, and a hold kept to the end of the walk would
+                    // span list execution and submission for the whole
+                    // submission.
                     if batch.texture_due(staging) {
                         if lock_each() {
                             // The old one-acquisition-a-texture path, kept as

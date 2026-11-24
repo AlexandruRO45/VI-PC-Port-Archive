@@ -7,13 +7,12 @@
 //! of a hope — the second process finds the object taken and leaves before it
 //! touches the GPU.
 //!
-//! The handle is created inheritable so every child this session starts
-//! inherits it, which is what keeps the exclusion true when a child outlives
-//! its parent: the object lives while any handle to it does, so an orphaned
-//! child still blocks the next launch. Such a child finds
-//! `VICTORY_SESSION_INHERITED` in its environment (set once, here, before any
-//! thread of ours exists) and holds its inherited handle instead of refusing
-//! itself.
+//! A child this session starts finds `VICTORY_SESSION_INHERITED` in its
+//! environment (set once, here, before any thread of ours exists), opens the
+//! name for itself and shares the parent's session instead of refusing itself.
+//! The handle is deliberately not inheritable: when it was, every process the
+//! title started inherited it — a console host among them — and a child that
+//! outlived the title kept the name taken with no session behind it.
 //!
 //! The name is in the `Global\` scope, which every session on the machine
 //! shares, and a mutex needs no privilege for it (`SeCreateGlobalPrivilege`
@@ -26,7 +25,19 @@
 use anyhow::Result;
 
 /// The session object's name, in the machine-wide `Global\` scope.
-const NAME: &str = "VIctory-title-session";
+///
+/// The suffix is not decoration. A handle that survives its owner keeps a
+/// mutex object alive while nobody holds it, and the guard refuses on
+/// `ERROR_ALREADY_EXISTS`, so one dead handle to the old name refused every
+/// launch on this machine with no session to show for it (2026-11-24: three
+/// launches in five seconds, no `victory.exe` alive, the object still
+/// openable). A new name is a new object and the corpse is irrelevant.
+///
+/// It also splits the fleet: a binary built before the rename speaks
+/// `VIctory-title-session` and will not refuse a session under this name, so
+/// every build on the machine has to be rebuilt before mixed binaries are
+/// trusted together.
+const NAME: &str = "VIctory-title-session-2";
 
 /// Set by the process that took the session; inherited by every child it
 /// starts, which then hold the inherited object instead of taking it again.
@@ -74,7 +85,7 @@ impl Drop for Session {
 /// can name a pid instead of guessing one from a process list. Session-local:
 /// a global mapping needs `SeCreateGlobalPrivilege`, which a global *mutex* may
 /// be made without, and every process of a session can open this one.
-const OWNER: &str = "Local\\VIctory-title-owner";
+const OWNER: &str = "Local\\VIctory-title-owner-2";
 
 /// What both refusals say first: the fact, and who may end it.
 fn stopping() -> &'static str {
@@ -184,12 +195,18 @@ mod imp {
     /// second session start beside it — silently, and only in that direction.
     fn make(name: &str) -> anyhow::Result<HANDLE> {
         let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
-        // An inheritable handle is what keeps the exclusion alive in a child
-        // that outlives this process.
+        // Not inheritable, deliberately. A child of this session opens the
+        // name for itself (`inherited`), so the exclusion survives a child that
+        // outlives this process without the handle being handed to every
+        // process the title starts — a console host that inherits it keeps the
+        // session name taken after the title is gone, and then every launch on
+        // the machine refuses with no session to show for it. Measured on
+        // 2026-11-24: three launches refused, no `victory.exe` alive, and
+        // `Global\VIctory-title-session` still openable.
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: std::ptr::null_mut(),
-            bInheritHandle: 1,
+            bInheritHandle: 0,
         };
         // SAFETY: a null-terminated name, a security descriptor that only asks
         // for inheritance, and no initial ownership.
