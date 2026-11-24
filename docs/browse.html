@@ -12,8 +12,8 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
 <style>
-.top { padding:44px 0 22px; }
-.top h1 { font-size:clamp(30px, 4.6vw, 46px); line-height:1.05; margin:8px 0 8px; }
+.top { padding:36px 0 20px; }
+.top h1 { font-size:clamp(28px, 4vw, 36px); line-height:1.1; margin:0 0 6px; }
 .top p { margin:0; color:var(--ink2); max-width:64ch; }
 .tabs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px; }
 .tabs button, select, input { font:inherit; color:var(--ink); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px 13px; }
@@ -47,15 +47,14 @@
 <nav class="nav" aria-label="Site"><div class="wrap">
   <a class="brand" href="./"><i aria-hidden="true"><b></b><b></b><b></b><b></b></i><span>GTA6 PC Port Archive</span></a>
   <ul>
-    <li><a href="./#activity">Activity</a></li><li><a href="./#projects">Projects</a></li>
-    <li><a href="./#people">People</a></li><li><a href="./#code">Get the code</a></li><li><a href="./#links">Links</a></li><li><a href="browse.html" aria-current="page">Browse</a></li>
+    <li><a href="./#projects">Projects</a></li><li><a href="./#activity">Activity</a></li><li><a href="./#people">People</a></li>
+    <li><a href="./#code">Code</a></li><li><a href="./#links">Links</a></li><li><a href="browse.html" aria-current="page">Browse issues</a></li>
   </ul>
 </div></nav>
 <main class="wrap">
   <div class="top">
-    <div class="label">Issues · pull requests · comments</div>
     <h1>Browse the archive</h1>
-    <p>Every issue and pull request from the four projects, with all their comments. Search by text, author name, or <code>#number</code>.</p>
+    <p>Search by text, author, or <code>#number</code>.</p>
   </div>
   <div class="tabs" id="tabs" role="group" aria-label="Project"></div>
   <div class="controls">
