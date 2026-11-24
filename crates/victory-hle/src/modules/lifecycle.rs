@@ -457,6 +457,47 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn sigterm_suspends_the_title_then_ends_the_process() {
+        extern "win64" fn routine(quiesced: u8, pipe: *mut c_void) {
+            // SAFETY: one byte to the test's pipe.
+            unsafe { libc::write(pipe as usize as i32, (&raw const quiesced).cast(), 1) };
+        }
+        let mut fds = [0; 2];
+        // SAFETY: pipe fills the two descriptors.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: the child installs the handler, registers and raises; it
+        // leaves only through `_exit`.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            end_on_signals();
+            let mut id = 0;
+            RegisterAppStateChangeNotification(Some(routine), fds[1] as usize as *mut c_void, &mut id);
+            // SAFETY: signals ourselves; the handler only writes a pipe.
+            unsafe { libc::raise(libc::SIGTERM) };
+            std::thread::sleep(Duration::from_secs(10));
+            // SAFETY: ends the child, never reached if the signal worked.
+            unsafe { libc::_exit(3) };
+        }
+        let mut status = 0;
+        let started = std::time::Instant::now();
+        // SAFETY: waits for our own child without blocking.
+        while unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == 0 {
+            if started.elapsed() > Duration::from_secs(20) {
+                // SAFETY: our own child.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                panic!("the child did not end");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "{status:#x}");
+        let mut quiesced = 0u8;
+        // SAFETY: reads the byte the routine wrote.
+        assert_eq!(unsafe { libc::read(fds[0], (&raw mut quiesced).cast(), 1) }, 1);
+        assert_eq!(quiesced, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn a_relaunch_waits_for_the_previous_process() {
         let mut child = std::process::Command::new("sleep").arg("0.3").spawn().unwrap();
         // SAFETY: no other test reads this variable.
