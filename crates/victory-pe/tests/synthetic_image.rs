@@ -465,3 +465,118 @@ fn layout_offsets_match_the_image() {
     put32(&mut d, layout::DOS_E_LFANEW, u32::MAX);
     assert_eq!(layout::data_directory_offset(&d, dir::IMPORT), None);
 }
+
+#[test]
+fn reads_names_from_the_iat_when_the_name_table_is_absent() {
+    // Old linkers leave OriginalFirstThunk at 0; the IAT holds the names.
+    let mut d = image();
+    put32(&mut d, at(IMPORT_DESCRIPTORS), 0);
+    d[at(NAME_TABLE)..at(NAME_TABLE) + 16].fill(0);
+    let info = ImageInfo::parse(&d).unwrap();
+    let entries: Vec<_> = info.imports[0]
+        .entries
+        .iter()
+        .map(|e| (e.symbol.clone(), e.iat_slot_rva))
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            (
+                ImportSymbol::Name {
+                    hint: 0x123,
+                    name: "ExitProcess".into()
+                },
+                IAT
+            ),
+            (ImportSymbol::Ordinal(5), IAT + 8),
+        ]
+    );
+}
+
+#[test]
+fn tls_directory_without_callbacks_or_without_an_rva() {
+    // A TLS directory with no callback array is still TLS (static data).
+    let mut d = image();
+    put64(
+        &mut d,
+        at(TLS_DIRECTORY) + layout::TLS64_ADDRESS_OF_CALLBACKS,
+        0,
+    );
+    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
+    assert_eq!((tls.callbacks_va, tls.callback_rvas.len()), (0, 0));
+
+    // A directory entry with RVA 0 means no TLS at all.
+    let mut d = image();
+    set_directory(&mut d, DIR_TLS, 0, 40);
+    assert!(ImageInfo::parse(&d).unwrap().tls.is_none());
+
+    // So does an image whose header lists no TLS directory slot.
+    let mut d = image();
+    put32(
+        &mut d,
+        OPT + layout::OPT_NUMBER_OF_RVA_AND_SIZES,
+        DIR_TLS as u32,
+    );
+    assert!(ImageInfo::parse(&d).unwrap().tls.is_none());
+}
+
+#[test]
+fn tls_callback_array_stops_at_the_end_of_the_section() {
+    // The last slot of the section, with no null terminator after it.
+    let last = SECTION_RVA + SECTION_SIZE - 8;
+    let mut d = image();
+    put64(
+        &mut d,
+        at(TLS_DIRECTORY) + layout::TLS64_ADDRESS_OF_CALLBACKS,
+        IMAGE_BASE + u64::from(last),
+    );
+    put64(&mut d, at(last), IMAGE_BASE + 0x1030);
+    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
+    assert_eq!(tls.callback_rvas, [0x1030]);
+}
+
+#[test]
+fn rejects_tls_outside_the_sections() {
+    let malformed = |d: &[u8], what: &str| {
+        assert!(
+            matches!(ImageInfo::parse(d), Err(PeError::Malformed(_))),
+            "{what}"
+        );
+    };
+    let callbacks = at(TLS_DIRECTORY) + layout::TLS64_ADDRESS_OF_CALLBACKS;
+
+    // Inside the image but past the only section.
+    let mut d = image();
+    set_directory(&mut d, DIR_TLS, SECTION_RVA + SECTION_SIZE + 0x100, 40);
+    malformed(&d, "directory past the section");
+
+    // Too close to the end of the section to hold AddressOfCallBacks.
+    let mut d = image();
+    set_directory(&mut d, DIR_TLS, SECTION_RVA + SECTION_SIZE - 0x10, 40);
+    malformed(&d, "truncated directory");
+
+    let mut d = image();
+    put64(
+        &mut d,
+        callbacks,
+        IMAGE_BASE + u64::from(SECTION_RVA + SECTION_SIZE + 0x100),
+    );
+    malformed(&d, "callback array past the section");
+
+    let mut d = image();
+    put64(&mut d, callbacks, IMAGE_BASE - 8);
+    malformed(&d, "callback array below the image base");
+
+    // A callback 4 GiB or more above the base has no RVA.
+    let mut d = image();
+    put64(&mut d, at(TLS_CALLBACKS) + 8, IMAGE_BASE + (1 << 32));
+    malformed(&d, "callback past 4 GiB");
+}
+
+#[test]
+fn rejects_pe32_images() {
+    // Same image, 32-bit optional header magic: PE32 is not supported.
+    let mut d = image();
+    put16(&mut d, OPT, 0x10B);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Unsupported(_))));
+}
