@@ -114,7 +114,19 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
 }
 
 /// Adds the problems with one file's content, reported as `label`.
-fn check_content(path: &str, label: &str, content: &[u8], violations: &mut Vec<String>) {
+fn check_content(path: &str, label: &str, content: &Content, violations: &mut Vec<String>) {
+    if content.size > content.head.len() as u64 {
+        // Only the start was read: no exception covers it, since the one
+        // exempted content is within the limit, and the start shows the rest.
+        violations.push(format!(
+            "{label}: {} bytes exceeds the {MAX_FILE_SIZE}-byte limit",
+            content.size
+        ));
+        for problem in check(path, content) {
+            violations.push(format!("{label}: {problem}"));
+        }
+        return;
+    }
     if let Some(problem) = exempt(path, content) {
         if let Err(problem) = problem {
             violations.push(format!("{label}: {problem}"));
@@ -126,13 +138,50 @@ fn check_content(path: &str, label: &str, content: &[u8], violations: &mut Vec<S
     }
 }
 
+/// Content as read: at most the first `MAX_FILE_SIZE` bytes, and the size of
+/// the whole.
+///
+/// A file over the limit is refused whatever it holds, and is read no
+/// further: a game dump or disc image of several gigabytes left in the
+/// checkout (untracked, not ignored) or staged by mistake was read into
+/// memory whole before being refused as too big, and could exhaust it.
+/// The rest is still streamed through, without being kept, to count it.
+#[derive(Debug, PartialEq)]
+struct Content {
+    head: Vec<u8>,
+    size: u64,
+}
+
+impl std::ops::Deref for Content {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.head
+    }
+}
+
+impl Content {
+    fn read(reader: impl std::io::Read) -> std::io::Result<Self> {
+        use std::io::Read;
+        let mut reader = reader;
+        let mut head = Vec::new();
+        (&mut reader)
+            .take(MAX_FILE_SIZE as u64)
+            .read_to_end(&mut head)?;
+        let rest = std::io::copy(&mut reader, &mut std::io::sink())?;
+        Ok(Self {
+            size: head.len() as u64 + rest,
+            head,
+        })
+    }
+}
+
 /// The index's blob for every tracked file of the full check, by object id,
 /// read with one `git cat-file --batch` rather than a process per file;
 /// `None` for an object git does not have.
 fn indexed_blobs(
     root: &Path,
     files: &[File],
-) -> Result<std::collections::HashMap<String, Option<Vec<u8>>>> {
+) -> Result<std::collections::HashMap<String, Option<Content>>> {
     use std::io::{BufRead, Read, Write};
     let mut oids: Vec<&str> = files
         .iter()
@@ -175,11 +224,10 @@ fn indexed_blobs(
             blobs.insert((*oid).to_owned(), None);
             continue;
         };
-        let mut content = Vec::new();
-        (&mut out)
-            .take(size)
-            .read_to_end(&mut content)
-            .context("reading git cat-file")?;
+        let content = Content::read((&mut out).take(size)).context("reading git cat-file")?;
+        if content.size != size {
+            bail!("git cat-file ended early");
+        }
         out.read_exact(&mut [0]).context("reading git cat-file")?;
         blobs.insert((*oid).to_owned(), Some(content));
     }
@@ -212,7 +260,7 @@ enum Source {
 /// The content to check; `Ok(None)` if there is nothing to check (a file
 /// gone from both the working tree and the index), `Err` with the problem if
 /// a path the check cannot read must not pass unread.
-fn read(root: &Path, file: &File) -> Result<Option<Vec<u8>>, String> {
+fn read(root: &Path, file: &File) -> Result<Option<Content>, String> {
     match &file.source {
         Source::Index { mode, .. } if mode == "160000" => {
             Err("a submodule: content from another repository bypasses this check".to_owned())
@@ -235,7 +283,9 @@ fn read(root: &Path, file: &File) -> Result<Option<Vec<u8>>, String> {
             };
             if kind.is_symlink() {
                 let target = std::fs::read_link(path).map_err(|e| format!("cannot read: {e}"))?;
-                return Ok(Some(link_bytes(&target)));
+                let head = link_bytes(&target);
+                let size = head.len() as u64;
+                return Ok(Some(Content { head, size }));
             }
             if kind.is_dir() {
                 // `git ls-files --others` lists an untracked repository
@@ -251,7 +301,8 @@ fn read(root: &Path, file: &File) -> Result<Option<Vec<u8>>, String> {
                 // A FIFO or device: reading it could block or never end.
                 return Err("not a regular file".to_owned());
             }
-            std::fs::read(path)
+            std::fs::File::open(path)
+                .and_then(Content::read)
                 .map(Some)
                 .map_err(|e| format!("cannot read: {e}"))
         }
@@ -260,15 +311,19 @@ fn read(root: &Path, file: &File) -> Result<Option<Vec<u8>>, String> {
 
 /// A blob's content. By object id, not `:<path>`, so no file name can make
 /// it fail.
-fn read_blob(root: &Path, oid: &str) -> Result<Vec<u8>, String> {
-    let out = git_command(root)
+/// Streamed, so a blob over the limit is not held in memory whole.
+fn read_blob(root: &Path, oid: &str) -> Result<Content, String> {
+    let mut child = git_command(root)
         .args(["cat-file", "blob", oid])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .map_err(|e| format!("cannot run git: {e}"))?;
-    if out.status.success() {
-        Ok(out.stdout)
-    } else {
-        Err("cannot read the indexed content".to_owned())
+    let content = child.stdout.take().map(Content::read);
+    let status = child.wait().map_err(|e| format!("cannot run git: {e}"))?;
+    match content {
+        Some(Ok(content)) if status.success() => Ok(content),
+        _ => Err("cannot read the indexed content".to_owned()),
     }
 }
 
@@ -1268,6 +1323,53 @@ mod tests {
         // Text on disk over text in the index is read once.
         std::fs::write(root.join("a.rs"), b"fn a() { 1 }\n").unwrap();
         super::run(root, false).unwrap();
+    }
+
+    /// A file over the limit is read no further than the limit, on disk, in
+    /// the index and when staged, and is refused with its whole size.
+    #[cfg(unix)]
+    #[test]
+    fn files_over_the_limit_are_not_read_whole() {
+        const BIG: u64 = 8 << 20;
+        let tmp = tempdir();
+        let root = tmp.path();
+        git_str(root, &["init", "-q"]);
+        // Sparse, so the test writes almost nothing to disk.
+        std::fs::File::create(root.join("game.rs"))
+            .unwrap()
+            .set_len(BIG)
+            .unwrap();
+        let read = |staged: bool| {
+            let files = super::list_files(root, staged).unwrap();
+            assert_eq!(files.len(), 1);
+            let content = super::read(root, &files[0]).unwrap().unwrap();
+            assert_eq!(content.size, BIG);
+            assert_eq!(content.head.len(), super::MAX_FILE_SIZE);
+        };
+        read(false);
+        assert!(super::run(root, false).is_err(), "untracked");
+
+        git_str(root, &["add", "game.rs"]);
+        read(true);
+        assert!(super::run(root, true).is_err(), "staged");
+        std::fs::write(root.join("game.rs"), b"fn game() {}\n").unwrap();
+        let files = super::list_files(root, false).unwrap();
+        let indexed = super::indexed_blobs(root, &files).unwrap();
+        let blob = indexed.values().next().unwrap().as_ref().unwrap();
+        assert_eq!((blob.size, blob.head.len()), (BIG, super::MAX_FILE_SIZE));
+        assert!(super::run(root, false).is_err(), "as indexed");
+
+        // At the limit exactly, the whole file is read and nothing is cut.
+        let edge = vec![b'\n'; super::MAX_FILE_SIZE];
+        let content = super::Content::read(&edge[..]).unwrap();
+        assert_eq!(
+            (content.size, content.head.len()),
+            (edge.len() as u64, edge.len())
+        );
+        std::fs::write(root.join("game.rs"), &edge).unwrap();
+        git_str(root, &["add", "game.rs"]);
+        super::run(root, false).unwrap();
+        super::run(root, true).unwrap();
     }
 
     /// A conflicted path has one index entry per stage, and the full check
