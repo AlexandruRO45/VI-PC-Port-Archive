@@ -3910,6 +3910,107 @@ mod tests {
         assert!(err.contains("VICTORY_GAMEDIR is set"), "{err}");
     }
 
+    /// Base folders set empty or relative are skipped, as [`default_dir`]
+    /// skips them, and each kept one is named by its variable or `~/` path.
+    #[test]
+    fn user_bases_skip_empty_and_relative_values() {
+        let home = PathBuf::from(abs("home"));
+        let roaming = PathBuf::from(abs("roaming"));
+        let env = |k: &str| match k {
+            "HOME" => Some(home.clone().into()),
+            "XDG_CACHE_HOME" => Some(OsString::new()),
+            "XDG_DATA_HOME" => Some("share".into()),
+            "XDG_CONFIG_HOME" => Some("./cfg".into()),
+            "APPDATA" => Some(roaming.clone().into()),
+            _ => None,
+        };
+        let bases = user_bases(env);
+        let names: Vec<&str> = bases.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "APPDATA",
+                "~/.cache",
+                "~/.local/share",
+                "~/.local/state",
+                "~/.config",
+                "~/.local"
+            ]
+        );
+        assert_eq!(bases[0].0, roaming);
+        assert_eq!(bases[1].0, home.join(".cache"));
+        // No absolute home: only the variables that are absolute themselves.
+        let env = |k: &str| match k {
+            "HOME" => Some("me".into()),
+            "XDG_STATE_HOME" => Some(abs("st")),
+            _ => None,
+        };
+        let bases = user_bases(env);
+        assert_eq!(bases, [(PathBuf::from(abs("st")), "XDG_STATE_HOME".into())]);
+        assert!(user_bases(|_| None).is_empty());
+    }
+
+    /// `%APPDATA%` is shared like `%LOCALAPPDATA%`, on every host, and a
+    /// relative `XDG_CONFIG_HOME` does not hide `~/.config`.
+    #[test]
+    fn cache_or_data_at_appdata_or_a_relative_xdg_fallback_is_refused() {
+        let home = PathBuf::from(abs("home"));
+        let roaming = PathBuf::from(abs("roaming"));
+        let run = |key: &'static str, value: PathBuf| {
+            let (home, roaming) = (home.clone(), roaming.clone());
+            let env = move |k: &str| match k {
+                "HOME" => Some(home.clone().into()),
+                "APPDATA" => Some(roaming.clone().into()),
+                "XDG_CONFIG_HOME" => Some("cfg".into()),
+                k if k == key => Some(value.clone().into()),
+                _ => None,
+            };
+            Config::resolve(FilePaths::default(), None, env)
+        };
+        let err = run("VICTORY_DATA_DIR", roaming.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is your shared APPDATA folder"), "{err}");
+        assert!(
+            err.contains(&roaming.join("victory").display().to_string()),
+            "{err}"
+        );
+        let err = run("VICTORY_CACHE_DIR", home.join(".config"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is your shared ~/.config folder"), "{err}");
+        // Victory's own folder inside either is fine.
+        run("VICTORY_DATA_DIR", roaming.join("victory")).unwrap();
+        run("VICTORY_CACHE_DIR", home.join(".config").join("victory")).unwrap();
+    }
+
+    /// A relative `XDG_CACHE_HOME` is skipped like an unset one, so data
+    /// under `~/.cache` is still refused and named that way; with no
+    /// absolute home and no absolute `XDG_CACHE_HOME` there is no user cache
+    /// to compare with, so nothing is refused.
+    #[test]
+    fn user_cache_check_skips_a_relative_xdg_cache_home() {
+        let home = PathBuf::from(abs("home"));
+        let data = home.join(".cache").join("saves");
+        let env = |k: &str| match k {
+            "HOME" => Some(home.clone().into()),
+            "XDG_CACHE_HOME" => Some("rel-cache".into()),
+            _ => None,
+        };
+        let err = ensure_data_outside_user_cache(&data, Origin::Env("VICTORY_DATA_DIR"), env)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("(~/.cache)"), "{err}");
+        assert!(err.contains("(from VICTORY_DATA_DIR)"), "{err}");
+        let env = |k: &str| match k {
+            "HOME" => Some("home".into()),
+            "XDG_CACHE_HOME" => Some("rel-cache".into()),
+            _ => None,
+        };
+        ensure_data_outside_user_cache(&data, Origin::Env("VICTORY_DATA_DIR"), env).unwrap();
+        ensure_data_outside_user_cache(&data, Origin::Default, |_| None).unwrap();
+    }
+
     fn abs(p: &str) -> OsString {
         if cfg!(windows) {
             format!("C:\\{p}").into()
