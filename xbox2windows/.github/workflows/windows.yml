@@ -1,0 +1,278 @@
+name: Windows checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pixel-binary:
+    name: Assemble and translate gfx1013 fixtures
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Check the GPU report summary and submit path
+        run: python3 -B tests/gpu_report_format_check.py
+      - name: Check machine-code inputs with LLVM 15
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends llvm-15 spirv-tools spirv-cross
+          python3 -B tests/spirv_window/sampler.py spirv-as spirv-val spirv-cross
+          python3 -B tests/spirv_window/ballot.py spirv-as spirv-val spirv-cross
+          python3 -B tests/spirv_window/check.py
+          python3 -B tests/spirv_window/compare_sampler.py spirv-as spirv-val spirv-cross
+          python3 -B tests/sampled_coverage_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/depth_mask_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/pixel_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/pixel_compare_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/mesh_indexed_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/mesh_entry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/mesh_descriptor_swap_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/mesh_lit_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/mesh_shadow_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          python3 -B tests/ffx_dispatch_aot_check.py llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+          LLVM_LIB=libLLVM-15.so.1 LLVM_MC=llvm-mc-15 LLVM_OBJCOPY=llvm-objcopy-15 python3 -B tests/rdna2_tools_check.py
+  python-linux:
+    name: Run platform-independent Python checks on Linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: '3.12'
+      - name: Install fixture dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run Python checks
+        run: |
+          python -B tests/script_state_check.py
+          python -B tests/resource_root_check.py
+          python -B tests/bcpack_check.py
+          python -B tests/bcpack_symbols_check.py
+          python -B tests/bc7_blocks_check.py
+          python -B tests/bc7_tiles_check.py
+          python -B tests/gfx10_texture_roundtrip_check.py
+          python -B tests/texture_bc_volume_check.py
+          python -B tests/form_coverage_check.py
+          python -B tests/resource_ranges_check.py
+          python -B tests/ttpf_batch_export_check.py
+          python -B tests/awc_metadata_check.py
+          python -B tests/sgd5_effects_check.py
+          python -B tests/dxcontainer_part_offsets_check.py
+          python -B tests/layout_chunks_check.py
+          python -B tests/dependency_paths_check.py
+          python -B tests/pe_package_preflight_check.py
+          python -B tests/pe_package_ordinal_plan_check.py
+          python -B tests/compat_report_check.py
+          python -B tests/intake/paths_check.py
+          python -B tests/intake/routing_check.py
+          python -B tests/intake/import_forms_check.py
+          python -B tests/shader_probe_check.py
+          python -B tests/shader_census_check.py
+          python -B tests/shader_corpus_report_check.py
+          python -B tests/dxil_retarget_check.py
+          python -B tests/rdna2_tools_check.py
+          python -B tests/pso_readiness_check.py
+          python -B tests/xmem_attribute_scan_check.py
+          python -B tests/xgameruntime_table_check.py
+          python -B tests/docs_links_check.py
+          python -B tests/bidi_controls_check.py
+          python -B tests/hardware_reports_check.py
+          python -B tests/rectlist_topology_check.py
+  build-and-test:
+    name: Build and test on Windows
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install fixture dependencies
+        shell: pwsh
+        run: |
+          python -m venv out/pe-env
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          .\out\pe-env\Scripts\python.exe -m pip install -r requirements-dev.txt
+      - name: Identify the MSVC toolset
+        id: toolset
+        shell: pwsh
+        run: |
+          .\tools\dev.ps1
+          "msvc=$env:VCToolsVersion" >> $env:GITHUB_OUTPUT
+      - name: Restore the pinned SPIR-V tools
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: out/tools/spirv/bin
+          key: spirv-cli-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-${{ hashFiles('tools/setup-spirv-tools.ps1', 'tools/patches/spirv-cross-minlod.patch') }}
+      - name: Build the pinned SPIR-V tools
+        shell: pwsh
+        run: .\tools\setup-spirv-tools.ps1
+      - name: Configure, build and run PC tests
+        shell: pwsh
+        env:
+          X2W_REQUIRE_SPIRV_TOOLS: '1'
+        run: |
+          .\tools\dev.ps1
+          cmake --preset dev
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build --preset dev
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ctest --preset dev --no-tests=error -E '_hardware$' --output-junit "$PWD/out/test-results.xml"
+      - name: Require the SPIR-V bridge WARP tests
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: ./out/pe-env/Scripts/python.exe -B tests/spirv_window/require_warp_results.py out/test-results.xml
+      - name: Draw the coverage dashboard
+        shell: pwsh
+        run: |
+          ./out/pe-env/Scripts/python.exe -B tools/form_coverage.py out/test-results.xml --json out/coverage/coverage.json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./out/pe-env/Scripts/python.exe -B tools/coverage_svg.py out/coverage/coverage.json out/coverage/dashboard.svg `
+            --source "$($env:GITHUB_SHA.Substring(0, 7)), Windows CI run $env:GITHUB_RUN_ID, WARP"
+      - name: Upload coverage dashboard
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-dashboard
+          path: out/coverage/dashboard.svg
+          if-no-files-found: error
+          overwrite: true
+      - name: Build and smoke-test the standalone GPU check
+        shell: pwsh
+        run: .\tools\package-gpu-check.ps1
+      - name: Upload verified GPU check
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gpu-check-windows-x64
+          path: |
+            out/gpu-check/Xbox2Windows-GpuCheck-win-x64.zip
+            out/gpu-check/Xbox2Windows-GpuCheck-win-x64.zip.sha256
+          if-no-files-found: error
+  build-and-test-release:
+    name: Build and test on Windows at /O2
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install fixture dependencies
+        shell: pwsh
+        run: |
+          python -m venv out/pe-env
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          .\out\pe-env\Scripts\python.exe -m pip install -r requirements-dev.txt
+      - name: Identify the MSVC toolset
+        id: toolset
+        shell: pwsh
+        run: |
+          .\tools\dev.ps1
+          "msvc=$env:VCToolsVersion" >> $env:GITHUB_OUTPUT
+      - name: Restore the pinned SPIR-V tools
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: out/tools/spirv/bin
+          key: spirv-cli-${{ runner.os }}-msvc-${{ steps.toolset.outputs.msvc }}-${{ hashFiles('tools/setup-spirv-tools.ps1', 'tools/patches/spirv-cross-minlod.patch') }}
+      - name: Build the pinned SPIR-V tools
+        shell: pwsh
+        run: .\tools\setup-spirv-tools.ps1
+      - name: Configure, build and run PC tests at /O2
+        shell: pwsh
+        env:
+          X2W_REQUIRE_SPIRV_TOOLS: '1'
+        run: |
+          .\tools\dev.ps1
+          cmake --preset release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build --preset release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ctest --preset release --no-tests=error -E '_hardware$' --output-junit "$PWD/out/test-results-release.xml"
+      - name: Require the SPIR-V bridge WARP tests at /O2
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: ./out/pe-env/Scripts/python.exe -B tests/spirv_window/require_warp_results.py out/test-results-release.xml
+
+  publish-coverage:
+    name: Publish the coverage chart
+    needs: [build-and-test, build-and-test-release]
+    if: >-
+      github.repository == 'R0Y00/Xbox2Windows' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: coverage-dashboard
+          path: chart
+      - name: Publish SVG and provenance together
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The artifact is data. This job does not check out or run repository code.
+          cd chart
+          test -s dashboard.svg
+          grep -Fq "Measured on ${GITHUB_SHA:0:7}, Windows CI run ${GITHUB_RUN_ID}, WARP." dashboard.svg
+          cat > README.md <<EOF
+          # Instruction coverage
+
+          [Source commit \`${GITHUB_SHA:0:7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) · [Windows CI run $GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT)
+
+          ![Instruction coverage for the measured Windows run](dashboard.svg)
+          EOF
+
+          git init --quiet
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          printf '::add-mask::%s\n' "$auth"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+          git add -- dashboard.svg README.md
+          tree=$(git write-tree)
+          ref=refs/heads/coverage-dashboard
+          subject="Coverage run $GITHUB_RUN_NUMBER"
+
+          # Retry a concurrent update without force-pushing or publishing an older run.
+          for attempt in 1 2 3; do
+            parent=$(git ls-remote origin "$ref")
+            parents=()
+            if [[ -n $parent ]]; then
+              git fetch --quiet --depth=1 origin "$ref"
+              previous=$(git log -1 --format=%s FETCH_HEAD)
+              if [[ $previous =~ ^Coverage\ run\ ([0-9]+)$ ]] &&
+                 (( BASH_REMATCH[1] >= GITHUB_RUN_NUMBER )); then
+                exit 0
+              fi
+              parents=(-p FETCH_HEAD)
+            fi
+            commit=$(git commit-tree "$tree" "${parents[@]}" -m "$subject")
+            if git push origin "$commit:$ref"; then
+              exit 0
+            fi
+            sleep "$attempt"
+          done
+          exit 1

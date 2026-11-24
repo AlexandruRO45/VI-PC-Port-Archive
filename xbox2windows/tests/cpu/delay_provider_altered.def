@@ -1,0 +1,5 @@
+LIBRARY cpu_delay_provider_altered
+
+EXPORTS
+    delayed_value
+    delayed_ordinal @2 NONAME

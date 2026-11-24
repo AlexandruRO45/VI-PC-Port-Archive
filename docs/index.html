@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GTA6 PC Port Archive</title>
+<meta name="description" content="Archive of Leonida, xcl, VIctory and Xbox2Windows: open-source projects that worked on running GTA VI on PC. Code, commit history, pull requests, issues and comments.">
+<script>
+  // old links pointed issues at index.html#project/number; they live on browse.html now
+  if (/^#(leonida|xcl|victory|xbox2windows)(\/\d+)?$/.test(location.hash)) location.replace("browse.html" + location.hash);
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<style>
+/* hero */
+.hero { padding:72px 0 0; }
+.hero h1 { font-size:clamp(38px, 7vw, 84px); line-height:.98; font-weight:700; margin:18px 0 22px; max-width:15ch; }
+.hero h1 em { font-style:normal; color:var(--muted); }
+.hero .lede { font-size:clamp(16px, 1.6vw, 19px); color:var(--ink2); max-width:58ch; margin:0; }
+.hero .cta { display:flex; gap:10px; flex-wrap:wrap; margin-top:30px; }
+.figures { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); margin-top:64px; border-top:1px solid var(--line); }
+.figures div { padding:18px 18px 0 0; }
+.figures div + div { padding-left:18px; border-left:1px solid var(--line); }
+.figures b { display:block; font-family:var(--display); font-size:clamp(28px, 4vw, 46px); line-height:1.05; letter-spacing:-.03em; font-variant-numeric:tabular-nums; }
+@media (max-width:700px) {
+  .figures { grid-template-columns:repeat(2, minmax(0, 1fr)); }
+  .figures div:nth-child(3) { padding-left:0; border-left:0; }
+  .figures div:nth-child(n+3) { border-top:1px solid var(--line); margin-top:18px; }
+}
+
+/* important links */
+.ilinks { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:14px; }
+@media (max-width:700px) { .ilinks { grid-template-columns:1fr; } }
+.ilink { display:flex; flex-direction:column; justify-content:space-between; gap:40px; min-height:200px; padding:24px; border:1px solid var(--ink); border-radius:14px; text-decoration:none; background:var(--panel); transition:background .15s, color .15s; }
+.ilink:hover { background:var(--ink); color:var(--bg); }
+.ilink:hover .label { color:inherit; opacity:.7; }
+.ilink .top { display:flex; justify-content:space-between; align-items:center; }
+.ilink .arrow { font-size:26px; line-height:1; transition:transform .15s; }
+.ilink:hover .arrow { transform:translate(3px, -3px); }
+.ilink .name { font-family:var(--display); font-weight:700; font-size:clamp(30px, 4.4vw, 52px); letter-spacing:-.03em; line-height:1; overflow-wrap:anywhere; }
+
+/* activity chart: small multiples, one row per project */
+.chart { position:relative; }
+.legend { display:flex; flex-wrap:wrap; gap:6px 18px; margin-bottom:14px; font-size:13px; color:var(--ink2); }
+.legend span { display:inline-flex; align-items:center; gap:7px; }
+.crow { display:grid; grid-template-columns:190px minmax(0, 1fr); gap:16px; align-items:end; padding:10px 0; border-bottom:1px solid var(--line); }
+.crow .who { padding-bottom:2px; }
+.crow .who b { display:flex; align-items:center; gap:8px; font-family:var(--display); font-size:17px; }
+.crow .who span { font-size:12.5px; color:var(--muted); }
+.crow svg { display:block; width:100%; height:72px; overflow:visible; }
+.axis { display:grid; grid-template-columns:190px minmax(0, 1fr); gap:16px; }
+.axis div { position:relative; height:28px; }
+.axis span { position:absolute; top:6px; font-family:var(--mono); font-size:11.5px; color:var(--muted); white-space:nowrap; border-left:1px solid var(--line); padding-left:6px; }
+@media (max-width:700px) {
+  .crow, .axis { grid-template-columns:minmax(0, 1fr); gap:6px; }
+  .axis > :first-child { display:none; }
+  .crow svg { height:56px; }
+}
+.plot { cursor:crosshair; outline:none; }
+.tip { position:absolute; pointer-events:none; z-index:5; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:13px; box-shadow:0 8px 24px rgba(0,0,0,.14); min-width:180px; display:none; }
+.tip .when { font-family:var(--mono); font-size:11.5px; color:var(--muted); margin-bottom:6px; }
+.tip div.r { display:flex; align-items:center; gap:8px; }
+.tip div.r b { margin-left:auto; font-variant-numeric:tabular-nums; padding-left:16px; }
+.note { font-size:13px; color:var(--muted); margin:12px 0 0; }
+details.table { margin-top:14px; }
+details.table summary { cursor:pointer; font-size:13.5px; font-weight:600; }
+.tbl { width:100%; border-collapse:collapse; margin-top:10px; font-size:13.5px; font-variant-numeric:tabular-nums; }
+.tbl th, .tbl td { padding:7px 10px; border-bottom:1px solid var(--line); text-align:right; }
+.tbl th:first-child, .tbl td:first-child { text-align:left; }
+.tbl thead th { font-family:var(--mono); font-size:11.5px; font-weight:500; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+.tblwrap { overflow-x:auto; }
+
+/* projects */
+.proj { display:grid; grid-template-columns:minmax(0, 1.1fr) minmax(0, 1fr); gap:28px 48px; padding:34px 0; border-bottom:1px solid var(--line); }
+.proj:first-child { padding-top:0; }
+@media (max-width:860px) { .proj { grid-template-columns:minmax(0, 1fr); } }
+.proj h3 { display:flex; align-items:center; gap:12px; font-size:clamp(28px, 3.4vw, 40px); }
+.proj h3 .dot { width:14px; height:14px; border-radius:3px; }
+.proj .chips { display:flex; flex-wrap:wrap; gap:6px; margin:12px 0 14px; }
+.proj p { color:var(--ink2); margin:0 0 20px; max-width:56ch; }
+.proj .actions { display:flex; flex-wrap:wrap; gap:8px; }
+.proj .actions .btn { padding:9px 14px; font-size:13.5px; }
+.kv { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); border-top:1px solid var(--line); }
+.kv div { padding:12px 0; border-bottom:1px solid var(--line); }
+.kv b { display:block; font-family:var(--display); font-size:24px; letter-spacing:-.02em; font-variant-numeric:tabular-nums; }
+.kv span { font-size:12.5px; color:var(--muted); }
+.window { font-family:var(--mono); font-size:12.5px; color:var(--ink2); margin:14px 0 10px; }
+.tops { font-size:13.5px; color:var(--ink2); }
+.tops a, .tops span { color:var(--ink); }
+
+/* people */
+.people { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:0 48px; list-style:none; margin:0; padding:0; counter-reset:n; }
+@media (max-width:860px) { .people { grid-template-columns:minmax(0, 1fr); } }
+.people li { display:grid; grid-template-columns:28px minmax(0, 1fr) auto; gap:4px 10px; align-items:center; padding:9px 0; border-bottom:1px solid var(--line); counter-increment:n; }
+.people li::before { content:counter(n); font-family:var(--mono); font-size:12px; color:var(--muted); grid-row:span 2; }
+.people .nm { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.people .nm a { text-decoration:none; } .people .nm a:hover { text-decoration:underline; }
+.people .ct { font-family:var(--mono); font-size:13px; font-variant-numeric:tabular-nums; text-align:right; }
+.people .bar { grid-column:2 / 4; display:flex; align-items:center; gap:10px; }
+.people .bar i { height:6px; border-radius:0 3px 3px 0; background:var(--ink2); min-width:2px; }
+.people .tags { display:flex; gap:4px; margin-left:auto; }
+.tag { display:inline-flex; align-items:center; gap:4px; font-family:var(--mono); font-size:10.5px; color:var(--muted); }
+.callout { margin-top:28px; padding:20px 22px; border-radius:12px; background:var(--soft); color:var(--ink2); max-width:80ch; }
+.callout b { color:var(--ink); }
+
+/* get the code */
+.cmds { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:14px; }
+@media (max-width:860px) { .cmds { grid-template-columns:minmax(0, 1fr); } }
+.cmd { border:1px solid var(--line); border-radius:12px; background:var(--panel); padding:16px; min-width:0; }
+.cmd.wide { grid-column:1 / -1; }
+.cmd .head { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px; }
+.cmd .head b { display:flex; align-items:center; gap:8px; font-size:14.5px; }
+.cmd pre { margin:0; font-family:var(--mono); font-size:12.5px; line-height:1.6; background:var(--soft); border-radius:8px; padding:12px; white-space:pre-wrap; overflow-wrap:anywhere; }
+.copy { font:600 12px/1 Inter, system-ui, sans-serif; color:var(--ink2); background:none; border:1px solid var(--line); border-radius:6px; padding:6px 10px; cursor:pointer; }
+.copy:hover { color:var(--ink); border-color:var(--ink); }
+</style>
+</head>
+<body>
+<nav class="nav" aria-label="Site"><div class="wrap">
+  <a class="brand" href="./"><i aria-hidden="true"><b></b><b></b><b></b><b></b></i><span>GTA6 PC Port Archive</span></a>
+  <ul>
+    <li><a href="#links">Links</a></li><li><a href="#activity">Activity</a></li><li><a href="#projects">Projects</a></li>
+    <li><a href="#people">People</a></li><li><a href="#code">Get the code</a></li><li><a class="go" href="browse.html">Browse →</a></li>
+  </ul>
+</div></nav>
+
+<main class="wrap">
+  <header class="hero">
+    <div class="label">Archive · saved 23–24 Nov 2026</div>
+    <h1>Four projects. Four days. <em>Everything they made.</em></h1>
+    <p class="lede">Leonida, xcl, VIctory and Xbox2Windows were open-source attempts at running GTA VI on PC. This archive keeps their code, their full commit history, and every pull request, issue and comment. No game files are included.</p>
+    <div class="cta">
+      <a class="btn solid" href="browse.html">Browse issues and pull requests</a>
+      <a class="btn" href="#code">Get the code</a>
+    </div>
+    <div class="figures" id="figures">
+      <div><b>–</b><span class="label">Commits</span></div>
+      <div><b>–</b><span class="label">Contributors</span></div>
+      <div><b>–</b><span class="label">Issues and PRs</span></div>
+      <div><b>–</b><span class="label">Comments</span></div>
+    </div>
+  </header>
+
+  <section class="sec" id="links" aria-labelledby="links-h">
+    <div class="sec-head"><div class="label">01</div><div><h2 id="links-h">Important links</h2></div></div>
+    <div class="ilinks">
+      <a class="ilink" href="https://portwatch-vi.xyz" target="_blank" rel="noopener">
+        <div class="top"><span class="label">External site</span><span class="arrow" aria-hidden="true">↗</span></div>
+        <span class="name">portwatch-vi.xyz</span>
+      </a>
+      <a class="ilink" href="https://leonida.now" target="_blank" rel="noopener">
+        <div class="top"><span class="label">External site</span><span class="arrow" aria-hidden="true">↗</span></div>
+        <span class="name">leonida.now</span>
+      </a>
+    </div>
+  </section>
+
+  <section class="sec" id="activity" aria-labelledby="act-h">
+    <div class="sec-head"><div class="label">02</div><div><h2 id="act-h">Commits per hour</h2>
+      <p id="act-sub">Every commit in each project's original history, by the hour it was written (UTC).</p></div></div>
+    <div class="chart" id="chart"><p class="note">Loading…</p></div>
+    <p class="note">Each row is scaled to its own busiest hour, so the shapes compare but the bar heights don't. The number under each name is that busiest hour.</p>
+    <details class="table"><summary>Show as a table</summary><div class="tblwrap" id="table"></div></details>
+  </section>
+
+  <section class="sec" id="projects" aria-labelledby="proj-h">
+    <div class="sec-head"><div class="label">03</div><div><h2 id="proj-h">The projects</h2>
+      <p>Each one is in its own folder on <code>main</code> and on its own branches with its original commit hashes. Each keeps its own license.</p></div></div>
+    <div id="projlist"></div>
+  </section>
+
+  <section class="sec" id="people" aria-labelledby="people-h">
+    <div class="sec-head"><div class="label">04</div><div><h2 id="people-h">The people</h2>
+      <p id="people-sub">The 40 people with the most commits across all four projects.</p></div></div>
+    <ol class="people" id="peoplelist"></ol>
+    <div class="callout" id="why"></div>
+  </section>
+
+  <section class="sec" id="code" aria-labelledby="code-h">
+    <div class="sec-head"><div class="label">05</div><div><h2 id="code-h">Get the code</h2>
+      <p>Clone everything, or one project with only its own history.</p></div></div>
+    <div class="cmds" id="cmds"></div>
+  </section>
+</main>
+
+<footer><div class="wrap">
+  <span>Code licenses: Leonida GPL-3.0 · xcl GPL-2.0 · VIctory GPL-3.0 · Xbox2Windows MIT. Issue data straight from the GitHub API.</span>
+  <a href="https://github.com/Guernica4u/GTA6-PC-Port-Archive">Repository on GitHub</a>
+</div></footer>
+
+<script>
+const REPO = "https://github.com/Guernica4u/GTA6-PC-Port-Archive";
+const PROJECTS = {
+  leonida: { name: "Leonida", tag: "LEO", lic: "GPL-3.0", orig: "ItsNotRexed/Leonida", gone: true,
+    desc: "Native PC recompilation of the Xbox version. The original repository was removed from GitHub on 23 Nov 2026." },
+  xcl: { name: "xcl", tag: "XCL", lic: "GPL-2.0", orig: "ivall/xcl",
+    desc: "Xbox Series compatibility layer for Windows: runs console code natively and recompiles RDNA2 shaders to DXIL." },
+  victory: { name: "VIctory", tag: "VIC", lic: "GPL-3.0", orig: "Marvisak/VIctory",
+    desc: "An attempt at running GTA VI on PC." },
+  xbox2windows: { name: "Xbox2Windows", tag: "X2W", lic: "MIT", orig: "R0Y00/Xbox2Windows",
+    desc: "Static recompilation of Xbox Series X|S software for x64 Windows, with CPU and GPU tests." },
+};
+const KEYS = Object.keys(PROJECTS);
+const $ = id => document.getElementById(id);
+const fmt = n => n.toLocaleString("en-US");
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+const day = t => new Date(t * 1000).toLocaleDateString("en-GB", { weekday:"short", day:"numeric", month:"short", timeZone:"UTC" });
+const stamp = t => new Date(t * 1000).toLocaleString("en-GB", { day:"numeric", month:"short", hour:"2-digit", minute:"2-digit", hour12:false, timeZone:"UTC" });
+const who = (name, login) => login ? `<a href="https://github.com/${encodeURIComponent(login)}">${esc(name)}</a>` : `<span>${esc(name)}</span>`;
+
+async function json(url) { try { const r = await fetch(url); return r.ok ? r.json() : null; } catch { return null; } }
+
+function figures(site, stats) {
+  const sum = f => KEYS.reduce((a, k) => a + ((stats || {})[k]?.[f] || 0), 0);
+  const commits = site ? KEYS.reduce((a, k) => a + site.projects[k].commits, 0) : null;
+  const vals = [commits, site?.people_total, stats ? sum("issues") + sum("prs") : null, stats ? sum("comments") : null];
+  [...$("figures").children].forEach((d, i) => { if (vals[i] != null) d.querySelector("b").textContent = fmt(vals[i]); });
+}
+
+/* ---------- activity chart ---------- */
+function barPath(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h);
+  return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`;
+}
+function chart(site) {
+  const N = site.hours, t0 = site.start;
+  const legend = `<div class="legend">${KEYS.map(k => `<span class="p-${k}"><i class="dot"></i>${PROJECTS[k].name}</span>`).join("")}</div>`;
+  const rows = KEYS.map(k => {
+    const p = site.projects[k], peak = Math.max(...p.hourly);
+    return `<div class="crow p-${k}"><div class="who"><b><i class="dot"></i>${PROJECTS[k].name}</b>
+      <span>${fmt(p.commits)} commits · peak ${fmt(peak)}/h</span></div><svg class="plot" data-k="${k}" role="img"
+      aria-label="${PROJECTS[k].name}: ${fmt(p.commits)} commits, busiest hour ${fmt(peak)} commits"></svg></div>`;
+  }).join("");
+  const ticks = [];
+  for (let i = 0; i < N; i++) if ((t0 + i * 3600) % 86400 === 0) ticks.push(i);
+  const axis = `<div class="axis"><div></div><div id="axis">${ticks.map(i => `<span style="left:${(i / N * 100).toFixed(3)}%${i / N > .85 ? ";transform:translateX(-100%);border-left:0;border-right:1px solid var(--line);padding:0 6px 0 0" : ""}">${day(t0 + i * 3600)}</span>`).join("")}</div></div>`;
+  $("chart").innerHTML = legend + rows + axis + `<div class="tip" id="tip" role="status"></div>`;
+  const svgs = [...$("chart").querySelectorAll("svg.plot")];
+  let hover = -1;
+
+  function draw() {
+    for (const svg of svgs) {
+      const k = svg.dataset.k, data = site.projects[k].hourly, peak = Math.max(...data);
+      const W = svg.clientWidth, H = svg.clientHeight, bw = W / N, gap = bw > 6 ? 2 : 1;
+      svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+      let d = "";
+      data.forEach((v, i) => { if (v) { const h = Math.max(1.5, v / peak * (H - 2)); d += barPath(i * bw + gap / 2, H - h, Math.max(1, bw - gap), h, 2); } });
+      svg.innerHTML = `<rect class="hl" x="0" y="0" width="${bw}" height="${H}" fill="var(--soft)" visibility="hidden"/>` +
+        `<line x1="0" x2="${W}" y1="${H - .5}" y2="${H - .5}" stroke="var(--line)"/><path d="${d}" fill="var(--pc)"/>`;
+    }
+    show(hover);
+  }
+  function show(i) {
+    hover = i;
+    const tip = $("tip");
+    for (const svg of svgs) {
+      const hl = svg.querySelector(".hl"); if (!hl) continue;
+      const bw = svg.clientWidth / N;
+      hl.setAttribute("visibility", i < 0 ? "hidden" : "visible");
+      hl.setAttribute("x", i * bw);
+    }
+    if (i < 0) { tip.style.display = "none"; return; }
+    const t = t0 + i * 3600;
+    tip.innerHTML = `<div class="when">${day(t)} · ${new Date(t * 1000).toISOString().slice(11, 13)}:00–${new Date((t + 3600) * 1000).toISOString().slice(11, 13)}:00 UTC</div>` +
+      KEYS.map(k => `<div class="r p-${k}"><i class="dot"></i>${PROJECTS[k].name}<b>${fmt(site.projects[k].hourly[i])}</b></div>`).join("");
+    tip.style.display = "block";
+    const box = $("chart").getBoundingClientRect(), svg = svgs[0].getBoundingClientRect();
+    const x = svg.left - box.left + (i + .5) * svg.width / N;
+    const w = tip.offsetWidth;
+    tip.style.left = Math.max(0, Math.min(box.width - w, x + 14 > box.width - w ? x - w - 14 : x + 14)) + "px";
+    tip.style.top = (svg.top - box.top) + "px";
+  }
+  const idx = e => { const r = e.currentTarget.getBoundingClientRect(); return Math.max(0, Math.min(N - 1, Math.floor((e.clientX - r.left) / r.width * N))); };
+  for (const svg of svgs) {
+    svg.addEventListener("pointermove", e => show(idx(e)));
+    svg.addEventListener("pointerdown", e => show(idx(e)));
+    svg.addEventListener("pointerleave", e => { if (e.pointerType === "mouse") show(-1); });
+    svg.tabIndex = 0;
+    svg.addEventListener("focus", () => { if (hover < 0) show(site.projects[svg.dataset.k].hourly.indexOf(Math.max(...site.projects[svg.dataset.k].hourly))); });
+    svg.addEventListener("blur", () => show(-1));
+    svg.addEventListener("keydown", e => {
+      if (e.key === "ArrowRight") { show(Math.min(N - 1, hover + 1)); e.preventDefault(); }
+      if (e.key === "ArrowLeft") { show(Math.max(0, hover - 1)); e.preventDefault(); }
+      if (e.key === "Escape") show(-1);
+    });
+  }
+  new ResizeObserver(draw).observe($("chart"));
+  draw();
+
+  // table view: commits per UTC day
+  const days = {};
+  for (let i = 0; i < N; i++) { const d = day(t0 + i * 3600); days[d] ??= Object.fromEntries(KEYS.map(k => [k, 0])); KEYS.forEach(k => days[d][k] += site.projects[k].hourly[i]); }
+  $("table").innerHTML = `<table class="tbl"><thead><tr><th>Day (UTC)</th>${KEYS.map(k => `<th>${PROJECTS[k].name}</th>`).join("")}<th>Total</th></tr></thead><tbody>` +
+    Object.entries(days).map(([d, v]) => `<tr><td>${d}</td>${KEYS.map(k => `<td>${fmt(v[k])}</td>`).join("")}<td>${fmt(KEYS.reduce((a, k) => a + v[k], 0))}</td></tr>`).join("") + "</tbody></table>";
+  const total = KEYS.reduce((a, k) => a + site.projects[k].commits, 0);
+  $("act-sub").textContent = `${fmt(total)} commits in ${N} hours, from ${day(t0)} to ${day(t0 + (N - 1) * 3600)}. Every commit in each project's original history, by the hour it was written (UTC).`;
+}
+
+/* ---------- projects ---------- */
+function projects(site, stats) {
+  $("projlist").innerHTML = KEYS.map(k => {
+    const P = PROJECTS[k], h = site?.projects[k], s = (stats || {})[k] || {};
+    const orig = P.gone ? `<span class="chip">${esc(P.orig)} · removed</span>` : `<a class="chip" href="https://github.com/${P.orig}">${esc(P.orig)} ↗</a>`;
+    const kv = [[h?.commits, "commits"], [h?.authors, "contributors"], [s.prs, "pull requests"], [s.issues, "issues"], [s.comments, "comments"], [h ? Math.round((h.last - h.first) / 3600) : null, "hours, first to last commit"]];
+    return `<article class="proj p-${k}">
+      <div><h3><i class="dot"></i>${P.name}</h3>
+        <div class="chips">${orig}<span class="chip">${P.lic}</span></div>
+        <p>${esc(P.desc)}</p>
+        <div class="actions">
+          <a class="btn solid" href="browse.html#${k}">Issues and PRs</a>
+          <a class="btn" href="${REPO}/tree/main/${k}">Code</a>
+          <a class="btn" href="${REPO}/archive/refs/heads/${k}/main.zip">Download zip</a>
+          <a class="btn" href="${REPO}/tree/main/github-export/${k}">Raw export</a>
+        </div></div>
+      <div><div class="kv">${kv.map(([v, l]) => `<div><b>${v == null ? "–" : fmt(v)}</b><span>${l}</span></div>`).join("")}</div>
+        ${h ? `<div class="window">${stamp(h.first)} → ${stamp(h.last)} UTC</div>
+        <div class="tops">Most commits: ${h.top.map(([n, l]) => who(n, l)).join(", ")}</div>` : ""}</div>
+    </article>`;
+  }).join("");
+}
+
+/* ---------- people ---------- */
+function people(site) {
+  const max = site.people[0][2];
+  $("peoplelist").innerHTML = site.people.map(([name, login, n, ps]) => `<li>
+    <span class="nm">${who(name, login)}</span><span class="ct">${fmt(n)}</span>
+    <span class="bar"><i style="width:${(n / max * 70).toFixed(2)}%"></i>
+      <span class="tags">${ps.map(p => `<span class="tag p-${p}" title="${PROJECTS[p].name}"><i class="dot"></i>${PROJECTS[p].tag}</span>`).join("")}</span></span></li>`).join("");
+  $("people-sub").textContent = `${fmt(site.people_total)} people wrote commits for these projects. These are the 40 with the most, across all four.`;
+  $("why").innerHTML = `<b>Where their commits are.</b> The <code>main</code> branch is a single snapshot of all four projects. Every original commit, with its author, is kept on that project's own branches: <code>leonida/main</code>, <code>xcl/main</code>, <code>victory/main</code> and <code>xbox2windows/main</code>.`;
+}
+
+/* ---------- get the code ---------- */
+function cmds() {
+  const all = `git clone ${REPO}.git`;
+  const one = k => `git clone --branch ${k}/main --single-branch ${REPO}.git ${k}`;
+  const box = (title, cmd, cls = "") => `<div class="cmd ${cls}"><div class="head"><b>${title}</b><button type="button" class="copy">Copy</button></div><pre>${esc(cmd)}</pre></div>`;
+  $("cmds").innerHTML = box("Everything: all four projects, issues and comments", all, "wide") +
+    KEYS.map(k => box(`<span class="p-${k}"><i class="dot"></i></span>${PROJECTS[k].name} only`, one(k))).join("");
+  $("cmds").addEventListener("click", async e => {
+    const b = e.target.closest(".copy"); if (!b) return;
+    try { await navigator.clipboard.writeText(b.closest(".cmd").querySelector("pre").textContent); b.textContent = "Copied"; }
+    catch { b.textContent = "Select and copy"; }
+    setTimeout(() => b.textContent = "Copy", 1600);
+  });
+}
+
+(async () => {
+  cmds();
+  const [site, stats] = await Promise.all([json("data/site.json"), json("data/stats.json")]);
+  figures(site, stats);
+  projects(site, stats);
+  if (site) { chart(site); people(site); }
+  else { $("chart").innerHTML = '<p class="note">Could not load the commit data.</p>'; $("people").hidden = true; }
+})();
+</script>
+</body>
+</html>

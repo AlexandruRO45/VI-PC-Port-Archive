@@ -1,0 +1,8 @@
+EXPORTS
+    fixture_create
+    create_body
+    call_provider
+    call_allocate
+    call_calloc
+    wrapper_oom
+    create_done

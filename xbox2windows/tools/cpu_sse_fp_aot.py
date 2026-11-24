@@ -1,0 +1,334 @@
+"""Lift bounded Windows x64 leaf functions with legacy SSE FP compares and moves to C++.
+
+Each export uses the leaf ABI void fn(word rcx, word rdx, word r8), where rcx,
+rdx and r8 carry 16-byte-aligned host pointers to caller-owned buffers (rcx
+and rdx are inputs, r8 is the output). XMM0..XMM5 are modeled as portable
+128-bit value structs (two 64-bit lanes). Only legacy encodings are accepted;
+VEX, EVEX and other non-legacy forms reject.
+
+Supported SSE instructions (5 forms from docs/coverage/x64_zen2.tsv group SSE):
+  - Packed float compare: cmpps (imm8 predicates 0..7, xmm and aligned m128)
+  - Scalar float compare: cmpss (imm8 predicates 0..7, xmm and m32; bits 127:32 preserved)
+  - Half-qword float moves: movlps, movhps (m64 load-merge preserving the other
+    64 bits, and m64 store)
+  - Non-temporal store: movntps (aligned m128 store)
+
+Transport/ABI glue: movaps, movdqa (aligned 128-bit load/store/reg copy),
+movdqu (unaligned 128-bit load/store/reg copy) and terminal ret. All memory
+stores must target an r8-rooted flat address; loads may read from rcx, rdx or
+r8. Full-width 128-bit aligned operands (cmpps m128, movntps, movaps m128,
+movdqa m128) require displacements divisible by 16.
+"""
+
+import argparse
+from pathlib import Path
+
+import pefile
+from iced_x86 import Code, Decoder, EncodingKind, OpKind, Register as R, RegisterExt
+
+from cpu_leaf_aot import bounded_code, export_rva
+
+
+ARGUMENTS = {R.RCX: "rcx", R.RDX: "rdx", R.R8: "r8"}
+VOLATILE_XMM = {getattr(R, f"XMM{i}"): i for i in range(6)}
+NONVOLATILE_VEC = {getattr(R, f"XMM{i}") for i in range(6, 16)}
+NONVOLATILE_GPR = {
+    R.EBX, R.RBX, R.EBP, R.RBP, R.ESI, R.RSI, R.EDI, R.RDI, R.ESP, R.RSP,
+    R.R12D, R.R12, R.R13D, R.R13, R.R14D, R.R14, R.R15D, R.R15,
+}
+
+LOAD_ALIGNED_VEC_CODES = {Code.MOVAPS_XMM_XMMM128, Code.MOVDQA_XMM_XMMM128}
+STORE_ALIGNED_VEC_CODES = {Code.MOVAPS_XMMM128_XMM, Code.MOVDQA_XMMM128_XMM}
+
+ALLOWED_CODES = {
+    Code.RETNQ,
+    Code.CMPPS_XMM_XMMM128_IMM8,
+    Code.CMPSS_XMM_XMMM32_IMM8,
+    Code.MOVLPS_XMM_M64,
+    Code.MOVLPS_M64_XMM,
+    Code.MOVHPS_XMM_M64,
+    Code.MOVHPS_M64_XMM,
+    Code.MOVNTPS_M128_XMM,
+    Code.MOVAPS_XMM_XMMM128,
+    Code.MOVAPS_XMMM128_XMM,
+    Code.MOVDQA_XMM_XMMM128,
+    Code.MOVDQA_XMMM128_XMM,
+    Code.MOVDQU_XMM_XMMM128,
+    Code.MOVDQU_XMMM128_XMM,
+}
+
+PRELUDE = """#include <atomic>
+#include <cstdint>
+#include <cstring>
+
+using word = std::uint64_t;
+
+struct Vec128 {
+    std::uint64_t q[2];
+};
+
+// Guest reads can fault even when the translated result is dead. Keep surrounding guest
+// writes on their original side of the read when the compiler inlines these helpers.
+static inline std::uint32_t load32(word address) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const auto value = *reinterpret_cast<const volatile std::uint32_t __unaligned*>(address);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return value;
+}
+
+static inline std::uint64_t load64(word address) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const auto value = *reinterpret_cast<const volatile std::uint64_t __unaligned*>(address);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return value;
+}
+
+static inline void store64(word address, std::uint64_t val) {
+    std::memcpy(reinterpret_cast<void*>(address), &val, 8);
+}
+
+static inline Vec128 load128(word address) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    Vec128 value;
+    std::memcpy(value.q, reinterpret_cast<const void*>(address), sizeof(value.q));
+    const volatile Vec128 observed = value;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return {{observed.q[0], observed.q[1]}};
+}
+
+static inline void store128(word address, const Vec128& v) {
+    std::memcpy(reinterpret_cast<void*>(address), v.q, 16);
+}
+
+static inline float d_as_float(std::uint32_t bits) {
+    float v;
+    std::memcpy(&v, &bits, 4);
+    return v;
+}
+
+static inline std::uint32_t lane32(const Vec128& v, unsigned i) {
+    return static_cast<std::uint32_t>(v.q[i >> 1] >> ((i & 1u) * 32u));
+}
+
+static inline void set_lane32(Vec128& v, unsigned i, std::uint32_t val) {
+    const unsigned shift = (i & 1u) * 32u;
+    v.q[i >> 1] = (v.q[i >> 1] & ~(0xffffffffull << shift)) | (static_cast<std::uint64_t>(val) << shift);
+}
+
+// CMPPS/CMPSS predicates 0..7: EQ_OQ, LT_OS, LE_OS, UNORD_Q, NEQ_UQ, NLT_US, NLE_US, ORD_Q.
+static inline std::uint32_t cmp_f32(float x, float y, std::uint8_t imm8) {
+    bool res;
+    switch (imm8 & 7u) {
+        case 0u: res = (x == y); break;
+        case 1u: res = (x < y); break;
+        case 2u: res = (x <= y); break;
+        case 3u: res = (x != x) || (y != y); break;
+        case 4u: res = !(x == y); break;
+        case 5u: res = !(x < y); break;
+        case 6u: res = !(x <= y); break;
+        default: res = (x == x) && (y == y); break;
+    }
+    return res ? 0xffffffffu : 0u;
+}
+
+static inline Vec128 op_cmpps(const Vec128& a, const Vec128& b, std::uint8_t imm8) {
+    Vec128 out{};
+    for (unsigned i = 0; i < 4u; ++i) {
+        set_lane32(out, i, cmp_f32(d_as_float(lane32(a, i)), d_as_float(lane32(b, i)), imm8));
+    }
+    return out;
+}
+
+static inline std::uint32_t op_cmpss_d(std::uint32_t a, std::uint32_t b, std::uint8_t imm8) {
+    return cmp_f32(d_as_float(a), d_as_float(b), imm8);
+}
+"""
+
+
+def vec_index(register, ins):
+    """Map XMM0..XMM5 to an index, rejecting nonvolatile and unsupported registers."""
+    if register in VOLATILE_XMM:
+        return VOLATILE_XMM[register]
+    if register in NONVOLATILE_VEC:
+        raise ValueError(f"nonvolatile vector register {register} at RVA {ins.ip:#x}: {ins}")
+    raise ValueError(f"unsupported vector register {register} at RVA {ins.ip:#x}: {ins}")
+
+
+def flat_address(ins, *, alignment=1, write=False):
+    """Lower a flat [base + disp] pointer operand rooted in an argument GPR64."""
+    base = ins.memory_base
+    if (ins.is_ip_rel_memory_operand or base in (R.NONE, R.RIP, R.EIP, R.RSP, R.ESP)
+            or ins.memory_index != R.NONE or not RegisterExt.is_gpr64(base)):
+        raise ValueError(f"unsupported memory operand at RVA {ins.ip:#x}: {ins}")
+    if base in NONVOLATILE_GPR:
+        raise ValueError(f"nonvolatile GPR base {base} in memory operand at RVA {ins.ip:#x}: {ins}")
+    if base not in ARGUMENTS:
+        raise ValueError(f"unsupported memory base {base} at RVA {ins.ip:#x}: {ins}")
+    if write and base != R.R8:
+        raise ValueError(f"non-r8 store memory operand at RVA {ins.ip:#x}: {ins}")
+    disp = ins.memory_displacement & ((1 << 64) - 1)
+    if disp % alignment:
+        raise ValueError(f"unaligned {alignment}-byte memory operand at RVA {ins.ip:#x}: {ins}")
+    name = ARGUMENTS[base]
+    return f"({name} + {disp:#x}ull)" if disp else name
+
+
+def lift_code(name, start, raw):
+    """Decode and lift one bounded straight-line legacy SSE FP leaf function."""
+    instructions = list(Decoder(64, raw, ip=start))
+    if not instructions or instructions[-1].next_ip != start + len(raw):
+        raise ValueError(f"truncated instruction stream in {name} at RVA {start:#x}")
+    if any(ins.is_invalid for ins in instructions):
+        bad = next(ins for ins in instructions if ins.is_invalid)
+        raise ValueError(f"invalid instruction at RVA {bad.ip:#x}")
+
+    used = set()
+    defined = set()
+    statements = []
+    returned = False
+
+    def read_vec(op_index, ins):
+        if ins.op_kind(op_index) != OpKind.REGISTER:
+            raise ValueError(f"expected register operand {op_index} at RVA {ins.ip:#x}: {ins}")
+        idx = vec_index(ins.op_register(op_index), ins)
+        if idx not in defined:
+            raise ValueError(f"undefined vector register xmm{idx} at RVA {ins.ip:#x}: {ins}")
+        used.add(idx)
+        return f"xmm{idx}"
+
+    def write_vec(op_index, ins):
+        if ins.op_kind(op_index) != OpKind.REGISTER:
+            raise ValueError(f"expected register destination at RVA {ins.ip:#x}: {ins}")
+        idx = vec_index(ins.op_register(op_index), ins)
+        used.add(idx)
+        return idx, f"xmm{idx}"
+
+    def vec_src128(op_index, ins, *, alignment=16):
+        if ins.op_kind(op_index) == OpKind.MEMORY:
+            return f"load128({flat_address(ins, alignment=alignment)})"
+        return read_vec(op_index, ins)
+
+    for ins in instructions:
+        if returned:
+            raise ValueError(f"unreachable instruction after ret at RVA {ins.ip:#x}: {ins}")
+        if ins.has_lock_prefix or ins.has_rep_prefix or ins.has_repne_prefix or ins.has_segment_prefix:
+            raise ValueError(f"unsupported instruction prefix at RVA {ins.ip:#x}: {ins}")
+        if ins.op_code().encoding != EncodingKind.LEGACY:
+            raise ValueError(f"non-legacy encoding at RVA {ins.ip:#x}: {ins}")
+        if ins.code not in ALLOWED_CODES:
+            raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
+
+        if ins.code == Code.RETNQ:
+            statements.append("return;")
+            returned = True
+        elif ins.code == Code.CMPPS_XMM_XMMM128_IMM8:
+            imm = ins.immediate8 & 0xff
+            if imm > 7:
+                raise ValueError(f"unsupported cmpps predicate {imm:#x} at RVA {ins.ip:#x}: {ins}")
+            dst = read_vec(0, ins)
+            src = vec_src128(1, ins, alignment=16)
+            dst_idx, dst_name = write_vec(0, ins)
+            statements.append(f"{dst_name} = op_cmpps({dst}, {src}, {imm:#x}u);")
+            defined.add(dst_idx)
+        elif ins.code == Code.CMPSS_XMM_XMMM32_IMM8:
+            imm = ins.immediate8 & 0xff
+            if imm > 7:
+                raise ValueError(f"unsupported cmpss predicate {imm:#x} at RVA {ins.ip:#x}: {ins}")
+            dst = read_vec(0, ins)
+            if ins.op1_kind == OpKind.MEMORY:
+                src32 = f"load32({flat_address(ins)})"
+            else:
+                src32 = f"lane32({read_vec(1, ins)}, 0u)"
+            dst_idx, dst_name = write_vec(0, ins)
+            statements.append(
+                f"set_lane32({dst_name}, 0u, op_cmpss_d(lane32({dst}, 0u), {src32}, {imm:#x}u));"
+            )
+            defined.add(dst_idx)
+        elif ins.code in (Code.MOVLPS_XMM_M64, Code.MOVHPS_XMM_M64):
+            if ins.op1_kind != OpKind.MEMORY:
+                raise ValueError(f"expected memory source at RVA {ins.ip:#x}: {ins}")
+            read_vec(0, ins)
+            dst_idx, dst_name = write_vec(0, ins)
+            q_idx = 1 if ins.code == Code.MOVHPS_XMM_M64 else 0
+            statements.append(f"{dst_name}.q[{q_idx}] = load64({flat_address(ins)});")
+            defined.add(dst_idx)
+        elif ins.code in (Code.MOVLPS_M64_XMM, Code.MOVHPS_M64_XMM):
+            if ins.op0_kind != OpKind.MEMORY:
+                raise ValueError(f"expected memory destination at RVA {ins.ip:#x}: {ins}")
+            src = read_vec(1, ins)
+            q_idx = 1 if ins.code == Code.MOVHPS_M64_XMM else 0
+            statements.append(f"store64({flat_address(ins, write=True)}, {src}.q[{q_idx}]);")
+        elif ins.code == Code.MOVNTPS_M128_XMM:
+            if ins.op0_kind != OpKind.MEMORY:
+                raise ValueError(f"expected memory destination at RVA {ins.ip:#x}: {ins}")
+            src = read_vec(1, ins)
+            statements.append(f"store128({flat_address(ins, alignment=16, write=True)}, {src});")
+        elif ins.code in (*LOAD_ALIGNED_VEC_CODES, Code.MOVDQU_XMM_XMMM128):
+            align = 16 if ins.code in LOAD_ALIGNED_VEC_CODES else 1
+            src = vec_src128(1, ins, alignment=align)
+            dst_idx, dst_name = write_vec(0, ins)
+            statements.append(f"{dst_name} = {src};")
+            defined.add(dst_idx)
+        elif ins.code in (*STORE_ALIGNED_VEC_CODES, Code.MOVDQU_XMMM128_XMM):
+            align = 16 if ins.code in STORE_ALIGNED_VEC_CODES else 1
+            src = read_vec(1, ins)
+            if ins.op0_kind == OpKind.MEMORY:
+                statements.append(
+                    f"store128({flat_address(ins, alignment=align, write=True)}, {src});"
+                )
+            else:
+                dst_idx, dst_name = write_vec(0, ins)
+                statements.append(f"{dst_name} = {src};")
+                defined.add(dst_idx)
+        else:
+            raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
+
+    if not returned:
+        raise ValueError(f"missing terminal ret in {name} at RVA {start + len(raw):#x}")
+
+    decls = [f"    Vec128 xmm{idx}{{}};" for idx in sorted(used)]
+    body = [f"    {stmt}" for stmt in statements]
+    lines = [
+        f'extern "C" __declspec(dllexport) void lifted_{name}(word rcx, word rdx, word r8) {{',
+        "    (void)rcx; (void)rdx; (void)r8;",
+        *decls,
+        *body,
+        "}",
+    ]
+    return "\n".join(lines), len(instructions)
+
+
+def lift(pe, name):
+    entry = export_rva(pe, name)
+    raw = bounded_code(pe, entry)
+    source, count = lift_code(name, entry, raw)
+    return source, entry, count
+
+
+def translate_pe(pe, names):
+    if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
+        raise ValueError("expected AMD64 PE32+")
+    lifted = [lift(pe, name) for name in names]
+    source = PRELUDE + "\n".join(f"\n{text}" for text, _, _ in lifted) + "\n"
+    meta = [(name, entry, count) for name, (_, entry, count) in zip(names, lifted)]
+    return source, meta
+
+
+def translate(image, names):
+    with pefile.PE(str(image), fast_load=True) as pe:
+        return translate_pe(pe, names)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("image", type=Path)
+    parser.add_argument("exports", help="comma-separated export names")
+    parser.add_argument("output", type=Path)
+    args = parser.parse_args()
+    try:
+        source, meta = translate(args.image, args.exports.split(","))
+        args.output.write_text(source, encoding="utf-8")
+        for name, entry, count in meta:
+            print(f"{name} at RVA {entry:#x}: {count} instructions")
+    except (ValueError, OSError, pefile.PEFormatError) as error:
+        parser.exit(1, f"{error}\n")

@@ -1,0 +1,18 @@
+EXPORTS
+    adcx32_op
+    adcx64_op
+    adox32_op
+    adox64_op
+    adx_dual64
+    shl1_adox32
+    imul_seto32
+    andn_clears_of32
+    mul_seto32
+    xadd_seto32
+    cmpxchg_seto32
+    rol_seto32
+    ror_seto32
+    rcl_seto32
+    rcr_seto32
+    shld_seto32
+    shrd_seto32

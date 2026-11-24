@@ -1,0 +1,56 @@
+name: Bug report
+description: Report a reproducible build, runtime or fixture failure
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Give the smallest source-built input that reproduces the failure. Do not
+        attach game files, dumps or distribution links.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or build
+      description: The commit, release tag or build under test.
+      placeholder: "8926223"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: The exact command and input that triggers the failure.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: The expected value, test result or observable behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: The first failing test and the first diagnostic or mismatch.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system and tool versions. For Windows builds include the Windows build, MSVC and SDK versions. For graphics tests include the adapter, driver, hardware or WARP backend and debug-layer status.
+      placeholder: Windows 11 build 26300.9974, VS 2022 17.14, SDK 10.0.26100, RTX 4060 Laptop driver 32.0.16.1656
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I reproduced this on a source-built input.
+          required: true
+        - label: I did not include game files, dumps, distribution links or credentials.
+          required: true

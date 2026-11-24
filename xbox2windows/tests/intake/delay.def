@@ -1,0 +1,3 @@
+LIBRARY intake_delay
+EXPORTS
+    delayed_value

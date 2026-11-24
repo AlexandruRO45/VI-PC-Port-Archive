@@ -1,0 +1,46 @@
+name: Research task
+description: Define a compatibility question another contributor can test on a PC
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe a question that can be tested with a source-built fixture or a
+        public sample. Do not attach game files, dumps or distribution links.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: Which behavior is unknown? Name the component or existing fixture.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence so far
+      description: Link the public reference or describe how to generate the input. Identify what was measured and which part is an inference.
+    validations:
+      required: true
+  - type: textarea
+    id: completion
+    attributes:
+      label: Completion condition
+      description: Give the test, expected observation and any acceptable alternatives or capability skips. If someone can take on part of the work, specify that part and the result they should bring back.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Required environment
+      description: State whether the task needs Windows, a physical GPU, WARP, LLVM or a local package. Write "none" when the task can be checked with pure-Python fixtures.
+      placeholder: Windows x64, WARP, no game files
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: The task can be reproduced with public or source-built inputs.
+          required: true
+        - label: I did not include game files, dumps, distribution links or credentials.
+          required: true

@@ -1,0 +1,22 @@
+{
+ "leonida": {
+  "issues": 371,
+  "prs": 9482,
+  "comments": 67447
+ },
+ "xcl": {
+  "issues": 154,
+  "prs": 361,
+  "comments": 1118
+ },
+ "victory": {
+  "issues": 38,
+  "prs": 145,
+  "comments": 323
+ },
+ "xbox2windows": {
+  "issues": 144,
+  "prs": 984,
+  "comments": 2318
+ }
+}

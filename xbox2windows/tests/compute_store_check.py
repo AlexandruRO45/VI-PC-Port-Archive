@@ -1,0 +1,3098 @@
+"""Check the single-store compute profile with original synthetic kernels."""
+from pathlib import Path
+import operator
+import os
+import operator
+import struct
+import subprocess
+import sys
+import tempfile
+from unittest.mock import patch
+
+from pixel_aot_check import envelope, must_reject
+import compute_store_aot as aot
+import shader_profile_audit
+from pixel_aot import _read_named_container, disassemble
+from resource_inventory import parts
+
+SENTINEL = 0xc5c5c5c5
+INDEXED = [
+    "s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+    "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+    "v_lshl_add_u32 v8, s11, 5, v0",
+    "v_mov_b32_e32 v15, 19", "v_mov_b32_e32 v16, -5",
+    "s_waitcnt lgkmcnt(0)", "buffer_store_dwordx2 v[15:16], v8, s[20:23], 0 idxen offset:4",
+    "s_endpgm",
+]
+FIXED = [
+    "s_mov_b32 s9, 0", "s_load_dwordx4 s[12:15], s[8:9], null",
+    "v_mov_b32_e32 v20, 11", "v_mov_b32_e32 v21, 23", "v_mov_b32_e32 v22, -2",
+    "s_waitcnt lgkmcnt(0)", "buffer_store_dwordx3 v[20:22], off, s[12:15], 0 offset:20",
+    "s_endpgm",
+]
+MULTI_FIXED = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_mov_b32 s10, 0x12345678",
+    "s_movk_i32 s11, 0xfffc",
+    "v_mov_b32_e32 v4, s10",
+    "v_mov_b32_e32 v5, s11",
+    "v_mov_b32_e32 v6, v4",
+    "v_mov_b32_e32 v7, 7",
+    "s_waitcnt lgkmcnt(0)",
+    "s_clause 0x1",
+    "buffer_store_dwordx2 v[4:5], off, s[12:15], 0 offset:8",
+    "buffer_store_dwordx2 v[6:7], off, s[12:15], 0 offset:32",
+    "s_endpgm",
+]
+MULTI_INDEXED = [
+    "s_mov_b32 s12, s7",
+    "s_mov_b32 s13, 0",
+    "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+    "s_mov_b32 s14, 0x00abcdef",
+    "s_movk_i32 s15, 0xfff0",
+    "v_lshl_add_u32 v8, s11, 5, v0",
+    "v_mov_b32_e32 v10, s14",
+    "v_mov_b32_e32 v11, s15",
+    "s_waitcnt lgkmcnt(0) vmcnt(0)",
+    "buffer_store_dword v10, v8, s[20:23], 0 idxen",
+    "buffer_store_dword v11, v8, s[20:23], 0 idxen offset:8",
+    "s_endpgm",
+]
+RUNTIME = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_load_dwordx4 s[16:19], s[8:9], 0x20",
+    "s_waitcnt lgkmcnt(0)",
+    "s_buffer_load_dword s20, s[16:19], null",
+    "s_buffer_load_dwordx2 s[22:23], s[16:19], 0xc",
+    "s_buffer_load_dwordx4 s[24:27], s[16:19], 0x30",
+    "s_waitcnt lgkmcnt(0)",
+    "s_mov_b32 s28, s20",
+    "v_mov_b32_e32 v10, s28", "v_mov_b32_e32 v11, s22", "v_mov_b32_e32 v12, s23",
+    "v_mov_b32_e32 v13, s27", "v_mov_b32_e32 v14, s26", "v_mov_b32_e32 v15, s25",
+    "v_mov_b32_e32 v16, s24", "v_mov_b32_e32 v17, v16",
+    "buffer_store_dwordx3 v[10:12], off, s[12:15], 0 offset:16",
+    "buffer_store_dwordx4 v[13:16], off, s[12:15], 0 offset:32",
+    "buffer_store_dword v17, off, s[12:15], 0 offset:64",
+    "s_endpgm",
+]
+# 8x8 tile: row = dispatch Y through idxen, column = dispatch X through offen (8-byte
+# elements); each invocation stores (tid.x, tid.y).
+TILE = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "v_lshl_add_u32 v3, s10, 3, v0",
+    "v_lshl_add_u32 v4, s11, 3, v1",
+    "v_lshlrev_b32_e32 v5, 3, v3",
+    "v_mov_b32_e32 v6, v3",
+    "v_mov_b32_e32 v7, v4",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx2 v[6:7], v[4:5], s[12:15], 0 idxen offen",
+    "s_endpgm",
+]
+# 4x1x8 slab: row = dispatch Z, column = dispatch X (16-byte elements); stores (tid.z, tid.x)
+# after a gap word.
+SLAB = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "v_lshl_add_u32 v10, s16, 3, v2",
+    "v_lshl_add_u32 v3, s10, 2, v0",
+    "v_lshlrev_b32_e32 v11, 4, v3",
+    "v_mov_b32_e32 v20, v10",
+    "v_mov_b32_e32 v21, v3",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx2 v[20:21], v[10:11], s[12:15], 0 idxen offen offset:4",
+    "s_endpgm",
+]
+# 4x4 tile with several groups in X and Y: one word per invocation, the dispatch X index.
+QUAD = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "v_lshl_add_u32 v4, s11, 2, v1",
+    "v_lshl_add_u32 v3, s10, 2, v0",
+    "v_lshlrev_b32_e32 v5, 2, v3",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v3, v[4:5], s[12:15], 0 idxen offen",
+    "s_endpgm",
+]
+# One 256-thread group: one word per invocation, the dispatch X index.
+WIDE = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "v_lshl_add_u32 v3, s10, 8, v0",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v3, v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+# 4x4x4 cube: plane = dispatch Z through idxen; row = dispatch Y and column = dispatch X
+# folded into one offen byte offset. One word per invocation, the dispatch Z index.
+CUBE = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "v_lshl_add_u32 v3, s10, 2, v0",
+    "v_lshl_add_u32 v4, s11, 2, v1",
+    "v_lshl_add_u32 v6, s16, 2, v2",
+    "v_lshlrev_b32_e32 v5, 2, v3",
+    "v_lshl_add_u32 v7, v4, 4, v5",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v6, v[6:7], s[12:15], 0 idxen offen",
+    "s_endpgm",
+]
+# The same three-axis address as LLVM 15 emits it (llc-15 -mtriple=amdgcn--amdpal -mcpu=gfx1013
+# -O2, amdgpu_kernel): the X byte offset is s_lshl_b32 of the group ID, then v_add_lshl_u32 with
+# the local ID. Only the kernel-argument load is replaced, by the descriptor-table load above.
+LLVM_CUBE = [
+    "s_mov_b32 s1, 0",
+    "v_lshl_add_u32 v1, s3, 2, v1",
+    "s_waitcnt lgkmcnt(0)",
+    "s_load_dwordx4 s[8:11], s[0:1], null",
+    "s_lshl_b32 s0, s2, 2",
+    "v_add_lshl_u32 v3, s0, v0, 2",
+    "v_lshl_add_u32 v0, s4, 2, v2",
+    "v_lshl_add_u32 v1, v1, 4, v3",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v0, v[0:1], s[8:11], 0 idxen offen",
+    "s_endpgm",
+]
+# 4x4 tile with a 72-byte row pitch folded by v_mad_u32_u24 (pitch in src0, as LLVM 15 emits
+# it) and a pure offen store; each invocation stores (tid.x, tid.y) in an 8-byte column.
+PITCH = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "v_lshl_add_u32 v3, s10, 2, v0",
+    "v_lshl_add_u32 v4, s11, 2, v1",
+    "v_lshlrev_b32_e32 v5, 3, v3",
+    "v_mad_u32_u24 v6, 0x48, v4, v5",
+    "v_mov_b32_e32 v8, v3",
+    "v_mov_b32_e32 v9, v4",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx2 v[8:9], v6, s[12:15], 0 offen",
+    "s_endpgm",
+]
+INDEX_BINDING = dict(table_reg=7, group_reg=11, descriptor_offset=48, stride=12)
+FIXED_BINDING = dict(table_reg=8, descriptor_offset=0)
+RUNTIME_BINDING = dict(FIXED_BINDING, constant_descriptor=32)
+TILE_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_y=11, stride=72)
+SLAB_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_z=16, stride=68)
+QUAD_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_y=11, stride=52)
+WIDE_BINDING = dict(FIXED_BINDING, group_reg=10, stride=4)
+CUBE_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_y=11, group_reg_z=16, stride=132)
+LLVM_CUBE_BINDING = dict(table_reg=0, descriptor_offset=0, group_reg=2, group_reg_y=3, group_reg_z=4, stride=136)
+PITCH_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_y=11)
+CASES = [
+    ("indexed", INDEXED, 32, INDEX_BINDING),
+    ("fixed", FIXED, 1, FIXED_BINDING),
+    ("multi_fixed", MULTI_FIXED, 1, FIXED_BINDING),
+    ("multi_indexed", MULTI_INDEXED, 32, INDEX_BINDING),
+    ("runtime", RUNTIME, 1, RUNTIME_BINDING),
+    ("tile", TILE, (8, 8, 1), TILE_BINDING),
+    ("slab", SLAB, (4, 1, 8), SLAB_BINDING),
+    ("quad", QUAD, (4, 4, 1), QUAD_BINDING),
+    ("wide", WIDE, (256, 1, 1), WIDE_BINDING),
+    ("cube", CUBE, (4, 4, 4), CUBE_BINDING),
+    ("llvm_cube", LLVM_CUBE, (4, 4, 4), LLVM_CUBE_BINDING),
+    ("pitch", PITCH, (4, 4, 1), PITCH_BINDING),
+]
+
+
+def grid_words(name, groups):
+    """Independent expected readback for the multi-dimensional cases."""
+    dims, words = dict((case[0], case[2]) for case in CASES)[name], [SENTINEL] * 320
+    gx, gy, gz = groups
+    for x in range(gx * dims[0]):
+        for y in range(gy * dims[1]):
+            for z in range(gz * dims[2]):
+                if name == "tile":
+                    words[(72 * y + 8 * x) // 4:(72 * y + 8 * x) // 4 + 2] = [x, y]
+                elif name == "slab":
+                    words[(68 * z + 16 * x + 4) // 4:(68 * z + 16 * x + 4) // 4 + 2] = [z, x]
+                elif name == "quad":
+                    words[(52 * y + 4 * x) // 4] = x
+                elif name == "cube":
+                    words[(132 * z + 16 * y + 4 * x) // 4] = z
+                elif name == "llvm_cube":
+                    words[(136 * z + 16 * y + 4 * x) // 4] = z
+                elif name == "pitch":
+                    words[(72 * y + 8 * x) // 4:(72 * y + 8 * x) // 4 + 2] = [x, y]
+                elif name == "wide":
+                    words[x] = x
+                else:
+                    raise ValueError(f"No expected layout for {name}")
+    return words
+
+
+GRID_DISPATCHES = {
+    "tile": ((1, 1, 1), (1, 2, 1)),
+    "slab": ((1, 1, 1), (1, 1, 2)),
+    "quad": ((1, 1, 1), (3, 2, 1)),
+    "wide": ((1, 1, 1),),
+    "cube": ((1, 1, 1), (1, 2, 2)),
+    "llvm_cube": ((1, 1, 1), (1, 1, 2), (1, 2, 2)),
+    "pitch": ((1, 1, 1), (2, 3, 1)),
+}
+# Recompiled mutations run on the largest dispatch. Swapping two axes that span the same range
+# leaves the buffer unchanged: Y and Z both span 8 in the 1x2x2 cube, so that swap runs on 1x1x2,
+# where Y spans 4 and Z spans 8.
+MUTATION_DISPATCH = {("llvm_cube", "swapped Y/Z"): (1, 1, 2)}
+
+
+def controls():
+    for change in (dict(table_reg=6), dict(group_reg=10), dict(descriptor_offset=32), dict(stride=8)):
+        must_reject(lambda: aot.lower(INDEXED, 32, **(INDEX_BINDING | change)))
+    for old, new in (("lgkmcnt(0)", "lgkmcnt(1)"), ("s11, 5", "s11, 4"),
+                     ("s[20:23], 0 idxen", "s[24:27], 0 idxen"), ("s13, 0", "s13, 1")):
+        must_reject(lambda: aot.lower([s.replace(old, new) for s in INDEXED], 32, **INDEX_BINDING))
+    must_reject(lambda: aot.lower(INDEXED[:6] + INDEXED[7:], 32, **INDEX_BINDING))
+    must_reject(lambda: aot.lower(INDEXED[:7] + ["s_mov_b32 s21, 0"] + INDEXED[7:], 32, **INDEX_BINDING))
+    must_reject(lambda: aot.lower(FIXED, 32, **FIXED_BINDING))
+    must_reject(lambda: aot.lower(["s_endpgm"], 1, **FIXED_BINDING))
+
+    # Read a constant word directly into v10 before the constant-load wait.
+    must_reject(lambda: aot.lower(
+        RUNTIME[:7] + ["v_mov_b32_e32 v10, s20", RUNTIME[7]] + RUNTIME[10:],
+        1, **RUNTIME_BINDING))
+    for old, new in (("s11, 5, v0", "s11, 5, v1"),
+                     ("v[15:16], v8,", "v[15:16], v0,"),
+                     ("0 idxen offset:4", "0 offset:4")):
+        must_reject(lambda: aot.lower([s.replace(old, new) for s in INDEXED], 32, **INDEX_BINDING))
+    must_reject(lambda: aot.lower(
+        RUNTIME[:4] + ["s_mov_b32 s17, 0"] + RUNTIME[4:], 1, **RUNTIME_BINDING))
+    must_reject(lambda: aot.lower(
+        INDEXED[:7] + ["s_mov_b32 s23, 0"] + INDEXED[7:], 32, **INDEX_BINDING))
+    movk_boundary = FIXED[:2] + ["s_movk_i32 s10, 0x8000", "v_mov_b32_e32 v20, s10"] + FIXED[3:]
+    assert "    outputData.Store3(20u, uint3(0xffff8000u, 0x00000017u, 0xfffffffeu));" in (
+        aot.lower(movk_boundary, 1, **FIXED_BINDING).splitlines())
+    must_reject(lambda: aot.lower(FIXED, 1, **dict(FIXED_BINDING, constant_descriptor=8)))
+
+    # Overlapping store spans in one invocation are rejected.
+    must_reject(lambda: aot.lower(
+        MULTI_FIXED[:-1] + ["buffer_store_dword v7, off, s[12:15], 0 offset:12", "s_endpgm"],
+        1, **FIXED_BINDING))
+    must_reject(lambda: aot.lower(
+        MULTI_INDEXED[:-1] + ["buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen offset:4", "s_endpgm"],
+        32, **INDEX_BINDING))
+    # Non-constant or pending scalar/vector sources and out-of-range hints/immediates are rejected.
+    must_reject(lambda: aot.lower(
+        [s.replace("v_mov_b32_e32 v4, s10", "v_mov_b32_e32 v4, s8") for s in MULTI_FIXED],
+        1, **FIXED_BINDING))
+    must_reject(lambda: aot.lower(
+        [s.replace("v_mov_b32_e32 v4, s10", "v_mov_b32_e32 v4, s12") for s in MULTI_FIXED],
+        1, **FIXED_BINDING))
+    must_reject(lambda: aot.lower(
+        [s.replace("v_mov_b32_e32 v6, v4", "v_mov_b32_e32 v6, v0") for s in MULTI_FIXED],
+        1, **FIXED_BINDING))
+    must_reject(lambda: aot.lower(
+        [s.replace("s_clause 0x1", "s_clause 0x40") for s in MULTI_FIXED],
+        1, **FIXED_BINDING))
+    must_reject(lambda: aot.lower(
+        [s.replace("s_movk_i32 s11, 0xfffc", "s_movk_i32 s11, 0x10000") for s in MULTI_FIXED],
+        1, **FIXED_BINDING))
+    must_reject(aot.group_size, bytes(52))
+    # Runtime info shorter than 48 bytes, or a non-compute stage, has no usable thread dimensions.
+    for size, stage in ((47, 5), (48, 4)):
+        psv = bytearray(52)
+        struct.pack_into("<I", psv, 0, size)
+        psv[28] = stage
+        struct.pack_into("<3I", psv, 40, 1, 1, 1)
+        rejects("Expected compute PSV runtime info", aot.group_size, bytes(psv))
+
+    # The 6-bit s_clause field, 32-bit literals and the 12-bit MUBUF offset.
+    max_clause = [s.replace("s_clause 0x1", "s_clause 0x3f") for s in MULTI_FIXED]
+    assert aot.lower(max_clause, 1, **FIXED_BINDING) == aot.lower(MULTI_FIXED, 1, **FIXED_BINDING)
+    rejects("Invalid scalar immediate", lambda: aot.lower(
+        [s.replace("s10, 0x12345678", "s10, -2147483649") for s in MULTI_FIXED],
+        1, **FIXED_BINDING))
+    rejects("Invalid literal move", lambda: aot.lower(
+        [s.replace("v20, 11", "v20, 0x100000000") for s in FIXED],
+        1, **FIXED_BINDING))
+    rejects("Unverified raw UAV store", lambda: aot.lower(
+        [s.replace("offset:20", "offset:4096") for s in FIXED],
+        1, **FIXED_BINDING))
+    for descriptor in (None, 8, 16, 33):
+        must_reject(lambda: aot.lower(RUNTIME, 1, **dict(FIXED_BINDING, constant_descriptor=descriptor)))
+    for old, new in (
+        ("s[16:19], 0x30", "s[16:19], 0x34"),
+        ("s[16:19], 0xc", "s[16:19], 0xa"),
+        ("s[16:19], 0xc", "s[12:15], 0xc"),
+        ("s[22:23]", "s[21:22]"),
+        ("s[24:27]", "s[20:23]"),
+        ("s[12:15], 0 offset:64", "s[16:19], 0 offset:64"),
+    ):
+        must_reject(lambda: aot.lower([line.replace(old, new) for line in RUNTIME], 1, **RUNTIME_BINDING))
+    for slot in (3, 7):
+        early = RUNTIME.copy()
+        early[slot] = "s_waitcnt vmcnt(0)"
+        must_reject(lambda: aot.lower(early, 1, **RUNTIME_BINDING))
+    grid_controls()
+    guard_controls()
+    read_controls()
+    alu_controls()
+
+
+def grid_controls():
+    """Multi-dimensional groups: exact output, then one rejection per broken assumption."""
+    tile = aot.lower(TILE, (8, 8, 1), **TILE_BINDING).splitlines()
+    assert "[numthreads(8,8,1)]" in tile
+    assert "    outputData.Store2(tid.y * 72u + (tid.x << 3u) + 0u, uint2(tid.x, tid.y));" in tile
+    assert "    outputData.Store2(tid.z * 68u + (tid.x << 4u) + 4u, uint2(tid.z, tid.x));" in (
+        aot.lower(SLAB, (4, 1, 8), **SLAB_BINDING).splitlines())
+    assert "    outputData.Store(tid.x * 4u + 0u, tid.x);" in aot.lower(WIDE, 256, **WIDE_BINDING).splitlines()
+    # Group sizes: per-axis and total D3D12 limits; the former 1D widths still pass.
+    for group in ((1024, 1, 1), (1, 1024, 1), (1, 1, 64), (16, 16, 4), 128, 32, 64, 1):
+        aot.checked_group(group)
+    for group in ((1025, 1, 1), (1, 1, 0), (1, 1, 65), (64, 4, 8), (0, 1, 1), (8, 0, 1), 0, (8.0, 8, 1)):
+        must_reject(aot.checked_group, group)
+    # Wrong group size: the shifts no longer match, or the size is not a power of two.
+    for group in ((8, 4, 1), (4, 8, 1), (8, 6, 1), (8, 12, 1), (12, 8, 1), (8, 8, 2), (8, 1, 1)):
+        must_reject(lambda: aot.lower(TILE, group, **TILE_BINDING))
+    # A group whose Y is one launches without a Y local ID; v1 is then undefined.
+    must_reject(lambda: aot.lower([s.replace("s11, 2, v1", "s11, 0, v1") for s in QUAD], (4, 1, 1),
+                                  **QUAD_BINDING))
+    # Axes swapped or ignored: local X with group Y, local Z read in a group whose Z is one.
+    for old, new in (("s11, 3, v1", "s11, 3, v0"), ("s10, 3, v0", "s10, 3, v1"),
+                     ("s10, 3, v0", "s11, 3, v0")):
+        must_reject(lambda: aot.lower([s.replace(old, new) for s in TILE], (8, 8, 1), **TILE_BINDING))
+    must_reject(lambda: aot.lower(SLAB, (4, 8, 1), **SLAB_BINDING))
+    must_reject(lambda: aot.lower([s.replace("3, v2", "3, v1") for s in SLAB], (4, 1, 8), **SLAB_BINDING))
+    # Wrong or missing group-register bindings.
+    for change in (dict(group_reg_y=12), dict(group_reg_y=None), dict(group_reg=11), dict(group_reg_y=8),
+                   dict(group_reg_z=11)):
+        must_reject(lambda: aot.lower(TILE, (8, 8, 1), **(TILE_BINDING | change)))
+    must_reject(lambda: aot.lower(SLAB, (4, 1, 8), **(SLAB_BINDING | dict(group_reg_z=None, group_reg_y=16))))
+    must_reject(lambda: aot.lower(SLAB, (4, 1, 8), **(SLAB_BINDING | dict(group_reg_y=16))))
+    # Index and byte offset from the same axis would alias rows.
+    same_axis = WIDE[:3] + ["v_lshlrev_b32_e32 v4, 2, v3", WIDE[3],
+                            "buffer_store_dword v3, v[3:4], s[12:15], 0 idxen offen", "s_endpgm"]
+    must_reject(lambda: aot.lower(same_axis, 256, **(WIDE_BINDING | dict(stride=1024))))
+    # Addresses that leave an element or a row, or that two invocations of one group share.
+    for binding in (dict(stride=60), dict(stride=None)):
+        must_reject(lambda: aot.lower(TILE, (8, 8, 1), **(TILE_BINDING | binding)))
+    for old, new in (("v_lshlrev_b32_e32 v5, 3, v3", "v_lshlrev_b32_e32 v5, 2, v3"),
+                     ("v_lshlrev_b32_e32 v5, 3, v3", "v_lshlrev_b32_e32 v5, 1, v3"),
+                     ("v_lshlrev_b32_e32 v5, 3, v3", "v_lshlrev_b32_e32 v5, 3, v4"),
+                     ("v_lshlrev_b32_e32 v5, 3, v3", "v_lshlrev_b32_e32 v5, 3, v0"),
+                     ("v[4:5], s[12:15], 0 idxen offen", "v4, s[12:15], 0 idxen"),
+                     ("v[4:5], s[12:15], 0 idxen offen", "v[4:5], s[12:15], 0 offen"),
+                     ("v[4:5], s[12:15], 0 idxen offen", "v[3:4], s[12:15], 0 idxen offen"),
+                     ("0 idxen offen", "0 idxen offen offset:4")):
+        must_reject(lambda: aot.lower([s.replace(old, new) for s in TILE], (8, 8, 1), **TILE_BINDING))
+    must_reject(lambda: aot.lower(WIDE, (256, 2, 1), **WIDE_BINDING))
+    must_reject(lambda: aot.lower(QUAD[:-1] + ["buffer_store_dword v3, v4, s[12:15], 0 idxen offset:4", "s_endpgm"],
+                                  (4, 4, 1), **QUAD_BINDING))
+    # Two stores that are valid alone but transpose the layout race across invocations.
+    transposed = ["v_mov_b32_e32 v6, v3", "v_lshlrev_b32_e32 v7, 3, v4",
+                  "buffer_store_dword v3, v[6:7], s[12:15], 0 idxen offen offset:4"]
+    aot.lower(QUAD[:5] + transposed[:2] + QUAD[5:6] + transposed[2:] + ["s_endpgm"], (4, 4, 1), **QUAD_BINDING)
+    must_reject(lambda: aot.lower(QUAD[:5] + transposed[:2] + QUAD[5:-1] + transposed[2:] + ["s_endpgm"],
+                                  (4, 4, 1), **QUAD_BINDING))
+    # A store with an unresolved local ID as data is still rejected.
+    must_reject(lambda: aot.lower([s.replace("v_mov_b32_e32 v6, v3", "v_mov_b32_e32 v6, v1") for s in TILE],
+                                  (8, 8, 1), **TILE_BINDING))
+    cube_controls()
+    llvm_cube_controls()
+    pitch_controls()
+    audit_candidates()
+
+
+def cube_controls():
+    """Three-axis stores: exact output, then one rejection per broken assumption."""
+    cube = aot.lower(CUBE, (4, 4, 4), **CUBE_BINDING).splitlines()
+    assert "[numthreads(4,4,4)]" in cube
+    assert "    outputData.Store(tid.z * 132u + (tid.y << 4u) + (tid.x << 2u) + 0u, tid.z);" in cube
+    # Z of one leaves v2 undefined; a wrong group size breaks a shift; a group register is missing.
+    for group in ((4, 4, 1), (4, 4, 2), (4, 2, 4), (2, 4, 4), (4, 4, 8)):
+        must_reject(lambda: aot.lower(CUBE, group, **CUBE_BINDING))
+    for change in (dict(group_reg_z=None), dict(group_reg_z=11), dict(group_reg_z=12)):
+        must_reject(lambda: aot.lower(CUBE, (4, 4, 4), **(CUBE_BINDING | change)))
+    for old, new in (
+        # Row and column from the same axis, or index and row from the same axis.
+        ("v_lshl_add_u32 v7, v4, 4, v5", "v_lshl_add_u32 v7, v3, 4, v5"),
+        ("v_lshl_add_u32 v6, s16, 2, v2", "v_lshl_add_u32 v6, s11, 2, v1"),
+        # Row operand is a raw local ID; column operand is an index, not a byte offset.
+        ("v_lshl_add_u32 v7, v4, 4, v5", "v_lshl_add_u32 v7, v1, 4, v5"),
+        ("v_lshl_add_u32 v7, v4, 4, v5", "v_lshl_add_u32 v7, v4, 4, v3"),
+        # The group's columns overflow a row, or the element overflows a column.
+        ("v_lshl_add_u32 v7, v4, 4, v5", "v_lshl_add_u32 v7, v4, 3, v5"),
+        ("v_lshlrev_b32_e32 v5, 2, v3", "v_lshlrev_b32_e32 v5, 1, v3"),
+        ("0 idxen offen", "0 idxen offen offset:4"),
+        # A plane offset without its index, or with the operands in the wrong order.
+        ("v[6:7], s[12:15], 0 idxen offen", "v7, s[12:15], 0 offen"),
+        ("v[6:7], s[12:15], 0 idxen offen", "v[7:8], s[12:15], 0 idxen offen"),
+    ):
+        must_reject(lambda: aot.lower([s.replace(old, new) for s in CUBE], (4, 4, 4), **CUBE_BINDING))
+    # The group's rows overflow the plane stride.
+    for stride in (60, None):
+        must_reject(lambda: aot.lower(CUBE, (4, 4, 4), **(CUBE_BINDING | dict(stride=stride))))
+    # The plane offset is not a storable word.
+    must_reject(lambda: aot.lower([s.replace("buffer_store_dword v6,", "buffer_store_dword v7,") for s in CUBE],
+                                  (4, 4, 4), **CUBE_BINDING))
+
+
+def llvm_cube_controls():
+    """The LLVM 15 cube: exact output, then one rejection per group-base assumption."""
+    def cube(*changes, group=(4, 4, 4), **binding):
+        lines = LLVM_CUBE
+        for old, new in changes:
+            assert sum(old in line for line in lines) == 1, old
+            lines = [part for line in lines for part in line.replace(old, new).split("\n")]
+        return aot.lower(lines, group, **(LLVM_CUBE_BINDING | binding))
+
+    source = cube().splitlines()
+    assert "[numthreads(4,4,4)]" in source
+    assert "    outputData.Store(tid.z * 136u + (tid.y << 4u) + (tid.x << 2u) + 0u, tid.z);" in source
+    # Other group sizes: a shift no longer matches, local Y or Z is not launched, or Z is not a
+    # power of two.
+    for group in ((4, 8, 4), (4, 4, 8), (4, 4, 2), (4, 4, 1), (4, 1, 4), (4, 4, 3)):
+        must_reject(lambda: cube(group=group))
+    # Group X of 2, 8 or 6: with Y moved to bit 5 the spans still fit, so only the group base
+    # rejects them, for its shift (2 and 8) or because 6 is not a power of two.
+    must_reject(lambda: cube(group=(2, 4, 4)))
+    for group in ((8, 4, 4), (6, 4, 4)):
+        must_reject(lambda: cube(("v1, v1, 4, v3", "v1, v1, 5, v3"), group=group))
+    # Group base: wrong shift, a source that is not a group ID, a destination past s105 or still
+    # pending from a descriptor load, a group base scaled again.
+    for changes in ((("s0, s2, 2", "s0, s2, 3"),), (("s0, s2, 2", "s0, s5, 2"),),
+                    (("s_lshl_b32 s0,", "s_lshl_b32 s106,"), ("v3, s0, v0", "v3, s106, v0")),
+                    (("s_load_dwordx4 s[8:11], s[0:1], null",
+                      "s_load_dwordx4 s[8:11], s[0:1], null\ns_load_dwordx4 s[12:15], s[0:1], null"),
+                     ("s_lshl_b32 s0,", "s_lshl_b32 s12,"), ("v3, s0, v0", "v3, s12, v0")),
+                    (("s0, s2, 2", "s0, s2, 2\ns_lshl_b32 s0, s0, 2"),)):
+        must_reject(lambda: cube(*changes))
+    # The same form on Y, whose group size differs from X: the base's shift and power of two
+    # are checked against its own axis.
+    y_form = (("v1, s3, 2, v1", "v4, s2, 2, v0"), ("s0, v0, 2", "s0, v1, 2"), ("v1, v1, 4, v3", "v1, v4, 4, v3"))
+    source = cube(("s0, s2, 2", "s0, s3, 1"), *y_form, group=(4, 2, 4)).splitlines()
+    assert "    outputData.Store(tid.z * 136u + (tid.x << 4u) + (tid.y << 2u) + 0u, tid.z);" in source
+    must_reject(lambda: cube(("s0, s2, 2", "s0, s3, 2"), *y_form, group=(4, 2, 4)))
+    must_reject(lambda: cube(("s0, s2, 2", "s0, s3, 1"), *y_form, group=(4, 3, 4)))
+    # Byte offset: an unscaled group ID, the group base of Y with local X, local Z added to the X
+    # base, a destination past v255.
+    for changes in ((("v3, s0, v0", "v3, s2, v0"),), (("s0, s2, 2", "s0, s3, 2"),),
+                    (("s0, v0, 2", "s0, v2, 2"),),
+                    (("v_add_lshl_u32 v3,", "v_add_lshl_u32 v256,"), ("v1, v1, 4, v3", "v1, v1, 4, v256"))):
+        must_reject(lambda: cube(*changes))
+    # The new byte offset still meets the element and row checks from #724.
+    for change in (("s0, v0, 2", "s0, v0, 1"), ("s0, v0, 2", "s0, v0, 3")):
+        must_reject(lambda: cube(change))
+    # A group base is not a storable word.
+    must_reject(lambda: cube(("v_lshl_add_u32 v1, v1, 4, v3", "v_lshl_add_u32 v1, v1, 4, v3\nv_mov_b32_e32 v5, s0"),
+                             ("buffer_store_dword v0,", "buffer_store_dword v5,")))
+
+
+def pitch_controls():
+    """Row-pitch stores: exact output, then one rejection per broken assumption."""
+    expected = "    outputData.Store2((tid.y & 0xffffffu) * 72u + (tid.x << 3u) + 0u, uint2(tid.x, tid.y));"
+    pitch = aot.lower(PITCH, (4, 4, 1), **PITCH_BINDING)
+    assert "[numthreads(4,4,1)]" in pitch.splitlines() and expected in pitch.splitlines()
+    # Either multiplicand may carry the pitch; without idxen the stride binding does not change the output.
+    assert aot.lower([s.replace("0x48, v4,", "v4, 0x48,") for s in PITCH], (4, 4, 1), **PITCH_BINDING) == pitch
+    assert aot.lower(PITCH, (4, 4, 1), **(PITCH_BINDING | dict(stride=16))) == pitch
+    # The column byte offset may also come in the LLVM 15 group-base form.
+    group_base = [part for line in PITCH for part in line.replace(
+        "v_lshlrev_b32_e32 v5, 3, v3", "s_lshl_b32 s20, s10, 2\nv_add_lshl_u32 v5, s20, v0, 3").split("\n")]
+    assert len(group_base) == len(PITCH) + 1 and aot.lower(group_base, (4, 4, 1), **PITCH_BINDING) == pitch
+    # An inline-constant pitch is printed in decimal.
+    assert expected.replace("72u", "64u") in aot.lower(
+        [s.replace("0x48", "64") for s in PITCH], (4, 4, 1), **PITCH_BINDING).splitlines()
+    for old, new in (
+        # Pitch unaligned, zero, negative, narrower than one group's columns, or wider than 24 bits.
+        ("0x48, v4", "0x46, v4"), ("0x48, v4", "0, v4"), ("0x48, v4", "-4, v4"),
+        ("0x48, v4", "0x1c, v4"), ("0x48, v4", "0x1000000, v4"),
+        # Pitch from a register, or no literal at all.
+        ("0x48, v4", "s10, v4"), ("0x48, v4", "v3, v4"),
+        # Row is a raw local ID, shares the column's axis, or the addend is an index, not bytes.
+        ("0x48, v4, v5", "0x48, v1, v5"), ("0x48, v4, v5", "0x48, v3, v5"), ("0x48, v4, v5", "0x48, v4, v3"),
+        # Output modifier.
+        ("0x48, v4, v5", "0x48, v4, v5 clamp"),
+        # The element overflows its column.
+        ("v_lshlrev_b32_e32 v5, 3, v3", "v_lshlrev_b32_e32 v5, 2, v3"), ("0 offen", "0 offen offset:4"),
+        # idxen on a pitch offset, or no offen.
+        ("0 offen", "0 idxen offen"), ("v6, s[12:15], 0 offen", "v6, s[12:15], 0 idxen"),
+        # The pitch offset is not a storable word.
+        ("buffer_store_dwordx2 v[8:9]", "buffer_store_dwordx2 v[6:7]"),
+    ):
+        must_reject(lambda: aot.lower([s.replace(old, new) for s in PITCH], (4, 4, 1), **PITCH_BINDING))
+    # A wrong group size breaks a shift or leaves an axis unseparated; a group register is missing.
+    for group in ((8, 4, 1), (4, 8, 1), (4, 4, 2), (4, 1, 1)):
+        must_reject(lambda: aot.lower(PITCH, group, **PITCH_BINDING))
+    for change in (dict(group_reg_y=None), dict(group_reg_y=12)):
+        must_reject(lambda: aot.lower(PITCH, (4, 4, 1), **(PITCH_BINDING | change)))
+    # One group's rows may span the whole 32-bit address space but not wrap onto each other.
+    tall = [s.replace("s10, 2, v0", "s10, 0, v0").replace("s11, 2, v1", "s11, 10, v1") for s in PITCH]
+    aot.lower([s.replace("0x48", "0x400000") for s in tall], (1, 1024, 1), **PITCH_BINDING)
+    must_reject(lambda: aot.lower([s.replace("0x48", "0x400004") for s in tall], (1, 1024, 1), **PITCH_BINDING))
+    # A second store with another pitch would use a different layout.
+    second = ["v_mad_u32_u24 v7, 0x50, v4, v5", "buffer_store_dword v8, v7, s[12:15], 0 offen offset:4"]
+    try:
+        aot.lower(PITCH[:6] + second[:1] + PITCH[6:-1] + second[1:] + ["s_endpgm"], (4, 4, 1), **PITCH_BINDING)
+    except ValueError as error:
+        assert str(error) == "Stores use different address layouts", error
+    else:
+        raise AssertionError("Two row pitches were accepted")
+
+
+def audit_candidates():
+    """The audit tries group Z in the SGPR after group X when the group's Y is one."""
+    slab = ["s_mov_b32 s4, s5", "s_mov_b32 s5, 0", "s_load_dwordx4 s[12:15], s[4:5], null",
+            "v_lshl_add_u32 v3, s6, 2, v0", "v_lshl_add_u32 v4, s7, 3, v2", "v_lshlrev_b32_e32 v5, 2, v3",
+            "s_waitcnt lgkmcnt(0)", "buffer_store_dword v4, v[4:5], s[12:15], 0 idxen offen", "s_endpgm"]
+    # The audit always offers a stride for multi-group shaders; a pure offen pitch store ignores it.
+    pitch = [s.replace("s[8:9]", "s[4:5]").replace("s9, 0", "s5, 0").replace("s10, 2", "s6, 2")
+             .replace("s11, 2", "s7, 2") for s in PITCH]
+    pitch.insert(0, "s_mov_b32 s4, s5")
+    pitch_line = "    outputData.Store2((tid.y & 0xffffffu) * 72u + (tid.x << 3u) + 0u, uint2(tid.x, tid.y));"
+    for lines, group, expected in ((slab, (4, 1, 8), "    outputData.Store(tid.z * 16u + (tid.x << 2u) + 0u, tid.z);"),
+                                   ([s.replace("s7, 3", "s8, 3") for s in slab], (4, 1, 8), None),
+                                   (pitch, (4, 4, 1), pitch_line)):
+        emitted = []
+        with patch.object(shader_profile_audit.pixel_aot, "disassemble", return_value=lines):
+            profiles = shader_profile_audit.compute_profiles(b"", group, None,
+                                                             lambda kind, source: emitted.append(source))
+        if expected is None:
+            assert profiles == [] and not emitted
+        else:
+            assert profiles == ["store"] and expected in emitted[0].splitlines()
+
+
+# Two-exit compute programs (#721), reusing the pixel verifier from #477. Both kernels are the
+# llc-15 output (-mtriple=amdgcn--amdpal -mcpu=gfx1013 -O2) of an original source:
+#   if (gid >= n) return;   // wave-uniform, with branch weights that mark the return likely
+#   store gid at a byte offset;
+# The conditional branch jumps over the early s_endpgm to the store block.
+EXIT_KERNEL = [  # amdgpu_kernel: group X in s2, bound n and descriptor from the kernel arguments
+    "s_load_dword s3, s[0:1], 0x8",
+    "s_waitcnt lgkmcnt(0)",
+    "s_cmp_ge_u32 s2, s3",
+    "s_cbranch_scc0 .Lbody",
+    "s_endpgm",
+    ".Lbody:",
+    "s_load_dwordx2 s[0:1], s[0:1], null",
+    "v_lshlrev_b32_e32 v0, 2, v0",
+    "v_mov_b32_e32 v1, s2",
+    "s_waitcnt lgkmcnt(0)",
+    "s_load_dwordx4 s[4:7], s[0:1], null",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v1, v0, s[4:7], 0 offen",
+    "s_endpgm",
+]
+EXIT_CS = [  # amdgpu_cs: descriptor, n and the group ID as SGPR arguments
+    "s_cmp_ge_u32 s5, s4",
+    "s_cbranch_scc0 .Lbody",
+    "s_endpgm",
+    ".Lbody:",
+    "s_lshl_b32 s4, s5, 2",
+    "v_mov_b32_e32 v0, s5",
+    "v_mov_b32_e32 v1, s4",
+    "buffer_store_dword v0, v1, s[0:3], 0 offen",
+    "s_endpgm",
+]
+# The same source with a per-lane bound (local X >= n). LLVM 15 merges the per-lane return into
+# one exit: s_cbranch_execz skips the store and reaches the only s_endpgm.
+LANE_EXIT = [
+    "s_load_dword s3, s[0:1], 0x8",
+    "s_waitcnt lgkmcnt(0)",
+    "v_cmp_gt_u32_e32 vcc_lo, s3, v0",
+    "s_and_saveexec_b32 s3, vcc_lo",
+    "s_cbranch_execz .Lend",
+    "s_load_dwordx2 s[0:1], s[0:1], null",
+    "v_lshlrev_b32_e32 v0, 2, v0",
+    "v_mov_b32_e32 v1, s2",
+    "s_waitcnt lgkmcnt(0)",
+    "s_load_dwordx4 s[4:7], s[0:1], null",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v1, v0, s[4:7], 0 offen",
+    ".Lend:",
+    "s_endpgm",
+]
+# Per-lane guards (#721), unchanged LLVM 15 output (-mtriple=amdgcn--amdpal -mcpu=gfx1013 -O2) of
+# original amdgpu_cs sources with a 32-bit table pointer and the group X ID as SGPR arguments, a
+# group of 32, u0 at table byte 0 and b0 at byte 32:
+#   gid = group.x * 32 + local.x;
+#   if (gid < n) store gid at element gid;        // n = params[0].x
+# The guard stays open to the exit; the u0 descriptor load is sunk under it.
+GUARD_END = [
+    "s_mov_b32 s2, s1",
+    "s_mov_b32 s1, 0",
+    "v_lshl_add_u32 v0, s2, 5, v0",
+    "s_load_dwordx4 s[4:7], s[0:1], 0x20",
+    "s_waitcnt lgkmcnt(0)",
+    "s_buffer_load_dword s3, s[4:7], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "v_cmp_gt_u32_e32 vcc_lo, s3, v0",
+    "s_and_saveexec_b32 s2, vcc_lo",
+    "s_cbranch_execz .LBB0_2",
+    "s_load_dwordx4 s[0:3], s[0:1], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v0, v0, s[0:3], 0 idxen",
+    ".LBB0_2:",
+    "s_endpgm",
+]
+# The same guard, then a store outside it, so exec is restored before the second store:
+#   if (gid < n) store gid at element gid, word 0;
+#   store 0x600d at element gid, word 1;
+GUARD_JOIN = [
+    "s_mov_b32 s2, s1",
+    "s_mov_b32 s1, 0",
+    "v_lshl_add_u32 v0, s2, 5, v0",
+    "s_load_dwordx4 s[8:11], s[0:1], 0x20",
+    "s_waitcnt lgkmcnt(0)",
+    "s_buffer_load_dword s3, s[8:11], 0x0",
+    "s_load_dwordx4 s[4:7], s[0:1], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "v_cmp_gt_u32_e32 vcc_lo, s3, v0",
+    "s_and_saveexec_b32 s0, vcc_lo",
+    "s_cbranch_execz .LBB1_2",
+    "buffer_store_dword v0, v0, s[4:7], 0 idxen",
+    ".LBB1_2:",
+    "s_waitcnt_depctr 0xffe3",
+    "s_or_b32 exec_lo, exec_lo, s0",
+    "v_mov_b32_e32 v1, 0x600d",
+    "buffer_store_dword v1, v0, s[4:7], 0 idxen offset:4",
+    "s_endpgm",
+]
+GUARD_BINDING = dict(table_reg=0, descriptor_offset=0, constant_descriptor=32, group_reg=1, stride=4)
+GUARD_CASES = [
+    ("guard_end", GUARD_END, 32, GUARD_BINDING),
+    ("guard_join", GUARD_JOIN, 32, GUARD_BINDING | dict(stride=8)),
+]
+GUARD_IF = "    if (params[0].x > tid.x) {"
+# Vector reads (#721), unchanged LLVM 15 code generator output (-mtriple=amdgcn--amdpal
+# -mcpu=gfx1013 -O2, no IR passes) of original amdgpu_cs sources as for the guards above, with a
+# second, read-only raw buffer at table byte 16 (t0). Both descriptors come from one x8 load.
+#   gid = group.x * 32 + local.x;
+#   if (gid < n) store source word gid (byte offset gid * 4) at element gid;
+READ_COPY = [
+    "s_mov_b32 s2, s1",
+    "s_mov_b32 s1, 0",
+    "v_lshl_add_u32 v0, s2, 5, v0",
+    "s_load_dwordx4 s[4:7], s[0:1], 0x20",
+    "s_waitcnt lgkmcnt(0)",
+    "s_buffer_load_dword s3, s[4:7], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "v_cmp_gt_u32_e32 vcc_lo, s3, v0",
+    "s_and_saveexec_b32 s2, vcc_lo",
+    "s_cbranch_execz .LBB0_2",
+    "s_load_dwordx8 s[0:7], s[0:1], 0x0",
+    "v_lshlrev_b32_e32 v1, 2, v0",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_load_dword v1, v1, s[4:7], 0 offen",
+    "s_waitcnt vmcnt(0)",
+    "buffer_store_dword v1, v0, s[0:3], 0 idxen",
+    ".LBB0_2:",
+    "s_endpgm",
+]
+#   if (gid < n) store word 1 of indexed source element gid at element gid;
+# The source stride is a descriptor field, bound here as 8 bytes.
+READ_INDEX = [
+    "s_mov_b32 s2, s1",
+    "s_mov_b32 s1, 0",
+    "v_lshl_add_u32 v0, s2, 5, v0",
+    "s_load_dwordx4 s[4:7], s[0:1], 0x20",
+    "s_waitcnt lgkmcnt(0)",
+    "s_buffer_load_dword s3, s[4:7], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "v_cmp_gt_u32_e32 vcc_lo, s3, v0",
+    "s_and_saveexec_b32 s2, vcc_lo",
+    "s_cbranch_execz .LBB1_2",
+    "s_load_dwordx8 s[0:7], s[0:1], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_load_dword v1, v0, s[4:7], 0 idxen offset:4",
+    "s_waitcnt vmcnt(0)",
+    "buffer_store_dword v1, v0, s[0:3], 0 idxen",
+    ".LBB1_2:",
+    "s_endpgm",
+]
+READ_BINDING = GUARD_BINDING | dict(source_descriptor=16)
+READ_CASES = [
+    ("read_copy", READ_COPY, 32, READ_BINDING),
+    ("read_index", READ_INDEX, 32, READ_BINDING | dict(source_stride=8)),
+]
+READ_LOADS = {"read_copy": "inputData.Load((tid.x << 2u) + 0u)", "read_index": "inputData.Load(tid.x * 8u + 4u)"}
+# Read-compute-write (#721), unchanged LLVM 15 code generator output of an original amdgpu_cs
+# source as for the reads, with the same bindings:
+#   if (gid < n) {
+#       v = source word gid (byte offset gid * 4);
+#       store umin((v & 0xffff) * (v >> 16) + gid, cap) at element gid;    // cap = params[0].y
+#   }
+READ_COMPUTE = [
+    "s_mov_b32 s2, s1",
+    "s_mov_b32 s1, 0",
+    "v_lshl_add_u32 v0, s2, 5, v0",
+    "s_load_dwordx4 s[4:7], s[0:1], 0x20",
+    "s_waitcnt lgkmcnt(0)",
+    "s_buffer_load_dword s3, s[4:7], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "v_cmp_gt_u32_e32 vcc_lo, s3, v0",
+    "s_and_saveexec_b32 s2, vcc_lo",
+    "s_cbranch_execz .LBB0_2",
+    "s_load_dwordx8 s[8:15], s[0:1], 0x0",
+    "v_lshlrev_b32_e32 v1, 2, v0",
+    "s_buffer_load_dword s0, s[4:7], 0x4",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_load_dword v1, v1, s[12:15], 0 offen",
+    "s_waitcnt vmcnt(0)",
+    "v_and_b32_e32 v2, 0xffff, v1",
+    "v_lshrrev_b32_e32 v1, 16, v1",
+    "v_mad_u32_u24 v1, v2, v1, v0",
+    "v_min_u32_e32 v1, s0, v1",
+    "buffer_store_dword v1, v0, s[8:11], 0 idxen",
+    ".LBB0_2:",
+    "s_endpgm",
+]
+ALU_WORD = ("min(params[0].y, ((((0x0000ffffu & {0}) & 0xffffffu) * (({0} >> (0x00000010u & 31u)) & 0xffffffu))"
+            " + tid.x))").format(READ_LOADS["read_copy"])
+
+
+def variant(lines, *changes):
+    """Apply (old, new) to the one line containing old; a newline in new inserts lines, "" deletes it."""
+    for old, new in changes:
+        assert sum(old in line for line in lines) == 1, old
+        lines = [part for line in lines for part in ((line.replace(old, new).split("\n") if new else [])
+                                                     if old in line else [line])]
+    return lines
+
+
+# Leave a different bit above bit 23 set in each multiplicand. The ordinary
+# codegen fixture above limits both inputs to 16 bits.
+READ_MAD24 = variant(
+    READ_COMPUTE,
+    ("v_and_b32_e32 v2, 0xffff, v1", "v_and_b32_e32 v2, 0x1ffffff, v1"),
+    ("v_lshrrev_b32_e32 v1, 16, v1", "v_and_b32_e32 v1, 0x2ffffff, v1"),
+)
+# Keep the same guarded read and write. Use the entire source and constant words.
+READ_MUL_LO = variant(
+    READ_COMPUTE,
+    ("v_and_b32_e32 v2, 0xffff, v1", ""),
+    ("v_lshrrev_b32_e32 v1, 16, v1", ""),
+    ("v_mad_u32_u24 v1, v2, v1, v0", "v_mul_lo_u32 v1, s0, v1"),
+    ("v_min_u32_e32 v1, s0, v1", ""),
+)
+# The remaining unsigned VOP2 operations of the subset, chained so each result feeds the next: the cap constant added
+# to the product (it wraps for most lanes), a high-bit OR and a high-bit XOR, then the unsigned maximum of the product
+# and the chain (the product wins for some lanes and the chain for others).
+READ_VOP2 = variant(
+    READ_COMPUTE,
+    ("v_min_u32_e32 v1, s0, v1", "v_add_nc_u32_e32 v2, s0, v1\nv_or_b32_e32 v2, 0x80000010, v2\n"
+                                 "v_xor_b32_e32 v2, 0x80000001, v2\nv_max_u32_e32 v1, v1, v2"),
+)
+ALU_CASES = [
+    ("read_compute", READ_COMPUTE, 32, READ_BINDING),
+    ("read_mad24", READ_MAD24, 32, READ_BINDING),
+    ("read_mul_lo", READ_MUL_LO, 32, READ_BINDING),
+    ("read_vop2", READ_VOP2, 32, READ_BINDING),
+]
+
+
+def guard_controls():
+    """Per-lane guards: exact output, then one rejection per broken control-flow assumption."""
+    def guard(name, *changes):
+        _, lines, width, binding = dict((case[0], case) for case in GUARD_CASES)[name]
+        return aot.lower(variant(lines, *changes), width, **binding).splitlines()
+
+    end, join = guard("guard_end"), guard("guard_join")
+    assert end[-4:] == [GUARD_IF, "        outputData.Store(tid.x * 4u + 0u, tid.x);", "    }", "}"], end
+    assert join[-5:] == [GUARD_IF, "        outputData.Store(tid.x * 8u + 0u, tid.x);", "    }",
+                         "    outputData.Store(tid.x * 8u + 4u, 0x0000600du);", "}"], join
+    # The compare picks the operator and operand order; an immediate bound is a literal.
+    for op, symbol in (("gt", ">"), ("lt", "<"), ("ge", ">="), ("le", "<=")):
+        assert f"    if (params[0].x {symbol} tid.x) {{" in guard("guard_join", ("v_cmp_gt_u32", f"v_cmp_{op}_u32"))
+    assert "    if (0x00000028u > tid.x) {" in guard("guard_join", ("vcc_lo, s3, v0", "vcc_lo, 40, v0"))
+    # Without the restore and the branch, exec stays masked to the exit: both stores are guarded.
+    unrestored = guard("guard_join", ("s_cbranch_execz", ""), (".LBB1_2:", ""), ("s_or_b32", ""))
+    assert unrestored[-5:] == [GUARD_IF, "        outputData.Store(tid.x * 8u + 0u, tid.x);",
+                               "        outputData.Store(tid.x * 8u + 4u, 0x0000600du);", "    }", "}"], unrestored
+    # A load waited for only under the guard is pending again after the restore, unless waited for.
+    late_load = (("s_load_dwordx4 s[4:7], s[0:1], 0x0", ""),
+                 ("vcc_lo, s3, v0", "vcc_lo, s3, v0\ns_load_dwordx4 s[4:7], s[0:1], 0x0"),
+                 ("s_cbranch_execz .LBB1_2", "s_cbranch_execz .LBB1_2\ns_waitcnt lgkmcnt(0)"))
+    assert guard("guard_join", *late_load, ("v1, 0x600d", "v1, 0x600d\ns_waitcnt lgkmcnt(0)")) == join
+    saved_s12 = (("saveexec_b32 s0", "saveexec_b32 s12"), ("exec_lo, exec_lo, s0", "exec_lo, exec_lo, s12"))
+    assert guard("guard_join", *saved_s12) == join
+    # A later compare does not change the guard.
+    assert guard("guard_join", ("v1, 0x600d", "v1, 0x600d\nv_cmp_lt_u32_e32 vcc_lo, s3, v0")) == join
+    # A copy of the saved mask restores it too.
+    assert guard("guard_join", ("s_cbranch_execz .LBB1_2", "s_mov_b32 s12, s0\ns_cbranch_execz .LBB1_2"),
+                 ("exec_lo, exec_lo, s0", "exec_lo, exec_lo, s12")) == join
+    restore, reach, target = ("Unverified lane guard restore", "Lane guard branch does not reach its restore",
+                              "Unverified branch target")
+    compare, repeated = "Unverified lane guard compare", "Unverified or repeated lane guard"
+    # Each control names its diagnostic, so it cannot pass for an unrelated reason.
+    for message, changes in (
+        # The exec mask is not restored before the store outside the guard, a register that
+        # does not hold the saved mask restores it, or a register overwrites it under the guard.
+        (reach, (("s_or_b32", ""),)),
+        (restore, (("exec_lo, exec_lo, s0", "exec_lo, exec_lo, s3"),)),
+        (restore, (("buffer_store_dword v0, v0", "s_mov_b32 s0, 0\nbuffer_store_dword v0, v0"),)),
+        # A copy made only inside the block that the branch skips holds the mask on one path only.
+        (restore, (("buffer_store_dword v0, v0", "s_mov_b32 s12, s0\nbuffer_store_dword v0, v0"),
+                   ("exec_lo, exec_lo, s0", "exec_lo, exec_lo, s12"))),
+        # The branch lands past the restore, inside the guarded block, or nowhere; a label
+        # that no branch names; a second branch to another label.
+        (restore, ((".LBB1_2:", ""), ("s_or_b32 exec_lo, exec_lo, s0", "s_or_b32 exec_lo, exec_lo, s0\n.LBB1_2:"))),
+        (reach, ((".LBB1_2:", ""), ("buffer_store_dword v0, v0", ".LBB1_2:\nbuffer_store_dword v0, v0"))),
+        (restore, ((".LBB1_2:", ""),)),
+        (target, (("s_cbranch_execz .LBB1_2", ""),)),
+        (target, (("s_cbranch_execz .LBB1_2", "s_cbranch_execz .LBB1_2\ns_cbranch_execz .LBB1_3"),)),
+        ("Unsupported compute instruction: s_cbranch_execnz", (("s_cbranch_execz", "s_cbranch_execnz"),)),
+        # No compare, a compare of a pending, unknown or non-word operand, or a mask from another source.
+        (repeated, (("v_cmp_gt_u32_e32 vcc_lo, s3, v0", ""),)),
+        (compare, (("vcc_lo, s3, v0", "vcc_lo, s12, v0"),)),
+        (compare, (("v_cmp_gt_u32_e32 vcc_lo, s3, v0", "s_buffer_load_dword s12, s[8:11], 0x4\n"
+                                                       "v_cmp_gt_u32_e32 vcc_lo, s12, v0"),)),
+        (compare, (("vcc_lo, s3, v0", "vcc_lo, s3, v1"),)),
+        (compare, (("vcc_lo, s3, v0", "vcc_lo, s2, v0"),)),
+        (compare, (("vcc_lo, s3, v0", "vcc_lo, s0, v0"),)),
+        ("Unsupported compute instruction: s_and_saveexec_b32 s0, s3",
+         (("s_and_saveexec_b32 s0, vcc_lo", "s_and_saveexec_b32 s0, s3"),)),
+        ("Unsupported compute instruction: s_and_saveexec_b64",
+         (("s_and_saveexec_b32 s0, vcc_lo", "s_and_saveexec_b64 s[0:1], vcc"),)),
+        # A second or nested guard.
+        (repeated, (("buffer_store_dword v0, v0", "v_cmp_gt_u32_e32 vcc_lo, s3, v0\n"
+                                                  "s_and_saveexec_b32 s12, vcc_lo\nbuffer_store_dword v0, v0"),)),
+        (repeated, (("v_mov_b32_e32 v1, 0x600d", "v_cmp_gt_u32_e32 vcc_lo, s3, v0\n"
+                                                 "s_and_saveexec_b32 s12, vcc_lo\nv_mov_b32_e32 v1, 0x600d"),)),
+        # A guard around no store.
+        ("Expected a store under the lane guard", (("buffer_store_dword v0, v0, s[4:7], 0 idxen", ""),)),
+        # A load waited for only under the guard, then used after the restore.
+        ("Unverified raw UAV store", late_load),
+        # A vector or scalar register written under the guard, read after the restore.
+        ("Store data is not a known word",
+         (("v_mov_b32_e32 v1, 0x600d", ""), ("buffer_store_dword v0, v0", "v_mov_b32_e32 v1, 0x600d\n"
+                                                                          "buffer_store_dword v0, v0"))),
+        ("Unverified raw UAV store",
+         (("s_load_dwordx4 s[4:7], s[0:1], 0x0", ""), *saved_s12,
+          ("buffer_store_dword v0, v0", "s_load_dwordx4 s[4:7], s[0:1], 0x0\ns_waitcnt lgkmcnt(0)\n"
+                                        "buffer_store_dword v0, v0"))),
+        # The saved mask stored as data.
+        ("Unresolved scalar move source", (("v_mov_b32_e32 v1, 0x600d", "v_mov_b32_e32 v1, s0"),)),
+    ):
+        rejects(message, guard, "guard_join", *changes)
+    # A restore with no guard.
+    rejects(restore, aot.lower, WIDE[:-1] + ["s_or_b32 exec_lo, exec_lo, s4", "s_endpgm"], 256, **WIDE_BINDING)
+    # The open guard of guard_end: its branch must reach a label, and only no-ops may follow the
+    # label before the exit.
+    rejects(target, guard, "guard_end", (".LBB0_2:", ""))
+    rejects(reach, guard, "guard_end", (".LBB0_2:", ""),
+            ("s[0:3], 0 idxen", "s[0:3], 0 idxen\n.LBB0_2:\ns_nop 0\nv_mov_b32_e32 v1, 0"))
+    # Branch labels come from decoded offsets: forward, at an instruction start, inside the span.
+    decoded = [(0, "v_cmp_gt_u32_e32 vcc_lo, s3, v0"), (4, "s_and_saveexec_b32 s0, vcc_lo"),
+               (8, "s_cbranch_execz 2"), (12, "buffer_store_dword v0, v0, s[4:7], 0 idxen"),
+               (20, "s_or_b32 exec_lo, exec_lo, s0"), (24, "s_endpgm")]
+    assert aot.labelled(decoded) == [line for _, line in decoded[:2]] + [
+        "s_cbranch_execz .L20", decoded[3][1], ".L20:", *(line for _, line in decoded[4:])]
+    for distance in ("1", "5", "65535", "-1"):
+        rejects("Branch outside decoded instruction boundaries",
+                aot.labelled, decoded[:2] + [(8, f"s_cbranch_execz {distance}")] + decoded[3:])
+
+
+def read_controls():
+    """Vector reads: exact output, then one rejection per broken read assumption."""
+    def read(name, *changes, **binding):
+        _, lines, width, bound = dict((case[0], case) for case in READ_CASES)[name]
+        return aot.lower(variant(lines, *changes), width, **(bound | binding)).splitlines()
+
+    for name in ("read_copy", "read_index"):
+        lines = read(name)
+        assert lines[:3] == ["cbuffer Constants : register(b0) { uint4 params[4]; };",
+                             "ByteAddressBuffer inputData : register(t0);",
+                             "RWByteAddressBuffer outputData : register(u0);"], lines
+        assert lines[-4:] == [GUARD_IF, f"        outputData.Store(tid.x * 4u + 0u, {READ_LOADS[name]});",
+                              "    }", "}"], lines
+    copy = read("read_copy")
+    # The same program with both descriptors loaded apart, as the full -O2 pipeline emits it.
+    assert read("read_copy", ("s_load_dwordx8 s[0:7], s[0:1], 0x0", "s_load_dwordx4 s[4:7], s[0:1], 0x10"),
+                ("v_lshlrev_b32_e32 v1, 2, v0", "v_lshlrev_b32_e32 v1, 2, v0\ns_load_dwordx4 s[0:3], s[0:1], 0x0")) == copy
+    # A combined wait, and a copy of the word read, are the same program.
+    assert read("read_copy", ("s_waitcnt vmcnt(0)", "s_waitcnt vmcnt(0) lgkmcnt(0)")) == copy
+    assert read("read_copy", ("s_waitcnt vmcnt(0)", "s_waitcnt vmcnt(0)\nv_mov_b32_e32 v2, v1"),
+                ("buffer_store_dword v1, v0", "buffer_store_dword v2, v0")) == copy
+    # A fixed read address.
+    assert "        outputData.Store(tid.x * 4u + 0u, inputData.Load(8u));" in read(
+        "read_copy", ("v1, v1, s[4:7], 0 offen", "v1, off, s[4:7], 0 offset:8"))
+    wait = "Vector load result used or overwritten before s_waitcnt vmcnt(0)"
+    descriptor, address = "Unverified buffer read descriptor", "Unsupported read address"
+    for name, message, changes, binding in (
+        # The word read is stored, copied or overwritten before its wait, or only a scalar wait follows.
+        ("read_copy", wait, (("s_waitcnt vmcnt(0)", ""),), {}),
+        ("read_copy", wait, (("s_waitcnt vmcnt(0)", "s_waitcnt lgkmcnt(0)"),), {}),
+        ("read_copy", wait, (("s_waitcnt vmcnt(0)", "v_mov_b32_e32 v2, v1\ns_waitcnt vmcnt(0)"),), {}),
+        ("read_copy", wait, (("s_waitcnt vmcnt(0)", "v_mov_b32_e32 v1, 7\ns_waitcnt vmcnt(0)"),), {}),
+        ("read_index", wait, (("s_waitcnt vmcnt(0)", ""),), {}),
+        # A partial count does not say which load completed.
+        ("read_copy", "Unsupported compute instruction: s_waitcnt vmcnt(1)",
+         (("s_waitcnt vmcnt(0)", "s_waitcnt vmcnt(1)"),), {}),
+        ("read_copy", "Unsupported compute instruction: s_waitcnt lgkmcnt(0) vmcnt(1)",
+         (("s_waitcnt vmcnt(0)", "s_waitcnt lgkmcnt(0) vmcnt(1)"),), {}),
+        # The read uses the store target, the constant buffer, an unbound slot, or a pending descriptor.
+        ("read_copy", "Reads from the stored UAV are not supported", (("v1, v1, s[4:7]", "v1, v1, s[0:3]"),), {}),
+        ("read_copy", "Unresolved compute descriptor load", (), dict(source_descriptor=48)),
+        ("read_copy", "Unresolved compute descriptor load", (), dict(source_descriptor=None)),
+        ("read_copy", descriptor, (("s_load_dwordx8 s[0:7], s[0:1], 0x0",
+                                    "s_load_dwordx4 s[8:11], s[0:1], 0x20\ns_load_dwordx4 s[0:3], s[0:1], 0x0"),
+                                   ("v1, v1, s[4:7]", "v1, v1, s[8:11]")), {}),
+        ("read_copy", descriptor, (("buffer_load_dword v1, v1, s[4:7], 0 offen", ""),
+                                   ("v_lshlrev_b32_e32 v1, 2, v0",
+                                    "v_lshlrev_b32_e32 v1, 2, v0\nbuffer_load_dword v1, v1, s[4:7], 0 offen")), {}),
+        # The index or byte offset is not the dispatch index, or the read uses the other addressing.
+        ("read_copy", address, (("v_lshlrev_b32_e32 v1, 2, v0", ""),), {}),
+        ("read_copy", address, (("v_lshlrev_b32_e32 v1, 2, v0", "v_mov_b32_e32 v1, 0"),), {}),
+        ("read_copy", address, (("v_lshlrev_b32_e32 v1, 2, v0", "v_lshlrev_b32_e32 v1, 1, v0"),), {}),
+        ("read_copy", address, (("v1, v1, s[4:7], 0 offen", "v1, v1, s[4:7], 0 idxen"),), dict(source_stride=4)),
+        ("read_index", address, (("v1, v0, s[4:7], 0 idxen", "v1, v0, s[4:7], 0 offen"),), {}),
+        ("read_index", address, (), dict(source_stride=None)),
+        ("read_index", address, (("v1, v0, s[4:7]", "v1, v2, s[4:7]"),), {}),
+        # The instruction offset is unaligned, leaves the source element, or leaves the 12-bit field.
+        ("read_copy", "Unverified read offset", (("s[4:7], 0 offen", "s[4:7], 0 offen offset:2"),), {}),
+        ("read_index", "Read leaves its source element", (("offset:4", "offset:8"),), {}),
+        ("read_copy", "Unverified read offset", (("s[4:7], 0 offen", "s[4:7], 0 offen offset:4096"),), {}),
+        # A load under the guard is unknown after the restore, even once waited for.
+        ("read_copy", "Store data is not a known word",
+         (("s_load_dwordx8 s[0:7], s[0:1], 0x0", ""),
+          ("s_and_saveexec_b32 s2, vcc_lo", "s_load_dwordx8 s[0:7], s[0:1], 0x0\ns_waitcnt lgkmcnt(0)\n"
+                                            "s_and_saveexec_b32 s12, vcc_lo"),
+          ("s_waitcnt vmcnt(0)", "s_or_b32 exec_lo, exec_lo, s12\ns_waitcnt vmcnt(0)"),
+          ("s_cbranch_execz .LBB0_2", ""), (".LBB0_2:", "")), {}),
+        # Binding errors: overlapping or unaligned slots, a stride without a source.
+        ("read_copy", "Invalid or overlapping source descriptor binding", (), dict(source_descriptor=24)),
+        ("read_copy", "Invalid or overlapping source descriptor binding", (), dict(source_descriptor=18)),
+        ("read_index", "Indexed reads require a source binding and aligned stride", (), dict(source_stride=10)),
+        ("read_index", "Indexed reads require a source binding and aligned stride", (),
+         dict(source_descriptor=None)),
+    ):
+        rejects(message, read, name, *changes, **binding)
+    # A read issued before the guard and waited for only under it is pending again after the
+    # restore; waited for again, it keeps its word.
+    early = (("s_load_dwordx8 s[0:7], s[0:1], 0x0", ""), ("v_lshlrev_b32_e32 v1, 2, v0", ""),
+             ("buffer_load_dword v1, v1, s[4:7], 0 offen", ""),
+             ("s_and_saveexec_b32 s2, vcc_lo", "s_load_dwordx8 s[8:15], s[0:1], 0x0\nv_lshlrev_b32_e32 v1, 2, v0\n"
+              "s_waitcnt lgkmcnt(0)\nbuffer_load_dword v1, v1, s[12:15], 0 offen\ns_and_saveexec_b32 s2, vcc_lo"),
+             ("s_cbranch_execz .LBB0_2", ""), (".LBB0_2:", ""),
+             ("buffer_store_dword v1, v0, s[0:3], 0 idxen",
+              "buffer_store_dword v0, v0, s[8:11], 0 idxen\ns_or_b32 exec_lo, exec_lo, s2"))
+    late = "buffer_store_dword v1, v0, s[8:11], 0 idxen offset:4\ns_endpgm"
+    rejects(wait, read, "read_copy", *early, ("s_endpgm", late), stride=8)
+    assert read("read_copy", *early, ("s_endpgm", "s_waitcnt vmcnt(0)\n" + late), stride=8)[-5:] == [
+        GUARD_IF, "        outputData.Store(tid.x * 8u + 0u, tid.x);", "    }",
+        "    outputData.Store(tid.x * 8u + 4u, inputData.Load((tid.x << 2u) + 0u));", "}"]
+    # Overwritten under the guard after its wait, the word read is unknown after the restore.
+    rejects("Store data is not a known word", read, "read_copy", *early,
+            ("s_or_b32 exec_lo", "v_mov_b32_e32 v1, 5\ns_or_b32 exec_lo"),
+            ("s_endpgm", "s_waitcnt vmcnt(0)\n" + late), stride=8)
+
+
+def alu_controls():
+    """Read-compute-write: exact output, then one rejection per instruction or operand outside the subset."""
+    def alu(*changes, **binding):
+        _, lines, width, bound = ALU_CASES[0]
+        return aot.lower(variant(lines, *changes), width, **(bound | binding)).splitlines()
+
+    lines = alu()
+    assert lines[:3] == ["cbuffer Constants : register(b0) { uint4 params[4]; };",
+                         "ByteAddressBuffer inputData : register(t0);",
+                         "RWByteAddressBuffer outputData : register(u0);"], lines
+    assert lines[-4:] == [GUARD_IF, f"        outputData.Store(tid.x * 4u + 0u, {ALU_WORD});", "    }", "}"], lines
+    # A copy of a result is the same program. Literal, negative inline and SGPR sources keep their order.
+    mad = "v_mad_u32_u24 v1, v2, v1, v0"
+    assert alu(("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v3, s0, v1\nv_mov_b32_e32 v1, v3")) == lines
+    load = READ_LOADS["read_copy"]
+    assert (f"min(params[0].y, (((0x0000012cu & 0xffffffu) * ((0xfffffff0u & {load}) & 0xffffffu)) + params[0].y)"
+            in alu(("0xffff, v1", "-16, v1"), (mad, "v_mad_u32_u24 v1, 0x12c, v2, s0"))[-3])
+    # Add, or, xor and max apply in order: max(cap, 0x80000001 ^ (cap | (7 + mad))); src0 prints first.
+    mad_word = ALU_WORD.split(", ", 1)[1][:-1]
+    vop2 = aot.lower(READ_VOP2, 32, **READ_BINDING).splitlines()
+    assert vop2[-3] == ("        outputData.Store(tid.x * 4u + 0u, max(" + mad_word + ", (0x80000001u ^ (0x80000010u | "
+                        f"(params[0].y + {mad_word})))));"), vop2
+    mul = "v_mul_lo_u32 v1, s0, v1"
+    lines = aot.lower(READ_MUL_LO, 32, **READ_BINDING).splitlines()
+    assert lines[-4:] == [GUARD_IF, f"        outputData.Store(tid.x * 4u + 0u, (params[0].y * {load}));",
+                         "    }", "}"], lines
+    rejects("Unverified ALU operand", aot.lower, variant(READ_MUL_LO, (mul, mul.replace("s0", "v255"))),
+            32, **READ_BINDING)
+    rejects("Unsupported compute instruction: v_mul_lo_u32", aot.lower, variant(READ_MUL_LO, (mul, mul + " clamp")),
+            32, **READ_BINDING)
+    unsupported, operand = "Unsupported compute instruction: ", "Unverified ALU operand"
+    compare = "Unverified lane guard compare"
+    # The x8 descriptor load moved before the guard, so only the result is written under it.
+    early = (("s_load_dwordx8 s[8:15], s[0:1], 0x0", ""),
+             ("s_and_saveexec_b32 s2, vcc_lo", "s_load_dwordx8 s[8:15], s[0:1], 0x0\ns_waitcnt lgkmcnt(0)\n"
+                                               "s_and_saveexec_b32 s2, vcc_lo"))
+    for message, changes in (
+        # Wrong opcodes: signed or other operations, and a carry form that would write vcc.
+        (unsupported + "v_min_i32_e32", (("v_min_u32_e32", "v_min_i32_e32"),)),
+        (unsupported + "v_max_i32_e32", (("v_min_u32_e32", "v_max_i32_e32"),)),
+        (unsupported + "v_ashrrev_i32_e32", (("v_lshrrev_b32_e32", "v_ashrrev_i32_e32"),)),
+        (unsupported + "v_xnor_b32_e32", (("v_and_b32_e32", "v_xnor_b32_e32"),)),
+        (unsupported + "v_mad_i32_i24", ((mad, "v_mad_i32_i24 v1, v2, v1, v0"),)),
+        (unsupported + "v_add_co_u32", ((mad, "v_add_co_u32 v1, vcc_lo, v2, v0"),)),
+        # Wrong operand widths: 16-bit, 64-bit and sub-dword (SDWA) forms, and a register range.
+        (unsupported + "v_min_u16_e32", (("v_min_u32_e32", "v_min_u16_e32"),)),
+        (unsupported + "v_mad_u32_u16", ((mad, "v_mad_u32_u16 v1, v2, v1, v0"),)),
+        (unsupported + "v_lshrrev_b64", (("v_lshrrev_b32_e32 v1, 16, v1", "v_lshrrev_b64 v[1:2], 16, v[1:2]"),)),
+        (unsupported + "v_mad_u64_u32", ((mad, "v_mad_u64_u32 v[1:2], s4, v2, v1, v[0:1]"),)),
+        (unsupported + "v_and_b32_sdwa", (("v_and_b32_e32 v2, 0xffff, v1", "v_and_b32_sdwa v2, v1, v1 dst_sel:DWORD "
+                                           "dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD"),)),
+        (unsupported + "v_and_b32_e32", (("0xffff, v1", "0xffff, v[1:2]"),)),
+        # An SGPR as the VOP2 src1, and an output modifier.
+        (unsupported + "v_min_u32_e32", (("s0, v1", "v1, s0"),)),
+        (unsupported + "v_mad_u32_u24", ((mad, mad + " clamp"),)),
+        # Sources that are not known words: an unknown, pending, descriptor or exec-mask SGPR, an
+        # unknown VGPR, a literal wider than 32 bits, a byte offset, and a word read before its wait.
+        # Also a destination past v255.
+        (operand, (("s0, v1", "s20, v1"),)),
+        (operand, (("s_buffer_load_dword s0, s[4:7], 0x4", ""),
+                   ("v_and_b32_e32", "s_buffer_load_dword s0, s[4:7], 0x4\nv_and_b32_e32"))),
+        (operand, (("s0, v1", "s8, v1"),)),
+        (operand, (("s0, v1", "s2, v1"),)),
+        (operand, (("16, v1", "16, v5"),)),
+        (operand, (("0xffff, v1", "0x1ffffffff, v1"),)),
+        (operand, (("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v256, s0, v1"),)),
+        (operand, (("v_and_b32_e32 v2, 0xffff, v1", "v_lshlrev_b32_e32 v3, 2, v0\nv_and_b32_e32 v2, 0xffff, v3"),)),
+        ("Unverified row pitch byte offset", ((mad, "v_lshlrev_b32_e32 v3, 2, v0\nv_mad_u32_u24 v1, v2, v1, v3"),)),
+        ("Vector load result used or overwritten before s_waitcnt vmcnt(0)", (("s_waitcnt vmcnt(0)", ""),)),
+        # A result or a word read used as an address or as a guard operand.
+        ("Unsupported store address", (("v1, v0, s[8:11]", "v0, v1, s[8:11]"),)),
+        ("Unsupported read address", (("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v1, s0, v1\n"
+                                       "buffer_load_dword v3, v1, s[12:15], 0 offen"),)),
+        (compare, (("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v1, s0, v1\nv_cmp_gt_u32_e32 vcc_lo, s3, v1"),)),
+        (compare, (("v_and_b32_e32", "v_cmp_gt_u32_e32 vcc_lo, s3, v1\nv_and_b32_e32"),)),
+        # Expressions are inline, so a result that keeps doubling is rejected.
+        ("ALU expression too large", (("v_min_u32_e32 v1, s0, v1",
+                                       "v_min_u32_e32 v1, s0, v1" + "\nv_and_b32_e32 v1, v1, v1" * 4),)),
+    ):
+        rejects(message, alu, *changes)
+    # A result computed under the guard is unknown after the restore; a word set after it is known.
+    restored = (*early, ("s_cbranch_execz .LBB0_2", ""), (".LBB0_2:", ""),
+                ("buffer_store_dword v1, v0, s[8:11], 0 idxen", "buffer_store_dword v0, v0, s[8:11], 0 idxen\n"
+                 "s_or_b32 exec_lo, exec_lo, s2\nbuffer_store_dword v1, v0, s[8:11], 0 idxen offset:4"))
+    rejects("Store data is not a known word", alu, *restored, stride=8)
+    assert alu(*restored, ("s_or_b32 exec_lo, exec_lo, s2", "s_or_b32 exec_lo, exec_lo, s2\nv_mov_b32_e32 v1, 9"),
+               stride=8)[-5:] == [GUARD_IF, "        outputData.Store(tid.x * 8u + 0u, tid.x);", "    }",
+                                  "    outputData.Store(tid.x * 8u + 4u, 0x00000009u);", "}"]
+
+
+def assemble(directory, assembler, objcopy, lines):
+    src, obj, raw = [directory / x for x in ("exit.s", "exit.o", "exit.bin")]
+    src.write_text("\n".join(lines) + "\n", encoding="ascii")
+    subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", src, "-o", obj], check=True)
+    subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
+    return raw.read_bytes()
+
+
+def bounded_container(code, *, mesh=False):
+    """A DXBC container whose FSSM v0x101 section ends in s_code_end padding."""
+    padded = code + bytes.fromhex("00009fbf") * (4 - (len(code) // 4 + 10) % 4)
+    payload = envelope(padded, directory_end=(40 + len(padded), 288 + len(padded)), compute_width=64,
+                       mesh_limits=(64, 32) if mesh else None)
+    return _read_named_container(payload, 1 + len(b"fixture") + 1)
+
+
+def rejects(message, function, *args, **kwargs):
+    """Require the named diagnostic, so a rejection cannot pass for an unrelated reason."""
+    try:
+        function(*args, **kwargs)
+    except ValueError as error:
+        assert message in str(error), error
+    except Exception as error:
+        raise AssertionError(f"Expected rejection: {message}, got {type(error).__name__}: {error}") from error
+    else:
+        raise AssertionError(f"Expected rejection: {message}")
+
+
+def two_exits(directory, assembler, objcopy, library):
+    """Extraction only: the code span is verified, the compute lowering still stops at the branch."""
+    def extract(code, *, mesh=False, llvm=library):
+        return aot.container_code(parts(bounded_container(code, mesh=mesh))[b"DXIL"],
+                                  stage=13 if mesh else 5, llvm=llvm)
+
+    def retarget(code, target):
+        # Point the conditional branch at a byte offset that labels cannot express.
+        pc = next(pc for pc, line in disassemble(code, library, offsets=True) if line.startswith("s_cbranch"))
+        return code[:pc] + struct.pack("<h", (target - pc - 4) // 4) + code[pc + 2:]
+
+    accepted = []
+    for lines, first_stop in ((EXIT_KERNEL, "s_load_dword s3, s[0:1], 0x8"), (EXIT_CS, "s_cmp_ge_u32 s5, s4")):
+        code = assemble(directory, assembler, objcopy, lines)
+        decoded = disassemble(code, library)
+        assert decoded.count("s_endpgm") == 2 and "s_cbranch_scc0 1" in decoded, decoded
+        assert extract(code) == code
+        accepted.append(code)
+        # The stage and the exact count stay explicit: LLVM is required, mesh stays rejected.
+        rejects("Unverified multi-exit program", extract, code, llvm=None)
+        rejects("Unverified multi-exit program", extract, code, mesh=True)
+        # The CLI and the audit pass LLVM through, so the first stop moves to the lowering.
+        blob = bounded_container(code)
+        container, output = directory / "exit.dxbc", directory / "exit.hlsl"
+        container.write_bytes(blob)
+        cli = subprocess.run([sys.executable, "-B", str(Path(aot.__file__)), container, "--output", output,
+                              "--llvm", library, "--table-reg", "0", "--descriptor-offset", "0"],
+                             capture_output=True, text=True)
+        assert cli.returncode == 1 and f"Unsupported compute instruction: {first_stop}" in cli.stderr, cli.stderr
+        assert shader_profile_audit.classify(blob, parts(blob), 5, library, None) == ([], "store lowering")
+
+    kernel = accepted[0]
+    # A per-lane return is one exit and passes without the two-exit check.
+    lane = assemble(directory, assembler, objcopy, LANE_EXIT)
+    assert extract(lane, llvm=None) == lane
+    # A direct branch may skip alignment NOPs, which stay in the span; any other skipped word fails.
+    nop = assemble(directory, assembler, objcopy, ["s_branch .Lstart", "s_nop 0", ".Lstart:"] + EXIT_KERNEL)
+    assert extract(nop) == nop and nop.endswith(kernel)
+    exit_at = EXIT_KERNEL.index(".Lbody:")
+    skipped = EXIT_KERNEL[:exit_at] + ["s_mov_b32 s9, 0"] + EXIT_KERNEL[exit_at:]
+    skipped_start = ["s_branch .Lstart", "s_mov_b32 s9, 0", ".Lstart:"] + EXIT_KERNEL
+    # The target must directly follow the early exit, even with a NOP between them.
+    after_exit = EXIT_KERNEL[:exit_at] + ["s_nop 0"] + EXIT_KERNEL[exit_at:]
+    # Wrong targets: one instruction late, or the final exit with the store block unreachable.
+    late = EXIT_KERNEL[:exit_at] + EXIT_KERNEL[exit_at + 1:exit_at + 2] + [".Lbody:"] + EXIT_KERNEL[exit_at + 2:]
+    final = EXIT_KERNEL[:exit_at] + EXIT_KERNEL[exit_at + 1:-1] + [".Lbody:", "s_endpgm"]
+    # Disconnected exits: an unconditional branch strands the early exit; no branch strands the store.
+    jump = [line.replace("s_cbranch_scc0", "s_branch") for line in EXIT_KERNEL]
+    straight = [line.replace("s_cbranch_scc0 .Lbody", "s_nop 0") for line in EXIT_KERNEL]
+    for lines in (skipped, skipped_start, after_exit, late, final, jump, straight):
+        rejects("Unreachable code or unverified alternate exit",
+                extract, assemble(directory, assembler, objcopy, lines))
+    # A third exit, and a literal that spells s_endpgm, exceed the exact two-marker limit.
+    third = EXIT_KERNEL[:exit_at] + ["s_cmp_eq_u32 s3, 0", "s_cbranch_scc0 .Lmid", "s_endpgm", ".Lmid:"] + \
+        EXIT_KERNEL[exit_at:]
+    spelled = [line.replace("v_mov_b32_e32 v1, s2", "v_mov_b32_e32 v1, 0xbf810000") for line in EXIT_KERNEL]
+    for lines in (third, spelled):
+        rejects("Unverified multi-exit program", extract, assemble(directory, assembler, objcopy, lines))
+    # In a one-exit program the same literal makes two raw markers but only one decoded exit.
+    rejects("Expected two decoded exits", extract, assemble(directory, assembler, objcopy, [
+        line.replace("v_mov_b32_e32 v1, s2", "v_mov_b32_e32 v1, 0xbf810000") for line in LANE_EXIT]))
+    # Branches into a literal operand or into the trailing s_code_end padding.
+    literal = assemble(directory, assembler, objcopy,
+                       [line.replace("v_mov_b32_e32 v1, s2", "v_mov_b32_e32 v1, 0x12345678") for line in EXIT_KERNEL])
+    assert extract(literal) == literal
+    operand = next(pc for pc, line in disassemble(literal, library, offsets=True) if "0x12345678" in line) + 4
+    for target in (operand, len(literal)):
+        rejects("Branch outside decoded instruction boundaries", extract, retarget(literal, target))
+
+
+def store_container(code, dims):
+    padded = code + bytes.fromhex("00009fbf") * (4 - (len(code) // 4 + 10) % 4)
+    payload = envelope(padded, directory_end=(40 + len(padded), 288 + len(padded)), compute_width=dims[0])
+    blob = bytearray(_read_named_container(payload, 1 + len(b"fixture") + 1))
+    # The shared envelope writes X only; set Y and Z in the PSV0 runtime info.
+    struct.pack_into("<2I", blob, blob.index(b"PSV0") + 8 + 44, *dims[1:])
+    return bytes(blob)
+
+
+
+DS_BINDING = dict(table_reg=7, descriptor_offset=0x30, group_reg=11, stride=4, cpu="gfx1030")
+DS_FEATURES = "+wavefrontsize32,-wavefrontsize64"
+DS_PREFIX = INDEXED[:4] + ["s_waitcnt lgkmcnt(0)"]
+DS_OPS = ("ds_bpermute_b32", "ds_permute_b32")
+
+
+def ds_program(op, bias):
+    return DS_PREFIX + [
+        f"v_add_nc_u32_e32 v5, {bias}, v0",
+        "v_and_b32_e32 v5, 31, v5",
+        "v_lshlrev_b32_e32 v5, 2, v5",
+        # Alias the byte address to prove that the result can replace its input.
+        f"{op} v5, v5, v8",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dword v5, v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+DS_CASES = [(op, ds_program(op, 5), DS_BINDING) for op in DS_OPS]
+
+
+def ds_reference(op, groups):
+    bias = 5 if op == "ds_bpermute_b32" else -5
+    return [lane // 32 * 32 + ((lane % 32 + bias) % 32) for lane in range(groups * 32)]
+
+
+def ds_controls():
+    for op, lines, binding in DS_CASES:
+        expected_bias = 5 if op == "ds_bpermute_b32" else 27
+        assert f"[(local.x + {expected_bias}u) & 31u]" in aot.lower(lines, 32, **binding)
+        valid = f"{op} v5, v5, v8"
+        for operands in ("v5, v8, v8", "v5, v5, v255"):
+            rejects("Unverified DS lane routing", aot.lower, variant(lines, (valid, f"{op} {operands}")),
+                    32, **binding)
+        rejects("Unsupported compute instruction", aot.lower,
+                variant(lines, (valid, valid + " offset:4")), 32, **binding)
+        i = lines.index(valid)
+        masked = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
+        rejects("Unverified DS lane routing", aot.lower, masked, 32, **binding)
+        rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+                lines[:i + 1] + lines[i + 2:], 32, **binding)
+
+
+LDS_BINDING = DS_BINDING | {"stride": 12, "lds_bytes": 128}
+
+
+def signed_order(word):
+    # Flipping the sign bit places negatives before nonnegatives in an unsigned comparison.
+    return word ^ 0x80000000
+
+
+LDS_UPDATES = {
+    "ds_add_u32": operator.add,
+    "ds_sub_u32": operator.sub,
+    "ds_and_b32": operator.and_,
+    "ds_or_b32": operator.or_,
+    "ds_xor_b32": operator.xor,
+    "ds_rsub_u32": lambda old, value: value - old,
+    "ds_min_i32": lambda old, value: min(old, value, key=signed_order),
+    "ds_max_i32": lambda old, value: max(old, value, key=signed_order),
+    "ds_min_u32": min,
+    "ds_max_u32": max,
+}
+LDS_ORDER_MUTANTS = {
+    "ds_rsub_u32": "ds_sub_u32",
+    "ds_min_i32": "ds_min_u32",
+    "ds_max_i32": "ds_max_u32",
+    "ds_min_u32": "ds_min_i32",
+    "ds_max_u32": "ds_max_i32",
+}
+
+
+def lds_update_inputs(op):
+    # Each pair is (scale, base) for a lane-dependent 32-bit word.
+    if op in LDS_ORDER_MUTANTS:
+        return (1, 0x7ffffff0), (1, 0xfffffff8), (4, 0xfffffff0)
+    return (1, 0xfffffff0), (1, 0x40000021), (1, 0x80000003)
+
+
+def lds_update_program(op):
+    (init_scale, init_base), (first_scale, first_base), (second_scale, second_base) = lds_update_inputs(op)
+    return DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        f"v_mad_u32_u24 v6, {init_scale}, v8, 0x{init_base:08x}",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        "ds_read_b32 v10, v5",
+        "s_waitcnt lgkmcnt(0)",
+        f"v_mad_u32_u24 v6, {first_scale}, v8, 0x{first_base:08x}",
+        f"{op} v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v6, 0",
+        "ds_read_b32 v11, v5",
+        "s_waitcnt lgkmcnt(0)",
+        f"v_mad_u32_u24 v9, {second_scale}, v8, 0x{second_base:08x}",
+        f"{op} v5, v9",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v9, 0",
+        "ds_read_b32 v12, v5",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+def lds_update_reference(op, groups):
+    update = LDS_UPDATES[op]
+    inputs = lds_update_inputs(op)
+    words = []
+    for lane in range(groups * 32):
+        initial, src1, src2 = ((scale * lane + base) & 0xffffffff for scale, base in inputs)
+        first = update(initial, src1) & 0xffffffff
+        second = update(first, src2) & 0xffffffff
+        words.extend((initial, first, second))
+    return words
+
+
+LDS_RETURN_UPDATES = {
+    "ds_add_rtn_u32": "ds_add_u32",
+    "ds_sub_rtn_u32": "ds_sub_u32",
+    "ds_and_rtn_b32": "ds_and_b32",
+    "ds_or_rtn_b32": "ds_or_b32",
+    "ds_xor_rtn_b32": "ds_xor_b32",
+    "ds_rsub_rtn_u32": "ds_rsub_u32",
+    "ds_min_rtn_i32": "ds_min_i32",
+    "ds_max_rtn_i32": "ds_max_i32",
+    "ds_min_rtn_u32": "ds_min_u32",
+    "ds_max_rtn_u32": "ds_max_u32",
+}
+
+
+def lds_return_update_program(op):
+    (init_scale, init_base), (first_scale, first_base), (second_scale, second_base) = lds_update_inputs(LDS_RETURN_UPDATES[op])
+    return DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_lshlrev_b32_e32 v11, 2, v0",
+        f"v_mad_u32_u24 v6, {init_scale}, v8, 0x{init_base:08x}",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        # First alias the data VGPR, then alias a copy of the address VGPR.
+        f"v_mad_u32_u24 v10, {first_scale}, v8, 0x{first_base:08x}",
+        f"{op} v10, v5, v10",
+        "s_waitcnt lgkmcnt(0)",
+        f"v_mad_u32_u24 v9, {second_scale}, v8, 0x{second_base:08x}",
+        f"{op} v11, v11, v9",
+        "s_waitcnt lgkmcnt(0)",
+        "ds_read_b32 v12, v5",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+LDS_PROGRAM = DS_PREFIX + [
+    "v_lshlrev_b32_e32 v5, 2, v0",
+    "v_mad_u32_u24 v6, 1, v8, 0x89abfff0",
+    "ds_write_b32 v5, v6",
+    "s_waitcnt lgkmcnt(0)",
+    "v_mov_b32_e32 v6, 0",
+    "ds_read_b32 v10, v5",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_u16 v11, v5",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_u16 v12, v5 offset:2",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+    "s_endpgm",
+]
+LDS_SUBWORDS = {f"subword_{width}_{offset}": (width, offset)
+                for width, offsets in ((8, range(4)), (16, (0, 2))) for offset in offsets}
+
+
+def lds_subword_program(width, offset):
+    suffix = f" offset:{offset}" if offset else ""
+    base = 0x12340070 if width == 8 else 0x12347ff0
+    neighbor = "" if offset else " offset:3"
+    return DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_mov_b32_e32 v6, 0x89abcdef",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        # A second partial write must preserve this change as well as untouched bytes.
+        "v_mov_b32_e32 v9, 0x42",
+        f"ds_write_b8 v5, v9{neighbor}",
+        "s_waitcnt lgkmcnt(0)",
+        f"v_mad_u32_u24 v6, 1, v8, 0x{base:08x}",
+        f"ds_write_b{width} v5, v6{suffix}",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v6, 0",
+        "ds_read_b32 v10, v5",
+        "s_waitcnt lgkmcnt(0)",
+        f"ds_read_u{width} v11, v5{suffix}",
+        "s_waitcnt lgkmcnt(0)",
+        f"ds_read_i{width} v12, v5{suffix}",
+        "s_waitcnt lgkmcnt(0)",
+        # Reading captures the value before this overwrite, even though export comes later.
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+# Capture the same byte before and after a halfword write, then overwrite
+# that byte alone and read the complete word.
+LDS_OVERLAP_PROGRAM = DS_PREFIX + [
+    "v_lshlrev_b32_e32 v5, 2, v0",
+    "v_mad_u32_u24 v6, 1, v8, 0x89abfff0",
+    "ds_write_b32 v5, v6",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_u8 v10, v5 offset:1",
+    "s_waitcnt lgkmcnt(0)",
+    "v_mov_b32_e32 v7, 0x1234",
+    "ds_write_b16 v5, v7",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_u8 v11, v5 offset:1",
+    "s_waitcnt lgkmcnt(0)",
+    "v_mov_b32_e32 v7, 0x5a",
+    "ds_write_b8 v5, v7 offset:1",
+    "s_waitcnt lgkmcnt(0)",
+    "ds_read_b32 v12, v5",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen",
+    "s_endpgm",
+]
+
+
+LDS_CASES = [("private", LDS_PROGRAM, LDS_BINDING),
+             ("lds_overlap", LDS_OVERLAP_PROGRAM, LDS_BINDING)] + [
+    (name, lds_subword_program(*layout), LDS_BINDING) for name, layout in LDS_SUBWORDS.items()
+]
+LDS_ARITHMETIC_CASES = [(op, lds_update_program(op), LDS_BINDING) for op in LDS_UPDATES] + [
+    (op, lds_return_update_program(op), LDS_BINDING) for op in LDS_RETURN_UPDATES
+]
+
+
+LDS_D16_READS = {
+    "ds_read_u8_d16": (1, False, False),
+    "ds_read_u8_d16_hi": (1, False, True),
+    "ds_read_i8_d16": (1, True, False),
+    "ds_read_i8_d16_hi": (1, True, True),
+    "ds_read_u16_d16": (2, False, False),
+    "ds_read_u16_d16_hi": (2, False, True),
+}
+LDS_D16_DESTINATIONS = (0xa53172be, 0xe8ba23f1, 0x64c139a7)
+
+
+def lds_d16_offsets(size):
+    return (0, 1, 3) if size == 1 else (0, 2, 0)
+
+
+def lds_d16_program(op):
+    size, _, _ = LDS_D16_READS[op]
+    lines = DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_mad_u32_u24 v6, 1, v8, 0x887f80f0",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+    ]
+    for dst, value, offset in zip(range(10, 13), LDS_D16_DESTINATIONS, lds_d16_offsets(size)):
+        suffix = f" offset:{offset}" if offset else ""
+        lines += [f"v_mov_b32_e32 v{dst}, 0x{value:08x}", f"{op} v{dst}, v5{suffix}", "s_waitcnt lgkmcnt(0)"]
+    return lines + ["buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen", "s_endpgm"]
+
+
+def lds_d16_reference(op, groups):
+    size, signed, high = LDS_D16_READS[op]
+    words = []
+    start = 2 if high else 0
+    for lane in range(groups * 32):
+        data = (0x887f80f0 + lane).to_bytes(4, "little")
+        for initial, offset in zip(LDS_D16_DESTINATIONS, lds_d16_offsets(size)):
+            field = int.from_bytes(data[offset:offset + size], "little", signed=signed)
+            result = bytearray(initial.to_bytes(4, "little"))
+            result[start:start + 2] = (field & 0xffff).to_bytes(2, "little")
+            words.append(int.from_bytes(result, "little"))
+    return words
+
+
+LDS_CASES += [(op, lds_d16_program(op), LDS_BINDING) for op in LDS_D16_READS]
+
+
+def lds_subword_reference(width, offset, groups):
+    expected = []
+    size = width // 8
+    for lane in range(groups * 32):
+        value = (0x70 if width == 8 else 0x7ff0) + lane
+        data = value.to_bytes(size, "little")
+        word = bytearray.fromhex("ef cd ab 89")
+        word[0 if offset else 3] = 0x42
+        word[offset:offset + size] = data
+        expected.extend((int.from_bytes(word, "little"), value,
+                         int.from_bytes(data, "little", signed=True) & 0xffffffff))
+    return expected
+
+
+LDS_REPLACEMENTS = ("ds_cmpst_b32", "ds_cmpst_rtn_b32", "ds_mskor_b32", "ds_mskor_rtn_b32", "ds_wrxchg_rtn_b32")
+
+
+def lds_replacement_instruction(op):
+    dst = "v10, " if "_rtn_" in op else ""
+    replacement = ", v7" if op != "ds_wrxchg_rtn_b32" else ""
+    return f"{op} {dst}v5, v6{replacement}"
+
+
+def lds_replacement_program(op):
+    lines = DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_mad_u32_u24 v9, 1, v8, 0x81a23450",
+        "ds_write_b32 v5, v9",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v6, 0x81a23450" if "cmpst" in op else "v_mov_b32_e32 v6, 0x00ff0ff0",
+        "v_mov_b32_e32 v7, 0x400580b1",
+    ]
+    if "_rtn_" not in op:
+        lines += ["ds_read_b32 v10, v5", "s_waitcnt lgkmcnt(0)"]
+    return lines + [
+        lds_replacement_instruction(op),
+        "s_waitcnt lgkmcnt(0)",
+        "ds_read_b32 v11, v5",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+def lds_replacement_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        old = 0x81a23450 + lane
+        if "cmpst" in op:
+            updated = 0x400580b1 if lane == 0 else old
+        elif "mskor" in op:
+            updated = (old & 0xff00f00f) | 0x400580b1
+        else:
+            updated = 0x00ff0ff0
+        words.extend((old, updated, SENTINEL))
+    return words
+
+
+LDS_REPLACEMENT_CASES = [(op, lds_replacement_program(op), LDS_BINDING) for op in LDS_REPLACEMENTS]
+
+
+def lds_overlap_reference(groups):
+    words = []
+    for lane in range(groups * 32):
+        data = bytearray((0x89abfff0 + lane).to_bytes(4, "little"))
+        pre = data[1]
+        data[0:2] = b"\x34\x12"
+        middle = data[1]
+        data[1] = 0x5a
+        words.extend((pre, middle, int.from_bytes(data, "little")))
+    return words
+
+
+LDS_COUNTERS = {
+    "ds_inc_u32": lambda old: old + 1 if old < 7 else 0,
+    "ds_dec_u32": lambda old: old - 1 if 1 <= old <= 7 else 7,
+    "ds_inc_rtn_u32": lambda old: old + 1 if old < 7 else 0,
+    "ds_dec_rtn_u32": lambda old: old - 1 if 1 <= old <= 7 else 7,
+    "ds_wrap_rtn_b32": lambda old: old - 7 if old >= 7 else old + 3,
+}
+
+
+def lds_counter_instruction(op):
+    if op == "ds_wrap_rtn_b32":
+        return f"{op} v10, v5, v10, v7"
+    if "_rtn_" in op:
+        return f"{op} v10, v5, v10"
+    return f"{op} v5, v6"
+
+
+def lds_counter_program(op):
+    snapshot = ["v_mov_b32_e32 v10, 7"] if "_rtn_" in op else ["ds_read_b32 v10, v5", "s_waitcnt lgkmcnt(0)"]
+    return DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_mad_u32_u24 v6, 1, v8, 0xfffffff0",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v6, 7",
+        "v_mov_b32_e32 v7, 3",
+    ] + snapshot + [
+        lds_counter_instruction(op),
+        "s_waitcnt lgkmcnt(0)",
+        "ds_read_b32 v11, v5",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+def lds_counter_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        old = (lane - 16) & 0xffffffff
+        words.extend((old, LDS_COUNTERS[op](old), SENTINEL))
+    return words
+
+
+LDS_REPLACEMENT_CASES += [(op, lds_counter_program(op), LDS_BINDING) for op in LDS_COUNTERS]
+
+
+def lds_reference(groups):
+    words = []
+    for lane in range(groups * 32):
+        word = 0x89abfff0 + lane
+        words.extend((word, word & 0xffff, word >> 16))
+    return words
+
+
+LDS_STRIDED_PROGRAMS = {
+    "lds_st64_b32": DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0", "v_mad_u32_u24 v6, 1, v8, 0x76543210", "v_mov_b32_e32 v7, 0x89abcdef",
+        "ds_write2st64_b32 v5, v6, v7 offset0:2 offset1:3", "s_waitcnt lgkmcnt(0)",
+        "ds_read2st64_b32 v[10:11], v5 offset0:3 offset1:2", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen", "s_endpgm",
+    ],
+    "lds_st64_b64": DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 3, v0", "v_mad_u32_u24 v6, 1, v8, 0x76543210", "v_mov_b32_e32 v7, 0x89abcdef",
+        "v_mov_b32_e32 v10, 0x12345678", "v_mov_b32_e32 v11, 0x9abcdef0",
+        "ds_write2st64_b64 v5, v[6:7], v[10:11] offset0:1 offset1:2", "s_waitcnt lgkmcnt(0)",
+        "ds_read2st64_b64 v[10:13], v5 offset0:2 offset1:1", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
+    ],
+    "lds_st64_xchg_b64": DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 3, v0", "v_mad_u32_u24 v6, 1, v8, 0x76543210", "v_mov_b32_e32 v7, 0x89abcdef",
+        "v_mov_b32_e32 v10, 0x12345678", "v_mov_b32_e32 v11, 0x9abcdef0",
+        "ds_write2st64_b64 v5, v[6:7], v[10:11] offset0:1 offset1:2", "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v12, 0x11111111", "v_mov_b32_e32 v13, 0x22222222",
+        "v_mov_b32_e32 v14, 0x33333333", "v_mov_b32_e32 v15, 0x44444444",
+        "ds_wrxchg2st64_rtn_b64 v[12:15], v5, v[12:13], v[14:15] offset0:2 offset1:1", "s_waitcnt lgkmcnt(0)",
+        "ds_read2st64_b64 v[16:19], v5 offset0:1 offset1:2", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx4 v[12:15], v8, s[20:23], 0 idxen",
+        "buffer_store_dwordx4 v[16:19], v8, s[20:23], 0 idxen offset:16", "s_endpgm",
+    ],
+    "lds_st64_xchg": DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0", "v_mad_u32_u24 v6, 1, v8, 0x76543210", "v_mov_b32_e32 v7, 0x89abcdef",
+        "ds_write2st64_b32 v5, v6, v7 offset0:2 offset1:3", "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v10, 0x12345678", "v_mov_b32_e32 v11, 0x9abcdef0",
+        "ds_wrxchg2st64_rtn_b32 v[10:11], v5, v10, v11 offset0:3 offset1:2", "s_waitcnt lgkmcnt(0)",
+        "ds_read2st64_b32 v[12:13], v5 offset0:2 offset1:3", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
+    ],
+}
+LDS_STRIDED_CASES = [(name, lines, LDS_BINDING | {"lds_bytes": 1280, "stride": {"lds_st64_b32": 8, "lds_st64_xchg_b64": 32}.get(name, 16)})
+                     for name, lines in LDS_STRIDED_PROGRAMS.items()]
+
+
+def lds_strided_reference(name, groups):
+    words = []
+    for lane in range(groups * 32):
+        first = 0x76543210 + lane
+        if name == "lds_st64_b32":
+            words.extend((0x89abcdef, first))
+        elif name == "lds_st64_xchg_b64":
+            words.extend((0x12345678, 0x9abcdef0, first, 0x89abcdef,
+                          0x33333333, 0x44444444, 0x11111111, 0x22222222))
+        elif name == "lds_st64_b64":
+            words.extend((0x12345678, 0x9abcdef0, first, 0x89abcdef))
+        else:
+            words.extend((0x89abcdef, first, 0x9abcdef0, 0x12345678))
+    return words
+
+
+
+LDS_F32_BINDING = LDS_BINDING | {"stride": 8, "lds_f32_mode": "normal-rne"}
+LDS_F32_OPS = {
+    "ds_add_f32": "v5, v7", "ds_add_rtn_f32": "v11, v5, v11",
+    "ds_min_f32": "v5, v7", "ds_max_f32": "v5, v7", "ds_cmpst_f32": "v5, v6, v7",
+    "ds_min_rtn_f32": "v11, v5, v11", "ds_max_rtn_f32": "v11, v5, v11",
+    "ds_cmpst_rtn_f32": "v11, v5, v6, v11",
+}
+
+
+def lds_f32_program(op):
+    add = op.startswith("ds_add")
+    return DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0", "v_and_b32_e32 v6, 1, v8",
+        "v_mov_b32_e32 v7, 0x40200000", "v_mad_u32_u24 v6, 0x800000, v6, v7",
+        "ds_write_b32 v5, v6", "s_waitcnt lgkmcnt(0)",
+        "ds_read_b32 v11, v5", "s_waitcnt lgkmcnt(0)",
+        f"v_mov_b32_e32 v7, {'0xc0400000' if add else '0x40400000'}",
+    ] + (["v_mov_b32_e32 v11, v7"] if "_rtn" in op else []) + (
+        ["v_mov_b32_e32 v6, 0x40200000"] if op.startswith("ds_cmpst") else []) + [
+        f"{op} {LDS_F32_OPS[op]}", "s_waitcnt lgkmcnt(0)",
+        "ds_read_b32 v10, v5", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen", "s_endpgm",
+    ]
+
+
+def lds_f32_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        old = 2.5 if lane % 2 == 0 else 5.0
+        if op.startswith("ds_add"):
+            new = old - 3.0
+        elif op.startswith("ds_cmpst"):
+            new = 3.0 if old == 2.5 else old
+        else:
+            new = (min if op.startswith("ds_min") else max)(old, 3.0)
+        words.extend(struct.unpack("<II", struct.pack("<ff", new, old)))
+    return words
+
+
+LDS_F32_CASES = [(op, lds_f32_program(op), LDS_F32_BINDING) for op in LDS_F32_OPS]
+
+
+LDS_WIDE_BINDING = LDS_BINDING | {"lds_bytes": 512}
+LDS_WIDE_SETUP = DS_PREFIX + [
+    "v_lshlrev_b32_e32 v5, 4, v0",
+    "v_mad_u32_u24 v6, 1, v8, 0x12345670",
+    "v_mov_b32_e32 v7, 0x89abcdef",
+    "v_mov_b32_e32 v9, 0x76543210",
+]
+
+
+def _signed64(value):
+    return value - (1 << 64) if value >> 63 else value
+
+
+def _min_i64(a, b):
+    return a if _signed64(a) < _signed64(b) else b
+
+
+def _max_i64(a, b):
+    return a if _signed64(a) > _signed64(b) else b
+
+
+LDS_QWORD_UPDATES = {
+    "ds_add_u64": operator.add, "ds_sub_u64": operator.sub, "ds_rsub_u64": lambda a, b: b - a,
+    "ds_and_b64": operator.and_, "ds_or_b64": operator.or_, "ds_xor_b64": operator.xor,
+    "ds_min_u64": min, "ds_max_u64": max, "ds_min_i64": _min_i64, "ds_max_i64": _max_i64,
+}
+
+
+LDS_QWORD_RETURNS = {f"{stem}_rtn_{width}": op for op in LDS_QWORD_UPDATES
+                     for stem, width in [op.rsplit("_", 1)]}
+
+
+def lds_qword_program(op):
+    returns = op in LDS_QWORD_RETURNS
+    ret_operand = "v[18:19], " if returns else ""
+    if LDS_QWORD_RETURNS.get(op, op) in ("ds_min_i64", "ds_max_i64", "ds_min_u64", "ds_max_u64"):
+        # Even lanes cross the signed high-word boundary; odd lanes repeat the
+        # high word and exercise the unsigned low-word tie-break.
+        prior = [
+            "v_mad_u32_u24 v16, 1, v8, 0xfffffff0",
+            "v_and_b32_e32 v17, 1, v8",
+            "v_mad_u32_u24 v17, 1, v17, 0x7fffffff",
+            "v_mov_b32_e32 v18, 0x00000018", "v_mov_b32_e32 v19, 0x80000000",
+        ]
+    else:
+        prior = [
+            "v_mad_u32_u24 v16, 1, v8, 0xfffffff0",
+            "v_mov_b32_e32 v17, 0xfffffff1",
+            "v_mov_b32_e32 v18, 0x00000018", "v_mov_b32_e32 v19, 0x0000000e",
+        ]
+    return LDS_WIDE_SETUP + [
+        *prior,
+        "ds_write_b64 v5, v[16:17] offset:8", "s_waitcnt lgkmcnt(0)",
+        f"{op} {ret_operand}v5, v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
+        "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
+    ] + (["v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v13, v19",
+          "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen"] if returns else
+         ["buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]) + ["s_endpgm"]
+
+
+def lds_qword_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        if LDS_QWORD_RETURNS.get(op, op) in ("ds_min_i64", "ds_max_i64", "ds_min_u64", "ds_max_u64"):
+            previous = ((0x7fffffff + (lane & 1)) << 32) | ((0xfffffff0 + lane) & 0xffffffff)
+            source = 0x8000000000000018
+        else:
+            previous = (0xfffffff1 << 32) | ((0xfffffff0 + lane) & 0xffffffff)
+            source = 0x0000000e00000018
+        current = LDS_QWORD_UPDATES[LDS_QWORD_RETURNS.get(op, op)](previous, source)
+        words.extend((current & 0xffffffff, (current >> 32) & 0xffffffff))
+        if op in LDS_QWORD_RETURNS:
+            words.extend((previous & 0xffffffff, previous >> 32))
+    return words
+
+
+def without_low_tiebreak(source):
+    """Remove the low-word clause from a qword min/max condition."""
+    start = source.index(" || ((")
+    depth = 0
+    for end in range(start + len(" || "), len(source)):
+        depth += {"(": 1, ")": -1}.get(source[end], 0)
+        if depth == 0:
+            return source[:start] + source[end + 1:]
+    raise AssertionError("Missing qword comparison tie-break")
+
+
+LDS_WIDE_QUAD_SETUP = [
+    "v_mov_b32_e32 v16, v6", "v_mov_b32_e32 v17, v7",
+    "v_mov_b32_e32 v18, v9", "v_mov_b32_e32 v19, 0xf0e1d2c3",
+]
+LDS_WIDE_QUADS = {
+    "lds_b128": ["ds_write_b128 v5, v[16:19]", "ds_read_b128 v[10:13], v5"],
+    "lds_write2_b32": ["ds_write_b128 v5, v[16:19]", "ds_write2_b32 v5, v6, v9 offset0:3 offset1:1",
+                       "ds_read_b128 v[10:13], v5"],
+    "lds_pair_b64": ["ds_write2_b64 v5, v[16:17], v[18:19] offset0:1",
+                     "ds_read2_b64 v[10:13], v5 offset1:1"],
+}
+LDS_WIDE_PROGRAMS = {
+    "lds_b64": [
+        "v_mov_b32_e32 v16, 5", "v_mov_b32_e32 v17, 9",
+        "ds_write_b64 v5, v[16:17]", "s_waitcnt lgkmcnt(0)",
+        "ds_write_b64 v5, v[6:7] offset:8", "s_waitcnt lgkmcnt(0)",
+        "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v12, 0x76543210",
+    ],
+    "lds_b96": [
+        "v_mov_b32_e32 v16, v6", "v_mov_b32_e32 v17, v7", "v_mov_b32_e32 v18, v9",
+        "ds_write_b96 v5, v[16:18]", "s_waitcnt lgkmcnt(0)",
+        "ds_read_b96 v[10:12], v5", "s_waitcnt lgkmcnt(0)",
+    ],
+    "lds_xchg2_b32": [
+        "v_mov_b32_e32 v16, v6", "v_mov_b32_e32 v17, v7", "v_mov_b32_e32 v18, v9",
+        "ds_write_b96 v5, v[16:18]", "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v10, 0x13572468", "v_mov_b32_e32 v11, 0x24681357",
+        "ds_wrxchg2_rtn_b32 v[10:11], v5, v10, v11 offset0:2", "s_waitcnt lgkmcnt(0)",
+        "ds_read2_b32 v[12:13], v5 offset0:2", "s_waitcnt lgkmcnt(0)",
+    ],
+    "lds_read2_b32": [
+        "v_mov_b32_e32 v16, v6", "v_mov_b32_e32 v17, v7", "v_mov_b32_e32 v18, v9",
+        "ds_write_b96 v5, v[16:18]", "s_waitcnt lgkmcnt(0)",
+        "ds_read2_b32 v[10:11], v5 offset0:2 offset1:1", "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v12, v6",
+    ],
+}
+
+
+def lds_wide_program(name):
+    if name in LDS_WIDE_QUADS:
+        ds = [line for op in LDS_WIDE_QUADS[name] for line in (op, "s_waitcnt lgkmcnt(0)")]
+        return LDS_WIDE_SETUP + LDS_WIDE_QUAD_SETUP + ds + [
+            "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
+        ]
+    store = ("buffer_store_dwordx4 v[10:13]" if name == "lds_xchg2_b32"
+             else "buffer_store_dwordx3 v[10:12]")
+    return LDS_WIDE_SETUP + LDS_WIDE_PROGRAMS[name] + [
+        store + ", v8, s[20:23], 0 idxen", "s_endpgm",
+    ]
+
+
+def lds_wide_reference(name, groups):
+    words = []
+    for lane in range(groups * 32):
+        data = 0x12345670 + lane
+        if name == "lds_xchg2_b32":
+            words.extend((0x76543210, data, 0x13572468, 0x24681357))
+            continue
+        if name in LDS_WIDE_QUADS:
+            words.extend({
+                "lds_b128": (data, 0x89abcdef, 0x76543210, 0xf0e1d2c3),
+                "lds_write2_b32": (data, 0x76543210, 0x76543210, data),
+                "lds_pair_b64": (0x76543210, 0xf0e1d2c3, data, 0x89abcdef),
+            }[name])
+            continue
+        words.extend((0x76543210, 0x89abcdef, data) if name == "lds_read2_b32"
+                     else (data, 0x89abcdef, 0x76543210))
+    return words
+
+
+LDS_PACKED_CASES = [(name, lds_wide_program(name), LDS_WIDE_BINDING | {"stride": 16} if name == "lds_xchg2_b32"
+                     else LDS_WIDE_BINDING) for name in LDS_WIDE_PROGRAMS]
+LDS_PACKED_CASES += [(name, lds_wide_program(name), LDS_WIDE_BINDING | {"stride": 16}) for name in LDS_WIDE_QUADS]
+
+
+LDS_HIGH_WRITES = {"ds_write_b8_d16_hi": (1, 1), "ds_write_b16_d16_hi": (2, 2)}
+
+
+def lds_high_write_program(name):
+    _, offset = LDS_HIGH_WRITES[name]
+    return DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_mov_b32_e32 v6, 0x89abcdef",
+        "ds_write_b32 v5, v6", "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v7, 0x9180abcd", "v_mad_u32_u24 v7, 0x10000, v8, v7",
+        f"{name} v5, v7 offset:{offset}", "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v7, 0",
+        "ds_read_b32 v10, v5", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dword v10, v8, s[20:23], 0 idxen", "s_endpgm",
+    ]
+
+
+def lds_high_write_reference(name, groups):
+    size, offset = LDS_HIGH_WRITES[name]
+    words = []
+    for lane in range(groups * 32):
+        word = bytearray.fromhex("ef cd ab 89")
+        source = (0x9180abcd + lane * 0x10000).to_bytes(4, "little")
+        word[offset:offset + size] = source[2:2 + size]
+        words.append(int.from_bytes(word, "little"))
+    return words
+
+
+LDS_ADDTID_PROGRAM = DS_PREFIX + [
+    "s_mov_b32 m0, 0",
+    "v_lshlrev_b32_e32 v5, 2, v0",
+    "v_mad_u32_u24 v6, 1, v8, 0x12345670",
+    "ds_write_addtid_b32 v6", "s_waitcnt lgkmcnt(0)",
+    "ds_read_b32 v10, v5", "s_waitcnt lgkmcnt(0)",
+    "v_mad_u32_u24 v6, 1, v8, 0x89abcdef",
+    "ds_write_b32 v5, v6", "s_waitcnt lgkmcnt(0)",
+    "ds_read_addtid_b32 v11", "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen", "s_endpgm",
+]
+LDS_PACKED_CASES += [(op, lds_high_write_program(op), LDS_BINDING | {"stride": 4}) for op in LDS_HIGH_WRITES]
+LDS_PACKED_CASES += [("lds_addtid", LDS_ADDTID_PROGRAM, LDS_BINDING | {"stride": 8})]
+
+
+LDS_WIDE_REPLACEMENTS = ("ds_cmpst_b64", "ds_cmpst_rtn_b64", "ds_mskor_b64", "ds_mskor_rtn_b64", "ds_wrxchg_rtn_b64")
+
+
+def lds_wide_replacement_instruction(op):
+    returns = "_rtn" in op
+    dest = "v[20:21], " if returns else ""
+    data2 = "" if "wrxchg" in op else ", v[20:21]"
+    return f"{op} {dest}v5, v[18:19]{data2} offset:8"
+
+
+def lds_wide_replacement_program(op):
+    returns = "_rtn" in op
+    return LDS_WIDE_SETUP + [
+        "v_and_b32_e32 v16, 1, v8", "v_lshrrev_b32_e32 v17, 1, v8", "v_and_b32_e32 v17, 1, v17",
+        "v_mad_u32_u24 v16, 1, v16, 0x12345670",
+        "v_mad_u32_u24 v17, 1, v17, 0x9abcdef0",
+        "v_mov_b32_e32 v18, 0x12345670", "v_mov_b32_e32 v19, 0x9abcdef0",
+        "v_mov_b32_e32 v20, 0xf0e1d2c3", "v_mov_b32_e32 v21, 0x87654321",
+        "ds_write_b64 v5, v[16:17] offset:8", "s_waitcnt lgkmcnt(0)",
+        lds_wide_replacement_instruction(op), "s_waitcnt lgkmcnt(0)",
+        "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
+    ] + (["v_mov_b32_e32 v12, v20", "v_mov_b32_e32 v13, v21",
+          "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen"] if returns else
+         ["buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]) + ["s_endpgm"]
+
+
+def lds_wide_replacement_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        old = (0x9abcdef0 + (lane >> 1 & 1)) << 32 | (0x12345670 + (lane & 1))
+        data = 0x9abcdef012345670
+        other = 0x87654321f0e1d2c3
+        if "cmpst" in op:
+            new = other if old == data else old
+        elif "mskor" in op:
+            new = (old & ~data) | other
+        else:
+            new = data
+        words.extend((new & 0xffffffff, new >> 32))
+        if "_rtn" in op:
+            words.extend((old & 0xffffffff, old >> 32))
+    return words
+
+
+LDS_WIDE_REPLACEMENT_CASES = [
+    (op, lds_wide_replacement_program(op), LDS_WIDE_BINDING | {"stride": 16 if "_rtn" in op else 8})
+    for op in LDS_WIDE_REPLACEMENTS
+]
+
+LDS_QWORD_BINDING = LDS_WIDE_BINDING | {"stride": 8}
+LDS_QWORD_CASES = [(op, lds_qword_program(op), LDS_QWORD_BINDING) for op in LDS_QWORD_UPDATES]
+LDS_QWORD_RETURN_BINDING = LDS_WIDE_BINDING | {"stride": 16}
+LDS_QWORD_CASES += [(op, lds_qword_program(op), LDS_QWORD_RETURN_BINDING) for op in LDS_QWORD_RETURNS]
+
+
+LDS_F64_CMPST = ("ds_cmpst_f64", "ds_cmpst_rtn_f64")
+
+
+def lds_f64_cmpst(op):
+    returns = "_rtn" in op
+    dest = "v[18:19], " if returns else ""
+    return LDS_WIDE_SETUP + [
+        "v_and_b32_e32 v16, 1, v8", "v_lshrrev_b32_e32 v17, 1, v8", "v_and_b32_e32 v17, 1, v17",
+        "v_mad_u32_u24 v17, 1, v17, 0x40040000",
+        "v_mov_b32_e32 v18, 0x12345678", "v_mov_b32_e32 v19, 0xbff80000",
+        "v_mov_b32_e32 v20, 0", "v_mov_b32_e32 v21, 0x40040000",
+        "ds_write_b64 v5, v[16:17] offset:8", "s_waitcnt lgkmcnt(0)",
+        f"{op} {dest}v5, v[20:21], v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
+        "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
+    ] + (["v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v13, v19",
+          "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen"] if returns else
+         ["buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]) + ["s_endpgm"]
+
+
+def lds_f64_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        previous = (lane & 1, 0x40040000 + (lane >> 1 & 1))
+        value = struct.unpack("<d", struct.pack("<II", *previous))[0]
+        words.extend((0x12345678, 0xbff80000) if value == 2.5 else previous)
+        if "_rtn" in op:
+            words.extend(previous)
+    return words
+
+
+LDS_F64_CASES = [(op, lds_f64_cmpst(op), LDS_WIDE_BINDING | {"stride": 16 if "_rtn" in op else 8,
+                                                          "lds_f64_mode": "normal"}) for op in LDS_F64_CMPST]
+LDS_FLOAT_CASES = LDS_F32_CASES + LDS_F64_CASES
+
+
+LDS_WAVE_COUNTER = DS_PREFIX + [
+    "s_mov_b32 m0, 0", "v_lshlrev_b32_e32 v5, 2, v0",
+    "v_mad_u32_u24 v6, 1, v8, 0xfffffff0", "ds_write_b32 v5, v6", "s_waitcnt lgkmcnt(0)",
+    "ds_append v10", "s_waitcnt lgkmcnt(0)",
+    "ds_read_b32 v11, v5", "s_waitcnt lgkmcnt(0)",
+    "ds_consume v12", "s_waitcnt lgkmcnt(0)",
+    "ds_read_b32 v13, v5", "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
+]
+LDS_CASES += [("lds_wave_counter", LDS_WAVE_COUNTER, LDS_BINDING | {"stride": 16})]
+
+
+def lds_wave_counter_reference(groups):
+    words = []
+    for lane in range(groups * 32):
+        first = lane // 32 * 32
+        seed = (0xfffffff0 + first) & 0xffffffff
+        incremented = (seed + 32) & 0xffffffff
+        private = (0xfffffff0 + lane) & 0xffffffff
+        words.extend((seed, incremented if lane == first else private, incremented, private))
+    return words
+
+
+def lds_controls():
+    op, lines, binding = LDS_WIDE_REPLACEMENT_CASES[1]
+    target = lds_wide_replacement_instruction(op)
+    for replacement, message in (
+        (target.replace("offset:8", "offset:0"), "Unverified private wide LDS replacement"),
+        (target.replace("v[18:19]", "v[18:20]"), "Unverified private wide LDS replacement range"),
+        (target.replace("v[18:19]", "v[254:255]"), "Unverified private wide LDS replacement source"),
+        (target + " gds", "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(lines, (target, replacement)), 32, **binding)
+
+    lines = lds_f64_cmpst("ds_cmpst_f64")
+    rejects("Unverified private LDS binary64 mode", aot.lower, lines, 32, **(LDS_WIDE_BINDING | {"stride": 8}))
+    lines = lds_f32_program("ds_add_f32")
+    rejects("Unverified private LDS floating-point mode", aot.lower, lines, 32, **LDS_BINDING)
+    for bad, message in (
+        ("ds_add_f32 v5, v7 gds", "Unsupported compute instruction"),
+        ("ds_add_f32 v5, v7 offset:4", "Unsupported compute instruction"),
+        ("ds_add_f32 v5, v255", "Unverified private LDS floating-point access"),
+        ("ds_add_f32 v5, v7, v8", "Unverified private LDS floating-point operands"),
+    ):
+        rejects(message, aot.lower, variant(lines, ("ds_add_f32 v5, v7", bad)), 32, **LDS_F32_BINDING)
+
+    cmpst = lds_replacement_instruction("ds_cmpst_rtn_b32")
+    lines = lds_replacement_program("ds_cmpst_rtn_b32")
+    for bad, message in (
+        (cmpst + " offset:4", "Unsupported compute instruction"),
+        (cmpst + " gds", "Unsupported compute instruction"),
+        (cmpst.replace(", v7", ""), "Unverified private LDS replacement operands"),
+        (cmpst.replace("v7", "v254"), "Unverified private LDS replacement"),
+    ):
+        rejects(message, aot.lower, variant(lines, (cmpst, bad)), 32, **LDS_BINDING)
+    for old, new, message in (
+        ("s_mov_b32 m0, 0", "s_nop 0", "Unverified private LDS thread-ID access"),
+        ("s_mov_b32 m0, 0", "s_mov_b32 m0, 4", "Unsupported compute instruction"),
+        ("ds_write_addtid_b32 v6", "ds_write_addtid_b32 v6 offset:4", "Unsupported compute instruction"),
+        ("ds_write_addtid_b32 v6", "ds_write_addtid_b32 v255", "Unverified private LDS thread-ID source"),
+        ("ds_write_addtid_b32 v6", "ds_read_addtid_b32 v11", "Uninitialized private LDS thread-ID word"),
+        ("ds_read_addtid_b32 v11", "ds_read_addtid_b32 v11\ns_nop 0",
+         "Expected immediate s_waitcnt lgkmcnt(0) after DS"),
+    ):
+        rejects(message, aot.lower, variant(LDS_ADDTID_PROGRAM, (old, new)), 32, **LDS_BINDING)
+    high = lds_high_write_program("ds_write_b16_d16_hi")
+    rejects("Unverified private LDS write", aot.lower,
+            variant(high, ("offset:2", "offset:1")), 32, **LDS_BINDING)
+    rejects("Unverified private LDS write", aot.lower,
+            variant(high, ("ds_write_b32 v5, v6", "s_nop 0")), 32, **LDS_BINDING)
+
+    ret = lds_qword_program("ds_add_rtn_u64")
+    instruction = "ds_add_rtn_u64 v[18:19], v5, v[18:19] offset:8"
+    for bad in (instruction.replace("v[18:19], v5", "v[18:20], v5"),
+                instruction.replace("v[18:19], v5", "v[255:256], v5")):
+        rejects("Unverified private wide LDS update", aot.lower, variant(ret, (instruction, bad)), 32,
+                **LDS_QWORD_RETURN_BINDING)
+
+    quad = lds_qword_program("ds_add_u64")
+    op = "ds_add_u64 v5, v[18:19] offset:8"
+    for bad, message in (
+        ("ds_add_u64 v5, v[18:19]", "Unverified private wide LDS update"),
+        ("ds_add_u64 v5, v[18:20] offset:8", "Unverified private wide LDS update"),
+        ("ds_add_u64 v5, v[254:255] offset:8", "Unverified private wide LDS update"),
+        (op + " gds", "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(quad, (op, bad)), 32, **LDS_QWORD_BINDING)
+
+    for name in ("ds_xor_b64", "ds_min_u64", "ds_max_u64", "ds_min_i64", "ds_max_i64"):
+        lines = lds_qword_program(name)
+        update = f"{name} v5, v[18:19] offset:8"
+        for bad, message in (
+            (f"{name} v5, v[18:19]", "Unverified private wide LDS update"),
+            (update + " gds", "Unsupported compute instruction"),
+        ):
+            rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_QWORD_BINDING)
+
+    pair = lds_wide_program("lds_pair_b64")
+    for before, after, message in (
+        ("offset0:1", "offset0:0", "Unverified private paired LDS access"),
+        ("offset1:1", "offset1:2", "Unverified private paired LDS access"),
+        ("v[18:19] offset0:1", "v[18:20] offset0:1", "Unverified private paired LDS register range"),
+        ("ds_write2_b64 v5, v[16:17], v[18:19] offset0:1", "ds_write_b64 v5, v[16:17]",
+         "Uninitialized private wide LDS word"),
+        ("offset1:1", "offset1:1 gds", "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(pair, (before, after)), 32, **(LDS_WIDE_BINDING | {"stride": 16}))
+
+    name, lines, binding = LDS_STRIDED_CASES[1]
+    assert name == "lds_st64_b64"
+    for before, after, message in (
+        ("offset0:1 offset1:2", "offset0:1 offset1:1", "Unverified private strided LDS access"),
+        ("offset0:1 offset1:2", "offset0:0 offset1:2", "Unverified private strided LDS access"),
+        ("offset0:1 offset1:2", "offset0:1 offset1:3", "Unverified private strided LDS access"),
+        ("v[10:11] offset0:1", "v[10:12] offset0:1", "Unverified private strided LDS source range"),
+        ("v[10:13], v5", "v[10:12], v5", "Unverified private strided LDS destination range"),
+        ("ds_write2st64_b64 v5, v[6:7], v[10:11] offset0:1 offset1:2", "s_nop 0",
+         "Uninitialized private strided LDS plane"),
+        ("offset0:2 offset1:1", "offset0:2 offset1:1 gds", "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(lines, (before, after)), 32, **binding)
+    rejects("Unverified private strided LDS access", aot.lower, lines, 32, **(binding | {"lds_bytes": 1279}))
+    for old, bad, message in (
+        ("s_mov_b32 m0, 0", "s_nop 0", "Unverified LDS wave counter"),
+        ("s_mov_b32 m0, 0", "s_mov_b32 m0, 4", "Unsupported compute instruction"),
+        ("ds_write_b32 v5, v6", "s_nop 0", "Unverified LDS wave counter"),
+        ("ds_append v10", "ds_append v10 gds", "Unsupported compute instruction"),
+        ("ds_consume v12", "ds_consume v12 offset:4", "Unsupported compute instruction"),
+        ("ds_append v10", "ds_append v10\ns_nop 0", "Expected immediate s_waitcnt lgkmcnt(0) after DS"),
+    ):
+        rejects(message, aot.lower, variant(LDS_WAVE_COUNTER, (old, bad)), 32, **LDS_BINDING)
+    lines = lds_wide_program("lds_xchg2_b32")
+    rejects("Unverified private paired dword exchange", aot.lower,
+            variant(lines, ("v10, v11 offset0:2", "v10, v11")), 32, **LDS_WIDE_BINDING)
+    rejects("Uninitialized private paired dword exchange", aot.lower,
+            variant(lines, ("ds_wrxchg2_rtn_b32 v[10:11], v5, v10, v11 offset0:2",
+                            "ds_wrxchg2_rtn_b32 v[10:11], v5, v10, v11 offset0:3")), 32, **LDS_WIDE_BINDING)
+    wide = lds_wide_program("lds_b96")
+    rejects("Unverified dispatch byte offset", aot.lower, wide, 32, **LDS_BINDING)
+    for old, bad, message in (
+        ("ds_write_b96 v5, v[16:18]", "s_nop 0", "Uninitialized private wide LDS word"),
+        ("ds_write_b96 v5, v[16:18]", "ds_write_b96 v5, v[16:17]", "Unverified private wide LDS register range"),
+        ("ds_write_b96 v5, v[16:18]", "ds_write_b96 v5, v[16:18] offset:8", "Unverified private wide LDS access"),
+        ("ds_read_b96 v[10:12], v5", "ds_read_b96 v[10:12], v5 gds", "Unsupported compute instruction"),
+        ("ds_read_b96 v[10:12], v5", "ds_read_b96 v[10:12], v5\nv_mov_b32_e32 v6, 0",
+         "Expected immediate s_waitcnt lgkmcnt(0) after DS"),
+    ):
+        rejects(message, aot.lower, variant(wide, (old, bad)), 32, **LDS_WIDE_BINDING)
+    rejects("Mixed private LDS address strides", aot.lower,
+            variant(wide, ("v_lshlrev_b32_e32 v5, 4, v0", "v_lshlrev_b32_e32 v3, 2, v0\n"
+                            "v_lshlrev_b32_e32 v5, 4, v0")), 32, **LDS_WIDE_BINDING)
+
+    wide_address = "v_lshlrev_b32_e32 v5, 4, v0"
+    implicit_write = "\n".join(("s_mov_b32 m0, 0", "v_mov_b32_e32 v15, 0x12345678",
+                                "ds_write_addtid_b32 v15", "s_waitcnt lgkmcnt(0)"))
+    for mixed in (implicit_write + "\n" + wide_address, wide_address + "\n" + implicit_write):
+        rejects("Mixed private LDS address strides", aot.lower,
+                variant(wide, (wide_address, mixed)), 32, **LDS_WIDE_BINDING)
+
+    lines = LDS_PROGRAM
+    assert " >> 16u) & 0xffffu)" in aot.lower(lines, 32, **LDS_BINDING)
+    for old, new, message in (
+        ("ds_write_b32 v5, v6", "s_nop 0", "Unverified private LDS read"),
+        ("ds_write_b32 v5, v6", "ds_write_b32 v8, v6", "Unverified private LDS write"),
+        ("ds_read_b32 v10, v5", "ds_read_b32 v10, v5 offset:2", "Unverified private LDS read"),
+        ("ds_read_u16 v12, v5 offset:2", "ds_read_u16 v12, v5 offset:1", "Unverified private LDS read"),
+    ):
+        rejects(message, aot.lower, variant(lines, (old, new)), 32, **LDS_BINDING)
+    i = lines.index("ds_write_b32 v5, v6")
+    masked = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
+    rejects("Unverified private LDS write", aot.lower, masked, 32, **LDS_BINDING)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+    rejects("Unverified dispatch byte offset", aot.lower, lines, 32, **(LDS_BINDING | {"lds_bytes": 127}))
+
+
+    lines = lds_subword_program(16, 2)
+    write = "ds_write_b16 v5, v6 offset:2"
+    read = "ds_read_i16 v12, v5 offset:2"
+    for old, new, message in (
+        ("ds_write_b32 v5, v6", "s_nop 0", "Unverified private LDS write"),
+        (write, "ds_write_b16 v5, v6 offset:1", "Unverified private LDS write"),
+        (write, "ds_write_b16 v5, v6 offset:3", "Unverified private LDS write"),
+        (write, "ds_write_b16 v5, v6 offset:2 gds", "Unsupported compute instruction"),
+        (write, "ds_write_b8 v5, v6 offset:4", "Unsupported compute instruction"),
+        (read, "ds_read_i16 v12, v5 offset:1", "Unverified private LDS read"),
+        (read, "ds_read_i16 v12, v8 offset:2", "Unverified private LDS read"),
+        (read, "ds_read_i8 v12, v5 offset:4", "Unsupported compute instruction"),
+        (read, "ds_read_u8 v12, v5 offset:2 gds", "Unsupported compute instruction"),
+    ):
+        # Only omit the first full-word write in the initialization control.
+        mutated = lines.copy()
+        mutated[mutated.index(old)] = new
+        rejects(message, aot.lower, mutated, 32, **LDS_BINDING)
+    i = lines.index(write)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+    pair = ["ds_write_b8 v5, v6", "s_waitcnt lgkmcnt(0)"]
+    rejects("LDS expression exceeds the profile limit", aot.lower,
+            lines[:i] + pair * 32 + lines[i:], 32, **LDS_BINDING)
+
+
+    update = "ds_add_u32 v5, v6"
+    lines = lds_update_program("ds_add_u32")
+    no_init = variant(lines, ("ds_write_b32 v5, v6", "s_nop 0"), ("ds_read_b32 v10, v5", "s_nop 0"))
+    rejects("Unverified private LDS update", aot.lower, no_init, 32, **LDS_BINDING)
+    for bad, message in (
+        ("ds_add_u32 v8, v6", "Unverified private LDS update"),
+        ("ds_add_u32 v5, v254", "Unverified private LDS update"),
+        ("ds_add_u32 v5, v6 offset:4", "Unsupported compute instruction"),
+        ("ds_add_u32 v5, v6 gds", "Unsupported compute instruction"),
+        ("ds_inc_rtn_u64 v[10:11], v5, v[6:7]", "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
+    i = lines.index(update)
+    masked = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
+    rejects("Unverified private LDS update", aot.lower, masked, 32, **LDS_BINDING)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+    pair = [update, "s_waitcnt lgkmcnt(0)"]
+    rejects("LDS expression exceeds the profile limit", aot.lower,
+            lines[:i] + pair * 32 + lines[i:], 32, **LDS_BINDING)
+
+
+    wrap = lds_counter_instruction("ds_wrap_rtn_b32")
+    lines = lds_counter_program("ds_wrap_rtn_b32")
+    for bad, message in (
+        (wrap + " offset:4", "Unsupported compute instruction"),
+        (wrap + " gds", "Unsupported compute instruction"),
+        (wrap.replace(", v7", ""), "Unverified LDS counter operands"),
+        (wrap.replace("v7", "v254"), "Unverified private LDS counter update"),
+        (wrap.replace("v5", "v8"), "Unverified private LDS counter update"),
+    ):
+        rejects(message, aot.lower, variant(lines, (wrap, bad)), 32, **LDS_BINDING)
+    i = lines.index(wrap)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+
+
+    update = "ds_add_rtn_u32 v10, v5, v10"
+    lines = lds_return_update_program("ds_add_rtn_u32")
+    expected = aot.lower(lines, 32, **LDS_BINDING)
+    assert aot.lower(variant(lines, (update, update + " offset:0")), 32, **LDS_BINDING) == expected
+    no_init = variant(lines, ("ds_write_b32 v5, v6", "s_nop 0"))
+    rejects("Unverified private LDS update", aot.lower, no_init, 32, **LDS_BINDING)
+    for bad, message in (
+        ("ds_add_rtn_u32 v256, v5, v10", "Unverified private LDS update"),
+        ("ds_add_rtn_u32 v10, v8, v10", "Unverified private LDS update"),
+        ("ds_add_rtn_u32 v10, v5, v254", "Unverified private LDS update"),
+        ("ds_add_rtn_u32 v10, v5, v10 offset:4", "Unsupported compute instruction"),
+        ("ds_add_rtn_u32 v10, v5, v10 gds", "Unsupported compute instruction"),
+        ("ds_add_rtn_u32 v5, v10", "Unsupported compute instruction"),
+        ("ds_add_u32 v10, v5, v10", "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
+    # The result in v11 replaces its address tag.
+    rejects("Unverified private LDS read", aot.lower,
+            variant(lines, ("ds_read_b32 v12, v5", "ds_read_b32 v12, v11")), 32, **LDS_BINDING)
+    i = lines.index(update)
+    masked = lines[:i] + ["v_cmp_gt_u32_e32 vcc_lo, 16, v8", "s_and_saveexec_b32 s5, vcc_lo"] + lines[i:]
+    rejects("Unverified private LDS update", aot.lower, masked, 32, **LDS_BINDING)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+
+
+    for ret, op in LDS_RETURN_UPDATES.items():
+        if op not in LDS_ORDER_MUTANTS:
+            continue
+        for lines, update in ((lds_update_program(op), f"{op} v5, v6"),
+                              (lds_return_update_program(ret), f"{ret} v10, v5, v10")):
+            for modifier in ("offset:4", "gds"):
+                rejects("Unsupported compute instruction", aot.lower,
+                        variant(lines, (update, f"{update} {modifier}")), 32, **LDS_BINDING)
+
+
+    lines = lds_d16_program("ds_read_u16_d16_hi")
+    read = "ds_read_u16_d16_hi v10, v5"
+    for bad, message in (
+        (read.replace("v10", "v254"), "Unverified D16 destination word"),
+        (read.replace("v10", "v5"), "Unverified D16 destination word"),
+        (read + " offset:1", "Unverified private LDS read"),
+        (read + " offset:4", "Unsupported compute instruction"),
+        (read + " gds", "Unsupported compute instruction"),
+        (read.replace("u16", "b32"), "Unsupported compute instruction"),
+        (read.replace("u16", "i16"), "Unsupported compute instruction"),
+    ):
+        rejects(message, aot.lower, variant(lines, (read, bad)), 32, **LDS_BINDING)
+    i = lines.index(read)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
+
+
+def ds_binary(directory, assembler, objcopy, library):
+    cases = DS_CASES + LDS_CASES + LDS_ARITHMETIC_CASES + LDS_REPLACEMENT_CASES + LDS_PACKED_CASES + LDS_STRIDED_CASES
+    cases += LDS_WIDE_REPLACEMENT_CASES
+    cases += LDS_QWORD_CASES
+    cases += LDS_FLOAT_CASES
+    for name, lines, binding in cases:
+        src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
+        src.write_text("\n".join(lines) + "\n", encoding="ascii")
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1030", f"-mattr={DS_FEATURES}",
+                        "-filetype=obj", src, "-o", obj], check=True)
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
+        code = raw.read_bytes()
+        decoded = aot.labelled(disassemble(code, library, offsets=True, cpu=b"gfx1030",
+                                          features=DS_FEATURES.encode()))
+        assert [line for line in decoded if line.startswith("ds_")] == [
+            line for line in lines if line.startswith("ds_")]
+        expected = aot.lower(lines, 32, **binding)
+        assert aot.lower(decoded, 32, **binding) == expected
+        container, output = directory / "ds.dxbc", directory / "ds-cli.hlsl"
+        container.write_bytes(store_container(code, (32, 1, 1)))
+        options = [item for key, value in binding.items() for item in ("--" + key.replace("_", "-"), str(value))]
+        subprocess.run([sys.executable, "-B", aot.__file__, container, "--output", output,
+                        "--llvm", library, *options], check=True)
+        assert output.read_text() == expected
+
+
+def ds_mutants(name, lines, binding, source):
+    if name in LDS_ORDER_MUTANTS:
+        changed = variant(lines, (f"{name} v5, v6", f"{LDS_ORDER_MUTANTS[name]} v5, v6"))
+        yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_UPDATES:
+        changed = variant(lines, (f"{name} v5, v6", "ds_write_b32 v5, v6"))
+        yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_RETURN_UPDATES:
+        op = LDS_RETURN_UPDATES[name]
+        return_new = f"{op} v5, v10\ns_waitcnt lgkmcnt(0)\nds_read_b32 v10, v5"
+        changed = variant(lines, (f"{name} v10, v5, v10", return_new))
+        words = lds_update_reference(op, 3)
+        # At some lanes a min/max update keeps the old value. Find the first changed lane.
+        first = next(i for i in range(0, len(words), 3) if words[i] != words[i + 1])
+        yield aot.lower(changed, 32, **binding), first
+        changed = variant(lines, (f"{name} v11, v11, v9", "ds_read_b32 v11, v11"))
+        second = next(i for i in range(2, len(words), 3) if words[i - 1] != words[i])
+        yield aot.lower(changed, 32, **binding), second
+        if op in LDS_ORDER_MUTANTS:
+            wrong_op = next(ret for ret, base in LDS_RETURN_UPDATES.items() if base == LDS_ORDER_MUTANTS[op])
+            changed = variant(lines, (f"{name} v10, v5, v10", f"{wrong_op} v10, v5, v10"))
+            yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_REPLACEMENTS:
+        instruction = lds_replacement_instruction(name)
+        if "cmpst" in name:
+            wrong = instruction.replace("v6, v7", "v7, v6")
+        elif "mskor" in name:
+            # Masking DATA1 would incorrectly discard bits outside the mask.
+            masked = 0x400580b1 & 0x00ff0ff0
+            changed = variant(lines, ("v_mov_b32_e32 v7, 0x400580b1", f"v_mov_b32_e32 v7, 0x{masked:08x}"))
+            yield aot.lower(changed, 32, **binding), 1
+            return
+        else:
+            wrong = "ds_read_b32 v10, v5"
+        yield aot.lower(variant(lines, (instruction, wrong)), 32, **binding), 1
+    elif name in LDS_SUBWORDS:
+        width, offset = LDS_SUBWORDS[name]
+        suffix = f" offset:{offset}" if offset else ""
+        changed = variant(lines, (f"ds_write_b{width} v5, v6{suffix}", "ds_write_b32 v5, v6"))
+        yield aot.lower(changed, 32, **binding), 0
+        changed = variant(lines, (f"ds_read_i{width} v12, v5{suffix}", f"ds_read_u{width} v12, v5{suffix}"))
+        # Lane 16 is the first to set the sign bit. The signed read is its third word.
+        yield aot.lower(changed, 32, **binding), 16 * 3 + 2
+    elif name in LDS_D16_READS:
+        changed = variant(lines, (f"v_mov_b32_e32 v10, 0x{LDS_D16_DESTINATIONS[0]:08x}", "v_mov_b32_e32 v10, 0"))
+        yield aot.lower(changed, 32, **binding), 0
+        if name in ("ds_read_i8_d16", "ds_read_i8_d16_hi"):
+            changed = variant(lines, (f"{name} v10, v5", f"{name.replace('i8', 'u8')} v10, v5"))
+            yield aot.lower(changed, 32, **binding), 0
+    elif name == "lds_wave_counter":
+        yield aot.lower(variant(lines, ("ds_append v10", "ds_consume v10")), 32, **binding), 1
+        yield aot.lower(variant(lines, ("ds_consume v12", "ds_append v12")), 32, **binding), 3
+    elif name in LDS_QWORD_RETURNS:
+        # Substitute the post-update word pair for the returned pre-update pair.
+        changed = variant(lines, ("v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v12, v10"),
+                          ("v_mov_b32_e32 v13, v19", "v_mov_b32_e32 v13, v11"))
+        ref = lds_qword_reference(name, 2)
+        word = next(i for i in range(len(ref)) if i % 4 >= 2 and ref[i] != ref[i - 2])
+        yield aot.lower(changed, 32, **binding), word
+    elif name in LDS_QWORD_UPDATES:
+        if name == "ds_add_u64":
+            wrong = source.replace(" + uint(", " + 0u * uint(")
+            word = 1
+            yield wrong, word
+        elif name in ("ds_sub_u64", "ds_rsub_u64"):
+            wrong = source.replace(" - uint(", " - 0u * uint(")
+            word = 33 if name == "ds_sub_u64" else 1
+            yield wrong, word
+        elif name == "ds_xor_b64":
+            wrong = aot.lower(variant(lines, (name, "ds_and_b64")), 32, **binding)
+            yield wrong, 0
+        elif name in ("ds_min_u64", "ds_max_u64", "ds_min_i64", "ds_max_i64"):
+            alternate = {"ds_min_u64": "ds_max_u64", "ds_max_u64": "ds_min_u64",
+                         "ds_min_i64": "ds_max_i64", "ds_max_i64": "ds_min_i64"}[name]
+            wrong = aot.lower(variant(lines, (name, alternate)), 32, **binding)
+            yield wrong, 0
+            # With only the high-word test left, min keeps the source on a tie
+            # and first differs at lane 17. Max instead keeps the source at
+            # lane 1, whose low word should have won.
+            wrong = without_low_tiebreak(source)
+            assert wrong != source
+            yield wrong, 34 if name.startswith("ds_min") else 2
+        else:
+            alternate = "ds_or_b64" if name == "ds_and_b64" else "ds_and_b64"
+            wrong = aot.lower(variant(lines, (name, alternate)), 32, **binding)
+            yield wrong, 0
+    elif name in LDS_WIDE_QUADS:
+        if name == "lds_b128":
+            change = ("v_mov_b32_e32 v19, 0xf0e1d2c3", "v_mov_b32_e32 v19, 0")
+            word = 3
+        elif name == "lds_write2_b32":
+            change = ("offset0:3 offset1:1", "offset0:1 offset1:3")
+            word = 1
+        else:
+            change = ("ds_read2_b64 v[10:13], v5 offset1:1", "ds_read2_b64 v[10:13], v5 offset0:1")
+            word = 0
+        yield aot.lower(variant(lines, change), 32, **binding), word
+    elif name in LDS_WIDE_PROGRAMS:
+        if name == "lds_xchg2_b32":
+            change = ("ds_wrxchg2_rtn_b32 v[10:11], v5, v10, v11 offset0:2",
+                      "ds_wrxchg2_rtn_b32 v[10:11], v5, v10, v11 offset1:2")
+        elif name == "lds_read2_b32":
+            change = ("offset0:2 offset1:1", "offset0:1 offset1:2")
+        elif name == "lds_b64":
+            change = ("ds_read_b64 v[10:11], v5 offset:8", "ds_read_b64 v[10:11], v5")
+        else:
+            change = ("v_mad_u32_u24 v6, 1, v8, 0x12345670", "v_mov_b32_e32 v6, 0")
+        yield aot.lower(variant(lines, change), 32, **binding), 0
+    elif name in LDS_HIGH_WRITES:
+        yield aot.lower(variant(lines, (name, name.removesuffix("_d16_hi"))), 32, **binding), 0
+    elif name == "lds_addtid":
+        changed = variant(lines, ("ds_read_addtid_b32 v11", "v_mov_b32_e32 v11, v10"))
+        yield aot.lower(changed, 32, **binding), 1
+    elif name == "lds_overlap":
+        no_halfword = variant(lines, ("ds_write_b16 v5, v7", "s_nop 0"))
+        yield aot.lower(no_halfword, 32, **binding), 1
+        no_byte = variant(lines, ("ds_write_b8 v5, v7 offset:1", "s_nop 0"))
+        yield aot.lower(no_byte, 32, **binding), 2
+    elif name in LDS_COUNTERS:
+        no_update = "ds_read_b32 v10, v5" if "_rtn_" in name else "s_nop 0"
+        changed = variant(lines, (lds_counter_instruction(name), no_update))
+        yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_F64_CMPST:
+        changed = variant(lines, ("v[20:21], v[18:19] offset:8", "v[18:19], v[20:21] offset:8"))
+        yield aot.lower(changed, 32, **binding), 0
+    elif name in LDS_STRIDED_PROGRAMS:
+        change = {
+            "lds_st64_b32": ("offset0:3 offset1:2", "offset0:2 offset1:3"),
+            "lds_st64_b64": ("offset0:2 offset1:1", "offset0:1 offset1:2"),
+            "lds_st64_xchg": ("offset0:3 offset1:2", "offset0:2 offset1:3"),
+            "lds_st64_xchg_b64": ("offset0:2 offset1:1", "offset0:1 offset1:2"),
+        }[name]
+        yield aot.lower(variant(lines, change), 32, **binding), 0
+    elif name in LDS_WIDE_REPLACEMENTS:
+        op = lds_wide_replacement_instruction(name)
+        if "cmpst" in name:
+            changed = variant(lines, ("v[18:19], v[20:21] offset:8", "v[20:21], v[18:19] offset:8"))
+            word = 0
+        elif "mskor" in name:
+            changed = variant(lines, ("v_mov_b32_e32 v20, 0xf0e1d2c3", "v_mov_b32_e32 v20, 0x10205240"))
+            word = 0
+        else:
+            changed = variant(lines, (op, "ds_read_b64 v[20:21], v5 offset:8"))
+            word = 4
+        yield aot.lower(changed, 32, **binding), word
+    elif name in LDS_F32_OPS:
+        if name in ("ds_min_rtn_f32", "ds_max_rtn_f32", "ds_cmpst_rtn_f32"):
+            changed = variant(lines, ("buffer_store_dwordx2 v[10:11]", "v_mov_b32_e32 v11, v10\n"
+                                      "buffer_store_dwordx2 v[10:11]"))
+            ref = lds_f32_reference(name, 3)
+            word = next(i for i in range(1, len(ref), 2) if ref[i - 1] != ref[i])
+            yield aot.lower(changed, 32, **binding), word
+        elif name.startswith("ds_add"):
+            yield source.replace(" + asfloat(", " - asfloat("), 0
+        elif name == "ds_cmpst_f32":
+            yield aot.lower(variant(lines, ("ds_cmpst_f32 v5, v6, v7", "ds_cmpst_f32 v5, v7, v6")),
+                            32, **binding), 0
+        else:
+            other = "ds_max_f32" if name == "ds_min_f32" else "ds_min_f32"
+            yield aot.lower(variant(lines, (name, other)), 32, **binding), 0
+    elif name == "private":
+        yield source.replace(" >> 16u) & 0xffffu)", " >> 0u) & 0xffffu)"), 2
+    else:
+        bias = 5 if name == "ds_bpermute_b32" else 27
+        yield source.replace(f"local.x + {bias}u", f"local.x + {32 - bias}u"), 0
+
+
+def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None):
+    if private:
+        lds_controls()
+    else:
+        ds_controls()
+    accepted = set()
+    if cases is None:
+        cases = LDS_CASES if private else DS_CASES
+    for name, lines, binding in cases:
+        source = aot.lower(lines, 32, **binding)
+        src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
+        src.write_text(source, encoding="ascii")
+        compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+        subprocess.run(compile, check=True)
+        run = [renderer, backend, "--compute-store-case", cso, case]
+        # Four words per lane fill the fixed 320-word readback before three groups.
+        four_words = (name in ("lds_wave_counter", "lds_xchg2_b32") or name in LDS_QWORD_RETURNS
+                      or name in LDS_WIDE_QUADS or name in LDS_STRIDED_PROGRAMS
+                      or name in LDS_F64_CMPST and "_rtn" in name
+                      or name in LDS_WIDE_REPLACEMENTS and "_rtn" in name)
+        group_counts = (1, 2) if four_words else (1, 3)
+        if name == "lds_st64_xchg_b64":
+            group_counts = (1,)
+        for groups in group_counts:
+            if name in LDS_UPDATES or name in LDS_RETURN_UPDATES:
+                words = lds_update_reference(LDS_RETURN_UPDATES.get(name, name), groups)
+            elif name in LDS_SUBWORDS:
+                words = lds_subword_reference(*LDS_SUBWORDS[name], groups)
+            elif name in LDS_D16_READS:
+                words = lds_d16_reference(name, groups)
+            elif name in LDS_REPLACEMENTS:
+                words = lds_replacement_reference(name, groups)
+            elif name in LDS_HIGH_WRITES:
+                words = lds_high_write_reference(name, groups)
+            elif name == "lds_addtid":
+                words = [base + lane for lane in range(groups * 32) for base in (0x12345670, 0x89abcdef)]
+            elif name == "lds_overlap":
+                words = lds_overlap_reference(groups)
+            elif name == "lds_wave_counter":
+                words = lds_wave_counter_reference(groups)
+            elif name in LDS_QWORD_UPDATES or name in LDS_QWORD_RETURNS:
+                words = lds_qword_reference(name, groups)
+            elif name in LDS_WIDE_PROGRAMS or name in LDS_WIDE_QUADS:
+                words = lds_wide_reference(name, groups)
+            elif name in LDS_COUNTERS:
+                words = lds_counter_reference(name, groups)
+            elif name in LDS_STRIDED_PROGRAMS:
+                words = lds_strided_reference(name, groups)
+            elif name in LDS_WIDE_REPLACEMENTS:
+                words = lds_wide_replacement_reference(name, groups)
+            elif name in LDS_F32_OPS:
+                words = lds_f32_reference(name, groups)
+            elif name in LDS_F64_CMPST:
+                words = lds_f64_reference(name, groups)
+            elif private:
+                words = lds_reference(groups)
+            else:
+                words = ds_reference(name, groups)
+            words += [SENTINEL] * (320 - len(words))
+            case.write_bytes(struct.pack("<321I", groups, *words))
+            execution = subprocess.run(run)
+            if execution.returncode:
+                return execution.returncode
+        for mutated, mismatched_word in ds_mutants(name, lines, binding, source):
+            assert mutated != source
+            src.write_text(mutated, encoding="ascii")
+            subprocess.run(compile, check=True)
+            bad = subprocess.run(run, capture_output=True, text=True)
+            if bad.returncode != 1 or f"word={mismatched_word} expected=" not in bad.stderr:
+                raise AssertionError(f"{name}: DS mutation escaped detection\n{bad.stderr}")
+            print(bad.stderr, end="")
+        accepted.update(line.split()[0] for line in lines)
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{op}\n" for op in sorted(accepted)), encoding="utf-8")
+    return 0
+
+
+def binary(directory, assembler, objcopy, library):
+    ds_controls()
+    lds_controls()
+    ds_binary(directory, assembler, objcopy, library)
+    two_exits(directory, assembler, objcopy, library)
+    for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES:
+        src, obj, raw = [directory / x for x in ("test.s", "test.o", "test.bin")]
+        src.write_text("\n".join(lines) + "\n", encoding="ascii")
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", src, "-o", obj], check=True)
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
+        code = raw.read_bytes()
+        dims = aot.checked_group(width)
+        blob = store_container(code, dims)
+        sections = parts(blob)
+        assert aot.group_size(sections[b"PSV0"]) == dims
+        assert aot.container_code(sections[b"DXIL"], stage=5) == code
+        must_reject(lambda: aot.container_code(sections[b"DXIL"], stage=0))
+        decoded = aot.labelled(disassemble(code, library, offsets=True))
+        assert aot.lower(decoded, width, **binding) == aot.lower(lines, width, **binding)
+        container, output = directory / "input.dxbc", directory / "cli.hlsl"
+        container.write_bytes(blob)
+        options = [item for key, value in binding.items() for item in ("--" + key.replace("_", "-"), str(value))]
+        cli = [sys.executable, "-B", str(Path(aot.__file__)), container, "--output", output,
+               "--llvm", library, *options]
+        subprocess.run(cli, check=True)
+        assert output.read_text() == aot.lower(lines, width, **binding)
+        if name in {case[0] for case in GUARD_CASES}:
+            # The decoded branch lands where the guarded store ends. Retarget it to the store (inside
+            # the guarded block), into the store's second word, and past the restore or the exit.
+            offsets = dict((line, pc) for pc, line in disassemble(code, library, offsets=True))
+            pc, store = offsets[next(line for line in offsets if line.startswith("s_cbranch"))], max(
+                pc for line, pc in offsets.items() if line.startswith("buffer_store") and "v0, v0" in line)
+            after = offsets.get("v_mov_b32_e32 v1, 0x600d", len(code))
+            if name == "guard_join":
+                # Landing on the restore itself, past the hazard wait, is the same program.
+                accepted = code[:pc] + struct.pack("<h", (offsets["s_or_b32 exec_lo, exec_lo, s0"] - pc - 4) // 4)
+                container.write_bytes(store_container(accepted + code[pc + 2:], dims))
+                subprocess.run(cli, check=True)
+                assert output.read_text() == aot.lower(lines, width, **binding)
+            for target, message in ((store, "Lane guard branch does not reach its restore"),
+                                    (store + 4, "Branch outside decoded instruction boundaries"),
+                                    (after, "Unverified lane guard restore" if name == "guard_join"
+                                     else "Branch outside decoded instruction boundaries")):
+                wrong = code[:pc] + struct.pack("<h", (target - pc - 4) // 4) + code[pc + 2:]
+                container.write_bytes(store_container(wrong, dims))
+                bad = subprocess.run(cli, capture_output=True, text=True)
+                assert bad.returncode == 1 and message in bad.stderr, (name, target, bad.stderr)
+
+
+def draw_runtime(cmd, case):
+    first = [0x80000000 + i * 0x101 for i in range(16)]
+    second = [0x7fc00000 + i * 0x181 for i in range(16)]
+    refs = []
+    for values in (first, second):
+        words = [SENTINEL] * 320
+        words[4:7] = [values[0], values[3], values[4]]
+        words[8:12] = values[12:16][::-1]
+        words[16] = values[12]
+        refs.append(words)
+        case.write_bytes(struct.pack("<337I", 1, *words, *values))
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+    case.write_bytes(struct.pack("<337I", 1, *refs[0], *second))
+    stale = subprocess.run(cmd, capture_output=True, text=True)
+    if (stale.returncode != 1 or "word=4 expected=80000000 actual=7fc00000" not in stale.stderr
+            or "groups=1 compared_words=320 mismatches=8" not in stale.stdout.splitlines()):
+        raise AssertionError(f"Expected a stale runtime constant mismatch\n{stale.stdout}\n{stale.stderr}")
+    case.write_bytes(struct.pack("<337I", 1, *refs[1], *second)[:-4])
+    truncated = subprocess.run(cmd, capture_output=True, text=True)
+    if truncated.returncode != 1 or "Invalid compute store constants" not in truncated.stderr:
+        raise AssertionError(f"Expected a truncated constants error\n{truncated.stdout}\n{truncated.stderr}")
+    return 0
+
+
+def grid_mutations(source, name):
+    """Translations that a dispatch-dimension mistake would produce; each must fail on the GPU."""
+    a, b = {"slab": ("tid.z", "tid.x")}.get(name, ("tid.x", "tid.y"))
+    if name != "wide":
+        yield "swapped axes", source.replace(a, "tid.T").replace(b, a).replace("tid.T", b)
+    if name in ("slab", "cube", "llvm_cube"):
+        yield "Z ignored", source.replace("tid.z", "tid.y")
+    if name == "llvm_cube":
+        for a, b in (("tid.x", "tid.z"), ("tid.y", "tid.z")):
+            yield f"swapped {a[-1].upper()}/{b[-1].upper()}", (
+                source.replace(a, "tid.T").replace(b, a).replace("tid.T", b))
+    if name == "pitch":
+        yield "power-of-two pitch", source.replace(" * 72u", " * 64u")
+    dims = dict((case[0], case[2]) for case in CASES)[name]
+    shrunk = (dims[0] // 2, *dims[1:])
+    yield "halved group X", source.replace("[numthreads({},{},{})]".format(*dims),
+                                           "[numthreads({},{},{})]".format(*shrunk))
+
+
+def draw_grid(directory, compiler, cmd, case, name):
+    dispatches = GRID_DISPATCHES[name]
+    for groups in dispatches:
+        words = grid_words(name, groups)
+        packed = groups[0] | groups[1] << 8 | groups[2] << 16
+        case.write_bytes(struct.pack("<321I", packed, *words))
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+    guard = words.index(SENTINEL)
+    words[guard] ^= 1
+    case.write_bytes(struct.pack("<321I", packed, *words))
+    bad = subprocess.run(cmd, capture_output=True, text=True)
+    if bad.returncode != 1 or f"word={guard} expected=" not in bad.stderr:
+        raise AssertionError(f"{name}: a wrong untouched word escaped detection")
+    words[guard] ^= 1
+    if len(dispatches) > 1:
+        first = dispatches[0]
+        case.write_bytes(struct.pack("<321I", first[0] | first[1] << 8 | first[2] << 16, *words))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: a wrong group count escaped detection")
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, mutated in grid_mutations(source, name):
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        groups = MUTATION_DISPATCH.get((name, label), dispatches[-1])
+        assert groups in dispatches, (name, label)
+        case.write_bytes(struct.pack("<321I", groups[0] | groups[1] << 8 | groups[2] << 16,
+                                     *grid_words(name, groups)))
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection with groups={groups}")
+    return 0
+
+
+def guard_words(name, groups, bound):
+    """Independent expected readback: lanes at or past the bound leave guarded words untouched."""
+    words = [SENTINEL] * 320
+    for gid in range(32 * groups):
+        if name == "guard_end" and gid < bound:
+            words[gid] = gid
+        elif name == "guard_join":
+            if gid < bound:
+                words[2 * gid] = gid
+            words[2 * gid + 1] = 0x600d
+    return words
+
+
+# (groups, bound): no lane, one group split, exactly one group; one lane, the third group split,
+# exactly the dispatch, past the dispatch. Mutations run on the largest dispatch with a split group.
+GUARD_RUNS = ((1, 0), (1, 17), (1, 32), (3, 1), (3, 70), (3, 96), (3, 200))
+GUARD_MUTATION_RUN = (3, 70)
+
+
+def guard_mutations(source, name):
+    """Translations that a guard mistake would produce; each must fail on the GPU."""
+    lines = source.splitlines()
+    at = lines.index(GUARD_IF)
+    close = lines.index("    }", at)
+    yield "guard inverted", source.replace(GUARD_IF, "    if (!(params[0].x > tid.x)) {")
+    yield "bound off by one", source.replace(GUARD_IF, "    if (params[0].x >= tid.x) {")
+    yield "guard ignored", "\n".join(lines[:at] + [line[4:] for line in lines[at + 1:close]] + lines[close + 1:]) + "\n"
+    if name == "guard_join":
+        # The exec restore ignored: the store after it stays under the guard.
+        moved = lines[:close] + ["    " + lines[close + 1], "    }"] + lines[close + 2:]
+        yield "restore ignored", "\n".join(moved) + "\n"
+
+
+def draw_guard(directory, compiler, cmd, case, name):
+    # params[0].x is the bound; the other words differ so that reading another word fails.
+    constants = [0x5eed0000 + i for i in range(16)]
+
+    def write(groups, bound, words=None):
+        case.write_bytes(struct.pack("<337I", groups, *(words or guard_words(name, groups, bound)), bound,
+                                     *constants[1:]))
+
+    for groups, bound in GUARD_RUNS:
+        write(groups, bound)
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+    groups, bound = GUARD_MUTATION_RUN
+    # Reference controls: the words of the first lane past the bound, and of the last lane under it.
+    for gid, wrong in ((bound, bound + 1), (bound - 1, bound - 1)):
+        reference = guard_words(name, groups, wrong)
+        write(groups, bound, reference)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        word = gid * (1 if name == "guard_end" else 2)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: a reference with bound {wrong} escaped detection\n{bad.stderr}")
+    write(groups, bound)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, mutated in guard_mutations(source, name):
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection with groups={groups} bound={bound}")
+    return 0
+
+
+def source_word(i):
+    """t0 as the harness fills it: 320 known words, then 320 sentinel words."""
+    return (0x8b02a7f1 + i * 0x413b1) & 0xffffffff if i < 320 else SENTINEL
+
+
+def read_words(name, groups, bound):
+    """Independent expected readback: each lane under the bound copies its source word."""
+    words = [SENTINEL] * 320
+    for gid in range(min(32 * groups, bound)):
+        words[gid] = source_word(gid if name == "read_copy" else 2 * gid + 1)
+    return words
+
+
+# (groups, bound): no lane passes, a split wave, and the largest dispatch the harness allows with its
+# fifth group split. Every lane reads one of the 320 known source words. Mutations run on the last.
+READ_RUNS = ((1, 0), (1, 17), (5, 150))
+
+
+def read_mutations(source, name):
+    """Translations that a read mistake would produce; each must fail on the GPU."""
+    load = READ_LOADS[name]
+    yield "index ignored", source.replace(load, "inputData.Load(4u)")
+    yield "next source word", source.replace(load, load.replace(" + ", " + 4u + "))
+    yield "read from the store target", source.replace(load, load.replace("inputData", "outputData"))
+
+
+def draw_read(directory, compiler, cmd, case, name):
+    constants = [0x5eed0000 + i for i in range(16)]
+
+    def write(groups, bound, words=None):
+        case.write_bytes(struct.pack("<337I", groups, *(words or read_words(name, groups, bound)), bound,
+                                     *constants[1:]))
+
+    for groups, bound in READ_RUNS:
+        write(groups, bound)
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+    groups, bound = READ_RUNS[-1]
+    # Reference controls: one source word off, and the first lane past the bound copying too.
+    off = read_words(name, groups, bound)
+    off[bound - 1] ^= 1
+    for word, reference in ((bound - 1, off), (bound, read_words(name, groups, bound + 1))):
+        write(groups, bound, reference)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: a wrong reference word {word} escaped detection\n{bad.stderr}")
+    write(groups, bound)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, mutated in read_mutations(source, name):
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection with groups={groups} bound={bound}")
+    return 0
+
+
+# cap = params[0].y clamps about half of the lanes of the largest dispatch; the other constant words
+# differ from it, so a translation that reads another word fails.
+ALU_CAP = 0x45000000
+
+
+def alu_word(gid, *, low=0xffff, shift=16, pick=min):
+    """Independent CPU reference of the read_compute result for one lane."""
+    word = source_word(gid)
+    return pick(((word & low) * (word >> shift) + gid) & 0xffffffff, ALU_CAP)
+
+
+def alu_words(groups, bound, **reference):
+    words = [SENTINEL] * 320
+    for gid in range(min(32 * groups, bound)):
+        words[gid] = alu_word(gid, **reference)
+    return words
+
+
+def alu_mutations(source):
+    """Translations that a wrong opcode or operand would produce; each must fail on the GPU."""
+    yield "max for min", source.replace("min(params", "max(params")
+    yield "shift by 15", source.replace(">> (0x00000010u", ">> (0x0000000fu")
+    yield "24-bit mask for 16-bit", source.replace("(0x0000ffffu &", "(0x00ffffffu &")
+    yield "addend dropped", source.replace(" + tid.x))", "))")
+    yield "cap from another word", source.replace("min(params[0].y", "min(params[0].z")
+
+
+def draw_alu(directory, compiler, cmd, case, name):
+    constants = [0x5eed0000 + i for i in range(16)]
+    constants[1] = ALU_CAP
+
+    def write(groups, bound, words=None):
+        case.write_bytes(struct.pack("<337I", groups, *(words or alu_words(groups, bound)), bound,
+                                     *constants[1:]))
+
+    for groups, bound in READ_RUNS:
+        write(groups, bound)
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+    groups, bound = READ_RUNS[-1]
+    expected = alu_words(groups, bound)
+    assert 0 < sum(word == ALU_CAP for word in expected) < bound, "the cap must clamp some lanes, not all"
+    # Reference controls: a CPU reference that disagrees with the program in one word, in the
+    # operation, the shift or the mask, or in the bound.
+    off = list(expected)
+    off[bound - 1] ^= 1
+    for label, reference in (("one word off", off), ("max for min", alu_words(groups, bound, pick=max)),
+                             ("shift by 15", alu_words(groups, bound, shift=15)),
+                             ("24-bit mask", alu_words(groups, bound, low=0xffffff)),
+                             ("lane past the bound", alu_words(groups, bound + 1))):
+        word = next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b)
+        write(groups, bound, reference)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: reference '{label}' escaped detection\n{bad.stderr}")
+    write(groups, bound)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, mutated in alu_mutations(source):
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection with groups={groups} bound={bound}")
+    return 0
+
+
+VOP2_CAP = 0xe0000000  # large enough that the product plus the cap wraps for many lanes
+
+
+def vop2_word(gid, *, pick="max", skip=()):
+    """Independent CPU reference of the read_vop2 result for one lane: the product p is added to the cap (wrapping),
+    OR-ed and XOR-ed with high-bit constants, and the unsigned maximum of p and that chain is stored."""
+    word = source_word(gid)
+    product = ((word & 0xffff) * (word >> 16) + gid) & 0xffffffff
+    chain = product if "add" in skip else (product + VOP2_CAP) & 0xffffffff
+    chain = chain if "or" in skip else chain | 0x80000010
+    chain = chain if "xor" in skip else chain ^ 0x80000001
+    if pick == "signed":
+        return max(product, chain, key=lambda v: v - (1 << 32) if v >> 31 else v)
+    return min(product, chain) if pick == "min" else max(product, chain)
+
+
+def vop2_words(groups, bound, **reference):
+    words = [SENTINEL] * 320
+    for gid in range(min(32 * groups, bound)):
+        words[gid] = vop2_word(gid, **reference)
+    return words
+
+
+def draw_vop2(directory, compiler, cmd, case, name):
+    """Chained add, or, xor and unsigned max against vop2_word, from the 320-word case format."""
+    constants = [0x5eed0000 + i for i in range(16)]
+    constants[1] = VOP2_CAP
+    groups, bound = READ_RUNS[-1]
+
+    def write(words):
+        case.write_bytes(struct.pack("<337I", groups, *words, bound, *constants[1:]))
+
+    expected = vop2_words(groups, bound)
+    products = [((source_word(g) & 0xffff) * (source_word(g) >> 16) + g) & 0xffffffff for g in range(bound)]
+    # Inputs must show an add that wraps, the max choosing each operand, and a signed max that would differ.
+    assert any(p + VOP2_CAP >= 1 << 32 for p in products), "no lane wraps the add"
+    assert any(e == p for e, p in zip(expected, products)), "no lane takes the product"
+    assert any(e != p for e, p in zip(expected, products)), "no lane takes the chain"
+    assert expected != vop2_words(groups, bound, pick="signed"), "a signed max would go unseen"
+    write(expected)
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    # Each wrong reference must fail the run at the first word where it differs from the right one.
+    for label, reference in (("signed max", vop2_words(groups, bound, pick="signed")),
+                             ("min for max", vop2_words(groups, bound, pick="min")),
+                             ("add dropped", vop2_words(groups, bound, skip=("add",))),
+                             ("or dropped", vop2_words(groups, bound, skip=("or",))),
+                             ("xor dropped", vop2_words(groups, bound, skip=("xor",)))):
+        word = next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b)
+        write(reference)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: reference '{label}' escaped detection\n{bad.stderr}")
+    write(expected)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, old, new in (("min for max", "max(((((", "min((((("), ("xor dropped", "0x80000001u ^", "0x00000000u ^"),
+                            ("or dropped", "0x80000010u |", "0x00000000u |"),
+                            ("add dropped", "(params[0].y + (", "(0u + (")):
+        mutated = source.replace(old, new)
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection")
+    return 0
+
+
+def draw_mad24(directory, compiler, cmd, case):
+    # Dispatch one group, enable only lane zero and leave all 319 other words
+    # at their sentinel. With cap = UINT_MAX the entire multiply is observable.
+    word = source_word(0)
+    low = word % (1 << 24)
+    assert word & (3 << 24) == 3 << 24 and low & 1
+    expected = (low * low) % (1 << 32)
+    values = [expected] + [SENTINEL] * 319
+    case.write_bytes(struct.pack("<337I", 1, *values, 1, 0xffffffff, *([0] * 14)))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    src, cso = directory / "mad24-mutant.hlsl", directory / "mad24-mutant.cso"
+    for removed_bit in (24, 25):
+        # Remove the lowerer's u24 truncation from exactly one source.
+        prepared = f"(0x{((1 << removed_bit) | 0xffffff):08x}u & {READ_LOADS['read_copy']})"
+        truncated = f"({prepared} & 0xffffffu)"
+        assert source.count(truncated) == 1
+        src.write_text(source.replace(truncated, prepared), encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        actual = (low * (low + (1 << removed_bit))) % (1 << 32)
+        mismatch = f"word=0 expected={expected:08x} actual={actual:08x}"
+        if bad.returncode != 1 or mismatch not in bad.stderr:
+            raise AssertionError(f"MAD24 bit {removed_bit} mutation escaped detection\n{bad.stderr}")
+        print(mismatch)
+    return 0
+
+
+def draw_mul_lo(cmd, case):
+    factor = 0x01000003
+    modulus = 1 << 32
+
+    def write(groups, bound, words):
+        case.write_bytes(struct.pack("<337I", groups, *words, bound, factor, *([0] * 14)))
+
+    for groups, bound in READ_RUNS:
+        words = [SENTINEL] * 320
+        for gid in range(bound):
+            words[gid] = (source_word(gid) * factor) % modulus
+        write(groups, bound, words)
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+
+    assert source_word(0) * factor >= modulus
+    controls = ((0, (source_word(0) * (factor & 0xffffff)) % modulus),
+                (0, ((source_word(0) & 0xffffff) * factor) % modulus),
+                (bound, (source_word(bound) * factor) % modulus))
+    for gid, wrong in controls:
+        assert wrong != words[gid]
+        stale = words.copy()
+        stale[gid] = wrong
+        write(groups, bound, stale)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        mismatch = f"word={gid} expected={wrong:08x} actual={words[gid]:08x}"
+        if bad.returncode != 1 or mismatch not in bad.stderr:
+            raise AssertionError(f"read_mul_lo: expected {mismatch}\n{bad.stderr}")
+        print(mismatch)
+    return 0
+
+
+def draw(directory, compiler, renderer, backend, cases=None):
+    for name, lines, width, binding in (CASES if cases is None else cases):
+        src, cso, case = [directory / x for x in ("store.hlsl", "store.cso", "store.case")]
+        src.write_text(aot.lower(lines, width, **binding), encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        cmd = [renderer, backend, "--compute-store-case", cso, case]
+        if name == "read_mul_lo":
+            result = draw_mul_lo(cmd, case)
+            if result:
+                return result
+            continue
+        if name == "read_mad24":
+            result = draw_mad24(directory, compiler, cmd, case)
+            if result:
+                return result
+            continue
+        if name.startswith(("guard_", "read_")):
+            result = (draw_guard if name.startswith("guard_") else draw_alu if name == "read_compute"
+                      else draw_vop2 if name == "read_vop2" else draw_read)(directory, compiler, cmd, case, name)
+            if result:
+                return result
+            continue
+        if name == "runtime" or name in GRID_DISPATCHES:
+            result = draw_runtime(cmd, case) if name == "runtime" else draw_grid(directory, compiler, cmd, case, name)
+            if result:
+                return result
+            continue
+        for groups in ((1, 3) if width == 32 else (1,)):
+            words = [SENTINEL] * 320
+            if name == "fixed":
+                words[5:8] = [11, 23, 0xfffffffe]
+                guard_word, stored_word = 0, 5
+            elif name == "indexed":
+                for i in range(groups * 32):
+                    words[3*i+1:3*i+3] = [19, 0xfffffffb]
+                guard_word, stored_word = 0, 1
+            elif name == "multi_fixed":
+                words[2:4] = [0x12345678, 0xfffffffc]
+                words[8:10] = [0x12345678, 7]
+                guard_word, stored_word = 4, 9
+            else:
+                for i in range(groups * 32):
+                    words[3*i] = 0x00abcdef
+                    words[3*i+2] = 0xfffffff0
+                guard_word, stored_word = 1, 2
+            case.write_bytes(struct.pack("<321I", groups, *words))
+            result = subprocess.run(cmd)
+            if result.returncode:
+                return result.returncode
+        words[guard_word] ^= 1
+        case.write_bytes(struct.pack("<321I", groups, *words))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={guard_word} expected=" not in bad.stderr:
+            raise AssertionError("A wrong untouched word escaped detection")
+        words[guard_word] ^= 1
+        words[stored_word] ^= 1
+        case.write_bytes(struct.pack("<321I", groups, *words))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError("A wrong stored word escaped detection")
+    return 0
+
+
+if __name__ == "__main__":
+    controls()
+    mode, *args = sys.argv[1:]
+    with tempfile.TemporaryDirectory() as tmp:
+        # The store cases and the guard/read cases run as separate CTest entries so each stays within its timeout.
+        modes = {"binary": binary, "draw": draw,
+                 "draw-ds-route": ds_draw,
+                 "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),
+                 "draw-lds-strided": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_STRIDED_CASES),
+                 "draw-lds-wide-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_WIDE_REPLACEMENT_CASES),
+                 "draw-lds-f32": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_FLOAT_CASES),
+                 "draw-lds-private": lambda d, *a: ds_draw(d, *a, private=True),
+                 "draw-lds-packed": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_PACKED_CASES),
+                 "draw-lds-arithmetic": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_ARITHMETIC_CASES),
+                 "draw-lds-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_REPLACEMENT_CASES),
+                 "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES)}
+        sys.exit(modes[mode](Path(tmp), *args))

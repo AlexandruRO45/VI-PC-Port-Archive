@@ -1,0 +1,3 @@
+LIBRARY amd_fidelityfx_loader_xbox.dll
+EXPORTS
+    ffxQuery
