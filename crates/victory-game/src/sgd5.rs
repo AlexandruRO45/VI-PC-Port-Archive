@@ -3998,4 +3998,102 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn stated_size_of_zero_is_a_stream_only_if_nothing_is_made() {
+        // A record may state an empty container. Its packed bytes are then a
+        // stream only if they make nothing: an empty fixed-code block, an
+        // empty stored one, or empty blocks one after another. Bytes that
+        // make even one byte are noise, as no byte may be made at all; the
+        // same bytes stating one byte are a stream. Alone, such a record
+        // covers no other, so it is yielded either way, unpacking only if it
+        // is a stream, and the record after it is found.
+        let empty: [(&str, &[u8]); 3] = [
+            ("empty fixed block", &[0x03, 0x00]),
+            ("empty stored block", &[0x01, 0, 0, 0xFF, 0xFF]),
+            (
+                "empty stored then empty fixed",
+                &[0x00, 0, 0, 0xFF, 0xFF, 0x03, 0x00],
+            ),
+        ];
+        for (what, packed) in empty {
+            assert_eq!(
+                miniz_oxide::inflate::decompress_to_vec(packed).ok(),
+                Some(Vec::new()),
+                "{what}"
+            );
+            assert!(starts_stream(packed, 0), "{what}");
+            assert!(!starts_stream(packed, 1), "{what}");
+
+            let (file, marker) = outer_then_after(packed, 0);
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            assert_eq!(found[0].unpack(), Some(Vec::new()), "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+        }
+        for level in [0, 1, 6, 10] {
+            let what = format!("one byte at level {level}");
+            let packed = miniz_oxide::deflate::compress_to_vec(b"A", level);
+            assert!(!starts_stream(&packed, 0), "{what}");
+            assert!(starts_stream(&packed, 1), "{what}");
+
+            let (file, marker) = outer_then_after(&packed, 0);
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            assert_eq!(found[0].unpack(), None, "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+        }
+    }
+
+    #[test]
+    fn marker_stating_zero_over_a_stream_making_bytes_does_not_hide_the_record() {
+        // Bytes that read as a marker stating an empty container, whose
+        // packed bytes make one byte and then run on over a real record:
+        // they are no stream of that size, so the record they cover is
+        // found. Stating one byte instead, the same bytes are a stream (the
+        // bytes after its final block are never read) and the record they
+        // cover is theirs.
+        let after = record_bytes("PS_after", 0x32, b"after");
+        for level in [0, 1, 6] {
+            let stream = miniz_oxide::deflate::compress_to_vec(b"A", level);
+            let mut packed = stream.clone();
+            packed.extend(&after);
+            packed.extend_from_slice(&[0x5A; 8]);
+            for stated in [0, 1] {
+                let what = format!("level {level}, stating {stated}");
+                let n = (12 + packed.len()) as u32;
+                let mut file = MAGIC.to_vec();
+                file.extend_from_slice(b"\x09PS_outer\0\x32");
+                let marker = file.len() + 4;
+                for v in [n, 0x000D_DCE7, n, stated] {
+                    file.extend_from_slice(&v.to_le_bytes());
+                }
+                let inner = file.len() + stream.len() + 19;
+                file.extend_from_slice(&packed);
+                let found: Vec<_> = records(&file).collect();
+                let names: Vec<_> = found.iter().map(|r| r.name).collect();
+                if stated == 0 {
+                    assert_eq!(names, [Some("PS_after")], "{what}");
+                    assert_eq!(found[0].offset, inner, "{what}");
+                    assert_eq!(found[0].unpack().as_deref(), Some(&b"after"[..]));
+                } else {
+                    assert_eq!(names, [Some("PS_outer")], "{what}");
+                    assert_eq!(found[0].span(), marker..file.len(), "{what}");
+                    assert_eq!(found[0].unpack().as_deref(), Some(&b"A"[..]), "{what}");
+                }
+            }
+        }
+    }
 }
