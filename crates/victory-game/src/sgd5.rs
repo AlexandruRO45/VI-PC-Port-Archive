@@ -3621,4 +3621,66 @@ mod tests {
             assert_eq!(found[1].span().end, file.len(), "{what}");
         }
     }
+
+    #[test]
+    fn codes_of_fifteen_bits_are_a_stream_only_when_the_code_is_complete() {
+        // Code lengths go up to 15 bits. A code as deep as deflate allows,
+        // one symbol at each length from 1 to 14 and two at 15, is complete,
+        // and data sent with every one of its codes (the 15-bit ones
+        // crossing byte boundaries) is a stream. Moving one symbol a bit
+        // deeper leaves a 15-bit code unassigned, and a bit shallower
+        // oversubscribes the code: both break the stream, though every
+        // symbol the data sends has a code. Such a broken record covers no
+        // other, so it is yielded and does not unpack, and the record after
+        // it is found either way.
+        let a = u32::from(b'A');
+        let n = u32::from(b'n');
+        // Code-length code: symbols 0 to 12 in 4 bits, 13 to 18 in 5
+        // (complete: 13/16 + 6/32).
+        let mut clen = [0; 19];
+        for (sym, len) in clen.iter_mut().enumerate() {
+            *len = if sym <= 12 { 4 } else { 5 };
+        }
+        // `a` to `n` in 1 to 14 bits, `A` and the end of the block in 15.
+        let block = |nudge: &[(u32, u32)]| {
+            let mut lengths = vec![0; 258];
+            for (i, sym) in (u32::from(b'a')..=n).enumerate() {
+                lengths[sym as usize] = i as u32 + 1;
+            }
+            (lengths[a as usize], lengths[256]) = (15, 15);
+            for &(sym, len) in nudge {
+                lengths[sym as usize] = len;
+            }
+            let mut data: Vec<u32> = (u32::from(b'a')..=n).collect();
+            data.extend([a, 256]);
+            dynamic_block(&clen, &length_symbols(&lengths), &lengths[..257], &data)
+        };
+        let want = b"abcdefghijklmnA".to_vec();
+        for (what, nudge, valid) in [
+            ("complete, 15 bits deep", &[][..], true),
+            ("`n` in 15 bits: one code unassigned", &[(n, 15)][..], false),
+            ("`A` in 14 bits: oversubscribed", &[(a, 14)][..], false),
+        ] {
+            let packed = block(nudge);
+            assert_eq!(
+                miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                valid.then(|| want.clone()),
+                "{what}"
+            );
+            assert_eq!(starts_stream(&packed, want.len()), valid, "{what}");
+
+            let (file, marker) = outer_then_after(&packed, want.len());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            assert_eq!(found[0].unpack(), valid.then(|| want.clone()), "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "{what}");
+        }
+    }
 }
