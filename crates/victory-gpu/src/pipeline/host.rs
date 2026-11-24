@@ -477,6 +477,13 @@ impl HostPipeline {
                 ..Default::default()
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            // A refusal that a later attempt at the same module survives is
+            // not a verdict on the module, so the one-at-a-time mode exists to
+            // tell a driver race from a description we build differently each
+            // time (`VICTORY_SERIAL_PIPELINES=1`).
+            static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let serial = std::env::var_os("VICTORY_SERIAL_PIPELINES")
+                .map(|_| ONE.lock().unwrap_or_else(|e| e.into_inner()));
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -484,15 +491,34 @@ impl HostPipeline {
                 // SAFETY: as above.
                 || unsafe { host.device.CreateComputePipelineState(&desc) },
             );
+            drop(serial);
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    // What the description carried, because a null or empty
+                    // `CS` is the refusal this call cannot distinguish from a
+                    // module the driver dislikes.
+                    tracing::warn!(
+                        error = %e,
+                        ?shaders,
+                        cs_bytes = desc.CS.BytecodeLength,
+                        root = desc.pRootSignature.is_some(),
+                        node = desc.NodeMask,
+                        flags = desc.Flags.0,
+                        "host pipeline refused"
+                    );
                     host.log_messages();
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host pipeline");
+            tracing::info!(
+                ?shaders,
+                cs_bytes = desc.CS.BytecodeLength,
+                root = desc.pRootSignature.is_some(),
+                node = desc.NodeMask,
+                flags = desc.Flags.0,
+                "host pipeline"
+            );
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
