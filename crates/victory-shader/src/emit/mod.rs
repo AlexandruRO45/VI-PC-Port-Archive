@@ -840,4 +840,108 @@ mod tests {
         let sfi0 = host.part(super::FourCC::SFI0).unwrap().data;
         assert_ne!(u64::from_le_bytes(sfi0[..8].try_into().unwrap()) & 0x2_0000, 0);
     }
+
+    /// Emits a pixel shader of `words` reading TEXCOORD.x (row 0) with
+    /// perspective-center barycentrics in v0/v1, checked by `dxil.dll`
+    /// where there is one; the host container.
+    fn pixel_reading_texcoord(words: &[u32]) -> super::HostShader {
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 0,
+                    mask: 0b0001,
+                    attr: 0,
+                    flat: false,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, kind, cols, usage| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols,
+            usage,
+            half: false,
+        };
+        let isg1 = super::container::signature(&[el("TEXCOORD", 0, 1, 0)], true);
+        let osg1 = super::container::signature(&[el("SV_Target", 16, 4, 15)], false);
+        let bytes =
+            crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+        out
+    }
+
+    fn declares_barycentrics(out: &super::HostShader) -> bool {
+        let host = super::Container::parse(&out.dxil).unwrap();
+        let isg1 = super::signature(host.part(super::FourCC::ISG1).unwrap().data).unwrap();
+        isg1.iter().any(|e| e.kind == 28)
+    }
+
+    /// An interpolation whose j is no loaded barycentric (here a constant):
+    /// both halves computed as the hardware does, from the vertex values;
+    /// the first half's i is the loaded one, `SV_Barycentrics.y`.
+    #[test]
+    fn an_interpolation_with_other_weights_is_computed_by_hand() {
+        let out = pixel_reading_texcoord(&[
+            0x7E0A_02F2, // v_mov_b32 v5, 1.0
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0005, // v_interp_p2_f32 v2, v5, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000,
+        ]);
+        assert!(declares_barycentrics(&out));
+    }
+
+    /// i and j read as data are `SV_Barycentrics` y and z.
+    #[test]
+    fn barycentrics_read_directly_are_sv_barycentrics() {
+        let out = pixel_reading_texcoord(&[
+            0xF800_180F,
+            0x0100_0100, // exp mrt0, v0, v1, v0, v1 done vm
+            0xBF81_0000,
+        ]);
+        assert!(declares_barycentrics(&out));
+    }
+
+    /// A program that only interpolates as loaded declares none.
+    #[test]
+    fn plain_interpolation_declares_no_barycentrics() {
+        let out = pixel_reading_texcoord(&[
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000,
+        ]);
+        assert!(!declares_barycentrics(&out));
+    }
 }

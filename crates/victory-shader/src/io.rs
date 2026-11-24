@@ -138,6 +138,10 @@ pub enum Interp {
     /// One vertex's value (`v_interp_mov_f32`), as encoded: 0 for P10,
     /// 1 for P20, 2 for P0 (the provoking vertex).
     Vertex { attribute: Attribute, vertex: u8 },
+    /// A half of an interpolation whose i or j is not one loaded (computed,
+    /// or joined from paths that reuse v0-v1), computed as the hardware
+    /// does: the first `P0 + i * P10`, the second `acc + j * P20`.
+    ByHand { attribute: Attribute, second: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,15 +377,27 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                                 return Err(unsupported(at, "an interpolation operand"));
                             };
                             // The first half's result is this one's old dst.
-                            let interp = halves
+                            let pair = halves
                                 .pair(
                                     attr,
                                     inst.read(Reg::V(d)),
                                     inst.read(Reg::V(reg)),
                                     &barycentric,
+                                    true,
                                 )
                                 .map_err(|what| unsupported(at, what))?;
-                            io.interps.push((site, interp.with(attribute)));
+                            if pair.weights == Weights::Any {
+                                for &f in &pair.first {
+                                    let first = Interp::ByHand {
+                                        attribute,
+                                        second: false,
+                                    };
+                                    if !io.interps.contains(&(f, first.clone())) {
+                                        io.interps.push((f, first));
+                                    }
+                                }
+                            }
+                            io.interps.push((site, pair.with(attribute)));
                         }
                         _ => return Err(unsupported(at, "an interpolation form")),
                     }
@@ -395,7 +411,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             _ => None,
                         };
                         let interp = halves
-                            .pair(&v.src[0], read(2), read(1), &barycentric)
+                            .pair(&v.src[0], read(2), read(1), &barycentric, false)
                             .map_err(|what| unsupported(at, what))?;
                         io.interps.push((site, interp.with(attribute)));
                     }
@@ -468,25 +484,39 @@ fn ps_vgprs(addr: u32) -> Vec<(u8, Input)> {
     out
 }
 
+/// The i and j an interpolation's halves read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Weights {
+    /// As loaded, of one kind.
+    Kind(Barycentric),
+    /// Both zero.
+    Zero,
+    /// Anything else: interpolated by hand.
+    Any,
+}
+
 /// An interpolation before its attribute is known.
 struct Pair {
-    /// `None`: i and j are both zero.
-    barycentric: Option<Barycentric>,
+    weights: Weights,
     first: Vec<Site>,
 }
 
 impl Pair {
     fn with(self, attribute: Attribute) -> Interp {
-        match self.barycentric {
-            Some(barycentric) => Interp::Interpolated {
+        match self.weights {
+            Weights::Kind(barycentric) => Interp::Interpolated {
                 attribute,
                 barycentric,
                 first: self.first,
             },
             // P0 + 0 * P10 + 0 * P20: the provoking vertex's value.
-            None => Interp::Vertex {
+            Weights::Zero => Interp::Vertex {
                 attribute,
                 vertex: 2,
+            },
+            Weights::Any => Interp::ByHand {
+                attribute,
+                second: true,
             },
         }
     }
@@ -503,13 +533,15 @@ impl Halves<'_> {
     /// The interpolation whose second half reads the first half's result
     /// `acc`, the barycentric `j`, and attribute `attr`: every first half
     /// must read the same attribute channel and the same kind's i (or, with
-    /// a zero j, a zero i).
+    /// a zero j, a zero i). Other weights are `Weights::Any` where
+    /// `by_hand` (32-bit halves) allows, refused otherwise.
     fn pair(
         &self,
         attr: &Operand,
         acc: Option<Value>,
         j: Option<Value>,
         barycentric: &impl Fn(Option<Value>) -> Option<(Option<Barycentric>, u8)>,
+        mut by_hand: bool,
     ) -> Result<Pair, &'static str> {
         let mut first = Vec::new();
         self.sites(
@@ -517,10 +549,10 @@ impl Halves<'_> {
             &mut Vec::new(),
             &mut first,
         )?;
-        let kind = match barycentric(j) {
-            Some((Some(kind), 1)) => Some(kind),
-            Some((None, _)) => None,
-            _ => return Err("an interpolation with computed barycentrics"),
+        let mut weights = match barycentric(j) {
+            Some((Some(kind), 1)) => Weights::Kind(kind),
+            Some((None, _)) => Weights::Zero,
+            _ => Weights::Any,
         };
         for &(b, i) in &first {
             let inst = &self.p.blocks[b].insts[i];
@@ -539,18 +571,22 @@ impl Halves<'_> {
             if a != *attr {
                 return Err("interpolation halves of different attributes");
             }
-            let paired = match (kind, barycentric(i)) {
-                (Some(kind), i) => i == Some((Some(kind), 0)),
-                (None, i) => matches!(i, Some((None, _))),
+            if inst.name() != "v_interp_p1_f32" {
+                by_hand = false;
+            }
+            let paired = match (weights, barycentric(i)) {
+                (Weights::Kind(kind), i) => i == Some((Some(kind), 0)),
+                (Weights::Zero, i) => matches!(i, Some((None, _))),
+                (Weights::Any, _) => true,
             };
             if !paired {
-                return Err("an interpolation with computed barycentrics");
+                weights = Weights::Any;
             }
         }
-        Ok(Pair {
-            barycentric: kind,
-            first,
-        })
+        if weights == Weights::Any && !by_hand {
+            return Err("an interpolation with computed barycentrics");
+        }
+        Ok(Pair { weights, first })
     }
 
     /// The instructions `v` comes from, through phis (`seen`: phis on the
@@ -694,14 +730,40 @@ mod tests {
         assert_eq!(*barycentric, Barycentric::PerspectiveCenter);
         assert_eq!(first, &[(0, 2)]);
 
-        // A constant is no barycentric, copied or not.
+        // A constant is no barycentric, copied or not: both halves are
+        // computed by hand.
         let k = program(&[
             0x7E0A_02F2, // v_mov_b32 v5, 1.0
             0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
             0xC809_0005, // v_interp_p2_f32 v2, v5, attr0.x
             S_ENDPGM,
         ]);
-        assert!(raise(&k, &pixel(vec![TEXCOORD], 2)).is_err());
+        let io = raise(&k, &pixel(vec![TEXCOORD], 2)).unwrap();
+        let attribute = Attribute {
+            usage: Usage::Generic,
+            row: 1,
+            channel: 0,
+            high: false,
+        };
+        assert_eq!(
+            io.interps,
+            [
+                (
+                    (0, 1),
+                    Interp::ByHand {
+                        attribute,
+                        second: false
+                    }
+                ),
+                (
+                    (0, 2),
+                    Interp::ByHand {
+                        attribute,
+                        second: true
+                    }
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -732,14 +794,21 @@ mod tests {
             )]
         );
 
-        // Only one weight zero is a point on an edge, no vertex.
+        // Only one weight zero is a point on an edge, no vertex: by hand.
         let edge = program(&[
             0x7E0A_0280, // v_mov_b32 v5, 0
             0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
             0xC809_0005, // v_interp_p2_f32 v2, v5, attr0.x
             S_ENDPGM,
         ]);
-        assert!(raise(&edge, &pixel(vec![TEXCOORD], 2)).is_err());
+        let io = raise(&edge, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert!(
+            io.interps
+                .iter()
+                .all(|i| matches!(i.1, Interp::ByHand { .. })),
+            "{:?}",
+            io.interps
+        );
     }
 
     #[test]

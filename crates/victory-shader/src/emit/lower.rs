@@ -14,7 +14,7 @@ use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
+use crate::io::{Attribute, Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
@@ -951,6 +951,9 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
+                Reg::V(_) if matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) => {
+                    continue; // loaded on first use
+                }
                 Reg::V(_) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
@@ -1136,7 +1139,11 @@ impl<'a> Lower<'a> {
             self.vals.insert(v, val);
             return Ok(val);
         }
-        Err("a value defined after its use")
+        match self.barycentric_value(v) {
+            Some(Val::Missing(why)) => Err(why),
+            Some(val) => Ok(val),
+            None => Err("a value defined after its use"),
+        }
     }
 
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
@@ -5483,6 +5490,11 @@ impl<'a> Lower<'a> {
                     None => continue,
                 },
                 Interp::Vertex { attribute, .. } => (attribute, 1),
+                // Flat, whatever else the row needs (bit 15: no mode).
+                Interp::ByHand { attribute, .. } => {
+                    *modes.entry(u32::from(attribute.row)).or_default() |= 1 << 15;
+                    (attribute, 1)
+                }
             };
             let row2 = inputs
                 .iter()
@@ -5592,10 +5604,105 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.cast(entry, Cast::Bitcast, sum, self.s.t.i32))
     }
 
+    /// Value `v` loaded and recorded, if it is a barycentric input (those
+    /// are loaded on first use, so that only programs reading one declare
+    /// `SV_Barycentrics`).
+    fn barycentric_value(&mut self, v: Value) -> Option<Val> {
+        let &(_, Input::Barycentric { kind, index }) =
+            self.x.io.inputs.iter().find(|i| i.0 == v)?
+        else {
+            return None;
+        };
+        let val = self.barycentric_input(kind, index);
+        self.vals.insert(v, val);
+        Some(val)
+    }
+
+    /// A console barycentric input register: i is the weight of P1 and j
+    /// of P2, `SV_Barycentrics` y and z (x weighs P0).
+    fn barycentric_input(&mut self, kind: Barycentric, index: u8) -> Val {
+        let Some(mode) = interp_mode(kind) else {
+            return Val::Missing("pull-model barycentrics");
+        };
+        match self.barycentrics(mode) {
+            Ok(id) => self.load_any_input(id, index + 1),
+            Err(why) => Val::Missing(why),
+        }
+    }
+
+    /// A `v_interp_p1_f32` (`P0 + i * P10`) or `v_interp_p2_f32`
+    /// (`acc + j * P20`) as the hardware computes it, from the attribute's
+    /// vertex values: for weights that are not the loaded i and j.
+    fn by_hand(&mut self, inst: &Inst, attribute: Attribute, second: bool) -> Result<(), Why> {
+        let Fields::Vintrp {
+            dst: Operand::Vector { reg: d, .. },
+            src: Operand::Vector { reg: w, .. },
+            ..
+        } = inst.fields
+        else {
+            return Err("an interpolation operand");
+        };
+        if let StageIo::Ps { inputs, .. } = &self.x.native.io
+            && inputs.iter().any(|i| i.row == attribute.row && i.fp16)
+        {
+            return Err("an interpolation by hand of a 16-bit input");
+        }
+        if attribute.high {
+            return Err("a 16-bit read of a 32-bit input");
+        }
+        // Declares this attribute's row flat, as AttributeAtVertex needs.
+        self.manual_rows();
+        let (id, col) = self
+            .find_input(attribute.row, attribute.channel)
+            .ok_or("an input the signature lacks")?;
+        if self.s.inputs[id].comp != 9 {
+            return Err("an interpolated integer input");
+        }
+        self.s.inputs[id].usage |= 1 << col;
+        let weight = inst.read(Reg::V(w)).ok_or("an interpolation operand")?;
+        let weight = self.i32_of(weight)?;
+        let weight = self.as_float(weight);
+        let entry = self.s.entry;
+        let vertex = |l: &mut Self, k: u8| {
+            let args = [
+                l.s.m.i32(id as u32),
+                l.s.m.i32(0),
+                l.s.m.i8(col),
+                l.s.m.i8(k),
+            ];
+            l.s.op(
+                entry,
+                "attributeAtVertex.f32",
+                Attr::ReadNone,
+                l.s.t.f32,
+                137,
+                &args,
+            )
+        };
+        let p0 = vertex(self, 0);
+        let pk = vertex(self, if second { 2 } else { 1 });
+        let c = self.cur;
+        let delta = self.s.m.bin(c, Bin::Sub, pk, p0);
+        let base = if second {
+            let acc = inst.read(Reg::V(d)).ok_or("an interpolation operand")?;
+            let acc = self.i32_of(acc)?;
+            self.as_float(acc)
+        } else {
+            p0
+        };
+        let r = self.fmad(weight, delta, base);
+        let r = self.as_int(r);
+        self.write(inst, Reg::V(d), r, None);
+        Ok(())
+    }
+
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
             return Err("the first half of an interpolation");
         };
+        if let Interp::ByHand { attribute, second } = *interp {
+            return self.by_hand(inst, attribute, second);
+        }
         let (attribute, mode) = match interp {
             Interp::Interpolated {
                 attribute,
@@ -5611,6 +5718,7 @@ impl<'a> Lower<'a> {
                 vertex: 2,
             } => (attribute, 1),
             Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
+            Interp::ByHand { .. } => unreachable!(),
         };
         let dst = match &inst.fields {
             Fields::Vintrp { dst, .. } => *dst,
@@ -7049,6 +7157,10 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                // Barycentric inputs are loaded on first use; a join may be it.
+                if !self.vals.contains_key(&arg) {
+                    self.barycentric_value(arg);
+                }
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
