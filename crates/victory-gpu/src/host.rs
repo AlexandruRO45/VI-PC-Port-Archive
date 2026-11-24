@@ -87,6 +87,14 @@ pub(crate) struct UnifiedBuffer {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+impl Drop for UnifiedArena {
+    fn drop(&mut self) {
+        // SAFETY: this arena owns the resource and is the only place that
+        // retains its persistent mapping.
+        unsafe { self.resource.Unmap(0, None) };
+    }
+}
+
 impl UnifiedArena {
     fn new(device: &ID3D12Device) -> windows::core::Result<Self> {
         let heap_desc = D3D12_HEAP_DESC {
@@ -389,7 +397,7 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 mod tests {
     use super::*;
 
-    /// Checks CPU writes -> GPU SRV reads and UAV writes -> CPU reads through
+    /// Checks CPU writes -> GPU UAV reads and writes -> CPU reads through
     /// two suballocations of one persistently mapped placed buffer.
     #[test]
     fn placed_custom_heap_shares_memory_between_cpu_and_gpu() {
@@ -405,24 +413,33 @@ mod tests {
         const INPUT: u32 = 0x1234_5678;
         const MASK: u32 = 0xA5A5_5A5A;
 
-        let Some(source) = host.unified_buffer(4) else {
-            eprintln!("CPU-visible custom placed heaps are not supported; skipped");
-            return;
+        // Keep this test independent of the process-wide lazy arena. It must
+        // not depend on being the first caller of Host::unified_buffer.
+        let arena = match UnifiedArena::new(&host.device) {
+            Ok(arena) => arena,
+            Err(error) => {
+                eprintln!("CPU-visible custom placed heaps are not supported; skipped: {error}");
+                return;
+            }
         };
-        let destination = host
-            .unified_buffer(4)
-            .expect("second suballocation failed after the shared heap was created");
-        let world_heap = host
-            .unified_buffer(174 << 20)
+        let source = arena
+            .buffer(4)
+            .expect("first shared-heap suballocation failed");
+        let destination = arena
+            .buffer(4)
+            .expect("second shared-heap suballocation failed");
+        let world_heap = arena
+            .buffer(174 << 20)
             .expect("arena cannot fit the 174 MiB title heap from #407");
 
-        assert_eq!(world_heap.offset, 2 * SLOT);
+        assert_eq!(source.offset, 0);
+        assert_eq!(destination.offset.checked_sub(source.offset), Some(SLOT));
+        assert_eq!(world_heap.offset.checked_sub(destination.offset), Some(SLOT));
         assert_eq!(
             world_heap.gpu.checked_sub(source.gpu),
             Some(world_heap.offset)
         );
         assert_eq!(source.offset % SLOT, 0);
-        assert_eq!(destination.offset.checked_sub(source.offset), Some(SLOT));
         assert_eq!(destination.gpu.checked_sub(source.gpu), Some(SLOT));
         assert_eq!(
             (destination.data as usize).checked_sub(source.data as usize),
@@ -439,9 +456,9 @@ mod tests {
         }
 
         const SHADER: &str = r#"
-#define RS "SRV(t0), UAV(u0)"
-ByteAddressBuffer source : register(t0);
+#define RS "UAV(u0), UAV(u1)"
 RWByteAddressBuffer destination : register(u0);
+RWByteAddressBuffer source : register(u1);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
@@ -507,35 +524,19 @@ void main() {
         .expect("create compute pipeline");
 
         let list = host.new_list().expect("create command list");
-        let activation = D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
-                    pResourceBefore: std::mem::ManuallyDrop::new(None),
-                    // SAFETY: this barrier borrows the live resource; ManuallyDrop
-                    // prevents releasing the borrowed COM interface.
-                    pResourceAfter: std::mem::ManuallyDrop::new(Some(unsafe {
-                        std::mem::transmute_copy(&source.resource)
-                    })),
-                }),
-            },
-        };
         let to_uav = transition(
             &source.resource,
             D3D12_RESOURCE_STATE_COMMON,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         );
-        // SAFETY: this is the first use of the placed resource. Activate its
-        // placed allocation, then explicitly transition COMMON to UAV before
-        // the compute shader accesses the arena.
+        // The arena is one D3D12 resource, so both suballocations use UAV
+        // access while the resource is in UNORDERED_ACCESS state.
         unsafe {
-            list.list.ResourceBarrier(&[activation]);
             list.list.ResourceBarrier(&[to_uav]);
             list.list.SetComputeRootSignature(&root);
             list.list.SetPipelineState(&pso);
-            list.list.SetComputeRootShaderResourceView(0, source.gpu);
-            list.list.SetComputeRootUnorderedAccessView(1, destination.gpu);
+            list.list.SetComputeRootUnorderedAccessView(0, destination.gpu);
+            list.list.SetComputeRootUnorderedAccessView(1, source.gpu);
             list.list.Dispatch(1, 1, 1);
         }
         list.close();
