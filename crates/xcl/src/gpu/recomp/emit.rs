@@ -3634,7 +3634,8 @@ impl Em {
                 let (a, b) = (Self::fsrc(m, 0, &ua), Self::fsrc(m, 1, &ub));
                 match op {
                     // abs / neg on the sign bit, as for f16 and f64: `-x` is a float subtract in
-                    // DXIL, which flushes a denormal and may quiet a signalling NaN (#1281)
+                    // DXIL, which flushes a denormal and may quiet a signalling NaN (#1281); `fclass` takes
+                    // the bits, like `fclass16`
                     "class" => {
                         let mut u = format!("({ua})");
                         if m.abs[0] {
@@ -3643,7 +3644,7 @@ impl Em {
                         if m.neg[0] {
                             u = format!("({u} ^ 0x80000000u)");
                         }
-                        format!("((({ub}) >> fclass(asfloat({u}))) & 1u) != 0u")
+                        format!("((({ub}) >> fclass({u})) & 1u) != 0u")
                     }
                     _ => float_compare(op, &a, &b, "isnan").ok_or("VOPC f32")?,
                 }
@@ -5859,8 +5860,7 @@ uint fclass16(uint h) {
     if (e == 0u) return m == 0u ? (n ? 5u : 6u) : (n ? 4u : 7u);
     return n ? 3u : 8u;
 }
-uint fclass(float f) {
-    uint u = asuint(f); uint e = (u >> 23) & 0xFFu; uint m = u & 0x7FFFFFu; bool n = (u >> 31) != 0u;
+uint fclass(uint u) { uint e = (u >> 23) & 0xFFu; uint m = u & 0x7FFFFFu; bool n = (u >> 31) != 0u;
     if (e == 0xFFu) return m != 0u ? (((m & 0x400000u) != 0u) ? 1u : 0u) : (n ? 2u : 9u);
     if (e == 0u) return m == 0u ? (n ? 5u : 6u) : (n ? 4u : 7u);
     return n ? 3u : 8u;
