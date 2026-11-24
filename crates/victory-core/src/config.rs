@@ -712,8 +712,8 @@ fn lexical(path: &Path) -> PathBuf {
 /// control characters ([`ensure_no_control`]), no surrounding quotes
 /// ([`ensure_unquoted`]), no surrounding whitespace ([`ensure_trimmed`]),
 /// no `file:` URI ([`ensure_not_uri`]), no unexpanded variable
-/// ([`ensure_no_variable`]) and no Windows drive or network path off Windows
-/// ([`ensure_native`]). `what` names the setting for the error.
+/// ([`ensure_no_variable`]) and no Windows drive, network or backslash
+/// path off Windows ([`ensure_native`]). `what` names the setting for the error.
 fn check_setting(what: &str, path: &Path) -> Result<()> {
     ensure_no_control(what, path)?;
     ensure_unquoted(what, path)?;
@@ -937,6 +937,13 @@ fn ensure_no_control(what: &str, path: &Path) -> Result<()> {
 /// backslashes are ordinary characters, so it would be one relative folder
 /// named `\\nas\games\gta`. The error says to mount the share and use the
 /// mount point instead.
+///
+/// So is a path that starts the Windows way with a backslash (`\Games\gta`,
+/// `.\gta`, `..\gta`, `~\Games\gta`), as copied from a Windows guide or a
+/// `.bat` file. Off Windows it would be one relative folder named
+/// `\Games\gta` (and `~\Games` would be read as another user's home); the
+/// error suggests the same path with `/`. A backslash later in a name
+/// (`games\gta`) is left alone, since a Unix folder name may hold one.
 fn ensure_native(what: &str, path: &Path, on_windows: bool) -> Result<()> {
     if on_windows {
         return Ok(());
@@ -955,7 +962,27 @@ fn ensure_native(what: &str, path: &Path, on_windows: bool) -> Result<()> {
             path.display()
         );
     }
+    if is_backslash_relative(path) {
+        let text = path.to_string_lossy();
+        anyhow::bail!(
+            "{what} is {text}, which uses Windows backslashes, but this host is not \
+             Windows; write it with `/`, perhaps {}",
+            text.replace('\\', "/")
+        );
+    }
     Ok(())
+}
+
+/// A path that starts with a Windows separator: a single leading `\`
+/// (`\Games`, root of the current drive), or `.`, `..` or `~` followed by
+/// `\`. A UNC path (`\\nas`) is [`is_unc_path`]'s business.
+fn is_backslash_relative(path: &Path) -> bool {
+    match path.as_os_str().as_encoded_bytes() {
+        [b'\\'] => true,
+        [b'\\', next, ..] => *next != b'\\',
+        [b'.' | b'~', b'\\', ..] | [b'.', b'.', b'\\', ..] => true,
+        _ => false,
+    }
 }
 
 /// Refuses a `VICTORY_TEST_TITLES` entry that is really several titles
@@ -2381,11 +2408,10 @@ mod tests {
             assert!(err.contains("mount"), "{err}");
             assert!(ensure_native("VICTORY_GAME_DIR", Path::new(p), true).is_ok());
         }
-        // A Unix `//host` path, a single backslash, a lone `\\` and a
-        // backslash later in the name are left alone.
+        // A Unix `//host` path, a lone `\\` and a backslash later in the
+        // name are not network paths.
         for p in [
             "//nas/games",
-            "\\games",
             "\\\\",
             "\\\\\\x",
             "\\\\/x",
@@ -2420,6 +2446,67 @@ mod tests {
             .to_string();
             assert!(err.contains(var), "{err}");
             assert!(err.contains("network path"), "{err}");
+        }
+    }
+
+    #[test]
+    fn windows_backslash_paths_are_refused_off_windows() {
+        for (p, suggested) in [
+            ("\\Games\\gta", "/Games/gta"),
+            ("\\", "/"),
+            (".\\gta", "./gta"),
+            ("..\\games\\gta", "../games/gta"),
+            ("~\\Games\\gta", "~/Games/gta"),
+        ] {
+            let err = ensure_native("VICTORY_GAME_DIR", Path::new(p), false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("VICTORY_GAME_DIR"), "{err}");
+            assert!(err.contains("backslashes"), "{err}");
+            assert!(err.ends_with(&format!("perhaps {suggested}")), "{err}");
+            assert!(ensure_native("VICTORY_GAME_DIR", Path::new(p), true).is_ok());
+        }
+        // A backslash later in a name, a Unix path, a dotted name and a
+        // leading `~` or `.` without a backslash are left alone.
+        for p in [
+            "games\\gta",
+            "/games/a\\b",
+            "./gta",
+            "~/gta",
+            "..gta",
+            ".x\\y",
+            "~user",
+            "",
+        ] {
+            assert!(!is_backslash_relative(Path::new(p)), "{p}");
+            assert!(ensure_native("x", Path::new(p), false).is_ok(), "{p}");
+        }
+        if cfg!(windows) {
+            return;
+        }
+        // Through the file and the variables, naming the setting, and ahead
+        // of the `~user` error a `~\` would otherwise get.
+        let parsed: FileConfig = toml::from_str("[paths]\ndata_dir = '~\\saves'\n").unwrap();
+        let err = parsed
+            .anchored_at(Path::new("/configs"), Some(Path::new("/home/me")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[paths].data_dir"), "{err}");
+        assert!(err.contains("backslashes"), "{err}");
+        for var in ["VICTORY_CACHE_DIR", "VICTORY_TEST_TITLES", "VICTORY_CONFIG"] {
+            let env = |k: &str| match k {
+                k if k == var => Some(OsString::from("..\\victory")),
+                "HOME" => Some(abs("home")),
+                _ => None,
+            };
+            let err = if var == "VICTORY_CONFIG" {
+                explicit_config(env, None).unwrap_err()
+            } else {
+                Config::resolve(FilePaths::default(), None, env).unwrap_err()
+            }
+            .to_string();
+            assert!(err.contains(var), "{err}");
+            assert!(err.contains("backslashes"), "{err}");
         }
     }
 
