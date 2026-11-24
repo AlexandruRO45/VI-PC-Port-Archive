@@ -445,6 +445,17 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// The number and total size of loose host copies currently retained.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn cache_stats() -> (usize, u64) {
+    LOOSE.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .fold((0, 0), |(count, bytes), shadow| {
+            (count + 1, bytes.saturating_add(shadow.len))
+        })
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
