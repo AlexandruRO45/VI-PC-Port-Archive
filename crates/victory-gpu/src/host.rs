@@ -366,7 +366,10 @@ fn create() -> windows::core::Result<Host> {
             };
             match got {
                 Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
-                Err(e) => tracing::warn!(error = %e, "no D3D12 debug layer"),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "no D3D12 debug layer (0x887A002D: the layers load DXGIDebug.dll,                      which only the Graphics Tools feature installs; the Agility SDK                      package does not carry it)"
+                ),
             }
             // GPU-based validation (`VICTORY_D3D12_GBV`): out-of-range
             // descriptor heap indices and the like become messages naming
