@@ -140,7 +140,21 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+/// On Linux the "host" is our own implementation of those DLLs
+/// (`crate::linux`); nothing is forwarded to a system library.
+#[cfg(target_os = "linux")]
+mod imp {
+    use victory_pe::ImportSymbol;
+
+    pub(super) fn resolve(dll: &str, symbol: &ImportSymbol) -> Option<usize> {
+        match symbol {
+            ImportSymbol::Name { name, .. } => crate::linux::lookup(dll, name),
+            ImportSymbol::Ordinal(o) => crate::linux::lookup_ordinal(dll, *o),
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 mod imp {
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
         None

@@ -23,6 +23,8 @@
 
 #[cfg(windows)]
 mod crash;
+#[cfg(target_os = "linux")]
+pub mod linux;
 pub mod prepare;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
