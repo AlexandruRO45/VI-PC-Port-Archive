@@ -181,7 +181,7 @@ mod tests {
         );
         // `..` stops at the root instead of escaping it.
         let tail = format!("X:{}\\..\\..\\one.dat", "a".repeat(LONG));
-        assert_eq!(host(&tail), format!(r"\\?\C:\games\title\one.dat"));
+        assert_eq!(host(&tail), r"\\?\C:\games\title\one.dat");
         // Just under the limit stays in the ordinary form.
         let tail = format!("X:{}", "a".repeat(LONG - r"C:\games\title".len() - 1));
         assert!(host(&tail).starts_with(r"C:\games\title"));
