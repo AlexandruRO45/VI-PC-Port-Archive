@@ -69,6 +69,12 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    try_build_valu_cs(body).expect("lower")
+}
+
+/// Builds and lowers a 1-thread synthetic RDNA2 compute shader, returning an
+/// error description if lowering fails.
+fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, String> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -138,7 +144,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
     })
-    .expect("lower");
+    .map_err(|e| format!("{e:?}"))?;
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -157,7 +163,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         assert_eq!(copy[4..20], ours[..], "container hash mismatch");
     }
 
-    shader
+    Ok(shader)
 }
 
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
@@ -1022,6 +1028,18 @@ fn sdwa_16bit_dst_word0_sext_and_byte_placement() {
     run_cases(&byte1_sext, &[[0xC900, 0, 0, 0]], |backend, _, _, got| {
         assert_eq!(got, 0xFFFF_F600, "{backend}: byte1_sext");
     });
+
+    // v_cvt_i16_f16_sdwa v0, v1 dst_sel:DWORD dst_unused:UNUSED_PAD -> zero-extends low 16 bits.
+    let dword_pad = build_valu_cs(&vop1_sdwa(0x53, 0, 1, (6, 0), (4, false)));
+    run_cases(&dword_pad, &[[0xC500, 0, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, 0x0000_FFFB, "{backend}: dword_pad");
+    });
+
+    // Reserved dst_unused=3 with dst_sel:DWORD must be rejected.
+    let Err(err) = try_build_valu_cs(&vop1_sdwa(0x53, 0, 1, (6, 3), (4, false))) else {
+        panic!("dst_sel:DWORD with dst_unused=3 should fail lowering");
+    };
+    assert!(err.contains("SDWA destination"), "unexpected error: {err}");
 }
 
 #[test]

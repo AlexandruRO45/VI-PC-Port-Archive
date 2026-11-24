@@ -4389,7 +4389,7 @@ impl<'a> Lower<'a> {
         if let Some(sd) = v.sdwa {
             let r = match (sd.dst_sel, sd.dst_unused) {
                 (0..=5, 0..=2) => self.place_bits(inst, Reg::V(reg), x, sd.dst_sel, sd.dst_unused),
-                (6, _) => {
+                (6, 0..=2) => {
                     let low = self.s.m.i32(0xFFFF);
                     self.s.m.bin(self.cur, Bin::And, x, low)
                 }
