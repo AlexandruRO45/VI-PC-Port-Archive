@@ -12,6 +12,8 @@
 
 use std::mem::offset_of;
 
+#[cfg(windows)]
+use crate::host::crumbs;
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
 };
@@ -379,6 +381,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                     host.len(),
                 )
             };
+            crumbs::record(crumbs::BARRIER, host.len() as u64, count);
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
         }
@@ -393,6 +396,7 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
+        crumbs::record(crumbs::TRANSITION, resource as u64, state);
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -414,6 +418,101 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     }
     // SAFETY: inside the buffer, checked above.
     Some(unsafe { data.add(offset as usize) })
+}
+
+/// Texture to buffer: the buffer's host copy is the title memory it names,
+/// so the copy lands in that buffer and goes back to title memory once the
+/// list has run.
+#[cfg(windows)]
+fn texture_to_buffer(
+    list: &crate::host::HostList,
+    dst: &CopyLocation,
+    src: &CopyLocation,
+    x: u32,
+    y: u32,
+    z: u32,
+    source_box: *const [u32; 6],
+) {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
+    use windows::core::Interface;
+    const FOOTPRINT: u32 = 1;
+    let miss = || {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // SAFETY: the locations name live resources or nothing.
+            let (w, h, d, pitch) = dst.footprint.shape();
+            tracing::warn!(
+                dst_kind = dst.kind,
+                src_kind = src.kind,
+                footprint = ?(w, h, d, pitch),
+                "texture to buffer copies not implemented"
+            );
+        });
+    };
+    let (Some(bytes), Some((data, size))) = (
+        dst.footprint.bytes(),
+        crate::resource::buffer_bytes(dst.resource),
+    ) else {
+        return miss();
+    };
+    if dst.footprint.offset.checked_add(bytes).is_none_or(|end| end > size) {
+        return miss();
+    }
+    let at = data as u64 + dst.footprint.offset;
+    let Some(shadow) = crate::shadow::find(at, bytes) else {
+        return miss();
+    };
+    let Some(src_copy) = crate::resource::host_copy(src.resource) else {
+        return miss();
+    };
+    let texture = &src_copy.texture;
+    let mut from = *src;
+    if src.kind != FOOTPRINT && src_copy.mip_drop() > 0 {
+        let console_sub = src.footprint.offset as u32;
+        let Some(host_sub) = src_copy.host_subresource(console_sub) else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::debug!("skipping CopyTextureRegion reading dropped top mip"));
+            return;
+        };
+        from.footprint.offset = u64::from(host_sub);
+    }
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src.resource, texture);
+    }
+    ensure_state(list, src.resource, COPY_SOURCE);
+    from.resource = texture.as_raw().cast_const().cast();
+    // The destination buffer reads title memory; what the copy writes there
+    // goes back to it once the list has run.
+    shadow.refresh(list, at, bytes);
+    shadow.gpu_writes(list, at, bytes);
+    // SAFETY: a live buffer.
+    let base = unsafe { shadow.buffer.GetGPUVirtualAddress() };
+    let to = CopyLocation {
+        resource: shadow.buffer.as_raw().cast_const().cast(),
+        kind: FOOTPRINT,
+        footprint: dst.footprint.at(shadow.gpu(at) - base),
+    };
+    let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| {
+        format!(
+            "copy to buffer {:?}+{:#x} {bytes} bytes at {x},{y},{z} from {:?} kind {}",
+            dst.resource, dst.footprint.offset, src.resource, src.kind
+        )
+    });
+    const _: () = assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+    // SAFETY: an open list; both locations in the host's layout, naming live
+    // resources; the box is the title's (same layout).
+    unsafe {
+        list.list.CopyTextureRegion(
+            (&raw const to).cast(),
+            x,
+            y,
+            z,
+            (&raw const from).cast(),
+            host_box,
+        )
+    };
 }
 
 /// Buffer to buffer: both are host memory, copied at submission.
@@ -442,6 +541,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
+        crumbs::record(crumbs::COPY_RESOURCE, dst as u64, 0);
         if let (Some(dst_copy), Some(src_copy)) = (
             crate::resource::host_copy(dst),
             crate::resource::host_copy(src),
@@ -581,20 +681,7 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(dst_copy) = crate::resource::host_copy(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                // SAFETY: the locations name live resources or nothing.
-                let (w, h, d, pitch) = dst.footprint.shape();
-                let src_desc = crate::resource::host_resource(src.resource)
-                    .map(|t| unsafe { t.GetDesc() });
-                tracing::warn!(
-                    dst_kind = dst.kind,
-                    src_kind = src.kind,
-                    footprint = ?(w, h, d, pitch),
-                    src_desc = ?src_desc,
-                    "texture to buffer copies not implemented"
-                );
-            });
+            texture_to_buffer(list, &dst, &src, x, y, z, source_box);
             return;
         };
         let to = &dst_copy.texture;
@@ -657,6 +744,7 @@ extern "system" fn copy_texture_region(
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
+        crumbs::record(crumbs::COPY, dst.resource as u64, x);
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
         to_location.resource = to.as_raw().cast_const().cast();
@@ -749,6 +837,7 @@ extern "system" fn resolve(
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
+        crumbs::record(crumbs::RESOLVE, dst as u64, dst_sub);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
@@ -829,6 +918,7 @@ extern "system" fn clear_rtv(
         });
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(texture, record.desc().as_ref());
+        crumbs::record(crumbs::CLEAR_RTV, record.resource as u64, 0);
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
@@ -877,6 +967,7 @@ extern "system" fn clear_dsv(
         const DEPTH_WRITE: u32 = 0x10;
         ensure_state(list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        crumbs::record(crumbs::CLEAR_DSV, record.resource as u64, 0);
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list
@@ -1367,6 +1458,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        crumbs::record(crumbs::BARRIER, u64::from(count), 0);
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }

@@ -259,6 +259,18 @@ pub(crate) fn bound(
     true
 }
 
+/// The most groups one mesh dispatch runs: the host's per-dimension limit,
+/// which the clamp below holds indirect arguments to (the `65535` in
+/// [`SOURCE`]).
+pub(crate) const MESH_GROUPS: u32 = 65535;
+
+/// `x`, the group count of a mesh dispatch, held to [`MESH_GROUPS`]: a
+/// count past it is an invalid command, and a dispatch of them runs until
+/// the host resets the display driver.
+pub(crate) fn mesh_groups(x: u32) -> u32 {
+    x.min(MESH_GROUPS)
+}
+
 /// After the execution: the buffer back to unordered access, where the
 /// title's passes keep using it.
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
@@ -284,6 +296,20 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    /// A mesh dispatch past the host's group limit is an invalid command,
+    /// whether its count comes from an indirect record (the clamp) or from
+    /// the title's own call.
+    #[test]
+    fn mesh_group_counts_are_bounded() {
+        assert_eq!(super::mesh_groups(0), 0);
+        assert_eq!(super::mesh_groups(1), 1);
+        assert_eq!(super::mesh_groups(65_535), 65_535);
+        assert_eq!(super::mesh_groups(65_536), 65_535);
+        assert_eq!(super::mesh_groups(u32::MAX), 65_535);
+        // The clamp shader holds indirect records to the same bound.
+        assert!(super::SOURCE.contains("min(g.x, 65535u)"));
+    }
+
     #[test]
     fn clamp_preserves_record_offsets_and_shared_budget() {
         let Some(host) = super::host() else {

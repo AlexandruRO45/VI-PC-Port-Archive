@@ -486,6 +486,128 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
+    #[cfg(test)]
+    pub(crate) fn eval_i32(&self, v: V) -> Option<u32> {
+        match v {
+            V::Const(i) => match self.consts.get(i as usize) {
+                Some((_, Const::Int(k))) => Some(*k as u32),
+                _ => None,
+            },
+            V::Inst(i) => match &self.insts.get(i as usize)?.op {
+                Op::Bin(op, a, b) => {
+                    let (a, b) = (self.eval_i32(*a)?, self.eval_i32(*b)?);
+                    Some(match op {
+                        Bin::Add => a.wrapping_add(b),
+                        Bin::Sub => a.wrapping_sub(b),
+                        Bin::Mul => a.wrapping_mul(b),
+                        Bin::And => a & b,
+                        Bin::Or => a | b,
+                        Bin::Xor => a ^ b,
+                        Bin::Shl => a.wrapping_shl(b),
+                        Bin::LShr => a.wrapping_shr(b),
+                        _ => return None,
+                    })
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn calls(&self, needle: &str) -> Vec<Vec<V>> {
+        self.insts
+            .iter()
+            .filter_map(|inst| match &inst.op {
+                Op::Call(f, args) if self.funcs[*f as usize].name.contains(needle) => {
+                    Some(args.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selects(&self) -> Vec<(V, V, V)> {
+        self.insts
+            .iter()
+            .filter_map(|inst| match inst.op {
+                Op::Select(c, t, f) => Some((c, t, f)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cmp_eq(&self, v: V) -> Option<(V, V)> {
+        let V::Inst(i) = v else { return None };
+        match self.insts.get(i as usize)?.op {
+            Op::Cmp(pred::EQ, a, b) => Some((a, b)),
+            _ => None,
+        }
+    }
+
+    /// The comparison `v` is, if it is one: its predicate and operands.
+    #[cfg(test)]
+    pub(crate) fn cmp_of(&self, v: V) -> Option<(u8, V, V)> {
+        let V::Inst(i) = v else { return None };
+        match self.insts.get(i as usize)?.op {
+            Op::Cmp(p, a, b) => Some((p, a, b)),
+            _ => None,
+        }
+    }
+
+    /// The select `v` is, if it is one: its condition, taken and untaken values.
+    #[cfg(test)]
+    pub(crate) fn select_of(&self, v: V) -> Option<(V, V, V)> {
+        let V::Inst(i) = v else { return None };
+        match self.insts.get(i as usize)?.op {
+            Op::Select(c, t, f) => Some((c, t, f)),
+            _ => None,
+        }
+    }
+
+    /// Every comparison the module emits: predicate and operands.
+    #[cfg(test)]
+    pub(crate) fn compares(&self) -> Vec<(u8, V, V)> {
+        self.insts
+            .iter()
+            .filter_map(|inst| match inst.op {
+                Op::Cmp(p, a, b) => Some((p, a, b)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether `v` a call of the function whose name contains `needle`.
+    #[cfg(test)]
+    pub(crate) fn is_call(&self, v: V, needle: &str) -> bool {
+        let V::Inst(i) = v else { return false };
+        matches!(
+            &self.insts.get(i as usize).map(|inst| &inst.op),
+            Some(Op::Call(f, _)) if self.funcs[*f as usize].name.contains(needle)
+        )
+    }
+
+    /// The binary operation `v` is, if it is one.
+    #[cfg(test)]
+    pub(crate) fn bin_of(&self, v: V) -> Option<(Bin, V, V)> {
+        let V::Inst(i) = v else { return None };
+        match self.insts.get(i as usize)?.op {
+            Op::Bin(op, a, b) => Some((op, a, b)),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_lane_index(&self, v: V) -> bool {
+        let V::Inst(i) = v else { return false };
+        matches!(
+            &self.insts.get(i as usize).map(|inst| &inst.op),
+            Some(Op::Call(f, _)) if self.funcs[*f as usize].name.contains("waveGetLaneIndex")
+        )
+    }
+
     /// The module as bitcode.
     /// Which instructions are written: every body instruction, the branch
     /// conditions, and whatever they read, transitively (a phi nothing reads

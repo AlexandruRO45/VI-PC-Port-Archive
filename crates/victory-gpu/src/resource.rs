@@ -328,6 +328,15 @@ impl PlacedFootprint {
     pub(crate) fn shape(&self) -> (u32, u32, u32, u32) {
         (self.width, self.height, self.depth, self.row_pitch)
     }
+
+    /// The same footprint at `offset` of a host buffer, in the host's format.
+    pub(crate) fn at(&self, offset: u64) -> Self {
+        PlacedFootprint {
+            offset,
+            format: pc_format(self.format),
+            ..*self
+        }
+    }
 }
 
 impl PlacedFootprint {
@@ -1220,6 +1229,12 @@ fn hand_out_resource(
         }),
     });
     #[cfg(windows)]
+    crate::host::crumbs::record(
+        crate::host::crumbs::RESOURCE_CREATE,
+        resource.data() as u64,
+        desc.dimension,
+    );
+    #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
@@ -1248,6 +1263,11 @@ impl Drop for Resource {
                 );
             }
         }
+        crate::host::crumbs::record(
+            crate::host::crumbs::RESOURCE_DESTROY,
+            self.data() as u64,
+            self.desc.dimension,
+        );
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
