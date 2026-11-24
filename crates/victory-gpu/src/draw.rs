@@ -193,6 +193,21 @@ enum RootArgument {
 }
 
 /// Validates the resource and the actual GPU address supplied to a setter.
+/// Local build: a table entry whose view the host cannot make reads as a null view instead of
+/// dropping the whole draw (the slot is null already); `VICTORY_STRICT_TABLES=1` drops it.
+fn valid_or_null(index: u32, host: &crate::descriptor::host::HostHeap) -> bool {
+    if strict_tables() {
+        return false;
+    }
+    host.make_null(index);
+    true
+}
+
+fn strict_tables() -> bool {
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRICT.get_or_init(|| std::env::var_os("VICTORY_STRICT_TABLES").is_some())
+}
+
 pub(crate) fn validate_root_buffer(
     kind: RootBuffer,
     gpu: u64,
@@ -628,7 +643,23 @@ impl State {
                 .index(handle)
                 .ok_or("descriptor outside the title heap")?;
             let view = crate::descriptor::view(handle).ok_or("descriptor is unset")?;
-            crate::descriptor::host::validate_binding(&view, binding.properties)?;
+            if let Err(why) = crate::descriptor::host::validate_binding(&view, binding.properties) {
+                // Local build: the console reads a view whose dimension or format differs from the
+                // shader's declaration (2D vs 2D array, typed format classes) and Grand Theft Auto VI
+                // relies on it; dropping those draws left the story's picture black. Only a
+                // wrong class of view (and missing resources) still drops the draw, unless
+                // `VICTORY_STRICT_DESCRIPTORS=1`.
+                let lenient = matches!(
+                    why,
+                    "descriptor shape does not match the shader"
+                        | "typed descriptor format does not match the shader"
+                        | "structured descriptor stride does not match the shader"
+                );
+                static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if !lenient || *STRICT.get_or_init(|| std::env::var_os("VICTORY_STRICT_DESCRIPTORS").is_some()) {
+                    return Err(why);
+                }
+            }
             if let Some(slot) = binding.table {
                 let entries = tables.entry(slot).or_default();
                 if !entries.contains(&(offset, kind)) {
@@ -1250,7 +1281,7 @@ impl State {
             }
             if !fresh {
                 for (_, (index, kind, handle, view)) in required {
-                    if host.mirror(index, handle, true).is_none() {
+                    if host.mirror(index, handle, true).is_none() && strict_tables() {
                         return Err("no valid host descriptor for table entry");
                     }
                     readable(list, kind, &view);
@@ -1309,7 +1340,9 @@ impl State {
                             }
                         };
                         if !valid && required.contains_key(&k) {
-                            return Err("no valid host descriptor for remapped table entry");
+                            if !valid_or_null(index, host) {
+                                return Err("no valid host descriptor for remapped table entry");
+                            }
                         }
                     }
                     Ok(())

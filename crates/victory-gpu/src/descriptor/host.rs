@@ -521,6 +521,20 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        #[cfg(not(feature = "diagnostics"))]
+        fn mirror_miss(_: &'static str) {}
+        #[cfg(feature = "diagnostics")]
+        fn mirror_miss(why: &'static str) {
+            use std::collections::HashMap;
+            static MISSES: std::sync::Mutex<Option<HashMap<&'static str, u64>>> = std::sync::Mutex::new(None);
+            let mut m = MISSES.lock().unwrap_or_else(|e| e.into_inner());
+            let map = m.get_or_insert_with(HashMap::new);
+            let n = map.entry(why).or_insert(0);
+            *n += 1;
+            if n.is_power_of_two() && *n >= 64 {
+                tracing::info!(count = *n, why, "host descriptor missing for a title slot");
+            }
+        }
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -542,6 +556,8 @@ impl HostHeap {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
+            // Local build: why table entries have no host descriptor (diagnostics).
+            mirror_miss(if tag != VIEW_TAG { "slot not written by the title (no view tag)" } else { "stale view (released resource or old generation)" });
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
@@ -561,6 +577,16 @@ impl HostHeap {
                 make(&view, self.cpu(index))
             };
             let valid = kept.is_some();
+            if !valid && !later {
+                mirror_miss(match &view {
+                    View::Constant(..) => "host view not made: constant buffer",
+                    View::Shader(..) => "host view not made: shader resource",
+                    View::Unordered(..) => "host view not made: unordered access",
+                    View::Placed(true, r, _) if r[0] != 1 => "host view not made: placed UAV texture (not mirrored)",
+                    View::Placed(..) => "host view not made: placed resource",
+                    View::Sampler(..) | View::ConsoleSampler(..) => "host view not made: sampler",
+                });
+            }
             made[index as usize] = if valid { key } else { 0 };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
