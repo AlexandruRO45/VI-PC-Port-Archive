@@ -3586,10 +3586,14 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
-            "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" => {
+            "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" | "v_movrelsd_2_b32"
+            | "v_swaprel_b32" => {
                 // M0 indexes the source (movrels), the destination (movreld)
                 // or both, from the encoded register up to the program's
                 // VGPR count (the registers the instruction reads or writes).
+                // movrelsd_2 and swaprel split M0 in two fields instead: the
+                // source's offset is M0[9:0] and the destination's M0[25:16]
+                // (the RDNA2 ISA's opcode description).
                 let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
                 let (
                     Some(&Operand::Vector { reg: sreg, .. }),
@@ -3598,39 +3602,93 @@ impl<'a> Lower<'a> {
                 else {
                     return Err("an M0-relative move");
                 };
-                let indexed_src = name != "v_movreld_b32";
-                let value = if indexed_src {
-                    let mut r = self.s.m.i32(0);
-                    for k in 0..=255u8.saturating_sub(sreg) {
-                        let Some(x) = inst.read(Reg::V(sreg + k)) else {
+                let (src_off, dst_off) = if matches!(name, "v_movrelsd_2_b32" | "v_swaprel_b32") {
+                    let k1023 = self.s.m.i32(0x3FF);
+                    let k16 = self.s.m.i32(16);
+                    let so = self.s.m.bin(c, Bin::And, m0, k1023);
+                    let hi = self.s.m.bin(c, Bin::LShr, m0, k16);
+                    (so, self.s.m.bin(c, Bin::And, hi, k1023))
+                } else {
+                    (m0, m0)
+                };
+                // The value `reg + off` holds: a select chain over the VGPRs
+                // the instruction's read set enumerates.
+                let read_at = |l: &mut Self, reg: u8, off: V| -> Result<V, Why> {
+                    let mut r = l.s.m.i32(0);
+                    for k in 0..=255u8.saturating_sub(reg) {
+                        let Some(x) = inst.read(Reg::V(reg + k)) else {
                             break;
                         };
-                        let x = self.i32_of(x)?;
-                        let kk = self.s.m.i32(u32::from(k));
-                        let is = self.s.m.cmp(c, pred::EQ, m0, kk);
-                        r = self.s.m.select(c, is, x, r);
+                        let x = l.i32_of(x)?;
+                        let kk = l.s.m.i32(u32::from(k));
+                        let is = l.s.m.cmp(c, pred::EQ, off, kk);
+                        r = l.s.m.select(c, is, x, r);
                     }
-                    r
-                } else {
-                    s(self, 0)?
+                    Ok(r)
+                };
+                // The same chain writing `val` to `reg + off` over the write
+                // set. A register may carry two write tokens — a swap names
+                // both operand ranges, and reads resolve to the last one.
+                let write_at = |l: &mut Self, base: u8, off: V, val: V, last: bool| {
+                    for k in 0..=255u8.saturating_sub(base) {
+                        let reg = Reg::V(base + k);
+                        let mut toks = inst
+                            .writes
+                            .iter()
+                            .filter(|(r, _)| *r == reg)
+                            .map(|&(_, v)| v);
+                        let Some(w) = (if last { toks.next_back() } else { toks.next() }) else {
+                            break;
+                        };
+                        // What the register holds going in: the value an
+                        // earlier chain wrote to it, else its old value.
+                        let old = inst.writes.iter().filter(|(r, _)| *r == reg).find_map(
+                            |&(_, t)| match l.vals.get(&t) {
+                                Some(&Val::I32(o)) => Some(o),
+                                _ => None,
+                            },
+                        );
+                        let old = match old {
+                            Some(o) => o,
+                            None => match inst.read(reg) {
+                                Some(o) => l.i32_of(o)?,
+                                None => l.s.m.i32(0),
+                            },
+                        };
+                        let kk = l.s.m.i32(u32::from(k));
+                        let is = l.s.m.cmp(c, pred::EQ, off, kk);
+                        let x = l.s.m.select(c, is, val, old);
+                        let x = match (guard, reg) {
+                            (Some(g), Reg::V(_)) => {
+                                let o = match inst.read(reg).map(|o| l.i32_of(o)) {
+                                    Some(Ok(o)) => o,
+                                    _ => l.s.m.i32(0),
+                                };
+                                l.s.m.select(l.cur, g, x, o)
+                            }
+                            _ => x,
+                        };
+                        l.vals.insert(w, Val::I32(x));
+                    }
+                    Ok(())
                 };
                 if name == "v_movrels_b32" {
-                    return int(self, value);
+                    let x = read_at(self, sreg, src_off)?;
+                    return int(self, x);
                 }
-                for k in 0..=255u8.saturating_sub(dreg) {
-                    let Some(_) = inst.write(Reg::V(dreg + k)) else {
-                        break;
-                    };
-                    let old = match inst.read(Reg::V(dreg + k)) {
-                        Some(o) => self.i32_of(o)?,
-                        None => self.s.m.i32(0),
-                    };
-                    let kk = self.s.m.i32(u32::from(k));
-                    let is = self.s.m.cmp(c, pred::EQ, m0, kk);
-                    let x = self.s.m.select(c, is, value, old);
-                    self.write_placed(inst, Reg::V(dreg + k), x, guard);
+                if name == "v_movreld_b32" {
+                    let x = s(self, 0)?;
+                    return write_at(self, dreg, dst_off, x, false);
                 }
-                Ok(())
+                let a = read_at(self, sreg, src_off)?;
+                if name == "v_swaprel_b32" {
+                    // Both indexed registers read before either writes; the
+                    // swap of two equal indices is a no-op.
+                    let b = read_at(self, dreg, dst_off)?;
+                    write_at(self, dreg, dst_off, a, false)?;
+                    return write_at(self, sreg, src_off, b, true);
+                }
+                write_at(self, dreg, dst_off, a, false)
             }
             "v_swap_b32" => {
                 let (
@@ -6689,6 +6747,37 @@ mod tests {
             S_ENDPGM,
         ];
         lowers_lds(&words).unwrap();
+    }
+
+    /// `v_movrelsd_2_b32` and `v_swaprel_b32` index the VGPR file through
+    /// the two fields of M0 (the source at M0[9:0], the destination at
+    /// M0[25:16]) instead of the whole register. Both were missing their
+    /// writes before the rule.
+    #[test]
+    fn m0_split_relative_moves() {
+        let movrelsd_2 = [
+            0xBEFC_03FF,
+            0x0014_000A, // s_mov_b32 s124, (20 << 16) | 10: M0
+            0x7E16_00AA, // v_mov_b32 v11, 42
+            0x7E0A_9101, // v_movrelsd_2_b32 v5, v1: v[5 + 20] = v[1 + 10]
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0xD834_0000,
+            0x0000_1902, // ds_write_b32 v2, v25
+            S_ENDPGM,
+        ];
+        lowers_lds(&movrelsd_2).unwrap();
+        let swaprel = [
+            0xBEFC_03FF,
+            0x0014_000A, // s_mov_b32 s124, (20 << 16) | 10: M0
+            0x7E16_00AA, // v_mov_b32 v11, 42
+            0x7E28_0087, // v_mov_b32 v20, 7
+            0x7E0A_D101, // v_swaprel_b32 v5, v1: v[5 + 20] <-> v[1 + 10]
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0xD834_0000,
+            0x0000_1902, // ds_write_b32 v2, v25
+            S_ENDPGM,
+        ];
+        lowers_lds(&swaprel).unwrap();
     }
 
     #[test]
