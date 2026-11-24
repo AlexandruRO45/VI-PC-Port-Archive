@@ -531,7 +531,148 @@ mod host {
     }
 }
 
-#[cfg(not(windows))]
+/// On Linux the host's modules are the system DLLs `crate::linux` serves,
+/// as pseudo modules (`linux::system_dlls`).
+#[cfg(target_os = "linux")]
+mod host {
+    use std::ffi::{CStr, c_void};
+
+    use crate::linux::system_dlls;
+
+    const ERROR_MOD_NOT_FOUND: u32 = 126;
+    const ERROR_PROC_NOT_FOUND: u32 = 127;
+
+    fn module(name: &str) -> *mut c_void {
+        system_dlls::handle(name).map_or_else(
+            || {
+                set_last_error(ERROR_MOD_NOT_FOUND);
+                std::ptr::null_mut()
+            },
+            |h| h as *mut c_void,
+        )
+    }
+
+    pub(super) fn get_module_handle_w(name: *const u16) -> *mut c_void {
+        module(&super::wide(name))
+    }
+
+    pub(super) fn get_module_handle_a(name: *const u8) -> *mut c_void {
+        module(&super::narrow(name))
+    }
+
+    pub(super) fn load_library_ex_a(name: *const u8, _: *mut c_void, _: u32) -> *mut c_void {
+        if name.is_null() {
+            return std::ptr::null_mut();
+        }
+        module(&super::narrow(name))
+    }
+
+    pub(super) fn load_library_ex_w(name: *const u16, _: *mut c_void, _: u32) -> *mut c_void {
+        if name.is_null() {
+            return std::ptr::null_mut();
+        }
+        module(&super::wide(name))
+    }
+
+    /// `C:\Windows\System32\<dll>`, as Windows names a system module.
+    fn path(module: *mut c_void) -> Option<String> {
+        system_dlls::name(module as usize).map(|n| format!(r"C:\Windows\System32\{n}"))
+    }
+
+    /// Copies `text` and a NUL as `GetModuleFileName` does: truncated to
+    /// `size` (with `ERROR_INSUFFICIENT_BUFFER`), the length without NUL.
+    fn copy<T: Copy + Default>(text: &[T], out: *mut T, size: u32) -> u32 {
+        if out.is_null() || size == 0 {
+            return 0;
+        }
+        let n = text.len().min(size as usize - 1);
+        // SAFETY: the title's buffer of `size` elements.
+        unsafe {
+            std::ptr::copy_nonoverlapping(text.as_ptr(), out, n);
+            out.add(n).write(T::default());
+        }
+        if n < text.len() {
+            set_last_error(122); // ERROR_INSUFFICIENT_BUFFER
+            return size;
+        }
+        n as u32
+    }
+
+    pub(super) fn get_module_file_name_w(module: *mut c_void, out: *mut u16, size: u32) -> u32 {
+        let Some(path) = path(module) else {
+            set_last_error(ERROR_MOD_NOT_FOUND);
+            return 0;
+        };
+        copy(&path.encode_utf16().collect::<Vec<_>>(), out, size)
+    }
+
+    pub(super) fn get_module_file_name_a(module: *mut c_void, out: *mut u8, size: u32) -> u32 {
+        let Some(path) = path(module) else {
+            set_last_error(ERROR_MOD_NOT_FOUND);
+            return 0;
+        };
+        copy(path.as_bytes(), out, size)
+    }
+
+    pub(super) fn set_last_error(code: u32) {
+        victory_loader::linux::teb::set_last_error(code);
+    }
+
+    pub(super) fn get_proc_address(module: *mut c_void, name: *const u8) -> *mut c_void {
+        let found = if (name as usize) < 0x1_0000 {
+            system_dlls::proc_address(module as usize, None, name as usize as u16)
+        } else {
+            // SAFETY: not an ordinal, so a NUL-terminated name.
+            let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
+            system_dlls::proc_address(module as usize, Some(&name), 0)
+        };
+        found.map_or_else(
+            || {
+                set_last_error(ERROR_PROC_NOT_FOUND);
+                std::ptr::null_mut()
+            },
+            |a| a as *mut c_void,
+        )
+    }
+
+    /// System modules stay loaded.
+    pub(super) fn free_library(module: *mut c_void) -> i32 {
+        i32::from(system_dlls::name(module as usize).is_some())
+    }
+
+    pub(super) fn disable_thread_library_calls(_: *mut c_void) -> i32 {
+        1
+    }
+
+    pub(super) fn exit(code: i32) -> ! {
+        std::process::exit(code)
+    }
+
+    pub(super) fn abort() -> ! {
+        std::process::abort()
+    }
+
+    pub(super) fn terminate_process(_: *mut c_void, code: u32) -> i32 {
+        std::process::exit(code as i32)
+    }
+
+    pub(super) fn set_unhandled_exception_filter(filter: extern "win64" fn(*const c_void) -> i32) {
+        victory_loader::linux::seh::set_top_level_filter(filter as *const () as usize);
+    }
+
+    pub(super) fn report_unhandled(info: *const c_void) {
+        // SAFETY: the dispatcher's exception pointers, passed to the filter.
+        unsafe { victory_loader::linux::seh::report_unhandled(info.cast()) };
+    }
+
+    pub(super) fn note_title_output(_: &str) {}
+
+    pub(super) fn callers() -> String {
+        String::new()
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 mod host {
     use std::ffi::c_void;
 
@@ -585,21 +726,8 @@ mod host {
         std::process::exit(code as i32)
     }
 
-    #[cfg(target_os = "linux")]
-    pub(super) fn set_unhandled_exception_filter(filter: extern "win64" fn(*const c_void) -> i32) {
-        victory_loader::linux::seh::set_top_level_filter(filter as *const () as usize);
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(super) fn report_unhandled(info: *const c_void) {
-        // SAFETY: the dispatcher's exception pointers, passed to the filter.
-        unsafe { victory_loader::linux::seh::report_unhandled(info.cast()) };
-    }
-
-    #[cfg(not(target_os = "linux"))]
     pub(super) fn set_unhandled_exception_filter(_: extern "win64" fn(*const c_void) -> i32) {}
 
-    #[cfg(not(target_os = "linux"))]
     pub(super) fn report_unhandled(_: *const c_void) {}
 
     pub(super) fn note_title_output(_: &str) {}

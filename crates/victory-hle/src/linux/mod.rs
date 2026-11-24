@@ -30,6 +30,7 @@ mod kernel32_threadpool;
 mod kernel32_time;
 mod kernel32_wait;
 mod ntdll_exception;
+pub(crate) mod system_dlls;
 mod ucrt_convert;
 mod ucrt_environment;
 mod ucrt_filesystem;
@@ -87,6 +88,11 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
         .flat_map(|m| m.exports.iter())
         .find(|e| e.name == name)
         .map(|e| e.address)
+}
+
+/// Whether any of our modules serves `dll`.
+pub(crate) fn serves(dll: &str) -> bool {
+    MODULES.iter().any(|m| m.serves(dll))
 }
 
 /// As [`lookup`], for an import by ordinal.
