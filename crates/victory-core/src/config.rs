@@ -89,10 +89,11 @@ impl FileConfig {
     /// (often the repository, which the asset policy refuses). A path that
     /// starts with `~` is under `home` instead, when there is one. A Windows
     /// drive path on another host is refused (see [`ensure_native`]) rather
-    /// than anchored here as a relative path.
+    /// than anchored here as a relative path, and so is a path holding a
+    /// control character (see [`ensure_no_control`]).
     fn anchored_at(self, dir: &Path, home: Option<&Path>) -> Result<FilePaths> {
         let anchor = |key: &str, p: PathBuf| -> Result<PathBuf> {
-            ensure_native(&format!("[paths].{key}"), &p, cfg!(windows))?;
+            check_setting(&format!("[paths].{key}"), &p)?;
             let p = expand_home(p, home);
             Ok(if p.is_relative() { dir.join(p) } else { p })
         };
@@ -118,7 +119,7 @@ impl Config {
     pub fn load() -> Result<Self> {
         let env = |k: &str| std::env::var_os(k);
         let home = home_dir(env);
-        let file = match config_file(explicit_config(env, home.as_deref()))? {
+        let file = match config_file(explicit_config(env, home.as_deref())?)? {
             Some(path) => {
                 let text = std::fs::read_to_string(&path)
                     .with_context(|| format!("reading {}", path.display()))?;
@@ -154,7 +155,7 @@ impl Config {
             Ok(match env(k).filter(|v| !v.is_empty()) {
                 Some(v) => {
                     let p = PathBuf::from(v);
-                    ensure_native(k, &p, cfg!(windows))?;
+                    check_setting(k, &p)?;
                     (Some(expand(p)), Origin::Env(k))
                 }
                 None if from_file.is_some() => (from_file, Origin::File),
@@ -166,7 +167,7 @@ impl Config {
                 Some(v) => {
                     // Checked before splitting: on this host `:` would cut
                     // `D:\a` in two.
-                    ensure_native("VICTORY_TEST_TITLES", Path::new(&v), cfg!(windows))?;
+                    check_setting("VICTORY_TEST_TITLES", Path::new(&v))?;
                     (
                         std::env::split_paths(&v)
                             .filter(|p| !p.as_os_str().is_empty())
@@ -258,14 +259,20 @@ fn parse_file(text: &str) -> Result<FileConfig> {
 /// `VICTORY_CONFIG`, empty counting as unset, with a leading `~` as the
 /// home directory like every other path variable: a quoted
 /// `VICTORY_CONFIG="~/victory.toml"` reaches us unexpanded and would
-/// otherwise be reported as not existing.
+/// otherwise be reported as not existing. Checked like the other path
+/// variables (see [`check_setting`]).
 fn explicit_config(
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
     home: Option<&Path>,
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>> {
     env("VICTORY_CONFIG")
         .filter(|v| !v.is_empty())
-        .map(|v| expand_home(PathBuf::from(v), home))
+        .map(|v| {
+            let p = PathBuf::from(v);
+            check_setting("VICTORY_CONFIG", &p)?;
+            Ok(expand_home(p, home))
+        })
+        .transpose()
 }
 
 /// The config file to read: `explicit` (`VICTORY_CONFIG`), which must be a
@@ -429,6 +436,36 @@ fn lexical(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// The checks every configured path goes through before it is used: no
+/// control characters ([`ensure_no_control`]) and no Windows drive path off
+/// Windows ([`ensure_native`]). `what` names the setting for the error.
+fn check_setting(what: &str, path: &Path) -> Result<()> {
+    ensure_no_control(what, path)?;
+    ensure_native(what, path, cfg!(windows))
+}
+
+/// Refuses a path holding a control character (a carriage return, newline,
+/// tab, ...). No real folder name has one, but a variable read from a
+/// `.env` file with Windows line endings (`set -a; . ./victory.env`, an
+/// env file for a container or a Proton/Wine wrapper) ends in an invisible
+/// `\r`, and a value pasted from a document can carry a tab or newline.
+/// Without this the path is reported later only as "does not exist", which
+/// looks right on screen; the error quotes the value so the character shows.
+fn ensure_no_control(what: &str, path: &Path) -> Result<()> {
+    let text = path.to_string_lossy();
+    let Some(c) = text.chars().find(|c| c.is_control()) else {
+        return Ok(());
+    };
+    let hint = if c == '\r' {
+        " (a Windows line ending: was it read from a file saved with CRLF line endings?)"
+    } else {
+        ""
+    };
+    anyhow::bail!(
+        "{what} is {text:?}, which contains the control character {c:?}{hint}; remove it"
+    );
 }
 
 /// Refuses a Windows drive path (`D:\games`, `D:/games`, `D:`) when the
@@ -770,16 +807,62 @@ mod tests {
         let home = PathBuf::from(abs("home"));
         let with = |v: &'static str| move |k: &str| (k == "VICTORY_CONFIG").then(|| v.into());
         assert_eq!(
-            explicit_config(with("~/victory.toml"), Some(&home)),
+            explicit_config(with("~/victory.toml"), Some(&home)).unwrap(),
             Some(home.join("victory.toml"))
         );
-        assert_eq!(explicit_config(with(""), Some(&home)), None);
-        assert_eq!(explicit_config(|_: &str| None, Some(&home)), None);
+        assert_eq!(explicit_config(with(""), Some(&home)).unwrap(), None);
+        assert_eq!(explicit_config(|_: &str| None, Some(&home)).unwrap(), None);
         // Without a home directory the value is taken as written.
         assert_eq!(
-            explicit_config(with("~/victory.toml"), None),
+            explicit_config(with("~/victory.toml"), None).unwrap(),
             Some(PathBuf::from("~/victory.toml"))
         );
+    }
+
+    #[test]
+    fn control_characters_in_paths_are_refused() {
+        // A CRLF `.env` file leaves a `\r` on the end of every value.
+        let err = ensure_no_control("VICTORY_GAME_DIR", Path::new("/games/gta\r"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VICTORY_GAME_DIR"), "{err}");
+        assert!(err.contains("\"/games/gta\\r\""), "{err}");
+        assert!(err.contains("CRLF"), "{err}");
+        let err = ensure_no_control("[paths].data_dir", Path::new("/a\tb"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'\\t'"), "{err}");
+        assert!(!err.contains("CRLF"), "{err}");
+        for ok in ["/games/gta", "games with spaces", "~/jeux/été", ""] {
+            assert!(ensure_no_control("x", Path::new(ok)).is_ok(), "{ok}");
+        }
+
+        // Every way in: each path variable, VICTORY_CONFIG and the file.
+        for var in [
+            "VICTORY_GAME_DIR",
+            "VICTORY_CACHE_DIR",
+            "VICTORY_DATA_DIR",
+            "VICTORY_TEST_TITLES",
+        ] {
+            let env = |k: &str| match k {
+                k if k == var => Some(OsString::from("/victory/x\r")),
+                "HOME" => Some(abs("home")),
+                _ => None,
+            };
+            let err = Config::resolve(FilePaths::default(), None, env)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(var), "{err}");
+        }
+        let env = |k: &str| (k == "VICTORY_CONFIG").then(|| OsString::from("victory.toml\r"));
+        let err = explicit_config(env, None).unwrap_err().to_string();
+        assert!(err.contains("VICTORY_CONFIG"), "{err}");
+        let parsed: FileConfig = toml::from_str("[paths]\ncache_dir = \"cache\\n\"\n").unwrap();
+        let err = parsed
+            .anchored_at(Path::new("/configs"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[paths].cache_dir"), "{err}");
     }
 
     #[test]
