@@ -216,8 +216,11 @@ struct Streams {
 
 impl Streams {
     /// Whether a marker that lies wholly in `lo..hi` starts such a record
-    /// (its header read from `lo` on).
+    /// (its header read from `lo` on). Bytes past the end of the file hold
+    /// no marker: a `hi` beyond it asks only up to the end, and is not taken
+    /// to have looked at markers it never saw.
     fn any_in(&mut self, file: &[u8], lo: usize, hi: usize) -> bool {
+        let hi = hi.min(file.len());
         if lo < self.from || lo > self.to {
             *self = Self {
                 from: lo,
@@ -229,12 +232,15 @@ impl Streams {
             let window = file.get(self.to..hi).unwrap_or_default();
             match memchr::memmem::find_iter(window, &MARKER)
                 .map(|m| self.to + m)
-                .find(|&at| match record(&file[at - 6..], 6) {
-                    Found::Record(inner) => inner.is_stream(),
-                    // Cut off, its bytes so far a deflate stream.
-                    Found::Truncated => true,
-                    Found::Nothing => false,
-                }) {
+                // A marker too near the start of the file has no header.
+                .find(
+                    |&at| match at.checked_sub(6).map(|h| record(&file[h..], 6)) {
+                        Some(Found::Record(inner)) => inner.is_stream(),
+                        // Cut off, its bytes so far a deflate stream.
+                        Some(Found::Truncated) => true,
+                        Some(Found::Nothing) | None => false,
+                    },
+                ) {
                 Some(at) => (self.to, self.hit) = (at, true),
                 // Markers at offsets up to `hi - 4` have been looked at.
                 None => self.to = self.to.max(hi.saturating_sub(MARKER.len() - 1)),
@@ -4182,5 +4188,52 @@ mod tests {
         );
         assert!(cache.any_in(&file, first + 1, markers[2] + 4));
         assert!(cache.any_in(&file, 6, first + 4), "back before: rescanned");
+    }
+
+    #[test]
+    fn stream_markers_asked_past_the_end_of_the_file_are_not_skipped() {
+        // A question whose `hi` runs past the end of the file must not count
+        // markers it never looked at as noise: one that stops short of a
+        // stream's marker, then one reaching past the end, must still find
+        // it, and so must questions from before what was remembered.
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("PS_a", 0x32, b"first"));
+        let marker = memchr::memmem::find(&file, &MARKER).unwrap();
+        let mut cache = Streams::default();
+        assert!(!cache.any_in(&file, 6, marker + 3), "one byte short");
+        assert!(cache.any_in(&file, 6, file.len() + 7), "past the end");
+
+        let mut cache = Streams::default();
+        // Nothing wholly in `marker + 1..`, however far past the end.
+        assert!(!cache.any_in(&file, marker + 1, file.len() + 1000));
+        assert!(!cache.any_in(&file, marker + 1, usize::MAX));
+        // Back to the marker (before what was remembered): rescanned.
+        assert!(cache.any_in(&file, marker, usize::MAX));
+        assert!(cache.any_in(&file, 0, marker + MARKER.len()));
+
+        // A cut-off record (a deflate stream's start) asked past the end.
+        let cut = record_bytes("PS_cut", 0x32, &[3; 2000]);
+        let mut cut_file = MAGIC.to_vec();
+        cut_file.extend_from_slice(&cut[..cut.len() - 3]);
+        let mut cache = Streams::default();
+        assert!(!cache.any_in(&cut_file, 6, 7));
+        assert!(cache.any_in(&cut_file, 6, cut_file.len() + 64));
+    }
+
+    #[test]
+    fn a_marker_too_near_the_start_for_a_header_is_not_a_stream() {
+        // A marker whose header would start before the file has none: it is
+        // no record, and asking from offset 0 must not underflow.
+        for at in 0..6 {
+            let mut file = vec![0_u8; at];
+            file.extend_from_slice(&MARKER);
+            for v in [16_u32, 16, 4] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            file.extend_from_slice(&[0x03, 0, 0, 0]);
+            let mut cache = Streams::default();
+            assert!(!cache.any_in(&file, 0, file.len()), "marker at {at}");
+            assert!(!cache.any_in(&file, 0, usize::MAX), "marker at {at}");
+        }
     }
 }
