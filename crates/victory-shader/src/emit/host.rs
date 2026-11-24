@@ -17,6 +17,28 @@ pub struct Host {
     pub device: ID3D12Device,
 }
 
+/// Report the native feature on the device that would create the PSO.
+/// A failed feature query is treated as not supported.
+pub fn barycentrics_supported(device: &ID3D12Device) -> bool {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+    // SAFETY: OPTIONS3 writes this structure of exactly the supplied size.
+    let result = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS3,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    };
+    result.is_ok() && options.BarycentricsSupported.as_bool()
+}
+
+fn check_pixel_features(device: &ID3D12Device, ps: &[u8]) -> Result<(), String> {
+    if super::requires_barycentrics(ps) && !barycentrics_supported(device) {
+        return Err("SV_Barycentrics requires D3D12_OPTIONS3.BarycentricsSupported".into());
+    }
+    Ok(())
+}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
@@ -284,6 +306,7 @@ impl Host {
         gs: &[u8],
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
+        check_pixel_features(&self.device, ps)?;
         let inputs = sig(vs, FourCC::ISG1)?;
         let names: Vec<CString> = inputs
             .iter()
@@ -383,6 +406,7 @@ impl Host {
         ms: &[u8],
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
+        check_pixel_features(&self.device, ps)?;
         /// A stream subobject: its type, then its description, pointer-aligned.
         #[repr(C, align(8))]
         struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);

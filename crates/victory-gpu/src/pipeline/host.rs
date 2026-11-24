@@ -299,6 +299,26 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+fn pixel_features_supported(dxil: &[u8], barycentrics: impl FnOnce() -> bool) -> bool {
+    !victory_shader::emit::requires_barycentrics(dxil) || barycentrics()
+}
+
+#[cfg(test)]
+#[test]
+fn native_barycentrics_need_the_device_feature() {
+    use victory_shader::{Container, FourCC, emit::host::stub_ps};
+
+    let mut ps = stub_ps();
+    assert!(pixel_features_supported(&ps.dxil, || panic!(
+        "plain PS queried OPTIONS3"
+    )));
+    let container = Container::parse(&ps.dxil).unwrap();
+    let bit = container.part(FourCC::SFI0).unwrap().offset + 8 + 2;
+    ps.dxil[bit] |= 2;
+    assert!(!pixel_features_supported(&ps.dxil, || false));
+    assert!(pixel_features_supported(&ps.dxil, || true));
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -338,6 +358,16 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        if let Some(ps) = find("pixel")
+            && !pixel_features_supported(&ps.translated()?.host.dxil, || {
+                host.barycentrics_supported()
+            })
+        {
+            return refuse(
+                "SV_Barycentrics requires D3D12_OPTIONS3.BarycentricsSupported",
+                shaders,
+            );
+        }
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
         let atomics64 = stages.iter().any(|(s, _)| {
             let Some(t) = s.translated() else {

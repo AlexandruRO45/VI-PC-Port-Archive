@@ -37,6 +37,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    barycentrics: OnceLock<bool>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -237,6 +238,7 @@ fn create() -> windows::core::Result<Host> {
         }
         Ok(Host {
             device,
+            barycentrics: OnceLock::new(),
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -469,6 +471,12 @@ struct Deferred {
 }
 
 impl Host {
+    pub(crate) fn barycentrics_supported(&self) -> bool {
+        *self
+            .barycentrics
+            .get_or_init(|| victory_shader::emit::host::barycentrics_supported(&self.device))
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
