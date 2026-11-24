@@ -446,6 +446,19 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            let host_dst = crate::resource::host_copy(dst);
+            let host_src = crate::resource::host_copy(src);
+            if let (Some(hd), Some(hs)) = (host_dst.as_ref(), host_src.as_ref()) {
+                if hd.mip_drop != hs.mip_drop {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(
+                            "copy_resource between textures with different mip_drop skipped"
+                        );
+                    });
+                    return;
+                }
+            }
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
@@ -511,7 +524,28 @@ extern "system" fn copy_texture_region(
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
         };
+        let mut to_sub = dst.footprint.offset as u32;
+        if dst.kind != FOOTPRINT {
+            if let Some(host_dst) = crate::resource::host_copy(dst.resource) {
+                let Some(host_sub) = host_dst.host_subresource(to_sub) else {
+                    return;
+                };
+                to_sub = host_sub;
+            }
+        }
+        let mut from_sub = src.footprint.offset as u32;
+        if src.kind != FOOTPRINT {
+            if let Some(host_src) = crate::resource::host_copy(src.resource) {
+                let Some(host_sub) = host_src.host_subresource(from_sub) else {
+                    return;
+                };
+                from_sub = host_sub;
+            }
+        }
         let mut from = src;
+        if src.kind != FOOTPRINT {
+            from.footprint.offset = u64::from(from_sub);
+        }
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
@@ -550,6 +584,9 @@ extern "system" fn copy_texture_region(
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
+        if dst.kind != FOOTPRINT {
+            to_location.footprint.offset = u64::from(to_sub);
+        }
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {

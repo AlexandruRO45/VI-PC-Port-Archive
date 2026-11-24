@@ -757,10 +757,41 @@ struct Resource {
 /// may release a resource whose commands it recorded but not yet submitted
 /// (console memory outlives the object; a host texture must outlive the
 /// lists that name it).
+/// Maps a guest subresource index to the corresponding host subresource index,
+/// or `None` if the subresource was dropped.
+pub fn map_subresource(guest_sub: u32, guest_mips: u32, drop: u32) -> Option<u32> {
+    if drop == 0 || guest_mips == 0 {
+        return Some(guest_sub);
+    }
+    let slice = guest_sub / guest_mips;
+    let guest_mip = guest_sub % guest_mips;
+    if guest_mip < drop {
+        return None;
+    }
+    let host_mips = guest_mips.saturating_sub(drop).max(1);
+    let host_mip = guest_mip - drop;
+    Some(slice * host_mips + host_mip)
+}
+
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    pub(crate) title_mips: u16,
+    pub(crate) mip_drop: u16,
+}
+
+#[cfg(windows)]
+impl HostTexture {
+    /// Maps a guest subresource index to the corresponding host subresource index,
+    /// or `None` if the subresource was dropped.
+    pub(crate) fn host_subresource(&self, guest_sub: u32) -> Option<u32> {
+        map_subresource(
+            guest_sub,
+            u32::from(self.title_mips),
+            u32::from(self.mip_drop),
+        )
+    }
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -806,20 +837,27 @@ pub(crate) fn compute_mip_drop(desc: &ResourceDesc) -> u32 {
         return 0;
     }
     // Only drop for pure sampled textures: not buffers, not render targets,
-    // not depth buffers, not UAVs, and not textures with MSAA.
+    // not depth buffers, not UAVs, not 3D textures, and not textures with MSAA.
     const TARGET_DEPTH_UNORDERED: u32 = 0x7;
     if desc.dimension == BUFFER
+        || desc.dimension == TEXTURE_3D
         || desc.flags & TARGET_DEPTH_UNORDERED != 0
         || desc.sample_count > 1
     {
         return 0;
     }
+    // Size floor: drop only textures >= 1024 on at least one axis.
+    // Small utility textures (1x1, LUTs, noise, UI) account for < 2.5% of VRAM
+    // but cause copy coordinate underflow and 1x1 degenerate collapses.
+    if desc.width.max(u64::from(desc.height)) < 1024 {
+        return 0;
+    }
     let mut k = drop;
     while k > 0 {
-        if desc.mip_levels > k as u16
+        // Require at least 2 mips to survive on the host.
+        if desc.mip_levels > (k as u16 + 1)
             && (desc.width >> k) > 0
             && (desc.height >> k) > 0
-            && (desc.dimension != TEXTURE_3D || (desc.depth_or_array_size >> k) > 0)
         {
             return k;
         }
@@ -985,9 +1023,12 @@ fn hand_out_resource(
         #[cfg(windows)]
         host: host.map(|texture| {
             let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+            let drop = compute_mip_drop(&desc);
             std::sync::Arc::new(HostTexture {
                 texture,
                 state: state.into(),
+                title_mips: desc.mip_levels,
+                mip_drop: drop as u16,
             })
         }),
     });
@@ -1917,5 +1958,33 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// Subresource index remapping prunes dropped guest mips and correctly maps surviving mips.
+    #[test]
+    fn subresource_index_remapping_and_pruning() {
+        // 6 slices (e.g. Cubemap), 8 guest mips, drop 2 -> host has 6 mips
+        const GUEST_MIPS: u32 = 8;
+        const DROP: u32 = 2;
+
+        // Slice 0, guest mip 0 -> dropped
+        assert_eq!(map_subresource(0, GUEST_MIPS, DROP), None);
+        // Slice 0, guest mip 1 -> dropped
+        assert_eq!(map_subresource(1, GUEST_MIPS, DROP), None);
+        // Slice 0, guest mip 2 -> host slice 0, mip 0 = 0
+        assert_eq!(map_subresource(2, GUEST_MIPS, DROP), Some(0));
+        // Slice 0, guest mip 7 -> host slice 0, mip 5 = 5
+        assert_eq!(map_subresource(7, GUEST_MIPS, DROP), Some(5));
+
+        // Slice 1, guest mip 0 (subresource 8) -> dropped
+        assert_eq!(map_subresource(8, GUEST_MIPS, DROP), None);
+        // Slice 1, guest mip 2 (subresource 10) -> host slice 1, mip 0 = 6
+        assert_eq!(map_subresource(10, GUEST_MIPS, DROP), Some(6));
+
+        // Slice 3, guest mip 4 (subresource 3 * 8 + 4 = 28) -> host slice 3, mip 2 (3 * 6 + 2 = 20)
+        assert_eq!(map_subresource(28, GUEST_MIPS, DROP), Some(20));
+
+        // Zero drop -> pass through
+        assert_eq!(map_subresource(15, GUEST_MIPS, 0), Some(15));
     }
 }
