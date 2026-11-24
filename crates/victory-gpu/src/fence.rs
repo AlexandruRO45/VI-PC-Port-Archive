@@ -159,7 +159,17 @@ impl Predicate {
         }
     }
 
-    fn reached(self) -> bool {
+    fn reached(self, fences: &MutexGuard<'_, BTreeMap<usize, usize>>) -> bool {
+        // Under LIVE the fence cannot finish dropping. Read its owned atomic,
+        // including either dword, without probing a guest pointer.
+        let base = self.address & !(size_of::<u64>() - 1);
+        if let Some(&ptr) = fences.get(&base) {
+            // SAFETY: the registry guard covers the entire load.
+            let word = unsafe { &*(ptr as *const Fence) }
+                .value
+                .load(Ordering::Acquire);
+            return self.matches(word >> (8 * (self.address - base)));
+        }
         #[cfg(windows)]
         {
             // The title may unmap a pending operand. Read through the OS, as
@@ -229,9 +239,10 @@ impl MemoryWait {
         if let Some(observed) = &self.observed {
             return observed.load(Ordering::Acquire);
         }
+        let fences = live();
         let mut pending = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
         let possible = self.predicate.can_match();
-        if possible && self.predicate.reached() {
+        if possible && self.predicate.reached(&fences) {
             return true;
         }
         let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -248,12 +259,14 @@ impl MemoryWait {
             warned: false,
         });
         drop(pending);
+        drop(fences);
         watch_notify();
         false
     }
 }
 
 fn scan_memory(
+    fences: &MutexGuard<'_, BTreeMap<usize, usize>>,
     pending: &mut Vec<Pending>,
     range: Option<std::ops::Range<usize>>,
 ) -> (Vec<Arc<Timeline>>, bool) {
@@ -269,7 +282,7 @@ fn scan_memory(
             return false;
         }
         if let WaitingQueue::Reachable(queue) = &entry.queue
-            && overlaps && wait.reached()
+            && overlaps && wait.reached(fences)
         {
             entry.observed.store(true, Ordering::Release);
             ready.push(queue.clone());
@@ -288,8 +301,11 @@ fn watch_loop() {
     loop {
         let seen = *WATCHER.generation.lock().unwrap_or_else(|e| e.into_inner());
         let (mut woken, fence_waiting) = scan_live_fences();
-        let (memory_ready, memory_waiting) =
-            scan_memory(&mut MEMORY.lock().unwrap_or_else(|e| e.into_inner()), None);
+        let (memory_ready, memory_waiting) = {
+            let fences = live();
+            let mut pending = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+            scan_memory(&fences, &mut pending, None)
+        };
         woken.extend(memory_ready);
         let any_waiting = fence_waiting || memory_waiting;
         if !woken.is_empty() {
@@ -543,11 +559,15 @@ impl Held {
 /// locks used by the polling thread. Otherwise the watcher can steal a wake
 /// between the store and notification while Host::execute still holds its lock.
 pub(crate) fn write_and_collect(at: usize, bytes: usize, store: impl FnOnce()) -> Woken {
+    if bytes == 0 {
+        store();
+        return Woken::default();
+    }
     let end = at.saturating_add(bytes);
     let live = live();
     let mut pending = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     store();
-    let (mut ready, _) = scan_memory(&mut pending, Some(at..end));
+    let (mut ready, _) = scan_memory(&live, &mut pending, Some(at..end));
     drop(pending);
     // A copied range may cover more than one fence.
     for (_, &ptr) in live.range(at.saturating_sub(size_of::<u64>() - 1)..end) {
@@ -650,12 +670,12 @@ mod tests {
         let mut isolated = vec![pending.swap_remove(index)];
         drop(pending);
         isolated[0].since = Instant::now() - STALL;
-        assert!(scan_memory(&mut isolated, None).0.is_empty());
+        assert!(scan_memory(&live(), &mut isolated, None).0.is_empty());
         assert!(isolated[0].warned);
         assert!(!wait.register(&timeline));
         drop(timeline);
         assert!(weak.upgrade().is_none());
-        assert!(!scan_memory(&mut isolated, None).1);
+        assert!(!scan_memory(&live(), &mut isolated, None).1);
     }
 
     #[test]
@@ -736,7 +756,7 @@ mod tests {
                     reference: 0,
                     ..p
                 }
-                .reached()
+                .reached(&live())
             );
         }
         assert!(rx.try_recv().is_err());
@@ -749,6 +769,28 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(2)).unwrap();
         // SAFETY: the wait has completed and no thread reads this reservation.
         assert_ne!(unsafe { VirtualFree(page, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn live_fence_operands_read_the_selected_dword() {
+        let fence = new_fence(0xaabbccdd_11223344);
+        let at = address(fence);
+        for (address, operand, reference) in [
+            (at, Operand::Qword, 0xaabbccdd_11223344),
+            (at, Operand::Dword(0xffff), 0x3344),
+            (at + 4, Operand::Dword(0xffff), 0xccdd),
+        ] {
+            assert!(
+                Predicate {
+                    address,
+                    operand,
+                    comparison: 3,
+                    reference
+                }
+                .reached(&live())
+            );
+        }
+        release_fence(fence);
     }
 
     #[cfg(windows)]
