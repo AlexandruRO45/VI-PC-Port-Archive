@@ -105,8 +105,10 @@ Host drivers that crash compiling a shader: with `VICTORY_PIPELINE_JOURNAL=1`
 a pipeline whose creation ends the process is refused from the next run on
 (its draws dropped, as for any refused pipeline) and listed in
 `pipeline-journal\crashed.txt` under the cache folder. Each such pipeline
-costs one crash; delete its line to try it again. Pipelines are created one
-at a time while it is on, so a crash names only the pipeline that caused it.
+costs one crash; delete its line to try it again. Pipelines are still created
+in parallel; when a crash leaves several in creation, they are listed in
+`pipeline-journal\suspects.txt` and each is created alone until it succeeds,
+so a repeat crash names only the pipeline that caused it.
 
 ## Debugging
 
