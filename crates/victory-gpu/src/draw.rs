@@ -1222,6 +1222,8 @@ impl State {
             )
         });
         crumbs::record(crumbs::INDIRECT, arguments, kind);
+        #[cfg(feature = "diagnostics")]
+        report_records(list, &args, arguments, (kind, stride, max));
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1242,6 +1244,65 @@ impl State {
         }
         true
     }
+}
+
+/// Diagnostics: the record an indirect execution is about to read
+/// (`VICTORY_INDIRECT_RECORD=1`) — the words the title left, the count and
+/// thread count they name, and whether their range fits the buffer. The clamp
+/// rewrites these words on the GPU, so this is the title's own record;
+/// [`crate::indirect::bound`] holds its output to the same bounds.
+#[cfg(feature = "diagnostics")]
+fn report_records(
+    list: &HostList,
+    args: &std::sync::Arc<crate::shadow::Shadow>,
+    at: u64,
+    (kind, stride, records): (u32, u32, u32),
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_RECORD").is_some()) {
+        return;
+    }
+    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+    // The first ones, then a sample: a frame holds thousands of these.
+    if n >= 64 && n % 256 != 0 {
+        return;
+    }
+    let len = u64::from(stride) * u64::from(records);
+    let left = args.left(at);
+    // Declared for copy-back, so what the GPU really holds comes back into
+    // the mirror once this list has run: the next read of the same range is
+    // the GPU's own content, not a stale guess, and a zero that survives that
+    // round trip is a zero in the argument buffer itself.
+    args.gpu_writes(list, at, len);
+    let words = args.words(at, len.min(64));
+    let word = |i: usize| words.get(i).copied().unwrap_or_default();
+    let (counts, threads) = match kind {
+        // A mesh or compute record is (x, y, z) groups of work.
+        2 | 10 => {
+            let (x, y, z) = (word(0), word(1), word(2));
+            ((x, y, z), u64::from(x) * u64::from(y) * u64::from(z))
+        }
+        // A draw's record is counts, then starts; indexed names indices.
+        _ => {
+            let (a, b, c) = (word(0), word(1), word(2));
+            ((a, b, c), u64::from(a) * u64::from(b))
+        }
+    };
+    tracing::warn!(
+        n,
+        kind,
+        stride,
+        records,
+        at = %format!("{at:#x}"),
+        fits = records == 0 || len <= left,
+        left,
+        words = ?&words[..words.len().min(8)],
+        counts = ?counts,
+        threads,
+        "indirect record"
+    );
 }
 
 /// The host command signature for one argument of `kind` with records

@@ -529,6 +529,20 @@ fn texture_to_buffer(
             host_box,
         )
     };
+    // COPY_DEST is a state a copy leaves, not one a buffer lives in: a
+    // shader that reads this range next must not find it there, so the
+    // buffer goes back to the state it had before the copy, or COMMON, which
+    // its next use promotes and which decays after.
+    const COMMON: u32 = 0;
+    let back = if before == COPY_DEST { COMMON } else { before };
+    let restore = crate::host::transition(
+        &shadow.buffer,
+        D3D12_RESOURCE_STATES(COPY_DEST as i32),
+        D3D12_RESOURCE_STATES(back as i32),
+    );
+    // SAFETY: an open list and a live buffer.
+    unsafe { list.list.ResourceBarrier(&[restore]) };
+    shadow.set_state(back);
 }
 
 /// Buffer to buffer: both are host memory, copied at submission.
