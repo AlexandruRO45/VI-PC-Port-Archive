@@ -524,8 +524,17 @@ fn git_z(root: &Path, args: &[&str]) -> Result<Option<Vec<Vec<u8>>>> {
 }
 
 /// Decodes a path git printed, keeping the exact bytes for reading it.
+///
+/// Git separates directories with `/` everywhere. On Unix a `\` is an
+/// ordinary byte of a name, so it is kept: shown as `/`, `odd\f.rs` was
+/// listed as `odd/f.rs`, a file in a directory that does not exist, and a
+/// name such as `assets\x.rs` read as a path through `assets/`.
 fn decode(root: &Path, raw: &[u8]) -> (String, bool, PathBuf) {
-    let name = String::from_utf8_lossy(raw).replace('\\', "/");
+    let name = String::from_utf8_lossy(raw);
+    #[cfg(not(unix))]
+    let name = name.replace('\\', "/");
+    #[cfg(unix)]
+    let name = name.into_owned();
     let utf8 = std::str::from_utf8(raw).is_ok();
     #[cfg(unix)]
     let on_disk = root.join(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(raw));
@@ -2540,8 +2549,7 @@ mod tests {
     /// `-` last in one is literal, so `[a-]z` takes `-z` and refuses `bz`;
     /// `\?` matches only a literal `?`, taking `a?b` and refusing `acb`. A
     /// pattern ending in a lone backslash matches nothing, so `odd\` stays
-    /// visible and is refused (it is left empty, since the listing shows a
-    /// backslash in a name as `/`). The last rule, with no newline after it,
+    /// visible and is refused. The last rule, with no newline after it,
     /// still holds, and `nonl` is taken.
     #[cfg(unix)]
     #[test]
@@ -2575,13 +2583,18 @@ mod tests {
         for dir in &refused {
             assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
         }
-        // Not `odd\`: the listing shows a `\` in a name as `/`.
-        for (i, dir) in refused[..3].iter().enumerate() {
+        for (i, dir) in refused.iter().enumerate() {
             std::fs::write(dir.join(format!("f{i}.rs")), b"fn f() {}\n").unwrap();
         }
         assert_eq!(
             names(root, false),
-            [".gitignore", "acb/f2.rs", "bz/f1.rs", "runx/f0.rs"]
+            [
+                ".gitignore",
+                "acb/f2.rs",
+                "bz/f1.rs",
+                "odd\\/f3.rs",
+                "runx/f0.rs"
+            ]
         );
         super::run(root, false).unwrap();
     }
@@ -2814,6 +2827,32 @@ mod tests {
             .into_iter()
             .map(|f| f.name)
             .collect()
+    }
+
+    /// On Unix a `\` is part of a file's name, not a separator, and the
+    /// name is listed and judged as it is: `tool.exe\LICENSE` is one file
+    /// whose name ends in `.exe\LICENSE`, not `LICENSE` in a directory
+    /// `tool.exe`, so it is off the allowlist in the full and staged checks
+    /// alike, though its content is plain text.
+    #[cfg(unix)]
+    #[test]
+    fn backslashes_are_kept_in_unix_names() {
+        let tmp = tempdir();
+        let root = tmp.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join("a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(root.join("tool.exe\\LICENSE"), b"MIT\n").unwrap();
+
+        assert_eq!(names(root, false), ["a.rs", "tool.exe\\LICENSE"]);
+        assert!(super::run(root, false).is_err());
+        git_str(root, &["add", "--", "a.rs", "tool.exe\\LICENSE"]);
+        assert_eq!(names(root, true), ["a.rs", "tool.exe\\LICENSE"]);
+        assert!(super::run(root, true).is_err());
+        assert_eq!(
+            check("tool.exe\\LICENSE", b"MIT\n"),
+            ["file type not on the allowlist"]
+        );
+        assert!(check("tool.exe/LICENSE", b"MIT\n").is_empty());
     }
 
     /// A symlink turned into a regular file is staged as a type change (`T`),
