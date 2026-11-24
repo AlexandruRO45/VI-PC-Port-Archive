@@ -322,9 +322,12 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     for i in 0..count {
         let at = base + 32 * i;
         let name_at = u32_at(part, at + 4)? as usize;
+        // The name is a NUL-terminated string inside the part. One with no
+        // terminator ran to the end of the part, taking whatever followed
+        // (other names, the next part's padding) as the semantic.
         let name = part
             .get(name_at..)
-            .and_then(|s| s.split(|&b| b == 0).next())
+            .and_then(|s| s.iter().position(|&b| b == 0).map(|end| &s[..end]))
             .ok_or(ShaderError::Malformed("signature name out of bounds"))?;
         let mask = *part
             .get(at + 24)
@@ -543,6 +546,29 @@ mod tests {
                 signature(&part(mask)).unwrap_err().to_string(),
                 refused.to_string(),
                 "mask {mask:#x}"
+            );
+        }
+    }
+
+    /// A signature name is NUL-terminated inside the part; one that runs
+    /// off the end is refused rather than taking the rest of the part.
+    #[test]
+    fn a_signature_name_without_its_terminator_is_refused() {
+        let part = |name: &[u8]| {
+            let mut p = Vec::new();
+            for w in [1, 8, 0, 40, 0, 0, 3, 1, 0x3, 0] {
+                p.extend_from_slice(&u32::to_le_bytes(w));
+            }
+            p.extend_from_slice(name);
+            p
+        };
+        let rows = signature(&part(b"TEXCOORD\0")).expect("a terminated name");
+        assert_eq!(rows[0].name, "TEXCOORD");
+        for name in [&b"TEXCOORD"[..], b""] {
+            assert_eq!(
+                signature(&part(name)).unwrap_err().to_string(),
+                ShaderError::Malformed("signature name out of bounds").to_string(),
+                "name {name:?}"
             );
         }
     }
