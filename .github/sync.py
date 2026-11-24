@@ -96,10 +96,12 @@ def export(p):
 
 
 def push(p, repo, default):
-    """Push the project's branches. Returns the refs GitHub refused."""
-    refs = [f"+refs/sync/{p}/heads/{default}:refs/heads/{p}/main", f"+refs/sync/{p}/pull/*:refs/heads/{p}/pr/*"]
-    refs += [f"+refs/sync/{p}/heads/{b}:refs/heads/{p}/branch/{b}"
-             for b in git("for-each-ref", "--format=%(refname:lstrip=4)", f"refs/sync/{p}/heads/").stdout.split() if b != default]
+    """Push the project's branches that changed, a few at a time. Returns the pushes GitHub refused."""
+    want = {}  # branch on origin: commit it should point at
+    for line in git("for-each-ref", "--format=%(objectname) %(refname)", f"refs/sync/{p}/heads/", f"refs/sync/{p}/pull/").stdout.splitlines():
+        sha, ref = line.split(" ", 1)
+        kind, name = ref.split("/", 4)[3:]
+        want[f"{p}/main" if kind == "heads" and name == default else f"{p}/branch/{name}" if kind == "heads" else f"{p}/pr/{name}"] = sha
     # the issue export also lives on its own branch, with the folder as the branch's root
     git("add", "--", f"github-export/{p}")
     tree = git("write-tree", f"--prefix=github-export/{p}/").stdout.strip()
@@ -107,13 +109,17 @@ def push(p, repo, default):
     parent = git("rev-parse", "-q", "--verify", f"refs/sync/{p}/export^{{commit}}", check=False).stdout.strip()
     if not parent or git("rev-parse", f"{parent}^{{tree}}").stdout.strip() != tree:
         msg = f"GitHub export of {repo} issues, PRs and comments ({TODAY})"
-        commit = git("commit-tree", tree, *(["-p", parent] if parent else []), "-m", msg).stdout.strip()
-        refs.append(f"{commit}:refs/heads/{p}/github-export")
-    rejected = lambda *specs: [l for l in git("push", "--no-tags", "--porcelain", "origin", *specs, check=False).stdout.splitlines() if l.startswith("!")]
+        want[f"{p}/github-export"] = git("commit-tree", tree, *(["-p", parent] if parent else []), "-m", msg).stdout.strip()
+    have = {}
+    for line in git("ls-remote", "origin", f"refs/heads/{p}/*").stdout.splitlines():
+        sha, ref = line.split("\t")
+        have[ref[len("refs/heads/"):]] = sha
+    specs = [f"+{sha}:refs/heads/{b}" for b, sha in sorted(want.items()) if have.get(b) != sha]
+    rejected = lambda *s: [l for l in git("push", "--no-tags", "--porcelain", "origin", *s, check=False).stdout.splitlines() if l.startswith("!")]
     refused = []
-    for line in rejected(*refs):
-        # GitHub's workflow-file check can time out on a big push; one branch at a time it usually answers
-        refused += rejected("+" + line.split("\t")[1]) if "timeout" in line else [line]
+    for i in range(0, len(specs), 20):  # GitHub's workflow-file check times out on pushes with many branches
+        for line in rejected(*specs[i:i + 20]):
+            refused += rejected("+" + line.split("\t")[1]) if "timed out" in line.lower() or "timeout" in line.lower() else [line]
     return refused
 
 
@@ -156,9 +162,9 @@ if __name__ == "__main__":
             synced.append(p)
             export(p)
             if pushing:
-                for line in push(p, repo, default):
-                    # the workflow's token may not touch .github/workflows files; those few branches wait for a manual push
-                    (skipped if "workflow" in line else problems).append(f"{p}: GitHub refused {line}")
+                # GitHub refuses branches that edit .github/workflows files (the workflow's token may not touch those)
+                # and sometimes times out; both are retried next run, so they're warnings, not failures
+                skipped += [f"{p}: GitHub refused {line}" for line in push(p, repo, default)]
                 if status_part(old, start) != status_part(new, start):
                     flag(p, repo)
             print(f"{p}: synced", flush=True)
