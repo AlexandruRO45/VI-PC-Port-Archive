@@ -169,6 +169,8 @@ can be read in the log. What came from it:
 | Ray tracing | the scaffold: builder programs translate, shader reads of title memory by raw address, and the hardware ray/box and ray/triangle test emulated in DXIL and checked against a Rust reference on the GPU | `crates/victory-shader/src/bvh.rs`, `emit/intersect.rs`, [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md) |
 | Stability | the hang the wave64 update introduced: its barrier form for 64-lane programs is off unless `VICTORY_WAVE_WIDE=1` | `crates/victory-shader/src/emit/wave.rs` |
 | Stability | an intermittent device loss from the pipeline library file being replaced while mapped | `crates/victory-gpu/src/pipeline/library.rs` |
+| Speed | clean-up passes over each translated module (`VICTORY_SHADER_OPT` bits: dead code, folding, reuse, branch facts, loads within a block, wave64 first-lane exchange), part of the shader cache key. Its author measures about 43 % fewer host instructions over the pack and about 20 ms less GPU time per frame on their machine | `crates/victory-shader/src/emit/bitcode/opt.rs` |
+| Tooling | `translate` reports a census of the emitted code | `crates/victory-shader/src/emit/bitcode/census.rs`, `apps/victory/src/translate.rs` |
 
 Its own README states the conditions on its numbers: one machine (Windows 11,
 i7-14700KF, RTX 4070 12 GB, 32 GB RAM), Series X profile, and its commits were
