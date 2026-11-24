@@ -8,10 +8,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
+use super::{DESCRIPTOR_DATA_SLOT, UserData};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -171,6 +171,8 @@ struct Lower<'a> {
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
+    /// Known fields of image descriptors read as scalar data, by result dword.
+    image_fields: HashMap<Value, (Site, u8)>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
@@ -476,6 +478,7 @@ impl<'a> Lower<'a> {
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
+            image_fields: HashMap::new(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -1239,6 +1242,65 @@ impl<'a> Lower<'a> {
             Operand::Literal(x) => Ok(self.s.m.i32(x)),
             Operand::Attr { .. } => Err("an attribute operand"),
         }
+    }
+
+    /// Reads only the bits an extractor observes. Address, format and
+    /// layout fields of the original descriptor remain unavailable.
+    fn operand_bits(&mut self, inst: &Inst, op: &Operand, bits: u32) -> Result<V, Why> {
+        if bits == 0 {
+            return Ok(self.s.m.i32(0));
+        }
+        if let Operand::Scalar { code, .. } = *op
+            && let Some(v) = inst.read(Reg::S(code))
+            && let Some(&(site, word)) = self.image_fields.get(&v)
+        {
+            let known = match word {
+                1 => 0xC000_0000,
+                2 => 0x3FFF_FFFF,
+                3 => 0x0000_F000,
+                _ => unreachable!(),
+            };
+            if bits & !known != 0 {
+                return Err("a descriptor's address or format read as data");
+            }
+            let index = self.heap_index(site, 0, false)?;
+            let h = self.s.root_srv_handle(DESCRIPTOR_DATA_SLOT);
+            let c = self.cur;
+            // Two dwords per heap entry: packed height/width, then base mip.
+            let three = self.s.m.i32(3);
+            let mut at = self.s.m.bin(c, Bin::Shl, index, three);
+            if word == 3 {
+                let four = self.s.m.i32(4);
+                at = self.s.m.bin(c, Bin::Add, at, four);
+            }
+            let (unused, mask, align) = (
+                self.s.m.undef(self.s.t.i32),
+                self.s.m.i8(1),
+                self.s.m.i32(4),
+            );
+            let ret = self
+                .s
+                .m
+                .named_struct("dx.types.ResRet.i32", vec![self.s.t.i32; 5]);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.i32",
+                Attr::ReadOnly,
+                ret,
+                139,
+                &[h, at, unused, mask, align],
+            );
+            let x = self.s.m.extract(c, r, 0);
+            let (op, shift) = match word {
+                1 => (Bin::Shl, 30),
+                2 => (Bin::LShr, 2),
+                3 => (Bin::Shl, 12),
+                _ => unreachable!(),
+            };
+            let shift = self.s.m.i32(shift);
+            return Ok(self.s.m.bin(c, op, x, shift));
+        }
+        self.operand(inst, op)
     }
 
     /// GFX10 puts an inline f16 constant in the low half of the operand.
@@ -2647,7 +2709,13 @@ impl<'a> Lower<'a> {
             }
             "s_bfe_u32" | "s_bfe_i32" => {
                 // src1: offset in bits 0-4, width in bits 16-22.
-                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let b = src32(self, 1)?;
+                let bits = self.s.m.int_value(b).map_or(u32::MAX, |ctrl| {
+                    let width = (ctrl as u32 >> 16 & 0x7F).min(32);
+                    let low = u32::MAX.checked_shr(32 - width).unwrap_or(0);
+                    low << (ctrl as u32 & 31)
+                });
+                let a = self.operand_bits(inst, src.first().ok_or("a missing operand")?, bits)?;
                 let (k16, k127) = (self.s.m.i32(16), self.s.m.i32(0x7F));
                 let w = self.s.m.bin(c, Bin::LShr, b, k16);
                 let w = self.s.m.bin(c, Bin::And, w, k127);
@@ -2914,6 +2982,84 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// A bindless load of exactly one resource heap entry.
+    fn aligned_heap_load(&self, site: Site) -> bool {
+        self.scalar.get(&site).is_some_and(|a| {
+            self.x
+                .native
+                .layout
+                .get(a.param)
+                .is_some_and(|r| r.root == RootType::ResourceHeap)
+                && a.offset.is_multiple_of(32)
+                && a.dynamic.is_none_or(|v| self.aligned_heap_offset(v, 12))
+        })
+    }
+
+    /// Whether the low five bits of an address term are all zero.
+    fn aligned_heap_offset(&self, v: Value, depth: u8) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        if let Some(&crate::ir::ScalarDword::Value(src)) = self.x.st.spills.get(&v) {
+            return self.aligned_heap_offset(src, depth - 1);
+        }
+        let Some(&b) = self.def_block.get(&v) else {
+            return false;
+        };
+        let block = &self.x.p.blocks[b];
+        let Some((i, inst)) = block
+            .insts
+            .iter()
+            .enumerate()
+            .find(|(_, i)| i.writes.iter().any(|w| w.1 == v))
+        else {
+            return false;
+        };
+        let immediate = |op: &Operand| match *op {
+            Operand::Const(c) => crate::gfx10::inline(c),
+            Operand::Literal(x) => Some(x),
+            Operand::Scalar { code: NULL, .. } => Some(0),
+            _ => None,
+        };
+        let aligned = |op: &Operand| {
+            if let Some(n) = immediate(op) {
+                return n.is_multiple_of(32);
+            }
+            let reg = match *op {
+                Operand::Scalar { code, .. } => Reg::S(code),
+                Operand::Vector { reg, .. } => Reg::V(reg),
+                _ => return false,
+            };
+            inst.read(reg)
+                .is_some_and(|v| self.aligned_heap_offset(v, depth - 1))
+        };
+        let name = inst.name();
+        match &inst.fields {
+            Fields::Sop { src, .. } => match (name, &src[..]) {
+                ("s_lshl_b32", [_, n]) => immediate(n).is_some_and(|n| n & 31 >= 5),
+                ("s_and_b32", [a, b]) => aligned(a) || aligned(b),
+                ("s_add_u32" | "s_add_i32" | "s_or_b32", [a, b]) => aligned(a) && aligned(b),
+                ("s_mov_b32", [a]) => aligned(a),
+                _ => false,
+            },
+            Fields::Valu(v) if name == "v_readfirstlane_b32" => v.src.first().is_some_and(aligned),
+            Fields::Valu(v)
+                if self.x.st.guards[b][i].is_none() && v.sdwa.is_none() && v.dpp.is_none() =>
+            {
+                match (name, &v.src[..]) {
+                    ("v_lshlrev_b32", [n, _]) => immediate(n).is_some_and(|n| n & 31 >= 5),
+                    ("v_add_lshl_u32", [_, _, n]) => immediate(n).is_some_and(|n| n & 31 >= 5),
+                    ("v_lshl_or_b32" | "v_lshl_add_u32", [_, n, a]) => {
+                        immediate(n).is_some_and(|n| n & 31 >= 5) && aligned(a)
+                    }
+                    ("v_mov_b32", [a]) => aligned(a),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
     /// the code also reads as numbers: the console compiler computes sizes
     /// from descriptor bits (an image's width, height, depth, levels; a
@@ -2957,6 +3103,13 @@ impl<'a> Lower<'a> {
                 })
             });
         let Some((at, first)) = use_at else {
+            if count == 8 && self.aligned_heap_load(site) {
+                for word in 1..=3 {
+                    if let Some(v) = inst.write(Reg::S(code + word)) {
+                        self.image_fields.insert(v, (site, word));
+                    }
+                }
+            }
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
@@ -5015,7 +5168,28 @@ impl<'a> Lower<'a> {
             }
             "v_alignbit_b32" | "v_alignbyte_b32" => {
                 // The low dword of {a, b} >> shift.
-                let (a, b, sh) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let sh = s(self, 2)?;
+                let shift = |x: u32| {
+                    if name == "v_alignbyte_b32" {
+                        (x & 3) << 3
+                    } else {
+                        x & 31
+                    }
+                };
+                let (a, b) = match (&inst.fields, self.s.m.int_value(sh)) {
+                    (Fields::Valu(v), Some(sh))
+                        if v.sdwa.is_none() && v.dpp.is_none() && v.abs == 0 && v.neg == 0 =>
+                    {
+                        let sh = shift(sh as u32);
+                        let lo = u32::MAX << sh;
+                        let hi = !lo;
+                        (
+                            self.operand_bits(inst, &v.src[0], hi)?,
+                            self.operand_bits(inst, &v.src[1], lo)?,
+                        )
+                    }
+                    _ => (s(self, 0)?, s(self, 1)?),
+                };
                 let sh = if name == "v_alignbyte_b32" {
                     let three = k(self, 3);
                     let t = self.s.m.bin(c, Bin::And, sh, three);
@@ -7078,6 +7252,47 @@ mod tests {
                 validator.validate(&mut lowered.dxil).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn extracts_only_known_fields_from_bindless_image_descriptors() {
+        let mut words = [
+            0x8F02_8501, // s_lshl_b32 s2, s1, 5
+            0x8002_0200, // s_add_u32 s2, s0, s2
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0201,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[2:3], null
+            0xD54E_0001,
+            10 | (9 << 9) | (158 << 18), // v_alignbit_b32 v1, s10, s9, 30
+            0x9391_FF0B,
+            0x0004_000C, // s_bfe_u32 s17, s11, offset:12 width:4
+            0x7E04_0211, // v_mov_b32 v2, s17
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xD834_0004,
+            0x0000_0200, // ds_write_b32 v0, v2 offset:4
+            S_ENDPGM,
+        ];
+        let layout = || {
+            vec![
+                root(RootType::ResourceHeap, 0, 0),
+                root(RootType::Constants, 1, 1),
+            ]
+        };
+        let mut lowered = lower_with(&words, layout(), vec![]).unwrap();
+        assert_eq!(lowered.root_srvs, [super::DESCRIPTOR_DATA_SLOT]);
+        use super::super::validator::Validator;
+        if let Ok(mut validator) = Validator::load(Validator::default_path().as_deref()) {
+            validator.validate(&mut lowered.dxil).unwrap();
+        }
+        words[8] = 0x0005_000C; // Also asks for one bit of LAST_LEVEL.
+        assert!(matches!(
+            lower_with(&words, layout(), vec![]),
+            Err(crate::ShaderError::Unsupported {
+                what: "a descriptor's address or format read as data",
+                ..
+            })
+        ));
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.

@@ -311,6 +311,14 @@ impl View {
     }
 }
 
+struct ViewEntry {
+    view: View,
+    generation: u32,
+    /// Read when the title creates the view and still owns its resource.
+    #[cfg(windows)]
+    image_words: [u32; 2],
+}
+
 /// Every distinct view in use; a descriptor holds a tag, an index into it
 /// and the entry's generation, which survive titles copying descriptors as
 /// bytes. A view of a resource lives as long as the resource: when the
@@ -322,8 +330,7 @@ impl View {
 /// views, samplers) are kept for the run; they are bounded by the title's
 /// memory and sampler states.
 struct Views {
-    /// Each entry's view and generation.
-    list: Vec<(View, u32)>,
+    list: Vec<ViewEntry>,
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -357,13 +364,20 @@ fn record(handle: u64, view: View) {
     let i = match views.index.get(&view) {
         Some(&i) => i,
         None => {
+            let entry = |generation| ViewEntry {
+                view: view.clone(),
+                generation,
+                #[cfg(windows)]
+                image_words: host::image_words(&view).unwrap_or([0; 2]),
+            };
             let i = match views.free.pop() {
                 Some(i) => {
-                    views.list[i as usize].0 = view.clone();
+                    let slot = &mut views.list[i as usize];
+                    *slot = entry(slot.generation);
                     i
                 }
                 None => {
-                    views.list.push((view.clone(), 1));
+                    views.list.push(entry(1));
                     views.list.len() as u32 - 1
                 }
             };
@@ -374,7 +388,7 @@ fn record(handle: u64, view: View) {
             i
         }
     };
-    let generation = views.list[i as usize].1;
+    let generation = views.list[i as usize].generation;
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     drop(views);
@@ -389,14 +403,15 @@ pub(crate) fn forget(resource: usize) {
         return;
     };
     for i in entries {
-        let (view, generation) = views.list[i as usize].clone();
+        let slot = &views.list[i as usize];
+        let (view, generation) = (slot.view.clone(), slot.generation);
         // Entries freed through a view's other resource may hold another
         // view by now.
         if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
             continue;
         }
         views.index.remove(&view);
-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+        views.list[i as usize].generation = generation.wrapping_add(1).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
@@ -407,8 +422,8 @@ pub(crate) fn forget(resource: usize) {
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    let entry = views.list.get(i as usize)?;
+    (entry.generation == generation).then(|| entry.view.clone())
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -419,8 +434,8 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    let entry = views.list.get(i as usize)?;
+    (tag == VIEW_TAG && entry.generation == generation).then(|| entry.view.clone())
 }
 
 /// A description of `N` words, if the title passes one.

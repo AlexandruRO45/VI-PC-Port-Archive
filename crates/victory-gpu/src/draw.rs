@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::DESCRIPTOR_DATA_SLOT;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -493,6 +494,28 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    if srv && slot == DESCRIPTOR_DATA_SLOT {
+                        let data = (self.heaps[0] != 0)
+                            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                            .flatten()
+                            .and_then(|heap| heap.image_data());
+                        let Some((buffer, handle)) = data else {
+                            once!("a draw or dispatch dropped: no image descriptor data");
+                            return false;
+                        };
+                        if list.first_use(buffer.as_raw() as usize) {
+                            list.keep(&buffer);
+                        }
+                        // SAFETY: an open list and a slot of its view heap.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootDescriptorTable(param, handle);
+                            } else {
+                                l.SetGraphicsRootDescriptorTable(param, handle);
+                            }
+                        }
+                        continue;
+                    }
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");

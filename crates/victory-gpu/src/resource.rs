@@ -112,6 +112,18 @@ const _: () = assert!(size_of::<ResourceDesc>() == 56);
 const BUFFER: u32 = 1;
 const TEXTURE_3D: u32 = 4;
 
+/// The mip-zero dimensions of a title texture, regardless of host backing.
+#[cfg(windows)]
+pub(crate) fn texture_dimensions(this: This) -> Option<(u64, u32)> {
+    (!this.is_null())
+        .then(|| resource(this).desc)
+        .and_then(|d| {
+            (2..=TEXTURE_3D)
+                .contains(&d.dimension)
+                .then_some((d.width, d.height))
+        })
+}
+
 /// Bytes per element and the element's width in texels (4 for block
 /// compression), by DXGI format number. `None` for 1-bit and video
 /// formats. The console adds 116/117 (10-bit float color), 118-120 (16-bit
