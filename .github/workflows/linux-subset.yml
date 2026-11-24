@@ -47,15 +47,14 @@ env:
   # and victory-loader are not yet; add each one once it is.
   RUSTDOC_CRATES: >-
     -p victory-core -p victory-pe -p victory-pipeline -p victory-game
-    -p victory-shader -p xtask
+    -p victory-shader -p victory-gpu -p xtask
   # Crates whose rustdoc builds with no warnings for the Windows target, where
   # cfg(windows) items (all of victory-hle, apps/victory's host) exist and the
-  # Linux rustdoc step never sees them. victory-shader (a Windows-only module
-  # links a private item), victory-gpu, victory-formats and victory-loader are
-  # not clean yet; add each one once it is.
+  # Linux rustdoc step never sees them. victory-formats and victory-loader
+  # are not clean yet; add each one once it is.
   WINDOWS_RUSTDOC_CRATES: >-
     -p victory-core -p victory-pe -p victory-pipeline -p victory-game
-    -p victory-hle -p victory
+    -p victory-hle -p victory-shader -p victory-gpu -p victory
 
 jobs:
   linux:
