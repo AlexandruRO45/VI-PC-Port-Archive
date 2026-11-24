@@ -2087,4 +2087,64 @@ mod tests {
         assert_eq!(found[0].unpack(), None);
         assert_eq!(found[1].unpack(), Some(container));
     }
+
+    #[test]
+    fn stream_split_into_blocks_with_empty_ones_between_is_a_record() {
+        // Deflate allows any number of blocks, stored ones of length 0
+        // among them (a sync flush writes `00 00 00 FF FF`). A stream of
+        // stored blocks built by hand, empty ones between them, ended by a
+        // fixed-code block from miniz, is a record: it starts a stream
+        // however it is cut, unpacks whole, and the record after it is
+        // found.
+        fn stored(data: &[u8]) -> Vec<u8> {
+            let len = data.len() as u16;
+            let mut out = vec![0]; // BFINAL 0, stored
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(data);
+            out
+        }
+        let container = b"DXBC in blocks, then a fixed-code tail".to_vec();
+        let (head, tail) = container.split_at(13);
+        let mut packed = Vec::new();
+        packed.extend(stored(&[]));
+        packed.extend(stored(&head[..5]));
+        packed.extend(stored(&[]));
+        packed.extend(stored(&head[5..]));
+        packed.extend(stored(&[]));
+        // miniz's stream for the tail ends it: a block after a fixed-code
+        // one starts mid-byte, so only stored blocks are put together here.
+        let fixed = miniz_oxide::deflate::compress_to_vec(tail, 1);
+        assert_eq!(fixed[0] & 0b111, 0b011, "one final fixed-code block");
+        packed.extend(fixed);
+        assert_eq!(
+            miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+            Some(container.clone())
+        );
+        for cut in 0..packed.len() {
+            assert!(
+                starts_stream(&packed[..cut], container.len()),
+                "cut at {cut}"
+            );
+        }
+        assert!(!starts_stream(&packed, container.len() + 1));
+
+        let n = (packed.len() + 12) as u32;
+        let mut file = MAGIC.to_vec();
+        file.extend_from_slice(b"\x0aPS_blocks\0\x32");
+        let marker = file.len() + 4;
+        for v in [n, 0x000D_DCE7, n, container.len() as u32] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&packed);
+        let after = file.len();
+        file.extend(record_bytes("PS_after", 0x32, b"after"));
+
+        let found: Vec<_> = records(&file).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_blocks"), Some("PS_after")]);
+        assert_eq!(found[0].span(), marker..after);
+        assert_eq!(found[0].unpack(), Some(container));
+        assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+    }
 }
