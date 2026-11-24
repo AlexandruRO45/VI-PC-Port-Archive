@@ -307,10 +307,11 @@ fn initial_lds() -> Vec<u8> {
         .collect()
 }
 
-/// Byte addresses (before the instruction's offset of 2) for an access of
-/// `name`'s width: every byte from 2 to 7, odd and straddling halfwords too.
-fn addresses(name: &str) -> Vec<u32> {
-    (0..if halfword(name) { 5 } else { 6 }).collect()
+/// Byte addresses (before the instruction's offset of 2) for an access:
+/// every byte from 2 to 7: odd halfwords too, and both straddling ones (at
+/// byte 3, into dword 1, and at byte 7, into dword 2).
+fn addresses() -> Vec<u32> {
+    (0..6).collect()
 }
 
 /// Writes the three dwords of `initial_lds` (`v7` = 0), then waits for them.
@@ -337,7 +338,7 @@ fn byte_and_halfword_reads() {
         let shader = build_cs(&body, LANES);
         let lds = initial_lds();
         for (label, host) in &hosts {
-            for at in addresses(name) {
+            for at in addresses() {
                 let got = run(label, host, &shader, [DWORD0, DWORD1, at, OLD], LANES);
                 let want = model_read(name, &lds, at as usize + 2, OLD);
                 for (lane, g) in got.into_iter().enumerate() {
@@ -372,7 +373,7 @@ fn byte_and_halfword_writes() {
         body.push(S_WAITCNT_0);
         let shader = build_cs(&body, LANES);
         for (label, host) in &hosts {
-            for at in addresses(name) {
+            for at in addresses() {
                 let at = at as usize + 2;
                 let mut lds = initial_lds();
                 model_write(name, &mut lds, at, OLD);
@@ -385,6 +386,49 @@ fn byte_and_halfword_writes() {
                         "{label}: {name} at {at}, lane {lane}: {g:#010x}, want {want:#010x}"
                     );
                 }
+            }
+        }
+    }
+}
+
+const DS_READ_U16: u8 = 0x3C;
+const DS_WRITE_B16: u8 = 0x1F;
+
+/// A halfword at the last byte of the program's 512 bytes of LDS has no
+/// next dword: its high byte reads 0 and its write is dropped, the low
+/// byte read and written as usual.
+#[test]
+fn a_halfword_at_the_end_of_lds() {
+    let (_one, hosts) = hosts();
+    for (name, op) in [("ds_read_u16", DS_READ_U16), ("ds_write_b16", DS_WRITE_B16)] {
+        // v3 = 509, so v3 + 2 is byte 511; DWORD0 goes in the last dword
+        // (byte 508, v7) first.
+        let mut body = vec![v_add_nc_u32(7, int(-1), 3)];
+        body.extend_from_slice(&ds(DS_WRITE_B32, 0, 7, 1, 0));
+        body.push(S_WAITCNT_0);
+        body.push(S_BARRIER);
+        if name == "ds_read_u16" {
+            body.extend_from_slice(&ds(op, 5, 3, 0, 2));
+        } else {
+            body.extend_from_slice(&ds(op, 0, 3, 4, 2));
+            body.push(S_WAITCNT_0);
+            body.push(S_BARRIER);
+            body.extend_from_slice(&ds(DS_READ_B32, 5, 7, 0, 0));
+        }
+        body.push(S_WAITCNT_0);
+        let shader = build_cs(&body, LANES);
+        let want = if name == "ds_read_u16" {
+            DWORD0 >> 24
+        } else {
+            DWORD0 & 0x00FF_FFFF | (OLD & 0xFF) << 24
+        };
+        for (label, host) in &hosts {
+            let got = run(label, host, &shader, [DWORD0, 0, 509, OLD], LANES);
+            for (lane, g) in got.into_iter().enumerate() {
+                assert_eq!(
+                    g, want,
+                    "{label}: {name} at 511, lane {lane}: {g:#010x}, want {want:#010x}"
+                );
             }
         }
     }

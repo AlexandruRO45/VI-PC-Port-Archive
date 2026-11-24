@@ -2468,9 +2468,11 @@ impl<'a> Lower<'a> {
     }
 
     /// For a halfword at byte LDS address `a` + `offset`: whether it sits at
-    /// byte 3 of its dword, and the dword after (that dword itself when it
-    /// does not). The hardware takes such a halfword's high byte from byte
-    /// 0 of the next dword, reading and writing (measured on RDNA2).
+    /// byte 3 of its dword with a next dword in the program's LDS, and that
+    /// dword (else the halfword's own dword). The hardware takes such a
+    /// halfword's high byte from byte 0 of the next dword, reading and
+    /// writing (measured on RDNA2); past the end of LDS the high byte reads
+    /// 0 and its write is dropped, as for any out-of-bounds access.
     fn lds_straddle(&mut self, a: V, offset: u32) -> (V, V) {
         let c = self.cur;
         let (o, two, three, one) = (
@@ -2479,11 +2481,15 @@ impl<'a> Lower<'a> {
             self.s.m.i32(3),
             self.s.m.i32(1),
         );
+        let end = self.s.m.i32(self.s.lds_dwords);
         let at = self.s.m.bin(c, Bin::Add, a, o);
         let byte = self.s.m.bin(c, Bin::And, at, three);
-        let straddle = self.s.m.cmp(c, pred::EQ, byte, three);
+        let at_byte3 = self.s.m.cmp(c, pred::EQ, byte, three);
         let index = self.s.m.bin(c, Bin::LShr, at, two);
         let after = self.s.m.bin(c, Bin::Add, index, one);
+        // `end` (out of range) where the halfword does not sit at byte 3.
+        let next = self.s.m.select(c, at_byte3, after, end);
+        let straddle = self.s.m.cmp(c, pred::IULT, next, end);
         let index = self.s.m.select(c, straddle, after, index);
         let lds = self.s.lds();
         (straddle, self.s.m.element(c, lds, index))
