@@ -973,9 +973,7 @@ fn into_destination(
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
-        Ok(())
-    } else {
+    if let Err(error) = super::xmem::write_physical(pages, offset, &data[..n]) {
         // Said aloud: the title never reads a request's result
         // (it only polls for completion), so a destination left unwritten
         // is a model or texture that silently holds whatever its pages
@@ -984,10 +982,12 @@ fn into_destination(
             offset,
             len,
             pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+            %error,
+            "dstorage: a destination's physical pages could not be written; its request fails"
         );
-        Err(E_INVALIDARG)
+        return Err(E_INVALIDARG);
     }
+    Ok(())
 }
 
 /// Slots by the 2020 order, which the argument shapes at
