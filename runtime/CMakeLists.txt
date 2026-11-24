@@ -131,6 +131,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xapu_chad.cpp
   )
   add_dependencies(gta6rt gta6rt_tls_host)
+  target_sources(gta6rt PRIVATE shims/dstorage.cpp)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
   # Static shim tables register themselves at startup; keep the linker from dropping their objects.
