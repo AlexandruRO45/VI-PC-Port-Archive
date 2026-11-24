@@ -596,6 +596,15 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         {
             return Err(Malformed("used descriptor of unknown kind"));
         }
+        // A read is likewise found and bound by its root kind: lowering
+        // classifies only table and root-descriptor reads (`used_kind`), the
+        // host binds only table reads (`draw::tables`), and the checks below
+        // pair a read with its parameter by kind. A read of a kind the
+        // layout could not hold (refused above) names no parameter any of
+        // them could find, so it is a format change to name here too.
+        if used.iter().any(|u| matches!(u.root, RootType::Other(_))) {
+            return Err(Malformed("used descriptor of unknown root kind"));
+        }
         // The host binds a table read by its root slot (`draw::tables`),
         // while lowering finds what a read is by the table address's SGPR
         // (`used_kind`). A read naming no table parameter with both would be
@@ -2419,6 +2428,29 @@ mod tests {
                 "kind {kind}, root {root}"
             );
         }
+    }
+
+    #[test]
+    fn refuses_a_descriptor_read_of_unknown_root_kind() {
+        let srv = 0u8;
+        // A table and a root descriptor are the kinds a read names here.
+        assert!(reading(&[(srv, 3, 0)]).is_ok());
+        assert!(reading(&[(srv, 1, 0)]).is_ok());
+        // 2 is the gap in the kinds, 7 the first past the sampler heap, and
+        // 0xFF the furthest a read's byte states; each is refused before
+        // the parameter it would name is looked for.
+        for root in [2u8, 7, 0xFF] {
+            assert_eq!(
+                why_refused(reading(&[(srv, root, 0)])),
+                "used descriptor of unknown root kind",
+                "root {root}"
+            );
+        }
+        // An unknown root kind is refused even beside a valid read.
+        assert_eq!(
+            why_refused(reading(&[(srv, 3, 0), (srv, 2, 0)])),
+            "used descriptor of unknown root kind"
+        );
     }
 
     #[test]
