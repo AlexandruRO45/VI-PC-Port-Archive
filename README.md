@@ -27,7 +27,7 @@ histories merge rather than being grafted: this fork's commit log contains
 fxceless's own commits and upstream's, unsquashed. See
 [Sources and attribution](#sources-and-attribution) for what came from where.
 
-## Status, checked against `082a618`
+## Status, checked against `253eea0`
 
 **Not playable.** The menus and the opening cutscene draw; a world frame has
 never been captured. The base this fork adopted reports a cutscene and a
@@ -36,8 +36,8 @@ adopted base now draws the cutscene too. Those are two different claims and the
 table keeps them apart.
 
 Every claim in this file carries one of three marks, and the file is re-checked
-whenever `main` moves. At **`082a618`** (2026-11-24), and re-checked at each move
-(`b3b8533` → `214f670` → `082a618`), with every verdict that changed saying so:
+whenever `main` moves. At **`253eea0`** (2026-11-24), and re-checked at each move
+(`b3b8533` → `214f670` → `082a618` → `253eea0`), with every verdict that changed saying so:
 
 - **verified** — read in the code at that sha, or measured by this fork and
   reproduced from the artefact it rests on;
@@ -241,7 +241,7 @@ tree. A row marked *carried by the base* kept its effect without our commit, and
 *unverified* means nobody has checked whether the base's own form does the same
 thing.
 
-| Change | Where | In `082a618`? | Measurement, with its conditions |
+| Change | Where | In `253eea0`? | Measurement, with its conditions |
 |---|---|---|---|
 | An optimized clear value only on a texture that can take one | `crates/victory-gpu/src/resource.rs` (`host_texture_desc`) | **Yes, since the re-apply** — `host_texture_desc(desc, clear)` at `resource.rs:1631` now takes the clear value and returns the one that survives the flag rules (`(ResourceDesc, Option<[u32; 5]>)`); it was absent at `b3b8533` | A WARP probe: D3D12 answers `E_INVALIDARG` (`0x80070057`) for a clear value on a resource whose render-target flag the format's rules removed. Before the fix, three `no host texture` failures a session for NV12 (format 86) at 1024x4096 and B4G4R4A4_UNORM (115) at 2560x1440 |
 | A view needs its resource's permission, and a clear it cannot serve is skipped | `crates/victory-gpu/src/host.rs` (`allows`, `clears_render_target`, `clears_depth`), `list.rs` (both clears) | **Yes, since the re-apply** — `clears_render_target` and `clears_depth` at `host.rs:45-54` both answer through `allows`; the once-only log helper `once_render` did not come back with them | The `op=clear_rtv` device removal at frame 1494, named by the breadcrumb ring (barrier, transition, resource_create, indirect, execute, dispatch, clear_rtv), is gone: a skipped clear records `b=1` instead of handing a null view to the runtime. Test: `a_depth_target_takes_no_unordered_view` |
@@ -364,7 +364,7 @@ tree**: `VICTORY_GPU_CHECK` and `VICTORY_D3D12_VALIDATE` are this fork's own
 instruments, written and used, which the adoption merge has not restored —
 `VICTORY_SERIAL_PIPELINES` was in the same state at `214f670` and came back with
 the re-apply. They describe what the re-apply still owes, not switches you can
-set against `082a618` today. The base carries about a
+set against `253eea0` today. The base carries about a
 hundred more of its own, mostly experiments, each described in a comment where
 it is read; its README is the index for those.
 
@@ -398,7 +398,7 @@ it is read; its README is the index for those.
 |---|---|
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | *diagnostics.* Translated loops stop after `n` iterations per lane (decimal or `0x` hex, at least 1) instead of 2^20. The value is part of the translation, so it takes its own cache entries. If a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_SKIP_PIPELINES=<hash>,…` | as above: omits work whose pipeline contains that shader |
-| `VICTORY_SERIAL_PIPELINES=1` | Creates compute pipelines one at a time, to tell a driver race from a description we build differently each run. A refusal that a later attempt at the same module survives is not a verdict on the module |
+| `VICTORY_SERIAL_PIPELINES=1` | Creates host pipelines one at a time, through one lock that every path into the vendor's compiler takes (the lazy helpers included), to tell a driver race from a description we build differently each run. A refusal that a later attempt at the same module survives is not a verdict on the module |
 
 ### What the process did
 
@@ -436,7 +436,9 @@ submission instead of once per texture is the fix under test.
 
 | Variable | Effect |
 |---|---|
-| `VICTORY_PIPELINE_WAIT_MS=<n>` | The per-frame budget, over all threads, for waiting on background pipeline creation. Default 500 ms; a draw can be omitted until its pipeline is ready |
+| `VICTORY_PIPELINE_WAIT_MS=<n>` | The per-frame budget, over all threads, for waiting on a background pipeline. Default 500 ms, shared across the threads of a frame; a draw is omitted until its pipeline is ready, and a budget of 0 never waits |
+| `VICTORY_PIPELINE_WAIT_BY_DURATION=1` | *diagnostics.* Off by default. On, a frame also gives up on a wait whose making is known to take longer than what is left of the budget — and **the draw it gives up on is the picture**: this is what turned a whole cutscene black on 2026-11-24. The measurement behind it stands (every world frame spent its 500 ms on stages that take 2.7 s and completed no pipeline), so it measures that, and it is never a setting |
+| `VICTORY_PIPELINE_TIMING=1` | *diagnostics.* Prints, once a second, where a pipeline's time goes — queued, translated, waiting on another thread's translation, root signature, library load, driver compile, stored back — with the rate they add up to, what draining the queue would take at that rate, and how much of the time the workers were busy rather than waiting for a processor |
 | `VICTORY_LATE_WAIT=1\|2\|3` | Sends a queue's submissions without waiting for each, and settles them at the next point a title buffer, a fence or a present is observed. Off unless the value is exactly 1, 2 or 3, and forced off by `VICTORY_GPU_TIMING`, which has to wait for each list to time it |
 | `VICTORY_RELAY=<1\|2>` | A thread of its own lands finished flights as the card runs them, so the submitting thread never waits and copies back itself. `2` also waits only for the flights that declared a range, not for everything in the air |
 | `VICTORY_WIDE_BACK=1` | Takes a submission's shader-written snapshots together and compares everything declared after the card, cut into ~1 MiB pieces over a few threads, instead of range by range on one |
