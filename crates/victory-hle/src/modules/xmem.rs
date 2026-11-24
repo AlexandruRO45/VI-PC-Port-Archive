@@ -249,12 +249,28 @@ pub extern "system" fn XMemVirtualAlloc(
     };
     if !at.is_null() && !placeholder {
         let addr = at as usize;
-        let already_tracked = !constrained && {
-            let regions = VIRTUAL_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
-            regions
-                .range(..=addr)
-                .next_back()
-                .is_some_and(|(&rbase, &(rlen, _))| addr < rbase.saturating_add(rlen))
+        let already_tracked = !constrained && (kind & MEM_RESERVE == 0) && {
+            let candidate = {
+                let regions = VIRTUAL_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+                regions
+                    .range(..=addr)
+                    .next_back()
+                    .filter(|&(&rbase, &(rlen, _))| addr < rbase.saturating_add(rlen))
+                    .map(|(&rbase, _)| rbase)
+            };
+            candidate.is_some_and(|rbase| {
+                let mut mbi = MEMORY_BASIC_INFORMATION::default();
+                // SAFETY: pseudo-handle and writable MEMORY_BASIC_INFORMATION.
+                let ok = unsafe {
+                    VirtualQueryEx(
+                        GetCurrentProcess(),
+                        at,
+                        &mut mbi,
+                        size_of::<MEMORY_BASIC_INFORMATION>(),
+                    )
+                };
+                ok != 0 && mbi.State != MEM_FREE && mbi.AllocationBase as usize == rbase
+            })
         };
         if !already_tracked {
             record_virtual_region(addr, size, flags & GRAPHICS != 0);
@@ -1234,6 +1250,51 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(count, pages.as_ptr()), 1);
         let after_phys_free = stats();
         assert!(after_phys_free.physical_pages + 50 <= after_phys.physical_pages);
+    }
+
+    #[test]
+    fn virtual_alloc_retracks_reused_subaddress_after_virtual_free() {
+        let stats = || {
+            let mut ws = WorkingSet::default();
+            assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut ws), 1);
+            ws
+        };
+
+        let before = stats();
+        let virt = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            16 * MIB,
+            MEM_RESERVE,
+            GRAPHICS,
+            PAGE_NOACCESS,
+        );
+        assert!(!virt.is_null());
+        // Release directly via VirtualFree without calling stats() in between so
+        // the old reservation stays in VIRTUAL_REGIONS as a stale entry.
+        // SAFETY: our reservation from above.
+        assert_ne!(unsafe { VirtualFree(virt, 0, MEM_RELEASE) }, 0);
+
+        let sub = virt.wrapping_byte_add(MIB);
+        let reused = XMemVirtualAlloc(
+            sub,
+            8 * MIB,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        if reused.is_null() {
+            return;
+        }
+        assert_eq!(reused, sub);
+
+        let after_reuse = stats();
+        assert!(after_reuse.title_used >= before.title_used + 6 * MIB);
+        assert!(after_reuse.gpu_optimal_used >= before.gpu_optimal_used + 6 * MIB);
+
+        // SAFETY: our reservation from above.
+        assert_ne!(unsafe { VirtualFree(reused, 0, MEM_RELEASE) }, 0);
+        let after_free = stats();
+        assert!(after_free.title_used + 6 * MIB <= after_reuse.title_used);
     }
 
     #[test]

@@ -294,6 +294,11 @@ impl Timer {
     fn schedule(&'static self, queue: Arc<Queue>, port: u32, delay_ms: u32, task: Task) {
         let due = Instant::now() + Duration::from_millis(delay_ms.into());
         let mut state = lock(&self.state);
+        if queue.terminated.load(Ordering::Acquire) {
+            drop(state);
+            task.run(true);
+            return;
+        }
         if !state.started {
             state.started = true;
             if std::thread::Builder::new()
@@ -325,6 +330,24 @@ impl Timer {
         }
     }
 
+    fn cancel_queue(&'static self, queue: &Arc<Queue>) -> Vec<Task> {
+        let mut canceled = Vec::new();
+        let mut state = lock(&self.state);
+        let mut kept = BinaryHeap::with_capacity(state.heap.len());
+        for Reverse(item) in state.heap.drain() {
+            if Arc::ptr_eq(&item.queue, queue) {
+                canceled.push(item.task);
+            } else {
+                kept.push(Reverse(item));
+            }
+        }
+        state.heap = kept;
+        if !canceled.is_empty() {
+            self.wake.notify_one();
+        }
+        canceled
+    }
+
     fn run(&'static self) {
         let mut state = lock(&self.state);
         loop {
@@ -346,7 +369,9 @@ impl Timer {
                 continue;
             };
             drop(state);
-            if !item.queue.terminated.load(Ordering::Acquire) {
+            if item.queue.terminated.load(Ordering::Acquire) {
+                item.task.run(true);
+            } else {
                 item.queue.deliver(item.port, item.task);
             }
             state = lock(&self.state);
@@ -539,6 +564,9 @@ pub fn XTaskQueueTerminate(
         return E_INVALIDARG;
     };
     queue.terminated.store(true, Ordering::Release);
+    for task in TIMER.cancel_queue(&queue) {
+        task.run(true);
+    }
     for port in &queue.ports {
         let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
         for task in pending {
@@ -912,7 +940,10 @@ pub fn pending_with(
     identity: *const c_void,
     work: impl FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
 ) -> HRESULT {
-    type Data = Mutex<(Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>, Vec<u8>)>;
+    type Data = Mutex<(
+        Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>,
+        Vec<u8>,
+    )>;
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
         // SAFETY: the runtime passes valid provider data; the context is the
         // boxed state until cleanup frees it.
@@ -923,7 +954,11 @@ pub fn pending_with(
             OP_CLEANUP => drop(unsafe { Box::from_raw(state) }),
             OP_BEGIN => {
                 // SAFETY: as above; cleanup waits for completion.
-                let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
+                let work = unsafe { &*state }
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0
+                    .take();
                 let (block, state) = (data.block as usize, state as usize);
                 std::thread::spawn(move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
@@ -952,7 +987,13 @@ pub fn pending_with(
     }
     let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
     let context = Box::into_raw(state);
-    let hr = XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider));
+    let hr = XAsyncBegin(
+        block,
+        context.cast(),
+        identity,
+        std::ptr::null(),
+        Some(provider),
+    );
     if hr < 0 {
         // SAFETY: refused before the call existed; still ours.
         drop(unsafe { Box::from_raw(context) });
@@ -1443,5 +1484,29 @@ mod tests {
         assert_eq!(DONE.load(Ordering::SeqCst), total);
         assert!(pool.worker_count() <= 3);
         pool.stop();
+    }
+
+    #[test]
+    fn terminate_cancels_pending_delayed_callbacks_immediately() {
+        extern "system" fn note(context: *mut c_void, canceled: bool) {
+            // SAFETY: the test passes a pointer to its atomic flag.
+            unsafe { (*context.cast::<AtomicBool>()).store(canceled, Ordering::SeqCst) };
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let canceled = AtomicBool::new(false);
+        let flag = (&canceled as *const AtomicBool).cast_mut().cast();
+        let start = Instant::now();
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 10_000, flag, Some(note)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueTerminate(q, true, std::ptr::null_mut(), None),
+            S_OK
+        );
+        assert!(canceled.load(Ordering::SeqCst));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        XTaskQueueCloseHandle(q);
     }
 }
