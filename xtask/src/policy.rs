@@ -1119,10 +1119,10 @@ mod tests {
             if cfg!(unix) && dir.as_os_str().as_encoded_bytes().contains(&b':') {
                 continue;
             }
-            if let Ok(tmp) = tempfile::tempdir_in(dir) {
-                if unseen_by_full_check(&checkout, tmp.path()) {
-                    return tmp;
-                }
+            if let Ok(tmp) = tempfile::tempdir_in(dir)
+                && unseen_by_full_check(&checkout, tmp.path())
+            {
+                return tmp;
             }
         }
         panic!(
