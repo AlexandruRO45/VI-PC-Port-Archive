@@ -10,7 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use victory_shader::emit::{DescriptorBinding, TITLE_MEMORY_VIEWS};
+use victory_shader::emit::{DescriptorBinding, TITLE_MEMORY_VIEWS, UserData};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -165,6 +165,15 @@ fn dropped(pipeline: usize) {
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
+/// Root UAV bindings so far: bounded by the shader's extent, and not (the
+/// rest of the title buffer's copy), with the bytes each declared.
+static ROOT_UAVS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Root UAVs bound and unbound so far, and the bytes they declared.
+pub(crate) fn root_uav_counts() -> [u64; 4] {
+    ROOT_UAVS.each_ref().map(|c| c.load(Ordering::Relaxed))
+}
+
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
@@ -316,6 +325,13 @@ fn root_uav_copy_back() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_ROOT_UAV_BACK").map_or(true, |v| v.trim() != "0"))
 }
 
+/// Local build: `VICTORY_ROOT_UAV_EXTENT=0` declares a root UAV to the end
+/// of its copy even when the shader bounds what it reaches.
+fn root_uav_extent() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_ROOT_UAV_EXTENT").map_or(true, |v| v.trim() != "0"))
+}
+
 fn root_address(root: Option<&Root>, kind: RootBuffer) -> Result<u64, &'static str> {
     match root {
         Some(&Root::View(actual, address)) if actual == kind => Ok(address),
@@ -324,7 +340,14 @@ fn root_address(root: Option<&Root>, kind: RootBuffer) -> Result<u64, &'static s
     }
 }
 
-fn root_view(list: &HostList, address: u64, kind: RootBuffer) -> Result<RootView, &'static str> {
+/// The root view of `address`. A root UAV reaches `extent` bytes when the
+/// shader bounds it, otherwise the rest of its copy.
+fn root_view(
+    list: &HostList,
+    address: u64,
+    kind: RootBuffer,
+    extent: Option<u64>,
+) -> Result<RootView, &'static str> {
     if address == 0 {
         return Err("the title GPU address is null");
     }
@@ -334,9 +357,14 @@ fn root_view(list: &HostList, address: u64, kind: RootBuffer) -> Result<RootView
     let limit = match kind {
         RootBuffer::Cbv => 1 << 16,
         RootBuffer::Srv => 1 << 20,
-        RootBuffer::Uav => u64::MAX,
+        RootBuffer::Uav => extent.map_or(u64::MAX, |e| e.max(4)),
     };
     let len = shadow.left(address).min(limit);
+    if kind == RootBuffer::Uav {
+        let k = if extent.is_some() { 0 } else { 1 };
+        ROOT_UAVS[k].fetch_add(1, Ordering::Relaxed);
+        ROOT_UAVS[k + 2].fetch_add(len, Ordering::Relaxed);
+    }
     let resource = if shadow.is_mirrored() {
         &crate::mirror::get().ok_or("no title memory mirror")?.buffer
     } else {
@@ -657,11 +685,18 @@ impl State {
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
-        self.prepare_for(list, indexed, false)
+        self.prepare_for(list, indexed, false, None)
     }
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
-    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+    /// `groups`: a direct mesh dispatch's group counts.
+    fn prepare_for(
+        &mut self,
+        list: &HostList,
+        indexed: bool,
+        mesh: bool,
+        groups: Option<[u32; 3]>,
+    ) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -673,7 +708,7 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
-        if !self.bind(list, p, false) {
+        if !self.bind(list, p, false, groups) {
             return false;
         }
         let l = &list.list;
@@ -736,7 +771,16 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+    ///
+    /// `groups`: the group counts of a direct dispatch (bounding the root
+    /// UAVs a shader reaches by its ids), `None` for draws and indirect ones.
+    fn bind(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        compute: bool,
+        groups: Option<[u32; 3]>,
+    ) -> bool {
         if p.compute != compute {
             return false;
         }
@@ -850,22 +894,7 @@ impl State {
                     RootBinding::Constants(dwords) => {
                         let mut values = vec![0u32; dwords as usize];
                         for u in &t.host.user_data {
-                            let fresh = made
-                                .iter()
-                                .find(|m| m.0 == u.slot && u.root == RootType::Table);
-                            let value = match fresh {
-                                Some(&(_, offset)) => Some(offset),
-                                None if u.root == RootType::Table => {
-                                    self.table_offset(compute, u.slot)
-                                }
-                                None => match self.roots_ref(compute).get(usize::from(u.slot)) {
-                                    Some(Root::Constants(words)) => {
-                                        words.get(u.dword as usize).copied().flatten()
-                                    }
-                                    _ => None,
-                                },
-                            };
-                            let Some(value) = value else {
+                            let Some(value) = self.user_word(&made, compute, u) else {
                                 once!(pipeline = %p.name, slot = u.slot, ?u.root, u.dword,
                                     "draw or dispatch dropped: missing or invalid root data");
                                 return false;
@@ -892,9 +921,21 @@ impl State {
                         RootArgument::Constants(values)
                     }
                     RootBinding::Buffer { slot, kind } => {
+                        let user = |dword: u8| {
+                            let u = t
+                                .host
+                                .user_data
+                                .iter()
+                                .find(|u| u.index == u32::from(dword))?;
+                            self.user_word(&made, compute, u)
+                        };
+                        let extent = (kind == RootBuffer::Uav && root_uav_extent())
+                            .then(|| t.host.root_uav_extents.iter().find(|e| e.slot == slot))
+                            .flatten()
+                            .and_then(|e| e.len(groups, user));
                         let view =
                             root_address(self.roots_ref(compute).get(usize::from(slot)), kind)
-                                .and_then(|address| root_view(list, address, kind));
+                                .and_then(|address| root_view(list, address, kind, extent));
                         let view = match view {
                             Ok(view) => view,
                             Err(reason) => {
@@ -1074,7 +1115,7 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        if !self.bind(list, p, true, Some([x, y, z])) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
@@ -1184,7 +1225,7 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = self.prepare_for(list, false, true)
+        let ran = self.prepare_for(list, false, true, Some([x, 1, 1]))
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
@@ -1208,6 +1249,22 @@ impl State {
             &self.compute
         } else {
             &self.graphics
+        }
+    }
+
+    /// The value of user-data dword `u` for this bind: a table's offset
+    /// (`made` holds the tables just made) or a root constant.
+    fn user_word(&self, made: &[(u8, u32)], compute: bool, u: &UserData) -> Option<u32> {
+        let fresh = made
+            .iter()
+            .find(|m| m.0 == u.slot && u.root == RootType::Table);
+        match fresh {
+            Some(&(_, offset)) => Some(offset),
+            None if u.root == RootType::Table => self.table_offset(compute, u.slot),
+            None => match self.roots_ref(compute).get(usize::from(u.slot)) {
+                Some(Root::Constants(words)) => words.get(u.dword as usize).copied().flatten(),
+                _ => None,
+            },
         }
     }
 
@@ -1588,9 +1645,9 @@ impl State {
         self.host_roots[1] = 0;
         let ran = match kind {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
+            MESH => self.prepare_for(list, false, true, None),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
+                Some(p) if p.compute => self.bind(list, p, true, None),
                 _ => false,
             },
             _ => false,

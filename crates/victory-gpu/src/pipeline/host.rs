@@ -838,6 +838,7 @@ mod root_binding_tests {
             descriptor_bindings: Vec::new(),
             buffer_addresses: Vec::new(),
             group_offsets: Vec::new(),
+            root_uav_extents: Vec::new(),
         }
     }
 
