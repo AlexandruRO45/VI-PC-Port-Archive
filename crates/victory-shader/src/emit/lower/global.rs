@@ -433,12 +433,9 @@ impl Lower<'_> {
             .layout
             .get(a.param)
             .ok_or("a descriptor read as data from no table")?;
-        let samplers = self
-            .x
-            .native
-            .used
-            .iter()
-            .any(|u| u.slot == rp.slot && u.kind == ResourceType::Sampler);
+        let samplers = self.x.native.used.iter().any(|u| {
+            u.slot == rp.slot && u.root == RootType::Table && u.kind == ResourceType::Sampler
+        });
         let base = match rp.root {
             RootType::Table if !samplers => match self.user(a.param, 0) {
                 Val::I32(x) => x,
