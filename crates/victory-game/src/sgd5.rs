@@ -3235,4 +3235,73 @@ mod tests {
         assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
         assert_eq!(found[1].span().end, file.len());
     }
+
+    #[test]
+    fn lone_distance_code_is_a_stream_and_its_missing_half_is_noise() {
+        // A dynamic block's codes must be complete, with two exceptions
+        // deflate allows for the distance code: one code of 1 bit, the
+        // other 1-bit code left unassigned, and no code at all (one length
+        // of 0) for data of literals only. A copy coded with the one code
+        // is a stream; a copy coded with the unassigned half, or any copy
+        // when there is no distance code, breaks it. Such a broken record
+        // covers no other, so it is yielded and does not unpack, and the
+        // record after it is found either way.
+        let a = u32::from(b'A');
+        // Code-length code: 18 in 1 bit, 2 in 2, 1 in 3, 0 and 17 in 4.
+        let mut clen = [0; 19];
+        (clen[18], clen[2], clen[1], clen[0], clen[17]) = (1, 2, 3, 4, 4);
+        // Literal/length codes: `A` in 1 bit, the end of the block and
+        // length code 257 (3 bytes) in 2; one distance code (distance 1)
+        // of `dist` bits.
+        let block = |dist: u32, copy: Option<u32>| {
+            let mut lengths = vec![0; 257 + 1 + 1];
+            (lengths[a as usize], lengths[256], lengths[257]) = (1, 2, 2);
+            lengths[258] = dist;
+            let lit = &lengths[..258];
+            let lit_codes = canonical(lit);
+            let mut bits = dynamic_header(258, 1, &clen, &length_symbols(&lengths));
+            bits.code(lit_codes[a as usize], 1);
+            match copy {
+                Some(code) => {
+                    bits.code(lit_codes[257], 2);
+                    bits.code(code, 1);
+                }
+                None => {
+                    for _ in 0..3 {
+                        bits.code(lit_codes[a as usize], 1);
+                    }
+                }
+            }
+            bits.code(lit_codes[256], 2);
+            bits.out
+        };
+        let want = b"AAAA".to_vec();
+        for (what, dist, copy, valid) in [
+            ("copy by the lone 1-bit code", 1, Some(0), true),
+            ("copy by its unassigned half", 1, Some(1), false),
+            ("literals only, no distance code", 0, None, true),
+            ("copy with no distance code", 0, Some(0), false),
+        ] {
+            let packed = block(dist, copy);
+            assert_eq!(
+                miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                valid.then(|| want.clone()),
+                "{what}"
+            );
+            assert_eq!(starts_stream(&packed, want.len()), valid, "{what}");
+
+            let (file, marker) = outer_then_after(&packed, want.len());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            assert_eq!(found[0].unpack(), valid.then(|| want.clone()), "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "{what}");
+        }
+    }
 }
