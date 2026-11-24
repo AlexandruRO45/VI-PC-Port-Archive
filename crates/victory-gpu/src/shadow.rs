@@ -334,11 +334,12 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
+            let mut scratch = Scratch::new();
             let mut synced = Vec::new();
             // Local build: which pieces the GPU changed, compared on several threads (one core
             // compared ~100 MB per submission, 27 submissions a frame: ~170 ms).
             let changed = changed_pieces(self, base, start, from, to);
+            let sync = !self.is_mirrored();
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
@@ -351,36 +352,11 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.ptr(at), n) };
                 // SAFETY: inside the snapshot's filled part; the lock is held, so it may be updated.
                 let old = unsafe { std::slice::from_raw_parts_mut((base + at) as *mut u8, n) };
-                let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Only the dwords the GPU changed go to title memory, each run written by
-                    // itself: the title's threads keep writing the rest of the piece while we
-                    // work (a whole 64 KiB piece read, patched and written back lost their
-                    // writes made in between: the world's root UAVs reach to the end of big
-                    // heaps the title's own records live in).
-                    let runs = gpu_runs(start + at, host, old);
-                    let mut opened = false;
-                    for &(a, b) in &runs {
-                        if title[a..b] == host[a..b] {
-                            continue;
-                        }
-                        if !opened {
-                            crate::watch::writing(start + at, n);
-                            opened = true;
-                        }
-                        crate::host::write_mapped((start + at + a) as *mut u8, host[a..b].as_ptr(), b - a);
-                        title[a..b].copy_from_slice(&host[a..b]);
-                        written += b - a;
-                    }
-                    if !self.is_mirrored() {
-                        // The copy takes the title's bytes in turn (its own buffer: no other
-                        // copy compares against it).
-                        host.copy_from_slice(title);
+                if let Some(w) = back_piece(start + at, host, old, &mut scratch, sync, back_mode()) {
+                    written += w;
+                    if sync {
                         synced.push((start + at) / PAGE);
                     }
-                    // Done with the piece: another range of this copy declared in the same
-                    // submission finds nothing more to write here.
-                    old.copy_from_slice(host);
                 }
                 at += n;
             }
@@ -776,21 +752,185 @@ fn gaps(from: usize, to: usize, mut holes: Vec<(usize, usize)>) -> Vec<(usize, u
 /// The runs (offsets in the piece, end exclusive) of the dwords of a piece at title address
 /// `address` whose bytes in `host` differ from `old`: what the GPU wrote. Dwords are aligned
 /// to title memory; a piece's partial first and last dwords count by themselves.
+#[cfg(test)]
 fn gpu_runs(address: usize, host: &[u8], old: &[u8]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    gpu_runs_into(address, host, old, &mut runs);
+    runs
+}
+
+/// The runs of changed dwords, as `gpu_runs` gives them, into `runs` (cleared first). Equal
+/// stretches are skipped 32 bytes at a time (fixed-size compares the compiler makes vector
+/// compares) instead of dword by dword.
+fn gpu_runs_into(address: usize, host: &[u8], old: &[u8], runs: &mut Vec<(usize, usize)>) {
+    runs.clear();
     let n = host.len().min(old.len());
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    let mut at = 0;
-    while at < n {
+    let (host, old) = (&host[..n], &old[..n]);
+    let mut push = |a: usize, e: usize| match runs.last_mut() {
+        Some(r) if r.1 == a => r.1 = e,
+        _ => runs.push((a, e)),
+    };
+    // one title dword (or the part of it in the piece) from `at`
+    let dword = |at: usize, push: &mut dyn FnMut(usize, usize)| -> usize {
         let end = ((address + at) / 4 * 4 + 4 - address).min(n);
         if host[at..end] != old[at..end] {
-            match runs.last_mut() {
-                Some(r) if r.1 == at => r.1 = end,
-                _ => runs.push((at, end)),
+            push(at, end);
+        }
+        end
+    };
+    let mut at = 0;
+    while at < n && !(address + at).is_multiple_of(8) {
+        at = dword(at, &mut push);
+    }
+    // `at` is 8-aligned in title memory from here on, so each 4 bytes are a whole dword
+    while at + 32 <= n {
+        let h: &[u8; 32] = host[at..at + 32].try_into().unwrap();
+        let o: &[u8; 32] = old[at..at + 32].try_into().unwrap();
+        if h != o {
+            for k in (0..32).step_by(4) {
+                if h[k..k + 4] != o[k..k + 4] {
+                    push(at + k, at + k + 4);
+                }
             }
         }
-        at = end;
+        at += 32;
     }
-    runs
+    while at < n {
+        at = dword(at, &mut push);
+    }
+}
+
+/// How the copy-back writes title memory.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BackMode {
+    /// One `WriteProcessMemory` per run of changed dwords (8867c99's way; ~10 us a run: the
+    /// world's ~100,000 runs a frame took 1.7 to 5 s).
+    Kernel,
+    /// Plain stores where the piece is committed read-write (one query per piece written),
+    /// the kernel elsewhere (read-only or otherwise protected title memory).
+    Direct,
+}
+
+/// Local build: `VICTORY_COPY_BACK_KERNEL=1` writes every run through the kernel again.
+fn back_mode() -> BackMode {
+    static MODE: std::sync::OnceLock<BackMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        if std::env::var("VICTORY_COPY_BACK_KERNEL").is_ok_and(|v| v.trim() == "1") { BackMode::Kernel } else { BackMode::Direct }
+    })
+}
+
+/// The last title region found committed and read-write (`[from, to)`), kept for the pieces
+/// after it: a query costs about as much as walking the region (~80 us for a 64 MB heap, the
+/// time 1,000 pieces' worth of runs take to write). Only read-write answers are kept: a block
+/// the write guards (`crate::watch`) opened since is asked again.
+#[derive(Default)]
+struct Writable {
+    from: usize,
+    to: usize,
+}
+
+impl Writable {
+    /// Whether all of `[at, at + n)` is committed and read-write (a plain store cannot fault
+    /// there except into the write guards' handler, which opens the block).
+    fn covers(&mut self, at: usize, n: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE, VirtualQuery,
+        };
+        let end = at + n;
+        let mut p = at;
+        while p < end {
+            if (self.from..self.to).contains(&p) {
+                p = self.to;
+                continue;
+            }
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            if unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) } == 0 {
+                return false;
+            }
+            let base = info.Protect & 0xff;
+            let next = info.BaseAddress as usize + info.RegionSize;
+            if info.State != MEM_COMMIT
+                || info.Protect & PAGE_GUARD != 0
+                || (base != PAGE_READWRITE && base != PAGE_EXECUTE_READWRITE)
+                || next <= p
+            {
+                return false;
+            }
+            (self.from, self.to) = (info.BaseAddress as usize, next);
+            p = next;
+        }
+        true
+    }
+}
+
+/// What [`back_piece`] reuses from piece to piece of a copy-back.
+struct Scratch {
+    /// Room for a piece's title bytes.
+    title: Vec<u8>,
+    runs: Vec<(usize, usize)>,
+    writable: Writable,
+}
+
+impl Scratch {
+    fn new() -> Scratch {
+        Scratch { title: vec![0; 64 << 10], runs: Vec::new(), writable: Writable::default() }
+    }
+}
+
+/// The copy-back of one piece (inside one 64 KiB title page) at title address `at`: `host` is
+/// the copy after the submission, `old` the snapshot before it (at most 64 KiB). Writes into title memory only the runs of dwords the GPU changed that title
+/// memory does not already hold, each run by itself: the title's threads keep writing the rest
+/// of the piece while we work (a whole 64 KiB piece read, patched and written back lost their
+/// writes made in between: the world's root UAVs reach to the end of big heaps the title's
+/// own records live in). With `sync`, the copy then takes the title's bytes (its own buffer:
+/// no other copy compares against it). The snapshot takes the copy's bytes: another range of
+/// the copy declared in the same submission finds nothing more to write here.
+///
+/// `None` when nothing was done (the GPU wrote nothing here, or title memory is unreadable);
+/// else the bytes written.
+fn back_piece(
+    at: usize,
+    host: &mut [u8],
+    old: &mut [u8],
+    scratch: &mut Scratch,
+    sync: bool,
+    mode: BackMode,
+) -> Option<usize> {
+    let n = host.len();
+    let Scratch { title, runs, writable } = scratch;
+    let title = &mut title[..n];
+    if host == old || !crate::host::read_into(at as *const u8, title) {
+        return None;
+    }
+    gpu_runs_into(at, host, old, runs);
+    let mut written = 0;
+    // decided at the first run to write: plain stores, or the kernel
+    let mut direct = None;
+    for &(a, b) in runs.iter() {
+        if title[a..b] == host[a..b] {
+            continue;
+        }
+        let direct = *direct.get_or_insert_with(|| {
+            crate::watch::writing(at, n);
+            mode == BackMode::Direct && writable.covers(at, n)
+        });
+        if direct {
+            // SAFETY: committed read-write title memory (just asked; the title does not unmap
+            // memory a submission it waits for writes), our own copy as the source.
+            unsafe { std::ptr::copy_nonoverlapping(host[a..b].as_ptr(), (at + a) as *mut u8, b - a) };
+        } else {
+            crate::host::write_mapped((at + a) as *mut u8, host[a..b].as_ptr(), b - a);
+        }
+        title[a..b].copy_from_slice(&host[a..b]);
+        written += b - a;
+    }
+    if sync {
+        host.copy_from_slice(title);
+    }
+    old.copy_from_slice(host);
+    Some(written)
 }
 
 /// The current submission's number (see [`next_submission`]).
@@ -1071,6 +1211,248 @@ mod tests {
         assert_eq!(&title[8..12], &[1, 2, 3, 4]);
         assert_eq!(title[40], 0xee);
         assert!(title[..8].iter().chain(&title[12..40]).all(|&b| b == 5));
+    }
+
+    /// 8867c99's dword walk, the reference the faster one must match.
+    fn gpu_runs_reference(address: usize, host: &[u8], old: &[u8]) -> Vec<(usize, usize)> {
+        let n = host.len().min(old.len());
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut at = 0;
+        while at < n {
+            let end = ((address + at) / 4 * 4 + 4 - address).min(n);
+            if host[at..end] != old[at..end] {
+                match runs.last_mut() {
+                    Some(r) if r.1 == at => r.1 = end,
+                    _ => runs.push((at, end)),
+                }
+            }
+            at = end;
+        }
+        runs
+    }
+
+    /// A small deterministic generator (no dependency).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    #[test]
+    fn fast_gpu_runs_match_the_reference() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for round in 0..3000 {
+            let n = 1 + rng.below(300);
+            let address = 0x1_0000 + rng.below(16);
+            let old: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+            let mut host = old.clone();
+            for _ in 0..rng.below(1 + round % 12) {
+                let i = rng.below(n);
+                host[i] = host[i].wrapping_add(1 + rng.below(255) as u8);
+            }
+            let mut runs = Vec::new();
+            gpu_runs_into(address, &host, &old, &mut runs);
+            assert_eq!(runs, gpu_runs_reference(address, &host, &old), "n {n} at {address:#x}");
+        }
+    }
+
+    /// Title memory for the tests: committed read-write pages of our own (never freed).
+    fn title_memory(len: usize) -> &'static mut [u8] {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        // SAFETY: a fresh allocation, never freed.
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            assert!(!p.is_null());
+            std::slice::from_raw_parts_mut(p.cast(), len)
+        }
+    }
+
+    /// Both ways of writing put the same bytes in title memory: the changed dwords title memory
+    /// did not hold already, nothing else. Read-only title memory goes through the kernel, which
+    /// leaves it alone in both.
+    #[test]
+    fn back_piece_writes_the_same_bytes_either_way() {
+        const N: usize = 64 << 10;
+        for protect in [false, true] {
+            let mut results = Vec::new();
+            for mode in [BackMode::Kernel, BackMode::Direct] {
+                let title = title_memory(N);
+                let mut rng = Rng(7);
+                for b in title.iter_mut() {
+                    *b = rng.next() as u8;
+                }
+                let mut old = title.to_vec();
+                let mut host = old.clone();
+                for _ in 0..500 {
+                    let i = rng.below(N);
+                    host[i] ^= 0x5a;
+                }
+                // a dword the title already holds with the GPU's value: not written
+                host[100..104].copy_from_slice(&[9, 9, 9, 9]);
+                title[100..104].copy_from_slice(&[9, 9, 9, 9]);
+                if protect {
+                    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+                    let mut was = 0;
+                    // SAFETY: our own allocation.
+                    unsafe { VirtualProtect(title.as_ptr().cast(), N, PAGE_READONLY, &mut was) };
+                    assert!(!Writable::default().covers(title.as_ptr() as usize, N));
+                }
+                // (the kernel does not write read-only memory either: it stays as it was)
+                let mut expected = title.to_vec();
+                if !protect {
+                    for (a, b) in gpu_runs_reference(title.as_ptr() as usize, &host, &old) {
+                        expected[a..b].copy_from_slice(&host[a..b]);
+                    }
+                }
+                let at = title.as_ptr() as usize;
+                let w = back_piece(at, &mut host, &mut old, &mut Scratch::new(), true, mode).unwrap();
+                let wrong = title.iter().zip(&expected).position(|(a, b)| a != b);
+                assert!(wrong.is_none(), "{mode:?}, protect {protect}: byte {wrong:?}");
+                // (read-only: the copy takes what we tried to write, as in 8867c99)
+                if !protect {
+                    assert_eq!(host, expected, "the copy takes the title's bytes");
+                }
+                assert_eq!(old, host, "the snapshot takes the copy's");
+                results.push((w, title.to_vec()));
+            }
+            assert!(results[0] == results[1], "protect {protect}");
+        }
+    }
+
+    /// Title threads writing a piece's other dwords while it is copied back keep their writes
+    /// (what 8867c99 fixed stays fixed with plain stores).
+    #[test]
+    fn concurrent_title_writes_outside_the_changed_dwords_survive() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const N: usize = 64 << 10;
+        for mode in [BackMode::Direct, BackMode::Kernel] {
+            for round in 0..20u8 {
+                let title = title_memory(N);
+                let at = title.as_ptr() as usize;
+                let old = vec![0u8; N];
+                let mut host = old.clone();
+                // the GPU wrote every 16th dword
+                for d in (0..N / 4).step_by(16) {
+                    host[d * 4..d * 4 + 4].copy_from_slice(&[0xa0, 0xa1, 0xa2, round]);
+                }
+                let stop = AtomicBool::new(false);
+                std::thread::scope(|s| {
+                    let stop = &stop;
+                    // a title thread: the other dwords, over and over, last with `round + 1`
+                    s.spawn(move || {
+                        let mut v = 0u8;
+                        loop {
+                            let last = stop.load(Ordering::Acquire);
+                            let value = if last { round + 1 } else { v };
+                            for d in (0..N / 4).filter(|d| d % 16 != 0) {
+                                // SAFETY: our own memory; volatile so each store happens.
+                                unsafe { std::ptr::write_volatile((at + d * 4) as *mut u32, u32::from(value) * 0x0101_0101) };
+                            }
+                            if last {
+                                break;
+                            }
+                            v = v.wrapping_add(1);
+                        }
+                    });
+                    for _ in 0..4 {
+                        let (mut h, mut o) = (host.clone(), old.clone());
+                        back_piece(at, &mut h, &mut o, &mut Scratch::new(), false, mode);
+                    }
+                    stop.store(true, Ordering::Release);
+                });
+                for d in 0..N / 4 {
+                    let got = &title[d * 4..d * 4 + 4];
+                    if d % 16 == 0 {
+                        assert_eq!(got, &[0xa0, 0xa1, 0xa2, round], "{mode:?}: GPU dword {d}");
+                    } else {
+                        assert_eq!(got, &[round + 1; 4], "{mode:?}: title dword {d} lost its write");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Copy-back of 64 MB with scattered GPU writes: 8867c99's way (byte-slice dword walk, one
+    /// `WriteProcessMemory` a run) against now; title memory restored before each pass.
+    /// `cargo test -p victory-gpu --release --lib copy_back_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    #[allow(clippy::type_complexity)]
+    fn copy_back_cost() {
+        const LEN: usize = 64 << 20;
+        const PIECE: usize = 64 << 10;
+        let title = title_memory(LEN);
+        let at = title.as_ptr() as usize;
+        let mut rng = Rng(42);
+        for b in title.iter_mut() {
+            *b = rng.next() as u8;
+        }
+        let pristine = title.to_vec();
+        let old = pristine.clone();
+        // how many of the 1,024 pieces the GPU wrote, how many dwords in each
+        for (pieces, dwords) in [(1024, 16), (1024, 128), (256, 1024), (64, 4096), (8, 16384), (0, 0)] {
+            let mut host = old.clone();
+            let mut rng = Rng(pieces as u64 * 31 + dwords as u64 + 1);
+            let mut chosen: Vec<usize> = (0..LEN / PIECE).collect();
+            for i in 0..chosen.len() {
+                let j = i + rng.below(chosen.len() - i);
+                chosen.swap(i, j);
+            }
+            for &p in &chosen[..pieces] {
+                for _ in 0..dwords {
+                    host[p * PIECE + rng.below(PIECE / 4) * 4] ^= 0xff;
+                }
+            }
+            let mut pass = |label: &str, f: &mut dyn FnMut(usize, &mut [u8], &mut [u8], &mut [u8]) -> usize| {
+                title.copy_from_slice(&pristine);
+                let (mut h, mut o) = (host.clone(), old.clone());
+                let mut scratch = vec![0u8; PIECE];
+                let t = std::time::Instant::now();
+                let mut written = 0;
+                for p in (0..LEN).step_by(PIECE) {
+                    written += f(at + p, &mut h[p..p + PIECE], &mut o[p..p + PIECE], &mut scratch);
+                }
+                let took = t.elapsed();
+                eprintln!("  {label}: {took:?} ({written} bytes written)");
+                (took, title.to_vec())
+            };
+            eprintln!("64 MB, {pieces} pieces changed, ~{dwords} dwords each:");
+            let (before, a) = pass("before (8867c99)", &mut |at, host, old, title| {
+                if host == old || !crate::host::read_into(at as *const u8, title) {
+                    return 0;
+                }
+                let mut w = 0;
+                let mut opened = false;
+                for (a, b) in gpu_runs_reference(at, host, old) {
+                    if title[a..b] == host[a..b] {
+                        continue;
+                    }
+                    if !opened {
+                        crate::watch::writing(at, host.len());
+                        opened = true;
+                    }
+                    crate::host::write_mapped((at + a) as *mut u8, host[a..b].as_ptr(), b - a);
+                    title[a..b].copy_from_slice(&host[a..b]);
+                    w += b - a;
+                }
+                host.copy_from_slice(title);
+                old.copy_from_slice(host);
+                w
+            });
+            let mut scratch = Scratch::new();
+            let (after, b) = pass("after", &mut |at, host, old, _| {
+                back_piece(at, host, old, &mut scratch, true, BackMode::Direct).unwrap_or(0)
+            });
+            assert!(a == b, "the same bytes either way");
+            eprintln!("  {:.1}x faster", before.as_secs_f64() / after.as_secs_f64().max(1e-9));
+        }
     }
 
     #[test]
