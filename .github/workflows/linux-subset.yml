@@ -101,3 +101,11 @@ jobs:
         run: >
           cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc
           $WINDOWS_CLIPPY_CRATES -- -D warnings
+
+      # The hle-probe fixture is outside the workspace (load_probe builds it on
+      # demand on Windows), so the steps above never compile it. It is
+      # Windows-only and needs no linker to check.
+      - name: clippy (hle-probe fixture, Windows target)
+        run: >
+          cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc
+          --manifest-path tests/fixtures/hle-probe/Cargo.toml -- -D warnings
