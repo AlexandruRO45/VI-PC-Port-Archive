@@ -158,8 +158,8 @@ jobs:
       # implementation; nothing is linked here, so the choice has no effect.
       CARGO_FEATURE_PURE: "1"
       # rustc warnings (unused imports, dead code, ...) fail every step,
-      # including in victory-hle and apps/victory, which no clippy step below
-      # covers yet. Set for the whole job so all steps share one build.
+      # including the workspace-wide `cargo check` ones. Set for the whole job
+      # so all steps share one build.
       # Dependencies are unaffected: cargo caps their lints.
       RUSTFLAGS: -D warnings
     steps:
@@ -180,12 +180,21 @@ jobs:
       - name: cargo check (workspace, all targets)
         run: cargo check --locked --workspace --all-targets --target x86_64-pc-windows-msvc
 
-      # victory-hle (and so apps/victory, which lints it as a dependency) is not
-      # clippy-clean for Windows yet; add it here once it is.
       - name: clippy (Windows target, clean crates)
         run: >
           cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc
           $WINDOWS_CLIPPY_CRATES -- -D warnings
+
+      # victory-hle and apps/victory are clippy-clean for Windows but for one
+      # field_reassign_with_default in victory-hle's xmem.rs (fixed in open
+      # PRs #355/#405). Lint them with only that lint allowed, so nothing else
+      # regresses meanwhile; once it is fixed, drop the -A and move both into
+      # WINDOWS_CLIPPY_CRATES. Both feature sets: the `diagnostics` code here
+      # is cfg(windows).
+      - name: clippy (Windows target, victory-hle and apps/victory)
+        run: |
+          cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc -p victory-hle -p victory -- -D warnings -A clippy::field_reassign_with_default
+          cargo clippy --locked --all-targets --all-features --target x86_64-pc-windows-msvc -p victory-hle -p victory -- -D warnings -A clippy::field_reassign_with_default
 
       # Same as the two steps above with every feature on, so the
       # `diagnostics` code (frame capture, the host debug layer, scripted keys,
