@@ -287,7 +287,10 @@ const WATERFALL_SIZE_ONLY_WAVE32: &[u32] = &[
 fn a_descriptor_only_read_as_data_gives_its_views_size() {
     // Without a use no instruction names the view's kind; the table's range
     // does (an image: taken for 2D). The lowering used to refuse.
-    let shader = build_with(WATERFALL_SIZE_ONLY_WAVE32, false, 0);
+    let refused = std::panic::catch_unwind(|| build_with(WATERFALL_SIZE_ONLY_WAVE32, false, 0));
+    assert!(refused.is_err(), "only a program refused otherwise measures");
+    let shader =
+        lower::with_measured_descriptors(|| build_with(WATERFALL_SIZE_ONLY_WAVE32, false, 0));
     let (a, b) = ([[0.0f32; 4]; 8 * 4], [[0.0f32; 4]; 4 * 2]);
     let views = [
         View::Texture(8, 4, &a),
