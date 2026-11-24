@@ -7,7 +7,8 @@
 //     refuses (MS with VS, CS with PS, a subobject twice or in two versions, an unknown type, a truncated stream) are E_INVALIDARG, and
 //     state not built yet (an amplification shader, a depth-bounds test) is E_NOTIMPL.
 //   - Draws: DispatchMesh(2, 2, 1) with root constants (0, 0) and a red tint fills the top-left quadrant;
-//     ExecuteIndirect with a padded DISPATCH_MESH signature runs an empty grid and then a (1, 1, 2) grid. The grid
+//     ExecuteIndirect with a padded DISPATCH_MESH signature runs a (1, 1, 2) grid. With indirect counts enabled,
+//     a GPU copy sets the count to 1 and suppresses a second nonempty grid. The grid
 //     moved by (1, -1) with a green tint fills the top half of the bottom-right quadrant, so the
 //     Y and Z counts reach the shader; the stream's VS PSO draws a full-screen triangle through a viewport on the
 //     bottom-left quadrant (yellow). Each pixel is read back and compared.
@@ -139,6 +140,7 @@ int main() {
         info.buffer_device_address = true;
         info.shader_dir = library.string();
         info.mesh_shader = mesh;
+        info.draw_indirect_count = d.draw_indirect_count;
         info.pipeline_statistics_query = d.pipeline_statistics_query;
         return info;
     };
@@ -192,6 +194,12 @@ int main() {
 
     constexpr UINT size = 64;
     std::vector<std::uint8_t> pixels(size * 256);
+    VkPhysicalDeviceProperties properties{};
+    const auto physical_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+        d.instance_proc(d.instance, "vkGetPhysicalDeviceProperties"));
+    EXPECT(physical_properties);
+    physical_properties(d.physical, &properties);
+    const bool counted_mesh = d.draw_indirect_count && properties.limits.maxDrawIndirectCount == UINT32_MAX;
     {
         Ref<ID3D12Device> device;
         Ref<ID3D12RootSignature> root;
@@ -273,7 +281,7 @@ int main() {
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
-        Ref<ID3D12Resource> upload, readback, target;
+        Ref<ID3D12Resource> upload, readback, target, count_buffer;
         const auto upload_desc = buffer_desc(4096);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
@@ -282,6 +290,13 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&readback.p))));
+        constexpr UINT count_offset = 4;
+        if (counted_mesh) {
+            const auto count_desc = buffer_desc(count_offset + sizeof(UINT));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &count_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&count_buffer.p))));
+        }
         D3D12_RESOURCE_DESC rt_desc{};
         rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         rt_desc.Width = rt_desc.Height = size;
@@ -303,8 +318,11 @@ int main() {
             D3D12_DISPATCH_MESH_ARGUMENTS grid;
             UINT padding;
         };
-        const MeshRecord mesh_args[] = {{{0, 0, 0}, 0}, {{1, 1, 2}, 0}};
+        const MeshRecord mesh_args[] = {{{0, 0, 0}, 0}, {{1, 1, 2}, 0}, {{2, 2, 1}, 0}};
         std::memcpy(up + mesh_args_offset, mesh_args, sizeof(mesh_args));
+        constexpr UINT count_upload_offset = mesh_args_offset + sizeof(mesh_args);
+        const UINT mesh_count = 1;
+        std::memcpy(up + count_upload_offset, &mesh_count, sizeof(mesh_count));
         const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
         const D3D12_INDIRECT_ARGUMENT_DESC mesh_argument{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
         const D3D12_COMMAND_SIGNATURE_DESC mesh_signature_desc{sizeof(MeshRecord), 1, &mesh_argument, 0};
@@ -351,11 +369,22 @@ int main() {
         list->SetGraphicsRootConstantBufferView(1, upload_va);
         list6->DispatchMesh(0, 1, 1);
         list6->DispatchMesh(2, 2, 1);
+        if (counted_mesh) {
+            list->CopyBufferRegion(count_buffer.p, count_offset, upload.p, count_upload_offset, sizeof(mesh_count));
+            const auto to_indirect = transition(count_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+            list->ResourceBarrier(1, &to_indirect);
+        }
         // Mesh draw 2: groups (0,0,0) and (0,0,1), columns 0 and 1 of row 0, moved by (1, -1), green -> the top half
         // of the bottom-right quadrant.
         list->SetGraphicsRoot32BitConstants(0, 2, down_right, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 256);
-        list->ExecuteIndirect(mesh_signature.p, 2, upload.p, mesh_args_offset, nullptr, 0);
+        // A count of one suppresses the second record, which would paint over the blue pixels below the green band.
+        if (counted_mesh)
+            list->ExecuteIndirect(mesh_signature.p, 2, upload.p, mesh_args_offset + sizeof(MeshRecord),
+                                  count_buffer.p, count_offset);
+        else
+            list->ExecuteIndirect(mesh_signature.p, 2, upload.p, mesh_args_offset, nullptr, 0);
         // The stream's VS PSO: a full-screen triangle through a viewport on the bottom-left quadrant, yellow.
         const D3D12_VIEWPORT bottom_left{0, float(size / 2), float(size / 2), float(size / 2), 0, 1};
         list->RSSetViewports(1, &bottom_left);
@@ -494,7 +523,7 @@ int main() {
             std::printf("pipelineStatisticsQuery not available: the D3D-291 statistics check is skipped\n");
         }
 
-        for (auto* r : {&upload, &readback, &target}) r->reset();
+        for (auto* r : {&upload, &readback, &target, &count_buffer}) r->reset();
         for (auto* p : {&mesh_pso, &vs_pso, &refused}) p->reset();
         root.reset();
         rtv_heap.reset();
@@ -525,6 +554,7 @@ int main() {
         }
     }
     EXPECT(!mismatches);
+    std::printf("mesh indirect used %s\n", counted_mesh ? "a GPU count buffer" : "a fixed count (GPU count unavailable)");
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;

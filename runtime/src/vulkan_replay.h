@@ -857,6 +857,7 @@ struct ReplayFunctions {
     PFN_vkCmdDraw draw = nullptr;
     PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
     PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;
+    PFN_vkCmdDrawMeshTasksIndirectCountEXT draw_mesh_tasks_indirect_count = nullptr;
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
     // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
@@ -2104,7 +2105,9 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
-    if (draw.mesh_indirect && !vk.draw_mesh_tasks_indirect) return ReplayResult::unsupported;
+    if (draw.mesh_indirect && (draw.mesh_indirect->count_buffer ? !vk.draw_mesh_tasks_indirect_count
+                                                               : !vk.draw_mesh_tasks_indirect))
+        return ReplayResult::unsupported;
     if (draw.mesh && !draw.mesh_indirect && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
@@ -3153,6 +3156,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!draw->mesh || args.stride < sizeof(VkDrawMeshTasksIndirectCommandEXT) || args.stride % 4 ||
                     !detail::indirect_range(p.binding, args.offset, VkDeviceSize(args.count) * args.stride))
                     return ReplayResult::invalid_indirect_arguments;
+                if (args.count_buffer) {
+                    const ResourceBinding* count = resolve(args.count_buffer);
+                    if (!count || !count->buffer) return ReplayResult::unresolved_resource;
+                    if (!detail::indirect_range(*count, args.count_offset, sizeof(std::uint32_t)))
+                        return ReplayResult::invalid_indirect_arguments;
+                    p.source = *count;
+                }
             }
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];
@@ -4218,10 +4228,15 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (draw->mesh_indirect) {
                 const auto& args = *draw->mesh_indirect;
                 const VkDeviceSize offset = p.binding.buffer_offset + args.offset;
-                // A single record per call also works without Vulkan's multiDrawIndirect feature.
-                for (std::uint32_t record = 0; record < args.count; ++record)
-                    vk.draw_mesh_tasks_indirect(command_buffer, p.binding.buffer,
-                                                offset + VkDeviceSize(record) * args.stride, 1, args.stride);
+                if (args.count_buffer) {
+                    vk.draw_mesh_tasks_indirect_count(command_buffer, p.binding.buffer, offset, p.source.buffer,
+                                                      p.source.buffer_offset + args.count_offset, args.count, args.stride);
+                } else {
+                    // A single record per call also works without Vulkan's multiDrawIndirect feature.
+                    for (std::uint32_t record = 0; record < args.count; ++record)
+                        vk.draw_mesh_tasks_indirect(command_buffer, p.binding.buffer,
+                                                    offset + VkDeviceSize(record) * args.stride, 1, args.stride);
+                }
             } else if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
             } else if (draw->indexed) {

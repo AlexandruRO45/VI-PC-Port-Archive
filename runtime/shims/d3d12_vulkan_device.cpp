@@ -5191,6 +5191,10 @@ public:
         VkPhysicalDeviceProperties properties{};
         device_properties(info.physical, &properties);
         state_.max_sampler_lod_bias = properties.limits.maxSamplerLodBias;
+        // D3D12 permits any UINT in the count buffer and clamps it to MaxCommandCount. Vulkan also limits
+        // the stored value itself, so use the native path only where every D3D12 count is valid.
+        if (info.mesh_shader && info.draw_indirect_count && properties.limits.maxDrawIndirectCount == UINT32_MAX)
+            state_.context->enable_mesh_indirect_count();
         std::uint32_t family_count = 0;
         queue_families(info.physical, &family_count, nullptr);
         std::vector<VkQueueFamilyProperties> families(family_count);
@@ -9559,6 +9563,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
     enable12.timelineSemaphore = VK_TRUE;
     enable12.separateDepthStencilLayouts = VK_TRUE;
+    info.draw_indirect_count = chosen12.drawIndirectCount == VK_TRUE;
+    enable12.drawIndirectCount = info.draw_indirect_count;
     info.buffer_device_address = chosen12.bufferDeviceAddress == VK_TRUE;
     enable12.bufferDeviceAddress = info.buffer_device_address ? VK_TRUE : VK_FALSE;
     info.storage_buffer_8bit = chosen12.storageBuffer8BitAccess == VK_TRUE;

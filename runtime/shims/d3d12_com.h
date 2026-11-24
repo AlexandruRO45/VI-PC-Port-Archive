@@ -175,6 +175,7 @@ struct VulkanDeviceInfo {
     // shaders have no amplification stage). Mesh-shader PSOs and DispatchMesh work, and CheckFeatureSupport reports
     // D3D12_MESH_SHADER_TIER_1; without it mesh PSOs are refused and the tier is NOT_SUPPORTED.
     bool mesh_shader = false;
+    bool draw_indirect_count = false;  // Vulkan 1.2 drawIndirectCount is enabled on device
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};

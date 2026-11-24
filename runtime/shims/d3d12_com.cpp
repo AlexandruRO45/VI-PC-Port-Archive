@@ -849,17 +849,18 @@ public:
             UINT64(max_command_count) > (arg_desc.Width - argument_buffer_offset) / stride)
             return check(false);
         if (kind == leonida::IndirectKind::dispatch_mesh) {
-            if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT || count_buffer) return check(false);
+            if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
             if (!max_command_count) return;
             if (!graphics_pipeline_ || !graphics_.layout) return check(false);
             if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
             const auto arguments = resource_id(argument_buffer);
-            if (!arguments) return check(false);
+            const auto count = count_buffer ? resource_id(count_buffer) : 0;
+            if (!arguments || (count_buffer && !count)) return check(false);
             leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
                                scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_};
             draw.mesh = true;
             draw.mesh_indirect = leonida::MeshIndirectArguments{arguments, argument_buffer_offset, stride,
-                                                                max_command_count};
+                                                                max_command_count, count, count_buffer_offset};
             return check(list_.draw(std::move(draw)));
         }
         leonida::ExecuteIndirect cmd{};
