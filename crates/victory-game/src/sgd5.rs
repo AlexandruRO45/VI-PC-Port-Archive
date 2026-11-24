@@ -2798,11 +2798,24 @@ mod tests {
     /// the code-length symbols `seq`, then `data` coded with literal/length
     /// code lengths `lit` (literals, then 256 for the end of the block).
     fn dynamic_block(clen: &[u32; 19], seq: &[(u32, u32)], lit: &[u32], data: &[u32]) -> Vec<u8> {
+        dynamic_block_of(257, 1, clen, seq, lit, data)
+    }
+
+    /// [`dynamic_block`] whose header states `hlit` literal/length codes
+    /// (257 to 288) and `hdist` distance codes (1 to 32).
+    fn dynamic_block_of(
+        hlit: u32,
+        hdist: u32,
+        clen: &[u32; 19],
+        seq: &[(u32, u32)],
+        lit: &[u32],
+        data: &[u32],
+    ) -> Vec<u8> {
         let mut bits = Bits::default();
         bits.put(1, 1); // BFINAL
         bits.put(2, 2); // dynamic codes
-        bits.put(0, 5); // HLIT: 257 literal/length codes
-        bits.put(0, 5); // HDIST: 1 distance code
+        bits.put(hlit - 257, 5); // HLIT
+        bits.put(hdist - 1, 5); // HDIST
         bits.put(15, 4); // HCLEN: all 19 code-length code lengths
         for sym in LENGTH_ORDER {
             bits.put(clen[sym], 3);
@@ -2922,5 +2935,109 @@ mod tests {
             assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
             assert_eq!(found[1].span().end, file.len(), "{what}");
         }
+    }
+
+    #[test]
+    fn dynamic_block_stating_codes_deflate_does_not_have_is_noise() {
+        // A dynamic block's header has room for 288 literal/length codes
+        // and 32 distance codes, but deflate has only 286 and 30: a header
+        // stating more breaks the stream, though every code it sends is a
+        // valid length and the data never uses the extra symbols. Such a
+        // record covers no other, so it is yielded and does not unpack, and
+        // the record after it is found either way.
+        let a = u32::from(b'A');
+        let mut clen = [0; 19];
+        (clen[18], clen[0], clen[1]) = (1, 2, 2);
+        let data = [a, a, a, a, 256];
+        let want = b"AAAA".to_vec();
+        let block = |hlit: u32, hdist: u32| {
+            let mut lengths = vec![0; (hlit + hdist) as usize];
+            (lengths[a as usize], lengths[256]) = (1, 1);
+            let lit = &lengths[..hlit as usize];
+            dynamic_block_of(hlit, hdist, &clen, &length_symbols(&lengths), lit, &data)
+        };
+        let mut cases = Vec::new();
+        for hlit in [257, 285, 286, 287, 288] {
+            for hdist in [1, 29, 30, 31, 32] {
+                cases.push((hlit, hdist, hlit <= 286 && hdist <= 30));
+            }
+        }
+        for &(hlit, hdist, valid) in &cases {
+            let what = format!("{hlit} literal/length codes, {hdist} distance codes");
+            let packed = block(hlit, hdist);
+            assert_eq!(
+                miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                valid.then(|| want.clone()),
+                "{what}"
+            );
+            assert_eq!(starts_stream(&packed, want.len()), valid, "{what}");
+
+            let (file, marker) = outer_then_after(&packed, want.len());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            assert_eq!(found[0].unpack(), valid.then(|| want.clone()), "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "{what}");
+        }
+    }
+
+    /// A non-final stored block of `before`, then one final fixed-code
+    /// block: a copy of 3 bytes from `distance` (1 to 4) bytes back, then
+    /// the end of the block.
+    fn stored_then_copy(before: &[u8], distance: u32) -> Vec<u8> {
+        let mut bits = Bits::default();
+        bits.put(1, 1); // BFINAL
+        bits.put(1, 2); // fixed codes
+        bits.code(1, 7); // length code 257: 3 bytes
+        bits.code(distance - 1, 5); // distance codes 0-3: 1-4, no extra bits
+        bits.code(0, 7); // end of block (256)
+        [stored_block(before), bits.out].concat()
+    }
+
+    #[test]
+    fn copy_reaching_back_into_an_earlier_block_is_a_stream() {
+        // A copy may reach back over every byte unpacked so far, earlier
+        // blocks' included: a final block that opens with a copy from a
+        // stored block before it is a stream, as far back as that block
+        // goes. One byte further reaches before the container's start, and
+        // the stream breaks there: such a record covers no other, so it is
+        // yielded and does not unpack, and the record after it is found
+        // either way.
+        let before = b"xyz";
+        for distance in 1..=4 {
+            let what = format!("distance {distance}");
+            let packed = stored_then_copy(before, distance);
+            let valid = distance as usize <= before.len();
+            let want = valid.then(|| {
+                let mut out = before.to_vec();
+                for _ in 0..3 {
+                    out.push(out[out.len() - distance as usize]);
+                }
+                out
+            });
+            assert_eq!(
+                miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                want,
+                "{what}"
+            );
+            assert_eq!(starts_stream(&packed, 6), valid, "{what}");
+
+            let (file, marker) = outer_then_after(&packed, 6);
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(found[0].offset, marker, "{what}");
+            assert_eq!(found[0].unpack(), want, "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "{what}");
+        }
+        // With nothing stored before it, even one byte back is too far.
+        assert!(!starts_stream(&stored_then_copy(b"", 1), 3));
     }
 }
