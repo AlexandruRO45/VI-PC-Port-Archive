@@ -50,6 +50,14 @@ const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
     (b"\xD0\xCF\x11\xE0", "MSI/OLE"),
 ];
 
+/// First line of a Git LFS pointer, current and pre-1.0 spec. The file
+/// itself is small text; what it stands for is stored outside the
+/// repository, where this check never sees it.
+const LFS_POINTER_PREFIXES: &[&[u8]] = &[
+    b"version https://git-lfs.github.com/spec/",
+    b"version https://hawser.github.com/spec/",
+];
+
 pub fn run(root: &Path, staged: bool) -> Result<()> {
     let files = list_files(root, staged)?;
     let mut violations = Vec::new();
@@ -399,6 +407,16 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
         if content.starts_with(magic) {
             problems.push(format!("looks like a {what}"));
         }
+    }
+    if LFS_POINTER_PREFIXES
+        .iter()
+        .any(|prefix| content.starts_with(prefix))
+    {
+        problems.push(
+            "a Git LFS pointer: the content it stands for is stored outside the repository, \
+             unchecked"
+                .to_owned(),
+        );
     }
     if content.contains(&0) {
         problems.push("binary content (NUL bytes)".to_owned());
@@ -775,6 +793,53 @@ mod tests {
                 .all(|(key, _)| key != "GIT_CONFIG_GLOBAL"),
             "the checkout's own check must keep the developer's excludes"
         );
+    }
+
+    const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1\n\
+        oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n\
+        size 12345\n";
+
+    /// A Git LFS pointer is small, allowlisted text, but the file it stands
+    /// for goes to LFS storage, which no check reads.
+    #[test]
+    fn rejects_lfs_pointers() {
+        assert!(!check("assets/model.txt", LFS_POINTER).is_empty());
+        let legacy = b"version https://hawser.github.com/spec/v1\noid sha256:00\nsize 1\n";
+        assert!(!check("data.json", legacy).is_empty());
+        assert!(
+            check("notes.md", b"See https://git-lfs.github.com/spec/v1.\n").is_empty(),
+            "only a pointer, not a mention"
+        );
+    }
+
+    /// With `filter=lfs`, the index holds the pointer while the working tree
+    /// holds the real file: the staged check reads only the pointer, and a
+    /// checkout without git-lfs sees only the pointer too. Both checks must
+    /// refuse it. The clean filter here stands in for git-lfs, which the
+    /// test does not need installed.
+    #[cfg(unix)]
+    #[test]
+    fn lfs_tracked_files_are_violations() {
+        let outside = tempfile::tempdir().unwrap();
+        let pointer = outside.path().join("pointer");
+        std::fs::write(&pointer, LFS_POINTER).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git_str(root, &["init", "-q"]);
+        let clean = format!("cat '{}'", pointer.display());
+        git_str(root, &["config", "filter.lfs.clean", &clean]);
+        git_str(root, &["config", "filter.lfs.smudge", "cat"]);
+        git_str(root, &["config", "filter.lfs.required", "true"]);
+        std::fs::write(root.join(".gitattributes"), "*.txt filter=lfs -text\n").unwrap();
+        std::fs::write(root.join("strings.txt"), "plain text on disk\n").unwrap();
+        git_str(root, &["add", ".gitattributes", "strings.txt"]);
+        let staged = git_str(root, &["cat-file", "blob", ":strings.txt"]);
+        assert_eq!(staged, LFS_POINTER, "the index holds the pointer");
+        assert!(super::run(root, true).is_err());
+
+        // A checkout without the filter: the pointer is the file on disk.
+        std::fs::write(root.join("strings.txt"), LFS_POINTER).unwrap();
+        assert!(super::run(root, false).is_err());
     }
 
     #[test]
