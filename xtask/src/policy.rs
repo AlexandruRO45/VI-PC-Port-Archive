@@ -1180,6 +1180,40 @@ mod tests {
         assert_eq!(status.code(), Some(1));
     }
 
+    /// Outside any repository, the walk is what lists files, so a TMPDIR is
+    /// unseen only under a `target` or `.git` directory, at any depth, as
+    /// the walk skips them; an ignore file there means nothing.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_outside_a_repository_follow_the_walk() {
+        let outer = tempdir();
+        let root = outer.path();
+        let visible = root.join("visible");
+        let ignored = root.join("ignored");
+        let nested = root.join("crates/x/target/tmp");
+        let git_dir = root.join("sub/.git");
+        for dir in [&visible, &ignored, &nested, &git_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "/ignored/\n").unwrap();
+        let outside = super::git_command(root)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .unwrap();
+        assert!(!outside.status.success(), "a repository above was found");
+
+        let tmp = tempdir_in_first(root, [visible.clone(), ignored.clone(), nested.clone()]);
+        assert_eq!(tmp.path().parent(), Some(nested.as_path()));
+        let tmp_git = tempdir_in_first(root, [git_dir.clone()]);
+        for dir in [&visible, &ignored] {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        std::fs::write(tmp_git.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        assert_eq!(names(root, false), [".gitignore"]);
+        super::run(root, false).unwrap();
+    }
+
     /// `path` quoted for `sh`, for the scripts tests write: a TMPDIR holding
     /// `'` made the hook and filter commands built from it shell syntax
     /// errors, and the git commands running them failed.
