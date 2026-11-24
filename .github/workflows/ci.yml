@@ -29,19 +29,32 @@ jobs:
         run: |
           $out = & cargo clippy --workspace --all-targets --locked --message-format=json -- -D warnings 2>&1
           $code = $LASTEXITCODE
+          $seen = [System.Collections.Generic.HashSet[string]]::new()
+          $msgs = [System.Collections.Generic.List[string]]::new()
           foreach ($line in $out) {
             try {
               $obj = $line | ConvertFrom-Json -ErrorAction Stop
               if ($obj.reason -eq 'compiler-message' -and ($obj.message.level -eq 'error' -or $obj.message.level -eq 'warning')) {
-                $span = $obj.message.spans | Where-Object { $_.is_primary } | Select-Object -First 1
-                $file = if ($span) { $span.file_name } else { 'Cargo.toml' }
-                $ln = if ($span) { $span.line_start } else { 1 }
-                $msg = ($obj.message.rendered -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')
-                Write-Output "::error file=$file,line=$ln::$msg"
+                $r = $obj.message.rendered
+                if ($r -and $seen.Add($r)) { $msgs.Add($r) }
               }
-            } catch {
-              Write-Output $line
+            } catch {}
+          }
+          $buf = ""
+          $n = 0
+          foreach ($m in $msgs) {
+            if (($buf.Length + $m.Length) -gt 3200 -and $buf.Length -gt 0) {
+              $enc = ($buf -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')
+              Write-Output "::error file=Cargo.toml,line=1::$enc"
+              $buf = ""
+              $n++
+              if ($n -ge 9) { break }
             }
+            $buf += $m + "`n"
+          }
+          if ($buf.Length -gt 0) {
+            $enc = ($buf -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')
+            Write-Output "::error file=Cargo.toml,line=1::$enc"
           }
           exit $code
       - name: Clippy, diagnostics build
@@ -49,19 +62,32 @@ jobs:
         run: |
           $out = & cargo clippy --workspace --all-targets --all-features --locked --message-format=json -- -D warnings 2>&1
           $code = $LASTEXITCODE
+          $seen = [System.Collections.Generic.HashSet[string]]::new()
+          $msgs = [System.Collections.Generic.List[string]]::new()
           foreach ($line in $out) {
             try {
               $obj = $line | ConvertFrom-Json -ErrorAction Stop
               if ($obj.reason -eq 'compiler-message' -and ($obj.message.level -eq 'error' -or $obj.message.level -eq 'warning')) {
-                $span = $obj.message.spans | Where-Object { $_.is_primary } | Select-Object -First 1
-                $file = if ($span) { $span.file_name } else { 'Cargo.toml' }
-                $ln = if ($span) { $span.line_start } else { 1 }
-                $msg = ($obj.message.rendered -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')
-                Write-Output "::error file=$file,line=$ln::$msg"
+                $r = $obj.message.rendered
+                if ($r -and $seen.Add($r)) { $msgs.Add($r) }
               }
-            } catch {
-              Write-Output $line
+            } catch {}
+          }
+          $buf = ""
+          $n = 0
+          foreach ($m in $msgs) {
+            if (($buf.Length + $m.Length) -gt 3200 -and $buf.Length -gt 0) {
+              $enc = ($buf -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')
+              Write-Output "::error file=Cargo.toml,line=1::$enc"
+              $buf = ""
+              $n++
+              if ($n -ge 9) { break }
             }
+            $buf += $m + "`n"
+          }
+          if ($buf.Length -gt 0) {
+            $enc = ($buf -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')
+            Write-Output "::error file=Cargo.toml,line=1::$enc"
           }
           exit $code
       # Includes xtask's repository_passes_policy, the asset-policy check.
@@ -72,8 +98,11 @@ jobs:
           $code = $LASTEXITCODE
           $out | ForEach-Object { Write-Output $_ }
           if ($code -ne 0) {
-            $fail = ($out | Select-String -Pattern 'FAILED|panicked at|error\[' -Context 0,4 | Out-String)
-            $msg = ($fail.Substring(0, [Math]::Min($fail.Length, 3500)) -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')
-            Write-Output "::error file=Cargo.toml,line=1::$msg"
+            $fail = ($out | Select-String -Pattern 'FAILED|panicked at|error\[|thread .+ panicked' -Context 0,5 | Out-String)
+            for ($i = 0; $i -lt $fail.Length -and $i -lt 28000; $i += 3200) {
+              $chunk = $fail.Substring($i, [Math]::Min(3200, $fail.Length - $i))
+              $enc = ($chunk -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')
+              Write-Output "::error file=Cargo.toml,line=1::$enc"
+            }
           }
           exit $code

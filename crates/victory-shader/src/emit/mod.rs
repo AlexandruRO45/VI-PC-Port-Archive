@@ -137,8 +137,6 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
-/// A translated shader and what the host binds for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// A 64-bit GPU address passed in two adjacent 32-bit root constants
 /// `(slot, dword)` and `(slot, dword + 1)`, bound as a root descriptor at
 /// register `register` in [`CONST_VIEW_SPACE`].
@@ -149,6 +147,8 @@ pub struct ConstRootView {
     pub register: u32,
 }
 
+/// A translated shader and what the host binds for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
     pub stage: HwStage,
     /// The DXIL container, hashed as D3D12 expects.

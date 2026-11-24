@@ -8208,6 +8208,7 @@ impl<'a> Lower<'a> {
 #[cfg(test)]
 mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use crate::emit::ConstRootView;
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
