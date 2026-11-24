@@ -3902,7 +3902,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         (hr, reused, in_driver, refusal_elapsed)
     };
     LAST_D3D12_ERROR.with(|e| *e.borrow_mut() = None);
-    let (mut hr, mut reused, mut in_driver, _first_elapsed) = try_create(&mut copy, &dxil, "compute");
+    let (mut hr, mut reused, mut in_driver, first_elapsed) = try_create(&mut copy, &dxil, "compute");
     let mut retried_no_gvn: Option<(u64, u64, String)> = None;
     let mut failure_note: Option<String> = None;
     if hr < 0 && !HEAP_WINDOW_OOM.with(|o| o.get()) {
@@ -3916,6 +3916,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         let mut retry_attempted = false;
         let (retry_hr, retried) = retry_compute_pso_without_gvn(
             first_hr,
+            first_elapsed,
             &dxil,
             || {
                 let without = console_to_dxil_without_gvn(cs, Stage::Compute, 0, wave32_only(this))?;
@@ -5105,15 +5106,21 @@ fn format_driver_rejection(hr: HRESULT, retained_message: Option<&str>) -> Strin
     }
 }
 
-/// Retry a driver-rejected compute PSO once using DXIL recompiled without DXC's GVN pass
+/// Upper bound on how long the initial driver refusal may take to qualify for a `-opt-disable gvn`
+/// retry: `#756` handle-phi refusals fail fast (<1 s), whereas multi-minute driver OOMs on huge
+/// shaders should not pay for a second, larger no-GVN compile.
+pub(crate) const NO_GVN_RETRY_MAX_REFUSAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Retry a fast driver-rejected compute PSO once using DXIL recompiled without DXC's GVN pass
 /// (avoiding handle phis that some drivers refuse with `E_OUTOFMEMORY`, #756).
 fn retry_compute_pso_without_gvn(
     first_hr: HRESULT,
+    first_elapsed: std::time::Duration,
     orig_dxil: &[u8],
     recompile: impl FnOnce() -> Result<Vec<u8>, String>,
     mut create: impl FnMut(&[u8]) -> HRESULT,
 ) -> (HRESULT, bool) {
-    if first_hr >= 0 {
+    if first_hr >= 0 || first_elapsed > NO_GVN_RETRY_MAX_REFUSAL {
         return (first_hr, false);
     }
     let Ok(retry_dxil) = recompile() else {
@@ -6047,6 +6054,7 @@ mod compute_pso_retry_tests {
         let mut create_calls = 0usize;
         let (hr, retried) = retry_compute_pso_without_gvn(
             0,
+            std::time::Duration::from_millis(100),
             b"orig-dxil",
             || panic!("successful compute PSO must not recompile without GVN"),
             |_| {
@@ -6062,6 +6070,7 @@ mod compute_pso_retry_tests {
         let mut seen = Vec::new();
         let (hr, retried) = retry_compute_pso_without_gvn(
             REFUSED_OOM,
+            std::time::Duration::from_millis(100),
             b"orig-dxil",
             || Ok(b"no-gvn-dxil".to_vec()),
             |dxil| {
@@ -6078,6 +6087,7 @@ mod compute_pso_retry_tests {
         let mut create_calls = 0usize;
         let (hr, retried) = retry_compute_pso_without_gvn(
             REFUSED_OOM,
+            std::time::Duration::from_millis(100),
             b"same-dxil",
             || Ok(b"same-dxil".to_vec()),
             |_| {
@@ -6090,11 +6100,36 @@ mod compute_pso_retry_tests {
 
     #[test]
     fn compute_pso_refusal_propagates_failure_when_retry_fails() {
-        let (hr1, retried1) = retry_compute_pso_without_gvn(REFUSED_OOM, b"orig-dxil", || Err("already -O0".into()), |_| 0);
+        let (hr1, retried1) = retry_compute_pso_without_gvn(REFUSED_OOM, std::time::Duration::from_millis(100), b"orig-dxil", || Err("already -O0".into()), |_| 0);
         assert_eq!((hr1, retried1), (REFUSED_OOM, false));
 
-        let (hr2, retried2) = retry_compute_pso_without_gvn(REFUSED_OOM, b"orig-dxil", || Ok(b"no-gvn-dxil".to_vec()), |_| REFUSED_ARG);
+        let (hr2, retried2) = retry_compute_pso_without_gvn(REFUSED_OOM, std::time::Duration::from_millis(100), b"orig-dxil", || Ok(b"no-gvn-dxil".to_vec()), |_| REFUSED_ARG);
         assert_eq!((hr2, retried2), (REFUSED_ARG, false));
+    }
+
+    #[test]
+    fn compute_pso_slow_refusal_skips_no_gvn_retry() {
+        let mut create_calls = 0usize;
+        let (hr, retried) = retry_compute_pso_without_gvn(
+            REFUSED_OOM,
+            std::time::Duration::from_secs(6),
+            b"orig-dxil",
+            || panic!("slow refusal (>5 s) must not pay for a second no-GVN compile"),
+            |_| {
+                create_calls += 1;
+                0
+            },
+        );
+        assert_eq!((hr, retried, create_calls), (REFUSED_OOM, false, 0));
+
+        let (hr_edge, retried_edge) = retry_compute_pso_without_gvn(
+            REFUSED_OOM,
+            NO_GVN_RETRY_MAX_REFUSAL,
+            b"orig-dxil",
+            || Ok(b"no-gvn-dxil".to_vec()),
+            |_| 0,
+        );
+        assert_eq!((hr_edge, retried_edge), (0, true));
     }
 
     #[test]

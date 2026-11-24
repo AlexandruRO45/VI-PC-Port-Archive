@@ -1070,10 +1070,12 @@ impl Pipelines {
             });
             let r = if let Some(pso) = from_cache {
                 self.reused.fetch_add(1, Ordering::Relaxed);
-                Ok(pso)
+                (Ok(pso), std::time::Duration::ZERO)
             } else {
                 desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+                let t0 = std::time::Instant::now();
                 let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+                let elapsed = t0.elapsed();
                 if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
                     if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
                         let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
@@ -1083,28 +1085,30 @@ impl Pipelines {
                         }
                     }
                 }
-                pso
+                (pso, elapsed)
             };
             *self.running.0.lock().unwrap() -= 1;
             self.running.1.notify_one();
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             r
         };
-        let mut r = try_create(&c.dxil);
+        let (mut r, first_elapsed) = try_create(&c.dxil);
         if let Err(first_err) = &r {
-            let reason = crate::hle::d3d12x::real::first_error_line(&first_err.to_string())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("{:#x}", first_err.code().0));
-            if let Some(nogvn) = retry_without_gvn() {
-                if nogvn.compiled.dxil != c.dxil {
-                    r = try_create(&nogvn.compiled.dxil);
-                    if r.is_ok() {
-                        eprintln!(
-                            "  {name}: driver refused compute pipeline ({reason}); built without GVN (dxil cache {:016x} -> {:016x}, {} B DXIL)",
-                            nogvn.rejected_key,
-                            nogvn.retry_key,
-                            nogvn.compiled.dxil.len()
-                        );
+            if first_elapsed <= crate::hle::d3d12x::real::NO_GVN_RETRY_MAX_REFUSAL {
+                let reason = crate::hle::d3d12x::real::first_error_line(&first_err.to_string())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{:#x}", first_err.code().0));
+                if let Some(nogvn) = retry_without_gvn() {
+                    if nogvn.compiled.dxil != c.dxil {
+                        r = try_create(&nogvn.compiled.dxil).0;
+                        if r.is_ok() {
+                            eprintln!(
+                                "  {name}: driver refused compute pipeline ({reason}); built without GVN (dxil cache {:016x} -> {:016x}, {} B DXIL)",
+                                nogvn.rejected_key,
+                                nogvn.retry_key,
+                                nogvn.compiled.dxil.len()
+                            );
+                        }
                     }
                 }
             }
