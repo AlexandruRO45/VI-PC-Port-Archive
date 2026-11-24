@@ -418,7 +418,12 @@ fn rebase(bytes: &mut [u8], delta: u64) {
     if rva == 0 || size == 0 {
         return;
     }
-    let start = info.rva_to_file_offset(rva).unwrap() as usize;
+    // The headers are mapped at the RVA equal to their file offset.
+    let start = match info.rva_to_file_offset(rva) {
+        Some(offset) => offset as usize,
+        None if (rva as usize) < SECTION_FILE => rva as usize,
+        None => panic!("relocation table at RVA {rva:#x} is not mapped"),
+    };
     let end = start + size as usize;
     let mut at = start;
     while at + 8 <= end {
@@ -993,6 +998,102 @@ fn a_tls_va_past_the_32_bit_rva_range_is_refused_not_truncated() {
                 ))
             ),
             "{what} more than 4 GiB above the image base"
+        );
+    }
+}
+
+/// Unused bytes in the headers, after the section table and before
+/// `SizeOfHeaders`. They are mapped at the RVA equal to their offset.
+const HEADER_SLACK: u32 = 0x1C0;
+
+#[test]
+fn a_relocation_table_in_the_headers_is_read_where_the_loader_reads_it() {
+    // The loaders find the table through the directory RVA in the mapped
+    // image, headers included. A copy of the block moved into the header
+    // slack must have its callback entry cleared as well.
+    let mut original = image();
+    let block = original[file(RELOCS)..file(RELOCS) + 16].to_vec();
+    put(&mut original, HEADER_SLACK as usize, &block);
+    // The old block stays in `.data`, but nothing points at it any more.
+    set_dir(&mut original, dir::BASERELOC, HEADER_SLACK, 16);
+    let info = ImageInfo::parse(&original).unwrap();
+    assert_eq!(info.rva_to_file_offset(HEADER_SLACK), None);
+
+    let prepared = prepare(&original).unwrap();
+    let entry = HEADER_SLACK as usize + 8 + 2;
+    assert_eq!(&prepared.bytes[entry..entry + 2], &[0, 0]);
+    for range in [
+        HEADER_SLACK as usize..entry,
+        entry + 2..HEADER_SLACK as usize + 16,
+    ] {
+        assert_eq!(&prepared.bytes[range.clone()], &original[range]);
+    }
+    assert_eq!(
+        &prepared.bytes[file(RELOCS)..file(RELOCS) + 16],
+        &original[file(RELOCS)..file(RELOCS) + 16],
+        "the stale block in `.data` is not a relocation table any more"
+    );
+
+    let delta = 0x5_0000_0000;
+    let mut mapped = prepared.bytes;
+    rebase(&mut mapped, delta);
+    assert_eq!(layout::read_u64(&mapped, file(callbacks_field())), Some(0));
+    assert_eq!(
+        layout::read_u64(&mapped, file(CALLBACKS)),
+        Some(IMAGE_BASE + u64::from(CODE) + delta)
+    );
+}
+
+#[test]
+fn a_relocation_table_in_the_headers_stops_at_size_of_headers() {
+    // A directory that starts in the header slack but claims to run past
+    // `SizeOfHeaders` is read only up to there: past it the mapped image
+    // is not the file. The block that fits is still read; the walk does
+    // not continue into the section's file bytes.
+    let mut original = image();
+    let block = original[file(RELOCS)..file(RELOCS) + 16].to_vec();
+    put(&mut original, HEADER_SLACK as usize, &block);
+    set_dir(&mut original, dir::BASERELOC, HEADER_SLACK, 0x1000);
+    let prepared = prepare(&original).unwrap();
+    let entry = HEADER_SLACK as usize + 8 + 2;
+    assert_eq!(&prepared.bytes[entry..entry + 2], &[0, 0]);
+    assert_eq!(
+        &prepared.bytes[SECTION_FILE..file(TLS)],
+        &original[SECTION_FILE..file(TLS)]
+    );
+
+    // A block that would cross `SizeOfHeaders` is not read at all, so the
+    // only thing that still clears the callback pointer is the TLS write.
+    // Only its first 12 bytes fit; the header still claims all 16.
+    let mut crossing = image();
+    let at = SECTION_FILE - 12;
+    put(&mut crossing, at, &block[..12]);
+    set_dir(&mut crossing, dir::BASERELOC, at as u32, 16);
+    let prepared = prepare(&crossing).unwrap();
+    assert_eq!(&prepared.bytes[at..at + 12], &crossing[at..at + 12]);
+    assert_eq!(
+        layout::read_u64(&prepared.bytes, file(callbacks_field())),
+        Some(0)
+    );
+}
+
+#[test]
+fn a_relocation_rva_past_the_headers_and_sections_is_not_read() {
+    // Between `SizeOfHeaders` and the first section, and past the last one,
+    // nothing is mapped from the file: no table is read there.
+    for rva in [SECTION_FILE as u32, 0x0800, 0x1_0000] {
+        let mut original = image();
+        set_dir(&mut original, dir::BASERELOC, rva, 16);
+        let prepared = prepare(&original).unwrap_or_else(|e| panic!("{rva:#x}: {e}"));
+        assert_eq!(
+            &prepared.bytes[SECTION_FILE..],
+            &{
+                let mut expected = original[SECTION_FILE..].to_vec();
+                let at = file(callbacks_field()) - SECTION_FILE;
+                expected[at..at + 8].fill(0);
+                expected
+            }[..],
+            "{rva:#x}"
         );
     }
 }

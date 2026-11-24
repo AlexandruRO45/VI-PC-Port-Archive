@@ -173,11 +173,36 @@ fn relocations(bytes: &[u8], info: &ImageInfo) -> Vec<Relocation> {
     else {
         return Vec::new();
     };
-    let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
+    if size == 0 {
         return Vec::new();
-    };
-    let start = start as usize;
-    relocation_entries(bytes, start, start.saturating_add(size as usize))
+    }
+    if let Some(start) = info.rva_to_file_offset(rva) {
+        let start = start as usize;
+        return relocation_entries(bytes, start, start.saturating_add(size as usize));
+    }
+    // The loaders read the table wherever the directory points in the
+    // mapped image, and that includes the headers, which are mapped at the
+    // RVA equal to their file offset. A table there that went unread would
+    // leave the callback field's relocation armed.
+    match header_bytes(bytes) {
+        Some(headers) if (rva as usize) < headers => {
+            let start = rva as usize;
+            relocation_entries(
+                bytes,
+                start,
+                start.saturating_add(size as usize).min(headers),
+            )
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// How many bytes at the start of the file are mapped as the headers:
+/// `SizeOfHeaders`, but never more than the file holds.
+fn header_bytes(bytes: &[u8]) -> Option<usize> {
+    let opt = layout::optional_header_offset(bytes)?;
+    let size = layout::read_u32(bytes, opt.checked_add(layout::OPT_SIZE_OF_HEADERS)?)?;
+    Some((size as usize).min(bytes.len()))
 }
 
 /// The entries of the relocation blocks in `bytes[start..end]`, ABSOLUTE
