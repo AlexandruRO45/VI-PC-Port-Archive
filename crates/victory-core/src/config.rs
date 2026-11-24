@@ -270,6 +270,7 @@ impl Config {
         if let Some(game) = &game_dir {
             ensure_game_apart(game, &cache_dir, &data_dir, &origins)?;
         }
+        ensure_titles_apart(&test_titles, &cache_dir, &data_dir, &origins)?;
         for (name, dir, origin, setting) in [
             (
                 "game",
@@ -626,6 +627,61 @@ fn ensure_game_apart(game: &Path, cache: &Path, data: &Path, origins: &Origins) 
                 game.display(),
                 origins.game_dir
             );
+        }
+    }
+    Ok(())
+}
+
+/// Each of the test titles is, like the game folder, a dump that Victory
+/// only reads, so [`ensure_game_apart`] applies to them too: a title inside
+/// (or equal to) the cache folder would be deleted with the cache, and a
+/// cache or data folder inside a title would mix derived files and saves
+/// into that dump. The easy slip is one parent folder for everything, e.g.
+/// `VICTORY_CACHE_DIR=~/xbox` with `VICTORY_TEST_TITLES=~/xbox/title-a`.
+/// The error names the title, so it is clear which entry of the list is
+/// meant. Compared lexically, without the disk.
+fn ensure_titles_apart(
+    titles: &[PathBuf],
+    cache: &Path,
+    data: &Path,
+    origins: &Origins,
+) -> Result<()> {
+    for title in titles {
+        if is_within(title, cache, FOLD_CASE) {
+            anyhow::bail!(
+                "the test title {} (from {}) is inside the cache folder {} (from {}), which \
+                 may be deleted at any time; set VICTORY_CACHE_DIR or [paths].cache_dir to a \
+                 folder outside the test titles",
+                title.display(),
+                origins.test_titles,
+                cache.display(),
+                origins.cache_dir
+            );
+        }
+        for (name, dir, origin, setting) in [
+            (
+                "cache",
+                cache,
+                origins.cache_dir,
+                "VICTORY_CACHE_DIR or [paths].cache_dir",
+            ),
+            (
+                "data",
+                data,
+                origins.data_dir,
+                "VICTORY_DATA_DIR or [paths].data_dir",
+            ),
+        ] {
+            if is_within(dir, title, FOLD_CASE) {
+                anyhow::bail!(
+                    "the {name} folder {} (from {origin}) is inside the test title {} (from \
+                     {}), which is a dump that is only read; set {setting} to a folder \
+                     outside it",
+                    dir.display(),
+                    title.display(),
+                    origins.test_titles
+                );
+            }
         }
     }
     Ok(())
@@ -2186,6 +2242,83 @@ mod tests {
             _ => None,
         };
         assert!(Config::resolve(FilePaths::default(), None, none).is_ok());
+    }
+
+    #[test]
+    fn test_titles_are_kept_apart_from_cache_and_data() {
+        let with = |titles: Vec<PathBuf>, cache: PathBuf, data: PathBuf| {
+            move |k: &str| match k {
+                "VICTORY_TEST_TITLES" => Some(std::env::join_paths(&titles).unwrap()),
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let x = PathBuf::from(abs("x"));
+        let err = |env| {
+            Config::resolve(FilePaths::default(), None, env)
+                .unwrap_err()
+                .to_string()
+        };
+        let other = PathBuf::from(abs("t"));
+
+        // A title inside (or equal to) the cache would be deleted with it;
+        // the second entry is the one named.
+        let e = err(with(
+            vec![other.clone(), x.join("title-a")],
+            x.clone(),
+            PathBuf::from(abs("d")),
+        ));
+        assert!(e.contains("test title"), "{e}");
+        assert!(e.contains("title-a"), "{e}");
+        assert!(e.contains("inside the cache folder"), "{e}");
+        assert!(e.contains("(from VICTORY_TEST_TITLES)"), "{e}");
+        let e = err(with(vec![x.clone()], x.clone(), PathBuf::from(abs("d"))));
+        assert!(e.contains("inside the cache folder"), "{e}");
+
+        // The cache or data inside a title would write into that dump.
+        let e = err(with(
+            vec![x.clone()],
+            x.join("cache"),
+            PathBuf::from(abs("d")),
+        ));
+        assert!(e.contains("cache folder"), "{e}");
+        assert!(e.contains("inside the test title"), "{e}");
+        let e = err(with(
+            vec![other.clone(), x.clone()],
+            PathBuf::from(abs("c")),
+            x.join("saves"),
+        ));
+        assert!(e.contains("data folder"), "{e}");
+        assert!(e.contains("(from VICTORY_DATA_DIR)"), "{e}");
+        // `.` and `..` are folded first.
+        let e = err(with(
+            vec![x.join(".")],
+            x.join("y").join("..").join("c"),
+            PathBuf::from(abs("d")),
+        ));
+        assert!(e.contains("inside the test title"), "{e}");
+
+        // Siblings are fine, including names that start with the title's.
+        let ok = with(
+            vec![x.clone(), other],
+            PathBuf::from(abs("x-cache")),
+            x.join("..").join("x-data"),
+        );
+        assert!(Config::resolve(FilePaths::default(), None, ok).is_ok());
+
+        // Titles from the file are named as such.
+        let file = FilePaths {
+            test_titles: vec![x.join("t")],
+            ..FilePaths::default()
+        };
+        let env = |k: &str| match k {
+            "VICTORY_CACHE_DIR" => Some(abs("x")),
+            "VICTORY_DATA_DIR" => Some(abs("d")),
+            _ => None,
+        };
+        let e = Config::resolve(file, None, env).unwrap_err().to_string();
+        assert!(e.contains("(from config file)"), "{e}");
     }
 
     #[test]
