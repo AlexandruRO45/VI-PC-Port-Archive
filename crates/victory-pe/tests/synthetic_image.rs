@@ -1941,3 +1941,54 @@ fn relocations_need_both_a_directory_and_no_stripped_flag() {
         assert!(!info.has_exception_table && !info.has_load_config);
     }
 }
+
+#[test]
+fn nt_headers_after_a_dos_stub_are_found_through_e_lfanew() {
+    // Linkers put a DOS stub between the MZ header and the NT headers. Moving
+    // the NT headers 0x40 bytes further in changes nothing but where they are.
+    let plain = ImageInfo::parse(&image()).unwrap();
+    let mut d = image();
+    let end = OPT + 240 + 40; // the end of the one section header
+    let headers = d[0x40..end].to_vec();
+    d[0x40..end].fill(0);
+    d[0x80..end + 0x40].copy_from_slice(&headers);
+    d[0x40..0x80].fill(0x90);
+    put32(&mut d, layout::DOS_E_LFANEW, 0x80);
+    assert!(end + 0x40 <= SECTION_FILE_OFFSET as usize);
+    assert_eq!(layout::file_header_offset(&d), Some(0x84));
+    assert_eq!(layout::optional_header_offset(&d), Some(OPT + 0x40));
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(format!("{info:?}"), format!("{plain:?}"));
+}
+
+#[test]
+fn the_section_table_follows_the_declared_optional_header_size() {
+    // SizeOfOptionalHeader, not the 240 bytes of a PE32+ header with 16
+    // directories, says where the section table starts.
+    let plain = ImageInfo::parse(&image()).unwrap();
+    let mut d = image();
+    let table = OPT + 240;
+    let header = d[table..table + 40].to_vec();
+    d[table..table + 40].fill(0);
+    d[table + 16..table + 56].copy_from_slice(&header);
+    put16(&mut d, 0x54, 256);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(format!("{info:?}"), format!("{plain:?}"));
+
+    // Declaring the longer header without moving the table reads the
+    // section header 16 bytes late: the section lands at RVA 0, and the
+    // import directory at 0x1100 is no longer inside any section.
+    let mut d = image();
+    put16(&mut d, 0x54, 256);
+    assert!(ImageInfo::parse(&d).is_err());
+}
+
+#[test]
+fn stack_sizes_are_read_as_64_bit_values() {
+    let mut d = image();
+    put64(&mut d, OPT + 72, 0x1_0000_0000 | 0x20_0000);
+    put64(&mut d, OPT + 80, 0x2_0000_0000 | 0x2000);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.stack_reserve, 0x1_0020_0000);
+    assert_eq!(info.stack_commit, 0x2_0000_2000);
+}
