@@ -729,10 +729,11 @@ impl Shader {
             features |= 0x1000_0000;
         }
         let sfi0 = features.to_le_bytes();
+        let dedup_names = wave_helpers || self.compute_derivatives;
         let signature = |elements: &[SigElement], input| {
-            let mut part = container::signature(elements, input);
+            let mut part = container::signature(elements, input, dedup_names);
             // Validator 1.7 and up include the dword padding in the part.
-            if wave_helpers || self.compute_derivatives {
+            if dedup_names {
                 part.resize(part.len().next_multiple_of(4), 0);
             }
             part

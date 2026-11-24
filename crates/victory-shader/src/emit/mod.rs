@@ -483,7 +483,7 @@ mod tests {
             half: false,
         };
         let osg1 =
-            container::signature(&[el("SV_Depth", 17, 9), el("SV_StencilRef", 20, 5)], false);
+            container::signature(&[el("SV_Depth", 17, 9), el("SV_StencilRef", 20, 5)], false, false);
         let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
@@ -579,8 +579,18 @@ mod tests {
             usage: 15,
             half: false,
         };
-        let isg = container::signature(&[element("SV_Position", 3)], true);
-        let osg = container::signature(&[element("SV_Target", 16)], false);
+        let texcoord = |index| SigElement {
+            index,
+            row: Some(index + 1),
+            usage: 0,
+            ..element("TEXCOORD", 0)
+        };
+        let isg = container::signature(
+            &[element("SV_Position", 3), texcoord(0), texcoord(1)],
+            true,
+            false,
+        );
+        let osg = container::signature(&[element("SV_Target", 16)], false, false);
         let c = crate::dxbc::build(&[(FourCC::ISG1, &isg), (FourCC::OSG1, &osg)]);
         let c = Container::parse(&c).unwrap();
         let p = ir::build(&native.code, false, native.vgprs).unwrap();
@@ -746,8 +756,8 @@ mod tests {
                 usage,
                 half: false,
             };
-            let isg1 = super::container::signature(&[el("TEXCOORD", 0, 0)], true);
-            let osg1 = super::container::signature(&[el("SV_Target", 16, 15)], false);
+            let isg1 = super::container::signature(&[el("TEXCOORD", 0, 0)], true, false);
+            let osg1 = super::container::signature(&[el("SV_Target", 16, 15)], false, false);
             let bytes =
                 crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
             let c = super::Container::parse(&bytes).unwrap();
@@ -818,7 +828,7 @@ mod tests {
             usage: 0,
             half: false,
         };
-        let isg1 = super::container::signature(&[w_only], true);
+        let isg1 = super::container::signature(&[w_only], true, false);
         let bytes = crate::dxbc::build(&[(super::FourCC::ISG1, &isg1)]);
         let c = super::Container::parse(&bytes).unwrap();
         let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
