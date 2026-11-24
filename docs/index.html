@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GTA6 PC Port Archive</title>
-<meta name="description" content="Archive of Leonida, xcl and VIctory: open-source projects that worked on running GTA VI on PC. Code, pull requests, issues and comments.">
+<meta name="description" content="Archive of Leonida, xcl, VIctory and Xbox2Windows: open-source projects that worked on running GTA VI on PC. Code, pull requests, issues and comments.">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
 <style>
@@ -59,7 +59,7 @@ footer { color:var(--muted); font-size:13px; padding:0 0 40px; }
 <div class="wrap">
   <header>
     <h1>GTA6 PC Port Archive</h1>
-    <p class="lede">Archived copies of three open-source projects that worked on running GTA VI on PC, saved on 2026-11-23: their code, every pull request, and every issue and comment. No game files are included.</p>
+    <p class="lede">Archived copies of four open-source projects that worked on running GTA VI on PC, saved on 2026-11-23 and 24: their code, every pull request, and every issue and comment. No game files are included.</p>
   </header>
 
   <section class="cards" id="cards"></section>
@@ -75,7 +75,7 @@ footer { color:var(--muted); font-size:13px; padding:0 0 40px; }
     <div class="list" id="list" aria-live="polite"><div class="empty">Loading…</div></div>
     <article class="detail" id="detail"><div class="empty">Pick an issue or pull request to read it and its comments.</div></article>
   </div>
-  <footer>Code licenses: Leonida GPL-3.0, xcl GPL-2.0, VIctory GPL-3.0. Data straight from the GitHub API; images in comments are links to GitHub and may no longer load.</footer>
+  <footer>Code licenses: Leonida GPL-3.0, xcl GPL-2.0, VIctory GPL-3.0, Xbox2Windows MIT. Data straight from the GitHub API; images in comments are links to GitHub and may no longer load.</footer>
 </div>
 
 <script>
@@ -84,6 +84,7 @@ const PROJECTS = {
   leonida: { name: "Leonida", desc: "Native PC recompilation of the Xbox version. Original: ItsNotRexed/Leonida (removed from GitHub on 2026-11-23).", lic: "GPL-3.0" },
   xcl: { name: "xcl", desc: "Xbox Series compatibility layer for Windows: runs console code natively and recompiles RDNA2 shaders to DXIL. Original: ivall/xcl.", lic: "GPL-2.0" },
   victory: { name: "VIctory", desc: "An attempt at running GTA VI on PC. Original: Marvisak/VIctory.", lic: "GPL-3.0" },
+  xbox2windows: { name: "Xbox2Windows", desc: "Static recompilation of Xbox Series X|S software for x64 Windows, with CPU and GPU tests. Original: R0Y00/Xbox2Windows.", lic: "MIT" },
 };
 const PAGE = 150;
 const cache = {}, commentCache = {};

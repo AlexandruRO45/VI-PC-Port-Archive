@@ -5,7 +5,7 @@ import gzip, json, os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "docs", "data")
-PROJECTS = ["leonida", "xcl", "victory"]
+PROJECTS = ["leonida", "xcl", "victory", "xbox2windows"]
 
 
 def rows(project, name):
