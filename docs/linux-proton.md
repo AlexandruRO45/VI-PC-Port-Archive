@@ -72,11 +72,21 @@ export VICTORY_DATA_DIR=$(z "$HOME/victory-data/data")
 export VICTORY_CACHE_DIR=$(z "$HOME/victory-data/cache")
 export VICTORY_LOG=info
 
-umu-run cmd.exe /c "$(z "$PWD/victory.exe") run $VICTORY_GAME_DIR\<the title's exe> --execute > $(z "$PWD/host.out.log") 2> $(z "$PWD/host.err.log")"
+# From the repository root: the cargo output from the build step above
+# (use .../diag/victory.exe for the diagnostics build).
+VICTORY_BIN=$PWD/target/x86_64-pc-windows-msvc/release/victory.exe
+# Host logs go outside the checkout, one folder per run.
+LOGS=$HOME/.local/share/victory/logs/$(date +%Y%m%d-%H%M%S)
+mkdir -p "$LOGS"
+
+umu-run cmd.exe /c "$(z "$VICTORY_BIN") run $VICTORY_GAME_DIR\<the title's exe> --execute > $(z "$LOGS/host.out.log") 2> $(z "$LOGS/host.err.log")"
 ```
 
 Proton does not pass the Windows console through, hence `cmd.exe /c` with
-redirections to keep the log. `crashes.log` is in the data folder as usual.
+redirections to keep the log. Those logs can contain title-derived data, so
+they live under `$LOGS`, not in the repository. If you copy `victory.exe`
+somewhere else, point `VICTORY_BIN` at that copy, also outside the
+repository. `crashes.log` is in the data folder as usual.
 
 Seen on one machine (NVIDIA RTX 2060 SUPER, UMU-Proton 11.0, release build):
 imports bind, the D3D12 device comes up on vkd3d-proton, the first-boot
