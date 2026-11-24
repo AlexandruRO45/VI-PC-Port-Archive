@@ -1359,4 +1359,89 @@ mod tests {
         // Without outputs, param0 is the one the hardware wants anyway.
         assert_eq!(export(32, vec![]), Ok(Target::Unread));
     }
+
+    /// The group id SGPRs follow the user data in component order, skipping
+    /// a disabled component, then the group info; an SGPR past them (or in
+    /// the user data) is no system value, and only compute reports how many
+    /// SGPRs the hardware initializes.
+    #[test]
+    fn compute_group_ids_follow_the_user_sgprs() {
+        // Two user SGPRs, group ids x and z (no y), the group info; one
+        // thread id component.
+        let rsrc2 = 2 << 1 | 1 << 7 | 1 << 9 | 1 << 10;
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(crate::native::ComputeIo {
+                rsrc2,
+                threads: [64, 1, 1],
+            }),
+            code: vec![],
+        };
+        // v_mov_b32 v<4 + s>, s<s> for s1 to s5.
+        let words: Vec<u32> = (1..=5)
+            .map(|s| 0x7E00_0200 | (4 + s) << 17 | s)
+            .chain([S_ENDPGM])
+            .collect();
+        let io = raise(&program(&words), &native).unwrap();
+        let mut got: Vec<Input> = io.inputs.iter().map(|i| i.1).collect();
+        got.sort_by_key(|i| format!("{i:?}"));
+        assert_eq!(
+            got,
+            [Input::GroupId(0), Input::GroupId(2), Input::GroupInfo]
+        );
+        // s0-s1 user data, s2-s4 system values.
+        assert_eq!(io.initialized_sgprs, Some(5));
+        // A pixel shader's SGPR count is the stage data's business.
+        let ps = raise(&program(&[S_ENDPGM]), &pixel(vec![], 0)).unwrap();
+        assert_eq!(ps.initialized_sgprs, None);
+    }
+
+    /// Each export carries a value per enabled channel and none for one the
+    /// mask leaves off; a compressed export reads one VGPR per channel pair,
+    /// and `done` marks only the export that says so.
+    #[test]
+    fn export_values_follow_the_channel_mask_and_compression() {
+        let p = program(&[
+            0xF800_040F, // exp mrt0, v2, v3 compr
+            0x0000_0302,
+            0xF800_0815, // exp mrt1, v0, off, v1, off done
+            0x0001_0000,
+            S_ENDPGM,
+        ]);
+        // Perspective center in v0/v1, position x and y in v2/v3: four
+        // distinct input values to export.
+        let io = raise(&p, &pixel(vec![], 1 << 1 | 1 << 8 | 1 << 9)).unwrap();
+        let input = |v: Option<Value>| io.inputs.iter().find(|i| Some(i.0) == v).map(|i| i.1);
+        let [compr, done] = &io.exports[..] else {
+            panic!("{:?}", io.exports)
+        };
+        assert_eq!(
+            (compr.target, compr.compressed, compr.done),
+            (Target::Color(0), true, false)
+        );
+        let v = compr.values;
+        assert!(v.iter().all(Option::is_some));
+        assert_eq!((v[0], v[2]), (v[1], v[3]), "one VGPR per pair");
+        assert_eq!(input(v[0]), Some(Input::Position(0)));
+        assert_eq!(input(v[2]), Some(Input::Position(1)));
+        assert_eq!(
+            (done.target, done.compressed, done.done),
+            (Target::Color(1), false, true)
+        );
+        let v = done.values;
+        assert_eq!(v.map(|c| c.is_some()), [true, false, true, false]);
+        let barycentric = |index| Input::Barycentric {
+            kind: Barycentric::PerspectiveCenter,
+            index,
+        };
+        assert_eq!(
+            (input(v[0]), input(v[2])),
+            (Some(barycentric(0)), Some(barycentric(1)))
+        );
+        assert_eq!((compr.site, done.site), ((0, 0), (0, 1)));
+    }
 }
