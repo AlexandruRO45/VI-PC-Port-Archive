@@ -821,6 +821,11 @@ fn writable(p: usize, n: usize) -> bool {
     true
 }
 
+/// Empty reads succeed without inspecting the file offset, as read_exact_at does.
+fn file_range_available(offset: u64, bytes: u32, file_len: u64) -> bool {
+    bytes == 0 || offset.checked_add(u64::from(bytes)).is_some_and(|end| end <= file_len)
+}
+
 fn read_exact_at(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<(), HRESULT> {
     let mut done = 0;
     while done < buf.len() {
@@ -887,6 +892,12 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         b
     } else {
         let f = file.and_then(|f| f.handle()).ok_or(E_FILE_HANDLE)?;
+        if r.source_size != 0 {
+            let len = f.metadata().map_err(|e| e.raw_os_error().map_or(E_ABORT, |c| (0x8007_0000u32 | (c as u32 & 0xFFFF)) as i32))?.len();
+            if !file_range_available(r.offset, r.source_size, len) {
+                return Err(E_END_OF_FILE);
+            }
+        }
         let mut b = vec![0u8; r.source_size as usize];
         read_exact_at(&f, r.offset, &mut b)?;
         b
@@ -1492,6 +1503,16 @@ mod tests {
         b[0x28..0x30].copy_from_slice(&offset.to_le_bytes());
         b[0x30..0x34].copy_from_slice(&src_size.to_le_bytes());
         b
+    }
+
+    #[test]
+    fn file_ranges_reject_truncation_and_offset_overflow() {
+        assert!(file_range_available(0, 4, 4));
+        assert!(file_range_available(3, 1, 4));
+        assert!(!file_range_available(3, 2, 4));
+        assert!(!file_range_available(0, u32::MAX, 1));
+        assert!(!file_range_available(u64::MAX - 1, 2, u64::MAX));
+        assert!(file_range_available(u64::MAX, 0, 0));
     }
 
     #[test]
