@@ -416,6 +416,16 @@ fn advances(wait_ms: u64) {
     }
     let every = if n <= 3 { 1 } else { 15 };
     if n % every == 0 || moved > 0 {
-        tracing::info!(waits = n, wait_ms, moved, "bink: after a wait,{report}");
+        // The presented frame the wait came in, so the decoder's own motion
+        // can be read against a window's frame numbers: a stretch where the
+        // picture does not change is either a decoder that has stopped or a
+        // surface nobody re-reads, and only this tells them apart.
+        tracing::info!(
+            frame = victory_gpu::frame::current(),
+            waits = n,
+            wait_ms,
+            moved,
+            "bink: after a wait,{report}"
+        );
     }
 }
