@@ -172,18 +172,45 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_cases_with(shader, cases, false, check);
+}
+
+/// Like [`run_cases`], except hosts that refuse to compile `shader` (for
+/// example 4-lane WARP rejecting a `WaveSize(32)` shader) are skipped instead
+/// of failing the test.
+fn run_cases_if_supported(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_cases_with(shader, cases, true, check);
+}
+
+fn run_cases_with(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    allow_unsupported_host: bool,
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut hosts = 0;
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = host
-            .compute_pipeline(shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        hosts += 1;
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(pipeline) => pipeline,
+            Err(e) if allow_unsupported_host => {
+                eprintln!("{label}: compute_pipeline unsupported ({e}); skipped");
+                continue;
+            }
+            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
+        };
         for (i, &inputs) in cases.iter().enumerate() {
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
@@ -209,7 +236,11 @@ fn run_cases(
         }
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    assert!(hosts > 0, "neither hardware nor WARP SM 6.6 device available");
+    assert!(
+        allow_unsupported_host || ran > 0,
+        "no SM 6.6 device compiled the shader"
+    );
 }
 
 fn is_f16_nan(bits: u16) -> bool {
@@ -1140,20 +1171,14 @@ fn v_mov_b32_sdwa_and_dpp_apply_bitwise_abs_and_neg() {
         );
     }
     let dpp_neg = build_valu_cs(&dpp_body_neg);
-    let can_run_dpp = {
-        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-        Host::new(false).is_ok_and(|host| host.compute_pipeline(&dpp_neg).is_ok())
-    };
-    if can_run_dpp {
-        run_cases(&dpp_neg, &mov_cases, |backend, i, _, got| {
-            let (name, bits) = patterns[i];
-            assert_eq!(
-                got,
-                bits ^ 0x8000_0000,
-                "{backend}: v_mov_b32_dpp -{name} ({bits:#010x})"
-            );
-        });
-    }
+    run_cases_if_supported(&dpp_neg, &mov_cases, |backend, i, _, got| {
+        let (name, bits) = patterns[i];
+        assert_eq!(
+            got,
+            bits ^ 0x8000_0000,
+            "{backend}: v_mov_b32_dpp -{name} ({bits:#010x})"
+        );
+    });
 }
 
 #[test]
