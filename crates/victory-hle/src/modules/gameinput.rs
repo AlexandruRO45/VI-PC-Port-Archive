@@ -1567,6 +1567,36 @@ mod tests {
     }
 
     #[test]
+    fn the_first_press_is_still_current_after_the_connect_callback() {
+        let (hub, host) = fake();
+        // The press that makes an idle slot a pad arrives in the same poll as the connect
+        // callback. A title that only starts reading after that callback still sees it,
+        // because a reading stays current until the pad reports something else.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
+        hub.poll();
+        let pressed = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(pressed).buttons, A);
+        release(pressed);
+
+        // Nothing changed on the host: no new reading, the pressed one is still current.
+        hub.poll();
+        let again = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(again).buttons, A);
+        release(again);
+
+        // The release does produce a new reading, so a press held across one poll is never
+        // lost; only a press that starts and ends between two reads would be.
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        let released = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(released).buttons, 0);
+        release(released);
+    }
+
+    #[test]
     fn keys_feed_the_keyboard_and_the_stand_in_pad() {
         let (hub, host) = fake();
         let log = Log::default();
