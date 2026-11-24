@@ -5014,6 +5014,95 @@ mod tests {
         std::fs::remove_dir_all(&scratch).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_subfolder_under_a_looping_link_a_file_root_or_a_locked_parent_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-subdir-odd-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        if ensure_outside_repo(&scratch).is_err() {
+            // `TMPDIR` is inside the checkout; every subfolder is refused,
+            // which `subfolders_are_created_nested_and_again_without_error`
+            // already checks.
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+        let cache = scratch.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let cfg = Config {
+            cache_dir: cache.clone(),
+            data_dir: scratch.join("data"),
+            ..Default::default()
+        };
+
+        // A link inside the cache that loops: an error naming the path for
+        // the link itself and for a folder under it, and the link is kept.
+        let looped = cache.join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        for sub in ["loop", "loop/inner", "loop/a/b"] {
+            let err = format!("{:#}", cfg.cache_subdir(sub).unwrap_err());
+            assert!(err.contains("creating"), "{sub}: {err}");
+            assert!(err.contains(&looped.display().to_string()), "{sub}: {err}");
+        }
+        assert!(looped.symlink_metadata().unwrap().file_type().is_symlink());
+
+        // A link to a folder a few levels inside a repository: refused by
+        // the marker above its target, and nothing is made there.
+        let deep = scratch.join("repo").join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(scratch.join("repo").join(crate::policy::ROOT_MARKER), b"").unwrap();
+        std::os::unix::fs::symlink(&deep, cache.join("deep")).unwrap();
+        for sub in ["deep", "deep/shaders"] {
+            assert!(cfg.cache_subdir(sub).is_err(), "{sub}");
+        }
+        assert_eq!(std::fs::read_dir(&deep).unwrap().count(), 0);
+
+        // The data folder itself a file (swapped in after the settings were
+        // checked): an error naming the subfolder, and the file kept as is.
+        std::fs::write(&cfg.data_dir, b"saves").unwrap();
+        let err = format!("{:#}", cfg.data_subdir("0000ABCD").unwrap_err());
+        assert!(err.contains("creating"), "{err}");
+        assert!(
+            err.contains(&cfg.data_dir.join("0000ABCD").display().to_string()),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&cfg.data_dir).unwrap(), b"saves");
+        std::fs::remove_file(&cfg.data_dir).unwrap();
+
+        // A cache folder not made yet, under a folder without write
+        // permission: the permission error with the subfolder it was
+        // creating, and nothing made.
+        let locked = scratch.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let shut = Config {
+            cache_dir: locked.join("cache"),
+            data_dir: scratch.join("data"),
+            ..Default::default()
+        };
+        // Root (or a CAP_DAC_OVERRIDE container) writes through the mode
+        // bits, leaving nothing to check.
+        let enforced = std::fs::create_dir(locked.join("probe")).is_err();
+        if enforced {
+            let err = shut.cache_subdir("images").unwrap_err();
+            let io = err.downcast_ref::<std::io::Error>().unwrap();
+            assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied, "{err:#}");
+            assert_eq!(
+                err.to_string(),
+                format!("creating {}", locked.join("cache/images").display())
+            );
+            assert!(!locked.join("cache").exists());
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Write permission back: the same call succeeds.
+        assert!(shut.cache_subdir("images").unwrap().is_dir());
+
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
     #[test]
     fn subfolders_refuse_a_leading_dot_and_allow_a_trailing_slash() {
         // A leading `./` is a `.` component; a trailing slash or a doubled
