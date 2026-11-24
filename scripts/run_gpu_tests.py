@@ -980,7 +980,8 @@ def run_suite(a, work: str) -> int:
             rc, msg = run_cmd([vk_compute, spv, groups, "dump"], env=cs_env)
             words = dump_words(msg)
             vals = words[:len(want)] if words else []
-            results.append((name, rc == 0 and vals == want, " ".join(hex(x) for x in vals) if vals else msg))
+            results.append((name,) + compute_result(rc, msg, rc == 0 and vals == want,
+                                                    " ".join(hex(x) for x in vals) if vals else msg))
         elif name in CLIP_CASES:
             detail = clip_test(a.build, spirv_dir, name)
             results.append((name, None if isinstance(detail, Skip) else not detail, detail or "four pixel masks exact"))
