@@ -1231,3 +1231,78 @@ fn symbol_keys_pad_every_guid_field_but_not_the_age() {
     guid[15] = 0x04;
     assert_eq!(key(guid, 2), "000000010002000300000000000000042");
 }
+
+#[test]
+fn a_tls_directory_too_short_for_its_callback_field_is_malformed() {
+    // The directory starts 16 bytes before the end of the section, so the
+    // AddressOfCallBacks field at offset 24 is past the section data.
+    let short = SECTION_RVA + SECTION_SIZE - 16;
+    let mut d = image();
+    set_directory(&mut d, DIR_TLS, short, 40);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+
+    // With exactly the 32 bytes up to and including the field it is read.
+    let fits = SECTION_RVA + SECTION_SIZE - 32;
+    let mut d = image();
+    set_directory(&mut d, DIR_TLS, fits, 40);
+    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
+    assert_eq!((tls.directory_rva, tls.callbacks_va), (fits, 0));
+    assert!(tls.callback_rvas.is_empty());
+}
+
+#[test]
+fn a_partial_tls_slot_at_the_end_of_the_section_is_not_read() {
+    // One whole slot, then four non-zero bytes the section ends on.
+    let array = SECTION_RVA + SECTION_SIZE - 12;
+    let mut d = image();
+    put64(
+        &mut d,
+        at(TLS_DIRECTORY) + layout::TLS64_ADDRESS_OF_CALLBACKS,
+        IMAGE_BASE + u64::from(array),
+    );
+    put64(&mut d, at(array), IMAGE_BASE + 0x1030);
+    put32(&mut d, at(array + 8), 0x1040);
+    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
+    assert_eq!(tls.callback_rvas, [0x1030]);
+}
+
+#[test]
+fn names_that_are_not_utf8_are_kept_with_replacement_characters() {
+    let mut d = image();
+    put_bytes(&mut d, DLL_NAME, b"KERN\xFFL32.dll\0");
+    put_bytes(&mut d, HINT_NAME + 2, b"Exit\xC3Process\0");
+    add_delay_import(&mut d);
+    put_bytes(&mut d, DELAY_DLL_NAME, b"USER\x8032.dll\0");
+    add_codeview(&mut d, b"RSDS");
+    // Same length as "t.pdb\0", so it still ends inside the record.
+    put_bytes(&mut d, CODEVIEW + 24, b"\xFE.pdb\0");
+
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.imports[0].dll, "KERN\u{FFFD}L32.dll");
+    assert_eq!(
+        info.imports[0].entries[0].symbol,
+        ImportSymbol::Name {
+            hint: 0x123,
+            name: "Exit\u{FFFD}Process".into()
+        }
+    );
+    assert_eq!(info.delay_imports[0].dll, "USER\u{FFFD}32.dll");
+    assert_eq!(info.codeview.unwrap().pdb_path, "\u{FFFD}.pdb");
+}
+
+#[test]
+fn a_codeview_path_without_its_nul_inside_the_record_is_malformed() {
+    // The record is 30 bytes, leaving six for "t.pdb\0"; a seven-byte path
+    // runs its terminator past the size the debug directory gives.
+    let mut d = image();
+    add_codeview(&mut d, b"RSDS");
+    put_bytes(&mut d, CODEVIEW + 24, b"tt.pdb\0");
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+
+    // Growing the record by that byte makes it readable again.
+    put32(&mut d, at(DEBUG_DIRECTORY) + 16, 4 + 16 + 4 + 7);
+    assert_eq!(
+        ImageInfo::parse(&d).unwrap().codeview.unwrap().pdb_path,
+        "tt.pdb"
+    );
+}
