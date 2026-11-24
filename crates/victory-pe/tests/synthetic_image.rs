@@ -2812,3 +2812,111 @@ fn a_debug_directory_in_another_section_than_its_record_is_read_there() {
     assert_eq!((cv.pdb_path.as_str(), cv.age), ("t.pdb", 0x2A));
     assert_eq!(cv.symbol_key(), "030201000504070608090A0B0C0D0E0F2A");
 }
+
+#[test]
+fn an_unsorted_export_name_table_still_names_every_export() {
+    // The Windows loader binary-searches the name pointer table, but reading
+    // the exports walks it in order: names out of order are all reported,
+    // each against the ordinal its own name-ordinal entry gives.
+    let mut d = image();
+    add_exports(&mut d);
+    let (names, ordinals) = (0x1384u32, 0x1390u32);
+    let (local, fwdname, fwdord) = (0x13A0u32, 0x13A8u32, 0x13B0u32);
+    for (i, (name, index)) in [(local, 0u16), (fwdord, 2), (fwdname, 1)]
+        .into_iter()
+        .enumerate()
+    {
+        put32(&mut d, at(names) + i * 4, name);
+        put16(&mut d, at(ordinals) + i * 2, index);
+    }
+    let mut exports: Vec<_> = ImageInfo::parse(&d)
+        .unwrap()
+        .exports
+        .into_iter()
+        .map(|e| (e.ordinal, e.name, e.rva, e.forward))
+        .collect();
+    exports.sort();
+    assert_eq!(
+        exports,
+        [
+            (1, Some("local".into()), Some(ENTRY), None),
+            (2, Some("fwdname".into()), None, Some("NTDLL.RtlFoo".into())),
+            (3, Some("fwdord".into()), None, Some("NTDLL.#7".into())),
+        ]
+    );
+}
+
+#[test]
+fn a_debug_directory_with_an_rva_but_no_size_has_no_codeview() {
+    let mut d = image();
+    add_codeview(&mut d, b"RSDS");
+    set_directory(&mut d, DIR_DEBUG, DEBUG_DIRECTORY, 0);
+    assert!(ImageInfo::parse(&d).unwrap().codeview.is_none());
+
+    // With no RVA the entry is absent whatever its size says.
+    set_directory(&mut d, DIR_DEBUG, 0, 28);
+    assert!(ImageInfo::parse(&d).unwrap().codeview.is_none());
+}
+
+#[test]
+fn an_import_with_an_empty_name_is_malformed() {
+    // A hint/name entry whose name is just its NUL has no name to bind by,
+    // so the image is rejected rather than importing "".
+    let mut d = image();
+    put_bytes(&mut d, HINT_NAME + 2, b"\0");
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+
+    let mut d = image();
+    add_delay_import(&mut d);
+    put_bytes(&mut d, DELAY_HINT_NAME + 2, b"\0");
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+}
+
+#[test]
+fn an_unaligned_iat_is_taken_as_written() {
+    // Slot RVAs are not rounded: the loader gets the bytes the name table
+    // pairs with, eight apart from wherever the IAT starts.
+    for iat in [IAT + 1, IAT + 4, IAT + 7] {
+        let mut d = image();
+        put32(&mut d, at(IMPORT_DESCRIPTORS) + 16, iat);
+        let info = ImageInfo::parse(&d).unwrap();
+        let slots: Vec<_> = info.imports[0]
+            .entries
+            .iter()
+            .map(|e| e.iat_slot_rva)
+            .collect();
+        assert_eq!(slots, [iat, iat + 8], "IAT at {iat:#x}");
+    }
+}
+
+#[test]
+fn a_tls_callback_array_in_the_headers_is_outside_the_sections() {
+    // The headers are mapped but belong to no section, so a callback array
+    // pointed at them cannot be read.
+    let mut d = image();
+    put64(
+        &mut d,
+        at(TLS_DIRECTORY) + layout::TLS64_ADDRESS_OF_CALLBACKS,
+        IMAGE_BASE + 0x100,
+    );
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+
+    // The same holds for the TLS directory itself.
+    let mut d = image();
+    set_directory(&mut d, DIR_TLS, 0x100, 40);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+}
+
+#[test]
+fn an_iat_whose_last_slot_crosses_the_size_of_image_rejects_the_whole_image() {
+    // The first slot fits; the second ends four bytes past SizeOfImage.
+    // Nothing is returned for the module, not even the slot that fit.
+    let mut d = image();
+    let iat = SIZE_OF_IMAGE - 12;
+    put32(&mut d, at(IMPORT_DESCRIPTORS) + 16, iat);
+    let err = ImageInfo::parse(&d).unwrap_err();
+    assert!(
+        matches!(&err, PeError::Malformed(m) if m.contains(&format!("{iat:#x}"))),
+        "{err:?}"
+    );
+}
