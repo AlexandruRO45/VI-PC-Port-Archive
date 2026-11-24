@@ -533,7 +533,9 @@ fn buffer_srv(
         );
         return None;
     }
-    buffer.FirstElement += offset / element;
+    // A corrupt descriptor can carry any first element: saturate so it
+    // stays past the copy (and null) instead of wrapping to a small one.
+    buffer.FirstElement = buffer.FirstElement.saturating_add(offset / element);
     // SAFETY: a live buffer.
     let capacity = unsafe { shadow.buffer.GetDesc() }.Width / element;
     let Some(count) = cut_to_copy(buffer.FirstElement, buffer.NumElements, capacity) else {
@@ -583,7 +585,9 @@ fn buffer_uav(
         once!(offset, element, "unordered buffer view not on an element of its host copy");
         return None;
     }
-    buffer.FirstElement += offset / element;
+    // A corrupt descriptor can carry any first element: saturate so it
+    // stays past the copy (and null) instead of wrapping to a small one.
+    buffer.FirstElement = buffer.FirstElement.saturating_add(offset / element);
     // SAFETY: a live buffer.
     let capacity = unsafe { shadow.buffer.GetDesc() }.Width / element;
     let Some(count) = cut_to_copy(buffer.FirstElement, buffer.NumElements, capacity) else {
