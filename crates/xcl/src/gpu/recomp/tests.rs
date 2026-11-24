@@ -200,6 +200,32 @@ fn scalar_bfe_64_handles_unsigned_signed_and_zero_width() {
 }
 
 #[test]
+fn scratch_address_modes_st_vaddr_and_saddr() {
+    let code = prog(&[
+        // ST mode (SADDR == 0x7F): base is 0u, offset only (ADDR field 0 is not treated as v0)
+        ("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 0), ("DATA", 1), ("SADDR", 0x7F), ("OFFSET", 16)], None),
+        ("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 2), ("ADDR", 0), ("SADDR", 0x7F), ("OFFSET", 16)], None),
+        // VADDR mode (SADDR == 0x7D): base is v3
+        ("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 4), ("ADDR", 3), ("SADDR", 0x7D), ("OFFSET", 32)], None),
+        // SADDR mode (SADDR == 4): base is s4
+        ("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 5), ("ADDR", 0), ("SADDR", 4), ("OFFSET", 64)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    // ST mode: 0u + 0x00000010u, no reference to v0
+    assert!(t.hlsl.contains("0u + 0x00000010u;"), "{}", t.hlsl);
+    // VADDR mode: v3 + 0x00000020u
+    assert!(t.hlsl.contains("v3 + 0x00000020u;"), "{}", t.hlsl);
+    // SADDR mode: s4 + 0x00000040u
+    assert!(t.hlsl.contains("s4 + 0x00000040u;"), "{}", t.hlsl);
+    // v0 should not be declared or referenced in HLSL
+    assert!(!t.hlsl.contains("uint v0 ="), "v0 was unexpectedly referenced: {}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+#[test]
 fn scalar_bitcmp_64_selects_the_indexed_half() {
     let code = prog(&[
         ("S_BITCMP1_B64", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 8)], None),
@@ -4551,11 +4577,14 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
     code.extend(glbl("GLOBAL_LOAD_UBYTE_D16_HI", &[("VDST", 61), ("ADDR", 3), ("SADDR", 2), ("OFFSET", 0x100)]));
     code.extend(glbl("GLOBAL_STORE_SHORT_D16_HI", &[("ADDR", 2), ("DATA", 62), ("SADDR", 2), ("OFFSET", 0x100)]));
     code.extend(glbl("GLOBAL_LOAD_USHORT", &[("VDST", 63), ("ADDR", 2), ("SADDR", 2), ("OFFSET", 0x100)]));
-    // scratch (per lane): a dword at 2 · lane + 16, a byte at 2 · lane + 40
-    code.extend(enc("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 11), ("SADDR", 0x7F), ("OFFSET", 16)]));
-    code.extend(enc("SCRATCH_STORE_BYTE", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 36), ("SADDR", 0x7F), ("OFFSET", 40)]));
-    code.extend(enc("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 64), ("ADDR", 2), ("SADDR", 0x7F), ("OFFSET", 16)]));
-    code.extend(enc("SCRATCH_LOAD_UBYTE", "ENC_FLAT_SCRATCH", &[("VDST", 65), ("ADDR", 2), ("SADDR", 0x7F), ("OFFSET", 40)]));
+    // scratch (per lane): a dword at 2 · lane + 16, a byte at 2 · lane + 40 (VADDR mode: SADDR 0x7D)
+    code.extend(enc("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 11), ("SADDR", 0x7D), ("OFFSET", 16)]));
+    code.extend(enc("SCRATCH_STORE_BYTE", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 36), ("SADDR", 0x7D), ("OFFSET", 40)]));
+    code.extend(enc("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 64), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 16)]));
+    code.extend(enc("SCRATCH_LOAD_UBYTE", "ENC_FLAT_SCRATCH", &[("VDST", 65), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 40)]));
+    // scratch ST mode (SADDR 0x7F): fixed offset, no VADDR base added even when v0 is nonzero
+    code.extend(enc("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 0), ("DATA", 11), ("SADDR", 0x7F), ("OFFSET", 80)]));
+    code.extend(enc("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 88), ("ADDR", 0), ("SADDR", 0x7F), ("OFFSET", 80)]));
     // VALU
     let vv = |n: u64| V + n;
     code.extend(vop3("V_SAD_U8", &[("VDST", 66), ("SRC0", vv(22)), ("SRC1", vv(23)), ("SRC2", vv(24))]));
@@ -4581,6 +4610,7 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
     st.sgpr[2] = 0x600;
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         let l32 = l as u32;
+        r[0] = 0x1234;
         r[2] = 2 * l32;
         r[3] = 0x80 + l32;
         for (k, a) in [(7, 512u32), (17, 516), (18, 520), (19, 524), (20, 528)] {
@@ -4645,6 +4675,7 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
         assert_eq!((v[59], v[60], v[61]), (b, b | 0xFFFF_FF00, 0x1234 | b << 16), "lane {l}: global ubyte / sbyte / ubyte_d16_hi");
         assert_eq!(v[63], 0xBEEF, "lane {l}: global_store_short_d16_hi + load_ushort");
         assert_eq!((v[64], v[65]), (l as u32 + 1, b), "lane {l}: scratch dword / byte");
+        assert_eq!(v[88], l as u32 + 1, "lane {l}: scratch ST mode (SADDR 0x7F) ignores v0");
         assert_eq!((v[66], v[67], v[68]), (133, 85, 0x2828_2828), "lane {l}: v_sad_u8 / v_msad_u8 / v_lerp_u8");
         assert_eq!((f32::from_bits(v[69]), f32::from_bits(v[70]), f32::from_bits(v[71])), (3.5, f32::INFINITY, 16.0), "lane {l}: div_fixup / fixup(x/0) / div_fmas");
         assert_eq!((f32::from_bits(v[72]), v[73]), (7.0, 0x7FFF_FFFF), "lane {l}: v_div_scale_f32 / v_add_nc_i32 clamp");
