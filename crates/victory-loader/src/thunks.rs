@@ -15,12 +15,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
+#[cfg(windows)]
 use windows_sys::Win32::System::Diagnostics::Debug::{
     DebugBreak, FlushInstructionCache, IsDebuggerPresent,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// What an unimplemented import does when called.
@@ -66,6 +69,7 @@ extern "win64" fn unimplemented_import(site: &'static ImportSite) -> u64 {
                 "VIctory: unimplemented import {}!{} called",
                 site.dll, site.symbol
             );
+            #[cfg(windows)]
             // SAFETY: plain Win32 calls without preconditions.
             unsafe {
                 if IsDebuggerPresent() != 0 {
@@ -88,6 +92,7 @@ pub(crate) struct ThunkBlock {
 
 impl ThunkBlock {
     /// Reserves room for `count` stubs (writable until [`Self::seal`]).
+    #[cfg(windows)]
     pub(crate) fn new(count: usize) -> Result<Self> {
         let len = (count.max(1) * THUNK_SIZE).next_multiple_of(4096);
         // SAFETY: fresh anonymous allocation; no existing memory is touched.
@@ -132,6 +137,7 @@ impl ThunkBlock {
 
     /// Makes the block read+execute. The block is intentionally leaked:
     /// title code may hold these addresses for the life of the process.
+    #[cfg(windows)]
     pub(crate) fn seal(self) -> Result<()> {
         let mut old = 0;
         // SAFETY: `base..base+len` is the allocation made in `new`.
@@ -144,6 +150,58 @@ impl ThunkBlock {
         }
         // SAFETY: flushing our own process's instruction cache for our own block.
         unsafe { FlushInstructionCache(GetCurrentProcess(), self.base as _, self.len) };
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ThunkBlock {
+    /// Reserves room for `count` stubs (writable until [`Self::seal`]).
+    pub(crate) fn new(count: usize) -> Result<Self> {
+        let len = (count.max(1) * THUNK_SIZE).next_multiple_of(4096);
+        // SAFETY: fresh anonymous mapping; no existing memory is touched.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            bail!(
+                "mmap for import stubs failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(ThunkBlock {
+            base: base.cast(),
+            len,
+            used: 0,
+        })
+    }
+
+    /// Makes the block read+execute. The block is intentionally leaked:
+    /// title code may hold these addresses for the life of the process.
+    pub(crate) fn seal(self) -> Result<()> {
+        // SAFETY: `base..base+len` is the mapping made in `new`.
+        let ok = unsafe {
+            libc::mprotect(
+                self.base.cast(),
+                self.len,
+                libc::PROT_READ | libc::PROT_EXEC,
+            )
+        };
+        if ok != 0 {
+            bail!(
+                "mprotect for import stubs failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        const PAGE_EXECUTE_READ: u32 = 0x20;
+        crate::linux::vm::adopt(self.base as usize, self.len, PAGE_EXECUTE_READ);
         Ok(())
     }
 }
