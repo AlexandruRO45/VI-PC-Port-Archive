@@ -1278,6 +1278,9 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    if max == 0 {
+        return;
+    }
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
@@ -1594,6 +1597,8 @@ mod tests {
         assert_eq!(indirect_offset(0x1000, 8, 4, 4), Some(0x1004));
         assert_eq!(indirect_offset(0x1000, 7, 4, 4), None);
         assert_eq!(indirect_offset(0x1000, 8, 2, 4), None);
+        assert_eq!(indirect_offset(0x1000, 8, 8, 0), Some(0x1008));
+        assert_eq!(indirect_offset(0x1000, 8, 12, 0), None);
         assert_eq!(indirect_offset(0x1000, u64::MAX, u64::MAX - 3, 4), None);
         assert_eq!(indirect_offset(u64::MAX - 7, 8, 4, 4), None);
     }
