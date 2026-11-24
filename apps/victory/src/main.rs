@@ -97,6 +97,9 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
+        /// Refuse to start if the host D3D12 device cannot execute translated pipelines.
+        #[arg(long, requires = "execute")]
+        require_host: bool,
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
@@ -158,10 +161,25 @@ fn main() -> Result<()> {
             unimplemented,
             strict,
             execute,
+            require_host,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => run::run(&exe, unimplemented, strict, execute, require_host, console),
         Command::Config => show_config(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn require_host_requires_execute() {
+        assert!(Cli::try_parse_from(["victory", "run", "game.exe", "--require-host"]).is_err());
+        assert!(
+            Cli::try_parse_from(["victory", "run", "game.exe", "--execute", "--require-host"])
+                .is_ok()
+        );
     }
 }
 

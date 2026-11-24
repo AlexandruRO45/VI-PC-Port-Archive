@@ -10,6 +10,7 @@ pub fn run(
     unimplemented: Unimplemented,
     strict: bool,
     execute: bool,
+    require_host: bool,
     console: Console,
 ) -> Result<()> {
     use std::sync::Arc;
@@ -29,6 +30,13 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    if require_host {
+        victory_hle::modules::d3d12x::ensure_host().map_err(|e| {
+            anyhow::anyhow!(
+                "cannot start title: --require-host needs a usable host D3D12 device: {e}"
+            )
+        })?;
+    }
     let image = victory_loader::load(&prepared, &images)?;
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
@@ -333,6 +341,6 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }
