@@ -3576,6 +3576,73 @@ mod tests {
     }
 
     #[test]
+    fn config_text_counts_lines_after_the_mark_and_at_the_end() {
+        // The byte offset and line are of the text after a dropped mark.
+        let err = format!(
+            "{:#}",
+            config_text(b"\xEF\xBB\xBF[paths]\n\xFF".to_vec()).unwrap_err()
+        );
+        assert!(err.contains("line 2 "), "{err}");
+        assert!(err.contains("byte 8,"), "{err}");
+        // A lone stray byte is not UTF-16, just not UTF-8 on line 1.
+        let err = format!("{:#}", config_text(b"\xFF".to_vec()).unwrap_err());
+        assert!(err.contains("line 1 "), "{err}");
+        assert!(!err.contains("UTF-16"), "{err}");
+        // A character cut off at the end of the file is on the last line.
+        let err = format!("{:#}", config_text(b"a\nb\n\xC3".to_vec()).unwrap_err());
+        assert!(err.contains("line 3 "), "{err}");
+        // A non-ASCII first byte before a zero is not taken for UTF-16.
+        let err = format!("{:#}", config_text(b"\xE9\0".to_vec()).unwrap_err());
+        assert!(!err.contains("UTF-16"), "{err}");
+    }
+
+    #[test]
+    fn misplaced_path_keys_in_broken_toml_keep_the_parser_message() {
+        // The file does not parse as TOML at all: the hint would be a guess,
+        // so the parser's own message (naming the broken header) stays.
+        let err = format!(
+            "{:#}",
+            parse_file("game_dir = '/games/gta'\n[paths\n").expect_err("refused")
+        );
+        assert!(!err.contains("must be under"), "{err}");
+        // A top-level key that is not a path key is the parser's business.
+        let err = format!("{:#}", parse_file("log = 'info'\n").expect_err("refused"));
+        assert!(!err.contains("must be under"), "{err}");
+        assert!(err.contains("log"), "{err}");
+        // A path key nested in another table is not top level either.
+        let err = format!(
+            "{:#}",
+            parse_file("[game]\ngame_dir = '/games/gta'\n").expect_err("refused")
+        );
+        assert!(!err.contains("must be under"), "{err}");
+    }
+
+    #[test]
+    fn misspellings_ignore_doubled_separators_and_other_suffixes() {
+        for (name, meant) in [
+            ("VICTORY__GAME__DIR", "VICTORY_GAME_DIR"),
+            ("VICTORY_CACHE_PATH", "VICTORY_CACHE_DIR"),
+            ("VICTORY_CONFIG_PATH", "VICTORY_CONFIG"),
+            ("VICTORY_TESTTITLES", "VICTORY_TEST_TITLES"),
+            ("-VICTORY_DATA_DIR-", "VICTORY_DATA_DIR"),
+        ] {
+            assert_eq!(misspelling_of(name), Some(meant), "{name}");
+        }
+        for name in [
+            "",
+            "_",
+            "VICTORY",
+            "VICTORY_",
+            "VICTORY_TEST_TITLES_DIR",
+            "VICTORY_CONFIG_FOLDER",
+            "VICTORY_GAME_DIR_PATH",
+            "VICTORY_CACHEDIR2",
+        ] {
+            assert_eq!(misspelling_of(name), None, "{name}");
+        }
+    }
+
+    #[test]
     fn example_config_parses() {
         let text = include_str!("../../../victory.example.toml");
         let parsed = parse_file(text).unwrap();
