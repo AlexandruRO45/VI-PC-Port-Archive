@@ -112,11 +112,20 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
             None => {}
         }
     }
+    #[cfg(test)]
+    if validate_d3d12_tests() {
+        panic!("{text}");
+    }
     tracing::error!("{text}");
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
     }
+}
+
+#[cfg(test)]
+fn validate_d3d12_tests() -> bool {
+    std::env::var_os("VICTORY_TEST_D3D12_VALIDATE").is_some()
 }
 
 /// The host GPU, created on first use; `None` without one (a run then
@@ -126,6 +135,11 @@ pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
+            #[cfg(test)]
+            assert!(
+                !validate_d3d12_tests(),
+                "could not create the validation device: {e}"
+            );
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
         }
@@ -147,15 +161,30 @@ fn create() -> windows::core::Result<Host> {
             }
             // GPU-based validation (`VICTORY_D3D12_GBV`): out-of-range
             // descriptor heap indices and the like become messages naming
-            // the command instead of page faults. Without state tracking
-            // (directly indexed textures are not transitioned).
+            // the command instead of page faults. Production diagnostics
+            // skip state tracking for directly indexed textures. Strict
+            // GPU tests keep it enabled.
             if std::env::var_os("VICTORY_D3D12_GBV").is_some()
                 && let Some(l) = &layer
             {
                 if let Ok(d1) = l.cast::<ID3D12Debug1>() {
                     d1.SetEnableGPUBasedValidation(true);
+                    #[cfg(test)]
+                    if validate_d3d12_tests() {
+                        eprintln!("GPU-based validation enabled with resource state tracking");
+                    }
+                } else {
+                    #[cfg(test)]
+                    assert!(
+                        !validate_d3d12_tests(),
+                        "GPU-based validation is unavailable"
+                    );
                 }
-                if let Ok(d2) = l.cast::<ID3D12Debug2>() {
+                #[cfg(test)]
+                let disable_state_tracking = !validate_d3d12_tests();
+                #[cfg(not(test))]
+                let disable_state_tracking = true;
+                if disable_state_tracking && let Ok(d2) = l.cast::<ID3D12Debug2>() {
                     d2.SetGPUBasedValidationFlags(
                         D3D12_GPU_BASED_VALIDATION_FLAGS_DISABLE_STATE_TRACKING,
                     );
@@ -190,6 +219,19 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
+        #[cfg(test)]
+        if validate_d3d12_tests() {
+            assert!(messages.is_some(), "D3D12 debug layer is not active");
+            let luid = device.GetAdapterLuid();
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid)?;
+            let desc = adapter.GetDesc1()?;
+            let name = String::from_utf16_lossy(&desc.Description);
+            eprintln!(
+                "D3D12 debug layer active on {}",
+                name.trim_end_matches('\0')
+            );
+        }
         let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
@@ -621,7 +663,12 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
-        self.log_messages();
+        let error = self.log_messages();
+        #[cfg(test)]
+        if validate_d3d12_tests() {
+            assert!(error.is_none(), "D3D12 debug layer reported {error:?}");
+        }
+        let _ = error;
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations

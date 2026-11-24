@@ -217,7 +217,7 @@ fn enhanced_barriers() -> bool {
     })
 }
 
-fn enhanced_list(list: &HostList) -> Option<ID3D12GraphicsCommandList7> {
+pub(crate) fn enhanced_list(list: &HostList) -> Option<ID3D12GraphicsCommandList7> {
     enhanced_barriers().then(|| list.list.cast().ok()).flatten()
 }
 
@@ -277,17 +277,15 @@ pub(crate) fn bound(
         buffer_barriers(enhanced, separate_count, COMMON_ACCESS, COMMON_ACCESS);
     } else {
         uav_barrier(l);
-        // Older hosts use the existing COMMON promotion/UAV convention
-        // for shadow buffers. The sanitizer leaves arguments in UAV.
-        for buffer in [Some(buffer), separate_count].into_iter().flatten() {
-            // SAFETY: an open list and live buffer.
-            unsafe {
-                l.ResourceBarrier(&[transition(
-                    buffer,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                )]);
-            }
+        // The clamp writes only the arguments. A distinct count can promote
+        // from COMMON, following a producer handoff if written in this batch.
+        // SAFETY: an open list and a live argument buffer.
+        unsafe {
+            l.ResourceBarrier(&[transition(
+                buffer,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
         }
     }
     true
@@ -296,21 +294,19 @@ pub(crate) fn bound(
 /// Finish indirect reads before later passes reuse the buffers. COMMON
 /// access leaves them available to shaders, vertex fetch, or another call.
 pub(crate) fn done(list: &HostList, args: &ID3D12Resource, count: Option<&ID3D12Resource>) {
-    let buffers = [Some(args), count.filter(|&count| count != args)]
-        .into_iter()
-        .flatten();
     if let Some(enhanced) = enhanced_list(list) {
+        let buffers = [Some(args), count.filter(|&count| count != args)]
+            .into_iter()
+            .flatten();
         buffer_barriers(&enhanced, buffers, COMMON_ACCESS, COMMON_ACCESS);
     } else {
-        for buffer in buffers {
-            // SAFETY: bound transitioned these buffers before indirect use.
-            unsafe {
-                list.list.ResourceBarrier(&[transition(
-                    buffer,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )]);
-            }
+        // SAFETY: bound transitioned the arguments before indirect use.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                args,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
         }
     }
 }
@@ -485,6 +481,48 @@ mod tests {
                 assert_eq!(self.mapped.read(), u32::MAX);
                 std::slice::from_raw_parts(self.mapped.add(1).cast(), self.records).to_vec()
             }
+        }
+    }
+
+    struct TitleCount {
+        resource: crate::object::This,
+        data: Box<[u32; 4]>,
+        shadow: std::sync::Arc<crate::shadow::Shadow>,
+    }
+
+    impl TitleCount {
+        fn new(words: [u32; 4]) -> Self {
+            let mut data = Box::new(words);
+            let address = data.as_mut_ptr() as u64;
+            let resource = crate::resource::test_buffer_at(address, 16);
+            let shadow = crate::shadow::find(address, 16).unwrap();
+            Self {
+                resource,
+                data,
+                shadow,
+            }
+        }
+
+        fn address(&self) -> u64 {
+            self.data.as_ptr() as u64
+        }
+
+        fn handoff(
+            &self,
+            list: &HostList,
+            before: D3D12_RESOURCE_STATES,
+            after: D3D12_RESOURCE_STATES,
+        ) {
+            crate::list::test_buffer_handoff(list, self.resource, before.0 as u32, after.0 as u32);
+        }
+    }
+
+    impl Drop for TitleCount {
+        fn drop(&mut self) {
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(
+                self.resource,
+                0x10,
+            )(self.resource);
         }
     }
 
@@ -701,8 +739,15 @@ mod tests {
         let list = host.new_list().unwrap();
         let args = Arguments::new(host, &[[1, 1, 1, 1, 1, 1, 1]]);
         let count = Arguments::new(host, &[[1]]);
+        let copied_count = Arguments::new(host, &[[0]]);
         let work = Arguments::new(host, &[[6, 2, 3]]);
         let signature = dispatch_signature(host, 12);
+        // SAFETY: live buffers. The later read of the count can share its
+        // legacy COPY_SOURCE state through read-only promotion.
+        unsafe {
+            list.list
+                .CopyBufferRegion(&copied_count.buffer, 4, &count.buffer, 4, 4);
+        }
         for (buffer, offset) in [(&count.buffer, 4), (&args.buffer, 28)] {
             assert!(bound(
                 &list,
@@ -724,42 +769,55 @@ mod tests {
         for _ in 0..2 {
             host.execute(&[&list]);
             assert_eq!(used(&list), 2 * (2 + 36) * 64);
+            assert_eq!(copied_count.read(), [[1]]);
         }
     }
 
     #[test]
     fn gpu_count_producer_in_another_list_and_submission() {
         let Some(host) = host() else { return };
-        let writer = host.new_list().unwrap();
         let reader = host.new_list().unwrap();
         let args = Arguments::new(host, &[[1, 1, 1]; 2]);
-        let count = Arguments::new(host, &[[0, 2, 1]]);
+        let mut count = TitleCount::new([u32::MAX, 0, 2, 1]);
         let work = Arguments::new(host, &[[6, 2, 3]]);
         let signature = dispatch_signature(host, 12);
         let c = clamp().unwrap();
         let constants = [10u32, 12, 1, 0];
-        let writer_budget = writer.budget().unwrap();
-        // SAFETY: the writer uses the mesh clamp to store Y=1 at byte 8
-        // of the count buffer. Its UAV use precedes indirect consumption.
-        unsafe {
-            writer.list.SetComputeRootSignature(&c.root);
-            writer.list.SetPipelineState(&c.pso);
+        let record_writer = |count: &TitleCount| {
+            let writer = host.new_list().unwrap();
+            count.shadow.refresh(&writer, count.address(), 16);
+            count.shadow.gpu_writes(&writer, count.address() + 4, 12);
+            let budget = writer.budget().unwrap();
+            // SAFETY: the mesh clamp stores Y=1 at byte 8 of the count.
+            unsafe {
+                writer.list.SetComputeRootSignature(&c.root);
+                writer.list.SetPipelineState(&c.pso);
+                writer
+                    .list
+                    .SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                writer
+                    .list
+                    .SetComputeRootUnorderedAccessView(1, count.shadow.gpu(count.address() + 4));
+                writer
+                    .list
+                    .SetComputeRootUnorderedAccessView(2, budget.GetGPUVirtualAddress());
+                writer.list.Dispatch(1, 1, 1);
+            }
             writer
-                .list
-                .SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-            writer
-                .list
-                .SetComputeRootUnorderedAccessView(1, count.gpu());
-            writer
-                .list
-                .SetComputeRootUnorderedAccessView(2, writer_budget.GetGPUVirtualAddress());
-            writer.list.Dispatch(1, 1, 1);
+        };
+        let writer = record_writer(&count);
+        if enhanced_list(&writer).is_none() {
+            count.handoff(
+                &writer,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            );
         }
         assert!(bound(
             &reader,
             &args.buffer,
             4,
-            Some(&count.buffer),
+            Some(&count.shadow.buffer),
             (COMPUTE, 12, 2)
         ));
         dispatch(
@@ -767,66 +825,94 @@ mod tests {
             (&args.buffer, 4),
             &signature,
             2,
-            Some((&count.buffer, 8)),
+            Some((&count.shadow.buffer, 8)),
             work.gpu(),
         );
         writer.close();
         reader.close();
         host.execute(&[&writer, &reader]);
-        assert_eq!(count.read(), [[0, 1, 1]]);
+        assert_eq!(*count.data, [u32::MAX, 0, 1, 1]);
         assert_eq!(used(&reader), (2 + 36) * 64);
+        // In separate submissions the writer's UAV state decays naturally.
+        count.data[2] = 2;
+        let writer = record_writer(&count);
+        writer.close();
+        host.execute(&[&writer]);
+        assert_eq!(*count.data, [u32::MAX, 0, 1, 1]);
         host.execute(&[&reader]);
         assert_eq!(used(&reader), (2 + 36) * 64);
     }
 
     #[test]
     fn indirect_buffers_can_be_used_for_copies_before_and_after() {
-        if !enhanced_barriers() {
-            eprintln!("skipped copy state test: requires enhanced barriers");
-            return;
-        }
         let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
         let args = Arguments::new(host, &[[1, 1, 1]; 2]);
-        let count = Arguments::new(host, &[[0]]);
+        let count = TitleCount::new([u32::MAX, 0, 0, 0]);
         let input = Arguments::new(host, &[[1]]);
         let first_arg = Arguments::new(host, &[[0]]);
         let result = Arguments::new(host, &[[0]]);
         let work = Arguments::new(host, &[[6, 2, 3]]);
         let signature = dispatch_signature(host, 12);
-        // SAFETY: live buffers. The prelude selects enhanced barriers for
-        // args and count, allowing them to start as copy source and destination.
-        unsafe {
-            list.list
-                .CopyBufferRegion(&first_arg.buffer, 4, &args.buffer, 4, 4);
-            list.list
-                .CopyBufferRegion(&count.buffer, 4, &input.buffer, 4, 4);
+        let enhanced = enhanced_list(&list).is_some();
+        if enhanced {
+            // SAFETY: the enhanced prelude permits an argument copy read
+            // before the clamp.
+            unsafe {
+                list.list
+                    .CopyBufferRegion(&first_arg.buffer, 4, &args.buffer, 4, 4)
+            };
         }
-        assert!(bound(
-            &list,
-            &args.buffer,
-            4,
-            Some(&count.buffer),
-            (COMPUTE, 12, 2)
-        ));
-        dispatch(
-            &list,
-            (&args.buffer, 4),
-            &signature,
-            2,
-            Some((&count.buffer, 4)),
-            work.gpu(),
-        );
-        // SAFETY: the indirect read has finished and the count buffer is
-        // available for the next access, here as a copy source.
+        for call in 0..2 {
+            if !enhanced && call > 0 {
+                count.handoff(
+                    &list,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                );
+            }
+            // SAFETY: live buffers and a writable copy destination.
+            unsafe {
+                list.list
+                    .CopyBufferRegion(&count.shadow.buffer, 4, &input.buffer, 4, 4)
+            };
+            if !enhanced {
+                count.handoff(
+                    &list,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                );
+            }
+            assert!(bound(
+                &list,
+                &args.buffer,
+                4,
+                Some(&count.shadow.buffer),
+                (COMPUTE, 12, 2)
+            ));
+            dispatch(
+                &list,
+                (&args.buffer, 4),
+                &signature,
+                2,
+                Some((&count.shadow.buffer, 4)),
+                work.gpu(),
+            );
+        }
+        // SAFETY: the count buffer can be read as a copy source after the
+        // indirect reads. Legacy read promotions can combine.
         unsafe {
             list.list
-                .CopyBufferRegion(&result.buffer, 4, &count.buffer, 4, 4)
+                .CopyBufferRegion(&result.buffer, 4, &count.shadow.buffer, 4, 4)
         };
         list.close();
-        host.execute(&[&list]);
-        assert_eq!(used(&list), (2 + 36) * 64);
-        assert_eq!(first_arg.read(), [[1]]);
-        assert_eq!(result.read(), [[1]]);
+        for _ in 0..2 {
+            host.execute(&[&list]);
+            assert_eq!(used(&list), 2 * (2 + 36) * 64);
+            if enhanced {
+                assert_eq!(first_arg.read(), [[1]]);
+            }
+            assert_eq!(result.read(), [[1]]);
+        }
     }
 }

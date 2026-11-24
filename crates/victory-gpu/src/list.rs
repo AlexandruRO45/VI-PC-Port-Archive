@@ -289,8 +289,7 @@ pub(crate) struct Barrier {
     last: u64,
 }
 
-/// The barrier on host resources, or `None` if it names a resource the host
-/// GPU does not have (buffers so far).
+/// The barrier on host resources, if the host mirrors the transition.
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
@@ -301,6 +300,30 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             const BEGIN_ONLY: u32 = 1;
             if b.flags & BEGIN_ONLY != 0 {
                 return None;
+            }
+            const INDIRECT_ARGUMENT: u32 = 0x200;
+            const UAV: u32 = 0x8;
+            let before = crate::host::pc_state((b.second >> 32) as u32);
+            let after = crate::host::pc_state(b.last as u32);
+            let indirect_handoff = (before == INDIRECT_ARGUMENT
+                && matches!(after, UAV | COPY_DEST))
+                || (after == INDIRECT_ARGUMENT && matches!(before, UAV | COPY_DEST));
+            if indirect_handoff
+                && let Some((data, _)) = crate::resource::buffer_bytes(b.first)
+                && crate::indirect::enhanced_list(list).is_none()
+                && let Some(shadow) = crate::shadow::existing(b.first as usize, data as u64)
+            {
+                // Preserve the title's handoff between a producer and
+                // indirect execution. Either native use can promote from
+                // COMMON, including the argument clamp's UAV access.
+                list.keep(&shadow.buffer);
+                return Some(Barrier {
+                    kind: 0,
+                    flags: 0,
+                    first: shadow.buffer.as_raw().cast_const().cast(),
+                    second: 0xffff_ffff | (u64::from(before) << 32),
+                    last: 0,
+                });
             }
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
@@ -369,21 +392,41 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             host.push(UAV_BARRIER);
         }
         if !host.is_empty() {
-            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-            const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
-            // SAFETY: the same layout; borrowed resource pointers, never
-            // released through this slice.
-            let host = unsafe {
-                std::slice::from_raw_parts(
-                    host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
-                    host.len(),
-                )
-            };
-            // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
+            record_barriers(list, &host);
         }
     }
     0
+}
+
+#[cfg(windows)]
+fn record_barriers(list: &crate::host::HostList, barriers: &[Barrier]) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+    const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
+    // SAFETY: identical layout, with live, borrowed resources on an open list.
+    unsafe {
+        list.list.ResourceBarrier(std::slice::from_raw_parts(
+            barriers.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
+            barriers.len(),
+        ));
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_buffer_handoff(
+    list: &crate::host::HostList,
+    resource: This,
+    before: u32,
+    after: u32,
+) {
+    let title = Barrier {
+        kind: 0,
+        flags: 0,
+        first: resource,
+        second: 0xffff_ffff | (u64::from(before) << 32),
+        last: u64::from(after),
+    };
+    let host = host_barrier(list, &title).expect("legacy buffer handoff");
+    record_barriers(list, &[host]);
 }
 
 /// Moves a title texture's host copy to `state` in the list, if needed.
