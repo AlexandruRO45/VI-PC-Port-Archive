@@ -292,6 +292,8 @@ fn containers(root: &Path) -> Vec<(String, PathBuf)> {
         }
     }
     out.sort();
+    // Recovery can see both names for a migration that already committed.
+    out.dedup();
     out
 }
 
@@ -1141,6 +1143,21 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
+    }
+
+    #[test]
+    fn recovering_a_committed_migration_counts_the_container_once() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let old = root.join("Slot");
+        let new = container_dir(root, "Slot");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("blob"), b"data").unwrap();
+        commit(&new, 1, "Slot", "", &[("blob", Source::Data(b"data"))]).unwrap();
+
+        assert_eq!(used_bytes(root), 4);
+        assert!(!old.exists());
+        assert_eq!(containers(root), [("Slot".into(), new)]);
     }
 
     /// An empty configuration id names none. As a folder name it would be

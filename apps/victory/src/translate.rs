@@ -273,10 +273,11 @@ pub fn run(
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
-        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
         for (v, p) in &pairs {
-            let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
+            let graphics = find_shader(&kept, v, &[HwStage::Vs, HwStage::Ms]);
+            let pixel = find_shader(&kept, p, &[HwStage::Ps]);
+            let made = match (graphics, pixel) {
+                (Some(vs), Some(ps)) => if vs.stage == HwStage::Ms {
                     host.mesh_pipeline(vs, ps)
                 } else {
                     host.pipeline(vs, ps)
@@ -301,6 +302,17 @@ pub fn run(
     Ok(())
 }
 
+fn find_shader<'a>(
+    shaders: &'a [(String, emit::HostShader)],
+    name: &str,
+    stages: &[HwStage],
+) -> Option<&'a emit::HostShader> {
+    shaders
+        .iter()
+        .find(|(label, shader)| stages.contains(&shader.stage) && label.contains(name))
+        .map(|(_, shader)| shader)
+}
+
 fn translate(
     source: &Source,
     path: &Path,
@@ -319,7 +331,7 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    if !lock(seen).insert(translation_key(&container)) {
         t.duplicates += 1;
         return;
     }
@@ -408,6 +420,18 @@ fn translate(
             }
         }
     }
+}
+
+fn translation_key(container: &Container<'_>) -> blake3::Hash {
+    // The emitter reads signatures and pipeline metadata alongside DXIL.
+    // Hash the parts rather than the source slice, which can extend past DXBC.
+    let mut hash = blake3::Hasher::new();
+    for part in &container.parts {
+        hash.update(&part.fourcc.0);
+        hash.update(&(part.data.len() as u64).to_le_bytes());
+        hash.update(part.data);
+    }
+    hash.finalize()
 }
 
 /// Validates an emitted shader if asked to.
@@ -659,4 +683,44 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use victory_shader::Part;
+
+    #[test]
+    fn pipeline_pair_selects_the_requested_shader_stage() {
+        let ps = host::stub_ps();
+        let vs = host::stub_vs(&ps).unwrap();
+        let shaders = [("test Ps".into(), ps), ("test Vs".into(), vs)];
+        let graphics = find_shader(&shaders, "test", &[HwStage::Vs, HwStage::Ms]);
+        let pixel = find_shader(&shaders, "test", &[HwStage::Ps]);
+        assert_eq!(graphics.map(|shader| shader.stage), Some(HwStage::Vs));
+        assert_eq!(pixel.map(|shader| shader.stage), Some(HwStage::Ps));
+    }
+
+    #[test]
+    fn translation_key_includes_shader_signatures() {
+        let container = |signature: &'static [u8], offset| Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: vec![
+                Part {
+                    fourcc: FourCC::DXIL,
+                    offset: 40,
+                    data: b"identical program",
+                },
+                Part {
+                    fourcc: FourCC::ISG1,
+                    offset,
+                    data: signature,
+                },
+            ],
+        };
+        let key = translation_key(&container(b"signature a", 80));
+        assert_ne!(key, translation_key(&container(b"signature b", 80)));
+        assert_eq!(key, translation_key(&container(b"signature a", 128)));
+    }
 }
