@@ -10,11 +10,16 @@
 //! pipeline, `C` a compute one, `U` (no payload) pipeline `hash` was built. A pipeline's
 //! payload names its shaders by hash; each shader is written once, before the first pipeline
 //! that uses it. Duplicates of earlier runs are not written again.
+//!
+//! On the title's pipeline threads an entry is built and hashed with no lock held; the lock
+//! covers its append only. The journal is opened (the frame headers of earlier runs read) on a
+//! thread of its own, and what is noted meanwhile waits in memory (`State::Opening`).
 
 use std::collections::HashSet;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use windows::Win32::Graphics::Direct3D12::*;
 
 pub const MAGIC: &[u8; 8] = b"XCLPJ001";
@@ -29,10 +34,39 @@ struct Journal {
     seen: HashSet<(u8, u64)>,
 }
 
-static J: Mutex<Option<Option<Journal>>> = Mutex::new(None);
+/// A frame to append: tag, windows byte, hash, payload.
+type Out<'a> = (u8, u8, u64, &'a [u8]);
+
+enum State {
+    Closed,
+    /// being opened (`open_in_background`): the frames noted meanwhile, owned, each once, and
+    /// their bytes
+    Opening(Vec<(u8, u8, u64, Vec<u8>)>, HashSet<(u8, u64)>, usize),
+    Open(Journal),
+    Off,
+}
+
+static J: Mutex<State> = Mutex::new(State::Closed);
+/// set with `State::Off`, so that the title's threads stop building entries
+static OFF: AtomicBool = AtomicBool::new(false);
+/// what may wait in memory while the journal is opened
+const OPENING_MAX: usize = 256 << 20;
 
 fn enabled() -> bool {
-    std::env::var("XCL_PSO_JOURNAL").map_or(true, |v| v != "0")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_PSO_JOURNAL").map_or(true, |v| v != "0")) && !OFF.load(Ordering::Relaxed)
+}
+
+/// A panic on another thread while it held the lock does not end the journal (each change of
+/// the state is one assignment, so it stays whole).
+fn lock() -> MutexGuard<'static, State> {
+    J.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn turn_off(g: &mut State, why: impl std::fmt::Display) {
+    crate::xlog_warn!("pipeline journal: {why}: off for this run");
+    *g = State::Off;
+    OFF.store(true, Ordering::Relaxed);
 }
 
 fn open() -> Option<Journal> {
@@ -86,17 +120,60 @@ fn open() -> Option<Journal> {
     Some(Journal { file, seen })
 }
 
-/// Runs `f` on the journal; a write error turns it off for the rest of the run (0).
-fn with(f: impl FnOnce(&mut Journal) -> std::io::Result<u64>) -> u64 {
-    let mut g = J.lock().unwrap();
-    let Some(j) = g.get_or_insert_with(open).as_mut() else { return 0 };
-    match f(j) {
-        Ok(h) => h,
-        Err(e) => {
-            crate::xlog_warn!("pipeline journal: {e}: off for this run");
-            *g = Some(None);
-            0
+/// Appends `frames` in order (shaders before the pipeline that names them); a write error turns
+/// the journal off for the rest of the run. The first call starts the opening.
+fn write(frames: &[Out]) {
+    if note(&mut lock(), frames) && std::thread::Builder::new().name("xcl-pso-journal".into()).spawn(open_in_background).is_err() {
+        turn_off(&mut lock(), "no thread to open it");
+    }
+}
+
+/// `write` on the state; true: the caller starts the opening.
+fn note(g: &mut State, frames: &[Out]) -> bool {
+    match g {
+        State::Off => false,
+        State::Open(j) => {
+            if let Err(e) = frames.iter().try_for_each(|&(t, w, h, p)| put(j, t, w, h, p)) {
+                turn_off(g, e);
+            }
+            false
         }
+        State::Opening(q, kept, bytes) => {
+            for &(t, w, h, p) in frames {
+                if kept.insert((t, h)) {
+                    *bytes += p.len();
+                    q.push((t, w, h, p.to_vec()));
+                }
+            }
+            if *bytes > OPENING_MAX {
+                turn_off(g, "too much noted while it was opened");
+            }
+            false
+        }
+        State::Closed => {
+            *g = State::Opening(Vec::new(), HashSet::new(), 0);
+            note(g, frames);
+            true
+        }
+    }
+}
+
+/// Opens the journal with no lock held (the title's threads go on noting), then writes what
+/// they noted meanwhile.
+fn open_in_background() {
+    let j = open();
+    opened(&mut lock(), j);
+}
+
+fn opened(g: &mut State, j: Option<Journal>) {
+    let State::Opening(q, ..) = std::mem::replace(g, State::Off) else { return };
+    let Some(mut j) = j else {
+        OFF.store(true, Ordering::Relaxed);
+        return;
+    };
+    match q.iter().try_for_each(|(t, w, h, p)| put(&mut j, *t, *w, *h, p)) {
+        Ok(()) => *g = State::Open(j),
+        Err(e) => turn_off(g, e),
     }
 }
 
@@ -204,13 +281,30 @@ fn put(j: &mut Journal, tag: u8, windows: u8, hash: u64, payload: &[u8]) -> std:
     Ok(())
 }
 
-fn put_shader(j: &mut Journal, out: &mut Vec<u8>, sh: Option<&[u8]>) -> std::io::Result<()> {
+/// A pipeline's frames, built and hashed with no lock held: its shaders', then its own.
+struct Entry<'a> {
+    shaders: Vec<Out<'a>>,
+    tag: u8,
+    windows: u8,
+    hash: u64,
+    payload: Vec<u8>,
+}
+
+impl Entry<'_> {
+    fn frames(&self) -> Vec<Out<'_>> {
+        let mut f = self.shaders.clone();
+        f.push((self.tag, self.windows, self.hash, &self.payload));
+        f
+    }
+}
+
+/// A shader's hash into the pipeline's payload, and its frame (none for an empty slot).
+fn add_shader<'a>(shaders: &mut Vec<Out<'a>>, out: &mut Vec<u8>, sh: Option<&'a [u8]>) {
     let h = sh.map_or(0, crate::gpu::shader::fnv64);
     if let Some(sh) = sh {
-        put(j, b'S', 0, h, sh)?;
+        shaders.push((b'S', 0, h, sh));
     }
     out.extend_from_slice(&h.to_le_bytes());
-    Ok(())
 }
 
 /// `pso::mem_windows` in a frame's byte: the count in the low 7 bits, `HEAP_WINDOWS` in the top
@@ -224,26 +318,34 @@ pub fn mem_windows_of(byte: u8) -> u32 {
     (byte & 0x7F) as u32 | if byte & 0x80 != 0 { crate::gpu::recomp::HEAP_WINDOWS } else { 0 }
 }
 
-fn finish(j: &mut Journal, tag: u8, mut payload: Vec<u8>) -> std::io::Result<u64> {
+fn entry(shaders: Vec<Out>, tag: u8, mut payload: Vec<u8>) -> Entry {
     // the memory windows are part of what the pipeline is (its HLSL differs with them, and with
     // heap windows)
     let windows = windows_byte(crate::gpu::recomp::pso::mem_windows());
     payload.push(windows);
     let hash = crate::gpu::shader::fnv64(&payload);
     payload.pop();
-    put(j, tag, windows, hash, &payload)?;
-    Ok(hash)
+    Entry { shaders, tag, windows, hash, payload }
+}
+
+/// Writes the entry; its hash.
+fn note_entry(e: Entry) -> u64 {
+    write(&e.frames());
+    e.hash
 }
 
 /// Note a graphics pipeline; its hash for `used`, 0 = not written.
 pub unsafe fn graphics(d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> u64 {
-    with(|j| graphics_in(j, d))
+    if !enabled() {
+        return 0;
+    }
+    note_entry(graphics_entry(d))
 }
 
-unsafe fn graphics_in(j: &mut Journal, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> std::io::Result<u64> {
-    let mut p = Vec::new();
+unsafe fn graphics_entry(d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> Entry<'_> {
+    let (mut shaders, mut p) = (Vec::new(), Vec::new());
     for b in [&d.VS, &d.PS, &d.DS, &d.HS, &d.GS] {
-        put_shader(j, &mut p, bytes_of(b))?;
+        add_shader(&mut shaders, &mut p, bytes_of(b));
     }
     let desc = graphics_bytes(d);
     p.extend_from_slice(&(desc.len() as u32).to_le_bytes());
@@ -262,19 +364,20 @@ unsafe fn graphics_in(j: &mut Journal, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -
             p.extend_from_slice(&w.to_le_bytes());
         }
     }
-    finish(j, b'G', p)
+    entry(shaders, b'G', p)
 }
 
 /// Note a compute pipeline; its hash for `used`, 0 = not written.
 pub unsafe fn compute(d: &D3D12_COMPUTE_PIPELINE_STATE_DESC) -> u64 {
-    with(|j| {
-        let mut p = Vec::new();
-        put_shader(j, &mut p, bytes_of(&d.CS))?;
-        let desc = compute_bytes(d);
-        p.extend_from_slice(&(desc.len() as u32).to_le_bytes());
-        p.extend_from_slice(&desc);
-        finish(j, b'C', p)
-    })
+    if !enabled() {
+        return 0;
+    }
+    let (mut shaders, mut p) = (Vec::new(), Vec::new());
+    add_shader(&mut shaders, &mut p, bytes_of(&d.CS));
+    let desc = compute_bytes(d);
+    p.extend_from_slice(&(desc.len() as u32).to_le_bytes());
+    p.extend_from_slice(&desc);
+    note_entry(entry(shaders, b'C', p))
 }
 
 /// Pipeline `hash` was built (the title used it): `xcl pipelines` makes these first.
@@ -282,7 +385,7 @@ pub fn used(hash: u64) {
     if hash == 0 {
         return;
     }
-    with(|j| put(j, b'U', 0, hash, &[]).map(|_| 0));
+    write(&[(b'U', 0, hash, &[])]);
 }
 
 /// A journal's pipeline, read back with everything it points to owned.
@@ -456,6 +559,33 @@ mod tests {
         // a torn tail is not a frame
         let whole = for_each_frame(&bytes, |_| {});
         assert_eq!(for_each_frame(&bytes[..bytes.len() - 3], |_| {}) < whole, true);
+    }
+
+    /// The entry written straight to `j` (no global state); its hash.
+    unsafe fn graphics_in(j: &mut Journal, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> std::io::Result<u64> {
+        let e = graphics_entry(d);
+        e.frames().iter().try_for_each(|&(t, w, h, p)| put(j, t, w, h, p))?;
+        Ok(e.hash)
+    }
+
+    #[test]
+    fn what_is_noted_while_the_journal_opens_is_written_after_in_order() {
+        let (vs, ps) = (vec![1u8; 8], vec![2u8; 8]);
+        let mut g = State::Closed;
+        assert!(note(&mut g, &[(b'S', 0, 11, &vs[..]), (b'G', 0, 21, &[7])]), "the first note starts the opening");
+        assert!(!note(&mut g, &[(b'S', 0, 11, &vs[..]), (b'S', 0, 12, &ps[..]), (b'G', 0, 22, &[8])]), "only once");
+        assert!(!note(&mut g, &[(b'U', 0, 21, &[])]));
+        let State::Opening(q, _, bytes) = &g else { panic!("not opening") };
+        assert_eq!((q.len(), *bytes), (5, 18), "a shader noted twice is kept once");
+        opened(&mut g, Some(Journal { file: tempfile(), seen: HashSet::new() }));
+        let State::Open(j) = &mut g else { panic!("not open") };
+        let mut bytes = MAGIC.to_vec();
+        use std::io::{Read, Seek};
+        j.file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        j.file.read_to_end(&mut bytes).unwrap();
+        let mut order = Vec::new();
+        for_each_frame(&bytes, |f| order.push((f.tag, f.hash)));
+        assert_eq!(order, [(b'S', 11), (b'G', 21), (b'S', 12), (b'G', 22), (b'U', 21)]);
     }
 
     fn tempfile() -> std::fs::File {
