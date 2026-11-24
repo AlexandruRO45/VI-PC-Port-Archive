@@ -7680,6 +7680,8 @@ impl<'a> Lower<'a> {
             }
             4 => (6, 2),
             5 => (7, 3),
+            6 if name == "image_load" || name == "image_get_resinfo" => (3, 2),
+            7 if name == "image_load" || name == "image_get_resinfo" => (8, 3),
             _ => return Err("an image dimension (cube loads or MSAA)"),
         };
         // Address VGPRs in order.
@@ -7923,7 +7925,7 @@ impl<'a> Lower<'a> {
             // in the first address: DXIL's dimensions; a channel DXIL leaves
             // out reads 1 (UAVs: one level).
             let h = self.handle(site, src, false, props)?;
-            let mip = if uav {
+            let mip = if uav || matches!(kind, 3 | 8) {
                 self.s.m.undef(self.s.t.i32)
             } else {
                 addr_val(self, 0)?
@@ -7936,14 +7938,15 @@ impl<'a> Lower<'a> {
             let one = self.s.m.i32(1);
             let present = match kind {
                 1 => [true, false, false, true],
-                2 | 5 | 6 => [true, true, false, true],
+                2 | 3 | 5 | 6 => [true, true, false, true],
                 _ => [true, true, true, true],
             };
             let Operand::Vector { reg, .. } = *data else {
                 return Err("an image result");
             };
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                let x = if ch == 3 && uav || !present[ch as usize] {
+                // MSAA textures have 1 mip level; DXIL getDimensions returns sample count in w.
+                let x = if (ch == 3 && (uav || matches!(kind, 3 | 8))) || !present[ch as usize] {
                     one
                 } else {
                     self.s.m.extract(c, d, ch)
@@ -8258,7 +8261,9 @@ impl<'a> Lower<'a> {
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 *slot = addr_val(self, k)?;
             }
-            let mip = if name == "image_load_mip" {
+            // shortcut: MSAA image_load forwards the fragment index as the sample
+            // index (assumes no FMASK remapping).
+            let mip = if name == "image_load_mip" || matches!(kind, 3 | 8) {
                 addr_val(self, coords)?
             } else if uav {
                 // Our declarations have four channels.
@@ -10723,6 +10728,79 @@ mod tests {
         // No parameter starts in rows 1, 3 or 4.
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
+        }
+    }
+
+    #[test]
+    fn msaa_image_load_and_get_resinfo_lower() {
+        use crate::native::{RootParam, RootType};
+
+        for (dim, op) in [(6u32, 0x00u32), (6, 0x0E), (7, 0x00), (7, 0x0E)] {
+            // s_mov_b32 s1, 0
+            // s_load_dwordx8 s[4:11], s[0:1], null
+            // v_mov_b32 v0..v3, 0
+            // image_load (0x00) / image_get_resinfo (0x0e) v[0..3], v[0..3], s[4:11]
+            // v_cmpx_ne_u32 exec, 0, v0
+            // s_endpgm
+            let mimg_w0 = 0xF000_0000 | (op << 18) | (0xF << 8) | (dim << 3);
+            let words = [
+                0xBE81_0380u32,
+                0xF40C_0100,
+                0xFA00_0000,
+                0x7E00_0280,
+                0x7E02_0280,
+                0x7E04_0280,
+                0x7E06_0280,
+                mimg_w0,
+                0x0001_0000,
+                0x7D9A_0080,
+                0xBF81_0000,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 4).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let out = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                view_marks: false,
+            })
+            .unwrap();
+            let c = crate::dxbc::Container::parse(&out.dxil).unwrap();
+            let sfi0 = c.part(crate::dxbc::FourCC::SFI0).unwrap().data;
+            let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+            assert_ne!(
+                features & 0x200_0000,
+                0,
+                "RESOURCE_HEAP feature bit missing"
+            );
         }
     }
 }
