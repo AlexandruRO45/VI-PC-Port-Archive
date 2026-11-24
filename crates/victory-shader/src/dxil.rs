@@ -353,4 +353,107 @@ mod tests {
             assert_eq!(DxilProgram::parse(&bytes).unwrap().dxil_version, v);
         }
     }
+
+    /// Every kind DXC's `DXIL::ShaderKind` numbers, Pixel (0) to Node (15),
+    /// decodes to its own variant; 16 (DXC's `Invalid`) and past are kept
+    /// as unknown, the kind field's top value included.
+    #[test]
+    fn every_known_kind_decodes_and_the_rest_are_unknown() {
+        use ShaderKind::*;
+        let known = [
+            Pixel,
+            Vertex,
+            Geometry,
+            Hull,
+            Domain,
+            Compute,
+            Library,
+            RayGeneration,
+            Intersection,
+            AnyHit,
+            ClosestHit,
+            Miss,
+            Callable,
+            Mesh,
+            Amplification,
+            Node,
+        ];
+        let kind = |k: u16| {
+            DxilProgram::parse(&build_standard(k, (6, 0), 0x100, &fake_bitcode()))
+                .unwrap()
+                .kind
+        };
+        for (k, want) in known.into_iter().enumerate() {
+            assert_eq!(kind(k as u16), want, "kind {k}");
+        }
+        for k in [16, 17, 0x7FFF, 0xFFFF] {
+            assert_eq!(kind(k), Unknown(k), "kind {k}");
+        }
+        // The kind sits above the model nibbles: neither leaks into it.
+        let bytes = build_standard(0xFFFF, (6, 0xF), 0x100, &fake_bitcode());
+        let p = DxilProgram::parse(&bytes).unwrap();
+        assert_eq!((p.kind, p.shader_model), (Unknown(0xFFFF), (6, 0xF)));
+    }
+
+    /// A program with `prefix` between the header and the bitcode and
+    /// `trailer` after it.
+    fn around(prefix: &[u8], trailer: &[u8]) -> Vec<u8> {
+        let bitcode = fake_bitcode();
+        let size = 24 + prefix.len() + bitcode.len() + trailer.len();
+        assert!(size.is_multiple_of(4));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&((5u32 << 16) | 0x65).to_le_bytes());
+        bytes.extend_from_slice(&((size / 4) as u32).to_le_bytes());
+        bytes.extend_from_slice(b"DXIL");
+        bytes.extend_from_slice(&0x105u32.to_le_bytes());
+        bytes.extend_from_slice(&(16 + prefix.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(bitcode.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(prefix);
+        bytes.extend_from_slice(&bitcode);
+        bytes.extend_from_slice(trailer);
+        bytes
+    }
+
+    /// `XDAT` counts only at the start of the prefix and `xbop` anywhere in
+    /// the trailer, at any byte offset; each in the other's place, or in
+    /// the wrong case, is no Xbox addition, though the layout is still not
+    /// PC's.
+    #[test]
+    fn xbox_extras_are_looked_for_only_where_each_belongs() {
+        let extras = |prefix: &[u8], trailer: &[u8]| {
+            let bytes = around(prefix, trailer);
+            let p = DxilProgram::parse(&bytes).unwrap();
+            assert_eq!((p.prefix, p.trailer), (prefix, trailer));
+            assert!(!p.is_standard_layout());
+            let x = p.xbox_extras();
+            (x.xdat, x.xbop)
+        };
+        assert_eq!(extras(b"XDAT", b"xbop"), (true, true));
+        // XDAT past the prefix's first byte, or only in the trailer.
+        assert_eq!(extras(b"\0\0\0\0XDAT", b""), (false, false));
+        assert_eq!(extras(b"", b"XDAT"), (false, false));
+        // xbop at an unaligned offset of the trailer still counts.
+        assert_eq!(extras(b"", b"\0xbop\0\0\0"), (false, true));
+        // xbop only in the prefix, or in another case.
+        assert_eq!(extras(b"xbop", b""), (false, false));
+        assert_eq!(extras(b"xdat", b"XBOP"), (false, false));
+    }
+
+    /// A zero-length bitcode is in bounds but holds no magic; a program of
+    /// exactly the 24-byte header is the smallest size accepted.
+    #[test]
+    fn an_empty_bitcode_lacks_the_magic() {
+        let mut bytes = build_standard(0, (6, 0), 0x100, &[]);
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(malformed(&bytes), "bitcode lacks LLVM magic");
+        // The magic just past the program's end is outside it.
+        bytes.extend_from_slice(&LLVM_BITCODE_MAGIC);
+        set_u32(&mut bytes, 20, 4);
+        assert_eq!(malformed(&bytes), "bitcode out of bounds");
+        set_u32(&mut bytes, 4, 7);
+        assert_eq!(
+            DxilProgram::parse(&bytes).unwrap().bitcode,
+            &LLVM_BITCODE_MAGIC
+        );
+    }
 }
