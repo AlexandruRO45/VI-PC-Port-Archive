@@ -173,7 +173,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, u32, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -3308,7 +3308,7 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props.0, props.1);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -5696,7 +5696,10 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(guard);
             if is_64 {
                 let i64t = self.s.m.int(64);
-                self.s.flags |= flags::INT64;
+                self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_ON_TYPED_RESOURCE;
+                if self.s.flags & flags::RESOURCE_HEAP != 0 {
+                    self.s.flags |= flags::ATOMIC_INT64_ON_HEAP_RESOURCE;
+                }
                 let pack64 = |s: &mut Self, lo: V, hi: V| {
                     let lo = s.s.m.cast(c, Cast::ZExt, lo, i64t);
                     let hi = s.s.m.cast(c, Cast::ZExt, hi, i64t);
@@ -7297,10 +7300,64 @@ mod tests {
             }]
         };
         let l = lower_with(&words, layout(), used()).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil.clone()).unwrap();
+        }
         let container = crate::Container::parse(&l.dxil).unwrap();
         let features = container.part(crate::FourCC::SFI0).unwrap();
         let sfi0 = u64::from_le_bytes(features.data.try_into().unwrap());
         assert_ne!(sfi0 & 0x8000, 0, "64-bit image atomic must declare INT64 feature");
+        assert_ne!(
+            sfi0 & 0x40_0000,
+            0,
+            "64-bit image atomic must declare ATOMIC_INT64_ON_TYPED_RESOURCE"
+        );
+        assert_ne!(
+            sfi0 & 0x1000_0000,
+            0,
+            "64-bit image atomic from descriptor heap must declare ATOMIC_INT64_ON_HEAP_RESOURCE"
+        );
+    }
+
+    #[test]
+    fn image_atomic_32_and_64_handles_do_not_collide_in_cache() {
+        // Table address at s0 loaded into s[2:3], s_load_dwordx8 s[0:7], s[2:3], null
+        // then 32-bit image_atomic_add v0, v2, s[0:7] dmask:0x1
+        // then 64-bit image_atomic_add v[0:1], v[2:3], s[0:7] dmask:0x3
+        let words = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            0xF044_0108,
+            0x0000_0002, // image_atomic_add v0, v2, s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D
+            0xF044_0308,
+            0x0000_0002, // image_atomic_add v[0:1], v[2:3], s[0:7] dmask:0x3 dim:SQ_RSRC_IMG_2D
+            S_ENDPGM,
+        ];
+        let layout = || vec![root(RootType::Table, 0, 0)];
+        let used = || {
+            vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        let l = lower_with(&words, layout(), used()).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil.clone()).unwrap();
+        }
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
