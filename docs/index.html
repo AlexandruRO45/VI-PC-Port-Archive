@@ -100,7 +100,7 @@
 
 <main class="wrap">
   <header class="hero">
-    <div class="kicker">Synced with GitHub every 6 hours</div>
+    <div class="kicker">Synced with GitHub every hour</div>
     <h1>GTA6 PC Port Archive</h1>
     <p class="lede">Saved copies of five open-source projects trying to run GTA VI on PC: their code, issues and comments. No game files.</p>
     <div class="answer" role="note">
@@ -201,7 +201,7 @@ function downloads() {
     const P = PROJECTS[k];
     return `<div class="dlc p-${k}">
       <h3><i class="dot"></i>${label(P)}</h3>
-      <p>${P.frozen || "Latest code, synced every 6 hours"}</p>
+      <p>${P.frozen || "Latest code, synced every hour"}</p>
       <div class="actions">
         <a class="btn solid sm" href="${zip(P, "main")}" aria-label="Download ${esc(plain(P))} code (zip)">Code .zip</a>
         <a class="btn sm" href="${zip(P, "github-export")}" aria-label="Download ${esc(plain(P))} issues and comments (zip)">Issues .zip</a>

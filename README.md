@@ -43,7 +43,7 @@ git clone --branch leonida-new/main --single-branch https://github.com/Guernica4
 
 ## Updates
 
-Every 6 hours, [`sync.yml`](.github/workflows/sync.yml) runs [`.github/sync.py`](.github/sync.py). For each project still
+Every hour, [`sync.yml`](.github/workflows/sync.yml) runs [`.github/sync.py`](.github/sync.py). For each project still
 on GitHub, it fetches the code, branches and pull requests, re-exports issues and comments, and rebuilds the site.
 Nothing is deleted: issues and comments removed upstream stay in the archive, and a project that disappears keeps
 its last copy. The old Leonida is no longer on GitHub, so it doesn't change.

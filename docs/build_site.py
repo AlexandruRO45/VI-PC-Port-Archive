@@ -16,8 +16,9 @@ def rows(project, name):
 
 def write_gz(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with gzip.open(path, "wt", encoding="utf-8", newline="\n") as f:
-        json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
+    data = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    with open(path, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as f:  # mtime 0: same data, same bytes
+        f.write(data)
 
 
 def build(project):
