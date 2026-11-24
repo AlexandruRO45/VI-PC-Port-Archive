@@ -1971,6 +1971,46 @@ mod tests {
     }
 
     #[test]
+    fn fixed_samplers_share_an_sgpr_only_by_taking_none() {
+        let (constants, descriptor, table, sampler, resource_heap) = (0, 1, 3, 4, 5);
+        // Stating none, any number of fixed samplers may name one dword,
+        // whatever their slots, and sit in a table's SGPR (of its own slot
+        // too), a heap's, or a root descriptor's high half, in either order.
+        for params in [
+            &[(sampler, 0, 4, 1), (sampler, 0, 4, 1)][..],
+            &[(sampler, 0, 4, 1), (sampler, 0, 4, 2), (sampler, 0, 4, 3)],
+            &[(table, 1, 4, 2), (sampler, 0, 4, 2)],
+            &[(sampler, 0, 4, 2), (table, 1, 4, 2)],
+            &[(resource_heap, 1, 4, 0), (sampler, 0, 4, 1)],
+            &[(descriptor, 2, 4, 0), (sampler, 0, 5, 1)],
+        ] {
+            assert!(program(params).is_ok(), "{params:?}");
+        }
+        // Stating one, a fixed sampler holds its SGPR like constants: only a
+        // table's ranges share one, so a second sampler there (even the same
+        // entry listed twice), a table range of the same slot, a heap, or a
+        // root descriptor's high half each collide, in either order.
+        for params in [
+            &[(sampler, 1, 4, 1), (sampler, 1, 4, 1)][..],
+            &[(sampler, 1, 4, 1), (sampler, 1, 4, 2)],
+            &[(sampler, 0, 4, 1), (sampler, 1, 4, 1), (sampler, 1, 4, 1)],
+            &[(table, 1, 4, 2), (sampler, 1, 4, 2)],
+            &[(sampler, 1, 4, 2), (table, 0, 4, 2)],
+            &[(resource_heap, 1, 4, 0), (sampler, 1, 4, 1)],
+            &[(descriptor, 2, 4, 0), (sampler, 1, 5, 1)],
+            &[(sampler, 2, 3, 1), (constants, 1, 4, 0)],
+        ] {
+            assert_eq!(
+                why_refused(program(params)),
+                "root parameters share an SGPR",
+                "{params:?}"
+            );
+        }
+        // Right after a sampler's last stated SGPR, the next is free.
+        assert!(program(&[(sampler, 2, 3, 1), (sampler, 1, 5, 2), (table, 1, 6, 3)]).is_ok());
+    }
+
+    #[test]
     fn compute_user_data_is_refused_before_system_sgprs() {
         // Sixteen user SGPRs (all of compute's user data) put group id x in
         // s16. Constants at dword 16 would cover it too, but are first a
