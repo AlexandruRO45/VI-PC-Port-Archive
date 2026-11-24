@@ -400,6 +400,7 @@ it is read; its README is the index for those.
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | *diagnostics.* Translated loops stop after `n` iterations per lane (decimal or `0x` hex, at least 1) instead of 2^20. The value is part of the translation, so it takes its own cache entries. If a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_SKIP_PIPELINES=<hash>,…` | as above: omits work whose pipeline contains that shader |
 | `VICTORY_SERIAL_PIPELINES=1` | Creates host pipelines one at a time, through one lock that every path into the vendor's compiler takes (the lazy helpers included), to tell a driver race from a description we build differently each run. A refusal that a later attempt at the same module survives is not a verdict on the module |
+| `VICTORY_NO_PIPELINE_FALLBACK=1` | *diagnostics.* Refuses a pipeline the library did not hold instead of making it, so a description the vendor compiler has faulted on costs a draw rather than the run — and the refusal names the pipeline, which a fault leaves nothing behind to say. The only crash-free configuration found so far: one window of 151 s reached frame 1,539 at 7.6 fps with 0 faults and 4,561 of 4,894 draws drawn, in a stage that window's report does not name. Its cost is exactly the pipelines it refuses |
 
 ### What the process did
 
