@@ -9,6 +9,10 @@
 //! leaves the menu up: the window stays open until Enter, with how the run
 //! ended, so its last lines can be read.
 //!
+//! S sets the game folder in `victory.toml`, K shows the keyboard's
+//! stand-in pad, and M switches the console model runs use (remembered).
+//! Those three follow the launcher in #1330.
+//!
 //! The colours are a sunset gradient of VIctory's own (violet, pink,
 //! peach), nothing of the title's. `NO_COLOR` turns them off, and so does a
 //! console without virtual-terminal sequences.
@@ -149,6 +153,9 @@ enum Choice {
     Again,
     Check,
     Data,
+    Folder,
+    Keys,
+    Model,
     Quit,
     Unknown,
 }
@@ -165,6 +172,9 @@ fn choice(input: &str) -> Choice {
         "2" | "r" => Choice::Again,
         "3" | "c" => Choice::Check,
         "4" | "d" => Choice::Data,
+        "s" => Choice::Folder,
+        "k" => Choice::Keys,
+        "m" => Choice::Model,
         "q" | "0" | "x" | "exit" | "quit" => Choice::Quit,
         _ => Choice::Unknown,
     }
@@ -201,6 +211,136 @@ fn load_last(data_dir: &Path) -> Option<PathBuf> {
 fn save_last(data_dir: &Path, exe: &Path) {
     let _ = std::fs::create_dir_all(data_dir);
     let _ = std::fs::write(last_file(data_dir), exe.display().to_string());
+}
+
+/// The console model runs from the menu use (`victory run --console`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Model {
+    SeriesX,
+    SeriesS,
+}
+
+impl Model {
+    fn arg(self) -> &'static str {
+        match self {
+            Model::SeriesX => "series-x",
+            Model::SeriesS => "series-s",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Model::SeriesX => "Series X",
+            Model::SeriesS => "Series S",
+        }
+    }
+
+    fn other(self) -> Self {
+        match self {
+            Model::SeriesX => Model::SeriesS,
+            Model::SeriesS => Model::SeriesX,
+        }
+    }
+}
+
+/// Where the menu's console model is remembered.
+fn model_file(data_dir: &Path) -> PathBuf {
+    data_dir.join("menu-console.txt")
+}
+
+fn load_model(data_dir: &Path) -> Model {
+    match std::fs::read_to_string(model_file(data_dir)) {
+        Ok(t) if t.trim() == Model::SeriesS.arg() => Model::SeriesS,
+        _ => Model::SeriesX,
+    }
+}
+
+fn save_model(data_dir: &Path, model: Model) {
+    let _ = std::fs::create_dir_all(data_dir);
+    let _ = std::fs::write(model_file(data_dir), model.arg());
+}
+
+/// The config file the tools read: `VICTORY_CONFIG`, else `victory.toml`
+/// in the current folder (beside `victory.exe` when it was double-clicked).
+fn config_path() -> PathBuf {
+    std::env::var_os("VICTORY_CONFIG")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| PathBuf::from("victory.toml"), PathBuf::from)
+}
+
+/// `text` (a config file, possibly empty) with `[paths].game_dir` set to
+/// `dir`: the active `game_dir` line replaced, else one added under
+/// `[paths]`, else a `[paths]` table appended. Comments and every other line
+/// stay as they were.
+fn set_game_dir(text: &str, dir: &Path) -> String {
+    let dir = dir.display().to_string();
+    // A literal string keeps backslashes as they are; it cannot hold an
+    // apostrophe, which a basic string with escapes can.
+    let value = if dir.contains('\'') {
+        format!("\"{}\"", dir.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        format!("'{dir}'")
+    };
+    let line = format!("game_dir = {value}");
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let header = |l: &str| l.trim_start().starts_with('[');
+    match lines.iter().position(|l| l.trim() == "[paths]") {
+        Some(at) => {
+            let end = lines[at + 1..]
+                .iter()
+                .position(|l| header(l))
+                .map_or(lines.len(), |n| at + 1 + n);
+            let active = lines[at + 1..end].iter().position(|l| {
+                let l = l.trim_start();
+                l.strip_prefix("game_dir")
+                    .is_some_and(|rest| rest.trim_start().starts_with('='))
+            });
+            match active {
+                Some(n) => lines[at + 1 + n] = line,
+                None => lines.insert(at + 1, line),
+            }
+        }
+        None => {
+            if lines.last().is_some_and(|l| !l.trim().is_empty()) {
+                lines.push(String::new());
+            }
+            lines.push("[paths]".to_owned());
+            lines.push(line);
+        }
+    }
+    let mut out = lines.join(newline);
+    out.push_str(newline);
+    out
+}
+
+/// The keyboard's stand-in pad (`gameinput.rs`, as the README lists it).
+fn keys_text(p: Paint) -> String {
+    let rows = [
+        ("W A S D / I J K L", "left / right stick"),
+        ("arrows", "D-pad"),
+        ("Enter, Backspace, X, Y", "A, B, X, Y"),
+        ("Q / E", "left / right shoulder"),
+        ("Z / C", "left / right trigger"),
+        ("F / H", "left / right stick click"),
+        ("Esc, Tab", "Menu, View"),
+    ];
+    let mut out = format!("\n  {}\n\n", p.bold("Keyboard controls", SUNSET[2]));
+    for (keys, pad) in rows {
+        out.push_str(&format!(
+            "  {:<24}{}\n",
+            p.rgb(keys, CREAM),
+            p.rgb(pad, DIM)
+        ));
+    }
+    out.push_str(&format!(
+        "\n  {}\n",
+        p.rgb(
+            "With no XInput pad connected, the keyboard is a pad while the game's window has focus.",
+            DIM
+        )
+    ));
+    out
 }
 
 /// One line of the setup check.
@@ -317,8 +457,7 @@ fn path_verdicts(cfg: &victory_core::Config) -> Vec<(Status, String, Option<Stri
             Status::Warn,
             "Game folder: not set".to_owned(),
             Some(
-                "Only the other commands need it (game_dir in victory.toml); 1 asks for the .exe."
-                    .to_owned(),
+                "S in the menu sets it (game_dir in victory.toml); 1 asks for the .exe.".to_owned(),
             ),
         )),
     }
@@ -494,7 +633,7 @@ fn banner(p: Paint) -> String {
     )
 }
 
-fn menu_text(p: Paint, last: Option<&Path>) -> String {
+fn menu_text(p: Paint, last: Option<&Path>, game_dir: Option<&Path>, model: Model) -> String {
     let key = |k: &str| p.bold(k, SUNSET[3]);
     let mut out = banner(p);
     out.push('\n');
@@ -512,6 +651,20 @@ fn menu_text(p: Paint, last: Option<&Path>) -> String {
         "  {}  Open the data folder   {}\n",
         key("4"),
         p.rgb("saves, crashes.log", DIM)
+    ));
+    let folder = game_dir.map_or_else(|| "(not set)".to_owned(), |d| d.display().to_string());
+    out.push('\n');
+    out.push_str(&format!(
+        "  {}  Set the game folder   {}\n",
+        key("S"),
+        p.rgb(&folder, DIM)
+    ));
+    out.push_str(&format!("  {}  Keyboard controls\n", key("K")));
+    out.push_str(&format!(
+        "  {}  Console: {}   {}\n",
+        key("M"),
+        model.name(),
+        p.rgb(&format!("(M switches to {})", model.other().name()), DIM)
     ));
     out.push_str(&format!("  {}  Quit\n\n", key("Q")));
     out.push_str(&format!("  {} ", p.rgb("Choose:", CREAM)));
@@ -672,10 +825,14 @@ fn pause(p: Paint, input: &mut impl BufRead) {
 }
 
 /// The command that runs `game` the way the menu does: `victory run <game>
-/// --execute` from this same executable, in this console.
-fn run_command(victory: &Path, game: &Path) -> std::process::Command {
+/// --execute --console <model>` from this same executable, in this console.
+fn run_command(victory: &Path, game: &Path, model: Model) -> std::process::Command {
     let mut c = std::process::Command::new(victory);
-    c.arg("run").arg(game).arg("--execute");
+    c.arg("run")
+        .arg(game)
+        .arg("--execute")
+        .arg("--console")
+        .arg(model.arg());
     c
 }
 
@@ -718,7 +875,7 @@ fn sparing_the_menu<T>(f: impl FnOnce() -> T) -> T {
 
 /// Runs `exe` in a child `victory run <exe> --execute`, then waits for
 /// Enter whatever happened to it.
-fn run_game(p: Paint, exe: &Path, data_dir: &Path, input: &mut impl BufRead) {
+fn run_game(p: Paint, exe: &Path, data_dir: &Path, model: Model, input: &mut impl BufRead) {
     if !exe.is_file() {
         println!(
             "\n  {} {}",
@@ -729,9 +886,14 @@ fn run_game(p: Paint, exe: &Path, data_dir: &Path, input: &mut impl BufRead) {
         return;
     }
     save_last(data_dir, exe);
-    println!("\n  {} {}\n", p.rgb("\u{25b6}", SUNSET[4]), exe.display());
-    let status =
-        std::env::current_exe().and_then(|me| sparing_the_menu(|| run_command(&me, exe).status()));
+    println!(
+        "\n  {} {}   {}\n",
+        p.rgb("\u{25b6}", SUNSET[4]),
+        exe.display(),
+        p.rgb(model.name(), DIM)
+    );
+    let status = std::env::current_exe()
+        .and_then(|me| sparing_the_menu(|| run_command(&me, exe, model).status()));
     let (mark, text) = match status {
         Ok(s) => {
             let (status, text) = ended(s.code());
@@ -748,6 +910,35 @@ fn run_game(p: Paint, exe: &Path, data_dir: &Path, input: &mut impl BufRead) {
     };
     println!("\n  {mark} {text}");
     pause(p, input);
+}
+
+/// Saves `dropped` (a folder, or a file in it) as the game folder in the
+/// config file; what happened, as a line for the menu.
+fn set_folder(dropped: &Path) -> (Status, String) {
+    let dir = if dropped.is_file() {
+        dropped.parent().map(Path::to_path_buf)
+    } else {
+        Some(dropped.to_path_buf())
+    };
+    let Some(dir) = dir.filter(|d| d.is_dir()) else {
+        return (Status::Bad, "No folder there.".to_owned());
+    };
+    if let Err(e) = victory_core::ensure_outside_repo(&dir) {
+        return (Status::Bad, e.to_string());
+    }
+    let path = config_path();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    if let Err(e) = std::fs::write(&path, set_game_dir(&text, &dir)) {
+        return (
+            Status::Bad,
+            format!("Could not write {}: {e}", path.display()),
+        );
+    }
+    let mut said = format!("Game folder set in {}.", path.display());
+    if std::env::var_os("VICTORY_GAME_DIR").is_some_and(|v| !v.is_empty()) {
+        said.push_str(" VICTORY_GAME_DIR is set, and it wins over the file.");
+    }
+    (Status::Good, said)
 }
 
 /// Names the console window (it shows the executable's path otherwise).
@@ -773,7 +964,12 @@ pub fn run() -> Result<()> {
     let mut input = stdin.lock();
     loop {
         let last = load_last(&data_dir);
-        print!("{}", menu_text(p, last.as_deref()));
+        let model = load_model(&data_dir);
+        let game_dir = victory_core::Config::load().ok().and_then(|c| c.game_dir);
+        print!(
+            "{}",
+            menu_text(p, last.as_deref(), game_dir.as_deref(), model)
+        );
         let _ = std::io::stdout().flush();
         let Some(line) = read_line(&mut input) else {
             return Ok(());
@@ -790,11 +986,11 @@ pub fn run() -> Result<()> {
                     return Ok(());
                 };
                 if !path.trim().is_empty() {
-                    run_game(p, &clean_path(&path), &data_dir, &mut input);
+                    run_game(p, &clean_path(&path), &data_dir, model, &mut input);
                 }
             }
             Choice::Again => match last {
-                Some(exe) => run_game(p, &exe, &data_dir, &mut input),
+                Some(exe) => run_game(p, &exe, &data_dir, model, &mut input),
                 None => {
                     println!("\n  {}", p.rgb("Nothing run yet: choose 1 first.", DIM));
                     pause(p, &mut input);
@@ -845,12 +1041,40 @@ pub fn run() -> Result<()> {
                 };
                 println!("\n  {}", p.rgb(&text, DIM));
             }
+            Choice::Folder => {
+                print!(
+                    "\n  {}\n  {} ",
+                    p.rgb(
+                        "Drag the game's folder (or its .exe) onto this window, or type its path, then press Enter.",
+                        CREAM
+                    ),
+                    p.rgb(">", SUNSET[3])
+                );
+                let _ = std::io::stdout().flush();
+                let Some(answer) = read_line(&mut input) else {
+                    return Ok(());
+                };
+                if !answer.trim().is_empty() {
+                    let said = set_folder(&clean_path(&answer));
+                    let (mark, colour) = match said.0 {
+                        Status::Good => ("\u{2713}", GOOD),
+                        _ => ("\u{2717}", BAD),
+                    };
+                    println!("\n  {} {}", p.rgb(mark, colour), p.rgb(&said.1, CREAM));
+                    pause(p, &mut input);
+                }
+            }
+            Choice::Keys => {
+                print!("{}", keys_text(p));
+                pause(p, &mut input);
+            }
+            Choice::Model => save_model(&data_dir, model.other()),
             Choice::Quit => return Ok(()),
             Choice::Unknown if line.trim().is_empty() => {}
             Choice::Unknown => {
                 println!(
                     "\n  {}",
-                    p.rgb("Type 1, 2, 3 or 4 and press Enter (Q to quit).", WARN)
+                    p.rgb("Type 1 to 4, S, K or M and press Enter (Q to quit).", WARN)
                 );
             }
         }
@@ -955,7 +1179,7 @@ mod tests {
         assert_eq!(mid, (100, 50, 25));
         let plain = Paint { color: false };
         assert_eq!(plain.gradient("VICTORY", &SUNSET), "VICTORY");
-        assert!(!menu_text(plain, None).contains('\x1b'));
+        assert!(!menu_text(plain, None, None, Model::SeriesX).contains('\x1b'));
         let colored = Paint { color: true };
         assert!(
             colored
@@ -999,10 +1223,20 @@ mod tests {
         let c = run_command(
             Path::new(r"C:\VIctory\victory.exe"),
             Path::new(r"D:\Games\title.exe"),
+            Model::SeriesS,
         );
         assert_eq!(c.get_program(), r"C:\VIctory\victory.exe");
         let args: Vec<_> = c.get_args().collect();
-        assert_eq!(args, ["run", r"D:\Games\title.exe", "--execute"]);
+        assert_eq!(
+            args,
+            [
+                "run",
+                r"D:\Games\title.exe",
+                "--execute",
+                "--console",
+                "series-s"
+            ]
+        );
         assert_eq!(ended(Some(0)), (Status::Good, "The run ended.".to_owned()));
         assert_eq!(
             ended(Some(0xC000_0005_u32 as i32)).1,
@@ -1042,11 +1276,83 @@ mod tests {
         );
     }
 
+    /// `[paths].game_dir` of a config file, as the tools parse it.
+    fn game_dir_of(text: &str) -> Option<String> {
+        let t: toml::Table = toml::from_str(text).expect("valid TOML");
+        Some(t.get("paths")?.get("game_dir")?.as_str()?.to_owned())
+    }
+
+    #[test]
+    fn the_game_folder_lands_in_the_config_and_leaves_the_rest() {
+        let dir = Path::new(r"D:\Games\Title 1.0");
+        // No file yet.
+        let new = set_game_dir("", dir);
+        assert_eq!(game_dir_of(&new).as_deref(), Some(r"D:\Games\Title 1.0"));
+        // The example file: its comments and other keys stay, the active
+        // line changes.
+        let example = "# Copy to victory.toml\n[paths]\n# Your own dump.\ngame_dir = 'D:\\victory-data\\game'\n# cache_dir = 'x'\ntest_titles = []\n";
+        let set = set_game_dir(example, dir);
+        assert_eq!(game_dir_of(&set).as_deref(), Some(r"D:\Games\Title 1.0"));
+        assert!(set.contains("# Your own dump.") && set.contains("# cache_dir = 'x'"));
+        assert!(set.contains("test_titles = []"));
+        assert_eq!(set.matches("game_dir").count(), 1);
+        // A [paths] table without the key, before another table.
+        let other = "[paths]\ncache_dir = 'C:\\c'\n\n[later]\nx = 1\n";
+        let set = set_game_dir(other, dir);
+        assert_eq!(game_dir_of(&set).as_deref(), Some(r"D:\Games\Title 1.0"));
+        assert!(set.contains("[later]\nx = 1"));
+        // No [paths] table at all.
+        let set = set_game_dir("[later]\nx = 1", dir);
+        assert_eq!(game_dir_of(&set).as_deref(), Some(r"D:\Games\Title 1.0"));
+        // An apostrophe needs a basic string.
+        let tom = Path::new(r"D:\Games\Tom's");
+        assert_eq!(
+            game_dir_of(&set_game_dir("", tom)).as_deref(),
+            Some(r"D:\Games\Tom's")
+        );
+        // Windows line ends stay Windows line ends.
+        assert!(set_game_dir("[paths]\r\ntest_titles = []\r\n", dir).contains("'\r\n"));
+    }
+
+    #[test]
+    fn the_console_model_switches_and_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_model(dir.path()), Model::SeriesX);
+        save_model(dir.path(), Model::SeriesX.other());
+        assert_eq!(load_model(dir.path()), Model::SeriesS);
+        assert_eq!(Model::SeriesS.other(), Model::SeriesX);
+        let p = Paint { color: false };
+        let text = menu_text(p, None, Some(Path::new(r"D:\G")), Model::SeriesS);
+        assert!(text.contains("Console: Series S   (M switches to Series X)"));
+        assert!(text.contains(r"Set the game folder   D:\G"));
+        assert_eq!(choice("s"), Choice::Folder);
+        assert_eq!(choice("K\r\n"), Choice::Keys);
+        assert_eq!(choice("m"), Choice::Model);
+    }
+
+    #[test]
+    fn the_keys_are_the_stand_in_pad() {
+        let text = keys_text(Paint { color: false });
+        for row in [
+            "W A S D / I J K L",
+            "Esc, Tab",
+            "Z / C",
+            "left / right trigger",
+        ] {
+            assert!(text.contains(row), "{row}");
+        }
+    }
+
     #[test]
     fn the_menu_offers_run_again_only_with_a_last_game() {
         let p = Paint { color: false };
-        assert!(menu_text(p, None).contains("(nothing run yet)"));
-        let text = menu_text(p, Some(Path::new(r"D:\Games\title.exe")));
+        assert!(menu_text(p, None, None, Model::SeriesX).contains("(nothing run yet)"));
+        let text = menu_text(
+            p,
+            Some(Path::new(r"D:\Games\title.exe")),
+            None,
+            Model::SeriesX,
+        );
         assert!(text.contains(r"Run again   D:\Games\title.exe"));
     }
 }
