@@ -1625,6 +1625,14 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
                 u.free(p);
             }
         }
+        let to_free_heap = forget_placed_buffer(this as usize);
+        if let (Some(p), Some(u)) = (to_free_heap, crate::gpu::uma::get()) {
+            if u.is_sparse(p) {
+                super::sparse::free(p);
+            } else {
+                u.free(p);
+            }
+        }
     }
     if held {
         super::late_release::hold(this as usize);
@@ -2773,10 +2781,13 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
             let d = super::device_x::pc_resource_desc(&x);
             let st = state as u32 & PC_RESOURCE_STATES;
             if let Some(hr) = place_at_title_address(this, block + offset, &d, st, clear as *const c_void, riid, ppv) {
-                if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && cpu_readback && crate::gpu::uma::get().is_some_and(|u| u.is_sparse(block + offset)) {
-                    let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
-                    if st == D3D12_RESOURCE_STATE_COPY_DEST.0 as u32 && (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32) == 0 {
-                        note_sparse_readback(*ppv as usize);
+                if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+                    note_placed_buffer(heap, *ppv as usize);
+                    if cpu_readback && crate::gpu::uma::get().is_some_and(|u| u.is_sparse(block + offset)) {
+                        let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+                        if st == D3D12_RESOURCE_STATE_COPY_DEST.0 as u32 && (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32) == 0 {
+                            note_sparse_readback(*ppv as usize);
+                        }
                     }
                 }
                 return hr;
@@ -2988,6 +2999,10 @@ struct HeapUma {
     /// in it read back on `Map(0, NULL, ...)`.
     cpu_readback: bool,
     block: Option<usize>,
+    /// Placed buffers referencing this heap's UMA block.
+    placed_buffers: usize,
+    /// Whether ID3D12Heap::Release was called with refcount dropping to 0.
+    released: bool,
 }
 
 /// heap → its backing block (allocated lazily on the first placed buffer; sparse VRAM for
@@ -3023,6 +3038,8 @@ unsafe fn note_heap_uma(desc: usize, ppv: *mut *mut c_void) {
             prefer_coherent: is_rb && size <= COHERENT_READBACK_MAX,
             cpu_readback: is_rb || is_custom_wb,
             block: None,
+            placed_buffers: 0,
+            released: false,
         },
     );
 }
@@ -3091,13 +3108,48 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
     Some((p, cpu_readback))
 }
 
-/// ID3D12Heap::Release: its block of unified memory goes with it.
+/// Placed buffer resource -> its backing heap
+static PLACED_BUFFER_HEAPS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+fn note_placed_buffer(heap: usize, res: usize) {
+    PLACED_BUFFER_HEAPS.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, heap);
+    if let Some(e) = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.get_mut(&heap)) {
+        e.placed_buffers += 1;
+    }
+}
+
+fn forget_placed_buffer(res: usize) -> Option<usize> {
+    let heap = PLACED_BUFFER_HEAPS.lock().unwrap().as_mut().and_then(|m| m.remove(&res))?;
+    let mut g = HEAP_UMA.lock().unwrap();
+    let e = g.as_mut().and_then(|m| m.get_mut(&heap))?;
+    e.placed_buffers = e.placed_buffers.saturating_sub(1);
+    if e.placed_buffers == 0 && e.released {
+        g.as_mut().and_then(|m| m.remove(&heap)).and_then(|e| e.block)
+    } else {
+        None
+    }
+}
+
+/// ID3D12Heap::Release: its block of unified memory goes with it when all placed buffers are released.
 unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
-        let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
-        if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
+        let heap = this as usize;
+        let to_free = {
+            let mut g = HEAP_UMA.lock().unwrap();
+            if let Some(e) = g.as_mut().and_then(|m| m.get_mut(&heap)) {
+                e.released = true;
+                if e.placed_buffers == 0 {
+                    g.as_mut().and_then(|m| m.remove(&heap)).and_then(|e| e.block)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let (Some(p), Some(u)) = (to_free, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
                 super::sparse::free(p);
             } else {
@@ -6282,5 +6334,145 @@ mod map_tests {
                 m.remove(&(upload.as_raw() as usize));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod heap_placed_buffer_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    /// Placed buffers referencing a HEAP_UMA heap keep the underlying physical sparse/UMA
+    /// allocation alive until all placed buffers are released. ID3D12Heap::Release when placed
+    /// buffers are still alive marks the heap released but retains the backing UMA block.
+    #[test]
+    fn placed_buffers_keep_heap_uma_allocation_alive_until_all_released() {
+        let heap_id = 0x8888_0000usize;
+        let block_addr = 0x9999_0000usize;
+        let res1 = 0xAAAA_0001usize;
+        let res2 = 0xAAAA_0002usize;
+
+        HEAP_UMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+            heap_id,
+            HeapUma {
+                size: 0x2_0000,
+                align: 0x1_0000,
+                prefer_coherent: false,
+                cpu_readback: false,
+                block: Some(block_addr),
+                placed_buffers: 0,
+                released: false,
+            },
+        );
+
+        note_placed_buffer(heap_id, res1);
+        note_placed_buffer(heap_id, res2);
+
+        {
+            let g = HEAP_UMA.lock().unwrap();
+            let e = g.as_ref().unwrap().get(&heap_id).unwrap();
+            assert_eq!(e.placed_buffers, 2);
+            assert!(!e.released);
+            assert_eq!(e.block, Some(block_addr));
+        }
+
+        static MOCK_HEAP_REFS: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn mock_heap_release_com(_this: *mut c_void) -> u32 {
+            MOCK_HEAP_REFS.load(Ordering::SeqCst)
+        }
+        let heap_pc_vtable = [0usize, 0usize, mock_heap_release_com as usize];
+        let heap_ext = [heap_pc_vtable.as_ptr() as usize, 0usize];
+        let heap_vtbl = heap_ext.as_ptr() as usize + 8;
+        let mut heap_obj = [heap_vtbl];
+        let heap_ptr = heap_obj.as_mut_ptr() as *mut c_void;
+        let heap_ptr_val = heap_ptr as usize;
+
+        let heap_uma_entry = HEAP_UMA.lock().unwrap().as_mut().unwrap().remove(&heap_id).unwrap();
+        HEAP_UMA.lock().unwrap().as_mut().unwrap().insert(heap_ptr_val, heap_uma_entry);
+        PLACED_BUFFER_HEAPS.lock().unwrap().as_mut().unwrap().insert(res1, heap_ptr_val);
+        PLACED_BUFFER_HEAPS.lock().unwrap().as_mut().unwrap().insert(res2, heap_ptr_val);
+
+        // Call mem_heap_release: refcount is 0, but placed buffers are still alive (placed_buffers == 2)
+        let remaining_heap_refs = unsafe { mem_heap_release(heap_ptr) };
+        assert_eq!(remaining_heap_refs, 0);
+
+        // The heap must still be in HEAP_UMA and the backing block retained!
+        {
+            let g = HEAP_UMA.lock().unwrap();
+            let e = g.as_ref().unwrap().get(&heap_ptr_val).expect("heap must not be freed while placed buffers survive");
+            assert_eq!(e.placed_buffers, 2);
+            assert!(e.released);
+            assert_eq!(e.block, Some(block_addr), "backing block must be retained");
+        }
+
+        // Release first placed buffer
+        let freed_on_first = forget_placed_buffer(res1);
+        assert_eq!(freed_on_first, None, "block must not be freed when other placed buffers remain");
+
+        {
+            let g = HEAP_UMA.lock().unwrap();
+            let e = g.as_ref().unwrap().get(&heap_ptr_val).expect("heap must remain while 1 placed buffer survives");
+            assert_eq!(e.placed_buffers, 1);
+            assert!(e.released);
+            assert_eq!(e.block, Some(block_addr));
+        }
+
+        // Release second (last) placed buffer
+        let freed_on_second = forget_placed_buffer(res2);
+        assert_eq!(freed_on_second, Some(block_addr), "backing block must be returned for freeing when last buffer is released");
+
+        // Heap should now be gone from HEAP_UMA
+        assert!(HEAP_UMA.lock().unwrap().as_ref().unwrap().get(&heap_ptr_val).is_none());
+    }
+
+    #[test]
+    fn placed_buffers_released_before_heap_frees_block_on_heap_release() {
+        let res = 0xBBBB_0001usize;
+
+        static MOCK_HEAP_REFS_2: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn mock_heap_release_com_2(_this: *mut c_void) -> u32 {
+            MOCK_HEAP_REFS_2.load(Ordering::SeqCst)
+        }
+        let heap_pc_vtable = [0usize, 0usize, mock_heap_release_com_2 as usize];
+        let heap_ext = [heap_pc_vtable.as_ptr() as usize, 0usize];
+        let heap_vtbl = heap_ext.as_ptr() as usize + 8;
+        let mut heap_obj = [heap_vtbl];
+        let heap_ptr = heap_obj.as_mut_ptr() as *mut c_void;
+        let heap_id = heap_ptr as usize;
+        let block_addr = 0x9999_1111usize;
+
+        HEAP_UMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+            heap_id,
+            HeapUma {
+                size: 0x1_0000,
+                align: 0x1_0000,
+                prefer_coherent: false,
+                cpu_readback: false,
+                block: Some(block_addr),
+                placed_buffers: 0,
+                released: false,
+            },
+        );
+
+        note_placed_buffer(heap_id, res);
+
+        // Buffer released BEFORE heap
+        let freed = forget_placed_buffer(res);
+        assert_eq!(freed, None, "buffer released before heap release must not free block yet");
+
+        {
+            let g = HEAP_UMA.lock().unwrap();
+            let e = g.as_ref().unwrap().get(&heap_id).unwrap();
+            assert_eq!(e.placed_buffers, 0);
+            assert!(!e.released);
+            assert_eq!(e.block, Some(block_addr));
+        }
+
+        // Now release heap: placed_buffers is 0, so block is freed immediately
+        let remaining = unsafe { mem_heap_release(heap_ptr) };
+        assert_eq!(remaining, 0);
+
+        // Heap is now gone from HEAP_UMA
+        assert!(HEAP_UMA.lock().unwrap().as_ref().unwrap().get(&heap_id).is_none());
     }
 }
