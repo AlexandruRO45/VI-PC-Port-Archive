@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::policy::ensure_outside_repo;
+use crate::policy::{ensure_outside_repo, resolve as resolve_path};
 
 #[derive(Debug, Default, Clone)]
 pub struct Config {
@@ -95,6 +95,13 @@ impl Config {
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
+        if resolve_path(&data_dir)?.starts_with(resolve_path(&cache_dir)?) {
+            anyhow::bail!(
+                "data directory {} is at or inside the cache directory {}; set VICTORY_DATA_DIR or [paths].data_dir to a location outside the cache",
+                data_dir.display(),
+                cache_dir.display()
+            );
+        }
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
@@ -198,6 +205,38 @@ mod tests {
         let text = include_str!("../../../victory.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
+    }
+
+    #[test]
+    fn persistent_data_cannot_be_inside_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        for data in [cache.clone(), cache.join("saves")] {
+            let file = FilePaths {
+                cache_dir: Some(cache.clone()),
+                data_dir: Some(tmp.path().join("data")),
+                ..Default::default()
+            };
+            let env =
+                |key: &str| (key == "VICTORY_DATA_DIR").then(|| data.clone().into_os_string());
+            let err = Config::resolve(file, None, env).unwrap_err();
+            assert!(err.to_string().contains("cache directory"), "{err}");
+        }
+    }
+
+    #[test]
+    fn adjacent_data_and_cache_directories_are_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("cache-saves");
+        let file = FilePaths {
+            cache_dir: Some(tmp.path().join("cache")),
+            data_dir: Some(data.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            Config::resolve(file, None, |_| None).unwrap().data_dir,
+            data
+        );
     }
 
     #[test]
