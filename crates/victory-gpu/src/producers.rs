@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::descriptor::View;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Target {
     /// Title memory, `start..end`.
     Buffer(u64, u64),
@@ -120,17 +120,39 @@ fn record(what: Target, writer: &str) {
     let frame = crate::queue::presented();
     let mut writes = WRITES.lock().unwrap_or_else(|e| e.into_inner());
     prune(&mut writes, frame);
+    push(&mut writes, what, writer, frame);
+    settle(&writes);
+}
+
+/// Adds a write of `what` by `writer` at `frame` to `writes`. A write
+/// already there is moved to the back with the new frame (so a writer
+/// dropped every frame never ages out); only a new one evicts the oldest
+/// when the queue is full, so a duplicate never costs an unrelated entry.
+fn push(writes: &mut VecDeque<Write>, what: Target, writer: &str, frame: u64) {
+    if let Some(i) = writes.iter().position(|w| w.what == what && &*w.writer == writer)
+        && let Some(mut w) = writes.remove(i)
+    {
+        w.frame = frame;
+        writes.push_back(w);
+        return;
+    }
     if writes.len() >= MAX_WRITES {
         writes.pop_front();
     }
-    if !writes.iter().any(|w| w.what == what && &*w.writer == writer) {
-        writes.push_back(Write {
-            what,
-            writer: writer.into(),
-            frame,
-        });
+    writes.push_back(Write {
+        what,
+        writer: writer.into(),
+        frame,
+    });
+}
+
+/// The title texture `view` names, if it names one (for the target
+/// preview, which notes textures dropped work would have written).
+pub(crate) fn texture_of(view: &View) -> Option<usize> {
+    match target_of(view)? {
+        Target::Texture(r) => Some(r),
+        Target::Buffer(..) => None,
     }
-    settle(&writes);
 }
 
 /// Dropped work `writer` would have written through `view`.
@@ -258,6 +280,38 @@ pub(crate) fn read(view: &View) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frames(writes: &VecDeque<Write>) -> Vec<(Target, u64)> {
+        writes.iter().map(|w| (w.what, w.frame)).collect()
+    }
+
+    /// A writer dropped again refreshes its frame instead of aging out.
+    #[test]
+    fn a_repeated_drop_refreshes_its_frame() {
+        let mut writes = VecDeque::new();
+        push(&mut writes, Target::Texture(1), "pixel a", 9);
+        push(&mut writes, Target::Texture(1), "pixel a", 10);
+        assert_eq!(frames(&writes), vec![(Target::Texture(1), 10)]);
+        prune(&mut writes, 11);
+        assert_eq!(writes.len(), 1, "still there for a read in frame 12");
+    }
+
+    /// At the cap, a duplicate that is not the oldest evicts nothing.
+    #[test]
+    fn a_duplicate_at_the_cap_evicts_nothing() {
+        let mut writes = VecDeque::new();
+        for i in 0..MAX_WRITES {
+            push(&mut writes, Target::Texture(i), "compute c", 5);
+        }
+        push(&mut writes, Target::Texture(7), "compute c", 6);
+        assert_eq!(writes.len(), MAX_WRITES);
+        assert!(writes.iter().any(|w| w.what == Target::Texture(0)), "the oldest is kept");
+        assert_eq!(writes.back().map(|w| (w.what, w.frame)), Some((Target::Texture(7), 6)));
+        // A new one at the cap evicts the oldest.
+        push(&mut writes, Target::Texture(MAX_WRITES), "compute c", 6);
+        assert_eq!(writes.len(), MAX_WRITES);
+        assert!(!writes.iter().any(|w| w.what == Target::Texture(0)));
+    }
 
     fn missing(what: Target) -> Write {
         Write {
