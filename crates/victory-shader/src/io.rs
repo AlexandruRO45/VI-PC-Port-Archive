@@ -849,6 +849,82 @@ mod tests {
         );
     }
 
+    /// The `high` bit of a 16-bit interpolation's attribute operand reads
+    /// the channel's upper f16 half; it is part of the attribute, so halves
+    /// that disagree on it are two attributes.
+    #[test]
+    fn half_precision_interpolation_of_the_high_half() {
+        let ps = pixel(vec![TEXCOORD], 2);
+        // v_interp_p1ll_f16 v4, attr0.y, v0 [high]
+        // v_interp_p2_f16 v4, attr0.y, v1, v4 [high]
+        let pair = |p1: u32, p2: u32| program(&[0xD742_0004, p1, 0xD75A_0004, p2, S_ENDPGM]);
+        let io = raise(&pair(0x0002_0140, 0x0412_0340), &ps).unwrap();
+        let [(_, Interp::Interpolated { attribute, .. })] = io.interps.as_slice() else {
+            panic!("{:?}", io.interps)
+        };
+        assert_eq!(
+            *attribute,
+            Attribute {
+                usage: Usage::Generic,
+                row: 1,
+                channel: 1,
+                high: true
+            }
+        );
+        // Either half alone on the high side is a different attribute.
+        for (p1, p2) in [(0x0002_0040, 0x0412_0340), (0x0002_0140, 0x0412_0240)] {
+            assert_eq!(
+                raise(&pair(p1, p2), &ps),
+                Err(ShaderError::Unsupported {
+                    offset: 8,
+                    what: "interpolation halves of different attributes"
+                }),
+                "p1 {p1:#x} p2 {p2:#x}"
+            );
+        }
+    }
+
+    /// A first half before a loop that leaves the accumulator alone reaches
+    /// the second half after it through the loop's phi; the phi's own
+    /// back edge adds no first half.
+    #[test]
+    fn interpolation_across_a_loop_finds_the_first_half_before_it() {
+        let p = program(&[
+            0xC810_0000, // v_interp_p1_f32 v4, v0, attr0.x
+            0xBF85_FFFF, // s_cbranch_scc1 -> 4 (itself)
+            0xC811_0001, // v_interp_p2_f32 v4, v1, attr0.x
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        let [(site, Interp::Interpolated { first, .. })] = io.interps.as_slice() else {
+            panic!("{:?}", io.interps)
+        };
+        assert_eq!(p.blocks[site.0].insts[site.1].machine.offset, 8);
+        assert_eq!(first, &[(0, 0)]);
+    }
+
+    /// A first half inside the loop runs on every path out of it, so it alone
+    /// pairs with the second half after the loop; the one before is dead.
+    #[test]
+    fn a_first_half_inside_a_loop_replaces_the_one_before_it() {
+        let p = program(&[
+            0xC810_0000, // v_interp_p1_f32 v4, v0, attr0.x
+            0xC810_0000, // v_interp_p1_f32 v4, v0, attr0.x
+            0xBF85_FFFE, // s_cbranch_scc1 -> 4
+            0xC811_0001, // v_interp_p2_f32 v4, v1, attr0.x
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        let [(_, Interp::Interpolated { first, .. })] = io.interps.as_slice() else {
+            panic!("{:?}", io.interps)
+        };
+        let offsets: Vec<u32> = first
+            .iter()
+            .map(|&(b, i)| p.blocks[b].insts[i].machine.offset as u32)
+            .collect();
+        assert_eq!(offsets, [4]);
+    }
+
     #[test]
     fn a_vertex_interpolation_names_p10_p20_or_p0() {
         // v_interp_mov_f32 v2, <vsrc>, attr0.x
