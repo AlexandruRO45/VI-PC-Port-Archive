@@ -1,6 +1,7 @@
 //! A DXIL vertex, pixel, compute or mesh shader under construction: the module,
 //! the `dx.op` declarations it calls, its signatures and bound resources,
-//! and the metadata and container that wrap it up (SM 6.6).
+//! and the metadata and container that wrap it up (SM 6.6, or 6.7 for
+//! pixel shaders that run wave operations).
 
 use super::bitcode::{Attr, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
@@ -532,6 +533,13 @@ impl Shader {
         }
         let props =
             (!props.is_empty()).then(|| self.m.md_node(props.into_iter().map(Some).collect()));
+        // Structurisation keeps the pixel quads' helper lanes in its
+        // control flow. They need defined wave results too: a first-lane
+        // read can choose the key that lets a lane leave a loop.
+        let wave_helpers = self.pixel && self.flags & flags::WAVE_OPS != 0;
+        if wave_helpers {
+            self.m.set_function_attr(self.main, Attr::WaveOpsIncludeHelperLanes);
+        }
         let main = self.m.md_value(self.main);
         let name = self.m.md_str("main");
         let entry = self
@@ -543,7 +551,9 @@ impl Shader {
         self.m.named_md("llvm.ident", vec![ident]);
         let one = i32c(&mut self, 1);
         let six = i32c(&mut self, 6);
-        let version = self.m.md_node(vec![Some(one), Some(six)]);
+        let minor = if wave_helpers { 7 } else { 6 };
+        let shader_minor = i32c(&mut self, minor);
+        let version = self.m.md_node(vec![Some(one), Some(shader_minor)]);
         self.m.named_md("dx.version", vec![version]);
         // The 1.6 and 1.7 validators reject implicit sampling in compute,
         // even though it belongs to shader model 6.6.
@@ -562,16 +572,16 @@ impl Shader {
             (None, false) => ("vs", 1),
         };
         let name = self.m.md_str(name);
-        let sm = self.m.md_node(vec![Some(name), Some(six), Some(six)]);
+        let sm = self.m.md_node(vec![Some(name), Some(six), Some(shader_minor)]);
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
         let bitcode = self.m.write();
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
-        dxil.extend((kind << 16 | 0x66).to_le_bytes());
+        dxil.extend((kind << 16 | 0x60 | minor).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
         dxil.extend(b"DXIL");
-        dxil.extend(0x106u32.to_le_bytes());
+        dxil.extend((0x100 | minor).to_le_bytes());
         dxil.extend(16u32.to_le_bytes());
         dxil.extend((bitcode.len() as u32).to_le_bytes());
         dxil.extend(&bitcode);
@@ -596,8 +606,16 @@ impl Shader {
             features |= 0x400_0000;
         }
         let sfi0 = features.to_le_bytes();
-        let isg1 = container::signature(&self.inputs, true);
-        let osg1 = container::signature(&self.outputs, false);
+        let signature = |elements: &[SigElement], input| {
+            let mut part = container::signature(elements, input);
+            // Validator 1.7 and up include the dword padding in the part.
+            if wave_helpers || self.compute_derivatives {
+                part.resize(part.len().next_multiple_of(4), 0);
+            }
+            part
+        };
+        let isg1 = signature(&self.inputs, true);
+        let osg1 = signature(&self.outputs, false);
         let flag = if self.pixel {
             self.outputs.iter().any(|o| (17..=19).contains(&o.kind))
         } else {
@@ -616,7 +634,7 @@ impl Shader {
             wave_size: self.wave_size,
         });
         let hash = [0u8; 20];
-        let psg1 = container::signature(&self.prims, false);
+        let psg1 = signature(&self.prims, false);
         let mut parts: Vec<(&[u8; 4], &[u8])> =
             vec![(b"SFI0", &sfi0), (b"ISG1", &isg1), (b"OSG1", &osg1)];
         if self.mesh.is_some() {
