@@ -2283,6 +2283,82 @@ mod tests {
     }
 
     #[test]
+    fn victory_config_is_read_without_looking_at_a_broken_default() {
+        // A scratch folder under the system temp folder, never the
+        // repository or the working directory; removed at the end.
+        let dir = std::env::temp_dir().join(format!(
+            "victory-explicit-over-default-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let default = dir.join("victory.toml");
+        let explicit = dir.join("explicit.toml");
+        std::fs::write(&explicit, "").unwrap();
+
+        // A ./victory.toml folder would be refused on its own, but
+        // VICTORY_CONFIG names the file to read, so it is never checked.
+        std::fs::create_dir(&default).unwrap();
+        assert!(config_file_or(None, &default).is_err());
+        assert_eq!(
+            config_file_or(Some(explicit.clone()), &default).unwrap(),
+            Some(explicit.clone())
+        );
+        // A folder holding victory.toml earns the hint, for the default too.
+        std::fs::write(default.join("victory.toml"), "").unwrap();
+        let err = config_file_or(None, &default).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!(
+                "did you mean {}?",
+                default.join("victory.toml").display()
+            )),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&default).unwrap();
+
+        #[cfg(unix)]
+        {
+            // Nor is a ./victory.toml link whose target is gone.
+            std::os::unix::fs::symlink(dir.join("gone.toml"), &default).unwrap();
+            assert!(config_file_or(None, &default).is_err());
+            assert_eq!(
+                config_file_or(Some(explicit.clone()), &default).unwrap(),
+                Some(explicit.clone())
+            );
+            std::fs::remove_file(&default).unwrap();
+
+            // A link to a folder is a folder, not "not a regular file".
+            let folder = dir.join("folder");
+            std::fs::create_dir(&folder).unwrap();
+            std::os::unix::fs::symlink(&folder, &default).unwrap();
+            let err = config_file_or(None, &default).unwrap_err().to_string();
+            assert!(err.contains("is a folder, not a config file"), "{err}");
+            std::fs::remove_file(&default).unwrap();
+
+            // A chain of links ending at a file is read, keeping the path
+            // as given so relative settings stay anchored beside it.
+            let real = dir.join("real.toml");
+            std::fs::write(&real, "").unwrap();
+            let middle = dir.join("middle.toml");
+            std::os::unix::fs::symlink(&real, &middle).unwrap();
+            std::os::unix::fs::symlink(&middle, &default).unwrap();
+            assert_eq!(
+                config_file_or(None, &default).unwrap(),
+                Some(default.clone())
+            );
+            // Breaking the far end of the chain names the next link's
+            // target, not the final file.
+            std::fs::remove_file(&real).unwrap();
+            let err = config_file_or(None, &default).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("a link to {}", middle.display())),
+                "{err}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_folder_setting_blocked_by_a_file_is_refused() {
         // A scratch folder under the system temp folder, never the
         // repository; removed at the end.
