@@ -1,5 +1,5 @@
 """Keep the archive in step with the projects that are still on GitHub.
-Run from the repo root: python -I .github/sync.py [--push]
+Run from the repo root: python -I .github/sync.py [--push] [project ...]  (no projects: all of them)
 
 For each project: fetch its code and pull requests, refresh its folder on main, export its issues and comments
 again, and rebuild the site data. Nothing is ever deleted: a project that can't be fetched (taken down, renamed,
@@ -16,6 +16,7 @@ PROJECTS = {
     "xcl": ("ivall/xcl", r"## Games"),
     "victory": ("Marvisak/VIctory", r"## Status"),
     "xbox2windows": ("R0Y00/Xbox2Windows", r"> \*\*Current status\.\*\*"),
+    "tuxbox": ("brcly/TuxBox", r"\*\*GTA VI \(ProjectScarlett\)\*\*"),
 }
 TODAY = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
@@ -148,8 +149,12 @@ def check_merge():
 if __name__ == "__main__":
     check_merge()
     pushing = "--push" in sys.argv[1:]
+    only = [a for a in sys.argv[1:] if not a.startswith("--")]
+    assert set(only) <= set(PROJECTS), f"unknown project in {only}"
     synced, problems, skipped = [], [], []
     for p, (repo, start) in PROJECTS.items():
+        if only and p not in only:
+            continue
         try:
             default = fetch(p, repo)
             if not default:
