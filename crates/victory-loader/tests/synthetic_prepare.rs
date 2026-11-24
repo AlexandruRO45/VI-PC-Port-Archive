@@ -1140,3 +1140,63 @@ fn relocation_types_x64_loaders_do_not_define_are_taken_as_pointer_wide() {
         assert_eq!(tls.callbacks_va, 0, "type {kind}");
     }
 }
+
+#[test]
+fn a_block_page_that_is_not_page_aligned_still_names_the_callback_field() {
+    // The loaders add each entry's offset to its block's page RVA without
+    // checking that the page is 4 KiB aligned. A block for page `TLS` whose
+    // entry is the pointer's offset inside the TLS directory patches the
+    // pointer just as the aligned form does.
+    let mut original = image();
+    let second = file(RELOCS) + 16;
+    put32(&mut original, second, TLS);
+    put32(&mut original, second + 4, 12);
+    put16(
+        &mut original,
+        second + 8,
+        (10 << 12) | layout::TLS64_ADDRESS_OF_CALLBACKS as u16,
+    );
+    put16(&mut original, second + 10, 0); // ABSOLUTE padding
+    // Only the unaligned block names the field.
+    put16(&mut original, callbacks_reloc(), 0);
+    set_dir(&mut original, dir::BASERELOC, RELOCS, 28);
+
+    let prepared = prepare(&original).unwrap();
+    assert_eq!(&prepared.bytes[second + 8..second + 10], &[0, 0]);
+    assert_eq!(
+        &prepared.bytes[file(RELOCS)..second + 8],
+        &original[file(RELOCS)..second + 8],
+        "the first block and the second block's header are left alone"
+    );
+    let mut mapped = prepared.bytes;
+    rebase(&mut mapped, 0x3_0000_0000);
+    assert_eq!(layout::read_u64(&mapped, file(callbacks_field())), Some(0));
+}
+
+#[test]
+fn bytes_after_the_last_whole_block_end_the_walk_but_not_the_patch() {
+    // Some linkers round the directory up past the last block, and some
+    // leave a zeroed block header there. Neither is a block of entries, and
+    // the callback entry before it is cleared all the same.
+    for (what, size, tail) in [
+        ("four stray bytes", 20u32, &[0xAA, 0xBB, 0xCC, 0xDD][..]),
+        ("a zeroed block header", 24, &[0; 8][..]),
+        (
+            "a header of size 8 and no entries",
+            24,
+            &[0, 0x10, 0, 0, 8, 0, 0, 0][..],
+        ),
+    ] {
+        let mut original = image();
+        put(&mut original, file(RELOCS) + 16, tail);
+        set_dir(&mut original, dir::BASERELOC, RELOCS, size);
+        let prepared = prepare(&original).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(&prepared.bytes[callbacks_reloc()..][..2], &[0, 0], "{what}");
+        let tail_at = file(RELOCS) + 16;
+        assert_eq!(
+            &prepared.bytes[tail_at..tail_at + tail.len()],
+            tail,
+            "{what}: the bytes past the last block are left as they were"
+        );
+    }
+}

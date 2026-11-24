@@ -497,4 +497,62 @@ mod tests {
         assert!(lib.imports.is_empty());
         assert_eq!(lib.other_members, 1);
     }
+
+    /// `ar` pads a member of odd length with one `\n` so the next header
+    /// starts on an even offset. The member after the pad is read too.
+    #[test]
+    fn a_member_of_odd_length_is_followed_by_its_padding() {
+        let odd = short_import("a.dll", "Od", 0, CODE, BY_NAME);
+        assert_eq!(odd.len() % 2, 1, "the fixture needs an odd member");
+        let whole = archive(&[odd, short_import("b.dll", "Even", 0, DATA, BY_NAME)]);
+        let lib = ImportLibrary::parse(&whole).unwrap();
+        assert_eq!(
+            lib.imports,
+            [
+                name("a.dll", "Od", LibImportKind::Code),
+                name("b.dll", "Even", LibImportKind::Data),
+            ]
+        );
+        assert_eq!(lib.other_members, 0);
+    }
+
+    /// A member with no bytes at all is not an import object: it is
+    /// counted, and the members after it are still read.
+    #[test]
+    fn an_empty_member_is_another_member() {
+        let lib = ImportLibrary::parse(&archive(&[
+            Vec::new(),
+            short_import("a.dll", "After", 0, CODE, BY_NAME),
+        ]))
+        .unwrap();
+        assert_eq!(lib.imports, [name("a.dll", "After", LibImportKind::Code)]);
+        assert_eq!(lib.other_members, 1);
+    }
+
+    /// The machine field is not filtered: an umbrella library is read for
+    /// its DLL map, and an import object for another machine names the same
+    /// `dll!export` pair.
+    #[test]
+    fn an_import_object_for_another_machine_is_still_read() {
+        let mut member = short_import("a.dll", "Arm", 0, CODE, BY_NAME);
+        member[6..8].copy_from_slice(&0xAA64u16.to_le_bytes()); // ARM64
+        let lib = ImportLibrary::parse(&archive(&[member])).unwrap();
+        assert_eq!(lib.imports, [name("a.dll", "Arm", LibImportKind::Code)]);
+        assert_eq!(lib.other_members, 0);
+    }
+
+    /// A symbol that is nothing but the prefix `NO_PREFIX` strips, or an
+    /// empty symbol read by name, names the empty export rather than
+    /// failing the library.
+    #[test]
+    fn a_symbol_that_is_only_a_prefix_names_the_empty_export() {
+        let lib = ImportLibrary::parse(&archive(&[
+            short_import("a.dll", "_", 0, CODE, NO_PREFIX),
+            short_import("a.dll", "", 0, CODE, BY_NAME),
+            short_import("a.dll", "_@4", 0, CODE, UNDECORATE),
+        ]))
+        .unwrap();
+        assert_eq!(lib.imports, [name("a.dll", "", LibImportKind::Code)]);
+        assert_eq!(lib.other_members, 0);
+    }
 }
