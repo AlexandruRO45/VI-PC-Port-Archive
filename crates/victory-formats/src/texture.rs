@@ -1947,4 +1947,85 @@ mod tests {
             }
         }
     }
+
+    /// Every mip of 2D arrays and 3D textures, in each addressable mode:
+    /// the last element along each edge has an address whose element fits
+    /// inside the layout, the first one past an edge (and any mip past the
+    /// chain) is refused, and copies refuse slices the texture lacks.
+    #[test]
+    fn offsets_stop_at_the_edges() {
+        let modes = [
+            Swizzle::LINEAR,
+            Swizzle::SW_256B_S,
+            Swizzle::SW_256B_D,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_4KB_D,
+            Swizzle::SW_64KB_S,
+            Swizzle::SW_64KB_D,
+        ];
+        let mut checked = 0;
+        for swizzle in modes {
+            for dimension in [Dimension::Tex2d, Dimension::Tex3d] {
+                for (w, h, depth, bpe, mips) in
+                    [(37, 19, 5, 4, 6), (300, 7, 3, 8, 9), (1, 1, 2, 16, 1)]
+                {
+                    let d = Desc {
+                        dimension,
+                        depth,
+                        ..desc(w, h, mips, bpe, swizzle)
+                    };
+                    let Ok(l) = Layout::new(&d) else {
+                        // Thin-only modes have no 3D layout.
+                        assert_eq!(dimension, Dimension::Tex3d, "{d:?}");
+                        continue;
+                    };
+                    assert!(l.addressable(), "{d:?}");
+                    checked += 1;
+                    let three_d = dimension == Dimension::Tex3d;
+                    for (i, m) in l.mips.iter().enumerate() {
+                        let i = i as u32;
+                        let at = format!("{d:?} mip {i}");
+                        let zs = if three_d { m.depth } else { depth };
+                        let (x, y, z) = (m.width - 1, m.height - 1, zs - 1);
+                        for (cx, cy, cz) in [(0, 0, 0), (x, 0, 0), (0, y, 0), (0, 0, z), (x, y, z)]
+                        {
+                            let offset = l.offset(i, cx, cy, cz).unwrap();
+                            assert!(offset + u64::from(bpe) <= l.size, "{at} ({cx},{cy},{cz})");
+                        }
+                        assert_eq!(l.offset(i, x + 1, 0, 0), Err(Error::Invalid), "{at}");
+                        assert_eq!(l.offset(i, 0, y + 1, 0), Err(Error::Invalid), "{at}");
+                        assert_eq!(l.offset(i, 0, 0, z + 1), Err(Error::Invalid), "{at}");
+                        assert_eq!(
+                            l.offset(i, u32::MAX, u32::MAX, u32::MAX),
+                            Err(Error::Invalid),
+                            "{at}"
+                        );
+                    }
+                    let mips = l.mips.len() as u32;
+                    assert_eq!(l.offset(mips, 0, 0, 0), Err(Error::Invalid), "{d:?}");
+                    let mut tiled = vec![0; l.size as usize];
+                    let row = w as usize * bpe as usize;
+                    let mut linear = vec![0; row * h as usize * depth as usize];
+                    let depth_pitch = row * h as usize;
+                    let past = if three_d { 1 } else { depth };
+                    assert_eq!(
+                        l.detile(&tiled, 0, past, &mut linear, row, depth_pitch),
+                        Err(Error::Invalid),
+                        "{d:?}"
+                    );
+                    assert_eq!(
+                        l.tile(&mut tiled, mips, 0, &linear, row, depth_pitch),
+                        Err(Error::Invalid),
+                        "{d:?}"
+                    );
+                    assert_eq!(
+                        l.detile(&tiled, 0, 0, &mut linear, row, depth_pitch),
+                        Ok(()),
+                        "{d:?}"
+                    );
+                }
+            }
+        }
+        assert!(checked >= 30, "{checked}");
+    }
 }
