@@ -1,8 +1,8 @@
-"""Export fxceless/victory-gta6 issues, PRs and comments to gzipped JSONL via the gh CLI.
+"""Export fxceless/victory-fork issues, PRs and comments to gzipped JSONL via the gh CLI.
 Resumable: a finished endpoint is skipped; pauses for the rate-limit reset when low."""
 import gzip, json, os, subprocess, sys, time
 
-REPO = "fxceless/victory-gta6"
+REPO = "fxceless/victory-fork"
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 ENDPOINTS = [
     ("issues_and_prs", f"repos/{REPO}/issues?state=all&sort=created&direction=asc"),

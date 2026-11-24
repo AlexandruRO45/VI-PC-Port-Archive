@@ -1,6 +1,6 @@
-# victory-gta6 GitHub export
+# victory-fork GitHub export
 
-Issues, pull requests and comments from `fxceless/victory-gta6`, exported from the GitHub REST API on 2026-11-24.
+Issues, pull requests and comments from `fxceless/victory-fork` (called `victory-gta6` until 24 Nov 2026), exported from the GitHub REST API on 2026-11-24.
 
 Each file in `data/` is gzipped JSON Lines: one API object per line, unchanged.
 

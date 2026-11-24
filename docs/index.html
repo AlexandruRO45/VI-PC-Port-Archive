@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GTA6 PC Port Archive</title>
-<meta name="description" content="Archive of the open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory, victory-gta6, Xbox2Windows and TuxBox. Code, branches, pull requests, issues and comments, synced hourly. Projects removed from GitHub stay here.">
+<meta name="description" content="Archive of the open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory, victory-fork, Xbox2Windows and TuxBox. Code, branches, pull requests, issues and comments, synced hourly. Projects removed from GitHub stay here.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <script>
   // old links pointed issues at index.html#project/number; they live on browse.html now ("leonida" is now "leonida-old")
@@ -166,7 +166,7 @@
 </main>
 
 <footer><div class="wrap">
-  <span>Licenses: Leonida (old and new) GPL-3.0 · xcl GPL-2.0 · VIctory GPL-3.0 · Xbox2Windows MIT · TuxBox Apache-2.0 · victory-gta6 GPL-3.0</span>
+  <span>Licenses: Leonida (old and new) GPL-3.0 · xcl GPL-2.0 · VIctory GPL-3.0 · Xbox2Windows MIT · TuxBox Apache-2.0 · victory-fork GPL-3.0</span>
   <a href="https://github.com/Guernica4u/GTA6-PC-Port-Archive">GitHub repository</a>
 </div></footer>
 
@@ -194,18 +194,18 @@ const PROJECTS = {
   tuxbox: { repo: "brcly/TuxBox", saved: "24 Nov 2026", name: "TuxBox", lic: "Apache-2.0", branch: "tuxbox", up: "https://github.com/brcly/TuxBox",
     desc: "Runs Xbox Series games on Linux (through Proton) and Windows.", reached: 2,
     note: "On Linux it starts and shows the player selection screen in 4K. What comes after that isn't checked yet.", src: "https://github.com/brcly/TuxBox/blob/main/docs/PROGRESS.md#games" },
-  "victory-gta6": { repo: "fxceless/victory-gta6", saved: "24 Nov 2026", name: "victory-gta6", lic: "GPL-3.0", branch: "victory-gta6", up: "https://github.com/fxceless/victory-gta6",
+  "victory-gta6": { repo: "fxceless/victory-fork", saved: "24 Nov 2026", name: "victory-fork", lic: "GPL-3.0", branch: "victory-gta6", up: "https://github.com/fxceless/victory-fork",
     desc: "A fork of VIctory focused on getting GTA VI's world to render and run on a Windows PC.", reached: 4,
-    note: "Plays the opening cutscene and renders the first gameplay scene with working input, but at 2-4 fps and with everything in shadow black.", src: "https://github.com/fxceless/victory-gta6#status-of-this-fork-2026-11-25" },
+    note: "Plays the opening cutscene and renders the first gameplay scene with working input, but at 2-4 fps and with everything in shadow black.", src: "https://github.com/fxceless/victory-fork#status-of-this-fork-2026-11-25" },
 };
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
 const label = P => P.tag ? `${P.name} <small>(${P.tag})</small>` : P.name;
 const plain = P => P.name + (P.tag ? ` (${P.tag})` : "");
 const KEYS = Object.keys(PROJECTS);
-const ALIVE = KEYS.filter(k => !PROJECTS[k].gone).sort((a, b) => plain(PROJECTS[a]).localeCompare(plain(PROJECTS[b]))), DEAD = KEYS.filter(k => PROJECTS[k].gone);
+const ALIVE = KEYS.filter(k => !PROJECTS[k].gone).sort((a, b) => PROJECTS[b].reached - PROJECTS[a].reached || plain(PROJECTS[a]).localeCompare(plain(PROJECTS[b]))), DEAD = KEYS.filter(k => PROJECTS[k].gone);
 const fmt = n => n == null ? "—" : n.toLocaleString("en-US");
-const ago = t => { const h = Math.round((Date.now() / 1000 - t) / 3600); return h < 1 ? "under an hour ago" : h < 48 ? `${h} hours ago` : `${Math.round(h / 24)} days ago`; };
+const ago = t => { const h = Math.round((Date.now() / 1000 - t) / 3600); return h < 1 ? "under an hour ago" : h < 48 ? `${h} hour${h === 1 ? "" : "s"} ago` : `${Math.round(h / 24)} days ago`; };
 const pulse = `<svg width="34" height="14" viewBox="0 0 34 14" aria-hidden="true"><path d="M0 7h9l3-6 4 12 3-9 2 3h13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
 const date = t => new Date(t * 1000).toLocaleDateString("en-GB", { day:"numeric", month:"short", year:"numeric", timeZone:"UTC" });
 const reach = P => P.reached ? `Gets to: ${STEPS[P.reached - 1]}` : "Doesn't start yet";
