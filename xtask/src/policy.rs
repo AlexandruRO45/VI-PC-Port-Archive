@@ -609,9 +609,10 @@ fn list_files_built_by(root: &Path, staged: bool, exe: Option<&Path>) -> Result<
         return Ok(files);
     }
     // Not a git repository: walk everything except build output.
-    let build = exe
-        .and_then(|exe| build_dir_in(root, exe))
-        .map(|dir| root.join(dir));
+    let build = exe.and_then(|exe| {
+        let top = build_dir_top(root, exe)?;
+        Some(root.join(top.strip_prefix(root.canonicalize().ok()?).ok()?))
+    });
     Ok(walkdir::WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| {
@@ -649,20 +650,40 @@ fn list_files_built_by(root: &Path, staged: bool, exe: Option<&Path>) -> Result<
 /// only its untracked files: what is tracked or staged there is still read,
 /// and the staged check, which decides what a commit holds, lists every
 /// staged path as before. The checkout itself is never passed over.
-fn build_dir_in(root: &Path, exe: &Path) -> Option<String> {
+///
+/// The path is kept as the bytes git prints, not as text: a checkout or
+/// target directory whose name is not UTF-8 (a home directory named in a
+/// legacy encoding, say) was not recognised, and every object file under
+/// it was listed and failed the full check.
+fn build_dir_in(root: &Path, exe: &Path) -> Option<Vec<u8>> {
+    let top = build_dir_top(root, exe)?;
+    let root = root.canonicalize().ok()?;
+    let relative = top.strip_prefix(&root).ok()?.as_os_str().as_encoded_bytes();
+    // Git for Windows prints `/`; a Unix name may hold a `\\` of its own.
+    Some(if cfg!(windows) {
+        relative
+            .iter()
+            .map(|&b| if b == b'\\' { b'/' } else { b })
+            .collect()
+    } else {
+        relative.to_vec()
+    })
+}
+
+/// The canonical path of the Cargo target directory `exe` was built in,
+/// when it lies inside `root` (see `build_dir_in`).
+fn build_dir_top(root: &Path, exe: &Path) -> Option<PathBuf> {
     let root = root.canonicalize().ok()?;
     let exe = exe.canonicalize().ok()?;
-    let top = exe
-        .ancestors()
+    exe.ancestors()
         .skip(1)
         .take_while(|dir| dir.starts_with(&root) && *dir != root)
         .filter(|dir| {
             std::fs::read(dir.join("CACHEDIR.TAG"))
                 .is_ok_and(|tag| tag.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55"))
         })
-        .last()?;
-    let relative = top.strip_prefix(&root).ok()?.to_str()?;
-    Some(relative.replace('\\', "/"))
+        .last()
+        .map(Path::to_path_buf)
 }
 
 /// Whether `path` is a symlink to the Cargo target directory `exe` was
@@ -691,9 +712,9 @@ fn leads_to_build_dir(path: &Path, exe: &Path) -> bool {
 }
 
 /// Whether the `/`-separated path `raw` lies under the directory `dir`.
-fn is_under(raw: &[u8], dir: Option<&str>) -> bool {
+fn is_under(raw: &[u8], dir: Option<&[u8]>) -> bool {
     dir.is_some_and(|dir| {
-        raw.strip_prefix(dir.as_bytes())
+        raw.strip_prefix(dir)
             .is_some_and(|rest| rest.first() == Some(&b'/'))
     })
 }
@@ -1394,7 +1415,7 @@ mod tests {
         let exe = fake_build_dir(&root.join("out/build"));
         assert_eq!(
             super::build_dir_in(root, &exe).as_deref(),
-            Some("out/build")
+            Some(&b"out/build"[..])
         );
 
         // An inner tag (cargo also tags some subdirectories) does not
@@ -1402,12 +1423,18 @@ mod tests {
         std::fs::write(root.join("out/build/debug/CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
         assert_eq!(
             super::build_dir_in(root, &exe).as_deref(),
-            Some("out/build")
+            Some(&b"out/build"[..])
         );
         std::fs::write(root.join("out/CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
-        assert_eq!(super::build_dir_in(root, &exe).as_deref(), Some("out"));
+        assert_eq!(
+            super::build_dir_in(root, &exe).as_deref(),
+            Some(&b"out"[..])
+        );
         std::fs::write(root.join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
-        assert_eq!(super::build_dir_in(root, &exe).as_deref(), Some("out"));
+        assert_eq!(
+            super::build_dir_in(root, &exe).as_deref(),
+            Some(&b"out"[..])
+        );
 
         // A tag without Cargo's signature is not one.
         let other = tempdir();
@@ -1421,9 +1448,9 @@ mod tests {
             None
         );
 
-        assert!(super::is_under(b"out/x", Some("out")));
-        assert!(!super::is_under(b"output/x", Some("out")));
-        assert!(!super::is_under(b"out", Some("out")));
+        assert!(super::is_under(b"out/x", Some(b"out")));
+        assert!(!super::is_under(b"output/x", Some(b"out")));
+        assert!(!super::is_under(b"out", Some(b"out")));
         assert!(!super::is_under(b"out/x", None));
     }
 
@@ -1471,6 +1498,49 @@ mod tests {
         std::fs::create_dir(&plain).unwrap();
         std::fs::write(plain.join("a.rs"), b"fn a() {}\n").unwrap();
         let exe = fake_build_dir(&plain.join("build-out"));
+        assert_eq!(names_built_by(&plain, &exe), ["a.rs"]);
+    }
+
+    /// A CARGO_TARGET_DIR inside the checkout whose name is not UTF-8 is
+    /// passed over like any other: it was compared as text, never matched
+    /// the bytes git prints, and each object file built there was listed.
+    /// A sibling whose name merely starts with the same bytes is still read.
+    #[cfg(unix)]
+    #[test]
+    fn a_build_directory_named_in_bytes_is_passed_over() {
+        use std::os::unix::ffi::OsStrExt;
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        git_str(root, &["config", "core.quotePath", "true"]);
+        std::fs::write(root.join("a.rs"), b"fn a() {}\n").unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"build-\xff");
+        if std::fs::create_dir(root.join(name)).is_err() {
+            // Some filesystems (APFS) refuse names that are not UTF-8.
+            return;
+        }
+        let exe = fake_build_dir(&root.join(name));
+        let sibling = root.join(std::ffi::OsStr::from_bytes(b"build-\xff\xfe"));
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::write(sibling.join("x.rs"), b"fn x() {}\n").unwrap();
+
+        assert_eq!(
+            super::build_dir_in(root, &exe).as_deref(),
+            Some(&b"build-\xff"[..])
+        );
+        let listed = names_built_by(root, &exe);
+        assert_eq!(
+            listed,
+            ["a.rs", "build-\u{fffd}\u{fffd}/x.rs"],
+            "{listed:?}"
+        );
+
+        // Outside a repository the walk passes it over too.
+        let outer = tempdir();
+        let plain = outer.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join("a.rs"), b"fn a() {}\n").unwrap();
+        let exe = fake_build_dir(&plain.join(name));
         assert_eq!(names_built_by(&plain, &exe), ["a.rs"]);
     }
 
@@ -1549,9 +1619,13 @@ mod tests {
         let build = std::env::current_exe()
             .ok()
             .and_then(|exe| super::build_dir_in(checkout, &exe));
-        if let Some(relative) = relative.to_str()
-            && super::is_under(relative.replace('\\', "/").as_bytes(), build.as_deref())
-        {
+        let raw: Vec<u8> = relative
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .map(|&b| if cfg!(windows) && b == b'\\' { b'/' } else { b })
+            .collect();
+        if super::is_under(&raw, build.as_deref()) {
             return true;
         }
         let status = super::git_command(checkout)
