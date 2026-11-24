@@ -3543,6 +3543,47 @@ mod tests {
         assert_eq!(cfg.data_dir, PathBuf::from(&data));
     }
 
+    #[test]
+    fn uri_and_variable_checks_handle_odd_spellings() {
+        // Hex escapes and the `localhost` host are matched in any case, and
+        // an encoded `/` is decoded like any other byte.
+        assert_eq!(uri_path("/a/%c3%a9").as_deref(), Some("/a/é"));
+        assert_eq!(uri_path("//LocalHost/a").as_deref(), Some("/a"));
+        assert_eq!(uri_path("///a%2Fb").as_deref(), Some("/a/b"));
+        assert_eq!(uri_path("///c:/games").as_deref(), Some("c:/games"));
+        // A drive without a separator after it is not a drive path.
+        assert_eq!(uri_path("///C:games").as_deref(), Some("/C:games"));
+        // A name must start with a letter or `_`: `$1`, `${1}` and `%1%`
+        // are not variables, but `$_X` and `${_}` are.
+        for ok in ["/a/$1", "/a/${1}", "/a/%1%", "/a/$-x", "/a/%a b%"] {
+            assert!(ensure_no_variable("x", Path::new(ok)).is_ok(), "{ok}");
+        }
+        for (bad, var) in [("/a/$_X", "$_X"), ("/a/${_}x", "${_}")] {
+            let err = ensure_no_variable("x", Path::new(bad))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("the variable {var};")),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    /// A variable name that is not Unicode cannot be one of ours and is
+    /// skipped, not refused or mistaken for a near miss.
+    #[cfg(unix)]
+    #[test]
+    fn misspelled_variables_skip_names_that_are_not_unicode() {
+        use std::os::unix::ffi::OsStringExt;
+        let odd = OsString::from_vec(b"VICTORY_GAME\xFFDIR".to_vec());
+        ensure_no_misspelled_variables([odd.clone()], |_| None).unwrap();
+        // It does not hide a real near miss listed after it.
+        let err = ensure_no_misspelled_variables([odd, "VICTORY_GAMEDIR".into()], |_| None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VICTORY_GAMEDIR is set"), "{err}");
+    }
+
     fn abs(p: &str) -> OsString {
         if cfg!(windows) {
             format!("C:\\{p}").into()
