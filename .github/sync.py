@@ -116,7 +116,14 @@ def push(p, repo, default):
         sha, ref = line.split("\t")
         have[ref[len("refs/heads/"):]] = sha
     specs = [f"+{sha}:refs/heads/{b}" for b, sha in sorted(want.items()) if have.get(b) != sha]
-    rejected = lambda *s: [l for l in git("push", "--no-tags", "--porcelain", "origin", *s, check=False).stdout.splitlines() if l.startswith("!")]
+    def rejected(*s):
+        # a push can hang on GitHub's side; give up after 5 minutes and report it like a timeout, retried next run
+        try:
+            out = subprocess.run(["git", "-C", ROOT, "push", "--no-tags", "--porcelain", "origin", *s],
+                                 capture_output=True, text=True, encoding="utf-8", timeout=300).stdout
+        except subprocess.TimeoutExpired:
+            return [f"!\t{x.lstrip('+')}\t[remote rejected] (timed out after 5 minutes)" for x in s]
+        return [l for l in out.splitlines() if l.startswith("!")]
     refused = []
     for i in range(0, len(specs), 20):  # GitHub's workflow-file check times out on pushes with many branches
         for line in rejected(*specs[i:i + 20]):

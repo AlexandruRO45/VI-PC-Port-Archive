@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GTA6 PC Port Archive</title>
-<meta name="description" content="Archive of six open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory, Xbox2Windows and TuxBox. How far each gets, plus code, issues and comments to download.">
+<meta name="description" content="Archive of the open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory, Xbox2Windows and TuxBox. Code, branches, pull requests, issues and comments, synced hourly. Projects removed from GitHub stay here.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <script>
   // old links pointed issues at index.html#project/number; they live on browse.html now ("leonida" is now "leonida-old")
@@ -22,41 +22,62 @@
 .hero { padding:56px 0 0; }
 .kicker { display:inline-flex; align-items:center; gap:8px; font-size:13.5px; font-weight:500; color:var(--ink2); background:var(--panel); border:1px solid var(--line); border-radius:99px; padding:4px 12px 4px 10px; }
 .kicker::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--open); box-shadow:0 0 0 3px color-mix(in srgb, var(--open) 22%, transparent); }
-.hero h1 { font-size:clamp(32px, 4.6vw, 46px); line-height:1.08; margin:16px 0 10px; }
-.hero .lede { font-size:17px; color:var(--ink2); max-width:56ch; margin:0; }
-.answer { margin-top:26px; display:flex; gap:14px; align-items:flex-start; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px 18px; max-width:640px; }
-.answer .no { flex:none; display:grid; place-items:center; width:40px; height:40px; border-radius:10px; background:var(--soft); font:700 15px/1 var(--display); }
-.answer b { display:block; font-size:18px; margin-bottom:2px; }
-.answer span { color:var(--ink2); font-size:15px; }
-.cta { display:flex; gap:10px; flex-wrap:wrap; margin-top:22px; }
+.hero h1 { font-size:clamp(34px, 6vw, 64px); line-height:1.02; letter-spacing:-.04em; margin:16px 0 12px; max-width:15ch; }
+.hero .lede { font-size:17px; color:var(--ink2); max-width:60ch; margin:0; }
+.split { display:grid; grid-template-columns:minmax(0, 1fr) minmax(0, 1fr); gap:14px; margin-top:28px; }
+.split a { display:block; text-decoration:none; border-radius:16px; padding:20px 22px; border:1px solid var(--line); }
+.split a:hover { border-color:var(--ink2); }
+.split .a { background:var(--panel); }
+.split .g { background:#121315; color:#d6d4ce; border-color:#26272b; }
+.split b { display:block; font:700 44px/1 var(--display); letter-spacing:-.03em; }
+.split .a b { color:var(--open); }
+.split .g b { color:#f1efea; }
+.split span { font-weight:600; }
+.split small { display:block; margin-top:4px; opacity:.75; font-size:14px; }
+@media (max-width:620px) { .split { grid-template-columns:minmax(0, 1fr); } }
 
-/* projects, with how far each gets */
-.projs { display:flex; flex-direction:column; gap:14px; }
-.proj { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px 20px; display:flex; flex-direction:column; gap:12px; position:relative; overflow:hidden; }
-.proj::before { content:""; position:absolute; inset:0 auto 0 0; width:4px; background:var(--pc); }
-.proj .hd { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
-.proj .ttl { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-.proj h3 { font-family:Inter, system-ui, sans-serif; font-size:19px; letter-spacing:-.01em; }
-.proj h3 small { font-weight:500; color:var(--muted); font-size:15px; }
-.proj .desc { margin:-4px 0 0; color:var(--ink2); font-size:15px; }
-.score { display:inline-flex; align-items:center; gap:8px; font-size:14px; font-weight:600; white-space:nowrap; }
-.score i { font-style:normal; font:600 12.5px/1 var(--mono); padding:4px 7px; border-radius:6px; background:var(--soft); color:var(--ink2); }
-.score.some i { background:color-mix(in srgb, var(--open) 16%, transparent); color:var(--ink); }
-.steps { list-style:none; margin:2px 0 0; padding:0; display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:6px; }
-.steps li { font-size:13px; line-height:1.25; text-align:center; padding:8px 4px; border-radius:8px; border:1.5px dashed var(--line); color:var(--muted); }
-.steps li.ok { border:1.5px solid var(--open); background:color-mix(in srgb, var(--open) 14%, transparent); color:var(--ink); font-weight:600; }
-.steps li.ok::before { content:"✓ "; color:var(--open); }
-.proj .note { margin:0; font-size:14.5px; color:var(--ink2); }
-.proj .note a { color:var(--muted); white-space:nowrap; }
-.proj .foot { display:flex; align-items:center; justify-content:space-between; gap:10px 16px; flex-wrap:wrap; border-top:1px solid var(--line); padding-top:12px; margin-top:2px; }
-.proj .foot .meta { font-size:13px; }
-.proj .actions { display:flex; flex-wrap:wrap; gap:8px; }
-@media (max-width:640px) {
-  .proj { padding:16px; }
-  .steps { gap:4px; }
-  .steps li { font-size:11.5px; padding:6px 2px; }
-}
-.src { margin:12px 0 0; font-size:13px; color:var(--muted); }
+/* archive: projects still on GitHub */
+.alive { display:grid; grid-template-columns:repeat(auto-fill, minmax(320px, 1fr)); gap:14px; }
+@media (max-width:380px) { .alive { grid-template-columns:minmax(0, 1fr); } }
+.life { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:20px; display:flex; flex-direction:column; gap:10px; position:relative; overflow:hidden; }
+.life::before { content:""; position:absolute; inset:0 auto 0 0; width:4px; background:var(--pc); }
+.life .hd { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.life h3 { font-size:21px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.life h3 small { font:500 14px/1 Inter, sans-serif; color:var(--muted); }
+.beat { display:inline-flex; align-items:center; gap:7px; font:600 12px/1 var(--mono); color:var(--open); white-space:nowrap; }
+.beat svg path { stroke-dasharray:60; animation:beat 2.4s linear infinite; }
+@keyframes beat { from { stroke-dashoffset:60; } to { stroke-dashoffset:-60; } }
+@media (prefers-reduced-motion:reduce) { .beat svg path { animation:none; stroke-dasharray:none; } }
+.life p { margin:0; color:var(--ink2); font-size:15px; }
+.life .facts { font:13px/1.55 var(--mono); color:var(--muted); }
+.life .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:auto; padding-top:4px; }
+
+/* graveyard: projects removed from GitHub (always dark) */
+.night { margin-top:80px; color:#d6d4ce; background:#121315; padding:64px 0 72px; border-top:1px solid #26272b; border-bottom:1px solid #26272b; }
+.night .sec { padding:0; }
+.night .sec-head h2 { color:#f1efea; }
+.night .sec-head p { color:#9c9a93; }
+.yard { display:flex; flex-direction:column; gap:14px; }
+.grave { background:#18191c; border:1px solid #2a2b2f; border-left:3px solid #6e6c66; border-radius:14px; padding:24px; display:grid; grid-template-columns:minmax(0, 1fr) minmax(0, 1.1fr); gap:20px 32px; }
+.grave h3 { font-size:30px; line-height:1.05; color:#f1efea; }
+.grave h3 small { font:500 15px/1 Inter, sans-serif; color:#8f8d86; letter-spacing:0; }
+.grave .gone { display:inline-block; margin:12px 0 0; font:600 12.5px/1 var(--mono); color:#e8a59a; border:1px solid #4a302c; background:#221816; padding:6px 9px; border-radius:6px; }
+.grave .was { margin:10px 0 0; font:13px/1.5 var(--mono); color:#8f8d86; }
+.grave p.d { margin:12px 0 0; color:#b4b2ab; font-size:15px; }
+.grave dl { margin:0; display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:1px; background:#2a2b2f; border:1px solid #2a2b2f; border-radius:10px; overflow:hidden; align-self:start; }
+.grave dl div { background:#18191c; padding:14px 16px; }
+.grave dt { font-size:13px; color:#8f8d86; }
+.grave dd { margin:2px 0 0; font:700 24px/1.1 var(--display); color:#f1efea; font-variant-numeric:tabular-nums; }
+.grave .actions { grid-column:1 / -1; display:flex; gap:8px; flex-wrap:wrap; }
+.grave .btn { color:#f1efea; border-color:#3a3b40; }
+.grave .btn:hover { border-color:#f1efea; background:transparent; }
+.grave .btn.solid { background:#f1efea; color:#121315; border-color:#f1efea; }
+.night :focus-visible { outline-color:#f1efea; }
+@media (max-width:760px) { .grave { grid-template-columns:minmax(0, 1fr); padding:20px; } }
+.how { margin:24px 0 0; color:#9c9a93; font-size:14.5px; max-width:72ch; }
+.how b { color:#d6d4ce; }
+.after-night #download { padding-top:72px; }
+
 
 /* download */
 .dl { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px; }
@@ -93,33 +114,36 @@
 <nav class="nav" aria-label="Site"><div class="wrap">
   <a class="brand" href="./"><i aria-hidden="true"><b></b><b></b><b></b><b></b></i><span>GTA6 PC Port Archive</span></a>
   <ul>
-    <li><a href="#projects">Projects</a></li><li><a href="#download">Download</a></li>
+    <li class="opt"><a href="#archive">Archive</a></li><li><a href="#graveyard">Graveyard</a></li><li><a href="#download">Download</a></li>
     <li class="opt"><a href="#links">Links</a></li><li><a class="go" href="browse.html">Browse issues</a></li>
   </ul>
 </div></nav>
 
-<main class="wrap">
+<main>
+<div class="wrap">
   <header class="hero">
     <div class="kicker">Synced with GitHub every hour</div>
-    <h1>GTA6 PC Port Archive</h1>
-    <p class="lede">Saved copies of six open-source projects trying to run GTA VI on PC: their code, issues and comments. No game files.</p>
-    <div class="answer" role="note">
-      <span class="no" aria-hidden="true">No</span>
-      <div><b>Can you play it on PC yet? No.</b>
-      <span>Furthest so far: VIctory loads into the world, but the screen stays dark there.</span></div>
-    </div>
-    <div class="cta">
-      <a class="btn solid" href="#projects">See how far each one gets</a>
-      <a class="btn" href="#download">Download</a>
+    <h1>The living, and the ones we saved.</h1>
+    <p class="lede">Every open-source GTA VI PC project is copied here: code, branches, pull requests, issues and comments. Projects still on GitHub live in the archive and update every hour. Projects that vanish go to the graveyard, where their copy is kept for good. No game files.</p>
+    <div class="split">
+      <a class="a" href="#archive"><b id="n-alive">5</b><span>in the archive</span><small>Still on GitHub · checked every hour</small></a>
+      <a class="g" href="#graveyard"><b id="n-dead">1</b><span>in the graveyard</span><small>Gone from GitHub · kept here forever</small></a>
     </div>
   </header>
 
-  <section class="sec" id="projects" aria-labelledby="proj-h">
-    <div class="sec-head"><h2 id="proj-h">Projects and how far they get</h2><p>Green means that part works.</p></div>
-    <div class="projs" id="projlist"></div>
-    <p class="src">Progress is from each project's own README on 24 Nov 2026, tested by its developers on their own PCs.</p>
+  <section class="sec" id="archive" aria-labelledby="arc-h">
+    <div class="sec-head"><h2 id="arc-h">Archive</h2><p>Still on GitHub. Every hour the sync checks each one for new code, pull requests and comments.</p></div>
+    <div class="alive" id="alive"></div>
   </section>
+</div>
 
+<section class="night" id="graveyard" aria-labelledby="gy-h"><div class="wrap"><div class="sec">
+  <div class="sec-head"><h2 id="gy-h">Graveyard</h2><p>Projects removed from GitHub. Their last copy stays here, complete, and no longer changes.</p></div>
+  <div class="yard" id="yard"></div>
+  <p class="how"><b>How a project gets here:</b> if the hourly sync can't reach a project because it was deleted, taken down or made private, it keeps the last copy and the project is listed here.</p>
+</div></div></section>
+
+<div class="wrap after-night">
   <section class="sec" id="download" aria-labelledby="dl-h">
     <div class="sec-head"><h2 id="dl-h">Download</h2><p>Zip files straight from GitHub. Source code only, no game files.</p></div>
     <div class="dl" id="dl"></div>
@@ -134,6 +158,7 @@
       <a class="ilink" href="https://fluxer.gg/YWOKODCW" target="_blank" rel="noopener"><span>fluxer.gg/YWOKODCW</span><span class="arrow" aria-hidden="true">↗</span></a>
     </div>
   </section>
+</div>
 </main>
 
 <footer><div class="wrap">
@@ -144,57 +169,66 @@
 <script>
 const REPO = "https://github.com/Guernica4u/GTA6-PC-Port-Archive";
 const STEPS = ["Starts", "Menus", "Loads the world", "World on screen", "Playable"];
-// reached = how many STEPS work, from each project's README (24 Nov 2026); branch = its branch prefix in this repo
+// reached = how many STEPS work, from each project's README (24 Nov 2026); branch = its branch prefix in this repo;
+// gone = date it was removed from GitHub (listed in the graveyard); born and commits come from its archived history
 const PROJECTS = {
-  "leonida-new": { name: "Leonida", tag: "new", lic: "GPL-3.0", branch: "leonida-new", up: "https://github.com/ubiquitarianism/leonida",
+  "leonida-new": { repo: "ubiquitarianism/leonida", saved: "24 Nov 2026", name: "Leonida", tag: "new", lic: "GPL-3.0", branch: "leonida-new", up: "https://github.com/ubiquitarianism/leonida",
     desc: "Leonida Continued: picks up the original Leonida with its full history.", reached: 0,
     note: "The game doesn't start yet. Its tools already unpack the game's shaders, models, textures and audio.", src: "https://github.com/ubiquitarianism/leonida#project-status" },
-  "leonida-old": { name: "Leonida", tag: "old", lic: "GPL-3.0", branch: "leonida", up: null, frozen: "Final copy, 23 Nov 2026",
-    desc: "The original. Removed from GitHub on 23 Nov 2026; this is the last copy saved.", reached: 0,
+  "leonida-old": { repo: "ItsNotRexed/Leonida", saved: "23 Nov 2026", gone: "23 Nov 2026", born: "20 Nov 2026", commits: 11487, name: "Leonida", tag: "old", lic: "GPL-3.0", branch: "leonida", up: null, frozen: "Final copy, 23 Nov 2026",
+    desc: "The original Leonida. Development continues in Leonida (new).", reached: 0,
     note: "Stopped before the game starts. The new Leonida carries on from here.", src: `${REPO}/tree/main/leonida-old#project-status` },
-  xcl: { name: "xcl", lic: "GPL-2.0", branch: "xcl", up: "https://github.com/ivall/xcl",
+  xcl: { repo: "ivall/xcl", saved: "23 Nov 2026", name: "xcl", lic: "GPL-2.0", branch: "xcl", up: "https://github.com/ivall/xcl",
     desc: "Runs Xbox Series games on Windows. Minecraft Preview and Unicorn Overlord are already fully playable.", reached: 2,
     note: "Starts in about 4 seconds and shows the menus at 30 fps. Gameplay not reached yet. (Its README calls it “a newer retail game”.)", src: "https://github.com/ivall/xcl#games" },
-  victory: { name: "VIctory", lic: "GPL-3.0", branch: "victory", up: "https://github.com/Marvisak/VIctory",
+  victory: { repo: "Marvisak/VIctory", saved: "23 Nov 2026", name: "VIctory", lic: "GPL-3.0", branch: "victory", up: "https://github.com/Marvisak/VIctory",
     desc: "Runs GTA VI's Xbox code natively on Windows.", reached: 3,
     note: "Starts, plays the intro, shows the menus and loads into the world. The world itself is still a dark screen.", src: "https://github.com/Marvisak/VIctory#status-2026-11-23" },
-  xbox2windows: { name: "Xbox2Windows", lic: "MIT", branch: "xbox2windows", up: "https://github.com/R0Y00/Xbox2Windows",
+  xbox2windows: { repo: "R0Y00/Xbox2Windows", saved: "23 Nov 2026", name: "Xbox2Windows", lic: "MIT", branch: "xbox2windows", up: "https://github.com/R0Y00/Xbox2Windows",
     desc: "Turns Xbox Series code into a Windows program.", reached: 1,
     note: "With a modified test EXE it plays the intro and reaches a loading screen. Menus not checked yet.", src: "https://github.com/R0Y00/Xbox2Windows#readme" },
-  tuxbox: { name: "TuxBox", lic: "Apache-2.0", branch: "tuxbox", up: "https://github.com/brcly/TuxBox",
+  tuxbox: { repo: "brcly/TuxBox", saved: "24 Nov 2026", name: "TuxBox", lic: "Apache-2.0", branch: "tuxbox", up: "https://github.com/brcly/TuxBox",
     desc: "Runs Xbox Series games on Linux (through Proton) and Windows.", reached: 2,
     note: "On Linux it starts and shows the player selection screen in 4K. What comes after that isn't checked yet.", src: "https://github.com/brcly/TuxBox/blob/main/docs/PROGRESS.md#games" },
 };
-// show the furthest first
-const KEYS = Object.keys(PROJECTS).sort((a, b) => PROJECTS[b].reached - PROJECTS[a].reached);
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
 const label = P => P.tag ? `${P.name} <small>(${P.tag})</small>` : P.name;
 const plain = P => P.name + (P.tag ? ` (${P.tag})` : "");
+const KEYS = Object.keys(PROJECTS);
+const ALIVE = KEYS.filter(k => !PROJECTS[k].gone).sort((a, b) => plain(PROJECTS[a]).localeCompare(plain(PROJECTS[b]))), DEAD = KEYS.filter(k => PROJECTS[k].gone);
+const fmt = n => n == null ? "—" : n.toLocaleString("en-US");
+const ago = t => { const h = Math.round((Date.now() / 1000 - t) / 3600); return h < 1 ? "under an hour ago" : h < 48 ? `${h} hours ago` : `${Math.round(h / 24)} days ago`; };
+const pulse = `<svg width="34" height="14" viewBox="0 0 34 14" aria-hidden="true"><path d="M0 7h9l3-6 4 12 3-9 2 3h13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
 const date = t => new Date(t * 1000).toLocaleDateString("en-GB", { day:"numeric", month:"short", year:"numeric", timeZone:"UTC" });
 const reach = P => P.reached ? `Gets to: ${STEPS[P.reached - 1]}` : "Doesn't start yet";
 const zip = (P, what) => `${REPO}/archive/refs/heads/${P.branch}/${what}.zip`;
 
 function projects(st) {
-  $("projlist").innerHTML = KEYS.map(k => {
-    const P = PROJECTS[k], s = (st || {})[k] || {};
-    return `<article class="proj p-${k}" aria-labelledby="h-${k}">
-      <div class="hd">
-        <div class="ttl"><h3 id="h-${k}">${label(P)}</h3><span class="chip">${P.lic}</span></div>
-        <span class="score${P.reached ? " some" : ""}"><i>${P.reached}/5</i>${esc(reach(P))}</span>
+  st = st || {};
+  $("n-alive").textContent = ALIVE.length; $("n-dead").textContent = DEAD.length;
+  $("alive").innerHTML = ALIVE.map(k => {
+    const P = PROJECTS[k], s = st[k] || {};
+    return `<article class="life p-${k}" aria-labelledby="h-${k}">
+      <div class="hd"><h3 id="h-${k}">${label(P)}</h3><span class="beat">${pulse}Alive</span></div>
+      <p>${esc(P.desc)}</p>
+      <div class="facts">${s.updated ? `Last code change ${ago(s.updated)}<br>` : ""}${fmt(s.prs)} PRs · ${fmt(s.issues)} issues · ${fmt(s.comments)} comments<br>Saved since ${P.saved} · ${P.lic}<br>Status: ${esc(reach(P))} (<a href="${P.src}" target="_blank" rel="noopener">source</a>)</div>
+      <div class="actions">
+        <a class="btn solid sm" href="${zip(P, "main")}">Download</a>
+        <a class="btn sm" href="browse.html#${k}">Issues</a>
+        <a class="btn sm" href="${P.up}" target="_blank" rel="noopener">On GitHub ↗</a>
       </div>
-      <p class="desc">${esc(P.desc)}</p>
-      <ol class="steps" aria-label="${esc(plain(P))}: ${esc(reach(P))}">${STEPS.map((step, i) =>
-        `<li${i < P.reached ? ' class="ok"' : ""}>${step}<span class="sr">${i < P.reached ? ": works" : ": not yet"}</span></li>`).join("")}</ol>
-      <p class="note">${esc(P.note)} <a href="${P.src}" target="_blank" rel="noopener">Source</a></p>
-      <div class="foot">
-        <span class="meta">${s.updated ? `Last code change ${date(s.updated)}` : ""}</span>
-        <div class="actions">
-          <a class="btn solid sm" href="browse.html#${k}">Issues and PRs</a>
-          <a class="btn sm" href="${REPO}/tree/main/${k}">Code</a>
-          ${P.up ? `<a class="btn sm" href="${P.up}" target="_blank" rel="noopener">Original ↗</a>` : ""}
-        </div>
-      </div>
+    </article>`;
+  }).join("");
+  $("yard").innerHTML = DEAD.map(k => {
+    const P = PROJECTS[k], s = st[k] || {};
+    return `<article class="grave" aria-labelledby="h-${k}">
+      <div><h3 id="h-${k}">${label(P)}</h3>
+        <span class="gone">Removed from GitHub · ${P.gone}</span>
+        <div class="was">Was at github.com/${P.repo}<br>Active ${P.born || "?"} – ${P.gone}</div>
+        <p class="d">${esc(P.desc)}</p></div>
+      <dl>${P.commits ? `<div><dt>Commits</dt><dd>${fmt(P.commits)}</dd></div>` : ""}<div><dt>Pull requests</dt><dd>${fmt(s.prs)}</dd></div><div><dt>Issues</dt><dd>${fmt(s.issues)}</dd></div><div><dt>Comments</dt><dd>${fmt(s.comments)}</dd></div></dl>
+      <div class="actions"><a class="btn solid sm" href="${zip(P, "main")}">Download code</a><a class="btn sm" href="${zip(P, "github-export")}">Download issues and comments</a><a class="btn sm" href="browse.html#${k}">Browse issues</a></div>
     </article>`;
   }).join("");
 }
@@ -212,7 +246,7 @@ function downloads() {
     </div>`;
   }).join("") + `<div class="dlc all">
       <h3>Everything</h3>
-      <p>All six projects in one zip, plus this site.</p>
+      <p>Every project, in the archive or the graveyard, in one zip, plus this site.</p>
       <div class="actions"><a class="btn sm" href="${REPO}/archive/refs/heads/main.zip">All .zip</a></div>
     </div>`;
 }

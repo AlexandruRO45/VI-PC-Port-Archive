@@ -4,7 +4,8 @@ name: Sync projects
 
 on:
   schedule:
-    - cron: "17 * * * *"
+    # GitHub may start scheduled runs late, and skips them while a run is still going (concurrency below)
+    - cron: "7 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -17,7 +18,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 55  # under an hour, so a stuck run never holds up the next one
     steps:
       - uses: actions/checkout@v5
 
@@ -33,6 +34,8 @@ jobs:
           git add -A
           if ! git diff --cached --quiet; then
             git commit -q -m "Sync with the projects on GitHub ($(date -u '+%Y-%m-%d %H:%M') UTC)"
+            # main may have moved while the sync ran; replay this commit on top
+            git pull -q --rebase origin main
             git push origin HEAD:main
           fi
           exit $status
