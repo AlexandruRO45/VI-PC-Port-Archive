@@ -71,6 +71,72 @@ Each is described in a comment where it is read.
 - A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
 - Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
 
+### justlovett0 fork — Windows 10 / RTX 3080 verification (2026-11-25)
+
+Verified on a second machine: **Windows 10 22H2 (19044), Ryzen 9 7900X,
+NVIDIA RTX 3080 10 GB, driver 621.24 (32.0.16.2124)**, Series X profile.
+
+**Windows 10 launch.** The inbox D3D12 runtime reports SM 6.5, so the fork's
+SM 6.6 shaders need the **Agility SDK 1.620.2** (upstream PR #175) beside the
+executable (`cargo xtask agility`; the exe exports `D3D12SDKVersion` /
+`D3D12SDKPath`). With it the title boots, plays the intro and enters the world
+without the init crash the SM 6.5 runtime causes.
+
+**Best verified configuration** — textures, world geometry and mostly-correct
+static lighting, ~4 fps (230-250 ms per frame):
+
+```bash
+VICTORY_BVH_BUILDER=1 VICTORY_BVH_QUARANTINE=1 \
+VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 \
+VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024 \
+VICTORY_TEXTURE_MIP_DROP=1 VICTORY_RELAY=1 \
+  victory.exe run "<game>\game_scarlett_master.exe" --execute
+```
+
+Findings on this machine:
+
+- **Static ray-traced lighting works** with `BVH_BUILDER=1 QUARANTINE=1`: the
+  trace/shading programs read the title's pre-built static acceleration
+  structures. The dynamic builder stays off (3 of its 53 programs fail a
+  divergent cross-half first-lane read), so shadowed areas are still darker than
+  sunlit ones.
+- **Texture mip-drop** — a port of upstream VIctory #1272, adapted to this fork's
+  lazy host-copy path (`Hosted`/`Made`/`Twin`, idle eviction).
+  `VICTORY_TEXTURE_MIP_DROP=1` drops the top mip of pure sampled textures. It
+  barely moves the frame rate (the world is not texture-bandwidth bound) but
+  **vastly improves lighting**, apparently by keeping irradiance/lighting textures
+  resident under lower VRAM pressure. Unset (default) is bit-identical to before;
+  render targets, depth and MSAA are exempt; allocation retries on
+  `E_OUTOFMEMORY`. Adds SRV mip-window re-basing, subresource remapping for
+  copies/resolves, and per-subresource host-written tracking.
+- **`VICTORY_RELAY=1`** (ordered relay worker) gives ~230-250 ms vs ~260-270 ms
+  without it, overlapping copy-back/merge with the next frame's preparation.
+  **`VICTORY_RELAY=2`** (precise per-memory waits) is *slower* here (250-270 ms).
+- **The frame rate is latency/synchronisation bound, not throughput bound**: CPU
+  and GPU usage are low during play. With minimal rendering (looking straight up)
+  the frame is ~150 ms; a full scene adds ~80-100 ms. The ~150 ms floor is GPU
+  read-back fetch latency plus the title's own frame pacing, not compute — so more
+  GPU/CPU horsepower does not help; overlap does.
+
+Negative results on this machine (do not use):
+
+- `VICTORY_INPLACE=1` and `VICTORY_TEXTURE_NO_WAIT=1` both **break the RT
+  lighting**: the flight tracking knows shader writes only through declared copy
+  ranges, so bypassing copies leaves stale/empty lighting reads.
+- `VICTORY_WIDE_REFRESH=1`, `VICTORY_CARD_REHASH_RUNS=1`,
+  `VICTORY_UNWATCHED_FRAMES=2`: no frame-rate gain (the refresh copies are kernel
+  page-fault bound, not thread bound).
+- The newer `fxceless/victory-fork` **shader clean-up optimizer, full on, renders
+  the scene black**, and its **#11 lane-mask pair-restore removes world geometry**
+  on this base — those shader-side changes do not transfer to this fork's wave64
+  emitter unchanged. A safe subset of the optimizer (dead code, folding, reuse,
+  load-CSE = `VICTORY_SHADER_OPT=23`, excluding branch facts and the wave64
+  first-lane exchange) is under test.
+
+The intro pre-rendered video logo jitters in every mode (a frame-token pacing
+issue in `frame.rs`, not the relay or the shaders); the world itself presents in
+order with `RELAY=1`.
+
 Everything below this line is upstream VIctory's own README, unchanged; its
 status section describes upstream, not this fork.
 
