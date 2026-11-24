@@ -119,6 +119,8 @@ def _modified(code, index, fields, literal, is_float):
 
 
 def _vop3(name, opcode, fields, literal):
+    if name in rdna2_hlsl_f16.TEMPLATES:
+        return rdna2_hlsl_f16.vop3(name, fields, literal, ACTIVE)
     is_float = "_f32" in name and not name.startswith(("v_cvt_u32", "v_cvt_i32"))
     a, b, c = (_modified(code, i, fields, literal, is_float) for i, code in enumerate(fields.sources))
     if opcode < 0x100 and is_compare(name):
