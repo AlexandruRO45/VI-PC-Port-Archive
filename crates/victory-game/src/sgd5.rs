@@ -45,16 +45,22 @@ pub fn is_sgd5(file: &[u8]) -> bool {
 /// first magic: bytes before it (an archive's other files) belong to no SGD5
 /// file, whatever markers they happen to hold. It resumes after each
 /// record's packed bytes: a marker inside them (stored deflate blocks carry a
-/// container's bytes as they are) is part of that record.
+/// container's bytes as they are) is part of that record, and so is any part
+/// of the next record's header or name, which must follow them.
 pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     let finder = memchr::memmem::Finder::new(&MARKER);
-    // No magic: start past the end, so nothing is found.
-    let mut from = memchr::memmem::find(file, MAGIC).map_or(file.len(), |m| m + MAGIC.len());
+    // Where the next record may start: after the magic, then after each
+    // record's packed bytes. No magic: past the end, so nothing is found.
+    let mut floor = memchr::memmem::find(file, MAGIC).map_or(file.len(), |m| m + MAGIC.len());
+    // A marker needs its name's NUL, the kind and `n` (6 bytes) before it.
+    let mut from = floor + 6;
     std::iter::from_fn(move || {
-        while let Some(found) = finder.find(&file[from..]) {
+        while let Some(found) = finder.find(file.get(from..)?) {
             let at = from + found;
-            if let Some(r) = record(file, at) {
-                from = at + 12 + r.packed.len();
+            if let Some(r) = record(&file[floor..], at - floor) {
+                let r = Record { offset: at, ..r };
+                floor = at + 12 + r.packed.len();
+                from = floor + 6;
                 return Some(r);
             }
             from = at + 1;
@@ -63,6 +69,7 @@ pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     })
 }
 
+/// The record whose marker is at `at`, reading nothing before `file`.
 fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
     let u32_at = |o: usize| {
         file.get(o..o + 4)
@@ -166,6 +173,34 @@ mod tests {
     }
 
     #[test]
+    fn header_inside_a_record_is_not_another_record() {
+        // The record's packed bytes end (after the deflate stream, which
+        // ignores them) with what would be the next header: NUL, kind, `n`.
+        let mut packed = miniz_oxide::deflate::compress_to_vec(b"first", 6);
+        let tail = miniz_oxide::deflate::compress_to_vec(b"phantom", 6);
+        let tail_n = (tail.len() + 12) as u32;
+        packed.extend_from_slice(&[0, 0x32]);
+        packed.extend_from_slice(&tail_n.to_le_bytes());
+        let n = (packed.len() + 12) as u32;
+        let mut file = MAGIC.to_vec();
+        file.extend_from_slice(b"\x09PS_first\0\x32");
+        for v in [n, 0x000D_DCE7, n, 5] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&packed);
+        // Right after it, a marker with no header of its own.
+        for v in [0x000D_DCE7, tail_n, 7] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&tail);
+
+        let found: Vec<_> = records(&file).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_first")]);
+        assert_eq!(found[0].unpack().as_deref(), Some(&b"first"[..]));
+    }
+
+    #[test]
     fn records_before_the_magic_are_not_read() {
         // An archive whose other file happens to hold a well-formed record.
         let mut archive = record_bytes("PS_elsewhere", 0x32, b"not ours");
@@ -193,6 +228,37 @@ mod tests {
                     "cut at {cut}: {:?} does not unpack",
                     r.name
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_container_unpacks() {
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("PS_empty", 0x32, b""));
+        let r = records(&file).next().unwrap();
+        assert_eq!(r.unpack(), Some(Vec::new()));
+    }
+
+    /// Every single-byte change to a small file: no panic, and the records
+    /// found are in file order, inside the file and do not overlap.
+    #[test]
+    fn damaged_file_yields_disjoint_records() {
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("PS_a", 0x32, &[5; 40]));
+        file.extend(record_bytes("VS_b", 0x41, b"second"));
+        for at in 0..file.len() {
+            for value in [0x00, 0x01, 0x0C, 0x0D, 0x7F, 0xDC, 0xE7, 0xFF] {
+                let mut damaged = file.clone();
+                damaged[at] = value;
+                let mut end = 0;
+                for r in records(&damaged) {
+                    let start = r.offset - 6;
+                    assert!(start >= end, "byte {at} = {value:#x}: records overlap");
+                    end = r.offset + 12 + r.packed.len();
+                    assert!(end <= damaged.len());
+                    let _ = r.unpack();
+                }
             }
         }
     }
