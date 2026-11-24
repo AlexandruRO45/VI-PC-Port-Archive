@@ -409,7 +409,7 @@ enum Step {
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
+    Run(usize, usize, Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
@@ -566,8 +566,9 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        let mut woken = crate::fence::Woken::default();
         for list in runs {
-            list.run_deferred(&mut batch);
+            list.run_deferred(&mut batch, &mut woken);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -659,13 +660,12 @@ impl Host {
         }
         for (shadow, address, len) in &back {
             let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
+            let written = shadow.copy_back(address, len, &mut woken);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         // Queues these writes release run their work once no lock is held:
         // it submits lists itself (this lock, the lists' `deferred`).
-        let mut woken = crate::fence::Woken::default();
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 woken.add(what.write(at as *mut u8, bytes));
@@ -1251,8 +1251,10 @@ impl HostList {
 
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
+    pub(crate) fn defer(&self, dst: usize, len: usize, work: impl Fn() + Send + 'static) {
+        self.deferred()
+            .copies
+            .push(Step::Run(dst, len, Box::new(work)));
         self.deferred().refreshed.clear();
     }
 
@@ -1270,7 +1272,7 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    fn run_deferred(&self, batch: &mut Batch, woken: &mut crate::fence::Woken) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -1283,7 +1285,9 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    woken.add(crate::fence::write_and_collect(dst, len, || {
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    }));
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -1304,11 +1308,13 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
+                Step::Run(_, _, work) | Step::Host(work) => {
+                    if let Step::Run(dst, len, _) = step {
                         batch.title_written();
+                        woken.add(crate::fence::write_and_collect(*dst, *len, work));
+                    } else {
+                        work();
                     }
-                    work();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
@@ -1458,7 +1464,10 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    unsafe {
+        ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0
+            && done == len
+    }
 }
 
 /// Copies host memory into title memory after a submission (what shaders

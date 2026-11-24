@@ -21,6 +21,7 @@ use crate::fence::Held;
 pub(crate) enum Op {
     /// Hold back what follows until the fence reaches the value.
     Wait(Held, u64),
+    Memory(crate::fence::MemoryWait),
     /// Command lists to run, a fence to signal.
     Run(Box<dyn FnOnce() + Send>),
 }
@@ -53,9 +54,16 @@ impl Timeline {
     /// Work another thread is running for the queue is waited for, as a
     /// submission's own work is.
     pub(crate) fn submit(self: &Arc<Self>, op: Op) {
+        self.submit_batch([op]);
+    }
+
+    /// Publish a whole ExecuteCommandLists call before starting its first segment.
+    pub(crate) fn submit_batch(self: &Arc<Self>, ops: impl IntoIterator<Item = Op>) {
         let mut s = self.lock();
-        s.ops.push_back(op);
-        s.pushed += 1;
+        for op in ops {
+            s.ops.push_back(op);
+            s.pushed += 1;
+        }
         let ticket = s.pushed;
         while s.busy && s.done < ticket {
             s = self.moved.wait(s).unwrap_or_else(|e| e.into_inner());
@@ -92,6 +100,13 @@ impl Timeline {
                     // signal after this check wakes us.
                     if !fence.wait_on_gpu(value, self) {
                         s.ops.push_front(Op::Wait(fence, value));
+                        s.held = true;
+                        break;
+                    }
+                }
+                Op::Memory(mut wait) => {
+                    if !wait.register(self) {
+                        s.ops.push_front(Op::Memory(wait));
                         s.held = true;
                         break;
                     }
