@@ -34,10 +34,11 @@ jobs:
         env:
           CARGO_TERM_COLOR: never
         run: |
+          set +e
           set -o pipefail
-          cargo test --workspace --locked 2>&1 | tee test.log
+          cargo test --workspace --locked 2>&1 | tee /tmp/test.log
           rc=$?
           if [ "$rc" -ne 0 ]; then
-            awk '/^failures:/{flag=1} flag{print "::error::" $0}' test.log | head -n 40
+            tail -n 35 /tmp/test.log | sed 's/^/::error::/'
             exit "$rc"
           fi
