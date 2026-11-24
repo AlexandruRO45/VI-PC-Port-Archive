@@ -144,10 +144,7 @@ impl Config {
         let home = home_dir(env);
         let file = match config_file(explicit_config(env, home.as_deref())?)? {
             Some(path) => {
-                let bytes =
-                    std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-                let text =
-                    config_text(bytes).with_context(|| format!("reading {}", path.display()))?;
+                let text = read_config(&path)?;
                 Some((path, text))
             }
             None => None,
@@ -358,6 +355,15 @@ const PATH_KEYS: [&str; 4] = ["game_dir", "cache_dir", "data_dir", "test_titles"
 /// own is an easy first file to write), is otherwise reported only as
 /// "unknown field `game_dir`, expected `paths`", which does not say what
 /// to change; the error names the key and the table it belongs in.
+/// The text of the config file at `path`, found by [`config_file`]. A file
+/// that is there but cannot be read (no read permission, or a folder
+/// swapped in after the check) and text that is not UTF-8 are both reported
+/// with the path, so it is clear which file to fix.
+fn read_config(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    config_text(bytes).with_context(|| format!("reading {}", path.display()))
+}
+
 fn parse_file(text: &str) -> Result<FileConfig> {
     let err = match toml::from_str(text) {
         Ok(parsed) => return Ok(parsed),
@@ -2744,6 +2750,71 @@ mod tests {
         assert_eq!(
             config_file_or(None, &default).unwrap(),
             Some(default.clone())
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_file_that_is_found_but_cannot_be_read_names_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        // A scratch folder under the system temp folder, never the
+        // repository or the working directory; removed at the end.
+        let dir = std::env::temp_dir().join(format!(
+            "victory-config-unreadable-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("victory.toml");
+        std::fs::write(&file, "[paths]\n").unwrap();
+
+        // Readable: the text, and a UTF-8 mark written by Notepad is dropped
+        // on the way from the disk too.
+        assert_eq!(read_config(&file).unwrap(), "[paths]\n");
+        std::fs::write(&file, b"\xEF\xBB\xBF[paths]\n").unwrap();
+        assert_eq!(read_config(&file).unwrap(), "[paths]\n");
+
+        // UTF-16 or stray bytes on disk: the fix, under the file's name.
+        for bytes in [
+            &b"\xFF\xFE[\0p\0"[..],
+            &b"[paths]\ngame_dir = \"\xE9\"\n"[..],
+        ] {
+            std::fs::write(&file, bytes).unwrap();
+            let err = read_config(&file).unwrap_err();
+            assert_eq!(err.to_string(), format!("reading {}", file.display()));
+            assert!(format!("{err:#}").contains("save it as UTF-8"), "{err:#}");
+        }
+
+        // No read permission: config_file still finds the file (only the
+        // folder's search permission is needed), so the read reports the
+        // permission error with the path rather than a bare "Permission
+        // denied (os error 13)", and never falls back to the defaults.
+        std::fs::write(&file, "").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(config_file_or(None, &file).unwrap(), Some(file.clone()));
+        // Root (or a CAP_DAC_OVERRIDE container) reads through the mode
+        // bits, leaving nothing to check.
+        if std::fs::read(&file).is_err() {
+            let err = read_config(&file).unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(err.to_string(), format!("reading {}", file.display()));
+        }
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(read_config(&file).unwrap(), "");
+
+        // A folder put where the file was after it was found: the OS error
+        // under the file's name, not a parse of nothing.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let err = read_config(&file).unwrap_err();
+        assert_eq!(err.to_string(), format!("reading {}", file.display()));
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::IsADirectory
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
