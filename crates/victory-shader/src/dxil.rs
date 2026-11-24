@@ -94,6 +94,12 @@ impl<'a> DxilProgram<'a> {
                 "program size disagrees with part size",
             ))?;
         let part = &part[..size];
+        // DXIL starts at shader model 6.0; anything older is DXBC bytecode,
+        // so a lower model in a DXIL header means it was misread or forged.
+        let shader_model = (((version >> 4) & 0xF) as u8, (version & 0xF) as u8);
+        if shader_model.0 < 6 {
+            return Err(ShaderError::Malformed("DXIL program below shader model 6"));
+        }
         if part.get(8..12) != Some(b"DXIL") {
             return Err(ShaderError::Malformed("missing DXIL magic"));
         }
@@ -118,7 +124,7 @@ impl<'a> DxilProgram<'a> {
             .ok_or(ShaderError::Malformed("bitcode offset too small"))?;
         Ok(DxilProgram {
             kind: ShaderKind::from_raw((version >> 16) as u16),
-            shader_model: (((version >> 4) & 0xF) as u8, (version & 0xF) as u8),
+            shader_model,
             dxil_version,
             bitcode,
             prefix,
@@ -314,5 +320,19 @@ mod tests {
         bytes[12..16].copy_from_slice(&LLVM_BITCODE_MAGIC);
         set_u32(&mut bytes, 16, 4);
         assert_eq!(malformed(&bytes), "bitcode offset too small");
+    }
+
+    #[test]
+    fn rejects_a_shader_model_below_6() {
+        // ps_5_1 and vs_4_0 are DXBC-only models; DXIL never carries them.
+        for sm in [(5, 1), (5, 0), (4, 0), (0, 0)] {
+            let bytes = build_standard(0, sm, 0x100, &fake_bitcode());
+            assert_eq!(malformed(&bytes), "DXIL program below shader model 6");
+        }
+        // 6.0 is the floor, and later majors are kept for whatever comes next.
+        for sm in [(6, 0), (6, 9), (7, 0)] {
+            let bytes = build_standard(0, sm, 0x100, &fake_bitcode());
+            assert_eq!(DxilProgram::parse(&bytes).unwrap().shader_model, sm);
+        }
     }
 }
