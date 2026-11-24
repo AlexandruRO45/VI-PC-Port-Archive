@@ -99,9 +99,9 @@ impl Shadow {
         (self.start + self.len).saturating_sub(address)
     }
 
-    /// Offset of a title address in `buffer` (the mirror's: the address itself).
+    /// Offset of a title address in `buffer` (a mirrored copy's from its first page).
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        if self.pages.is_empty() { address - self.start } else { address }
+        if self.pages.is_empty() { address - self.start } else { address - (self.start & !(crate::mirror::TILE - 1)) }
     }
 
     /// CPU address of byte `off` of the copy; valid up to the end of its 64 KiB title page.
@@ -141,8 +141,11 @@ impl Shadow {
         }
         let first = start / TILE;
         let pages = m.pages(first, (start + len.max(1)).div_ceil(TILE) - first)?;
-        let mut s = Shadow::new(m.buffer.clone(), std::ptr::null_mut(), m.va + start, start, len);
-        s.pages = pages;
+        // views and barriers name a buffer of the copy's own over the same pages; shader
+        // addresses are the mirror's (reads past the copy find neighbours or zeros)
+        let own = m.alias(&pages)?;
+        let mut s = Shadow::new(own, std::ptr::null_mut(), m.va + start, start, len);
+        s.pages = pages.into_iter().map(|(cpu, _, _)| cpu).collect();
         Some(s)
     }
 

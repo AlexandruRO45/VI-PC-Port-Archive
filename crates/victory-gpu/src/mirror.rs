@@ -34,8 +34,8 @@ struct Chunk {
 }
 
 struct Pages {
-    /// title page index → CPU address of its page
-    map: HashMap<u64, usize>,
+    /// title page index → CPU address of its page, its chunk and tile there
+    map: HashMap<u64, (usize, usize, u32)>,
     chunks: Vec<Chunk>,
 }
 
@@ -106,17 +106,17 @@ impl Mirror {
         start.checked_add(len).is_some_and(|end| end <= BYTES)
     }
 
-    /// The CPU addresses of the pages of title pages `first..first + count`, made and mapped
-    /// where they are new (zeros).
-    pub(crate) fn pages(&self, first: u64, count: u64) -> Option<Vec<usize>> {
+    /// The pages of title pages `first..first + count` (CPU address, chunk, tile), made and
+    /// mapped in the mirror where they are new (zeros).
+    pub(crate) fn pages(&self, first: u64, count: u64) -> Option<Vec<(usize, usize, u32)>> {
         let host = crate::host::host()?;
         let mut p = self.pages.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::with_capacity(count as usize);
         // new mappings by chunk: (mirror tiles, heap tiles)
         let mut new: HashMap<usize, (Vec<u32>, Vec<u32>)> = HashMap::new();
         for page in first..first + count {
-            if let Some(&cpu) = p.map.get(&page) {
-                out.push(cpu);
+            if let Some(&found) = p.map.get(&page) {
+                out.push(found);
                 continue;
             }
             if p.chunks.last().is_none_or(|c| c.used == CHUNK_TILES) {
@@ -129,16 +129,44 @@ impl Mirror {
             let tile = c.used;
             c.used += 1;
             let cpu = c.cpu + tile as usize * TILE as usize;
-            p.map.insert(page, cpu);
+            p.map.insert(page, (cpu, k, tile));
             let e = new.entry(k).or_default();
             e.0.push(page as u32);
             e.1.push(tile);
-            out.push(cpu);
+            out.push((cpu, k, tile));
         }
         for (k, (tiles, heap_tiles)) in new {
             host.map_tiles(&self.buffer, &tiles, &p.chunks[k].heap, &heap_tiles);
         }
         Some(out)
+    }
+}
+
+impl Mirror {
+    /// A reserved buffer of its own over `pages` (in order: its tile k is pages[k]), for what
+    /// names a resource (views, barriers, indirect arguments, copies): one resource for all
+    /// of title memory would be in one state for all of it.
+    pub(crate) fn alias(&self, pages: &[(usize, usize, u32)]) -> Option<ID3D12Resource> {
+        let host = crate::host::host()?;
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a reserved buffer.
+        unsafe {
+            host.device
+                .CreateReservedResource(&buffer_desc(pages.len() as u64 * TILE), D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                .ok()?;
+        }
+        let buffer = buffer?;
+        let p = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+        let mut by_chunk: HashMap<usize, (Vec<u32>, Vec<u32>)> = HashMap::new();
+        for (k, &(_, chunk, tile)) in pages.iter().enumerate() {
+            let e = by_chunk.entry(chunk).or_default();
+            e.0.push(k as u32);
+            e.1.push(tile);
+        }
+        for (chunk, (tiles, heap_tiles)) in by_chunk {
+            host.map_tiles(&buffer, &tiles, &p.chunks[chunk].heap, &heap_tiles);
+        }
+        Some(buffer)
     }
 }
 
