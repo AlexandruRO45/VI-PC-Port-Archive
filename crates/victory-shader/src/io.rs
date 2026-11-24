@@ -253,11 +253,13 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         (StageIo::Ms(ms), HwStage::Ms) => {
             let group = p.inputs.iter().find(|i| i.0 == Reg::V(5)).map(|i| i.1);
             // The group input holds the same value in every lane only as the
-            // first lane reads it; a VGPR write reads its old value too.
+            // first lane reads it. A write to v5 reads its old value too
+            // (lanes outside EXEC keep it), which is no per-lane use; v5 as
+            // one of that write's own sources (`v_add_nc_u32 v5, v5, v1`) is.
             let per_lane = p.blocks.iter().flat_map(|b| &b.insts).find(|i| {
                 group.is_some_and(|g| i.reads.contains(&(Reg::V(5), g)))
                     && i.name() != "v_readfirstlane_b32"
-                    && i.write(Reg::V(5)).is_none()
+                    && (i.write(Reg::V(5)).is_none() || names_as_source(i, 5))
             });
             if let Some(i) = per_lane {
                 return Err(unsupported(
@@ -454,6 +456,30 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         }
     }
     Ok(io)
+}
+
+/// Whether one of `inst`'s source operands covers `v<reg>`: the reads it
+/// makes on purpose, not the old value of a VGPR it writes.
+fn names_as_source(inst: &Inst, reg: u8) -> bool {
+    let covers = |o: &Operand| matches!(*o, Operand::Vector { reg: r, dwords } if r <= reg && reg - r < dwords);
+    let name = inst.name();
+    // Stores and atomics read their data; a load writes it.
+    let stored = name.contains("_store") || name.contains("_atomic");
+    match &inst.fields {
+        Fields::Valu(v) => v.src.iter().any(covers),
+        // `v_interp_p2*` adds to its destination (the first half's result).
+        Fields::Vintrp { dst, src, .. } => {
+            covers(src) || (name.starts_with("v_interp_p2") && covers(dst))
+        }
+        Fields::Ds { addr, data, .. } => addr.iter().chain(data).any(covers),
+        Fields::Buffer { data, addr, .. } => {
+            covers(addr) || (stored && data.as_ref().is_some_and(covers))
+        }
+        Fields::Image { data, addr, .. } => addr.iter().any(covers) || (stored && covers(data)),
+        Fields::Flat { addr, data, .. } => addr.iter().chain(data).any(covers),
+        Fields::Exp { src, .. } => src.iter().flatten().any(covers),
+        Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. } => false,
+    }
 }
 
 /// The pixel input VGPRs that `addr` enables, with their meaning.
@@ -789,6 +815,56 @@ mod tests {
         assert_eq!(io.exports[0].target, Target::Primitive);
         // The group input is uniform only as the first lane reads it.
         assert!(mesh(&[0x7E02_0305, S_ENDPGM]).is_err()); // v_mov_b32 v1, v5
+    }
+
+    fn mesh_io(words: &[u32]) -> Result<Io, ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 256).unwrap();
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 128,
+                max_vertices: 128,
+                max_primitives: 128,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code,
+        };
+        raise(&p, &native)
+    }
+
+    /// A write to v5 reads the group input as its old value, which is not
+    /// a per-lane use; v5 among that write's sources is.
+    #[test]
+    fn the_mesh_group_read_per_lane_is_refused_where_it_happens() {
+        let per_lane = |offset| {
+            Err(ShaderError::Unsupported {
+                offset,
+                what: "the mesh group input read per lane",
+            })
+        };
+        // v_readfirstlane_b32 s2, v5; v_mov_b32 v1, v5: the second, at 4.
+        assert_eq!(mesh_io(&[0x7E04_0505, 0x7E02_0305, S_ENDPGM]), per_lane(4));
+        // v_add_nc_u32 v5, v5, v1: each lane adds to its own group value.
+        assert_eq!(mesh_io(&[0x4A0A_0305, S_ENDPGM]), per_lane(0));
+        // v_add_nc_u32 v5, v1, v5: v5 as the second source too.
+        assert_eq!(mesh_io(&[0x4A0A_0B01, S_ENDPGM]), per_lane(0));
+        // exp pos0, v5, off, off, off done: an export reads every lane.
+        assert_eq!(mesh_io(&[0xF800_08C1, 0x0000_0005, S_ENDPGM]), per_lane(0));
+        // v_mov_b32 v5, v0 overwrites it; the next read is of v0's value.
+        let io = mesh_io(&[0x7E0A_0300, 0x7E02_0305, S_ENDPGM]).unwrap();
+        assert!(io.inputs.iter().any(|i| i.1 == Input::MeshGroup));
+        // Read by the first lane twice, it is uniform both times.
+        assert!(mesh_io(&[0x7E04_0505, 0x7E06_0505, S_ENDPGM]).is_ok());
+        // A program that never reads it names no group input at all.
+        assert_eq!(mesh_io(&[S_ENDPGM]).unwrap().inputs, vec![]);
     }
 
     fn vertex(inputs: Vec<crate::native::VsInput>) -> NativeProgram {
