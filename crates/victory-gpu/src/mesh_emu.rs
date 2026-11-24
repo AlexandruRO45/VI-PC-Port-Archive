@@ -4,13 +4,13 @@
 //! An emulated mesh pipeline runs in two host steps on a shared VRAM buffer:
 //! 1. The translated mesh compute shader (`cs_6_6`) writes packed primitive
 //!    indices, vertex attributes, and per-primitive attributes per group into
-//!    `output` (`u0, space 2`).
+//!    `output` (`u0, space 3`).
 //! 2. The generated unpack vertex shader (`vs_6_6`) reads `output` (`t0, space
-//!    2`) by `SV_VertexID` and feeds the title's original pixel shader.
+//!    3`) by `SV_VertexID` and feeds the title's original pixel shader.
 //!
 //! Indirect mesh dispatches (`ExecuteIndirect`) additionally run a tiny
 //! compute preparation pass (`PREP_SOURCE`) to sum group counts across
-//! indirect records, build `slot_map` (`t0, space 2`) when `max_records > 1`,
+//! indirect records, build `slot_map` (`t0, space 3`) when `max_records > 1`,
 //! and emit both host `Dispatch` and `DrawInstanced` indirect arguments into
 //! `indirect_args`.
 
@@ -116,19 +116,22 @@ fn configured_output_bytes() -> Option<u64> {
 
 fn allocate_output(host: &Host) -> Option<(ID3D12Resource, u64)> {
     if let Some(bytes) = configured_output_bytes()
-        && let Some(buf) = host.default_buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+        && let Some(buf) = host.unordered_buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
     {
         return Some((buf, bytes));
     }
     for &bytes in OUTPUT_FALLBACK_SIZES {
-        if let Some(buf) = host.default_buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+        if let Some(buf) = host.unordered_buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+        {
             return Some((buf, bytes));
         }
     }
     None
 }
 
-fn compile_prep(device: &ID3D12Device) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+fn compile_prep(
+    device: &ID3D12Device,
+) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: static HLSL source and entry strings live through the call; out pointers are ours.
@@ -181,9 +184,12 @@ fn compile_prep(device: &ID3D12Device) -> windows::core::Result<(ID3D12RootSigna
 fn make() -> Option<Buffers> {
     let host = host()?;
     let (output, output_bytes) = allocate_output(host)?;
-    let slot_map = host.default_buffer(SLOT_MAP_BYTES, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)?;
-    let indirect_args =
-        host.default_buffer(INDIRECT_ARGS_BYTES, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)?;
+    let slot_map =
+        host.unordered_buffer(SLOT_MAP_BYTES, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)?;
+    let indirect_args = host.unordered_buffer(
+        INDIRECT_ARGS_BYTES,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    )?;
     let (dummy_srv, dummy_ptr) = host.upload_buffer(256)?;
     // SAFETY: `dummy_ptr` points to 256 zeroed bytes of a live upload buffer.
     unsafe { std::ptr::write_bytes(dummy_ptr, 0, 256) };
@@ -344,8 +350,10 @@ mod tests {
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 ),
             ]);
-            list.list.CopyBufferRegion(&readback_args, 0, &b.indirect_args, 0, 32);
-            list.list.CopyBufferRegion(&readback_map, 0, &b.slot_map, 0, 32);
+            list.list
+                .CopyBufferRegion(&readback_args, 0, &b.indirect_args, 0, 32);
+            list.list
+                .CopyBufferRegion(&readback_map, 0, &b.slot_map, 0, 32);
             list.list.ResourceBarrier(&[
                 transition(
                     &b.indirect_args,
@@ -382,7 +390,8 @@ mod tests {
                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            list.list.CopyBufferRegion(&readback_args, 0, &b.indirect_args, 0, 32);
+            list.list
+                .CopyBufferRegion(&readback_args, 0, &b.indirect_args, 0, 32);
             list.list.ResourceBarrier(&[transition(
                 &b.indirect_args,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -392,7 +401,8 @@ mod tests {
         list.close();
         host.execute(&[&list]);
         // SAFETY: GPU execution finished.
-        let out_words = unsafe { std::slice::from_raw_parts(rb_args_ptr.cast::<u32>(), 8).to_vec() };
+        let out_words =
+            unsafe { std::slice::from_raw_parts(rb_args_ptr.cast::<u32>(), 8).to_vec() };
         assert_eq!(&out_words[0..3], &[2, 1, 1]);
         assert_eq!(&out_words[4..8], &[2 * 8 * 3, 1, 0, 0]);
     }

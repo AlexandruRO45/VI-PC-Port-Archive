@@ -5,7 +5,7 @@
 //! (`cs_6_6`) with the console's `[numthreads(threads, 1, 1)]` and LDS, writing
 //! packed primitive indices, per-vertex attributes (`OSG1`), and per-primitive
 //! attributes (`PSG1`) into a fixed-stride per-group slice of a raw UAV buffer
-//! at `u0, space 2` ([`MESH_EMU_SPACE`]):
+//! at `u0, space 3` ([`MESH_EMU_SPACE`]):
 //!
 //! ```text
 //! group g (byte offset = g * group_bytes):
@@ -15,7 +15,7 @@
 //! ```
 //!
 //! [`unpack_vertex_shader`] builds the matching `vs_6_6` that reads that raw
-//! buffer at `t0, space 2` by `SV_VertexID`, culls bit-31 primitives via quiet
+//! buffer at `t0, space 3` by `SV_VertexID`, culls bit-31 primitives via quiet
 //! `NaN` on `SV_Position`, and emits every vertex and per-primitive attribute in
 //! the exact signature layout the title's pixel shader (`ps_6_6`) expects.
 
@@ -27,9 +27,9 @@ use super::shader::Shader;
 use crate::ShaderError;
 use crate::dxbc::{Container, FourCC, u32_at};
 
-/// Sentinel `base_group` value in `b0, space 2` telling an emulated mesh
+/// Sentinel `base_group` value in `b0, space 3` telling an emulated mesh
 /// compute shader that reads `SV_GroupID` to look up its per-record group ID
-/// in the `slot_map` raw SRV (`t0, space 2`).
+/// in the `slot_map` raw SRV (`t0, space 3`).
 pub const INDIRECT_SLOT_MAP_FLAG: u32 = u32::MAX;
 
 /// Whether a console mesh shader (`HwStage::Ms`) translates to native `ms_6_6`
@@ -114,7 +114,7 @@ struct UnpackOutput {
 }
 
 /// Generates a `vs_6_6` DXIL container that unpacks `emu`'s raw buffer (`t0,
-/// space 2`) by `SV_VertexID` into the input signature expected by `ps_dxil`
+/// space 3`) by `SV_VertexID` into the input signature expected by `ps_dxil`
 /// (or rasterizer system values only for depth-only pipelines).
 pub fn unpack_vertex_shader(emu: &MeshEmu, ps_dxil: Option<&[u8]>) -> Result<Vec<u8>, ShaderError> {
     if emu.max_vertices == 0 || emu.max_primitives == 0 {
@@ -781,10 +781,7 @@ mod tests {
     }
 
     const fn vop2(op: u16, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
-        (op as u32 & 0x3F) << 25
-            | (vdst as u32) << 17
-            | (vsrc1 as u32) << 9
-            | (src0 as u32 & 0x1FF)
+        (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
     }
 
     const fn vopc(op: u16, src0: u16, vsrc1: u8) -> u32 {
@@ -862,10 +859,8 @@ mod tests {
         };
         let osg_bytes = super::super::container::signature(osg1, false);
         let psg_bytes = super::super::container::signature(psg1, false);
-        let container_bytes = crate::dxbc::build(&[
-            (FourCC::OSG1, &osg_bytes),
-            (FourCC::PSG1, &psg_bytes),
-        ]);
+        let container_bytes =
+            crate::dxbc::build(&[(FourCC::OSG1, &osg_bytes), (FourCC::PSG1, &psg_bytes)]);
         let c = Container::parse(&container_bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
         let st = structure::structure(&p).unwrap();
@@ -913,10 +908,8 @@ mod tests {
             },
             code,
         };
-        let isg1 = super::super::container::signature(
-            &[sig_el(semantic_name, 0, 9, Some(0), 0xF)],
-            true,
-        );
+        let isg1 =
+            super::super::container::signature(&[sig_el(semantic_name, 0, 9, Some(0), 0xF)], true);
         let osg1 =
             super::super::container::signature(&[sig_el("SV_Target", 16, 9, Some(0), 0xF)], false);
         let container_bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
@@ -946,7 +939,10 @@ mod tests {
             ran += 1;
             f(label, &host);
         }
-        assert!(ran > 0 || std::env::var("CI").is_err(), "no SM 6.6 host available");
+        assert!(
+            ran > 0 || std::env::var("CI").is_err(),
+            "no SM 6.6 host available"
+        );
     }
 
     #[test]
