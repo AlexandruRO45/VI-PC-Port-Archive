@@ -128,8 +128,8 @@ impl Config {
         };
         let (source, parsed) = match file {
             Some((path, text)) => {
-                let parsed: FileConfig =
-                    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+                let parsed =
+                    parse_file(&text).with_context(|| format!("parsing {}", path.display()))?;
                 let dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
                 let paths = parsed
                     .anchored_at(&dir, home.as_deref())
@@ -217,6 +217,39 @@ impl Config {
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
     }
+}
+
+/// The keys of the `[paths]` table.
+const PATH_KEYS: [&str; 4] = ["game_dir", "cache_dir", "data_dir", "test_titles"];
+
+/// Parses a config file. A `[paths]` key written at the top level, above
+/// the `[paths]` header or in a file without one (`game_dir = '...'` on its
+/// own is an easy first file to write), is otherwise reported only as
+/// "unknown field `game_dir`, expected `paths`", which does not say what
+/// to change; the error names the key and the table it belongs in.
+fn parse_file(text: &str) -> Result<FileConfig> {
+    let err = match toml::from_str(text) {
+        Ok(parsed) => return Ok(parsed),
+        Err(e) => e,
+    };
+    let misplaced: Vec<&str> = text
+        .parse::<toml::Table>()
+        .map(|top| {
+            PATH_KEYS
+                .into_iter()
+                .filter(|k| top.contains_key(*k))
+                .collect()
+        })
+        .unwrap_or_default();
+    if misplaced.is_empty() {
+        return Err(err.into());
+    }
+    anyhow::bail!(
+        "{} must be under the [paths] table: put a `[paths]` line above {} \
+         (see victory.example.toml)",
+        misplaced.join(", "),
+        if misplaced.len() == 1 { "it" } else { "them" }
+    );
 }
 
 /// `VICTORY_CONFIG`, empty counting as unset, with a leading `~` as the
@@ -784,8 +817,43 @@ mod tests {
     #[test]
     fn example_config_parses() {
         let text = include_str!("../../../victory.example.toml");
-        let parsed: FileConfig = toml::from_str(text).unwrap();
+        let parsed = parse_file(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
+    }
+
+    #[test]
+    fn top_level_path_keys_say_where_they_belong() {
+        let err = format!(
+            "{:#}",
+            parse_file("game_dir = '/games/gta'\n").expect_err("refused")
+        );
+        assert!(
+            err.contains("game_dir must be under the [paths] table"),
+            "{err}"
+        );
+
+        // Above the header, two keys, and a [paths] table that is fine.
+        let text = "cache_dir = 'c'\ntest_titles = []\n[paths]\ndata_dir = 'd'\n";
+        let err = format!("{:#}", parse_file(text).expect_err("refused"));
+        assert!(
+            err.contains("cache_dir, test_titles must be under"),
+            "{err}"
+        );
+        assert!(err.contains("above them"), "{err}");
+
+        // Other mistakes keep the parser's own message.
+        let err = format!("{:#}", parse_file("[path]\n").expect_err("refused"));
+        assert!(err.contains("path"), "{err}");
+        assert!(!err.contains("must be under"), "{err}");
+        let err = format!(
+            "{:#}",
+            parse_file("[paths]\ngamedir = 'x'\n").expect_err("refused")
+        );
+        assert!(err.contains("gamedir"), "{err}");
+
+        // A correct file still parses.
+        let parsed = parse_file("[paths]\ngame_dir = '/games/gta'\n").expect("parses");
+        assert_eq!(parsed.paths.game_dir, Some(PathBuf::from("/games/gta")));
     }
 
     #[test]
