@@ -555,4 +555,77 @@ mod tests {
         assert_eq!(lib.imports, [name("a.dll", "", LibImportKind::Code)]);
         assert_eq!(lib.other_members, 0);
     }
+
+    /// DLL names are kept as written: two spellings of one DLL are two
+    /// entries, ordered by their bytes, so upper case sorts first.
+    #[test]
+    fn dll_names_are_compared_as_written() {
+        let lib = ImportLibrary::parse(&archive(&[
+            short_import("kernelx.dll", "Sleep", 0, CODE, BY_NAME),
+            short_import("KERNELX.DLL", "Sleep", 0, CODE, BY_NAME),
+            short_import("KernelX.dll", "Sleep", 0, CODE, BY_NAME),
+        ]))
+        .unwrap();
+        assert_eq!(
+            lib.imports,
+            [
+                name("KERNELX.DLL", "Sleep", LibImportKind::Code),
+                name("KernelX.dll", "Sleep", LibImportKind::Code),
+                name("kernelx.dll", "Sleep", LibImportKind::Code),
+            ]
+        );
+        assert_eq!(lib.other_members, 0);
+    }
+
+    /// Ordinals sort by value, not as text, and the whole 16-bit range is
+    /// read, from 0 to 0xFFFF.
+    #[test]
+    fn ordinals_sort_by_value_over_the_whole_range() {
+        let lib = ImportLibrary::parse(&archive(&[
+            short_import("a.dll", "x", 0xFFFF, CODE, BY_ORDINAL),
+            short_import("a.dll", "x", 10, CODE, BY_ORDINAL),
+            short_import("a.dll", "x", 9, CODE, BY_ORDINAL),
+            short_import("a.dll", "x", 0, CODE, BY_ORDINAL),
+        ]))
+        .unwrap();
+        let ordinals: Vec<_> = lib
+            .imports
+            .iter()
+            .map(|import| match import.export {
+                ImportSymbol::Ordinal(o) => o,
+                ImportSymbol::Name { .. } => panic!("{import:?} is not an ordinal"),
+            })
+            .collect();
+        assert_eq!(ordinals, [0, 9, 10, 0xFFFF]);
+    }
+
+    /// Without `EXPORTAS`, only the symbol and the DLL name are read: bytes
+    /// that `SizeOfData` counts after them do not change the import.
+    #[test]
+    fn bytes_after_the_dll_name_are_not_read_without_export_as() {
+        let mut member = short_import("a.dll", "Plain", 0, CODE, BY_NAME);
+        member.extend_from_slice(b"Other\0junk");
+        let data_len = (member.len() - 20) as u32;
+        member[12..16].copy_from_slice(&data_len.to_le_bytes());
+        let lib = ImportLibrary::parse(&archive(&[member])).unwrap();
+        assert_eq!(lib.imports, [name("a.dll", "Plain", LibImportKind::Code)]);
+        assert_eq!(lib.other_members, 0);
+    }
+
+    /// The hint of a by-name import is not kept: a library names exports,
+    /// and a hint into one build's export table is no part of that name.
+    #[test]
+    fn the_hint_of_a_by_name_import_is_not_kept() {
+        let lib = ImportLibrary::parse(&archive(&[short_import(
+            "a.dll", "Hinted", 0x1234, CODE, BY_NAME,
+        )]))
+        .unwrap();
+        assert_eq!(
+            lib.imports[0].export,
+            ImportSymbol::Name {
+                hint: 0,
+                name: "Hinted".into()
+            }
+        );
+    }
 }
