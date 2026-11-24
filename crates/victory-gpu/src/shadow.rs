@@ -406,18 +406,26 @@ struct Entry {
 
 struct Buffers {
     by_start: BTreeMap<(u64, usize), Entry>,
-    /// Longest registered buffer length; bounds reverse scans in [`find`].
-    max_len: u64,
+    /// The same buffers by length class: class `c` holds lengths in
+    /// `[2^c, 2^(c+1))`, mapping `(start, resource)` to `end`. A class-`c`
+    /// buffer can only cover `[address, end)` if it starts at or above
+    /// `end - (2^(c+1) - 1)`, so [`find`] scans each class over that window only.
+    by_class: [BTreeMap<(u64, usize), u64>; 64],
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
 static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
     by_start: BTreeMap::new(),
-    max_len: 0,
+    by_class: [const { BTreeMap::new() }; 64],
 });
 
 fn buffers() -> std::sync::MutexGuard<'static, Buffers> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The power-of-two length class of a nonzero length.
+fn class(len: u64) -> usize {
+    63 - len.leading_zeros() as usize
 }
 
 /// A title buffer exists at `start` (`len` bytes).
@@ -426,18 +434,15 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
         return;
     };
     let mut state = buffers();
-    let replaced = state
+    if let Some(old) = state
         .by_start
-        .insert((start, resource), Entry { end, shadow: None });
-    if len >= state.max_len {
-        state.max_len = len;
-    } else if replaced.is_some_and(|old| old.end - start == state.max_len) {
-        state.max_len = state
-            .by_start
-            .iter()
-            .map(|(&(s, _), e)| e.end - s)
-            .max()
-            .unwrap_or(0);
+        .insert((start, resource), Entry { end, shadow: None })
+        && old.end > start
+    {
+        state.by_class[class(old.end - start)].remove(&(start, resource));
+    }
+    if len > 0 {
+        state.by_class[class(len)].insert((start, resource), end);
     }
 }
 
@@ -445,14 +450,9 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 pub(crate) fn unregister(resource: usize, start: u64) {
     let mut state = buffers();
     if let Some(removed) = state.by_start.remove(&(start, resource))
-        && removed.end - start == state.max_len
+        && removed.end > start
     {
-        state.max_len = state
-            .by_start
-            .iter()
-            .map(|(&(s, _), e)| e.end - s)
-            .max()
-            .unwrap_or(0);
+        state.by_class[class(removed.end - start)].remove(&(start, resource));
     }
 }
 
@@ -462,30 +462,47 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let required = len.max(1);
     let end = address.checked_add(required)?;
     let mut state = buffers();
-    // No registered buffer can cover `[address, end)` if `required > max_len`,
-    // or if its start is below `end - max_len`.
+    // The innermost buffer holding the range: the largest start at or below
+    // `address` whose end reaches `end`; of equal starts, the smallest end;
+    // of equal ends, the largest resource (the first met in descending order).
     let mut key: Option<((u64, usize), u64)> = None;
-    if required <= state.max_len {
-        let min_start = end.saturating_sub(state.max_len);
-        // The innermost buffer holding the range: the largest start at or below
-        // `address` whose end reaches `end`; of equal starts, the smallest end.
-        // Same-start entries are contiguous, so the first covering block found
-        // in start-descending order is the innermost.
-        for (&k, e) in state
-            .by_start
-            .range((min_start, 0)..=(address, usize::MAX))
-            .rev()
-        {
-            if let Some((best, bend)) = &key {
-                if best.0 != k.0 {
+    for c in class(required)..64 {
+        let map = &state.by_class[c];
+        if map.is_empty() {
+            continue;
+        }
+        let reach = if c == 63 {
+            u64::MAX
+        } else {
+            (1u64 << (c + 1)) - 1
+        };
+        let min_start = end.saturating_sub(reach);
+        let mut here: Option<((u64, usize), u64)> = None;
+        for (&k, &e) in map.range((min_start, 0)..=(address, usize::MAX)).rev() {
+            if key.is_some_and(|(best, _)| k.0 < best.0) {
+                break;
+            }
+            if let Some((first, fend)) = here {
+                if first.0 != k.0 {
                     break;
                 }
-                if e.end >= end && e.end < *bend {
-                    key = Some((k, e.end));
+                if e >= end && e < fend {
+                    here = Some((k, e));
                 }
-            } else if e.end >= end {
-                key = Some((k, e.end));
+            } else if e >= end {
+                here = Some((k, e));
             }
+        }
+        if let Some((k, e)) = here {
+            key = match key {
+                Some((best, bend))
+                    if k.0 < best.0
+                        || (k.0 == best.0 && (e > bend || (e == bend && k.1 < best.1))) =>
+                {
+                    Some((best, bend))
+                }
+                _ => Some((k, e)),
+            };
         }
     }
     let Some((key, _)) = key else {
@@ -601,22 +618,20 @@ mod tests {
     }
 
     #[test]
-    fn max_len_tracks_register_replace_and_unregister() {
-        // Use a distinctive large length above any concurrent test's buffers.
+    fn class_index_follows_register_replace_and_unregister() {
         let base = 0x7000_0000_0000u64;
-        let big = 0x10_0000_0000u64;
-        let mid = 0x08_0000_0000u64;
-        register(9001, base, mid);
-        assert!(buffers().max_len >= mid);
-        register(9002, base + 0x1000, big);
-        assert_eq!(buffers().max_len, big);
-        // Shrinking the current longest entry recomputes max_len.
-        register(9002, base + 0x1000, 64);
-        assert_eq!(buffers().max_len, mid);
-        // Unregistering the remaining longest entry recomputes max_len again.
+        register(9001, base, 0x10_0000);
+        assert!(buffers().by_class[20].contains_key(&(base, 9001)));
+        // Re-registering with another length moves it to that class.
+        register(9001, base, 64);
+        assert!(!buffers().by_class[20].contains_key(&(base, 9001)));
+        assert!(buffers().by_class[6].contains_key(&(base, 9001)));
+        // Zero-length registration removes it from any length class.
+        register(9001, base, 0);
+        assert!(!buffers().by_class[6].contains_key(&(base, 9001)));
+        register(9001, base, 64);
         unregister(9001, base);
-        assert!(buffers().max_len < mid);
-        unregister(9002, base + 0x1000);
+        assert!(!buffers().by_class[6].contains_key(&(base, 9001)));
     }
 }
 
