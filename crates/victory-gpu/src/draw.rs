@@ -223,9 +223,16 @@ pub(crate) fn validate_root_buffer(
     }
     let alignment = match kind {
         RootBuffer::Cbv => D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
-        // Keep the conservative raw-view floor that guarded the first
-        // reported failing dispatch.
-        RootBuffer::Srv | RootBuffer::Uav => D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT,
+        // Local build: root SRV/UAV addresses of raw and structured buffers need
+        // 4-byte alignment (the 16-byte floor dropped Grand Theft Auto VI's clears
+        // at title addresses ending in 4 or 8). `VICTORY_ROOT_ALIGN16=1` restores it.
+        RootBuffer::Srv | RootBuffer::Uav => {
+            if std::env::var_os("VICTORY_ROOT_ALIGN16").is_some() {
+                D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT
+            } else {
+                4
+            }
+        }
     };
     if !gpu.is_multiple_of(u64::from(alignment)) {
         return Err("the root GPU address is misaligned");
@@ -247,7 +254,7 @@ mod root_view_tests {
         };
         let base = 0x1000;
         assert!(validate_root_buffer(RootBuffer::Uav, base, base, desc, 4).is_ok());
-        for gpu in [0, base - 16, base + 4, base + 256] {
+        for gpu in [0, base - 16, base + 2, base + 256] {
             assert!(validate_root_buffer(RootBuffer::Uav, gpu, base, desc, 4).is_err());
         }
         assert!(validate_root_buffer(RootBuffer::Uav, base + 240, base, desc, 17).is_err());
