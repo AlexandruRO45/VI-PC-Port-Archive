@@ -4040,6 +4040,16 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
                 float(self, r)
             }
+            "v_cvt_f32_f64" => {
+                let (lo, hi) = self.src64_pair(inst, 0)?;
+                self.s.flags |= flags::DOUBLE;
+                let f64t = self.s.m.double();
+                let d = self
+                    .s
+                    .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]);
+                let r = self.s.m.cast(c, Cast::FpTrunc, d, self.s.t.f32);
+                float(self, r)
+            }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
                 // Each source is f32, or with op_sel_hi the low (op_sel: high)
                 // f16 half; neg_hi is the absolute value here.
@@ -4256,6 +4266,38 @@ impl<'a> Lower<'a> {
             _ => {
                 let r = self.integer(inst, name)?;
                 int(self, r)
+            }
+        }
+    }
+
+    /// The low and high 32-bit halves of a 64-bit source (without `INT64`).
+    fn src64_pair(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 || v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok((lo, hi))
+        };
+        match op {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1)),
+            Operand::Scalar { code, .. } if code != NULL => {
+                pair(self, Reg::S(code), Reg::S(code + 1))
+            }
+            Operand::Const(k @ 128..=208) => {
+                let x = crate::resource::inline(k).ok_or("a special operand")?;
+                let lo = self.s.m.i32(x);
+                let hi = self.s.m.i32(((x as i32) >> 31) as u32);
+                Ok((lo, hi))
+            }
+            _ => {
+                let x = self.operand(inst, &op)?;
+                Ok((x, self.s.m.i32(0)))
             }
         }
     }
@@ -5784,7 +5826,7 @@ impl<'a> Lower<'a> {
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
@@ -5971,9 +6013,15 @@ impl<'a> Lower<'a> {
                         let y = addr_val(self, first + spatial + k)?;
                         g[3 + k] = to_float(self, y);
                     }
+                    let clamp = if name == "image_sample_d_cl" {
+                        let x = addr_val(self, first + grads + coords)?;
+                        to_float(self, x)
+                    } else {
+                        fu
+                    };
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
@@ -7417,5 +7465,14 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn v_cvt_f32_f64_lowers_with_double_flag() {
+        let words = [
+            0x7E00_1F00, // v_cvt_f32_f64 v0, v[0:1]
+            S_ENDPGM,
+        ];
+        lowers(&words, 0).expect("v_cvt_f32_f64 should lower");
     }
 }
