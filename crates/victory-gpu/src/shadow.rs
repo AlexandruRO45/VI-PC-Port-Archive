@@ -179,6 +179,17 @@ impl Shadow {
     }
 
     /// Bytes from a title address to the buffer's end.
+    /// The words at `[address, address + len)` as the host copy holds them:
+    /// the title's memory when the range was bound, for diagnostics that need
+    /// the record without reading it back from the GPU.
+    pub(crate) fn words(&self, address: u64, len: u64) -> Vec<u32> {
+        let (from, to) = self.inside(address as usize, len as usize);
+        let words = (to - from) / 4;
+        // SAFETY: the copy stays mapped for the shadow's life and `from` is
+        // inside it.
+        unsafe { std::slice::from_raw_parts(self.data.add(from).cast::<u32>(), words) }.to_vec()
+    }
+
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)
     }

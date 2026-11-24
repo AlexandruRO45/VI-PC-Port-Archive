@@ -237,9 +237,21 @@ pub(crate) fn bound(
     }
     let l = &list.list;
     let constants = [kind, stride, records, 0];
+    let before = shadow.state();
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
+        // The clamp reads and writes the records through a UAV, so the buffer
+        // is moved there from wherever the title left it: a copy may have put
+        // it in COPY_DEST, and a UAV read of a buffer in COPY_DEST is as
+        // invalid as writing one.
+        if before != D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32 {
+            l.ResourceBarrier(&[transition(
+                buffer,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
         // Earlier shader writes (the title's argument passes) first.
         l.ResourceBarrier(&[uav_barrier()]);
         l.SetComputeRootSignature(&c.root);
@@ -257,6 +269,7 @@ pub(crate) fn bound(
             ),
         ]);
     }
+    shadow.set_state(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT.0 as u32);
     true
 }
 

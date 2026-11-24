@@ -652,6 +652,15 @@ fn timing() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
 
+/// One submission per list, each asked for the removal reason as it lands
+/// (`VICTORY_D3D12_VALIDATE=1`): the first submission that comes back
+/// removed is the one that named the invalid call, and the operations it
+/// recorded are a list of tens rather than the thousands a frame holds.
+fn validate() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_D3D12_VALIDATE").is_some())
+}
+
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
@@ -866,7 +875,7 @@ impl Host {
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() || validate() {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -876,7 +885,15 @@ impl Host {
             vec![&lists[..]]
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if validate() {
+            firsts
+                .iter()
+                .zip(firsts.iter().skip(1).chain([&lists.len()]))
+                .map(|(&a, &b)| &lists[a..b])
+                .collect()
+        } else {
+            vec![&lists[..]]
+        };
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -894,6 +911,25 @@ impl Host {
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
+            }
+            // Which submission removed it, not just that one did: this
+            // list's operations are the suspect set, in the order they ran.
+            if validate() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                tracing::error!(
+                    submission = *submitted,
+                    list = i,
+                    of = runs.len(),
+                    "the submission that removed the device"
+                );
+                #[cfg(feature = "diagnostics")]
+                {
+                    let notes = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner());
+                    tracing::error!(ops = notes.len(), "guilty submission ops");
+                    for (n, _) in notes.iter().rev().take(16).rev() {
+                        tracing::error!(op = %n, "guilty submission op");
+                    }
+                }
+                break;
             }
             #[cfg(feature = "diagnostics")]
             if timing() && started.elapsed() > std::time::Duration::from_millis(NOTABLE_MS) {
