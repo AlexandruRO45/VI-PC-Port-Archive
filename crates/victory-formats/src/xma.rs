@@ -1156,6 +1156,113 @@ mod tests {
         assert_eq!(c.next, None);
     }
 
+    /// Reads bit `at` of `data`, MSB first.
+    fn get_bit(data: &[u8], at: usize) -> u8 {
+        (data[at / 8] >> (7 - at % 8)) & 1
+    }
+
+    /// A packet's `skip` field: a frame that runs off the end of a packet
+    /// continues after the header of this stream's next packet, past the
+    /// other streams' packets, and the frame after a packet's last frame is
+    /// looked for there too.
+    #[test]
+    fn frames_skip_other_streams_packets() {
+        // Packets 0, 2 and 4 are this stream's; 1 and 3 belong to another
+        // stream and hold a pattern that must never show up in a frame.
+        let mut data = vec![0u8; 5 * PACKET_BYTES];
+        for p in [1, 3] {
+            data[p * PACKET_BYTES..][..PACKET_BYTES].fill(0xa5);
+        }
+        let header = |frames: u32, first: u32, skip: u32| (frames << 26) | (first << 11) | skip;
+        put_bits(&mut data, 0, 32, header(2, 0, 1));
+        put_bits(&mut data, 2 * PACKET_BITS, 32, header(1, 48, 1));
+        put_bits(&mut data, 4 * PACKET_BITS, 32, header(1, 7, 0));
+        // A (100 bits), then B to 48 bits into packet 2's payload.
+        let a_start = HEADER_BITS;
+        put_bits(&mut data, a_start, LENGTH_BITS, 100);
+        let b_start = a_start + 100;
+        let b_bits = PACKET_BITS - b_start + 48;
+        put_bits(&mut data, b_start, LENGTH_BITS, b_bits as u32);
+        // B's tail: a pattern in packet 2's first 48 payload bits.
+        let tail = 2 * PACKET_BITS + HEADER_BITS;
+        put_bits(&mut data, tail, 32, 0xdead_beef);
+        put_bits(&mut data, tail + 32, 16, 0x1234);
+        // C, packet 2's only frame, then padding; D starts packet 4.
+        let c_start = tail + 48;
+        put_bits(&mut data, c_start, LENGTH_BITS, 60);
+        let d_start = 4 * PACKET_BITS + HEADER_BITS + 7;
+        put_bits(&mut data, d_start, LENGTH_BITS, 40);
+
+        let a = read_frame(&data, a_start).unwrap();
+        assert_eq!((a.bits, a.start, a.next), (100, a_start, Some(b_start)));
+        let b = read_frame(&data, b_start).unwrap();
+        assert_eq!((b.bits, b.next), (b_bits, Some(c_start)));
+        // B is its bits in packet 0 followed by packet 2's first 48.
+        for i in 0..b_bits {
+            let at = if b_start + i < PACKET_BITS {
+                b_start + i
+            } else {
+                tail + (b_start + i - PACKET_BITS)
+            };
+            assert_eq!(get_bit(&b.data, i), get_bit(&data, at), "bit {i}");
+        }
+        let c = read_frame(&data, c_start).unwrap();
+        assert_eq!((c.bits, c.next), (60, Some(d_start)));
+        let d = read_frame(&data, d_start).unwrap();
+        // D was packet 4's only frame and packet 4 is the last.
+        assert_eq!((d.bits, d.next), (40, None));
+    }
+
+    /// A frame that ends exactly at its packet's end: the next frame is in
+    /// the stream's next packet, at that packet's first frame, even though
+    /// the header counts more frames.
+    #[test]
+    fn a_frame_ending_at_the_packet_end_continues_in_the_next_packet() {
+        let mut data = vec![0u8; 3 * PACKET_BYTES];
+        let header = |frames: u32, first: u32, skip: u32| (frames << 26) | (first << 11) | skip;
+        put_bits(&mut data, 0, 32, header(5, 0, 1));
+        put_bits(&mut data, 2 * PACKET_BITS, 32, header(1, 3, 0));
+        let (start, len) = (HEADER_BITS, PACKET_BITS - HEADER_BITS);
+        put_bits(&mut data, start, LENGTH_BITS, len as u32);
+        let frame = read_frame(&data, start).unwrap();
+        assert_eq!(frame.bits, PACKET_BITS - HEADER_BITS);
+        assert_eq!(frame.next, Some(2 * PACKET_BITS + HEADER_BITS + 3));
+        // Without the stream's next packet there is no next frame.
+        assert_eq!(read_frame(&data[..PACKET_BYTES], start).unwrap().next, None);
+    }
+
+    /// A frame's 15-bit length must cover the length field itself, and the
+    /// all-ones length is not a frame; a frame cut off by the end of the
+    /// buffer is not one either.
+    #[test]
+    fn frame_lengths_must_cover_the_field_and_fit() {
+        for len in (0..=LENGTH_BITS).chain([0x7fff]) {
+            let mut data = vec![0u8; PACKET_BYTES];
+            put_bits(&mut data, 0, 32, 1 << 26);
+            put_bits(&mut data, HEADER_BITS, LENGTH_BITS, len);
+            assert!(read_frame(&data, HEADER_BITS).is_none(), "length {len}");
+        }
+        let mut data = vec![0u8; PACKET_BYTES];
+        put_bits(&mut data, 0, 32, 1 << 26);
+        put_bits(&mut data, HEADER_BITS, LENGTH_BITS, LENGTH_BITS + 1);
+        let frame = read_frame(&data, HEADER_BITS).unwrap();
+        assert_eq!((frame.bits, frame.data.len()), (16, 2));
+        // One bit more than the single packet holds runs off the buffer.
+        let mut data = vec![0u8; PACKET_BYTES];
+        put_bits(&mut data, 0, 32, 1 << 26);
+        let len = PACKET_BITS - HEADER_BITS + 1;
+        put_bits(&mut data, HEADER_BITS, LENGTH_BITS, len as u32);
+        assert!(read_frame(&data, HEADER_BITS).is_none());
+        // So does a start past the end, or inside a cut-off header.
+        assert!(read_frame(&data, PACKET_BITS + HEADER_BITS).is_none());
+        assert!(read_frame(&data[..2], 0).is_none());
+    }
+
+    #[test]
+    fn errors_name_the_codec() {
+        assert_eq!(Error("bad tile").to_string(), "XMA: bad tile");
+    }
+
     /// Random packets walked frame by frame and decoded, and random bits
     /// decoded directly, give frames or errors, never a panic or a loop
     /// that does not end; every decode still appends a whole frame.
