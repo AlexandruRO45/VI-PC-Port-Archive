@@ -505,10 +505,16 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
             })
             .collect::<Vec<RootParam>>();
         // A parameter's SGPRs must exist: `user_sgpr` and the high half of a
-        // root descriptor are computed from these bytes.
+        // root descriptor are computed from these bytes. Resource tracking
+        // reads that high half from the SGPR after the first whatever the
+        // stated count, so a descriptor spans at least two.
         if layout.iter().any(|p| {
             let first = u32::from(p.user_data) + u32::from(stage.user_sgpr(0));
-            u64::from(first) + u64::from(p.sgprs.max(1)) > u64::from(SGPRS)
+            let span = match p.root {
+                RootType::Descriptor => p.sgprs.max(2),
+                _ => p.sgprs.max(1),
+            };
+            u64::from(first) + u64::from(span) > u64::from(SGPRS)
         }) {
             return Err(Malformed("root parameter outside the SGPRs"));
         }
@@ -923,10 +929,40 @@ mod tests {
         wide[entry + 8..entry + 12].copy_from_slice(&97u32.to_le_bytes());
         assert_eq!(layout(&wide).unwrap()[0].layout[0].sgprs, 97);
         wide[entry + 8..entry + 12].copy_from_slice(&98u32.to_le_bytes());
-        assert!(layout(&wide).is_err());
+        assert_eq!(
+            refused_blob(&xbch(&wide)),
+            "root parameter outside the SGPRs"
+        );
         let mut far = blob.clone();
         far[entry + 16] = 0xFF;
-        assert!(layout(&far).is_err());
+        assert_eq!(
+            refused_blob(&xbch(&far)),
+            "root parameter outside the SGPRs"
+        );
+
+        // A root descriptor's high half is the SGPR after its first, even
+        // when the record states fewer than two: one in s104 fits (s104,
+        // s105), one in s105 would take VCC_LO as its high half.
+        for sgprs in [0u32, 1, 2] {
+            let mut desc = blob.clone();
+            desc[entry..entry + 4].copy_from_slice(&1u32.to_le_bytes());
+            desc[entry + 8..entry + 12].copy_from_slice(&sgprs.to_le_bytes());
+            desc[entry + 16] = 104;
+            assert_eq!(
+                layout(&desc).unwrap()[0].layout[0].root,
+                RootType::Descriptor
+            );
+            desc[entry + 16] = 105;
+            assert_eq!(
+                refused_blob(&xbch(&desc)),
+                "root parameter outside the SGPRs"
+            );
+            // Other kinds of parameter still take one SGPR there.
+            desc[entry..entry + 4].copy_from_slice(&3u32.to_le_bytes());
+            if sgprs <= 1 {
+                assert!(layout(&desc).is_ok());
+            }
+        }
 
         blob[record + RECORD_COUNTS] = 9;
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_err());
