@@ -27,6 +27,41 @@ pub struct Config {
     pub test_titles: Vec<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
+    /// Where each value above came from.
+    pub origins: Origins,
+}
+
+/// Where a configured value came from, so `victory config` and errors can
+/// name the setting to change instead of leaving the user to guess which of
+/// the variable, the file and the default won.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// Not set anywhere: the built-in default (or nothing, for `game_dir`).
+    #[default]
+    Default,
+    /// The `[paths]` table of the config file.
+    File,
+    /// The named environment variable.
+    Env(&'static str),
+}
+
+impl std::fmt::Display for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Origin::Default => f.write_str("default"),
+            Origin::File => f.write_str("config file"),
+            Origin::Env(name) => f.write_str(name),
+        }
+    }
+}
+
+/// The [`Origin`] of each [`Config`] value.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Origins {
+    pub game_dir: Origin,
+    pub cache_dir: Origin,
+    pub data_dir: Origin,
+    pub test_titles: Origin,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -101,32 +136,44 @@ impl Config {
         // A quoted `VICTORY_GAME_DIR="~/games"` reaches us unexpanded.
         let home = home_dir(&env);
         let expand = |p: PathBuf| expand_home(p, home.as_deref());
-        let env_path = |k: &str| {
-            env(k)
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .map(expand)
+        // The variable, else the file, with where the value came from.
+        let pick =
+            |k: &'static str, from_file: Option<PathBuf>| match env(k).filter(|v| !v.is_empty()) {
+                Some(v) => (Some(expand(PathBuf::from(v))), Origin::Env(k)),
+                None if from_file.is_some() => (from_file, Origin::File),
+                None => (None, Origin::Default),
+            };
+        let (test_titles, test_titles_origin) =
+            match env("VICTORY_TEST_TITLES").filter(|v| !v.is_empty()) {
+                Some(v) => (
+                    std::env::split_paths(&v)
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map(expand)
+                        .collect(),
+                    Origin::Env("VICTORY_TEST_TITLES"),
+                ),
+                None if file.test_titles.is_empty() => (file.test_titles, Origin::Default),
+                None => (file.test_titles, Origin::File),
+            };
+        let (game_dir, game_origin) = pick("VICTORY_GAME_DIR", file.game_dir);
+        let (cache_dir, cache_origin) = pick("VICTORY_CACHE_DIR", file.cache_dir);
+        let cache_dir = cache_dir.map_or_else(|| default_dir(Kind::Cache, &env), Ok)?;
+        let (data_dir, data_origin) = pick("VICTORY_DATA_DIR", file.data_dir);
+        let data_dir = data_dir.map_or_else(|| default_dir(Kind::Data, &env), Ok)?;
+        let origins = Origins {
+            game_dir: game_origin,
+            cache_dir: cache_origin,
+            data_dir: data_origin,
+            test_titles: test_titles_origin,
         };
-        let test_titles = match env("VICTORY_TEST_TITLES").filter(|v| !v.is_empty()) {
-            Some(v) => std::env::split_paths(&v)
-                .filter(|p| !p.as_os_str().is_empty())
-                .map(expand)
-                .collect(),
-            None => file.test_titles,
-        };
-        let cache_dir = env_path("VICTORY_CACHE_DIR")
-            .or(file.cache_dir)
-            .map_or_else(|| default_dir(Kind::Cache, &env), Ok)?;
-        let data_dir = env_path("VICTORY_DATA_DIR")
-            .or(file.data_dir)
-            .map_or_else(|| default_dir(Kind::Data, &env), Ok)?;
-        ensure_data_outside_cache(&cache_dir, &data_dir)?;
+        ensure_data_outside_cache(&cache_dir, &data_dir, &origins)?;
         Ok(Config {
-            game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
+            game_dir,
             cache_dir,
             data_dir,
             test_titles,
             source,
+            origins,
         })
     }
 
@@ -195,14 +242,18 @@ fn config_file(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
 /// at any time, so data inside (or equal to) the cache would be lost with it.
 /// Easy to set up by accident, e.g. `VICTORY_CACHE_DIR=~/victory` with
 /// `VICTORY_DATA_DIR=~/victory/data`. Compared as written (no symlinks
-/// followed): the folders need not exist yet.
-fn ensure_data_outside_cache(cache_dir: &Path, data_dir: &Path) -> Result<()> {
+/// followed): the folders need not exist yet. The error says where each
+/// folder came from, so it is clear which setting caused it.
+fn ensure_data_outside_cache(cache_dir: &Path, data_dir: &Path, origins: &Origins) -> Result<()> {
     if data_dir.starts_with(cache_dir) {
         anyhow::bail!(
-            "the data folder {} is inside the cache folder {}, which may be deleted at any \
-             time; set VICTORY_DATA_DIR or [paths].data_dir to a folder outside it",
+            "the data folder {} (from {}) is inside the cache folder {} (from {}), which may \
+             be deleted at any time; set VICTORY_DATA_DIR or [paths].data_dir to a folder \
+             outside it",
             data_dir.display(),
-            cache_dir.display()
+            origins.data_dir,
+            cache_dir.display(),
+            origins.cache_dir
         );
     }
     Ok(())
@@ -561,6 +612,69 @@ mod tests {
             _ => None,
         };
         assert!(Config::resolve(FilePaths::default(), None, cache_in_data).is_ok());
+    }
+
+    #[test]
+    fn origins_name_the_setting_that_won() {
+        let file = FilePaths {
+            game_dir: Some(abs("file-game").into()),
+            cache_dir: Some(abs("file-cache").into()),
+            test_titles: vec![abs("file-title").into()],
+            ..Default::default()
+        };
+        let env = |k: &str| match k {
+            "VICTORY_GAME_DIR" => Some(abs("env-game")),
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        let cfg = Config::resolve(file, None, env).unwrap();
+        assert_eq!(
+            cfg.origins,
+            Origins {
+                game_dir: Origin::Env("VICTORY_GAME_DIR"),
+                cache_dir: Origin::File,
+                data_dir: Origin::Default,
+                test_titles: Origin::File,
+            }
+        );
+
+        // Empty variables are unset, so they are not the origin either.
+        let env = |k: &str| match k {
+            "VICTORY_CACHE_DIR" | "VICTORY_TEST_TITLES" => Some(OsString::new()),
+            "VICTORY_DATA_DIR" => Some(abs("env-data")),
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        let cfg = Config::resolve(FilePaths::default(), None, env).unwrap();
+        assert_eq!(
+            cfg.origins,
+            Origins {
+                game_dir: Origin::Default,
+                cache_dir: Origin::Default,
+                data_dir: Origin::Env("VICTORY_DATA_DIR"),
+                test_titles: Origin::Default,
+            }
+        );
+        assert_eq!(
+            Origin::Env("VICTORY_DATA_DIR").to_string(),
+            "VICTORY_DATA_DIR"
+        );
+        assert_eq!(Origin::File.to_string(), "config file");
+        assert_eq!(Origin::Default.to_string(), "default");
+    }
+
+    #[test]
+    fn data_inside_the_cache_names_both_origins() {
+        // The cache from the file is the home folder, which holds the
+        // default data folder: the error must say which setting is which.
+        let file = FilePaths {
+            cache_dir: Some(abs("home").into()),
+            ..Default::default()
+        };
+        let env = |k: &str| (k == "HOME").then(|| abs("home"));
+        let err = Config::resolve(file, None, env).unwrap_err().to_string();
+        assert!(err.contains("(from default)"), "{err}");
+        assert!(err.contains("(from config file)"), "{err}");
     }
 
     #[test]
