@@ -2512,6 +2512,57 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_config_link_that_loops_is_refused_not_skipped() {
+        // A scratch folder under the system temp folder, never the
+        // repository or the working directory; removed at the end.
+        let dir =
+            std::env::temp_dir().join(format!("victory-config-loop-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let default = dir.join("victory.toml");
+
+        // A link to itself and a two-link cycle: the links are there, so
+        // this is not "no config file", and the loop is not "does not
+        // exist" either (that would send the user hunting for a file).
+        let other = dir.join("other.toml");
+        for (first, second) in [(&default, &default), (&default, &other)] {
+            let _ = std::fs::remove_file(&default);
+            let _ = std::fs::remove_file(&other);
+            std::os::unix::fs::symlink(second, first).unwrap();
+            if first != second {
+                std::os::unix::fs::symlink(first, second).unwrap();
+            }
+            let err = config_file_or(None, &default).unwrap_err();
+            let io = err.downcast_ref::<std::io::Error>().unwrap();
+            assert_ne!(io.kind(), std::io::ErrorKind::NotFound, "{err:#}");
+            let text = err.to_string();
+            assert!(
+                text.starts_with(&format!("checking the config file {}", default.display())),
+                "{text}"
+            );
+            assert!(!text.contains("does not exist"), "{text}");
+
+            // The same through VICTORY_CONFIG, naming the variable.
+            let err = config_file(Some(default.clone())).unwrap_err().to_string();
+            assert!(
+                err.starts_with(&format!("checking VICTORY_CONFIG at {}", default.display())),
+                "{err}"
+            );
+
+            // VICTORY_CONFIG naming a real file is read without touching
+            // the looping default.
+            let real = dir.join("real.toml");
+            std::fs::write(&real, "").unwrap();
+            assert_eq!(
+                config_file_or(Some(real.clone()), &default).unwrap(),
+                Some(real)
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_folder_setting_blocked_by_a_file_is_refused() {
         // A scratch folder under the system temp folder, never the
