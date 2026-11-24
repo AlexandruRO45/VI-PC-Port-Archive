@@ -2394,7 +2394,17 @@ impl State {
                     }
                     _ => (stride, max),
                 };
-                args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
+                // `VICTORY_NO_ARGS_REFRESH=1` leaves the title's argument
+                // buffer alone. The copy here uploads the host copy over the
+                // GPU buffer, so a record a compute pass in this same list
+                // already wrote is replaced by whatever the host copy last
+                // held — and the clamp then reports zero groups for a
+                // dispatch that was handed real ones. Off, the difference
+                // between "the title wrote nothing" and "we overwrote what it
+                // wrote" shows up in the clamp's own counters.
+                if !crate::host::no_args_refresh() {
+                    args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
+                }
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
                 }
