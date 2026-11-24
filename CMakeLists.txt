@@ -712,9 +712,11 @@ add_dependencies(d3d12_xs_shim_check pso_compute_headers)
 target_link_libraries(d3d12_xs_shim_check PRIVATE d3d12_xs_shim dxgi)
 target_include_directories(d3d12_xs_shim_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_features(d3d12_xs_shim_check PRIVATE cxx_std_17)
-foreach(scenario IN ITEMS exports serialize deserialize iids warp_root)
+foreach(scenario IN ITEMS exports serialize deserialize iids warp_root heap_indexing)
     add_test(NAME d3d12_xs_shim_${scenario} COMMAND d3d12_xs_shim_check ${scenario})
 endforeach()
+# 77: the desktop runtime accepts the heap-indexing flags (shader model 6.6), so the retry is unreachable.
+set_tests_properties(d3d12_xs_shim_heap_indexing PROPERTIES SKIP_RETURN_CODE 77)
 # D3D12XboxCreateDevice device-slot inventory and source-built creation fixture (#XCL-08).
 set(d3d12x_pso_header "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_pso_cs.h")
 add_custom_command(OUTPUT "${d3d12x_pso_header}"
