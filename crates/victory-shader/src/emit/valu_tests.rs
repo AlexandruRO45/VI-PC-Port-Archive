@@ -69,6 +69,10 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_cs_outputs(body, &[0])
+}
+
+fn build_valu_cs_outputs(body: &[u32], outputs: &[u8]) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -79,7 +83,9 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    for (i, &reg) in outputs.iter().enumerate() {
+        words.extend_from_slice(&buffer_store_dword(reg, 8, 4 * i as u16));
+    }
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -174,6 +180,17 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    run_cases_outputs(shader, cases, 1, |label, i, inputs, out| {
+        check(label, i, inputs, out[0]);
+    });
+}
+
+fn run_cases_outputs(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    dwords: u32,
+    mut check: impl FnMut(&str, usize, [u32; 4], &[u32]),
+) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -199,13 +216,13 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(dwords)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            check(label, i, inputs, out[0][0]);
+            check(label, i, inputs, &out[0]);
         }
         ran += 1;
     }
@@ -936,4 +953,104 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+fn check_quad_sad(op: u16, packed: bool, masked: bool) {
+    let outputs: &[u8] = if packed { &[4, 5] } else { &[4, 5, 6, 7] };
+    let tail = if packed {
+        [0xfff8_0049, 0, 0]
+    } else {
+        [u32::MAX - 5, 0x8000_0010, u32::MAX - 1]
+    };
+    let cases = [
+        [0xc800_0a01, 0xff03_641e, 0x4500_1d00, 0xfffa_fff0],
+        [0xc800_0a01, 0xff03_641e, 0x4500_1d00, u32::MAX - 1],
+        [0xc800_0a01, 0xff03_641e, 0, u32::MAX],
+        [0xc800_0a01, 0xff03_641e, 0x4538_1d02, 1],
+        [0xc800_0a01, 0xff03_641e, 0x4500_1d00, 0],
+    ];
+
+    for clamp in [false, true] {
+        let mut body = Vec::new();
+        for (&reg, literal) in outputs[1..].iter().zip(tail) {
+            body.extend([vop1(0x001, reg, 255), literal]);
+        }
+        // Keep the old destination when v4 is zero, then restore EXEC for the stores.
+        body.push(s_mov_b32(6, ir::EXEC));
+        body.extend(vop3(0x0d5, 0, vgpr(4), 128, 0)); // v_cmpx_ne_u32 v4, 0
+        // Write in place over the accumulator register tuple.
+        let [mut w0, w1] = vop3(op, 4, vgpr(1), vgpr(3), vgpr(4));
+        w0 |= u32::from(clamp) << 15;
+        body.extend([w0, w1, s_mov_b32(ir::EXEC, 6)]);
+
+        let shader = build_valu_cs_outputs(&body, outputs);
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        let flags = u64::from_le_bytes(features.data.try_into().unwrap());
+        assert_eq!(flags & 0x8000, 0, "opcode {op:#x}, clamp {clamp}: INT64");
+
+        run_cases_outputs(
+            &shader,
+            &cases,
+            outputs.len() as u32,
+            |backend, i, inputs, got| {
+                let [lo, hi, target, acc] = inputs;
+                let reference = [lo.to_le_bytes(), hi.to_le_bytes()].concat();
+                let target = target.to_le_bytes();
+                let mut want = [acc, tail[0], tail[1], tail[2]];
+                if acc != 0 {
+                    let accumulators = if packed {
+                        [acc & 0xffff, acc >> 16, tail[0] & 0xffff, tail[0] >> 16]
+                    } else {
+                        want
+                    };
+                    let max = if packed { 0xffff } else { u32::MAX };
+                    let lanes: [u32; 4] = std::array::from_fn(|lane| {
+                        let sad = reference[lane..lane + 4]
+                            .iter()
+                            .zip(target)
+                            .filter(|&(_, b)| !masked || b != 0)
+                            .map(|(&a, b)| u32::from(a.abs_diff(b)))
+                            .sum();
+                        let acc = accumulators[lane];
+                        if clamp {
+                            acc.saturating_add(sad).min(max)
+                        } else {
+                            acc.wrapping_add(sad) & max
+                        }
+                    });
+                    want = if packed {
+                        [
+                            lanes[0] | (lanes[1] << 16),
+                            lanes[2] | (lanes[3] << 16),
+                            0,
+                            0,
+                        ]
+                    } else {
+                        lanes
+                    };
+                }
+                assert_eq!(
+                    got,
+                    &want[..outputs.len()],
+                    "{backend}: opcode {op:#x}, clamp {clamp}, case {i}"
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn v_qsad_pk_u16_u8_accumulates_all_windows() {
+    check_quad_sad(0x172, true, false);
+}
+
+#[test]
+fn v_mqsad_pk_u16_u8_masks_zero_target_bytes() {
+    check_quad_sad(0x173, true, true);
+}
+
+#[test]
+fn v_mqsad_u32_u8_masks_zero_target_bytes() {
+    check_quad_sad(0x175, false, true);
 }

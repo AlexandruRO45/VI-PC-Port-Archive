@@ -3744,6 +3744,9 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" | "v_mqsad_u32_u8" => {
+                self.quad_sad(inst, guard)
+            }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
@@ -4258,6 +4261,117 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
         }
+    }
+
+    /// The two dwords of a packed SAD operand, kept as separate i32s.
+    fn sad_pair(&mut self, inst: &Inst, op: &Operand) -> Result<[V; 2], Why> {
+        if let Operand::Const(code @ 240..=248) = *op {
+            let values = [
+                0.5f64,
+                -0.5,
+                1.0,
+                -1.0,
+                2.0,
+                -2.0,
+                4.0,
+                -4.0,
+                std::f64::consts::FRAC_1_PI / 2.0,
+            ];
+            let bits = values[usize::from(code - 240)].to_bits();
+            return Ok([self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32)]);
+        }
+        let lo = self.operand(inst, op)?;
+        let hi = match *op {
+            Operand::Vector { reg, .. } => inst.read(Reg::V(reg + 1)),
+            Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code + 1)),
+            Operand::Const(193..=208) => return Ok([lo, self.s.m.i32(u32::MAX)]),
+            _ => return Ok([lo, self.s.m.i32(0)]),
+        };
+        Ok([lo, self.i32_of(hi.ok_or("an unread operand")?)?])
+    }
+
+    fn quad_sad(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.abs != 0 || v.neg != 0 || v.opsel != 0 || v.omod != 0 {
+            return Err("unsupported quad SAD modifiers");
+        }
+        let [reference, target, acc] = v.src.as_slice() else {
+            return Err("missing quad SAD operands");
+        };
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("a quad SAD result outside VGPRs");
+        };
+        let packed = inst.name() != "v_mqsad_u32_u8";
+        let c = self.cur;
+        let reference = self.sad_pair(inst, reference)?;
+        // Four four-byte windows start at byte offsets 0 through 3.
+        let reference: [V; 7] =
+            std::array::from_fn(|i| self.select_bits(reference[i / 4], (i % 4) as u8, false));
+        let target = self.operand(inst, target)?;
+        let target = [0, 1, 2, 3].map(|i| self.select_bits(target, i, false));
+        let zero = self.s.m.i32(0);
+        let enabled = (inst.name() != "v_qsad_pk_u16_u8")
+            .then(|| target.map(|byte| self.s.m.cmp(c, pred::NE, byte, zero)));
+        let accumulators: [V; 4] = if packed {
+            let [lo, hi] = self.sad_pair(inst, acc)?;
+            [
+                self.select_bits(lo, 4, false),
+                self.select_bits(lo, 5, false),
+                self.select_bits(hi, 4, false),
+                self.select_bits(hi, 5, false),
+            ]
+        } else {
+            self.vgprs(inst, acc, 4)?.try_into().expect("four VGPRs")
+        };
+        let max16 = self.s.m.i32(u16::MAX.into());
+        let max32 = self.s.m.i32(u32::MAX);
+        let results: [V; 4] = std::array::from_fn(|lane| {
+            let acc = accumulators[lane];
+            let mut sum = acc;
+            for (j, &query) in target.iter().enumerate() {
+                let byte = reference[lane + j];
+                let less = self.s.m.cmp(c, pred::IULT, byte, query);
+                let forward = self.s.m.bin(c, Bin::Sub, byte, query);
+                let reverse = self.s.m.bin(c, Bin::Sub, query, byte);
+                let diff = self.s.m.select(c, less, reverse, forward);
+                let diff = match enabled {
+                    Some(enabled) => self.s.m.select(c, enabled[j], diff, zero),
+                    None => diff,
+                };
+                sum = self.s.m.bin(c, Bin::Add, sum, diff);
+            }
+            if packed {
+                if v.clamp {
+                    let overflow = self.s.m.cmp(c, pred::IUGT, sum, max16);
+                    self.s.m.select(c, overflow, max16, sum)
+                } else {
+                    self.s.m.bin(c, Bin::And, sum, max16)
+                }
+            } else if v.clamp {
+                // The nonnegative SAD is at most 1020, so the sum wraps at most once.
+                let overflow = self.s.m.cmp(c, pred::IULT, sum, acc);
+                self.s.m.select(c, overflow, max32, sum)
+            } else {
+                sum
+            }
+        });
+
+        if packed {
+            let shift = self.s.m.i32(16);
+            let (pairs, _) = results.as_chunks::<2>();
+            for (i, &[lo, hi]) in pairs.iter().enumerate() {
+                let hi = self.s.m.bin(c, Bin::Shl, hi, shift);
+                let word = self.s.m.bin(c, Bin::Or, lo, hi);
+                self.write(inst, Reg::V(reg + i as u8), word, guard);
+            }
+        } else {
+            for (i, result) in results.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + i as u8), result, guard);
+            }
+        }
+        Ok(())
     }
 
     /// A 64-bit source (a register pair; inline constants sign-extend).
