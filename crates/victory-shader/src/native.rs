@@ -2654,6 +2654,74 @@ mod tests {
     }
 
     #[test]
+    fn heaps_hold_one_sgpr_of_their_own() {
+        let (constants, table, resource_heap, sampler_heap) = (0, 3, 5, 6);
+        // The two heaps side by side, beside constants, and at the last
+        // user-data dword are fine.
+        assert!(program(&[(resource_heap, 1, 4, 0), (sampler_heap, 1, 5, 1)]).is_ok());
+        assert!(program(&[(constants, 4, 0, 0), (resource_heap, 1, 4, 1)]).is_ok());
+        for root in [resource_heap, sampler_heap] {
+            assert!(program(&[(root, 1, 31, 0)]).is_ok(), "{root} at dword 31");
+            assert_eq!(
+                why_refused(program(&[(root, 1, 32, 0)])),
+                "root parameter past the user data",
+                "{root} at dword 32"
+            );
+        }
+        // Only a table's ranges may share an SGPR: two heaps, a heap in the
+        // constants' last dword, or a heap and a table of the same slot
+        // would each have one read as the other.
+        for (params, what) in [
+            (
+                [(resource_heap, 1, 4, 0), (sampler_heap, 1, 4, 1)],
+                "both heaps in s4",
+            ),
+            (
+                [(resource_heap, 1, 4, 0), (resource_heap, 1, 4, 0)],
+                "the resource heap listed twice",
+            ),
+            (
+                [(constants, 4, 0, 0), (sampler_heap, 1, 3, 1)],
+                "the sampler heap in the constants' last dword",
+            ),
+            (
+                [(table, 1, 4, 2), (resource_heap, 1, 4, 2)],
+                "a heap stating a table's slot and SGPR",
+            ),
+        ] {
+            assert_eq!(
+                why_refused(program(&params)),
+                "root parameters share an SGPR",
+                "{what}"
+            );
+        }
+        // In compute, with only the group info enabled (s0), a heap there
+        // is refused even stating no SGPRs: its address is read from the
+        // SGPR its byte names. Right after it, s1 is free.
+        let info_in_s0: u32 = 1 << 10;
+        for root in [resource_heap, sampler_heap] {
+            for sgprs in [0, 1] {
+                assert_eq!(
+                    why_refused(compute_program(info_in_s0, root, sgprs, 0)),
+                    "root parameter over a system SGPR",
+                    "{root}/{sgprs}"
+                );
+                assert!(
+                    compute_program(info_in_s0, root, sgprs, 1).is_ok(),
+                    "{root}/{sgprs} at s1"
+                );
+            }
+            // Compute's user data ends at dword 15 for a heap too.
+            assert!(compute_program(0, root, 1, 15).is_ok(), "{root}");
+            assert_eq!(
+                why_refused(compute_program(0, root, 1, 16)),
+                "root parameter past the user data",
+                "{root}"
+            );
+        }
+    }
+
+    #[test]
     fn user_data_follows_each_stage_system_sgprs() {
         // Merged stages and mesh shaders have 8 system SGPRs before their
         // user data; the legacy stages and compute start it at s0.
