@@ -54,15 +54,21 @@ pub(crate) struct Host {
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
     /// Optional CPU-visible heap for placed buffers (the arena is probed lazily).
+    #[cfg_attr(not(test), allow(dead_code))]
     unified: OnceLock<Option<UnifiedArena>>,
 }
 
 /// A bump-allocated CPU-visible D3D12 heap. Allocations never overlap.
 // Fits the 174 MiB title heap called out in #407, with room for alignment.
+// The production path remains intentionally unwired for this first probe.
+#[cfg_attr(not(test), allow(dead_code))]
 const UNIFIED_ARENA_SIZE: u64 = 256 << 20;
+#[cfg_attr(not(test), allow(dead_code))]
 const UNIFIED_HEAP_ALIGNMENT: u64 = 64 << 10;
+#[cfg_attr(not(test), allow(dead_code))]
 const UNIFIED_ALIGNMENT: u64 = 256;
 
+#[cfg_attr(not(test), allow(dead_code))]
 struct UnifiedArena {
     _heap: ID3D12Heap,
     resource: ID3D12Resource,
@@ -72,6 +78,7 @@ struct UnifiedArena {
 }
 
 /// A persistently mapped suballocation in the arena's placed buffer.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct UnifiedBuffer {
     pub(crate) resource: ID3D12Resource,
     pub(crate) data: *mut u8,
@@ -79,6 +86,7 @@ pub(crate) struct UnifiedBuffer {
     pub(crate) offset: u64,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl UnifiedArena {
     fn new(device: &ID3D12Device) -> windows::core::Result<Self> {
         let heap_desc = D3D12_HEAP_DESC {
@@ -381,8 +389,8 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 mod tests {
     use super::*;
 
-    /// Checks CPU writes -> GPU UAV reads/writes -> CPU reads through two
-    /// suballocations of one persistently mapped placed buffer.
+    /// Checks CPU writes -> GPU SRV reads and UAV writes -> CPU reads through
+    /// two suballocations of one persistently mapped placed buffer.
     #[test]
     fn placed_custom_heap_shares_memory_between_cpu_and_gpu() {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -431,9 +439,9 @@ mod tests {
         }
 
         const SHADER: &str = r#"
-#define RS "UAV(u0), UAV(u1)"
-RWByteAddressBuffer source : register(u0);
-RWByteAddressBuffer destination : register(u1);
+#define RS "SRV(t0), UAV(u0)"
+ByteAddressBuffer source : register(t0);
+RWByteAddressBuffer destination : register(u0);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
@@ -481,6 +489,8 @@ void main() {
                 code.GetBufferSize(),
             )
         };
+        // SAFETY: `bytes` is the serialized root signature compiled above and
+        // the device returns an owned COM interface.
         let root: ID3D12RootSignature =
             unsafe { host.device.CreateRootSignature(0, bytes) }.expect("create root signature");
         // SAFETY: the PSO description borrows the live bytecode and root signature.
@@ -524,7 +534,7 @@ void main() {
             list.list.ResourceBarrier(&[to_uav]);
             list.list.SetComputeRootSignature(&root);
             list.list.SetPipelineState(&pso);
-            list.list.SetComputeRootUnorderedAccessView(0, source.gpu);
+            list.list.SetComputeRootShaderResourceView(0, source.gpu);
             list.list.SetComputeRootUnorderedAccessView(1, destination.gpu);
             list.list.Dispatch(1, 1, 1);
         }
@@ -549,6 +559,7 @@ void main() {
             factory.EnumWarpAdapter::<IDXGIAdapter>()
         };
         let Ok(raw) = raw else { return };
+        // SAFETY: reading the DXGI adapter description does not retain pointers.
         let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
         eprintln!(
             "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
@@ -2040,6 +2051,7 @@ impl Host {
     /// A suballocation in a lazily probed CPU-visible buffer shared with the GPU.
     /// Unsupported adapters or exhausted capacity return None; title allocations
     /// do not use this arena yet.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn unified_buffer(&self, size: u64) -> Option<UnifiedBuffer> {
         let arena = self.unified.get_or_init(|| match UnifiedArena::new(&self.device) {
             Ok(arena) => {
