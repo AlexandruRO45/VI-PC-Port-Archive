@@ -1016,3 +1016,62 @@ fn a_directory_with_a_size_but_no_rva_is_absent() {
     assert!(!info.has_exception_table);
     assert!(!info.has_load_config);
 }
+
+#[test]
+fn header_flag_words_are_passed_through_unchanged() {
+    let mut d = image();
+    // High entropy VA, dynamic base, NX compatible, terminal server aware.
+    put16(&mut d, OPT + 70, 0x8160);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.characteristics, 0x0022);
+    assert_eq!(info.dll_characteristics, 0x8160);
+    assert!(!info.is_dll());
+}
+
+#[test]
+fn names_come_from_the_name_table_when_the_iat_is_bound() {
+    // A bound image has absolute addresses already written into its IAT;
+    // the unbound name table still says what each slot imports.
+    let mut d = image();
+    put64(&mut d, at(IAT), 0x7FF8_0000_1000);
+    put64(&mut d, at(IAT) + 8, 0x7FF8_0000_2000);
+    let info = ImageInfo::parse(&d).unwrap();
+    let entries: Vec<_> = info.imports[0]
+        .entries
+        .iter()
+        .map(|e| (e.symbol.clone(), e.iat_slot_rva))
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            (
+                ImportSymbol::Name {
+                    hint: 0x123,
+                    name: "ExitProcess".into()
+                },
+                IAT
+            ),
+            (ImportSymbol::Ordinal(5), IAT + 8),
+        ]
+    );
+}
+
+#[test]
+fn an_import_module_with_an_empty_name_table_has_no_entries() {
+    let mut d = image();
+    d[at(NAME_TABLE)..at(NAME_TABLE) + 16].fill(0);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.imports.len(), 1);
+    assert_eq!(info.imports[0].dll, "KERNEL32.dll");
+    assert!(info.imports[0].entries.is_empty());
+    assert_eq!(info.import_count(), 0);
+}
+
+#[test]
+fn an_import_directory_holding_only_the_terminator_has_no_modules() {
+    let mut d = image();
+    d[at(IMPORT_DESCRIPTORS)..at(IMPORT_DESCRIPTORS) + 20].fill(0);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert!(info.imports.is_empty());
+    assert_eq!(info.import_count(), 0);
+}
