@@ -535,4 +535,95 @@ mod tests {
         assert_eq!(p.xbox_extras(), XboxExtras::default());
         assert!(!p.is_standard_layout());
     }
+
+    /// What every accepted program satisfies, whatever its bytes: a model
+    /// of 6 or later, a DXIL version of 1.0 or later, LLVM's magic at the
+    /// bitcode's start and a word-aligned length, and the prefix, bitcode
+    /// and trailer tiling the program's own bytes after the header and no
+    /// further.
+    fn assert_sound(bytes: &[u8], p: &DxilProgram, at: &str) {
+        let size = u32_at(bytes, 4).unwrap() as usize * 4;
+        assert!(p.shader_model.0 >= 6, "{at}");
+        assert!(p.dxil_version >> 8 >= 1, "{at}");
+        assert!(p.bitcode.starts_with(&LLVM_BITCODE_MAGIC), "{at}");
+        assert!(p.bitcode.len().is_multiple_of(4), "{at}");
+        let tiled = [p.prefix, p.bitcode, p.trailer].concat();
+        assert_eq!(tiled, &bytes[24..size], "{at}");
+        let start = 8 + u32_at(bytes, 16).unwrap() as usize;
+        assert!(
+            std::ptr::eq(p.bitcode.as_ptr(), bytes[start..].as_ptr()),
+            "{at}"
+        );
+    }
+
+    /// Any single corrupted byte of a valid program, PC or Xbox layout,
+    /// either fails with an error or parses soundly; it never panics.
+    #[test]
+    fn a_corrupted_byte_anywhere_fails_cleanly_or_parses_soundly() {
+        let programs = [
+            build_standard(0, (6, 0), 0x100, &fake_bitcode()),
+            around(b"XDAT\x01\0\0\0", b"\0\0\0\0xbop\0\0\0\0"),
+        ];
+        for bytes in programs {
+            for i in 0..bytes.len() {
+                for value in [0x00, 0x01, 0x04, 0x7F, 0x80, 0xFF, bytes[i] ^ 0x10] {
+                    let mut bad = bytes.clone();
+                    bad[i] = value;
+                    if let Ok(p) = DxilProgram::parse(&bad) {
+                        assert_sound(&bad, &p, &format!("byte {i} = {value:#x}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A program cut short anywhere is refused: the size word then claims
+    /// more than the part holds, before any other field is read, so no cut
+    /// reads past the end or names a later check.
+    #[test]
+    fn a_program_cut_short_anywhere_is_refused() {
+        let bytes = around(b"XDAT\x01\0\0\0", b"xbop");
+        assert!(DxilProgram::parse(&bytes).is_ok());
+        for len in 8..bytes.len() {
+            assert_eq!(
+                malformed(&bytes[..len]),
+                "program size disagrees with part size",
+                "{len} of {} bytes",
+                bytes.len()
+            );
+        }
+    }
+
+    /// Lowering the size word a dword at a time drops the trailer first,
+    /// then cuts into the bitcode, which is then out of bounds: the size
+    /// decides the program's end, not the part's length.
+    #[test]
+    fn a_smaller_size_word_drops_the_trailer_then_cuts_the_bitcode() {
+        let trailer = b"\0\0\0\0xbop";
+        let mut bytes = around(b"", trailer);
+        let full = bytes.len() / 4;
+        for drop in 0..=full {
+            set_u32(&mut bytes, 4, (full - drop) as u32);
+            let kept = trailer.len().saturating_sub(4 * drop);
+            let cut = 4 * drop > trailer.len();
+            match DxilProgram::parse(&bytes) {
+                Ok(p) => {
+                    assert!(!cut, "{drop} dwords dropped");
+                    assert_eq!(p.trailer, &trailer[..kept]);
+                    assert_eq!(p.xbox_extras().xbop, kept == trailer.len());
+                    assert_sound(&bytes, &p, &format!("{drop} dwords dropped"));
+                }
+                Err(ShaderError::Malformed(why)) => {
+                    assert!(cut, "{drop} dwords dropped: {why}");
+                    let want = if (full - drop) * 4 < 24 {
+                        "program size disagrees with part size"
+                    } else {
+                        "bitcode out of bounds"
+                    };
+                    assert_eq!(why, want, "{drop} dwords dropped");
+                }
+                Err(other) => panic!("{other:?}"),
+            }
+        }
+    }
 }
