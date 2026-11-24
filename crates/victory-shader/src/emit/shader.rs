@@ -674,6 +674,13 @@ impl Shader {
         }
 
         let sigs = if graphics {
+            // Reads settle an element's interpolation mode while the program is
+            // lowered: one mode per row, as DXIL requires (§`one_mode_per_row`).
+            if self.pixel {
+                super::one_mode_per_row(&mut self.inputs);
+            } else {
+                super::one_mode_per_row(&mut self.outputs);
+            }
             let ins = self.signature_md(self.inputs.clone());
             let outs = self.signature_md(self.outputs.clone());
             let prims = self.signature_md(self.prims.clone());
