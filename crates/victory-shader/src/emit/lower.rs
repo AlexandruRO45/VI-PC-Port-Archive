@@ -2334,7 +2334,6 @@ impl<'a> Lower<'a> {
     }
 
     // ---- instructions ----
-    // ---- instructions ----
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
