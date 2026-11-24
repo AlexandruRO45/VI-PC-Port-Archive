@@ -31,14 +31,16 @@ for i, (a, t) in enumerate(ins):
     for j in range(i + 3, min(i + 60, len(ins))):
         tj = ins[j][1]
         body.append(tj)
-        ma = re.match(rf'(?:add\s+\$0x([0-9a-f]+),%{P}|lea\s+0x([0-9a-f]+)\(%(\w+)\),%\w+)$', tj)
-        if ma and ma.group(1):
+        ma = re.match(rf'add\s+\$0x([0-9a-f]+),%{P}$', tj)
+        if ma:
             length = int(ma.group(1), 16)
-        if re.match(rf'mov\s+%\w+,0x18\(%{L}\)$', tj):
+        ms = re.match(rf'mov\s+%(\w+),0x18\(%{L}\)$', tj)
+        if ms:
             if length is None:
-                # lea 0xN(%rcx),%rax style
+                dst = ms.group(1)
+                # lea 0xN(%P),%dst style
                 for tb in body:
-                    ml = re.match(r'lea\s+0x([0-9a-f]+)\(%\w+\),%\w+$', tb)
+                    ml = re.match(rf'lea\s+0x([0-9a-f]+)\(%{P}\),%{dst}$', tb)
                     if ml:
                         length = int(ml.group(1), 16)
             break
