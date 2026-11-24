@@ -345,6 +345,10 @@ pub struct Structured {
     pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
+    /// Non-EXEC-derived values read as masks (uniform `s_cselect`, constants,
+    /// scalar logical ops on them, opaque values), kept apart from `masks` so
+    /// ordinary scalar uses of those SGPRs are unaffected.
+    pub other_masks: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
@@ -356,6 +360,15 @@ pub struct Structured {
 }
 
 impl Structured {
+    /// The lane-mask boolean for `lo`, checking EXEC/VALU-derived masks first
+    /// and then uniform/constant/other masks read by selects, carries, or phis.
+    pub fn select_mask(&self, lo: Value) -> Option<Bool> {
+        self.masks
+            .get(&lo)
+            .or_else(|| self.other_masks.get(&lo))
+            .copied()
+    }
+
     pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
         match high {
             Some(high) => self.paired_masks.get(&(low, high)),
@@ -407,6 +420,9 @@ struct Lanes<'a> {
     scc_lane: Map<Value, Bool>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
+    /// Incoming argument keys of unresolved `Atom::Phi` joins, resolved in
+    /// `finish` so back-edge uniform/constant masks enter `other_masks`.
+    phi_args: Vec<Key>,
     /// Per block: what a lane knows on entry, over forward edges only.
     first: Vec<Bool>,
     /// Per block ending in a branch: when a lane takes it.
@@ -473,6 +489,7 @@ impl<'a> Lanes<'a> {
             other: Map::default(),
             scc_lane: Map::default(),
             joins: Vec::new(),
+            phi_args: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
@@ -485,6 +502,7 @@ impl<'a> Lanes<'a> {
         self.other.clear();
         self.scc_lane.clear();
         self.joins.clear();
+        self.phi_args.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
@@ -586,6 +604,12 @@ impl<'a> Lanes<'a> {
         execs: &[Vec<Option<Bool>>],
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
+        let mut i = 0;
+        while i < self.phi_args.len() {
+            let arg = self.phi_args[i];
+            self.mask(arg);
+            i += 1;
+        }
         let blocks = &self.p.blocks;
         let b = &mut self.b;
         let guards = blocks
@@ -626,6 +650,7 @@ impl<'a> Lanes<'a> {
         }
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            other_masks: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
                 .masks
                 .keys()
@@ -680,11 +705,13 @@ impl<'a> Lanes<'a> {
             None => {
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
-                let m = match (lo, hi) {
-                    (Some(at), Some(hi)) if at == hi => def(lo)
+                let split = match (lo, hi) {
+                    (Some(at), Some(hi_at)) if at == hi_at => def(lo)
                         .and_then(|i| self.sop(i))
-                        .and_then(|r| r.dst)
-                        .map(|d| d.1),
+                        .and_then(|r| r.dst.map(|d| (d.1, r.derived))),
+                    (Some(lo_at), Some(hi_at)) if self.p.wave64 => {
+                        self.split_wave64_mask(lo_at, hi_at, k)
+                    }
                     _ => None,
                 };
                 // What an EXEC write the pass does not follow leaves there.
@@ -693,11 +720,14 @@ impl<'a> Lanes<'a> {
                         i.write(Reg::S(EXEC)) == Some(v) || i.write(Reg::S(EXEC + 1)) == Some(v)
                     })
                 };
-                let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
-                let m = m.unwrap_or_else(|| {
-                    let born = self.born(k.0);
-                    self.b.atom(Atom::Opaque(k.0), born)
-                });
+                let (m, split_derived) = match split {
+                    Some((m, d)) => (m, d),
+                    None => {
+                        let born = self.born(k.0);
+                        (self.b.atom(Atom::Opaque(k.0), born), false)
+                    }
+                };
+                let derived = split_derived || exec_write(lo, k.0) || exec_write(hi, k.1);
                 (m, derived)
             }
         };
@@ -767,8 +797,65 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
+        self.phi_args.extend(args);
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))
+    }
+
+    /// Resolves a Wave64 mask pair whose low and high dwords were written by
+    /// two separate 32-bit scalar instructions: either a split copy
+    /// (`s_mov_b32` + `s_mov_b32`) or two identical 32-bit uniform masks
+    /// (`s_mov_b32 0/-1`, `s_cselect_b32 -1, 0` on the same SCC).
+    fn split_wave64_mask(
+        &mut self,
+        lo_at: (usize, usize),
+        hi_at: (usize, usize),
+        k: Key,
+    ) -> Option<(Bool, bool)> {
+        let p = self.p;
+        let li = &p.blocks[lo_at.0].insts[lo_at.1];
+        let hi = &p.blocks[hi_at.0].insts[hi_at.1];
+        let scalar_mov = |inst: &Inst| -> Option<Value> {
+            if inst.name() != "s_mov_b32" {
+                return None;
+            }
+            let Fields::Sop { src, .. } = &inst.fields else {
+                return None;
+            };
+            let [Operand::Scalar { code, .. }] = &src[..] else {
+                return None;
+            };
+            (*code != NULL).then(|| inst.read(Reg::S(*code))).flatten()
+        };
+        if let (Some(a), Some(b)) = (scalar_mov(li), scalar_mov(hi))
+            && (a, b) != k
+        {
+            return Some(self.mask((a, b)));
+        }
+        let const_bool = |op: &Operand| match *op {
+            Operand::Const(128) | Operand::Literal(0) => Some(Bool::FALSE),
+            Operand::Const(193) | Operand::Literal(u32::MAX) => Some(Bool::TRUE),
+            _ => None,
+        };
+        let uniform_32 = |inst: &Inst, l: &mut Self| -> Option<Bool> {
+            let Fields::Sop { src, .. } = &inst.fields else {
+                return None;
+            };
+            match inst.name() {
+                "s_mov_b32" if src.len() == 1 => const_bool(&src[0]),
+                "s_cselect_b32" if src.len() == 2 => {
+                    let (a, c) = (const_bool(&src[0])?, const_bool(&src[1])?);
+                    let scc = inst.read(Reg::Scc)?;
+                    let born = l.born(scc);
+                    let u = l.b.atom(Atom::Uniform(scc), born);
+                    Some(l.b.ite(u, a, c))
+                }
+                _ => None,
+            }
+        };
+        let ml = uniform_32(li, self)?;
+        let mh = uniform_32(hi, self)?;
+        (ml == mh).then_some((ml, false))
     }
 
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Option<(Bool, bool)> {
@@ -973,9 +1060,9 @@ impl<'a> Lanes<'a> {
                     l.masks.insert(k, m);
                     l.active.insert(k.0);
                 };
-                // A select reads a mask nothing else may: a join of compare
-                // results is resolved here, as for EXEC.
-                if name == "v_cndmask_b32"
+                // A select or carry-in reads a mask nothing else may: resolve
+                // joins, uniform selects and constants here, as for EXEC.
+                if (name == "v_cndmask_b32" || name.ends_with("_co_ci_u32"))
                     && let Some(&Operand::Scalar { code, .. }) = v.src.get(2)
                     && code != NULL
                     && let Some(k) = self.key(|r| inst.read(r), code)

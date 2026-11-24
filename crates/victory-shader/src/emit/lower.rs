@@ -4605,13 +4605,17 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                    _ => None,
+                let m = match v.src.get(2) {
+                    Some(&Operand::Scalar { code: NULL, .. }) | Some(&Operand::Const(128)) => {
+                        Bool::FALSE
+                    }
+                    Some(&Operand::Const(193)) => Bool::TRUE,
+                    Some(&Operand::Scalar { code, .. }) => inst
+                        .read(Reg::S(code))
+                        .and_then(|m| self.x.st.select_mask(m))
+                        .ok_or("a select on an untracked mask")?,
+                    _ => return Err("a select on an untracked mask"),
                 };
-                let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
-                    .ok_or("a select on an untracked mask")?;
                 let cond = self.boolean(m, c)?;
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
@@ -4631,12 +4635,16 @@ impl<'a> Lower<'a> {
                 }
                 let cin = if name.ends_with("_ci_u32") {
                     let m = match v.src.get(2) {
-                        Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                        _ => None,
+                        Some(&Operand::Scalar { code: NULL, .. }) | Some(&Operand::Const(128)) => {
+                            Bool::FALSE
+                        }
+                        Some(&Operand::Const(193)) => Bool::TRUE,
+                        Some(&Operand::Scalar { code, .. }) => inst
+                            .read(Reg::S(code))
+                            .and_then(|m| self.x.st.select_mask(m))
+                            .ok_or("a carry-in from an untracked mask")?,
+                        _ => return Err("a carry-in from an untracked mask"),
                     };
-                    let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
-                        .ok_or("a carry-in from an untracked mask")?;
                     Some(self.boolean(m, c)?)
                 } else {
                     None
@@ -7385,10 +7393,11 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
+                let m = self
+                    .x
+                    .st
+                    .select_mask(phi.args[n])
+                    .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
                 let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
@@ -8147,16 +8156,27 @@ mod tests {
         wave64: bool,
         max_wave: u32,
     ) -> Result<Lowered, crate::ShaderError> {
+        lower_cs_wave_layout(words, threads, vec![], wave64, max_wave)
+    }
+
+    fn lower_cs_wave_layout(
+        words: &[u32],
+        threads: [u32; 3],
+        layout: Vec<RootParam>,
+        wave64: bool,
+        max_wave: u32,
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64,
             vgprs: 256,
-            layout: vec![],
+            layout,
             used: vec![],
             io: StageIo::Cs(ComputeIo {
-                // 512 bytes of LDS.
-                rsrc2: 1 << 15,
+                // 512 bytes of LDS and the layout's user SGPRs.
+                rsrc2: 1 << 15 | sgprs << 1,
                 threads,
             }),
             code,
@@ -8254,6 +8274,164 @@ mod tests {
                 err,
                 crate::ShaderError::Unsupported {
                     what: "a cross-lane operation needing wave64",
+                    ..
+                }
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn v_cndmask_lowers_uniform_cselect_and_logical_masks_in_wave32_and_wave64() {
+        let cnd = |mask_src: u32| [0xD501_0001, 256 | (129 << 9) | (mask_src << 18)];
+        let layout = || vec![root(RootType::Constants, 0, 0), root(RootType::Constants, 1, 1)];
+
+        // Wave64: s_cselect_b64 + s_and_b64 of two uniform SCC conditions.
+        let [c0, c1] = cnd(6);
+        let wave64_words = [
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0x8582_80C1, // s_cselect_b64 s[2:3], -1, 0
+            0xBF07_8001, // s_cmp_lg_u32 s1, 0
+            0x8584_80C1, // s_cselect_b64 s[4:5], -1, 0
+            0x8786_0402, // s_and_b64 s[6:7], s[2:3], s[4:5]
+            c0,
+            c1, // v_cndmask_b32 v1, v0, 1, s[6:7]
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        for max_wave in [32, 64] {
+            let mut l =
+                lower_cs_wave_layout(&wave64_words, [64, 1, 1], layout(), true, max_wave).unwrap();
+            assert!(!l.wave_ops);
+            if max_wave == 32 {
+                assert_eq!(l.wave_size, None);
+            }
+            #[cfg(windows)]
+            validate_dxil(&mut l.dxil);
+        }
+
+        // Wave32: s_cselect_b32 -> v_cndmask_b32.
+        let [c0, c1] = cnd(2);
+        let wave32_words = [
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0x8502_80C1, // s_cselect_b32 s2, -1, 0
+            c0,
+            c1, // v_cndmask_b32 v1, v0, 1, s2
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let mut l = lower_cs_wave_layout(&wave32_words, [32, 1, 1], layout(), false, 32).unwrap();
+        assert!(!l.wave_ops);
+        #[cfg(windows)]
+        validate_dxil(&mut l.dxil);
+    }
+
+    #[test]
+    fn v_cndmask_lowers_constants_inline_and_split_wave64_halves() {
+        let cnd = |mask_src: u32| [0xD501_0001, 256 | (129 << 9) | (mask_src << 18)];
+        let layout = || vec![root(RootType::Constants, 0, 0)];
+
+        // Constant s_mov_b64 -1, inline constant -1 (193), and split s_cselect_b32 halves.
+        let [m0, m1] = cnd(2);
+        let [i0, i1] = cnd(193);
+        let cases: &[&[u32]] = &[
+            &[
+                0xBE82_04C1, // s_mov_b64 s[2:3], -1
+                m0,
+                m1,
+                0xD834_0000,
+                0x0000_0100,
+                S_ENDPGM,
+            ],
+            &[i0, i1, 0xD834_0000, 0x0000_0100, S_ENDPGM],
+            &[
+                0xBF06_8000, // s_cmp_eq_u32 s0, 0
+                0x8502_80C1, // s_cselect_b32 s2, -1, 0
+                0x8503_80C1, // s_cselect_b32 s3, -1, 0
+                m0,
+                m1,
+                0xD834_0000,
+                0x0000_0100,
+                S_ENDPGM,
+            ],
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                0xBE83_036B, // s_mov_b32 s3, vcc_hi
+                m0,
+                m1,
+                0xD834_0000,
+                0x0000_0100,
+                S_ENDPGM,
+            ],
+        ];
+        for words in cases {
+            let mut l = lower_cs_wave_layout(words, [64, 1, 1], layout(), true, 32).unwrap();
+            assert_eq!(l.wave_size, None);
+            #[cfg(windows)]
+            validate_dxil(&mut l.dxil);
+        }
+    }
+
+    #[test]
+    fn mask_phi_joining_vcmp_and_constant_zero_lowers() {
+        // Uniform branch: arm A sets s[2:3] via v_cmp, arm B sets s[2:3] = 0,
+        // joined at a phi read by v_cndmask_b32.
+        let [c0, c1] = [0xD501_0001, 256 | (129 << 9) | (2 << 18)];
+        let words = [
+            0xBF06_8000, // 0: s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // 4: s_cbranch_scc1 -> 16 (arm B)
+            0x7D84_0080, // 8: v_cmp_eq_u32 vcc, 0, v0
+            0xBE82_046A, // 12: s_mov_b64 s[2:3], vcc
+            0xBF82_0001, // 16?: wait, offset below:
+            0xBE82_0480, // arm B: s_mov_b64 s[2:3], 0
+            c0,
+            c1, // join: v_cndmask_b32 v1, v0, 1, s[2:3]
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        // Fix branch offsets:
+        // [0] 0: s_cmp_eq_u32
+        // [1] 4: s_cbranch_scc1 +3 -> target at word 1+1+3 = 5 (arm B: s_mov_b64 0)
+        // [2] 8: v_cmp_eq_u32
+        // [3] 12: s_mov_b64 s[2:3], vcc
+        // [4] 16: s_branch +1 -> target at word 4+1+1 = 6 (join: v_cndmask_b32)
+        // [5] 20: s_mov_b64 s[2:3], 0
+        // [6..8] 24: v_cndmask_b32
+        let mut words = words;
+        words[1] = 0xBF85_0003;
+        words[4] = 0xBF82_0001;
+        let layout = vec![root(RootType::Constants, 0, 0)];
+        let mut l = lower_cs_wave_layout(&words, [64, 1, 1], layout, true, 32).unwrap();
+        assert_eq!(l.wave_size, None);
+        #[cfg(windows)]
+        validate_dxil(&mut l.dxil);
+    }
+
+    #[test]
+    fn v_cndmask_opaque_scalar_mask_refuses_cleanly_on_wave32_host() {
+        // Arbitrary input SGPR pair s[0:1] used as a Wave64 bitmask in v_cndmask_b32
+        // must be refused cleanly on a 32-lane host (never silently miscompiled).
+        let [c0, c1] = [0xD501_0001, 256 | (129 << 9)];
+        let words = [
+            c0,
+            c1, // v_cndmask_b32 v1, v0, 1, s[0:1]
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Constants, 0, 0), root(RootType::Constants, 1, 1)];
+        let Err(err) = lower_cs_wave_layout(&words, [64, 1, 1], layout, true, 32) else {
+            panic!("expected opaque lane mask refusal on 32-lane host");
+        };
+        assert!(
+            matches!(
+                err,
+                crate::ShaderError::Unsupported {
+                    what: "an opaque lane mask",
                     ..
                 }
             ),
