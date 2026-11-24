@@ -512,21 +512,49 @@ fn explicit_config(
 /// The config file to read: `explicit` (`VICTORY_CONFIG`), which must be a
 /// file, else `./victory.toml` when that is a file.
 fn config_file(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
-    let Some(path) = explicit else {
-        let default = PathBuf::from("victory.toml");
-        return Ok(default.is_file().then_some(default));
+    config_file_or(explicit, Path::new("victory.toml"))
+}
+
+/// [`config_file`] with `default` in place of `./victory.toml`. A missing
+/// `default` is no config file, but one that is there and cannot be read
+/// as one is refused rather than skipped: a `victory.toml` folder, a
+/// `victory.toml` link whose target was moved or deleted, or one that
+/// cannot be checked (no permission) would otherwise be passed over without
+/// a word, and every setting in it silently replaced by its default.
+fn config_file_or(explicit: Option<PathBuf>, default: &Path) -> Result<Option<PathBuf>> {
+    let (path, what, checking) = match explicit {
+        Some(path) => {
+            let what = format!("VICTORY_CONFIG points at {}", path.display());
+            let checking = format!("checking VICTORY_CONFIG at {}", path.display());
+            (path, what, checking)
+        }
+        None => {
+            let path = default.to_path_buf();
+            if std::fs::symlink_metadata(&path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Ok(None);
+            }
+            let what = format!("the config file {}", path.display());
+            let checking = format!("checking the config file {}", path.display());
+            (path, what, checking)
+        }
     };
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            anyhow::bail!(
-                "VICTORY_CONFIG points at {}, which does not exist",
-                path.display()
-            );
+            // A link to a file that was moved or deleted: the link itself
+            // is there, so say where it leads.
+            if let Ok(target) = std::fs::read_link(&path) {
+                anyhow::bail!(
+                    "{what}, a link to {}, which does not exist",
+                    target.display()
+                );
+            }
+            anyhow::bail!("{what}, which does not exist");
         }
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("checking VICTORY_CONFIG at {}", path.display()));
+            return Err(err).context(checking);
         }
     };
     if metadata.is_file() {
@@ -540,15 +568,9 @@ fn config_file(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
         } else {
             String::new()
         };
-        anyhow::bail!(
-            "VICTORY_CONFIG points at {}, which is a folder, not a config file{hint}",
-            path.display()
-        );
+        anyhow::bail!("{what}, which is a folder, not a config file{hint}");
     }
-    anyhow::bail!(
-        "VICTORY_CONFIG points at {}, which is not a regular file",
-        path.display()
-    );
+    anyhow::bail!("{what}, which is not a regular file");
 }
 
 /// Refuses a cache or data folder that is the root of a drive, the home
@@ -2170,6 +2192,92 @@ mod tests {
                 err.contains("/dev/null, which is not a regular file"),
                 "{err}"
             );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_default_config_that_is_not_a_file_is_refused() {
+        // A scratch folder under the system temp folder, never the
+        // repository or the working directory; removed at the end.
+        let dir = std::env::temp_dir().join(format!(
+            "victory-default-config-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let default = dir.join("victory.toml");
+
+        // Missing: no config file, as before.
+        assert_eq!(config_file_or(None, &default).unwrap(), None);
+
+        // A regular file is read.
+        std::fs::write(&default, "").unwrap();
+        assert_eq!(
+            config_file_or(None, &default).unwrap(),
+            Some(default.clone())
+        );
+        // VICTORY_CONFIG still wins over the default.
+        let other = dir.join("other.toml");
+        std::fs::write(&other, "").unwrap();
+        assert_eq!(
+            config_file_or(Some(other.clone()), &default).unwrap(),
+            Some(other.clone())
+        );
+        std::fs::remove_file(&default).unwrap();
+
+        // A folder named victory.toml is reported, not skipped.
+        std::fs::create_dir(&default).unwrap();
+        let err = config_file_or(None, &default).unwrap_err().to_string();
+        assert!(err.contains("is a folder, not a config file"), "{err}");
+        assert!(err.contains(&default.display().to_string()), "{err}");
+        assert!(!err.contains("VICTORY_CONFIG"), "{err}");
+        std::fs::remove_dir(&default).unwrap();
+
+        #[cfg(unix)]
+        {
+            // A link whose target is gone names the target, for the default
+            // file and for VICTORY_CONFIG.
+            let gone = dir.join("moved-away.toml");
+            std::os::unix::fs::symlink(&gone, &default).unwrap();
+            let err = config_file_or(None, &default).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!(
+                    "a link to {}, which does not exist",
+                    gone.display()
+                )),
+                "{err}"
+            );
+            let err = config_file(Some(default.clone())).unwrap_err().to_string();
+            assert!(err.starts_with("VICTORY_CONFIG points at"), "{err}");
+            assert!(err.contains(&gone.display().to_string()), "{err}");
+
+            // Once the target is back, the link is read.
+            std::fs::write(&gone, "").unwrap();
+            assert_eq!(
+                config_file_or(None, &default).unwrap(),
+                Some(default.clone())
+            );
+            std::fs::remove_file(&default).unwrap();
+
+            // A path that cannot be checked is an error, not "no file".
+            std::fs::write(&default, "").unwrap();
+            let blocked = default.join("victory.toml");
+            let err = config_file_or(None, &blocked).unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::NotADirectory
+            );
+            assert!(
+                err.to_string().contains("checking the config file"),
+                "{err}"
+            );
+            std::fs::remove_file(&default).unwrap();
+
+            // Something that is neither a file nor a folder.
+            std::os::unix::fs::symlink("/dev/null", &default).unwrap();
+            let err = config_file_or(None, &default).unwrap_err().to_string();
+            assert!(err.contains("which is not a regular file"), "{err}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
