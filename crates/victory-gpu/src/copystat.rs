@@ -77,6 +77,14 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
     e.2 += us;
 }
 
+/// Whether the line reports the two halves of a shader-written buffer's cost
+/// apart: the bytes kept before a submission and the bytes compared after it.
+#[cfg(test)]
+pub(crate) fn reports_the_two_halves() -> bool {
+    let text = line(1.0, 0);
+    text.contains("MB kept before shaders write") && text.contains("MB compared after them")
+}
+
 fn page_faults() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
@@ -97,13 +105,37 @@ pub(crate) fn log(frames: f64) {
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
+    tracing::info!("{}", line(frames, faults));
+    let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
+    ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
+    for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery(src as *const _, &mut info, size_of_val(&info)) };
+        let kind = info.Type;
+        tracing::info!(
+            "  copied from {src:#x}+{len:#x} (memory {kind:#x}): {:.1}x/frame, {:.2} MB/frame, {:.2} ms/frame",
+            n as f64 / frames,
+            bytes as f64 / 1e6 / frames,
+            us as f64 / 1e3 / frames
+        );
+    }
+}
+
+/// The frame-rate line's copy account, over `frames` frames and `faults`
+/// page faults: the counters since the last line, per frame. Its own
+/// function so a test can read what it says.
+pub(crate) fn line(frames: f64, faults: u64) -> String {
     let c: Vec<f64> = COUNT
         .iter()
         .map(|a| a.swap(0, Relaxed) as f64 / frames)
         .collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
-    tracing::info!(
+    format!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
@@ -136,22 +168,15 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::SnapshotBytes as usize]),
         ms(c[C::SnapshotUs as usize]),
         mb(c[C::Compared as usize]),
-    );
-    let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
-    ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
-    for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
-        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        unsafe { VirtualQuery(src as *const _, &mut info, size_of_val(&info)) };
-        let kind = info.Type;
-        tracing::info!(
-            "  copied from {src:#x}+{len:#x} (memory {kind:#x}): {:.1}x/frame, {:.2} MB/frame, {:.2} ms/frame",
-            n as f64 / frames,
-            bytes as f64 / 1e6 / frames,
-            us as f64 / 1e3 / frames
-        );
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    /// The line keeps the two halves apart, so a frame's cost cannot be read
+    /// as one number again.
+    #[test]
+    fn the_copy_line_reports_the_two_halves_of_a_shader_write() {
+        assert!(super::reports_the_two_halves());
     }
 }

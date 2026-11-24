@@ -294,6 +294,18 @@ pub(crate) mod crumbs {
     }
 }
 
+/// The host GPU for a test that needs one, or `None` with a line saying the
+/// test asserted nothing. The device is made once per process, so a run whose
+/// guard test (`the_device_tests_have_a_device`) passes took no early return.
+#[cfg(test)]
+pub(crate) fn test_gpu() -> Option<&'static Host> {
+    let host = host();
+    if host.is_none() {
+        println!("skipped: no host D3D12 device, so this test asserted nothing");
+    }
+    host
+}
+
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
 /// draws nothing at seconds per frame.
@@ -2435,6 +2447,21 @@ fn pump() {
 }
 
 #[cfg(test)]
+mod device {
+    use super::host;
+
+    /// A green run must not be green because nothing ran: the device the
+    /// tests assert against is made once per process, so if it exists here it
+    /// existed for every test that early-returns without one.
+    #[test]
+    fn the_device_tests_have_a_device() {
+        assert!(
+            host().is_some() || std::env::var_os("VICTORY_TESTS_ALLOW_NO_GPU").is_some(),
+            "no host D3D12 device: every device test in this crate asserted nothing.              Set VICTORY_TESTS_ALLOW_NO_GPU=1 if that is what you meant."
+        );
+    }
+}
+
 mod cost {   // the frame log's costliest-submission accounting (diagnostics builds)
     #[cfg(feature = "diagnostics")]
     use super::{KEPT, NOTABLE_MS, Submission, keep, take_submissions};
