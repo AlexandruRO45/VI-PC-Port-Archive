@@ -423,42 +423,120 @@ impl Shadow {
         self.update_ranges(&[(address, address + len)])
     }
 
-    /// Refreshes sorted, disjoint, nonempty title ranges in this shadow.
-    /// Query write watch together when a bounded span supports it,
-    /// and copy only the requested bytes outside any pending GPU write.
-    pub(crate) fn update_ranges(&self, mut ranges: &[(usize, usize)]) -> usize {
-        let update_one = |(from, to)| {
-            self.update_outside_gpu_writes(from, to, |from, to| self.update_free(from, to))
+    /// Refresh sorted, disjoint title ranges in one preparation pass.
+    /// Subtract pending GPU writes before planning observations so all of
+    /// the readable pieces can share a fresh sample.
+    pub(crate) fn update_ranges(&self, ranges: &[(usize, usize)]) -> usize {
+        let Some((&(first, _), &(_, last))) = ranges.first().zip(ranges.last()) else {
+            return 0;
         };
-        let mut copied = 0;
-        while let Some((&(from, _), remaining)) = ranges.split_first() {
-            if remaining.is_empty() || self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
-                return copied + ranges.iter().copied().map(update_one).sum::<usize>();
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if pending.is_empty() && start <= first && first < last && last <= end {
+            return self.update_ready(ranges);
+        }
+
+        pending.sort_unstable();
+        let mut ready = Vec::with_capacity(ranges.len());
+        let mut writes = pending.as_slice();
+        for &(from, to) in ranges {
+            let (mut from, to) = (from.max(start), to.min(end));
+            while let Some((&(a, b), rest)) = writes.split_first() {
+                if from >= to || a >= to {
+                    break;
+                }
+                if b > from {
+                    if from < a {
+                        ready.push((from, a));
+                    }
+                    from = b;
+                }
+                if b >= to {
+                    break;
+                }
+                writes = rest;
             }
-            let count = Self::watch_group_len(ranges);
-            if count > 1
+            if from < to {
+                ready.push((from, to));
+            }
+        }
+        self.update_ready(&ready)
+    }
+
+    fn update_ready(&self, mut ranges: &[(usize, usize)]) -> usize {
+        let mut copied = 0;
+        let mut allocation: Option<crate::watch::Allocation> = None;
+        while let Some((&(from, to), remaining)) = ranges.split_first() {
+            if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+                return copied
+                    + ranges
+                        .iter()
+                        .map(|&(from, to)| self.update_unwatched(from, to))
+                        .sum::<usize>();
+            }
+            // Sparse requests need no allocation lookup. For dense ranges,
+            // bound the candidate group before walking it, even if the
+            // shadow spans many separate reservations.
+            if remaining.is_empty() || Self::watch_group_len(&ranges[..2]) == 1 {
+                copied += self.update_free(from, to);
+                ranges = remaining;
+                continue;
+            }
+            let page_start = from / PAGE * PAGE;
+            allocation = allocation
+                .filter(|a| a.is_live() && a.start <= page_start && page_start < a.end)
+                .or_else(|| crate::watch::allocation(page_start));
+            let limit = allocation.map_or(ranges.len(), |a| {
+                ranges.partition_point(|&(_, end)| end.div_ceil(PAGE) <= a.end / PAGE)
+            });
+            let count = Self::watch_group_len(&ranges[..limit.max(1)]);
+            let group = &ranges[..count];
+            let end = group[count - 1].1;
+            if allocation.is_some_and(|a| a.is_empty_private(page_start, end)) {
+                for &(from, to) in group {
+                    copied += self.zero_reserved(from, to);
+                }
+            } else if count > 1
                 && let Some((now, written)) =
-                    crate::watch::grouped_writes(from, ranges[count - 1].1)
+                    crate::watch::grouped_writes(from, end, self.watch_floor(from, end), allocation)
             {
                 self.watched.store(WATCHED, Ordering::Relaxed);
-                for &(from, to) in &ranges[..count] {
-                    copied += self.update_outside_gpu_writes(from, to, |from, to| {
-                        let first = written.partition_point(|&(page, _)| page < from / PAGE);
-                        self.update_watched(from, to, now, &written[first..])
-                    });
+                // One observation is shared by this group only. GPU write
+                // ranges have already been excluded, and no result survives
+                // another deferred CPU write, remap, or submission.
+                let mut written = written.as_slice();
+                for &(from, to) in group {
+                    written = &written[written.partition_point(|&(page, _)| page < from / PAGE)..];
+                    copied += self.update_watched(from, to, now, written);
                 }
             } else {
-                // Guarded views, separate allocations and failed probes
-                // still use the individual range's watch/fallback path.
-                copied += ranges[..count]
+                copied += group
                     .iter()
-                    .copied()
-                    .map(update_one)
+                    .map(|&(from, to)| self.update_free(from, to))
                     .sum::<usize>();
             }
             ranges = &ranges[count..];
         }
         copied
+    }
+
+    /// Oldest generation among still-valid bytes in the sampled pages.
+    /// Uninitialized bytes copy regardless of the journal answer.
+    fn watch_floor(&self, from: usize, to: usize) -> u64 {
+        let base = self.start as usize / PAGE;
+        let first = from / PAGE - base;
+        let last = to.div_ceil(PAGE) - base;
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let whole = copied.whole[first..last]
+            .iter()
+            .copied()
+            .filter(|&at| at != 0);
+        let partial = copied.partial.range(first..last).map(|(_, page)| page.at);
+        whole.chain(partial).min().unwrap_or(u64::MAX)
     }
 
     fn watch_group_len(ranges: &[(usize, usize)]) -> usize {
@@ -482,52 +560,15 @@ impl Shadow {
         count
     }
 
-    fn update_outside_gpu_writes(
-        &self,
-        from: usize,
-        to: usize,
-        mut update: impl FnMut(usize, usize) -> usize,
-    ) -> usize {
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (from.max(start), to.min(end));
-        if from >= to {
-            return 0;
-        }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
-        if !busy.is_empty() {
-            // Around ranges shaders are writing: the gaps, each as below
-            // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
-            busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
-                if a > at {
-                    bytes += update(at, a);
-                }
-                at = at.max(e);
-            }
-            if at < to {
-                bytes += update(at, to);
-            }
-            return bytes;
-        }
-        update(from, to)
-    }
-
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         let watched = self.watched.load(Ordering::Relaxed);
         if watched != NOT_WATCHED {
             let mut region = None;
-            if let Some((now, written)) = crate::watch::shadow_writes(from, to, &mut region) {
+            if let Some((now, written)) =
+                crate::watch::shadow_writes(from, to, self.watch_floor(from, to), &mut region)
+            {
                 self.watched.store(WATCHED, Ordering::Relaxed);
                 return self.update_watched(from, to, now, &written);
             }
@@ -573,7 +614,8 @@ impl Shadow {
                 copied += self.zero_reserved(from, end);
             } else if region.committed_private
                 && (from != first || end < to)
-                && let Some((now, written)) = crate::watch::grouped_writes(from, end)
+                && let Some((now, written)) =
+                    crate::watch::grouped_writes(from, end, self.watch_floor(from, end), None)
             {
                 self.watched.store(WATCHED, Ordering::Relaxed);
                 copied += self.update_watched(from, end, now, &written);
@@ -703,6 +745,9 @@ impl Shadow {
             let index = page - base;
             let at = copied.whole[index];
             if at != 0 && write <= at {
+                // A fresh observation covers the entire tracking page,
+                // even if the shader only requested part of it.
+                copied.whole[index] = now;
                 continue;
             }
             let lo = (page * PAGE).max(start);

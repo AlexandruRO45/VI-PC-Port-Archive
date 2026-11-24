@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -84,18 +85,164 @@ pub(crate) fn memory_region(start: usize) -> Option<MemoryRegion> {
     }
 }
 
+static MAPPING_REVISION: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+pub(crate) struct Allocation {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    private: bool,
+    empty: bool,
+    revision: u64,
+}
+
+impl Allocation {
+    pub(crate) fn is_live(self) -> bool {
+        self.revision == MAPPING_REVISION.load(Ordering::Acquire)
+    }
+
+    fn contains(self, first: usize, end: usize) -> bool {
+        self.start <= first && end <= self.end && self.is_live()
+    }
+
+    pub(crate) fn is_empty_private(self, first: usize, end: usize) -> bool {
+        self.private && self.empty && self.contains(first, end)
+    }
+}
+
+/// A Windows reservation extent, independent of individual page commitment
+/// and protection. Resolve this optionally so older Win32 providers still
+/// use the non-reset GetWriteWatch preflight.
+pub(crate) fn allocation(address: usize) -> Option<Allocation> {
+    use std::{ffi::c_void, sync::OnceLock};
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::{
+        LibraryLoader::{GetModuleHandleW, GetProcAddress},
+        Memory::{
+            MemoryRegionInfo, WIN32_MEMORY_INFORMATION_CLASS, WIN32_MEMORY_REGION_INFORMATION,
+        },
+        Threading::GetCurrentProcess,
+    };
+    use windows_sys::core::BOOL;
+
+    type Query = unsafe extern "system" fn(
+        HANDLE,
+        *const c_void,
+        WIN32_MEMORY_INFORMATION_CLASS,
+        *mut c_void,
+        usize,
+        *mut usize,
+    ) -> BOOL;
+    static QUERY: OnceLock<Option<Query>> = OnceLock::new();
+    let query = (*QUERY.get_or_init(|| {
+        // SAFETY: the strings are terminated and we look up the documented
+        // Win32 function in an already loaded system module.
+        unsafe {
+            let library = GetModuleHandleW(windows::core::w!("kernelbase.dll").as_ptr());
+            if library.is_null() {
+                return None;
+            }
+            GetProcAddress(library, c"QueryVirtualMemoryInformation".as_ptr().cast())
+                .map(|entry| std::mem::transmute::<_, Query>(entry))
+        }
+    }))?;
+    let revision = MAPPING_REVISION.load(Ordering::Acquire);
+    let mut info = WIN32_MEMORY_REGION_INFORMATION::default();
+    // SAFETY: MemoryRegionInfo writes this sized structure for our process.
+    unsafe {
+        if query(
+            GetCurrentProcess(),
+            address as *const _,
+            MemoryRegionInfo,
+            (&raw mut info).cast(),
+            size_of_val(&info),
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return None;
+        }
+        let start = info.AllocationBase as usize;
+        let end = start.checked_add(info.RegionSize)?;
+        // The Private bit is the first field of the Win32 region union.
+        let private = info.Anonymous.Anonymous._bitfield & 1 != 0;
+        (start <= address && address < end).then_some(Allocation {
+            start,
+            end,
+            private,
+            empty: info.CommitSize == 0,
+            revision,
+        })
+    }
+}
+
+const CHUNK_PAGES: usize = 64;
+
+struct ChangeChunk {
+    latest: u64,
+    pages: [u64; CHUNK_PAGES],
+}
+
+impl ChangeChunk {
+    fn new() -> Self {
+        Self {
+            latest: 0,
+            pages: [0; CHUNK_PAGES],
+        }
+    }
+}
+
 struct Journal {
     /// Numbers watch queries and remap notifications; 0 is "never".
     asked: u64,
-    /// Page number → the last recorded write or remap.
-    written: BTreeMap<usize, u64>,
+    /// Page generations indexed by chunks. A chunk's latest change lets a
+    /// reader skip all of its older entries without walking those pages.
+    changes: BTreeMap<usize, ChangeChunk>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
 }
 
+impl Journal {
+    fn record(
+        changes: &mut BTreeMap<usize, ChangeChunk>,
+        first: usize,
+        last: usize,
+        generation: u64,
+    ) {
+        for index in first / CHUNK_PAGES..last.div_ceil(CHUNK_PAGES) {
+            let base = index * CHUNK_PAGES;
+            let lo = first.saturating_sub(base);
+            let hi = (last - base).min(CHUNK_PAGES);
+            let chunk = changes.entry(index).or_insert_with(ChangeChunk::new);
+            chunk.latest = generation;
+            chunk.pages[lo..hi].fill(generation);
+        }
+    }
+
+    fn since(&self, first: usize, last: usize, after: u64) -> (u64, Vec<(usize, u64)>) {
+        let mut pages = Vec::new();
+        for (&index, chunk) in self
+            .changes
+            .range(first / CHUNK_PAGES..last.div_ceil(CHUNK_PAGES))
+            .filter(|(_, chunk)| chunk.latest > after)
+        {
+            let base = index * CHUNK_PAGES;
+            let lo = first.saturating_sub(base);
+            let hi = (last - base).min(CHUNK_PAGES);
+            pages.extend(
+                chunk.pages[lo..hi]
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &generation)| generation > after)
+                    .map(|(offset, &generation)| (base + lo + offset, generation)),
+            );
+        }
+        (self.asked, pages)
+    }
+}
+
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
-    written: BTreeMap::new(),
+    changes: BTreeMap::new(),
     found: Vec::new(),
 });
 
@@ -105,7 +252,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    query(start, end, guarded, false, None)
+    query(start, end, guarded, false, 0, None)
 }
 
 /// Export the first mapping checked for the guard fallback to buffer
@@ -113,15 +260,31 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 pub(crate) fn shadow_writes(
     start: usize,
     end: usize,
+    after: u64,
     region: &mut Option<MemoryRegion>,
 ) -> Option<(u64, Vec<(usize, u64)>)> {
-    query(start, end, true, false, Some(region))
+    query(start, end, true, false, after, Some(region))
 }
 
-/// Queries one bounded span where the individual ranges may belong to
-/// separate reservations. A failed probe leaves their dirty bits intact.
-pub(crate) fn grouped_writes(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
-    query(start, end, false, true, None)
+/// One fresh observation for a group of requested ranges. The caller
+/// uses it only within this preparation pass. When the reservation has
+/// been verified we can skip the non-reset probe across its own pages.
+pub(crate) fn grouped_writes(
+    start: usize,
+    end: usize,
+    after: u64,
+    allocation: Option<Allocation>,
+) -> Option<(u64, Vec<(usize, u64)>)> {
+    let first = start / PAGE;
+    let last = end.div_ceil(PAGE);
+    match allocation.filter(|a| a.contains(first * PAGE, last * PAGE)) {
+        Some(a) if a.private => query(start, end, false, false, after, None),
+        Some(_) => {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            j.clean_guarded(first, last, after)
+        }
+        None => query(start, end, false, true, after, None),
+    }
 }
 
 fn query(
@@ -129,6 +292,7 @@ fn query(
     end: usize,
     guarded: bool,
     preflight: bool,
+    after: u64,
     first_region: Option<&mut Option<MemoryRegion>>,
 ) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
@@ -136,6 +300,9 @@ fn query(
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    if guarded && let Some(answer) = j.clean_guarded(first, last, after) {
+        return Some(answer);
+    }
     let capacity = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(capacity.max(j.found.len()), 0);
     #[cfg(feature = "diagnostics")]
@@ -165,13 +332,17 @@ fn query(
     let (count, guarded) = match ask(WRITE_WATCH_FLAG_RESET) {
         Some(count) => (count, Vec::new()),
         None if guarded => {
-            let region = memory_region(first * PAGE)?;
-            let reserved_shadow = first_region.is_some() && region.reserved;
-            if let Some(out) = first_region {
-                *out = Some(region);
-            }
-            if !region.mapped || reserved_shadow {
-                return None;
+            // A positive section-view lookup remains valid until a runtime
+            // mapping change. Dirty guards need not rewalk the view.
+            if !guards().views.contains(&first) {
+                let region = memory_region(first * PAGE)?;
+                if let Some(out) = first_region {
+                    *out = Some(region);
+                }
+                if !region.mapped || region.reserved {
+                    return None;
+                }
+                guards().views.insert(first);
             }
             (0, guard_blocks(first * PAGE, last * PAGE))
         }
@@ -185,32 +356,49 @@ fn query(
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    let Journal { changes, found, .. } = j;
+    for page in found[..count].iter().map(|&at| at / PAGE).chain(guarded) {
+        Journal::record(changes, page, page + 1, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some(j.since(first, last, after))
+}
+
+impl Journal {
+    /// Every protected page in this interval is already tracked by our
+    /// guards. Writes, runtime write preparation, and remaps invalidate
+    /// that proof. Lock order is journal then guards, as on the slow path.
+    fn clean_guarded(
+        &mut self,
+        first: usize,
+        last: usize,
+        after: u64,
+    ) -> Option<(u64, Vec<(usize, u64)>)> {
+        if first == last || guards().clean.range(first..last).count() != last - first {
+            return None;
+        }
+        self.asked += 1;
+        Some(self.since(first, last, after))
+    }
 }
 
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
+const _: () = assert!(BLOCK == PAGE);
 
 struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
+    /// Starting blocks positively identified as section views. Remap and
+    /// allocation notices invalidate these observations.
+    views: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
+    views: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -323,11 +511,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     {
         let mut g = guards();
-        let blocks: Vec<usize> = g
-            .protected
-            .range(at / BLOCK..end.div_ceil(BLOCK))
-            .copied()
-            .collect();
+        let from = at / BLOCK;
+        let to = end.div_ceil(BLOCK);
+        forget_views(&mut g, from, to);
+        let blocks: Vec<usize> = g.protected.range(from..to).copied().collect();
         for block in blocks {
             g.protected.remove(&block);
             g.clean.remove(&block);
@@ -343,16 +530,37 @@ pub fn title_memory_allocation_changed(at: usize, len: usize) {
         && at < end
     {
         let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        // A private allocation notice can also cover a former guarded view.
+        // Keep the handler's ownership of any remaining protection, but
+        // require another observation before reusing its clean state.
+        {
+            let mut g = guards();
+            let first = at / BLOCK;
+            let last = end.div_ceil(BLOCK);
+            forget_views(&mut g, first, last);
+            while let Some(block) = g.clean.range(first..last).next().copied() {
+                g.clean.remove(&block);
+            }
+        }
         record_mapping_change(&mut journal, at, end);
     }
 }
 
-fn record_mapping_change(journal: &mut Journal, at: usize, end: usize) {
-    journal.asked += 1;
-    let now = journal.asked;
-    for page in at / PAGE..end.div_ceil(PAGE) {
-        journal.written.insert(page, now);
+fn forget_views(guards: &mut Guards, first: usize, last: usize) {
+    while let Some(block) = guards.views.range(first..last).next().copied() {
+        guards.views.remove(&block);
     }
+}
+
+fn record_mapping_change(journal: &mut Journal, at: usize, end: usize) {
+    MAPPING_REVISION.fetch_add(1, Ordering::Release);
+    journal.asked += 1;
+    Journal::record(
+        &mut journal.changes,
+        at / PAGE,
+        end.div_ceil(PAGE),
+        journal.asked,
+    );
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -488,14 +696,29 @@ pub(crate) mod tests {
             let into = unsafe { std::slice::from_raw_parts_mut((view + 100) as *mut u8, 13) };
             file.read(into).is_ok_and(|n| n == 13)
         };
-        assert!(!read(&mut file), "the kernel does not fault into our handler");
+        assert!(
+            !read(&mut file),
+            "the kernel does not fault into our handler"
+        );
         writing(view + 100, 13);
         assert!(read(&mut file));
         // SAFETY: the bytes just read.
-        assert_eq!(unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) }, b"from the disk");
-        assert_eq!(guard(view, view + 2 * BLOCK), Some((view / PAGE..view / PAGE + 1).collect()));
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) },
+            b"from the disk"
+        );
+        assert_eq!(
+            guard(view, view + 2 * BLOCK),
+            Some((view / PAGE..view / PAGE + 1).collect())
+        );
         // SAFETY: our view.
-        unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            )
+        };
         title_memory_remapped(view, 2 * BLOCK);
     }
 
@@ -564,7 +787,7 @@ pub(crate) mod tests {
                 first.0.cast::<u8>().write(1);
                 second.0.cast::<u8>().write(2);
             }
-            assert!(grouped_writes(base, next + PAGE).is_none());
+            assert!(grouped_writes(base, next + PAGE, 0, None).is_none());
             let (now, first_writes) = writes(base, next, false).unwrap();
             assert!(now > before);
             assert_eq!(first_writes, [(base / PAGE, now)]);
