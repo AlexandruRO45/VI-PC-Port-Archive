@@ -48,8 +48,31 @@ pub fn name_image(base: usize, name: &str) {
 pub fn locate(address: usize) -> String {
     match unwind::image_of(address) {
         Some((base, name)) => format!("{name}+{:#x}", address - base),
-        None => format!("{address:#x}"),
+        None => host_location(address).unwrap_or_else(|| format!("{address:#x}")),
     }
+}
+
+/// `file+offset (symbol)` of an address in our own binary or a host
+/// library, for `addr2line -e <file> <offset>`.
+fn host_location(address: usize) -> Option<String> {
+    // SAFETY: Dl_info is plain data, filled by dladdr.
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    // SAFETY: dladdr only reads the loader's tables.
+    if unsafe { libc::dladdr(address as *const libc::c_void, &mut info) } == 0
+        || info.dli_fname.is_null()
+    {
+        return None;
+    }
+    // SAFETY: dladdr gives NUL-terminated names that live as long as the module.
+    let file = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
+    let file = file.rsplit('/').next().unwrap_or_default().to_owned();
+    let mut text = format!("{file}+{:#x}", address - info.dli_fbase as usize);
+    if !info.dli_sname.is_null() {
+        // SAFETY: as above.
+        let name = unsafe { std::ffi::CStr::from_ptr(info.dli_sname) }.to_string_lossy();
+        text += &format!(" ({name})");
+    }
+    Some(text)
 }
 
 /// The calling thread's stack `[StackLimit, StackBase)` from its TEB
