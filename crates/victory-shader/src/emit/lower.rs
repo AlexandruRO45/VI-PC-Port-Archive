@@ -7218,6 +7218,74 @@ mod tests {
         }
     }
 
+    /// A lane given as a 32-bit literal, or as a negative inline constant,
+    /// is masked the same way: literal 35 or `0xFFFF_FFE3` is lane 3 of a
+    /// wave32, and -1 is the wave's top lane (31 or 63), not a lane past it.
+    #[test]
+    fn a_literal_or_negative_lane_select_wraps_as_the_hardware_does() {
+        // src1 is an inline constant (`Ok`) or the literal (`Err`) after
+        // the instruction.
+        let program = |write: Result<u32, u32>, read: Result<u32, u32>| {
+            let mut words = vec![0xBE80_0387]; // s_mov_b32 s0, 7
+            for (op, dst, src0, lane) in [(0xD761_0000, 1, 0, write), (0xD760_0000, 2, 0x101, read)]
+            {
+                let code = lane.unwrap_or(0xFF);
+                words.extend([op | dst, code << 9 | src0]);
+                if let Err(literal) = lane {
+                    words.push(literal);
+                }
+            }
+            words.extend([
+                0xBF07_8002, // s_cmp_lg_u32 s2, 0
+                0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+                0xBE83_0380, // s_mov_b32 s3, 0
+                S_ENDPGM,
+            ]);
+            words
+        };
+        let inline = |lane: u32| Ok(128 + lane);
+        for (wave64, lane, literals) in [
+            (false, 3, [35, 0xFFFF_FFE3, 0x8000_0003]),
+            (true, 3, [67, 0xFFFF_FFC3, 0x8000_0003]),
+        ] {
+            let low = dxil(&program(inline(lane), inline(lane)), wave64).unwrap();
+            assert_eq!(dxil(&program(Err(lane), Err(lane)), wave64).unwrap(), low);
+            for x in literals {
+                let at = format!("{x:#x} wave64 {wave64}");
+                assert_eq!(
+                    dxil(&program(Err(x), inline(lane)), wave64).unwrap(),
+                    low,
+                    "{at}"
+                );
+                assert_eq!(
+                    dxil(&program(inline(lane), Err(x)), wave64).unwrap(),
+                    low,
+                    "{at}"
+                );
+            }
+            assert_ne!(
+                dxil(&program(Err(lane + 1), inline(lane)), wave64).unwrap(),
+                low
+            );
+        }
+        // -1 (inline 0xC1) is lane 31 of a wave32 and lane 63 of a wave64.
+        for (wave64, top) in [(false, 31), (true, 63)] {
+            let top_lane = dxil(&program(inline(top), inline(top)), wave64).unwrap();
+            assert_eq!(
+                dxil(&program(Ok(0xC1), inline(top)), wave64).unwrap(),
+                top_lane
+            );
+            assert_eq!(
+                dxil(&program(inline(top), Ok(0xC1)), wave64).unwrap(),
+                top_lane
+            );
+            assert_eq!(
+                dxil(&program(Ok(0xC1), Ok(0xC1)), wave64).unwrap(),
+                top_lane
+            );
+        }
+    }
+
     /// Lowers a compute program with the root parameters `layout` (in user
     /// SGPRs from s0 on) and the used resources `used`.
     fn lower_with(
