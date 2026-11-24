@@ -275,7 +275,9 @@ impl Layout {
             && d.samples.is_power_of_two()
             && d.samples <= 8
             && (d.samples == 1 || (d.dimension == Dimension::Tex2d && d.mips == 1))
-            && (d.dimension != Dimension::Tex1d || d.height == 1)
+            // GFX10 permits linear, Z and render swizzles for 1D resources.
+            && (d.dimension != Dimension::Tex1d
+                || (d.height == 1 && !d.swizzle.standard() && !d.swizzle.display()))
             && (d.dimension != Dimension::Tex3d
                 || matches!(d.swizzle.0, 0 | 5 | 9 | 17 | 21 | 24..=27));
         if !valid {
@@ -851,6 +853,22 @@ mod tests {
             let mut deep = desc(1, 1, 1, 16, swizzle);
             deep.depth = u32::MAX;
             assert_eq!(Layout::new(&deep), Err(Error::Invalid));
+        }
+    }
+
+    #[test]
+    fn one_dimensional_textures_require_a_supported_swizzle() {
+        let mut d = Desc {
+            dimension: Dimension::Tex1d,
+            ..desc(32, 1, 1, 4, Swizzle::LINEAR)
+        };
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_Z_X, Swizzle::SW_64KB_R_X] {
+            d.swizzle = swizzle;
+            assert!(Layout::new(&d).is_ok(), "{swizzle:?}");
+        }
+        for swizzle in [Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
+            d.swizzle = swizzle;
+            assert_eq!(Layout::new(&d), Err(Error::Invalid), "{swizzle:?}");
         }
     }
 
