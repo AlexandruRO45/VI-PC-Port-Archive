@@ -1426,6 +1426,9 @@ impl Drop for Resource {
                 self.data() as u64,
             );
         }
+        if let Some(copy) = self.host.take() {
+            crate::host::retire(copy);
+        }
     }
 }
 
