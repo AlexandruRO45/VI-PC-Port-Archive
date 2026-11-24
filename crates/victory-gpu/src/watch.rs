@@ -176,12 +176,35 @@ struct Guards {
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
+    /// Local build: blocks found entirely unmapped (holes of the tile heap: 132 MB of them). A
+    /// copy reads them as zeros, once; they are not asked about again until the runtime maps or
+    /// unmaps memory there (`title_memory_remapped`). Before, every asking called them written,
+    /// and each refresh read them anew (a failing read, region queries, zero fill).
+    holes: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
+    holes: BTreeSet::new(),
 });
+
+/// `VICTORY_HOLE_MEMO=0` turns the memory of holes off.
+fn remember_holes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HOLE_MEMO").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Whether block `block` is entirely unmapped (not committed anywhere in it).
+fn is_hole(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let at = block * BLOCK;
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State != MEM_COMMIT && info.BaseAddress as usize + info.RegionSize >= at + BLOCK
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -205,7 +228,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     for block in first..=last {
-        let open = block < last && !g.clean.contains(&block);
+        let hole = block < last && g.holes.contains(&block);
+        #[cfg(feature = "diagnostics")]
+        if hole {
+            crate::copystat::add(crate::copystat::C::HoleSkips, 1);
+        }
+        let open = block < last && !hole && !g.clean.contains(&block);
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
@@ -250,6 +278,8 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     for block in from..to {
         if set(block, block + 1) {
             note(g, block, block + 1);
+        } else if remember_holes() && is_hole(block) {
+            g.holes.insert(block);
         }
     }
 }
@@ -296,6 +326,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    let holes: Vec<usize> = g.holes.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
+    for block in holes {
+        g.holes.remove(&block);
     }
 }
 
