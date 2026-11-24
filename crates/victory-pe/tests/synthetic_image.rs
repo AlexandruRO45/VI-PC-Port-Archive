@@ -521,7 +521,7 @@ fn tls_directory_without_callbacks_or_without_an_rva() {
 }
 
 #[test]
-fn tls_callback_array_stops_at_the_end_of_the_section() {
+fn rejects_tls_callback_array_without_a_terminator() {
     // The last slot of the section, with no null terminator after it.
     let last = SECTION_RVA + SECTION_SIZE - 8;
     let mut d = image();
@@ -531,8 +531,10 @@ fn tls_callback_array_stops_at_the_end_of_the_section() {
         IMAGE_BASE + u64::from(last),
     );
     put64(&mut d, at(last), IMAGE_BASE + 0x1030);
-    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
-    assert_eq!(tls.callback_rvas, [0x1030]);
+    assert!(matches!(
+        ImageInfo::parse(&d),
+        Err(PeError::Malformed(message)) if message == "unterminated TLS callback array"
+    ));
 }
 
 #[test]
