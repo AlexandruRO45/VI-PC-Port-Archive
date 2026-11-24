@@ -220,6 +220,8 @@ impl Shadow {
             return;
         }
         let mut snapshots = snapshots();
+        let started = std::time::Instant::now();
+        let mut kept_bytes = 0;
         for (from, to) in gaps {
             // SAFETY: inside the mapping.
             let host = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
@@ -227,8 +229,16 @@ impl Shadow {
             snapshots.bytes.extend_from_slice(host);
             snapshots.parts += 1;
             before.push(Part { from, to, at });
+            kept_bytes += to - from;
         }
         before.sort_unstable_by_key(|p| p.from);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::SnapshotBytes, kept_bytes as u64);
+            add(C::SnapshotUs, started.elapsed().as_micros() as u64);
+        }
+        let _ = kept_bytes;
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -261,6 +271,8 @@ impl Shadow {
                     at += n;
                     continue;
                 };
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::Compared, n as u64);
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy

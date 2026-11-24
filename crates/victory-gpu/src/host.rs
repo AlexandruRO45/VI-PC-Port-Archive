@@ -1309,14 +1309,18 @@ impl HostList {
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         // Timing alone needs the texts and the stamps; the marker commands
         // are for the device-removed report, so they stay behind it.
+        // Naming every command costs a string per command: that is the price
+        // of the names, and a run that measures a frame's time with timing on
+        // pays it on both sides of the comparison.
         let timed = timing();
         if !timed && !dred_on() {
             return;
         }
-        let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+        let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let at = notes.len() as u32;
         if timed
-            && let Some((heap, _)) = self.stamps()
             && at < STAMPS - 1
+            && let Some((heap, _)) = self.stamps()
         {
             // SAFETY: an open list and our query heap.
             unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
@@ -1330,10 +1334,7 @@ impl HostList {
                 self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
             };
         }
-        self.notes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((what, range));
+        notes.push((what, range));
     }
 
     /// Notes a pipeline the list binds.
@@ -1873,32 +1874,29 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
+                // The submissions and the copy stats cover this whole window
+                // (the log fires every few seconds), not the one-second
+                // frame-rate window `frames` counts.
+                let window = std::mem::take(&mut self.copy_stats_frames) as f64;
                 let (total, slow) = take_submissions();
-                if let Some(worst) = slow.first() {
+                tracing::info!(
+                    "submissions per frame: {:.1}, {:.1} of them over {NOTABLE_MS} ms",
+                    total as f64 / window,
+                    slow.len() as f64 / window,
+                );
+                for s in &slow {
                     tracing::info!(
-                        "submissions per frame: {:.1}, {:.1} of them over {NOTABLE_MS} ms; costliest \
-                         {:.1} ms with {} lists, {} commands, {} draws, {} dispatches",
-                        total as f64 / frames,
-                        slow.len() as f64 / frames,
-                        worst.ms as f64,
-                        worst.lists,
-                        worst.commands,
-                        worst.draws,
-                        worst.dispatches,
+                        "  costliest submission {} ms, {} lists, {} commands, {} draws, {} \
+                         dispatches: {}",
+                        s.ms,
+                        s.lists,
+                        s.commands,
+                        s.draws,
+                        s.dispatches,
+                        s.pipelines
                     );
-                    for s in &slow {
-                        tracing::info!(
-                            "  submission {} ms, {} lists, {} commands, {} draws, {} dispatches: {}",
-                            s.ms,
-                            s.lists,
-                            s.commands,
-                            s.draws,
-                            s.dispatches,
-                            s.pipelines
-                        );
-                    }
                 }
-                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                crate::copystat::log(window);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",

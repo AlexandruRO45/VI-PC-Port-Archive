@@ -79,10 +79,15 @@ ratio. The shape is not an artefact of one build.
 
 1. **Declare the GPU-written ranges once per frame, not once per submission**
    (`Shadow::writing`/`copy_back`). The world declares the same big heap
-   dozens of times per frame; snapshots are ~244 ms/frame and the compare is
-   ~350 ms/frame for the same bytes. Halving the declared bytes halves both.
-   Correctness rests on `watch::writes` reporting CPU writes between
-   submissions, which is already the path's own assumption.
+   dozens of times per frame. The frame log now splits that cost in two
+   (`{:.1} MB kept before shaders write in {:.1} ms, {:.1} MB compared after
+   them` on the `copies per frame` line): keeping the before-bytes is a
+   memcpy per declared range per submission, and it goes away entirely once
+   the copy kept across submissions is updated in `copy_back` instead of
+   discarded. The **compare survives** — it is the price of not knowing which
+   bytes a shader wrote, and declaring a range once per frame does not tell
+   us that; only an incremental compare could, and that needs the GPU's own
+   write ranges.
 2. **Ship the frame log's per-submission breakdown** (this branch): it names
    the costliest submissions with their pipelines, draws, dispatches and
    command counts, and on a device removal it dumps the timings of the list
@@ -121,6 +126,12 @@ marker; the two are now independent).
 To price the copy machinery itself, run the same command with
 `VICTORY_COPY_MODE=none` in `-Set` (copies and refreshes skipped, timing
 only) and compare `ms/frame`: the difference is the whole copy share.
+
+Naming commands is not free: with `VICTORY_GPU_TIMING` on, every draw,
+dispatch and transition builds its own description and takes the note lock, so
+a frame measured with timing on carries that CPU cost. Compare `ms/frame`
+with timing on in *both* runs (one of them with `VICTORY_GPU_TIMING=1
+VICTORY_SKIP_PIPELINES=<hash>`), never against a run with timing off.
 
 ## What is still blocked
 
