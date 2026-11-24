@@ -45,13 +45,10 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     };
     // A container stored as is inside a record's packed bytes (deflate
     // stored blocks) is that record's, already counted.
-    let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| !sgd5::in_record(&records, offset))
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
-            offset,
-            data: &data[offset..],
-        })
+    // So is one kept in a part of another container stored as is.
+    let raw = victory_shader::dxbc::find_all(data, |offset| sgd5::in_record(&records, offset))
+        .into_iter()
+        .map(|(offset, data)| Source::Raw { offset, data })
         .collect::<Vec<_>>();
     let mut out: Vec<Source<'_>> = records.into_iter().map(Source::Packed).collect();
     out.extend(raw);
