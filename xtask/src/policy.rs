@@ -2011,6 +2011,49 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// Git trims only unescaped trailing spaces from a rule and never
+    /// normalizes the path it spells: `/tab\t` keeps its tab, so it ignores
+    /// `tab\t` and leaves `tab` visible; `/two\ \ ` keeps both escaped
+    /// spaces, so `two  ` is taken and `two` refused; and `./dot/` and
+    /// `/dbl//` match nothing, so `dot` and `dbl` stay visible and are
+    /// refused, left empty.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_matched_by_rules_trimmed_only_of_spaces() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(
+            root.join(".gitignore"),
+            "/tab\t\n/two\\ \\ \n./dot/\n/dbl//\n",
+        )
+        .unwrap();
+        let tab = root.join("tab");
+        let tabbed = root.join("tab\t");
+        let two = root.join("two");
+        let spaced = root.join("two  ");
+        let dot = root.join("dot");
+        let dbl = root.join("dbl");
+        for dir in [&tab, &tabbed, &two, &spaced, &dot, &dbl] {
+            std::fs::create_dir(dir).unwrap();
+        }
+
+        let tmp = tempdir_in_first(root, [tab.clone(), dot.clone(), tabbed.clone()]);
+        assert_eq!(tmp.path().parent(), Some(tabbed.as_path()));
+        let tmp_two = tempdir_in_first(root, [two.clone(), dbl.clone(), spaced.clone()]);
+        assert_eq!(tmp_two.path().parent(), Some(spaced.as_path()));
+        for dir in [&tab, &two, &dot, &dbl] {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        for dir in [tmp.path(), tmp_two.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        std::fs::write(tab.join("a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(dot.join("b.rs"), b"fn b() {}\n").unwrap();
+        assert_eq!(names(root, false), [".gitignore", "dot/b.rs", "tab/a.rs"]);
+        super::run(root, false).unwrap();
+    }
+
     /// A `core.excludesFile` set in the checkout's own `.git/config`, and
     /// kept outside the checkout, is an ignore source the full check reads
     /// as well: a TMPDIR ignored only there is taken, while a directory it
