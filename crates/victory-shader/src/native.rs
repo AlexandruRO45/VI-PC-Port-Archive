@@ -741,22 +741,22 @@ fn user_data_dwords(stage: HwStage) -> u32 {
     }
 }
 
-/// Whether every SGPR a root parameter states (a root descriptor's high
-/// half included) is one of the stage's user-data registers. A parameter
-/// stating no SGPRs (a fixed sampler) takes none.
+/// Whether every SGPR a root parameter takes ([`sgpr_span`]: a root
+/// descriptor's high half included) is one of the stage's user-data
+/// registers. Only a fixed sampler stating no SGPRs takes none: a table,
+/// heap or constants entry stating none still names its first SGPR, which
+/// lowering reads as user data (a table's address) like any other.
 fn params_in_user_data(stage: HwStage, layout: &[RootParam]) -> bool {
     layout.iter().all(|p| {
-        let span = match p.root {
-            RootType::Descriptor => p.sgprs.max(2),
-            _ => p.sgprs,
-        };
+        let (_, span) = sgpr_span(stage, p);
         span == 0 || u64::from(p.user_data) + u64::from(span) <= u64::from(user_data_dwords(stage))
     })
 }
 
-/// Whether no SGPR holds two root parameters: each covers its stated
-/// SGPRs (none for, say, a fixed sampler), a root descriptor also the high
-/// half resource tracking reads after its first. Only the ranges of one
+/// Whether no SGPR holds two root parameters: each covers the SGPRs it
+/// takes ([`sgpr_span`]: none only for a fixed sampler stating none, at
+/// least its first for any other kind, and a root descriptor also the high
+/// half resource tracking reads after its first). Only the ranges of one
 /// table (one slot, one table address SGPR) may share; a slot number alone
 /// does not make two entries one parameter, as a table range and constants
 /// stating the same slot would still be read as whichever comes first.
@@ -764,11 +764,7 @@ fn params_apart(stage: HwStage, layout: &[RootParam]) -> bool {
     // The layout was checked first, so every covered SGPR is below `SGPRS`.
     let mut owner = [None; SGPRS as usize];
     layout.iter().all(|p| {
-        let (first, _) = sgpr_span(stage, p);
-        let span = match p.root {
-            RootType::Descriptor => p.sgprs.max(2),
-            _ => p.sgprs,
-        };
+        let (first, span) = sgpr_span(stage, p);
         let key = (p.slot, p.root, first);
         (first..first + span).all(|s| match owner[s as usize].replace(key) {
             None => true,
@@ -3634,6 +3630,51 @@ mod tests {
         blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
         let count = params.len() as u32;
         blob[record + RECORD_COUNTS..][..4].copy_from_slice(&count.to_le_bytes());
+    }
+
+    #[test]
+    fn an_entry_stating_no_sgprs_still_takes_its_first_unless_a_fixed_sampler() {
+        let (constants, table, sampler, resource_heap, sampler_heap) = (0, 3, 4, 5, 6);
+        // A table, heap or constants entry stating no SGPRs names its first
+        // one all the same: lowering reads a table's address from it and
+        // declares the user data up to it, so it must be user data and its
+        // own. In a pixel program dword 31 is the last of the 32.
+        for root in [constants, table, resource_heap, sampler_heap] {
+            assert!(program(&[(root, 0, 31, 1)]).is_ok(), "kind {root}");
+            for (params, why) in [
+                (&[(root, 0, 32, 1)][..], "root parameter past the user data"),
+                (
+                    &[(constants, 1, 4, 0), (root, 0, 4, 1)],
+                    "root parameters share an SGPR",
+                ),
+                (
+                    &[(root, 0, 4, 1), (constants, 1, 4, 0)],
+                    "root parameters share an SGPR",
+                ),
+            ] {
+                assert_eq!(why_refused(program(params)), why, "kind {root}: {params:?}");
+            }
+            // Next to it, the following SGPR is free.
+            assert!(program(&[(root, 0, 4, 1), (constants, 1, 5, 0)]).is_ok());
+        }
+        // A fixed sampler stating none takes none, so it may sit past the
+        // user data (in the SGPRs) and share an SGPR with anything.
+        assert!(program(&[(sampler, 0, 32, 1)]).is_ok());
+        assert!(program(&[(constants, 1, 4, 0), (sampler, 0, 4, 1)]).is_ok());
+        // Ranges of one table stating none share its address SGPR, as ranges
+        // stating one do; another table there does not.
+        assert!(program(&[(table, 0, 4, 1), (table, 1, 4, 1), (table, 0, 4, 1)]).is_ok());
+        assert_eq!(
+            why_refused(program(&[(table, 0, 4, 1), (table, 0, 4, 2)])),
+            "root parameters share an SGPR"
+        );
+        // Compute has 16 user-data dwords and runs the same rule.
+        let cs = |params: &[(u32, u32, u8, u8)]| stage_layout(HwStage::Cs, params);
+        assert!(cs(&[(table, 0, 15, 1)]).is_ok());
+        assert_eq!(
+            why_refused(cs(&[(table, 0, 16, 1)])),
+            "root parameter past the user data"
+        );
     }
 
     #[test]
