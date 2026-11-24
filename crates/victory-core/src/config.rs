@@ -3,10 +3,11 @@
 //! Resolution order for each value: environment variable, then the config
 //! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default.
 //! A variable that is set but empty counts as unset. Relative paths in the
-//! config file are relative to the file, not to the working directory.
+//! config file are relative to the file, not to the working directory. A
+//! leading `~` in a path (from the file or a variable) is the home directory.
 //! See `victory.example.toml` at the repository root.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -50,9 +51,13 @@ impl FileConfig {
     /// the directory holding the config file. With `VICTORY_CONFIG` pointing
     /// elsewhere, `cache_dir = "cache"` then means the folder next to that
     /// file, not one under whatever directory the tool was started from
-    /// (often the repository, which the asset policy refuses).
-    fn anchored_at(self, dir: &Path) -> FilePaths {
-        let anchor = |p: PathBuf| if p.is_relative() { dir.join(p) } else { p };
+    /// (often the repository, which the asset policy refuses). A path that
+    /// starts with `~` is under `home` instead, when there is one.
+    fn anchored_at(self, dir: &Path, home: Option<&Path>) -> FilePaths {
+        let anchor = |p: PathBuf| {
+            let p = expand_home(p, home);
+            if p.is_relative() { dir.join(p) } else { p }
+        };
         let paths = self.paths;
         FilePaths {
             game_dir: paths.game_dir.map(anchor),
@@ -89,7 +94,8 @@ impl Config {
                 let parsed: FileConfig =
                     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
                 let dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
-                (Some(path), parsed.anchored_at(&dir))
+                let home = home_dir(|k| std::env::var_os(k));
+                (Some(path), parsed.anchored_at(&dir, home.as_deref()))
             }
             None => (None, FilePaths::default()),
         };
@@ -101,10 +107,19 @@ impl Config {
         source: Option<PathBuf>,
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Self> {
-        let env_path = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+        // A quoted `VICTORY_GAME_DIR="~/games"` reaches us unexpanded.
+        let home = home_dir(&env);
+        let expand = |p: PathBuf| expand_home(p, home.as_deref());
+        let env_path = |k: &str| {
+            env(k)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .map(expand)
+        };
         let test_titles = match env("VICTORY_TEST_TITLES").filter(|v| !v.is_empty()) {
             Some(v) => std::env::split_paths(&v)
                 .filter(|p| !p.as_os_str().is_empty())
+                .map(expand)
                 .collect(),
             None => file.test_titles,
         };
@@ -147,6 +162,35 @@ fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     ensure_outside_repo(&dir)?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
+}
+
+/// The user's home directory: `HOME`, else `USERPROFILE` (Windows), when
+/// set to an absolute path.
+fn home_dir(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(|k| env(k).map(PathBuf::from))
+        .find(|p| p.is_absolute())
+}
+
+/// `~` and `~/rest` (`~\rest` on Windows) under `home`. Neither TOML nor a
+/// quoted shell value expands `~`, so without this `game_dir = "~/games"`
+/// would name a folder called `~`. `~user` is left alone, and so is
+/// everything when there is no home directory.
+fn expand_home(path: PathBuf, home: Option<&Path>) -> PathBuf {
+    let Some(home) = home else { return path };
+    let mut parts = path.components();
+    match parts.next() {
+        Some(Component::Normal(first)) if first == "~" => {
+            let rest = parts.as_path();
+            if rest.as_os_str().is_empty() {
+                home.to_path_buf()
+            } else {
+                home.join(rest)
+            }
+        }
+        _ => path,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -325,7 +369,7 @@ mod tests {
         );
         let parsed: FileConfig = toml::from_str(&text).unwrap();
         let dir = PathBuf::from(abs("configs"));
-        let paths = parsed.anchored_at(&dir);
+        let paths = parsed.anchored_at(&dir, None);
         assert_eq!(paths.game_dir.unwrap(), dir.join("game"));
         // Absolute paths are kept as written.
         assert_eq!(paths.cache_dir.unwrap(), PathBuf::from(abs("elsewhere")));
@@ -337,8 +381,60 @@ mod tests {
     fn the_default_config_file_keeps_paths_as_written() {
         // `./victory.toml` has an empty parent, so nothing changes.
         let parsed: FileConfig = toml::from_str("[paths]\ngame_dir = 'game'\n").unwrap();
-        let paths = parsed.anchored_at(Path::new(""));
+        let paths = parsed.anchored_at(Path::new(""), None);
         assert_eq!(paths.game_dir.unwrap(), PathBuf::from("game"));
+    }
+
+    #[test]
+    fn a_leading_tilde_is_the_home_directory() {
+        let home = PathBuf::from(abs("home"));
+        let h = Some(home.as_path());
+        assert_eq!(expand_home("~".into(), h), home);
+        assert_eq!(expand_home("~/games/gta".into(), h), home.join("games/gta"));
+        // Only a whole leading `~` component counts.
+        assert_eq!(expand_home("~user/x".into(), h), PathBuf::from("~user/x"));
+        assert_eq!(expand_home("a/~/b".into(), h), PathBuf::from("a/~/b"));
+        // Without a home directory nothing changes.
+        assert_eq!(expand_home("~/x".into(), None), PathBuf::from("~/x"));
+    }
+
+    #[test]
+    fn tilde_in_the_file_is_home_not_next_to_the_file() {
+        let parsed: FileConfig =
+            toml::from_str("[paths]\ngame_dir = '~/games/gta'\ntest_titles = ['~/t']\n").unwrap();
+        let home = PathBuf::from(abs("home"));
+        let paths = parsed.anchored_at(&PathBuf::from(abs("configs")), Some(&home));
+        assert_eq!(paths.game_dir.unwrap(), home.join("games/gta"));
+        assert_eq!(paths.test_titles, vec![home.join("t")]);
+    }
+
+    #[test]
+    fn tilde_in_variables_is_home() {
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let titles = format!("~/one{sep}~/two");
+        let env = |k: &str| match k {
+            "VICTORY_GAME_DIR" => Some(OsString::from("~/games/gta")),
+            "VICTORY_CACHE_DIR" => Some(OsString::from("~")),
+            "VICTORY_TEST_TITLES" => Some(OsString::from(&titles)),
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        let cfg = Config::resolve(FilePaths::default(), None, env).unwrap();
+        let home = PathBuf::from(abs("home"));
+        assert_eq!(cfg.game_dir.unwrap(), home.join("games/gta"));
+        assert_eq!(cfg.cache_dir, home);
+        assert_eq!(cfg.test_titles, vec![home.join("one"), home.join("two")]);
+    }
+
+    #[test]
+    fn home_dir_falls_back_to_userprofile_and_skips_relative() {
+        let env = |k: &str| match k {
+            "HOME" => Some(OsString::from("relative")),
+            "USERPROFILE" => Some(abs("profile")),
+            _ => None,
+        };
+        assert_eq!(home_dir(env), Some(PathBuf::from(abs("profile"))));
+        assert_eq!(home_dir(|_: &str| None), None);
     }
 
     #[test]

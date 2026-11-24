@@ -2,7 +2,8 @@
 # Every path must be OUTSIDE the repository; the tools refuse otherwise.
 # Environment variables (shown below) take precedence over this file.
 # VICTORY_CONFIG selects a different config file.
-# Relative paths here are relative to this file. An empty variable counts as unset.
+# Relative paths here are relative to this file; a leading ~ is your home folder.
+# An empty variable counts as unset.
 
 [paths]
 # Your own dump of Grand Theft Auto VI.     env: VICTORY_GAME_DIR
