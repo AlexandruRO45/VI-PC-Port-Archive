@@ -111,38 +111,38 @@ struct File {
 }
 
 enum Source {
-    /// On disk, at this path.
-    Worktree(PathBuf),
+    /// On disk, at `path`. `index` is the object id of the blob the index
+    /// holds for it, if any: the content that stays in the repository, and
+    /// in the next commit, while the file is missing from disk.
+    Worktree {
+        path: PathBuf,
+        index: Option<String>,
+    },
     /// Staged: the index entry's mode and object id.
     Index { mode: String, oid: String },
 }
 
-/// The content to check; `Ok(None)` if there is nothing to check (a tracked
-/// file deleted from the working tree), `Err` with the problem if a path the
-/// check cannot read must not pass unread.
+/// The content to check; `Ok(None)` if there is nothing to check (a file
+/// gone from both the working tree and the index), `Err` with the problem if
+/// a path the check cannot read must not pass unread.
 fn read(root: &Path, file: &File) -> Result<Option<Vec<u8>>, String> {
     match &file.source {
         Source::Index { mode, .. } if mode == "160000" => {
             Err("a submodule: content from another repository bypasses this check".to_owned())
         }
-        Source::Index { oid, .. } => {
-            // By object id, not `:<path>`, so no file name can make it fail.
-            let out = git_command(root)
-                .args(["cat-file", "blob", oid])
-                .output()
-                .map_err(|e| format!("cannot run git: {e}"))?;
-            if out.status.success() {
-                Ok(Some(out.stdout))
-            } else {
-                Err("cannot read the staged content".to_owned())
-            }
-        }
-        Source::Worktree(path) => {
+        Source::Index { oid, .. } => read_blob(root, oid).map(Some),
+        Source::Worktree { path, index } => {
             // Not `metadata`: that follows a symlink, and git stores a
             // symlink's target path, not what it points to.
             let kind = match std::fs::symlink_metadata(path) {
                 Ok(meta) => meta.file_type(),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                // Deleted but not `git rm`ed, or left out of a sparse
+                // checkout: the index still holds the file, and a plain
+                // `git commit` keeps it. Committed with `--no-verify` and
+                // then removed, it used to pass the full check unread.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return index.as_deref().map(|oid| read_blob(root, oid)).transpose();
+                }
                 Err(e) => return Err(format!("cannot read: {e}")),
             };
             if kind.is_symlink() {
@@ -167,6 +167,20 @@ fn read(root: &Path, file: &File) -> Result<Option<Vec<u8>>, String> {
                 .map(Some)
                 .map_err(|e| format!("cannot read: {e}"))
         }
+    }
+}
+
+/// A blob's content. By object id, not `:<path>`, so no file name can make
+/// it fail.
+fn read_blob(root: &Path, oid: &str) -> Result<Vec<u8>, String> {
+    let out = git_command(root)
+        .args(["cat-file", "blob", oid])
+        .output()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        Err("cannot read the indexed content".to_owned())
     }
 }
 
@@ -372,28 +386,34 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<File>> {
         ],
     )? {
         // A submodule is a directory on disk, or nothing if not checked out;
-        // only the index says what it is.
-        let submodules: Vec<Vec<u8>> = git_z(root, &["ls-files", "-z", "--stage"])?
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|entry| {
-                let tab = entry.iter().position(|&b| b == b'\t')?;
-                entry
-                    .starts_with(b"160000 ")
-                    .then(|| entry[tab + 1..].to_vec())
-            })
-            .collect();
+        // only the index says what it is. Each entry is
+        // `<mode> <oid> <stage>\t<path>`; a conflicted path has several,
+        // and any one of them is content the check must see.
+        let index: std::collections::HashMap<Vec<u8>, (String, String)> =
+            git_z(root, &["ls-files", "-z", "--stage"])?
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|entry| {
+                    let tab = entry.iter().position(|&b| b == b'\t')?;
+                    let header = std::str::from_utf8(&entry[..tab]).ok()?;
+                    let mut parts = header.split(' ');
+                    let (mode, oid) = (parts.next()?.to_owned(), parts.next()?.to_owned());
+                    Some((entry[tab + 1..].to_vec(), (mode, oid)))
+                })
+                .collect();
         let mut files: Vec<File> = fields
             .iter()
             .map(|raw| {
                 let (name, utf8_name, on_disk) = decode(root, raw);
-                let source = if submodules.contains(raw) {
-                    Source::Index {
-                        mode: "160000".to_owned(),
+                let source = match index.get(raw) {
+                    Some((mode, _)) if mode == "160000" => Source::Index {
+                        mode: mode.clone(),
                         oid: String::new(),
-                    }
-                } else {
-                    Source::Worktree(on_disk)
+                    },
+                    entry => Source::Worktree {
+                        path: on_disk,
+                        index: entry.map(|(_, oid)| oid.clone()),
+                    },
                 };
                 File {
                     name,
@@ -417,7 +437,10 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<File>> {
             Some(File {
                 name: relative.to_string_lossy().replace('\\', "/"),
                 utf8_name: relative.to_str().is_some(),
-                source: Source::Worktree(e.path().to_owned()),
+                source: Source::Worktree {
+                    path: e.path().to_owned(),
+                    index: None,
+                },
             })
         })
         .collect())
@@ -983,6 +1006,50 @@ mod tests {
             Some(&b"MZ\x90\0"[..])
         );
         assert!(super::run(root, false).is_err());
+    }
+
+    /// A tracked file missing from disk is still in the index, and a plain
+    /// `git commit` keeps it; the full check reads it from there. Committed
+    /// with `--no-verify` and then deleted, or hidden from a sparse checkout,
+    /// it used to pass unread.
+    #[cfg(unix)]
+    #[test]
+    fn tracked_files_missing_from_disk_are_read_from_the_index() {
+        let tmp = tempdir();
+        let root = tmp.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join("a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(root.join("game.rs"), b"MZ\x90\0binary").unwrap();
+        git_str(root, &["add", "a.rs", "game.rs"]);
+        git_str(root, &["commit", "-q", "--no-verify", "-m", "x"]);
+
+        std::fs::remove_file(root.join("game.rs")).unwrap();
+        assert_eq!(names(root, false), ["a.rs", "game.rs"]);
+        assert!(super::run(root, false).is_err(), "deleted, not staged");
+
+        git_str(root, &["update-index", "--skip-worktree", "game.rs"]);
+        assert!(
+            super::run(root, false).is_err(),
+            "outside the sparse checkout"
+        );
+        git_str(root, &["update-index", "--no-skip-worktree", "game.rs"]);
+
+        // Removed from the index too: nothing of it is left to check.
+        git_str(root, &["rm", "-q", "--cached", "game.rs"]);
+        assert_eq!(names(root, false), ["a.rs"]);
+        super::run(root, false).unwrap();
+
+        // A deleted symlink is read as the target path git stores.
+        let target = format!("{}/x", "a".repeat(super::MAX_ENCODED_RUN));
+        std::os::unix::fs::symlink(&target, root.join("link.rs")).unwrap();
+        git_str(root, &["add", "link.rs"]);
+        std::fs::remove_file(root.join("link.rs")).unwrap();
+        let files = super::list_files(root, false).unwrap();
+        let link = files.iter().find(|f| f.name == "link.rs").unwrap();
+        assert_eq!(
+            super::read(root, link).unwrap().as_deref(),
+            Some(target.as_bytes())
+        );
     }
 
     /// A submodule pulls in another repository's content, which no check
