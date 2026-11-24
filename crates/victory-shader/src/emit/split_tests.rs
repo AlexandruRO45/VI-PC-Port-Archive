@@ -428,3 +428,27 @@ fn saveexec_scc_tests_new_exec_not_saved_exec() {
     ];
     console_flow_case("saveexec SCC tests new EXEC", &body, 64, |_| 42);
 }
+
+/// A loop that runs while `s_and_saveexec` leaves a lane: SCC is the new
+/// EXEC, so the wave leaves when its last lane does. Lane t stays for t + 1
+/// iterations and s9 counts the wave's: 64. Branching on the saved EXEC
+/// ran the loop once more, with no lane in it.
+#[test]
+fn loops_leave_on_the_new_exec_of_saveexec() {
+    let body = [
+        0xD760_000E,
+        0x0001_1500, // v_readlane_b32 s14, v0, 10 (takes the console flow)
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0xBE8A_047E, // s_mov_b64 s[10:11], exec
+        0xBE89_0380, // s_mov_b32 s9, 0
+        // loop:
+        0x8009_8109, // s_add_u32 s9, s9, 1
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D82_0280, // v_cmp_lt_u32 vcc, 0, v1
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF85_FFFB, // s_cbranch_scc1 loop
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("a loop leaving on saveexec's SCC", &body, 64, |_| 64);
+}
