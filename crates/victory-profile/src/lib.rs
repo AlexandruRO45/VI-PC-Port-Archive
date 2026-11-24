@@ -10,6 +10,10 @@
 //! Off, every hook is one relaxed load of a flag. On, a hook is a few
 //! relaxed atomic adds on a [`Stat`] its call site looked up once.
 //!
+//! `VICTORY_PROFILE_OVERLAY=1` (or `VICTORY_PROFILE=overlay`) turns it on
+//! with an on-screen panel as well, which F3 shows and hides; see
+//! [`overlay`].
+//!
 //! ```ignore
 //! victory_profile::scope!("hle", "ReadFile", len);      // times the block
 //! victory_profile::count!("gpu", "upload buffer", size); // counts bytes
@@ -20,6 +24,7 @@
 
 mod memory;
 mod out;
+pub mod overlay;
 pub mod stats;
 
 use std::collections::BTreeMap;
@@ -50,7 +55,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// What the variables ask for.
 #[derive(Debug, Clone, PartialEq)]
 struct Settings {
-    /// `VICTORY_PROFILE=<dir>` (anything but `1`): where the files go.
+    /// `VICTORY_PROFILE=<dir>` (anything but `1` or `overlay`): where the
+    /// files go.
     dir: Option<PathBuf>,
     /// `VICTORY_PROFILE_INTERVAL=<seconds>` between summaries (default 5).
     interval: Duration,
@@ -97,7 +103,7 @@ impl Settings {
             .collect();
         dumps.sort();
         Settings {
-            dir: (!matches!(profile, "" | "1")).then(|| PathBuf::from(profile)),
+            dir: (!matches!(profile, "" | "1" | "overlay")).then(|| PathBuf::from(profile)),
             interval: positive(interval)
                 .map_or(d.interval, |s| Duration::from_secs_f64(s.max(0.5))),
             hitch_ms: positive(hitch_ms).unwrap_or(d.hitch_ms),
@@ -117,12 +123,19 @@ fn settings() -> &'static Settings {
 }
 
 /// Turns profiling on if `VICTORY_PROFILE` is set: `1` for the logged
-/// summaries, a folder for the files as well. Call once, early.
+/// summaries, a folder for the files as well, `overlay` for the summaries
+/// and the on-screen panel (as `VICTORY_PROFILE_OVERLAY=1` alone does).
+/// Call once, early.
 pub fn init() {
-    let Ok(profile) = std::env::var("VICTORY_PROFILE") else {
+    let var = |name: &str| std::env::var(name).ok();
+    let profile = var("VICTORY_PROFILE");
+    let overlay = overlay::wanted(
+        profile.as_deref(),
+        var("VICTORY_PROFILE_OVERLAY").as_deref(),
+    );
+    let Some(profile) = profile.or_else(|| overlay.then(|| "1".to_owned())) else {
         return;
     };
-    let var = |name: &str| std::env::var(name).ok();
     let s = Settings::parse(
         &profile,
         var("VICTORY_PROFILE_INTERVAL").as_deref(),
@@ -153,6 +166,10 @@ pub fn init() {
         }
     }
     ON.store(true, Relaxed);
+    if overlay {
+        overlay::enable();
+        tracing::info!(target: "victory_profile", "profile overlay on; F3 shows and hides it");
+    }
     tracing::info!(
         target: "victory_profile",
         interval_s = s.interval.as_secs_f64(),
@@ -1017,6 +1034,7 @@ mod tests {
         assert_eq!(s.interval, Duration::from_millis(500));
         assert_eq!(s.hitch_ms, 50.0);
         assert_eq!(s.trace_min_ns, 100_000);
+        assert_eq!(Settings::parse("overlay", None, None, None, None).dir, None);
     }
 
     #[test]
