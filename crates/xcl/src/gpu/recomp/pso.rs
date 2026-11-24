@@ -143,7 +143,7 @@ pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_w
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
-    if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
+    if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) || !int64_typed_atomic() {
         return compile_one();
     }
     static CACHE: OnceLock<Mutex<ShaderCache>> = OnceLock::new();
@@ -517,7 +517,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
         let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
-        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, int64_typed_atomic: int64_typed_atomic(), ..Default::default() })?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
             return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -545,7 +545,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, int64_typed_atomic: int64_typed_atomic(), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -627,6 +627,37 @@ fn wave_range(device: &ID3D12Device) -> Option<(u32, u32)> {
     }
     .ok()
     .map(|_| (options.WaveLaneCountMin, options.WaveLaneCountMax))
+}
+
+/// Whether the device supports SM 6.6 64-bit integer atomics on typed UAVs accessed through
+/// `ResourceDescriptorHeap` (`OPTIONS9::AtomicInt64OnTypedResourceSupported` and
+/// `OPTIONS11::AtomicInt64OnDescriptorHeapResourceSupported`).
+pub fn int64_typed_atomic_for_device(device: &ID3D12Device) -> bool {
+    let mut o9 = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+    let mut o11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+    unsafe {
+        device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &mut o9 as *mut _ as _, std::mem::size_of_val(&o9) as u32)
+            .is_ok()
+            && o9.AtomicInt64OnTypedResourceSupported.as_bool()
+            && device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS11, &mut o11 as *mut _ as _, std::mem::size_of_val(&o11) as u32)
+                .is_ok()
+            && o11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
+    }
+}
+
+/// Whether the active runtime D3D12 device supports 64-bit typed image atomics through
+/// `ResourceDescriptorHeap`. Defaults to `true` when no runtime device exists (CLI / offline).
+pub fn int64_typed_atomic() -> bool {
+    let raw = crate::hle::d3d12x::real::device_raw();
+    if raw.is_null() {
+        return true;
+    }
+    unsafe {
+        let dev: Option<&ID3D12Device> = windows::core::Interface::from_raw_borrowed(&raw);
+        dev.is_none_or(int64_typed_atomic_for_device)
+    }
 }
 
 pub fn wave32_only_for_device(device: &ID3D12Device) -> bool {
