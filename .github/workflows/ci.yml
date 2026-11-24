@@ -25,9 +25,55 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        shell: pwsh
+        run: |
+          $out = & cargo clippy --workspace --all-targets --locked --message-format=json -- -D warnings 2>&1
+          $code = $LASTEXITCODE
+          foreach ($line in $out) {
+            try {
+              $obj = $line | ConvertFrom-Json -ErrorAction Stop
+              if ($obj.reason -eq 'compiler-message' -and ($obj.message.level -eq 'error' -or $obj.message.level -eq 'warning')) {
+                $span = $obj.message.spans | Where-Object { $_.is_primary } | Select-Object -First 1
+                $file = if ($span) { $span.file_name } else { 'Cargo.toml' }
+                $ln = if ($span) { $span.line_start } else { 1 }
+                $msg = ($obj.message.rendered -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')
+                Write-Output "::error file=$file,line=$ln::$msg"
+              }
+            } catch {
+              Write-Output $line
+            }
+          }
+          exit $code
       - name: Clippy, diagnostics build
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        shell: pwsh
+        run: |
+          $out = & cargo clippy --workspace --all-targets --all-features --locked --message-format=json -- -D warnings 2>&1
+          $code = $LASTEXITCODE
+          foreach ($line in $out) {
+            try {
+              $obj = $line | ConvertFrom-Json -ErrorAction Stop
+              if ($obj.reason -eq 'compiler-message' -and ($obj.message.level -eq 'error' -or $obj.message.level -eq 'warning')) {
+                $span = $obj.message.spans | Where-Object { $_.is_primary } | Select-Object -First 1
+                $file = if ($span) { $span.file_name } else { 'Cargo.toml' }
+                $ln = if ($span) { $span.line_start } else { 1 }
+                $msg = ($obj.message.rendered -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')
+                Write-Output "::error file=$file,line=$ln::$msg"
+              }
+            } catch {
+              Write-Output $line
+            }
+          }
+          exit $code
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
-        run: cargo test --workspace --locked
+        shell: pwsh
+        run: |
+          $out = & cargo test --workspace --locked 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Output $_ }
+          if ($code -ne 0) {
+            $fail = ($out | Select-String -Pattern 'FAILED|panicked at|error\[' -Context 0,4 | Out-String)
+            $msg = ($fail.Substring(0, [Math]::Min($fail.Length, 3500)) -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')
+            Write-Output "::error file=Cargo.toml,line=1::$msg"
+          }
+          exit $code
