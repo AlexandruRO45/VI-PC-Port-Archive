@@ -6211,6 +6211,12 @@ impl<'a> Lower<'a> {
             &self.s.outputs
         };
         let by_kind = |kind: u8| outputs.iter().position(|o| o.kind == kind);
+        // Register component `ch` of element `id`, as the element's own
+        // column; `None` for a component the element does not cover.
+        let column = |id: usize, ch: u8| {
+            let o = &outputs[id];
+            (ch >= o.col && ch < o.col + o.cols).then(|| (id, ch - o.col))
+        };
         // 16-bit vertex outputs: the halves each dword carries, as (output
         // element, channel, high half) per channel.
         let halves = match e.target {
@@ -6251,11 +6257,15 @@ impl<'a> Lower<'a> {
                 break;
             }
             let found = match e.target {
+                // The export's channels are the register's components. A
+                // narrower element (a `float2` target) has columns only for
+                // its own; the rest went out as columns past it, and DXC's
+                // validator refuses a `storeOutput` outside its element.
                 Target::Color(n) => outputs
                     .iter()
                     .position(|o| o.kind == 16 && o.row == Some(u32::from(n)))
-                    .map(|id| (id, ch)),
-                Target::Position(0) => by_kind(3).map(|id| (id, ch)),
+                    .and_then(|id| column(id, ch)),
+                Target::Position(0) => by_kind(3).and_then(|id| column(id, ch)),
                 Target::Depth => match ch {
                     0 => by_kind(17)
                         .or(by_kind(18))

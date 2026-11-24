@@ -1174,6 +1174,69 @@ mod tests {
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
 
+    /// A pixel shader exporting all four channels of `mrt0` to an
+    /// `SV_Target` narrower than a row. The export's channels are register
+    /// components; ones the element does not cover were stored as columns
+    /// past it (z and w of a `float2`), which DXC's validator refuses, and
+    /// the emitted `OSG1` claimed them written.
+    #[test]
+    fn a_colour_export_stays_inside_its_element() {
+        // v_mov_b32 v0, 1.0; exp mrt0 v0, v0, v0, v0 done; s_endpgm
+        let words = [0x7E00_02F2u32, 0xF800_080F, 0x0000_0000, 0xBF81_0000];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        // The emitted `OSG1` row's mask and never-written mask.
+        let masks = |col: u8, cols: u8| {
+            let target = SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col,
+                cols,
+                usage: 0,
+                half: false,
+            };
+            let osg1 = super::container::signature(&[target], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1[..])]);
+            let c = Container::parse(&bytes).unwrap();
+            let shader = emit(&c, &native, &p, &st, &io, &res).expect("a colour export");
+            let c = Container::parse(&shader.dxil).unwrap();
+            let osg1 = c.part(FourCC::OSG1).unwrap().data;
+            (osg1[8 + 24], osg1[8 + 25])
+        };
+        // Every component the element has is written, and only those: the
+        // never-written mask is exactly the components it lacks.
+        for (col, cols, mask) in [
+            (0, 4, 0xF),
+            (0, 3, 0x7),
+            (0, 2, 0x3),
+            (0, 1, 0x1),
+            (2, 2, 0xC),
+            (3, 1, 0x8),
+        ] {
+            assert_eq!(masks(col, cols), (mask, !mask & 0xF), "{mask:#x}");
+        }
+    }
+
     /// A vertex shader reading its vertex id. The console signature leaves
     /// the id out, so lowering gives it the row after the last one the
     /// signature uses. After r31 that row is r32, past the 32 registers
