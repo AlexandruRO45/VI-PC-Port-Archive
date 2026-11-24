@@ -86,6 +86,19 @@ fn probe_dll() -> Option<PathBuf> {
     Some(dll)
 }
 
+/// A stand-in title DLL: `version.dll` from the system directory. Built from
+/// `%SystemRoot%` (Windows may not be on `C:`); the copy names both paths if
+/// it fails.
+fn copy_stand_in_dll(to: &Path) {
+    let windows = std::env::var_os("SystemRoot")
+        .filter(|p| !p.is_empty())
+        .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+    let from = windows.join("System32").join("version.dll");
+    if let Err(e) = std::fs::copy(&from, to) {
+        panic!("copying {} to {}: {e}", from.display(), to.display());
+    }
+}
+
 extern "system" fn fake_xgameruntime_initialize() -> i32 {
     0x1234
 }
@@ -181,11 +194,7 @@ fn loads_binds_and_calls_probe() {
 
     // The "title" ships victory-probe-title.dll: any real DLL will do.
     let title_dir = tempfile::tempdir().unwrap();
-    std::fs::copy(
-        r"C:\Windows\System32\version.dll",
-        title_dir.path().join("victory-probe-title.dll"),
-    )
-    .unwrap();
+    copy_stand_in_dll(&title_dir.path().join("victory-probe-title.dll"));
     let dlls =
         victory_loader::load_title_dlls(image.info(), title_dir.path(), dir.path(), &|_| true)
             .unwrap();
@@ -302,11 +311,7 @@ fn maps_a_title_dll_the_title_loads_itself() {
     let title_dir = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     // Any real DLL will do; it imports only host DLLs, which are not in the folder.
-    std::fs::copy(
-        r"C:\Windows\System32\version.dll",
-        title_dir.path().join("Late.dll"),
-    )
-    .unwrap();
+    copy_stand_in_dll(&title_dir.path().join("Late.dll"));
     let load = |name: &str, wanted: &dyn Fn(&str) -> bool| {
         victory_loader::load_title_dll(name, title_dir.path(), cache.path(), wanted).unwrap()
     };
