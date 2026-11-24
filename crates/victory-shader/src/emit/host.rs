@@ -1004,6 +1004,28 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_impl(root, pso, d, None)
+    }
+
+    /// Runs a mesh pipeline with `groups` mesh thread groups and returns each
+    /// UAV's contents in heap order.
+    pub fn dispatch_mesh(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        groups: u32,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_impl(root, pso, d, Some(groups))
+    }
+
+    fn dispatch_impl(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        mesh: Option<u32>,
+    ) -> Result<Vec<Vec<u32>>, String> {
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
@@ -1334,15 +1356,32 @@ impl Host {
                 dev.CreateSampler(s, at);
             }
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
-            list.SetComputeRootSignature(root);
+            // A mesh pipeline is a graphics pipeline, so its root arguments
+            // go through the graphics root signature.
+            if mesh.is_some() {
+                list.SetGraphicsRootSignature(root);
+            } else {
+                list.SetComputeRootSignature(root);
+            }
             for (param, arg) in &d.roots {
                 match arg {
-                    Root::Constants(data) => list.SetComputeRoot32BitConstants(
-                        *param,
-                        data.len() as u32,
-                        data.as_ptr().cast(),
-                        0,
-                    ),
+                    Root::Constants(data) => {
+                        if mesh.is_some() {
+                            list.SetGraphicsRoot32BitConstants(
+                                *param,
+                                data.len() as u32,
+                                data.as_ptr().cast(),
+                                0,
+                            )
+                        } else {
+                            list.SetComputeRoot32BitConstants(
+                                *param,
+                                data.len() as u32,
+                                data.as_ptr().cast(),
+                                0,
+                            )
+                        }
+                    }
                     Root::Table { sampler, index } => {
                         let (h, size) = if *sampler {
                             (&samplers, sampler_size)
@@ -1351,12 +1390,22 @@ impl Host {
                         };
                         let mut at = h.GetGPUDescriptorHandleForHeapStart();
                         at.ptr += (index * size) as u64;
-                        list.SetComputeRootDescriptorTable(*param, at);
+                        if mesh.is_some() {
+                            list.SetGraphicsRootDescriptorTable(*param, at);
+                        } else {
+                            list.SetComputeRootDescriptorTable(*param, at);
+                        }
                     }
                     Root::View { srv, data } => {
                         let b = upload(data)?;
                         let va = b.GetGPUVirtualAddress();
-                        if *srv {
+                        if mesh.is_some() {
+                            if *srv {
+                                list.SetGraphicsRootShaderResourceView(*param, va);
+                            } else {
+                                list.SetGraphicsRootConstantBufferView(*param, va);
+                            }
+                        } else if *srv {
                             list.SetComputeRootShaderResourceView(*param, va);
                         } else {
                             list.SetComputeRootConstantBufferView(*param, va);
@@ -1365,8 +1414,16 @@ impl Host {
                     }
                 }
             }
-            let [x, y, z] = d.groups;
-            list.Dispatch(x, y, z);
+            match mesh {
+                Some(groups) => {
+                    let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
+                    list6.DispatchMesh(groups, 1, 1);
+                }
+                None => {
+                    let [x, y, z] = d.groups;
+                    list.Dispatch(x, y, z);
+                }
+            }
             for (r, size, n, rb) in &uavs {
                 // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
