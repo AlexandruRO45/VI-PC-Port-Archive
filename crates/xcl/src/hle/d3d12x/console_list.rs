@@ -341,28 +341,35 @@ unsafe fn field(obj: usize, at: usize) -> *mut usize {
     (obj + at) as *mut usize
 }
 
-/// start a fresh record chunk (the previous one keeps what was written)
-unsafe fn new_chunk(obj: usize, st: &mut ListState) {
+/// start a fresh record chunk of at least `min_bytes + SLACK` bytes (the previous one keeps what was written)
+unsafe fn new_chunk_of(obj: usize, st: &mut ListState, min_bytes: usize) {
     if let Some(last) = st.chunks.last_mut() {
         last.1 = *field(obj, F_WRITE) - last.0.as_ptr() as usize;
     }
-    let c = vec![0u8; CHUNK].into_boxed_slice();
+    let cap = CHUNK.max(min_bytes.saturating_add(SLACK));
+    let c = vec![0u8; cap].into_boxed_slice();
     let start = c.as_ptr() as usize;
     st.chunks.push((c, 0));
     *field(obj, F_WRITE) = start;
-    *field(obj, F_END) = start + CHUNK - SLACK;
-    *field(obj, F_DISPATCH_END) = start + CHUNK - SLACK;
+    *field(obj, F_END) = start + cap - SLACK;
+    *field(obj, F_DISPATCH_END) = start + cap - SLACK;
+}
+
+/// start a fresh record chunk (the previous one keeps what was written)
+unsafe fn new_chunk(obj: usize, st: &mut ListState) {
+    new_chunk_of(obj, st, 0);
 }
 
 /// append a record (methods: the same encodings the inline code writes)
 unsafe fn push(obj: usize, words: &[u32]) {
+    let Some(bytes) = words.len().checked_mul(4) else { return };
     let w = *field(obj, F_WRITE);
-    if w + 4 * words.len() > *field(obj, F_END) + SLACK / 2 {
-        with_list(obj, |st| new_chunk(obj, st));
+    if w.checked_add(bytes).is_none_or(|end| end > *field(obj, F_END) + SLACK / 2) {
+        with_list(obj, |st| new_chunk_of(obj, st, bytes));
     }
     let w = *field(obj, F_WRITE);
     std::ptr::copy_nonoverlapping(words.as_ptr(), w as *mut u32, words.len());
-    *field(obj, F_WRITE) = w + 4 * words.len();
+    *field(obj, F_WRITE) = w + bytes;
 }
 
 fn header(i: usize) -> u32 {
@@ -422,20 +429,30 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
 
 unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, pso: *mut c_void) -> HRESULT {
     let obj = this as usize;
-    let Some((pc, old_alloc, blocks)) = with_list(obj, |st| {
+    let Some(pc) = with_list(obj, |st| st.pc) else {
+        return crate::util::E_FAIL;
+    };
+    let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
+    let hr = f(pc, allocator, pc_pso(pso));
+    if hr < 0 {
+        return hr;
+    }
+    let Some((old_alloc, blocks)) = with_list(obj, |st| {
         st.chunks.clear();
         st.arena = Default::default();
-        (st.pc, std::mem::replace(&mut st.allocator, allocator as usize), std::mem::take(&mut st.uma))
+        let old = std::mem::replace(&mut st.allocator, allocator as usize);
+        let uma = std::mem::take(&mut st.uma);
+        new_chunk(obj, st);
+        (old, uma)
     }) else {
         return crate::util::E_FAIL;
     };
     // what the previous recording left in unified memory lives until its allocator resets
-    if !blocks.is_empty() {
-        PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(old_alloc).or_default().extend(blocks);
+    hold_until_reset(old_alloc, blocks);
+    if !pso.is_null() {
+        cl_set_pipeline_state(this, pso);
     }
-    with_list(obj, |st| new_chunk(obj, st));
-    let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
-    f(pc, allocator, pc_pso(pso))
+    hr
 }
 
 unsafe extern "system" fn cl_dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
@@ -464,7 +481,7 @@ unsafe extern "system" fn cl_set_root_constant(this: *mut c_void, i: u32, value:
     push(this as usize, &[header(i as usize) + 4 * offset, value]);
 }
 unsafe extern "system" fn cl_set_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
-    if n == 0 {
+    if n == 0 || data.is_null() {
         return;
     }
     let mut w = vec![header(i as usize) + 4 * offset + ((n - 1) << 16)];
@@ -1006,5 +1023,72 @@ mod tests {
         let l = layout_from_blob(&rts0(&[(1, 2), (2, 0), (0, 0)])).unwrap();
         let args: Vec<u8> = [1u32, 2, 0x5000, 4, 0x80].iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(user_data_gfx(&l, &args, 0x200), vec![0x200, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0x5000, 4, 0x80]);
+    }
+
+    #[test]
+    fn cl_reset_preserves_state_on_pc_failure_and_records_initial_pso_on_success() {
+        use std::sync::atomic::AtomicI32;
+        static NEXT_HR: AtomicI32 = AtomicI32::new(0);
+        unsafe extern "system" fn fake_release(_this: *mut c_void) -> u32 {
+            0
+        }
+        unsafe extern "system" fn fake_reset(_this: *mut c_void, _alloc: *mut c_void, _pso: *mut c_void) -> HRESULT {
+            NEXT_HR.load(Ordering::Acquire)
+        }
+        let mut vt = [0usize; 16];
+        vt[2] = fake_release as usize;
+        vt[10] = fake_reset as usize;
+        let fake_pc = [vt.as_ptr() as usize];
+        let fake_pso_pc = [vt.as_ptr() as usize];
+        unsafe {
+            let list = create_with_allocator(fake_pc.as_ptr() as *mut c_void, 0x1111 as *mut c_void);
+            let pso = wrap_pso(fake_pso_pc.as_ptr() as *mut c_void, true, 0);
+            cl_dispatch(list, 1, 2, 3);
+            let before = recorded_words(list);
+            assert_eq!(before, vec![DISPATCH, 1, 2, 3]);
+
+            // Failed PC Reset must not wipe the recorded command stream.
+            NEXT_HR.store(crate::util::E_FAIL, Ordering::Release);
+            assert_eq!(cl_reset(list, 0x2222 as *mut c_void, pso), crate::util::E_FAIL);
+            assert_eq!(recorded_words(list), before, "failed cl_reset must preserve recorded stream");
+
+            // Successful PC Reset with non-null initial PSO must emit the PIPE_MARKER packet.
+            NEXT_HR.store(S_OK, Ordering::Release);
+            assert_eq!(cl_reset(list, 0x2222 as *mut c_void, pso), S_OK);
+            let after = recorded_words(list);
+            assert_eq!(after.len(), 7, "cl_reset with initial PSO must record its 7-word PIPE_MARKER packet");
+            assert_eq!(after[0], PIPE_MARKER);
+            assert_eq!((after[2] as usize) | ((after[3] as usize) << 32), pso as usize);
+
+            // Clean up without leaking.
+            pso_release(pso);
+            cl_release(list);
+        }
+    }
+
+    #[test]
+    fn push_oversized_record_and_null_root_constants_are_safe() {
+        unsafe extern "system" fn fake_release(_this: *mut c_void) -> u32 {
+            0
+        }
+        let mut vt = [0usize; 16];
+        vt[2] = fake_release as usize;
+        let fake_pc = [vt.as_ptr() as usize];
+        unsafe {
+            let list = create_with_allocator(fake_pc.as_ptr() as *mut c_void, 0x3333 as *mut c_void);
+            // Null data pointer with n > 0 must be ignored rather than dereferenced.
+            cl_set_root_constants(list, 0, 4, std::ptr::null(), 0);
+            assert!(recorded_words(list).is_empty());
+
+            // A record larger than CHUNK must grow the chunk instead of overflowing the heap buffer.
+            let big = vec![0xA5A5_5A5Au32; CHUNK / 4 + 64];
+            push(list as usize, &big);
+            let words = recorded_words(list);
+            assert_eq!(words.len(), big.len());
+            assert_eq!(words[0], 0xA5A5_5A5A);
+            assert_eq!(words[words.len() - 1], 0xA5A5_5A5A);
+
+            cl_release(list);
+        }
     }
 }
