@@ -1289,6 +1289,51 @@ mod tests {
     }
 
     #[test]
+    fn bc5_endpoint_and_index_references_cross_the_history_boundary() {
+        let mut t = Tables::parse(&tables()).unwrap();
+        t.bc5[0].ep[..4].copy_from_slice(&[1, 2, 3, 4]);
+        t.bc5[254].ix[..16].fill(7);
+        t.bc5[254].ix[16..].fill(3);
+
+        let mut records = vec![vec![0; 24]; 258];
+        // Index distance 255 plus endpoint delta +2 wraps to distance 1.
+        // At block zero these select opposite ends of the dictionary.
+        records[0][..4].copy_from_slice(&[2, 0, 15, 15]);
+        records[1][4..8].copy_from_slice(&[20, 40, 60, 80]);
+        // Only the first red pixel has a nonzero index in block 2.
+        records[2][8] = 1;
+        // Block 256 copies block 1. Block 257 takes its endpoints from
+        // block 256 (now in slot zero) and its indices from block 2.
+        records[256][..4].copy_from_slice(&[0, 0, 15, 15]);
+        records[257][..4].copy_from_slice(&[2, 0, 15, 15]);
+
+        let widths = [3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5];
+        let src = stream(&t, &widths, 2, &records);
+        let mut dst = vec![0; 16 * records.len()];
+        decode(5, &src, &mut dst, &t).unwrap();
+
+        // BC5 stores two BC4 blocks. Six bytes per channel hold sixteen
+        // little-endian 3-bit codes, here all 1 for red and 4 for green.
+        let dictionary = [
+            129, 130, 0x49, 0x92, 0x24, 0x49, 0x92, 0x24, // red
+            131, 132, 0x24, 0x49, 0x92, 0x24, 0x49, 0x92, // green
+        ];
+        let endpoints = [138, 148, 0, 0, 0, 0, 0, 0, 158, 168, 0, 0, 0, 0, 0, 0];
+        let empty = [128, 128, 0, 0, 0, 0, 0, 0, 128, 128, 0, 0, 0, 0, 0, 0];
+        for (i, block) in dst.chunks_exact(16).enumerate() {
+            let mut expected = match i {
+                0 => dictionary,
+                1 | 256 | 257 => endpoints,
+                _ => empty,
+            };
+            if i == 2 || i == 257 {
+                expected[2] = 2;
+            }
+            assert_eq!(block, expected, "BC5 block {i}");
+        }
+    }
+
+    #[test]
     fn lanes_take_bytes_in_schedule_order_and_long_fragments() {
         let t = Tables::parse(&tables()).unwrap();
         // Many blocks: long fragments (over 256 payload bytes) on the wide lanes.
