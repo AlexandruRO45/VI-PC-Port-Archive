@@ -239,27 +239,29 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 
 /// The format of a texture the host GPU renders to or writes as unordered
 /// access, for the title's `format`. The console's GPU does both with the
-/// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115), and
-/// the title has full-screen targets in both; a host that refuses either use
-/// (NVIDIA) refused the whole texture, so every pass that wrote it drew
-/// nothing. There 8-bit RGBA stands in: the same channels in the same
-/// order, every 4-bit level exact and every 5-bit level within 1/510.
+/// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115), and on Series S
+/// with R9G9B9E5_SHAREDEXP (67); a host that refuses either use (NVIDIA)
+/// refused the whole texture — and `CreateGraphicsPipelineState` with
+/// R9G9B9E5 as an RTV format removes the host device with
+/// `DXGI_ERROR_INVALID_CALL` (0x887A0001). There 8-bit RGBA (28) stands in
+/// for the 16-bit colour formats and R11G11B10_FLOAT (26, same 32-bit
+/// unsigned HDR RGB domain with alpha reading 1.0) stands in for R9G9B9E5.
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
 /// shortcut: copies between such a target and a texture the title fills
-/// itself in the 16-bit format are skipped ([`stands_in`]); convert them
+/// itself in the original format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 26)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; STAND_INS.len()]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
-            STAND_INS.map(|(f, _)| {
+            STAND_INS.map(|(f, stand_in)| {
                 let Some(host) = crate::host::host() else {
                     return false;
                 };
@@ -279,7 +281,11 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
-                    tracing::info!(format = f, "the host does not render to this format: 8-bit RGBA stands in");
+                    tracing::info!(
+                        format = f,
+                        stand_in,
+                        "the host does not render to this format: stand-in format used"
+                    );
                 }
                 refused
             })

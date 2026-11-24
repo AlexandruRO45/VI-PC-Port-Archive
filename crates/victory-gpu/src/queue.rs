@@ -585,13 +585,26 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// `D3D12XBOX_PRESENT_PLANE_PARAMETERS` (72 bytes = 0x48): frame token,
+/// buffer count, resource pointers, optional source/dest rects, color space,
+/// scale filter, extended descs, and MPO blend flags.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
+    _pad0: u32,
     resources: *const This,
+    src_rects: *const [i32; 4],
+    dst_rects: *const [i32; 4],
+    color_space: u32,
+    scale_filter: u32,
+    extended_count: u32,
+    _pad1: u32,
+    extended_descs: *const u8,
+    flags: u32,
+    _pad2: u32,
 }
+const _: () = assert!(size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -816,24 +829,85 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        let count = (planes as usize).min(crate::host::MAX_PRESENT_PLANES);
+        let mut entries: Vec<(
+            This,
+            &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+            u32,
+            Option<[i32; 4]>,
+            bool,
+        )> = Vec::with_capacity(count);
+        for i in 0..count {
+            // SAFETY: the title passes `planes` `Plane` (72-byte) descriptors.
+            let Some(plane) = (unsafe { plane_parameters.add(i).as_ref() }) else {
+                break;
+            };
+            if plane.count == 0 || plane.resources.is_null() {
+                continue;
+            }
+            // SAFETY: `plane.resources` holds `plane.count` resource pointers.
+            let resource = unsafe { *plane.resources };
+            let Some(texture) = crate::resource::host_resource(resource) else {
+                continue;
+            };
+            let src_rect = if !plane.src_rects.is_null() {
+                let mut bytes = [0u8; 16];
+                if crate::host::read_into(plane.src_rects.cast::<u8>(), &mut bytes) {
+                    let r = [
+                        i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                        i32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+                        i32::from_ne_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+                        i32::from_ne_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+                    ];
+                    (r[0] >= 0 && r[1] >= 0 && r[2] > r[0] && r[3] > r[1]).then_some(r)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let straight_alpha = (plane.flags & 0x2) != 0;
+            let state_probe = if count == 1 { COPY_SOURCE } else { PIXEL_SHADER_RESOURCE };
+            let state = crate::resource::host_transition(resource, state_probe)
+                .map_or(state_probe, |(_, before)| before);
+            entries.push((resource, texture, state, src_rect, straight_alpha));
+        }
+        if !entries.is_empty() {
+            let shown = if entries.len() == 1
+                && entries[0].3.is_none_or(|r| {
+                    // SAFETY: live host resource.
+                    let d = unsafe { entries[0].1.GetDesc() };
+                    r == [0, 0, d.Width as i32, d.Height as i32]
+                })
+            {
+                host.present(entries[0].1, entries[0].2, frame)
+            } else {
+                let present_planes: Vec<crate::host::PresentPlane<'_>> = entries
+                    .iter()
+                    .map(|&(_, texture, state, src_rect, straight_alpha)| {
+                        crate::host::PresentPlane {
+                            texture,
+                            state,
+                            src_rect,
+                            straight_alpha,
+                        }
+                    })
+                    .collect();
+                host.present_planes(&present_planes, frame)
+            };
+            for &(resource, _, state, _, _) in &entries {
+                crate::resource::host_transition(resource, state);
+            }
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, entries[0].0, entries[0].2, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = shown;
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);

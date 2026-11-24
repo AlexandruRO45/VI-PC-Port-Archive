@@ -49,7 +49,19 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
-    let title_dir = exe.parent().unwrap_or(Path::new("."));
+    let exe_dir = exe.parent().unwrap_or(Path::new("."));
+    let title_dir = if exe_dir.join("MicrosoftGame.config").is_file() {
+        exe_dir
+    } else if let Some(game_dir) = cfg
+        .game_dir
+        .as_deref()
+        .filter(|d| d.join("MicrosoftGame.config").is_file())
+    {
+        println!("package dir    {}", game_dir.display());
+        game_dir
+    } else {
+        exe_dir
+    };
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
