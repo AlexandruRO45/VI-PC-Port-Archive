@@ -121,19 +121,24 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
 static ORIG_NT_TERMINATE: AtomicUsize = AtomicUsize::new(0);
 static ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+fn begin_termination(h: isize, ending: &std::sync::atomic::AtomicBool, wine: impl FnOnce() -> bool, write_report: impl FnOnce()) -> bool {
+    if (h != 0 && h != -1) || ending.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    // Wine does not deliver the executable's process-detach TLS callback.
+    if wine() {
+        write_report();
+    }
+    true
+}
 /// ntdll!NtTerminateProcess: the process ending (ExitProcess, abort()'s _exit(3),
 /// TerminateProcess of itself) is logged once – status, the calls that led there and, when the
 /// status is not 0, every other thread – and the log written out. abort() leaves no other
 /// trace: the buffered log lines went with the process.
 unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 {
-    if (h == 0 || h == -1) && !ENDING.swap(true, Ordering::AcqRel) {
+    if begin_termination(h, &ENDING, crate::util::under_wine, || crate::report::write_final(None)) {
         let probe = 0usize;
         let (tid, stack) = (windows_sys::Win32::System::Threading::GetCurrentThreadId(), stack_callers_n(&probe as *const usize as usize, 16));
-        if crate::util::under_wine() {
-            // Under Wine, an exe's TLS callbacks never receive DLL_PROCESS_DETACH at process exit (#1461).
-            // Write the final report before NtTerminateProcess terminates the process.
-            crate::report::write_final(None);
-        }
         if status != 0 {
             crate::xlog_error!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}");
             dump_threads();
@@ -1158,9 +1163,17 @@ mod tests {
     }
 
     #[test]
-    fn terminate_process_report_invocation_is_safe_under_wine() {
-        // Under Wine, hk_nt_terminate_process triggers write_final(None) at process termination (#1461).
-        // Verify write_final(None) executes cleanly without panic, even in uninitialized test environments.
-        crate::report::write_final(None);
+    fn termination_reports_once_for_the_current_process_under_wine() {
+        use std::sync::atomic::AtomicBool;
+        let ending = AtomicBool::new(false);
+        let writes = std::cell::Cell::new(0);
+        let report = || writes.set(writes.get() + 1);
+        assert!(!begin_termination(42, &ending, || panic!("other process"), report));
+        assert!(begin_termination(-1, &ending, || true, report));
+        assert!(!begin_termination(0, &ending, || true, report));
+        assert_eq!(writes.get(), 1);
+        let windows = AtomicBool::new(false);
+        assert!(begin_termination(0, &windows, || false, report));
+        assert_eq!(writes.get(), 1);
     }
 }
