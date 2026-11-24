@@ -242,7 +242,11 @@ mod tests {
             assert_eq!(p as usize % 16, 0);
             assert_eq!(HeapSize(heap, 0, p), n);
             // SAFETY: n zeroed bytes.
-            assert!(unsafe { std::slice::from_raw_parts(p.cast::<u8>(), n) }.iter().all(|&b| b == 0));
+            assert!(
+                unsafe { std::slice::from_raw_parts(p.cast::<u8>(), n) }
+                    .iter()
+                    .all(|&b| b == 0)
+            );
             assert_eq!(HeapFree(heap, 0, p), 1);
         }
         let a = alloc(100, 256, true);
@@ -264,7 +268,10 @@ mod tests {
         let bytes = unsafe { std::slice::from_raw_parts(q, 1000) };
         assert!(bytes[..10].iter().all(|&b| b == 0xAB) && bytes[10..].iter().all(|&b| b == 0));
         // Shrinking in place works; growing past the block does not.
-        assert_eq!(HeapReAlloc(heap, HEAP_REALLOC_IN_PLACE_ONLY, q.cast(), 3), q.cast());
+        assert_eq!(
+            HeapReAlloc(heap, HEAP_REALLOC_IN_PLACE_ONLY, q.cast(), 3),
+            q.cast()
+        );
         assert_eq!(HeapSize(heap, 0, q.cast()), 3);
         assert!(HeapReAlloc(heap, HEAP_REALLOC_IN_PLACE_ONLY, q.cast(), 1 << 20).is_null());
         assert!(HeapReAlloc(heap, 0, std::ptr::null_mut(), 8).is_null());

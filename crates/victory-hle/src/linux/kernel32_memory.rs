@@ -202,7 +202,12 @@ mod tests {
 
     #[test]
     fn the_win32_surface_reports_through_the_last_error() {
-        let p = VirtualAlloc(std::ptr::null_mut(), 0x2000, vm::MEM_COMMIT, vm::PAGE_READWRITE);
+        let p = VirtualAlloc(
+            std::ptr::null_mut(),
+            0x2000,
+            vm::MEM_COMMIT,
+            vm::PAGE_READWRITE,
+        );
         assert!(!p.is_null());
         let mut info = MemoryBasicInformation::default();
         assert_eq!(VirtualQuery(p, &mut info, 48), 48);
@@ -213,7 +218,10 @@ mod tests {
         let mut old = 0;
         assert_eq!(VirtualProtect(p, 1, vm::PAGE_READONLY | 0x800, &mut old), 1);
         assert_eq!(old, vm::PAGE_READWRITE);
-        assert_eq!(VirtualProtect(p, 1, vm::PAGE_READWRITE, std::ptr::null_mut()), 0);
+        assert_eq!(
+            VirtualProtect(p, 1, vm::PAGE_READWRITE, std::ptr::null_mut()),
+            0
+        );
         assert_eq!(last_error(), ERROR_NOACCESS);
         // `old` inside the pages made read-only is left alone.
         let inside = p.cast::<u32>();
