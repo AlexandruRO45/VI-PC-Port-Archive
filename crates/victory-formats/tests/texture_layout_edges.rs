@@ -209,3 +209,89 @@ fn copies_accept_exact_buffers_and_refuse_one_byte_less() {
         );
     }
 }
+
+/// A linear 3×2 RGBA8 array of three slices stores each slice's 512 bytes
+/// one after the other. Subresource `mip + slice * mips` copies only into
+/// its own slice; the other slices stay as they were.
+#[test]
+fn linear_array_slices_are_disjoint() {
+    let t = texture(Dimension::Tex2d, 3, 2, 3, 1, R8G8B8A8, Swizzle::LINEAR);
+    assert_eq!(t.array_size(), 3);
+    assert_eq!(t.planes[0].layout.slice_size, 512);
+    assert_eq!(t.size, 1536);
+
+    let linear: Vec<u8> = (1..=24).collect();
+    let mut tiled = vec![0xcc; 1536];
+    t.tile(&mut tiled, 1, &linear, 12, 0).unwrap();
+    let mut expected = vec![0xcc; 1536];
+    expected[512..524].copy_from_slice(&linear[0..12]);
+    expected[768..780].copy_from_slice(&linear[12..24]);
+    assert_eq!(tiled, expected);
+    assert_eq!(t.planes[0].layout.offset(0, 2, 1, 2), Ok(1024 + 256 + 8));
+
+    // Past the last slice there is no subresource.
+    assert_eq!(t.subresource(3), None);
+    assert_eq!(t.tile(&mut tiled, 3, &linear, 12, 0), Err(Error::Invalid));
+}
+
+/// RGBA8 in 256-byte blocks is 8×8 elements, so a 9×9 texture takes 2×2
+/// blocks: element (8, 0) starts the second block, (0, 8) the third (two
+/// blocks per row of blocks) and (8, 8) the fourth. A copy writes exactly
+/// its 81 texels and none of the padding.
+#[test]
+fn tiny_blocks_step_to_the_next_block_at_eight_elements() {
+    let t = texture(Dimension::Tex2d, 9, 9, 1, 1, R8G8B8A8, Swizzle::SW_256B_S);
+    let l = &t.planes[0].layout;
+    assert_eq!(l.block, [8, 8, 1]);
+    assert_eq!((l.mips[0].pitch, l.mips[0].rows), (16, 16));
+    assert_eq!(t.size, 1024);
+    assert_eq!(l.offset(0, 8, 0, 0), Ok(256));
+    assert_eq!(l.offset(0, 0, 8, 0), Ok(512));
+    assert_eq!(l.offset(0, 8, 8, 0), Ok(768));
+    // x bit 2 lands on address bit 7, y bit 2 on bit 6.
+    assert_eq!(l.offset(0, 4, 4, 0), Ok(128 | 64));
+    assert_eq!(l.offset(0, 9, 0, 0), Err(Error::Invalid));
+
+    let linear = vec![0xab; 9 * 36];
+    let mut tiled = vec![0; 1024];
+    t.tile(&mut tiled, 0, &linear, 36, 0).unwrap();
+    assert_eq!(tiled.iter().filter(|&&b| b == 0xab).count(), 81 * 4);
+    // Block 1 holds column 8 only: x bits 0-2 are 0, so only y varies
+    // (bits 4-6), one element per 16 bytes.
+    for y in 0..8 {
+        let at = 256 + y * 16;
+        assert_eq!(&tiled[at..at + 4], &[0xab; 4], "row {y}");
+        assert_eq!(&tiled[at + 4..at + 16], &[0; 12], "row {y}");
+    }
+}
+
+/// A linear 3×2 D24S8 texture is a 512-byte depth plane followed by a
+/// one-byte-per-element stencil plane (rows still padded to 256 bytes).
+/// Subresource 1 is the stencil plane's mip 0: copies land at
+/// `512 + y * 256 + x` and never touch the depth plane.
+#[test]
+fn stencil_plane_copies_stay_in_their_plane() {
+    const D24S8: u32 = 45;
+    let t = texture(Dimension::Tex2d, 3, 2, 1, 1, D24S8, Swizzle::LINEAR);
+    assert_eq!(t.planes.len(), 2);
+    assert_eq!((t.planes[1].offset, t.planes[1].stencil), (512, true));
+    assert_eq!(t.size, 1024);
+    assert_eq!(t.subresource_count(), 2);
+    assert_eq!(t.footprint(1).unwrap().row_pitch, 3);
+
+    let mut tiled = vec![0; 1024];
+    t.tile(&mut tiled, 1, &[1, 2, 3, 4, 5, 6], 3, 0).unwrap();
+    let mut expected = vec![0; 1024];
+    expected[512..515].copy_from_slice(&[1, 2, 3]);
+    expected[768..771].copy_from_slice(&[4, 5, 6]);
+    assert_eq!(tiled, expected);
+
+    let mut back = [0; 6];
+    t.detile(&tiled, 1, &mut back, 3, 0).unwrap();
+    assert_eq!(back, [1, 2, 3, 4, 5, 6]);
+    // The whole texture must be there, even to copy only the depth plane.
+    assert_eq!(
+        t.detile(&tiled[..1023], 0, &mut [0; 12 * 2], 12, 0),
+        Err(Error::TooSmall)
+    );
+}
