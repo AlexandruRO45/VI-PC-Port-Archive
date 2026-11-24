@@ -1810,6 +1810,43 @@ mod tests {
     }
 
     #[test]
+    fn grouped_reserved_reads_see_a_later_commit() {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: the fixture acquires and owns this private reservation.
+        let title = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!title.is_null());
+        let title = Reservation(title);
+        let base = title.0 as usize;
+        let Some(shadow) = shadow_at(base, 2 * PAGE) else {
+            return;
+        };
+        let ranges = [(base + 8, base + 16), (base + PAGE + 8, base + PAGE + 16)];
+        assert_eq!(shadow.update_ranges(&ranges), 16);
+        assert_eq!(shadow.update_ranges(&ranges), 0);
+        assert_eq!(native_byte(&shadow, 8), 0);
+        assert_eq!(native_byte(&shadow, PAGE + 8), 0);
+
+        // SAFETY: the requested page is inside the reservation we own.
+        let live =
+            unsafe { VirtualAlloc((base + PAGE) as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(live as usize, base + PAGE);
+        crate::watch::title_memory_allocation_changed(base + PAGE, PAGE);
+        // SAFETY: this page is now committed and writable.
+        unsafe { live.cast::<u8>().add(8).write(7) };
+        assert_eq!(shadow.update_ranges(&ranges), 8);
+        assert_eq!(native_byte(&shadow, 8), 0);
+        assert_eq!(native_byte(&shadow, PAGE + 8), 7);
+        assert_eq!(shadow.update_ranges(&ranges), 0);
+    }
+
+    #[test]
     fn grouped_watch_keeps_mixed_private_reservations_separate() {
         let Some(host) = host() else {
             return;
