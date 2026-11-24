@@ -5784,3 +5784,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             --host $<TARGET_FILE:rcas_coordinate_readback> --backend warp --case ${control})
     endforeach()
 endif()
+
+# The AOT draw harnesses compile a shader with DXC and then drive the adapter.
+# Alone they take 18-36 s, but under `ctest -j8` they time-share the adapter with
+# seven siblings and overran the 45-60 s their declarations give them, so they
+# failed as Timeout while every one of them passed on its own. 180 s covers that
+# contention and still catches a hang.
+get_property(all_tests DIRECTORY PROPERTY TESTS)
+foreach(aot_test IN LISTS all_tests)
+    if(aot_test MATCHES "^(compute_store_aot|pixel_aot)(_.*)?_hardware$")
+        set_tests_properties(${aot_test} PROPERTIES TIMEOUT 180)
+    endif()
+endforeach()
