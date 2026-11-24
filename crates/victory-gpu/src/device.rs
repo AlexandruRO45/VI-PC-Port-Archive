@@ -9,8 +9,8 @@
 use std::ffi::c_void;
 
 use crate::object::{
-    self, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, HRESULT, Iid, Object, S_FALSE, S_OK, Table, This,
-    guid, guid_text,
+    self, guid, guid_text, Iid, Object, Table, This, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL,
+    HRESULT, S_FALSE, S_OK,
 };
 use crate::{
     descriptor, dxgi, fence, frame, list, pipeline, query, queue, resource, root, signature,
@@ -381,16 +381,18 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
+    f[57] = object::ignore as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
+    f[67] = object::ignore as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
     f[73] = list::create_list_x as *const (); // 0x248
     f[74] = resource::register_page_pool as *const (); // 0x250
     f[75] = resource::unregister_page_pool as *const (); // 0x258
-    // CreateCommittedResourceX: its description is PC's plus DCC options,
-    // which we have no use for (the AMD upscaler's, on Series S).
+                                                         // CreateCommittedResourceX: its description is PC's plus DCC options,
+                                                         // which we have no use for (the AMD upscaler's, on Series S).
     f[76] = resource::create_committed as *const (); // 0x260
     f[78] = frame::set_interval as *const (); // 0x270
     f[79] = frame::schedule as *const (); // 0x278
@@ -430,6 +432,10 @@ mod tests {
         );
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
+        let s1c8 = slot::<extern "system" fn() -> HRESULT>(device, 0x1c8);
+        assert_eq!(s1c8(), S_OK);
+        let s218 = slot::<extern "system" fn() -> HRESULT>(device, 0x218);
+        assert_eq!(s218(), S_OK);
     }
 
     #[test]
