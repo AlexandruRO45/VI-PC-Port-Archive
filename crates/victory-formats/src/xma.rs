@@ -1893,4 +1893,139 @@ mod tests {
             assert_eq!((d.ch[0].coeffs[y], d.ch[1].coeffs[y]), want, "y {y}");
         }
     }
+
+    /// Packs a string of `0`/`1` into bytes, MSB first.
+    fn bit_string(bits: &str) -> [u8; 8] {
+        let mut data = [0u8; 8];
+        for (i, c) in bits.bytes().enumerate() {
+            data[i / 8] |= u8::from(c == b'1') << (7 - i % 8);
+        }
+        data
+    }
+
+    /// `subframe_length` reads `0` for a whole frame, `10` for half and `11`
+    /// for a quarter, and reads nothing for the last quarter of a frame.
+    /// `tile_header` reads a "fixed" bit, then per subframe one "contains"
+    /// bit for each channel at the shortest length (skipped when fixed, when
+    /// only one channel is that short, or for the last quarter), then the
+    /// subframe length.
+    #[test]
+    fn tile_header_splits_the_frame_into_subframes() {
+        fn read(d: &mut Decoder, bits: &str, end: usize) -> (Result<(), Error>, usize) {
+            let data = bit_string(bits);
+            let mut b = Bits {
+                data: &data,
+                pos: 0,
+                end,
+            };
+            (d.tile_header(&mut b), b.consumed())
+        }
+        fn lens(d: &Decoder, c: usize) -> &[usize] {
+            &d.ch[c].subframe_len[..d.ch[c].num_subframes]
+        }
+
+        let d = Decoder::new(1, 44_100);
+        for (bits, offset, want, used) in [
+            ("0", 0, 512, 1),
+            ("10", 0, 256, 2),
+            ("11", 0, 128, 2),
+            ("10", 256, 256, 2),
+            ("11", 384, 128, 0),
+        ] {
+            let data = bit_string(bits);
+            let mut b = Bits {
+                data: &data,
+                pos: 0,
+                end: 8,
+            };
+            assert_eq!(
+                d.subframe_length(&mut b, offset),
+                Ok(want),
+                "{bits} at {offset}"
+            );
+            assert_eq!(b.consumed(), used, "{bits} at {offset}");
+        }
+
+        let mut mono = Decoder::new(1, 44_100);
+        assert_eq!(read(&mut mono, "10", 2), (Ok(()), 2));
+        assert_eq!(lens(&mono, 0), [512]);
+        // Quarter, half, then the last quarter without a length.
+        assert_eq!(read(&mut mono, "11110", 5), (Ok(()), 5));
+        assert_eq!(lens(&mono, 0), [128, 256, 128]);
+        assert_eq!(read(&mut mono, "1111110", 7), (Ok(()), 7));
+        assert_eq!(lens(&mono, 0), [128, 128, 256]);
+        // Half, then a whole frame: too long.
+        assert_eq!(
+            read(&mut mono, "1100", 4).0,
+            Err(Error("channel longer than a frame"))
+        );
+        // A header cut off after its first subframe.
+        assert_eq!(read(&mut mono, "11", 2).0, Err(Error("tile header")));
+
+        let mut stereo = Decoder::new(2, 44_100);
+        // Not fixed: both channels in one whole-frame subframe.
+        assert_eq!(read(&mut stereo, "0110", 4), (Ok(()), 4));
+        assert_eq!(
+            (lens(&stereo, 0), lens(&stereo, 1)),
+            (&[512][..], &[512][..])
+        );
+        // Fixed: no "contains" bits.
+        assert_eq!(read(&mut stereo, "11011", 5), (Ok(()), 5));
+        assert_eq!(lens(&stereo, 0), [256, 128, 128]);
+        assert_eq!(lens(&stereo, 1), [256, 128, 128]);
+        // Channel 0 takes a quarter; channel 1, now alone at 0, takes the
+        // whole frame without a "contains" bit; channel 0 then takes a half
+        // and the last quarter, each without one.
+        assert_eq!(read(&mut stereo, "01011010", 8), (Ok(()), 8));
+        assert_eq!(lens(&stereo, 0), [128, 256, 128]);
+        assert_eq!(lens(&stereo, 1), [512]);
+    }
+
+    /// `Decoder::new` splits each of the three block sizes into scale factor
+    /// bands: they start at 0, grow in steps that are multiples of 4 and end
+    /// at the block length. Each band maps to itself at its own block size,
+    /// and to a band covering its middle at the others.
+    #[test]
+    fn scale_factor_bands_cover_each_block() {
+        for rate in [24_000, 32_000, 44_100, 48_000] {
+            let d = Decoder::new(2, rate);
+            for i in 0..BLOCK_SIZES {
+                let len = FRAME_SAMPLES >> i;
+                let n = d.num_sfb[i];
+                assert!((1..MAX_BANDS).contains(&n), "{rate} Hz block {i}: {n}");
+                let offsets = &d.sfb_offsets[i][..=n];
+                assert_eq!(offsets[0], 0);
+                assert_eq!(offsets[n], len, "{rate} Hz block {i}");
+                for w in offsets.windows(2) {
+                    assert!(w[0] < w[1], "{rate} Hz block {i}: {offsets:?}");
+                }
+                for &o in &offsets[..n] {
+                    assert_eq!(o % 4, 0, "{rate} Hz block {i}: {offsets:?}");
+                }
+                for b in 0..n {
+                    assert_eq!(d.sf_offsets[i][i][b], b, "{rate} Hz block {i}");
+                    // The middle of band `b`, in whole-frame samples.
+                    let mid = ((offsets[b] + offsets[b + 1] - 1) << i) >> 1;
+                    for x in 0..BLOCK_SIZES {
+                        let v = d.sf_offsets[i][x][b];
+                        assert!(v < d.num_sfb[x], "{rate} Hz {i}->{x} band {b}");
+                        assert!(
+                            mid <= d.sfb_offsets[x][v + 1] << x,
+                            "{rate} Hz {i}->{x} band {b}"
+                        );
+                        assert!(
+                            v == 0 || d.sfb_offsets[x][v] << x < mid,
+                            "{rate} Hz {i}->{x} band {b}"
+                        );
+                    }
+                }
+            }
+            // Lower rates put the same frequencies at higher bins, so they
+            // need at least as many bands.
+            if rate > 24_000 {
+                let lower = Decoder::new(2, rate - 1);
+                assert!(lower.num_sfb[0] >= d.num_sfb[0], "{rate} Hz");
+            }
+        }
+    }
 }
