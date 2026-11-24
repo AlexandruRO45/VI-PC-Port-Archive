@@ -22,6 +22,8 @@
 //! victory_profile::load("dstorage", || name.into(), bytes, took);
 //! ```
 
+pub mod gpu;
+pub mod live;
 mod memory;
 mod out;
 pub mod overlay;
@@ -125,7 +127,8 @@ fn settings() -> &'static Settings {
 /// Turns profiling on if `VICTORY_PROFILE` is set: `1` for the logged
 /// summaries, a folder for the files as well, `overlay` for the summaries
 /// and the on-screen panel (as `VICTORY_PROFILE_OVERLAY=1` alone does).
-/// Call once, early.
+/// `VICTORY_PROFILE_LIVE` alone turns it on too, with live lines
+/// ([`live`]). Call once, early.
 pub fn init() {
     let var = |name: &str| std::env::var(name).ok();
     let profile = var("VICTORY_PROFILE");
@@ -133,7 +136,13 @@ pub fn init() {
         profile.as_deref(),
         var("VICTORY_PROFILE_OVERLAY").as_deref(),
     );
-    let Some(profile) = profile.or_else(|| overlay.then(|| "1".to_owned())) else {
+    let live = live::LiveSettings::parse(
+        var("VICTORY_PROFILE_LIVE").as_deref(),
+        var("VICTORY_PROFILE_LIVE_SLOW_MS").as_deref(),
+        var("VICTORY_PROFILE_LIVE_STALL_MS").as_deref(),
+    );
+    let Some(profile) = profile.or_else(|| (overlay || live.is_some()).then(|| "1".to_owned()))
+    else {
         return;
     };
     let s = Settings::parse(
@@ -176,6 +185,9 @@ pub fn init() {
         hitch_ms = s.hitch_ms,
         "profiling on"
     );
+    if let Some(live) = live {
+        live::start(live, s.dir.as_deref());
+    }
     let _ = std::thread::Builder::new()
         .name("victory-profile".into())
         .spawn(reporter);
@@ -447,11 +459,14 @@ impl Drop for Scope {
 // Frames.
 
 /// Work of the frame being made, summed until it is presented.
-static WORK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static WORK: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 const SUBMISSIONS: usize = 0;
 const LISTS: usize = 1;
 const PREPARE_NS: usize = 2;
 const GPU_WAIT_NS: usize = 3;
+/// Draws and dispatches dropped, and of zero groups ([`gpu`]).
+const DROPPED: usize = 4;
+const ZERO_GROUPS: usize = 5;
 
 /// A host submission of `lists` command lists: `prepare` making it ready
 /// on the CPU, `gpu_wait` waiting for its fence.
@@ -495,6 +510,9 @@ pub(crate) struct FrameRow {
     pub(crate) lists: u64,
     pub(crate) draws: u64,
     pub(crate) dispatches: u64,
+    /// Draws and dispatches not run on the host, and those of zero groups.
+    pub(crate) dropped: u64,
+    pub(crate) zero_groups: u64,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) format: u32,
@@ -548,6 +566,8 @@ pub fn frame(f: Frame) {
         lists: work[LISTS],
         draws: f.draws,
         dispatches: f.dispatches,
+        dropped: work[DROPPED],
+        zero_groups: work[ZERO_GROUPS],
         width: f.width,
         height: f.height,
         format: f.format,
@@ -570,8 +590,14 @@ pub fn frame(f: Frame) {
         ts - row.interval_ms * 1e3,
         row.interval_ms * 1e3,
         &format!(
-            r#""gpu_wait_ms":{:.3},"prepare_ms":{:.3},"draws":{},"dispatches":{},"submissions":{}"#,
-            row.gpu_wait_ms, row.prepare_ms, row.draws, row.dispatches, row.submissions
+            r#""gpu_wait_ms":{:.3},"prepare_ms":{:.3},"draws":{},"dispatches":{},"submissions":{},"dropped":{},"zero_groups":{}"#,
+            row.gpu_wait_ms,
+            row.prepare_ms,
+            row.draws,
+            row.dispatches,
+            row.submissions,
+            row.dropped,
+            row.zero_groups
         ),
     );
     out::counter(
@@ -626,8 +652,8 @@ fn frame_lines(rows: &[FrameRow], seconds: f64) -> Vec<String> {
     let last = rows.last().copied().unwrap_or_default();
     lines.push(format!(
         "per frame: {:.2} ms preparing, {:.2} ms waiting for the GPU, {:.2} ms \
-         presenting; {:.1} submissions, {:.1} lists, {:.0} draws, {:.0} dispatches; \
-         last frame {} at {}x{} format {}",
+         presenting; {:.1} submissions, {:.1} lists, {:.0} draws, {:.0} dispatches, {:.1} \
+         dropped, {:.1} of zero groups; last frame {} at {}x{} format {}",
         mean(|r| r.prepare_ms),
         mean(|r| r.gpu_wait_ms),
         mean(|r| r.present_ms),
@@ -635,6 +661,8 @@ fn frame_lines(rows: &[FrameRow], seconds: f64) -> Vec<String> {
         mean(|r| r.lists as f64),
         mean(|r| r.draws as f64),
         mean(|r| r.dispatches as f64),
+        mean(|r| r.dropped as f64),
+        mean(|r| r.zero_groups as f64),
         last.number,
         last.width,
         last.height,
@@ -915,6 +943,7 @@ fn summary(period: Duration) {
     let stats = all_stats();
     let mut lines = frame_lines(&rows, period.as_secs_f64());
     lines.extend(memory_lines(&stats));
+    lines.extend(gpu::lines(false));
     lines.extend(stat_lines(&stats, false));
     log(&lines);
     out::flush();
@@ -964,6 +993,7 @@ pub fn dump(reason: &str) {
     }
     let stats = all_stats();
     lines.extend(memory_lines(&stats));
+    lines.extend(gpu::lines(true));
     lines.extend(stat_lines(&stats, true));
     for (key, value) in lock(&NOTES).iter() {
         lines.push(format!("{key}: {value}"));

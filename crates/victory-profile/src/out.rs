@@ -36,7 +36,7 @@ fn files() -> std::sync::MutexGuard<'static, Files> {
 }
 
 pub(crate) const CSV_HEADER: &str = "frame,time_s,interval_ms,fps,present_ms,prepare_ms,\
-gpu_wait_ms,submissions,lists,draws,dispatches,width,height,format,hitch\n";
+gpu_wait_ms,submissions,lists,draws,dispatches,width,height,format,hitch,dropped,zero_groups\n";
 
 /// Creates both files in `dir`.
 pub(crate) fn open(dir: &Path) -> std::io::Result<()> {
@@ -53,7 +53,7 @@ pub(crate) fn open(dir: &Path) -> std::io::Result<()> {
 
 pub(crate) fn csv_row(r: &FrameRow) -> String {
     format!(
-        "{},{:.4},{:.3},{:.2},{:.3},{:.3},{:.3},{},{},{},{},{},{},{},{}\n",
+        "{},{:.4},{:.3},{:.2},{:.3},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{}\n",
         r.number,
         r.time_s,
         r.interval_ms,
@@ -69,6 +69,8 @@ pub(crate) fn csv_row(r: &FrameRow) -> String {
         r.height,
         r.format,
         u8::from(r.hitch),
+        r.dropped,
+        r.zero_groups,
     )
 }
 
@@ -215,6 +217,8 @@ mod tests {
             lists: 7,
             draws: 900,
             dispatches: 12,
+            dropped: 5,
+            zero_groups: 2,
             width: 1920,
             height: 1080,
             format: 28,
@@ -223,7 +227,7 @@ mod tests {
         let line = csv_row(&row);
         assert_eq!(
             line,
-            "42,1.5000,40.000,25.00,1.000,2.000,30.000,3,7,900,12,1920,1080,28,0\n"
+            "42,1.5000,40.000,25.00,1.000,2.000,30.000,3,7,900,12,1920,1080,28,0,5,2\n"
         );
         assert_eq!(line.split(',').count(), CSV_HEADER.split(',').count());
     }
