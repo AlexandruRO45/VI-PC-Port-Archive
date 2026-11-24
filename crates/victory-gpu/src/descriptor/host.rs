@@ -761,10 +761,20 @@ fn write_address(data: usize, index: usize, view: Option<&View>) {
     unsafe { ((data + 8 * index) as *mut [u32; 2]).write_unaligned(words) };
 }
 
-/// The title memory a buffer shader or unordered access view reads: its
-/// address and length.
+/// The title memory a buffer constant, shader or unordered access view
+/// reads: its address and length (constant buffers cut to their registered
+/// title buffer's end, in whole dwords).
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let (base, words): (u64, &[u32; 10]) = match view {
+        &View::Constant(address, size) => {
+            if address == 0 {
+                return None;
+            }
+            let bytes = u64::from(size);
+            let clamped =
+                crate::shadow::registered_left(address).map_or(bytes, |left| bytes.min(left));
+            return Some((address, clamped & !3));
+        }
         View::Shader(r, Some(desc)) => (
             crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
             desc,
@@ -797,6 +807,9 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
+    if len == 0 {
+        return None;
+    }
     let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
     Some((shadow, address, len))
 }
@@ -1044,14 +1057,16 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
-        &View::Constant(address, size) => {
+        &View::Constant(address, _) => {
             // Constant buffers in the title's slots, through the heap itself
             // or a table, are read as raw buffers by translated shaders
             // (`victory_shader::emit`, "Constant buffers in the heap"): the
             // console needs 16-byte alignment, a host constant buffer view
             // 256, which most of the title's do not have on the host.
-            let shadow = crate::shadow::find(address, u64::from(size))?;
-            let bytes = u64::from(size).min(shadow.left(address));
+            let (_, bytes) = buffer_range(view)?;
+            if bytes == 0 {
+                return None;
+            }
             let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,
                 ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -1403,6 +1418,113 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Suballocated constant buffer views whose 64 KiB size runs past the end
+    /// of their registered title buffer clamp to the remaining whole dwords of
+    /// that buffer (and so bind to its copy rather than a separate loose
+    /// window), null and empty ones become null views, and view-address tables
+    /// record their 48-bit title addresses.
+    #[test]
+    fn constant_views_clamp_to_their_buffer_and_record_their_address() {
+        let memory = vec![0u8; 0x10000];
+        let odd = vec![0u8; 0x1008];
+        let loose = vec![0u8; 0x1000];
+        let start = memory.as_ptr() as u64;
+        let odd_start = odd.as_ptr() as u64;
+        let loose_at = loose.as_ptr() as u64;
+        crate::shadow::register(start as usize, start, 0x10000);
+        crate::shadow::register(odd_start as usize, odd_start, 0x1006);
+
+        assert_eq!(buffer_range(&View::Constant(0, 256)), None);
+        assert_eq!(
+            buffer_range(&View::Constant(start + 0x100, 0)),
+            Some((start + 0x100, 0))
+        );
+        assert_eq!(
+            buffer_range(&View::Constant(start + 0x100, 256)),
+            Some((start + 0x100, 256))
+        );
+        assert_eq!(
+            buffer_range(&View::Constant(start + 0xfc00, 65536)),
+            Some((start + 0xfc00, 1024))
+        );
+        assert_eq!(
+            buffer_range(&View::Constant(odd_start + 0x1000, 256)),
+            Some((odd_start + 0x1000, 4))
+        );
+        assert_eq!(
+            buffer_range(&View::Constant(odd_start + 0x1004, 256)),
+            Some((odd_start + 0x1004, 0))
+        );
+        assert_eq!(
+            buffer_range(&View::Constant(loose_at, 65536)),
+            Some((loose_at, 65536))
+        );
+
+        let (Some(host), Some(heap)) = (host(), HostHeap::new(false, 8)) else {
+            crate::shadow::unregister(odd_start as usize, odd_start);
+            crate::shadow::unregister(start as usize, start);
+            return;
+        };
+
+        assert!(view_copy(&View::Constant(0, 256)).is_none());
+        assert!(make_view(&View::Constant(0, 256), heap.cpu(0)).is_none());
+        assert!(view_copy(&View::Constant(start + 0x100, 0)).is_none());
+        assert!(make_view(&View::Constant(start + 0x100, 0), heap.cpu(0)).is_none());
+        assert!(view_copy(&View::Constant(odd_start + 0x1004, 256)).is_none());
+        assert!(make_view(&View::Constant(odd_start + 0x1004, 256), heap.cpu(0)).is_none());
+
+        let expected = crate::shadow::find(start, 0x10000).unwrap();
+        let overlong = View::Constant(start + 0xfc00, 65536);
+        let (copy, at, len) = view_copy(&overlong).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&copy, &expected));
+        assert_eq!((at, len), (start + 0xfc00, 1024));
+        let made = make_view(&overlong, heap.cpu(1)).unwrap();
+        assert_eq!(
+            windows::core::Interface::as_raw(&made),
+            windows::core::Interface::as_raw(&expected.buffer)
+        );
+
+        let mut records = [0u64; 16];
+        let handle = |r: &[u64; 16], i: usize| r.as_ptr() as u64 + 32 * i as u64;
+        let words = |addr: u64| [addr as u32, (addr >> 32) as u32 & 0xFFFF];
+        let at0 = start + 0xfc00;
+        let at1 = start + 0x200;
+        crate::descriptor::create_cbv(
+            std::ptr::null(),
+            &[at0 as u32, (at0 >> 32) as u32, 65536, 0],
+            handle(&records, 0),
+        );
+        heap.mirror(0, handle(&records, 0), true);
+        assert!(heap.view_addresses().is_some());
+
+        crate::descriptor::create_cbv(
+            std::ptr::null(),
+            &[at1 as u32, (at1 >> 32) as u32, 256, 0],
+            handle(&records, 1),
+        );
+        crate::descriptor::create_cbv(std::ptr::null(), &[0, 0, 256, 0], handle(&records, 2));
+        heap.mirror(1, handle(&records, 1), true);
+        heap.mirror(2, handle(&records, 2), true);
+
+        let data = heap.addresses.get().unwrap().as_ref().unwrap().1;
+        let read_addr = |slot: usize| {
+            // SAFETY: the view-address buffer holds 8 bytes per title slot (`count == 8`).
+            unsafe { ((data + 8 * slot) as *const [u32; 2]).read_unaligned() }
+        };
+        assert_eq!(read_addr(0), words(at0));
+        assert_eq!(read_addr(1), words(at1));
+        assert_eq!(read_addr(2), [0, 0]);
+
+        records[4..8].fill(0);
+        heap.mirror(1, handle(&records, 1), true);
+        assert_eq!(read_addr(1), [0, 0]);
+
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        crate::shadow::unregister(odd_start as usize, odd_start);
+        crate::shadow::unregister(start as usize, start);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
