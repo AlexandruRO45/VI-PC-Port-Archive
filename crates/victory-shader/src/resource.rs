@@ -784,7 +784,7 @@ impl<'a> Tracer<'a> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Moved {
     Const(u32),
     Value(Value),
@@ -1250,6 +1250,73 @@ mod tests {
         for c in (0..128).chain(209..240).chain(249..=255) {
             assert_eq!(inline(c), None, "code {c}");
         }
+    }
+
+    /// The first instruction of `words`, decoded into its SSA form.
+    fn first_inst(words: &[u32]) -> (Program, Inst) {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let inst = p.blocks[0].insts[0].clone();
+        (p, inst)
+    }
+
+    /// The scalar moves fold to the constant each dword receives: inline
+    /// and literal sources, the bit-reversed and inverted inline forms,
+    /// `s_movk_i32`'s sign-extended 16 bits, and a 64-bit inline integer
+    /// sign-extended into its high dword.
+    #[test]
+    fn scalar_moves_fold_to_the_constant_each_dword_receives() {
+        let moved = |words: &[u32], k: usize| copy_source(&first_inst(words).1, k);
+        let c = |x: u32| Some(Moved::Const(x));
+        // s_mov_b32 s0, 5 / -3 / 0x1234_5678
+        assert_eq!(moved(&[0xBE80_0385, S_ENDPGM], 0), c(5));
+        assert_eq!(moved(&[0xBE80_03C3, S_ENDPGM], 0), c(-3i32 as u32));
+        assert_eq!(
+            moved(&[0xBE80_03FF, 0x1234_5678, S_ENDPGM], 0),
+            c(0x1234_5678)
+        );
+        // s_mov_b32 s0, 1.0 keeps the float's bits.
+        assert_eq!(moved(&[0xBE80_03F2, S_ENDPGM], 0), c(1.0f32.to_bits()));
+        // s_brev_b32 s0, 1 and s_not_b32 s0, 0
+        assert_eq!(moved(&[0xBE80_0B81, S_ENDPGM], 0), c(0x8000_0000));
+        assert_eq!(moved(&[0xBE80_0780, S_ENDPGM], 0), c(u32::MAX));
+        // s_movk_i32 s0, 0x8000 / 0x7fff
+        assert_eq!(moved(&[0xB000_8000, S_ENDPGM], 0), c(0xFFFF_8000));
+        assert_eq!(moved(&[0xB000_7FFF, S_ENDPGM], 0), c(0x7FFF));
+        // s_mov_b64 s[0:1], 7 / -1: the high dword is the sign.
+        assert_eq!(moved(&[0xBE80_0487, S_ENDPGM], 0), c(7));
+        assert_eq!(moved(&[0xBE80_0487, S_ENDPGM], 1), c(0));
+        assert_eq!(moved(&[0xBE80_04C1, S_ENDPGM], 0), c(u32::MAX));
+        assert_eq!(moved(&[0xBE80_04C1, S_ENDPGM], 1), c(u32::MAX));
+        // s_mov_b32 s0, null reads as zero.
+        assert_eq!(moved(&[0xBE80_037D, S_ENDPGM], 0), c(0));
+    }
+
+    /// A register move copies the value read from the dword it names, the
+    /// high dword of a 64-bit move from the next register; a float has no
+    /// 64-bit inline integer form, and other operations are not copies.
+    #[test]
+    fn scalar_register_moves_copy_each_dword_and_other_operations_do_not() {
+        // s_mov_b64 s[0:1], s[4:5]
+        let (_, inst) = first_inst(&[0xBE80_0404, S_ENDPGM]);
+        for k in 0..2 {
+            let read = inst.read(Reg::S(4 + k as u8)).unwrap();
+            assert_eq!(copy_source(&inst, k), Some(Moved::Value(read)));
+        }
+        // s_mov_b64 s[0:1], 1.0 and s_brev_b32 s0, s4 do not fold.
+        assert_eq!(
+            copy_source(&first_inst(&[0xBE80_04F2, S_ENDPGM]).1, 0),
+            None
+        );
+        assert_eq!(
+            copy_source(&first_inst(&[0xBE80_0B04, S_ENDPGM]).1, 0),
+            None
+        );
+        // s_add_u32 s0, s1, s2 is no move.
+        assert_eq!(
+            copy_source(&first_inst(&[0x8000_0201, S_ENDPGM]).1, 0),
+            None
+        );
     }
 
     fn track_err(words: &[u32], layout: &[RootParam], stage: HwStage) -> ShaderError {
