@@ -5137,7 +5137,10 @@ produced and the status HRESULT.
 With DirectStorage 1.3.0 and zlib 1.3.1, the generated 116-byte stream
 produced 768 bytes. Truncation, bad checksum, trailing bytes and mismatched
 destination sizes in both directions returned `0x8007000d` and preserved the
-destination. All six cases passed on Windows build 26200.
+destination. Additional cases verify RFC 1950 streams exceeding 64 KiB (128 KiB and
+256 KiB) with full uncompressed readback, as well as a negative control where a
+128 KiB stream is submitted to a 64 KiB destination buffer, returning `0x8007000d`
+and preserving the unwritten destination. All nine cases passed on Windows build 26100.
 
 Extract the [DirectStorage NuGet package](https://www.nuget.org/packages/Microsoft.Direct3D.DirectStorage/1.3.0)
 under `out/dstorage-sdk` and install a static x64 build of

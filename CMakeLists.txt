@@ -15,7 +15,7 @@ if(DSTORAGE_SDK_ROOT)
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${dstorage_native}/bin/x64/dstorage.dll"
             "${dstorage_native}/bin/x64/dstoragecore.dll" "$<TARGET_FILE_DIR:dstorage_rfc1950_check>"
         VERBATIM)
-    foreach(scenario IN ITEMS success truncated checksum trailing oversize undersize)
+    foreach(scenario IN ITEMS success truncated checksum trailing oversize undersize large_128k large_256k overflow_64k)
         add_test(NAME dstorage_rfc1950_${scenario} COMMAND dstorage_rfc1950_check ${scenario})
         set_tests_properties(dstorage_rfc1950_${scenario} PROPERTIES TIMEOUT 30)
     endforeach()

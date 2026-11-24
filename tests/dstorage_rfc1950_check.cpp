@@ -37,7 +37,16 @@ struct TempFile {
 int run(std::string_view scenario)
 {
     constexpr unsigned char sentinel = 0xca;
-    std::array<BYTE, 768> plain{};
+    size_t plain_size = 768;
+    if (scenario == "large_128k") {
+        plain_size = 128 * 1024;
+    } else if (scenario == "large_256k") {
+        plain_size = 256 * 1024;
+    } else if (scenario == "overflow_64k") {
+        plain_size = 128 * 1024;
+    }
+
+    std::vector<BYTE> plain(plain_size);
     for (size_t i = 0; i < plain.size(); ++i) plain[i] = BYTE((i % 32) * 13 + (i / 256));
     uLongf compressed_size = compressBound(static_cast<uLong>(plain.size()));
     std::vector<BYTE> compressed(compressed_size);
@@ -50,7 +59,8 @@ int run(std::string_view scenario)
     else if (scenario == "trailing") compressed.push_back(0xcd);
     else if (scenario == "oversize") ++expected_size;
     else if (scenario == "undersize") --expected_size;
-    else if (scenario != "success") return 2;
+    else if (scenario == "overflow_64k") expected_size = 64 * 1024;
+    else if (scenario != "success" && scenario != "large_128k" && scenario != "large_256k") return 2;
 
     TempFile tmp;
     constexpr char prefix[] = "source offset";
@@ -105,7 +115,7 @@ int run(std::string_view scenario)
     std::printf("consumed=%llu/%zu produced=%llu/%u codec=0x%08lx completion=0x%08lx\n",
         decoded.consumed, compressed.size(), decoded.produced, expected_size,
         static_cast<unsigned long>(decoded.status), static_cast<unsigned long>(completion_hr));
-    const bool success = scenario == "success";
+    const bool success = scenario == "success" || scenario == "large_128k" || scenario == "large_256k";
     const HRESULT expected = success ? S_OK : HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
     if (decoded.status != expected || completion_hr != expected || output.front() != sentinel || output.back() != sentinel)
         throw std::runtime_error("Wrong status or corrupt guard byte");

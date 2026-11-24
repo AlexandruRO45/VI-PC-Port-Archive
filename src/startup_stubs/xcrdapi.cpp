@@ -280,24 +280,41 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         std::size_t size = source_size;
         if (zlib) {
             // With BCPack after it, the inflated size is not given; the destination size bounds it.
-            output.resize(bcpack ? std::size_t{destination_size} * 2 + 0x10000 : destination_size);
+            // DirectStorage provides UncompressedSize at request + 0x38. When destination is smaller
+            // than the stream (e.g. 64 KiB tile/page target), allocate for the full uncompressed stream
+            // so single-pass inflate succeeds and verifies Adler32, then bound destination writes to destination_size.
+            const unsigned uncompressed_size = *reinterpret_cast<const unsigned*>(request + 0x38);
+            std::size_t target_size = (uncompressed_size > destination_size) ? uncompressed_size : destination_size;
+            if (bcpack) target_size = target_size * 2 + 0x10000;
+            output.resize(target_size);
             std::size_t produced = 0;
-            if (!x2w_inflate::inflate_zlib(input, source_size, output.data(), output.size(), &produced)) {
+            bool ok = x2w_inflate::inflate_zlib(input, source_size, output.data(), output.size(), &produced);
+            if (!ok && output.size() < 0x80000) {
+                // If destination_size was smaller than the uncompressed stream and uncompressed_size was unset,
+                // expand up to 512 KiB to accommodate larger chunks.
+                std::size_t big_size = std::size_t{destination_size} * 8 + 0x40000;
+                if (big_size < 0x80000) big_size = 0x80000;
+                std::vector<unsigned char> big(big_size);
+                std::size_t big_produced = 0;
+                if (x2w_inflate::inflate_zlib(input, source_size, big.data(), big.size(), &big_produced)) {
+                    output = std::move(big);
+                    produced = big_produced;
+                    ok = true;
+                }
+            }
+            if (!ok) {
                 outcome = "zlib failed";
                 data = nullptr;
                 static LONG diagnosed;
                 if (InterlockedIncrement(&diagnosed) <= 12) {
-                    std::vector<unsigned char> big(std::size_t{destination_size} * 8 + 0x40000);
-                    std::size_t big_produced = 0;
-                    const bool big_ok = x2w_inflate::inflate_zlib(input, source_size, big.data(), big.size(), &big_produced);
-                    log("x2w-dstorage zlib failure: header %02x %02x %02x %02x, larger buffer -> %s produced=0x%zx (dest 0x%x, source 0x%x)",
-                        input[0], input[1], input[2], input[3], big_ok ? "ok" : "still failed", big_produced, destination_size, source_size);
+                    log("x2w-dstorage zlib failure: header %02x %02x %02x %02x (dest 0x%x, source 0x%x)",
+                        input[0], input[1], input[2], input[3], destination_size, source_size);
                 }
             } else {
                 output.resize(produced);
                 data = output.data();
                 size = produced;
-                outcome = produced == destination_size || bcpack ? "inflated" : "inflated (short)";
+                outcome = produced == destination_size || bcpack ? "inflated" : "inflated (larger/short)";
                 InterlockedIncrement(&requests_compressed);
             }
         }
@@ -416,7 +433,9 @@ void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
     const u64 options = *reinterpret_cast<const u64*>(request);
     if (options & (1ull << 21)) {
         const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(request + 0x08);
-        const unsigned size = *reinterpret_cast<const unsigned*>(request + 0x18);
+        const unsigned destination_size = *reinterpret_cast<const unsigned*>(request + 0x18);
+        const unsigned uncompressed_size = *reinterpret_cast<const unsigned*>(request + 0x38);
+        const unsigned size = (uncompressed_size > destination_size) ? uncompressed_size : destination_size;
         const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
         const std::size_t pages = (std::size_t{page_offset} + size + 0xFFFF) / 0x10000;
         if (title && pages && x2w_local::readable(title, pages * sizeof(ULONG_PTR))) {
