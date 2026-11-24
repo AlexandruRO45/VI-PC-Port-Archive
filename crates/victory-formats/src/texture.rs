@@ -979,8 +979,6 @@ mod tests {
         }
     }
 
-    /// Sizes past the hardware's 16384 texels per side are refused instead
-    /// of overflowing the size arithmetic (found by random-input testing).
     /// Like the XMA and BCPack errors, texture errors name the format and
     /// can be boxed as `std::error::Error`.
     #[test]
@@ -994,6 +992,8 @@ mod tests {
         assert_ne!(Error::Invalid.to_string(), Error::TooSmall.to_string());
     }
 
+    /// Sizes past the hardware's 16384 texels per side are refused instead
+    /// of overflowing the size arithmetic (found by random-input testing).
     #[test]
     fn extents_past_the_hardware_limit_are_invalid() {
         for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_D_X] {

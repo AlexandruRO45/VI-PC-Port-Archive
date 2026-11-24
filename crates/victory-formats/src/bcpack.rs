@@ -240,7 +240,8 @@ impl Tables {
 
 /// Unpacks `src` (BC number `bc`, 1 and 3-7) into `dst`, whose length gives
 /// the block count. The stream carries no size: bytes after the last one the
-/// lanes need are ignored, a stream that runs out is an error.
+/// lanes need are ignored, a stream that runs out is an error. On an error
+/// `dst` is left as it was, even when the bad block comes after good ones.
 pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(), Error> {
     let (block, widths, per) = layout(bc)?;
     if dst.is_empty() || !dst.len().is_multiple_of(block) {
@@ -250,7 +251,12 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
     let mut records = vec![0u8; blocks * widths.len() * per];
     let mut next = src.iter().copied();
     lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
-    unpack(bc, &records, dst, tables)
+    // BC6H modes and BC7 control codes are checked block by block while
+    // unpacking, so unpack aside and copy only a whole success.
+    let mut out = vec![0u8; dst.len()];
+    unpack(bc, &records, &mut out, tables)?;
+    dst.copy_from_slice(&out);
+    Ok(())
 }
 
 /// Block bytes, lane widths and symbols per lane per block of BC `bc`.
@@ -1368,6 +1374,52 @@ mod tests {
     /// used buckets must be non-empty and tile 65536 exactly, in the first,
     /// a middle and the last model of each width group. Buckets past a
     /// model's used ones are never read.
+    /// Every BC number but 1 and 3-7 is refused, and no error writes to
+    /// `dst`: not a bad format or size, not a stream that runs out, and not
+    /// a bad BC6H mode or BC7 control code in a block after good ones.
+    #[test]
+    fn errors_leave_the_destination_alone() {
+        let t = Tables::parse(&tables()).unwrap();
+        let mut dst = vec![0xa5u8; 4 * 16];
+        for bc in (0..=255u8).filter(|bc| !matches!(bc, 1 | 3..=7)) {
+            assert!(decode(bc, &[0; 64], &mut dst, &t).is_err(), "BC{bc}");
+        }
+        assert!(decode(4, &[0; 64], &mut dst[..12], &t).is_err());
+        assert!(decode(4, &[], &mut dst, &t).is_err());
+        assert!(dst.iter().all(|&b| b == 0xa5));
+
+        const BC6_LANES: [u8; 16] = [3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4];
+        const BC7_LANES: [u8; 16] = [3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4];
+        // Records of 32 symbols: byte 30 picks the BC6H mode (0-13 valid)
+        // and, with byte 31, the BC7 control code (only code 0 is used by
+        // these tables).
+        let record = |b30: u8| {
+            let mut r = vec![0u8; 32];
+            r[30] = b30;
+            r
+        };
+        for (bc, widths, bad) in [(6, &BC6_LANES, 14), (7, &BC7_LANES, 1)] {
+            let good: Vec<Vec<u8>> = (0..4).map(|_| record(0)).collect();
+            let src = stream(&t, widths, 2, &good);
+            let mut want = vec![0u8; 4 * 16];
+            decode(bc, &src, &mut want, &t).unwrap();
+            for at in 0..4 {
+                let mut records = good.clone();
+                records[at] = record(bad);
+                let src = stream(&t, widths, 2, &records);
+                let mut dst = vec![0xa5u8; 4 * 16];
+                assert!(decode(bc, &src, &mut dst, &t).is_err(), "BC{bc} {at}");
+                assert!(dst.iter().all(|&b| b == 0xa5), "BC{bc} bad block {at}");
+                // The good blocks before it still decode on their own.
+                if at > 0 {
+                    let mut part = vec![0u8; at * 16];
+                    decode(bc, &src, &mut part, &t).unwrap();
+                    assert_eq!(part, want[..at * 16], "BC{bc} {at}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn tables_parse_checks_size_and_every_model() {
         let base = tables();
