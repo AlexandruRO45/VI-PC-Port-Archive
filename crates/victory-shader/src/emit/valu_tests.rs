@@ -937,3 +937,96 @@ fn oob_raw_dword_high_offsets() {
         assert_eq!(got, [0], "raw dword off={off:#010x} must return 0");
     }
 }
+
+#[test]
+fn oob_raw_store_does_not_corrupt_element_zero() {
+    // Store 0x1111_2222 to offset 0, then store 0xDEAD_BEEF to an OOB offset `s0`.
+    // Element 0 must remain 0x1111_2222 (not overwritten by OOB clamping to 0).
+    let mut words = Vec::new();
+    words.push(s_mov_b32(3, 0x80)); // s3 = 0
+    let output = s_load_dwordx4(8, 2); // heap slot 0 -> s[8:11]
+    words.extend_from_slice(&output);
+    // v4 = 0x1111_2222 via literal
+    words.push(vop1(0x001, 4, 0xFF));
+    words.push(0x1111_2222);
+    // store v4 at offset 0
+    words.extend_from_slice(&buffer_store_dword(4, 8, 0));
+    // v1 = s0 (OOB byte offset), v5 = 0xDEAD_BEEF
+    words.push(vop1(0x001, 1, sgpr(0)));
+    words.push(vop1(0x001, 5, 0xFF));
+    words.push(0xDEAD_BEEF);
+    // buffer_store_dword v5, v1, s[8:11], 0 offen
+    words.extend_from_slice(&[
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | ((8u32 >> 2) & 0x1F) << 16 | (5u32 << 8) | 1,
+    ]);
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 2,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 3 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let shader = lower_compute_oob(&native);
+    let host = Host::new(false).expect("hardware SM 6.6 device");
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+    for &off in &[0xFFFF_FFFCu32, 0x8000_0000, 0xFFFF_FFF0] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => off,
+                (RootType::Table, 1) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(4)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        assert_eq!(
+            out[0][0], 0x1111_2222,
+            "OOB raw store at {off:#010x} must not overwrite element 0"
+        );
+    }
+}
