@@ -1591,3 +1591,60 @@ fn two_descriptors_for_the_same_dll_stay_separate_modules() {
     );
     assert_eq!(info.import_count(), 3);
 }
+
+#[test]
+fn a_name_table_outside_the_sections_is_rejected() {
+    for table in [SECTION_RVA + SECTION_SIZE + 0x100, SIZE_OF_IMAGE + 0x100] {
+        let mut d = image();
+        put32(&mut d, at(IMPORT_DESCRIPTORS), table);
+        assert!(ImageInfo::parse(&d).is_err(), "name table at {table:#x}");
+
+        let mut d = image();
+        add_delay_import(&mut d);
+        put32(&mut d, at(DELAY_DESCRIPTORS) + 16, table);
+        assert!(
+            ImageInfo::parse(&d).is_err(),
+            "delay name table at {table:#x}"
+        );
+    }
+}
+
+#[test]
+fn import_descriptors_that_run_off_the_section_are_rejected() {
+    // The only descriptor fills the last 20 bytes, leaving no terminator.
+    const LAST: u32 = SECTION_RVA + SECTION_SIZE - 20;
+    let mut d = image();
+    let desc = at(IMPORT_DESCRIPTORS);
+    let copy: Vec<u8> = d[desc..desc + 20].to_vec();
+    put_bytes(&mut d, LAST, &copy);
+    set_directory(&mut d, dir::IMPORT, LAST, 20);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+}
+
+#[test]
+fn the_import_directory_size_does_not_limit_the_descriptors_read() {
+    // Descriptors are read up to the all-zero terminator, as the loader does,
+    // even when the directory entry covers only the first one.
+    let mut d = image();
+    set_directory(&mut d, dir::IMPORT, IMPORT_DESCRIPTORS, 20);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.imports.len(), 1);
+    assert_eq!(info.import_count(), 2);
+}
+
+#[test]
+fn an_export_past_the_raw_data_is_kept_as_its_rva() {
+    // Exported data in the zero-filled part of the image has no file bytes,
+    // but its RVA is still what the export table gives.
+    const BSS: u32 = SECTION_RVA + SECTION_SIZE + 0x200;
+    let mut d = image();
+    add_exports(&mut d);
+    put32(&mut d, at(0x1378), BSS);
+    let info = ImageInfo::parse(&d).unwrap();
+    let local = info.exports.iter().find(|e| e.ordinal == 1).unwrap();
+    assert_eq!(
+        (local.name.as_deref(), local.rva, local.forward.as_deref()),
+        (Some("local"), Some(BSS), None)
+    );
+    assert_eq!(info.rva_to_file_offset(BSS), None);
+}
