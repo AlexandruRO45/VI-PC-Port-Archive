@@ -37,6 +37,13 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    /// Bytes whose refresh went past the guard instead of being passed over:
+    /// the guard had seen a write to them and no second view maps them, a
+    /// second view maps them (the hash is the only eye there), or it was
+    /// their hash turn with nothing seen written.
+    TexPastWrote,
+    TexPastSecond,
+    TexPastTurn,
     /// Frames presented since the last line (what the line divides by).
     Frames,
     /// Calls of list methods that record into a host list, and the
@@ -1060,7 +1067,8 @@ pub(crate) fn log(frames: f64) {
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
-         changed, {:.1} MB hashed, {:.1} MB of them changed",
+         changed, {:.1} MB hashed, {:.1} MB of them changed, past the guard: {:.1} MB with a write \
+         seen and no second view, {:.1} MB a second view, {:.1} MB their turn",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1084,6 +1092,9 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+        mb(c[C::TexPastWrote as usize]),
+        mb(c[C::TexPastSecond as usize]),
+        mb(c[C::TexPastTurn as usize]),
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
