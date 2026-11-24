@@ -486,7 +486,11 @@ struct EnormousTurn(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
 impl EnormousTurn {
     fn wanted(src: &str) -> bool {
-        src.len() > ENORMOUS_SOURCE || (cfg!(test) && src.contains(enormous_tests::MARK))
+        #[cfg(test)]
+        if src.contains(enormous_tests::MARK) {
+            return true;
+        }
+        src.len() > ENORMOUS_SOURCE
     }
 
     fn take() -> EnormousTurn {
