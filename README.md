@@ -73,6 +73,25 @@ Each is described in a comment where it is read.
 - A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
 - Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
 
+### Windows 10: the D3D12 Agility SDK
+
+Every translated shader is shader model 6.6, and Windows 10's own D3D12
+runtime stops at 6.5 whatever the GPU supports: there every pipeline is
+refused and the GPU tests fail with "no SM 6.6 device". The `victory`
+executable and the GPU test harnesses therefore export `D3D12SDKVersion` and
+`D3D12SDKPath`, so that the system loader takes Microsoft's redistributable
+runtime from `D3D12\` beside them when it is there. Fetch it once, and again
+after `cargo clean`:
+
+```powershell
+cargo xtask agility    # Microsoft.Direct3D.D3D12 1.620.2 into the cache folder, then target\<profile>[\deps]\D3D12\
+```
+
+The log line `host D3D12 runtime` names the runtime in use and its shader
+model. On Windows 11 the step is optional (without the folder the system's
+runtime is used). Tried on Windows 10 22H2 with an RX 7900 XTX: shader model
+6.9 and mesh shaders with the SDK, 6.5 without.
+
 Everything below this line is upstream VIctory's own README, unchanged; its
 status section describes upstream, not this fork.
 
