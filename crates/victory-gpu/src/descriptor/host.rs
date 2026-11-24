@@ -70,8 +70,25 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// without hitting its cap, used as the minimum dynamic headroom before
+/// shrinking static slots.
 const MIN_DYNAMIC: u32 = 1 << 16;
+
+/// Splits a capped view heap (`max_views` total slots) into
+/// `(static_slots, dynamic_slots)`. Keeps every requested title slot whenever
+/// at least [`MIN_DYNAMIC`] dynamic slots still fit (giving all remaining room
+/// up to `max_views` to dynamic slots), and otherwise reserves [`DYNAMIC`]
+/// dynamic slots so capped hosts (NVIDIA) match uncapped hosts' capacity.
+fn capped_split(requested: u32, max_views: u32) -> (u32, u32) {
+    if requested.saturating_add(DYNAMIC) <= max_views {
+        (requested, DYNAMIC)
+    } else if requested.saturating_add(MIN_DYNAMIC) <= max_views {
+        (requested, max_views - requested)
+    } else {
+        let extra = DYNAMIC.min(max_views);
+        (max_views - extra, extra)
+    }
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -93,8 +110,10 @@ impl HostHeap {
                     })
             }
         };
-        // The larger dynamic range only where the host takes it on top of
-        // every title slot; else the smaller one, and the cap after that.
+        // The larger dynamic range on top of every title slot where the host
+        // takes it; when the host caps the heap at `PORTABLE_VIEWS` (NVIDIA),
+        // split `PORTABLE_VIEWS` via `capped_split` so dynamic slots keep full
+        // `DYNAMIC` headroom instead of running dry at `MIN_DYNAMIC`.
         let (heap, count, extra) = if sampler {
             match make(count) {
                 Ok(heap) => (heap, count, 0),
@@ -103,21 +122,33 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make(count + DYNAMIC) {
-            (heap, count, DYNAMIC)
         } else {
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+            match make(count.saturating_add(DYNAMIC)) {
+                Ok(heap) => (heap, count, DYNAMIC),
+                Err(e) if count.saturating_add(DYNAMIC) > PORTABLE_VIEWS => {
+                    let (static_slots, dynamic_slots) = capped_split(count, PORTABLE_VIEWS);
+                    tracing::warn!(
+                        error = %e,
+                        count,
+                        static_slots,
+                        dynamic_slots,
+                        "host view heap capped at {PORTABLE_VIEWS}"
+                    );
+                    match make(static_slots + dynamic_slots) {
+                        Ok(heap) => (heap, static_slots, dynamic_slots),
+                        Err(e) => {
+                            tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                            return None;
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
-                }
+                Err(_) => match make(count.saturating_add(MIN_DYNAMIC)) {
+                    Ok(heap) => (heap, count, MIN_DYNAMIC),
+                    Err(e) => {
+                        tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                        return None;
+                    }
+                },
             }
         };
         // SAFETY: a live heap.
@@ -972,5 +1003,20 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn capped_split_preserves_dynamic_budget_on_nvidia_cap() {
+        // Small heap fits both requested slots and full DYNAMIC headroom.
+        assert_eq!(capped_split(100_000, PORTABLE_VIEWS), (100_000, DYNAMIC));
+        // Intermediate heap keeps all requested slots and hands the rest to dynamic.
+        assert_eq!(
+            capped_split(800_000, PORTABLE_VIEWS),
+            (800_000, PORTABLE_VIEWS - 800_000)
+        );
+        // Capped mega-heap reserves full DYNAMIC headroom within PORTABLE_VIEWS.
+        let (s, d) = capped_split(1_245_184, PORTABLE_VIEWS);
+        assert_eq!((s, d), (PORTABLE_VIEWS - DYNAMIC, DYNAMIC));
+        assert_eq!(s + d, PORTABLE_VIEWS);
     }
 }
