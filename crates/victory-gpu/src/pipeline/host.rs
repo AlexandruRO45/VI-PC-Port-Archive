@@ -249,11 +249,18 @@ pub(crate) struct Input {
 const RECTANGLES: i32 = 19;
 const QUADS: i32 = 32;
 
+/// How a stage's user data (`b0, space 0`) is bound in the host root signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UserDataBind {
+    Constants { param: u32, dwords: u32 },
+    Cbv { param: u32, dwords: u32 },
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
-    /// The root parameter of its user data, and its size in dwords.
-    pub(crate) user_data: Option<(u32, u32)>,
+    /// How its user data is bound, if the shader reads any.
+    pub(crate) user_data: Option<UserDataBind>,
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
@@ -402,7 +409,10 @@ impl HostPipeline {
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
-                stage.user_data = Some((params.len() as u32, dwords));
+                stage.user_data = Some(UserDataBind::Constants {
+                    param: params.len() as u32,
+                    dwords,
+                });
                 params.push(D3D12_ROOT_PARAMETER1 {
                     ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
                     Anonymous: D3D12_ROOT_PARAMETER1_0 {
@@ -487,7 +497,7 @@ impl HostPipeline {
             bound.push(stage);
         }
         // One pair for all stages: they share the heap and the bitmap.
-        let marks = stages
+        let mut marks = stages
             .iter()
             .any(|(s, _)| s.translated().is_some_and(|t| t.host.view_marks))
             .then(|| {
@@ -510,6 +520,7 @@ impl HostPipeline {
                 }
                 (first, first + 1)
             });
+        fit_root_signature(&mut params, &mut bound, &mut marks);
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -761,7 +772,144 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
-fn root_signature(
+/// Maximum root-signature cost in 32-bit DWORDs allowed by D3D12.
+const D3D12_MAX_ROOT_COST: u32 = 64;
+
+fn root_param_cost(p: &D3D12_ROOT_PARAMETER1) -> u32 {
+    match p.ParameterType {
+        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => {
+            // SAFETY: `ParameterType` selects the `Constants` union field.
+            unsafe { p.Anonymous.Constants.Num32BitValues }
+        }
+        D3D12_ROOT_PARAMETER_TYPE_CBV
+        | D3D12_ROOT_PARAMETER_TYPE_SRV
+        | D3D12_ROOT_PARAMETER_TYPE_UAV => 2,
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => 1,
+        _ => 0,
+    }
+}
+
+pub(crate) fn root_signature_cost(params: &[D3D12_ROOT_PARAMETER1]) -> u32 {
+    params.iter().map(root_param_cost).sum()
+}
+
+/// Fits `params` within D3D12's 64-DWORD root signature limit, updating
+/// `stages` and `marks` bindings and parameter indices to match.
+pub(crate) fn fit_root_signature(
+    params: &mut Vec<D3D12_ROOT_PARAMETER1>,
+    stages: &mut [Stage],
+    marks: &mut Option<(u32, u32)>,
+) {
+    // Phase 1: spill the largest root-constant user-data block (> 2 dwords)
+    // to a root CBV (cost 2 dwords) until the signature fits.
+    while root_signature_cost(params) > D3D12_MAX_ROOT_COST {
+        let best = stages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| match s.user_data {
+                Some(UserDataBind::Constants { dwords, .. }) if dwords > 2 => Some((i, dwords)),
+                _ => None,
+            })
+            .max_by_key(|&(i, dwords)| (dwords, std::cmp::Reverse(i)));
+        let Some((si, _)) = best else {
+            break;
+        };
+        let Some(UserDataBind::Constants { param, dwords }) = stages[si].user_data else {
+            unreachable!();
+        };
+        let visibility = params[param as usize].ShaderVisibility;
+        params[param as usize] = D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0,
+                    RegisterSpace: USER_DATA_SPACE,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC,
+                },
+            },
+            ShaderVisibility: visibility,
+        };
+        stages[si].user_data = Some(UserDataBind::Cbv { param, dwords });
+    }
+
+    // Phase 2: if still over 64 DWORDs, deduplicate identical CBV/SRV/UAV
+    // root descriptors across stages (excluding per-stage user-data CBVs at
+    // `b0, space USER_DATA_SPACE`, descriptor tables, and 32-bit constants),
+    // upgrading the kept parameter's visibility to ALL and remapping indices.
+    if root_signature_cost(params) > D3D12_MAX_ROOT_COST {
+        let mut new_params: Vec<D3D12_ROOT_PARAMETER1> = Vec::with_capacity(params.len());
+        let mut seen: std::collections::HashMap<(i32, u32, u32), u32> =
+            std::collections::HashMap::new();
+        let mut remap: Vec<u32> = Vec::with_capacity(params.len());
+        for &p in params.iter() {
+            let dedup_key = match p.ParameterType {
+                D3D12_ROOT_PARAMETER_TYPE_CBV
+                | D3D12_ROOT_PARAMETER_TYPE_SRV
+                | D3D12_ROOT_PARAMETER_TYPE_UAV => {
+                    // SAFETY: `ParameterType` selects the `Descriptor` union field.
+                    let d = unsafe { p.Anonymous.Descriptor };
+                    let is_user_data = p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV
+                        && d.ShaderRegister == 0
+                        && d.RegisterSpace == USER_DATA_SPACE;
+                    (!is_user_data).then_some((
+                        p.ParameterType.0,
+                        d.ShaderRegister,
+                        d.RegisterSpace,
+                    ))
+                }
+                _ => None,
+            };
+            if let Some(key) = dedup_key {
+                if let Some(&kept) = seen.get(&key) {
+                    new_params[kept as usize].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+                    remap.push(kept);
+                    continue;
+                }
+                let idx = new_params.len() as u32;
+                seen.insert(key, idx);
+                new_params.push(p);
+                remap.push(idx);
+            } else {
+                let idx = new_params.len() as u32;
+                new_params.push(p);
+                remap.push(idx);
+            }
+        }
+        *params = new_params;
+        for stage in stages.iter_mut() {
+            if let Some(UserDataBind::Constants { param, .. } | UserDataBind::Cbv { param, .. }) =
+                &mut stage.user_data
+            {
+                *param = remap[*param as usize];
+            }
+            for (_, param) in &mut stage.root_cbvs {
+                *param = remap[*param as usize];
+            }
+            for (_, param) in &mut stage.root_srvs {
+                *param = remap[*param as usize];
+            }
+            for (_, param) in &mut stage.root_uavs {
+                *param = remap[*param as usize];
+            }
+            for param in [
+                &mut stage.memory,
+                &mut stage.memory_dirty,
+                &mut stage.view_addresses,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                *param = remap[*param as usize];
+            }
+        }
+        if let Some((table, bitmap)) = marks {
+            *table = remap[*table as usize];
+            *bitmap = remap[*bitmap as usize];
+        }
+    }
+}
+
+pub(crate) fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
@@ -806,6 +954,22 @@ fn root_signature(
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_shader(
+    stage: &'static str,
+    host: victory_shader::emit::HostShader,
+) -> Arc<Shader> {
+    Arc::new(Shader {
+        stage,
+        hash: "synthetic".to_owned(),
+        container: Vec::new(),
+        translated: std::sync::OnceLock::from(Some(Translated {
+            host,
+            used: Vec::new(),
+        })),
+    })
 }
 
 #[cfg(test)]
@@ -869,5 +1033,600 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    fn dummy_shader(stage: &'static str) -> Arc<Shader> {
+        Arc::new(Shader {
+            stage,
+            hash: String::new(),
+            container: Vec::new(),
+            translated: std::sync::OnceLock::new(),
+        })
+    }
+
+    fn const_param(dwords: u32, vis: D3D12_SHADER_VISIBILITY) -> D3D12_ROOT_PARAMETER1 {
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: USER_DATA_SPACE,
+                    Num32BitValues: dwords,
+                },
+            },
+            ShaderVisibility: vis,
+        }
+    }
+
+    fn view_param(
+        kind: D3D12_ROOT_PARAMETER_TYPE,
+        reg: u32,
+        space: u32,
+        vis: D3D12_SHADER_VISIBILITY,
+    ) -> D3D12_ROOT_PARAMETER1 {
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: kind,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: reg,
+                    RegisterSpace: space,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: vis,
+        }
+    }
+
+    fn add_stage(
+        params: &mut Vec<D3D12_ROOT_PARAMETER1>,
+        name: &'static str,
+        vis: D3D12_SHADER_VISIBILITY,
+        user_dwords: u32,
+        cbv_slots: &[u8],
+        srv_slots: &[u8],
+    ) -> Stage {
+        let user_data = (user_dwords > 0).then(|| {
+            let param = params.len() as u32;
+            params.push(const_param(user_dwords, vis));
+            UserDataBind::Constants {
+                param,
+                dwords: user_dwords,
+            }
+        });
+        let mut root_cbvs = Vec::new();
+        for &slot in cbv_slots {
+            root_cbvs.push((slot, params.len() as u32));
+            params.push(view_param(
+                D3D12_ROOT_PARAMETER_TYPE_CBV,
+                u32::from(slot),
+                ROOT_CBV_SPACE,
+                vis,
+            ));
+        }
+        let mut root_srvs = Vec::new();
+        for &slot in srv_slots {
+            root_srvs.push((slot, params.len() as u32));
+            params.push(view_param(
+                D3D12_ROOT_PARAMETER_TYPE_SRV,
+                u32::from(slot),
+                ROOT_CBV_SPACE,
+                vis,
+            ));
+        }
+        Stage {
+            shader: dummy_shader(name),
+            user_data,
+            root_cbvs,
+            root_srvs,
+            root_uavs: Vec::new(),
+            memory: None,
+            memory_dirty: None,
+            view_addresses: None,
+        }
+    }
+
+    #[test]
+    fn fit_keeps_constants_when_cost_at_most_64() {
+        let mut params = Vec::new();
+        let mut stages = vec![
+            add_stage(
+                &mut params,
+                "vertex",
+                D3D12_SHADER_VISIBILITY_VERTEX,
+                32,
+                &[],
+                &[],
+            ),
+            add_stage(
+                &mut params,
+                "pixel",
+                D3D12_SHADER_VISIBILITY_PIXEL,
+                32,
+                &[],
+                &[],
+            ),
+        ];
+        assert_eq!(root_signature_cost(&params), 64);
+        fit_root_signature(&mut params, &mut stages, &mut None);
+        assert_eq!(root_signature_cost(&params), 64);
+        assert_eq!(
+            stages[0].user_data,
+            Some(UserDataBind::Constants {
+                param: 0,
+                dwords: 32
+            })
+        );
+        assert_eq!(
+            stages[1].user_data,
+            Some(UserDataBind::Constants {
+                param: 1,
+                dwords: 32
+            })
+        );
+    }
+
+    #[test]
+    fn fit_spills_one_stage_when_slightly_over_64() {
+        let mut params = Vec::new();
+        let mut stages = vec![
+            add_stage(
+                &mut params,
+                "vertex",
+                D3D12_SHADER_VISIBILITY_VERTEX,
+                32,
+                &[],
+                &[0],
+            ),
+            add_stage(
+                &mut params,
+                "pixel",
+                D3D12_SHADER_VISIBILITY_PIXEL,
+                32,
+                &[],
+                &[],
+            ),
+        ];
+        assert_eq!(root_signature_cost(&params), 66);
+        fit_root_signature(&mut params, &mut stages, &mut None);
+        assert_eq!(root_signature_cost(&params), 36);
+        assert_eq!(
+            stages[0].user_data,
+            Some(UserDataBind::Cbv {
+                param: 0,
+                dwords: 32
+            })
+        );
+        assert_eq!(
+            stages[1].user_data,
+            Some(UserDataBind::Constants {
+                param: 2,
+                dwords: 32
+            })
+        );
+        assert_eq!(params[0].ParameterType, D3D12_ROOT_PARAMETER_TYPE_CBV);
+        assert_eq!(params[0].ShaderVisibility, D3D12_SHADER_VISIBILITY_VERTEX);
+        // SAFETY: `params[0]` was rewritten to `CBV` above.
+        let desc = unsafe { params[0].Anonymous.Descriptor };
+        assert_eq!(desc.ShaderRegister, 0);
+        assert_eq!(desc.RegisterSpace, USER_DATA_SPACE);
+        assert_eq!(desc.Flags, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC);
+    }
+
+    #[test]
+    fn fit_spills_both_stages_with_heavy_root_views() {
+        let mut params = Vec::new();
+        let srvs: Vec<u8> = (0..18).collect();
+        let mut stages = vec![
+            add_stage(
+                &mut params,
+                "vertex",
+                D3D12_SHADER_VISIBILITY_VERTEX,
+                32,
+                &[],
+                &srvs,
+            ),
+            add_stage(
+                &mut params,
+                "pixel",
+                D3D12_SHADER_VISIBILITY_PIXEL,
+                32,
+                &[],
+                &[],
+            ),
+        ];
+        assert_eq!(root_signature_cost(&params), 100);
+        fit_root_signature(&mut params, &mut stages, &mut None);
+        assert_eq!(root_signature_cost(&params), 40);
+        assert_eq!(
+            stages[0].user_data,
+            Some(UserDataBind::Cbv {
+                param: 0,
+                dwords: 32
+            })
+        );
+        assert_eq!(
+            stages[1].user_data,
+            Some(UserDataBind::Cbv {
+                param: 19,
+                dwords: 32
+            })
+        );
+        assert_eq!(params[0].ShaderVisibility, D3D12_SHADER_VISIBILITY_VERTEX);
+        assert_eq!(params[19].ShaderVisibility, D3D12_SHADER_VISIBILITY_PIXEL);
+    }
+
+    #[test]
+    fn fit_spills_single_stage_over_64_dwords() {
+        let mut params = Vec::new();
+        let mut stages = vec![add_stage(
+            &mut params,
+            "compute",
+            D3D12_SHADER_VISIBILITY_ALL,
+            72,
+            &[],
+            &[],
+        )];
+        assert_eq!(root_signature_cost(&params), 72);
+        fit_root_signature(&mut params, &mut stages, &mut None);
+        assert_eq!(root_signature_cost(&params), 2);
+        assert_eq!(
+            stages[0].user_data,
+            Some(UserDataBind::Cbv {
+                param: 0,
+                dwords: 72
+            })
+        );
+        assert_eq!(params[0].ParameterType, D3D12_ROOT_PARAMETER_TYPE_CBV);
+    }
+
+    #[test]
+    fn fit_phase2_deduplicates_shared_root_views_and_remaps() {
+        let cbvs: Vec<u8> = (0..10).collect();
+        let srvs: Vec<u8> = (0..10).collect();
+        let mut params = Vec::new();
+        let mut stages = vec![
+            add_stage(
+                &mut params,
+                "vertex",
+                D3D12_SHADER_VISIBILITY_VERTEX,
+                32,
+                &cbvs,
+                &srvs,
+            ),
+            add_stage(
+                &mut params,
+                "pixel",
+                D3D12_SHADER_VISIBILITY_PIXEL,
+                32,
+                &cbvs,
+                &srvs,
+            ),
+        ];
+        assert_eq!(root_signature_cost(&params), 144);
+        fit_root_signature(&mut params, &mut stages, &mut None);
+        assert_eq!(params.len(), 22);
+        assert_eq!(root_signature_cost(&params), 44);
+        assert_eq!(
+            stages[0].user_data,
+            Some(UserDataBind::Cbv {
+                param: 0,
+                dwords: 32
+            })
+        );
+        assert_eq!(
+            stages[1].user_data,
+            Some(UserDataBind::Cbv {
+                param: 21,
+                dwords: 32
+            })
+        );
+        assert_eq!(params[0].ShaderVisibility, D3D12_SHADER_VISIBILITY_VERTEX);
+        assert_eq!(params[21].ShaderVisibility, D3D12_SHADER_VISIBILITY_PIXEL);
+        assert_eq!(stages[0].root_cbvs, stages[1].root_cbvs);
+        assert_eq!(stages[0].root_srvs, stages[1].root_srvs);
+        for (i, &(_, param)) in stages[0]
+            .root_cbvs
+            .iter()
+            .chain(&stages[0].root_srvs)
+            .enumerate()
+        {
+            assert_eq!(param as usize, i + 1);
+            assert_eq!(
+                params[param as usize].ShaderVisibility,
+                D3D12_SHADER_VISIBILITY_ALL
+            );
+        }
+    }
+
+    #[test]
+    fn fit_phase2_does_not_merge_tables_or_constants() {
+        let ranges = [D3D12_DESCRIPTOR_RANGE1::default(); 1];
+        let table = |vis| D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: ranges.as_ptr(),
+                },
+            },
+            ShaderVisibility: vis,
+        };
+        let srvs: Vec<u8> = (0..18).collect();
+        let mut params = Vec::new();
+        let mut stages = vec![
+            add_stage(
+                &mut params,
+                "vertex",
+                D3D12_SHADER_VISIBILITY_VERTEX,
+                2,
+                &[],
+                &srvs,
+            ),
+            add_stage(
+                &mut params,
+                "pixel",
+                D3D12_SHADER_VISIBILITY_PIXEL,
+                2,
+                &[],
+                &srvs,
+            ),
+        ];
+        params.push(table(D3D12_SHADER_VISIBILITY_VERTEX));
+        params.push(table(D3D12_SHADER_VISIBILITY_PIXEL));
+        // 2 (vs const) + 36 (vs srvs) + 2 (ps const) + 36 (ps srvs) + 2 (tables) = 78
+        assert_eq!(root_signature_cost(&params), 78);
+        fit_root_signature(&mut params, &mut stages, &mut None);
+        // 18 SRVs merged -> 2 + 36 + 2 + 2 = 42 DWORDs; constants and tables kept separate.
+        assert_eq!(root_signature_cost(&params), 42);
+        assert_eq!(params.len(), 22);
+        assert_eq!(
+            stages[0].user_data,
+            Some(UserDataBind::Constants {
+                param: 0,
+                dwords: 2
+            })
+        );
+        assert_eq!(
+            stages[1].user_data,
+            Some(UserDataBind::Constants {
+                param: 19,
+                dwords: 2
+            })
+        );
+        assert_eq!(
+            params[20].ParameterType,
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE
+        );
+        assert_eq!(
+            params[21].ParameterType,
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE
+        );
+    }
+
+    #[test]
+    fn host_oversized_graphics_root_signatures_serialize_after_fit() {
+        let Some(host) = host() else {
+            return;
+        };
+        let _ = host.log_messages();
+
+        // Case 1: 66 DWORDs (Phase 1 spill only).
+        let mut params = Vec::new();
+        let mut stages = vec![
+            add_stage(
+                &mut params,
+                "vertex",
+                D3D12_SHADER_VISIBILITY_VERTEX,
+                32,
+                &[],
+                &[0],
+            ),
+            add_stage(
+                &mut params,
+                "pixel",
+                D3D12_SHADER_VISIBILITY_PIXEL,
+                32,
+                &[],
+                &[],
+            ),
+        ];
+        assert!(root_signature(&host.device, &params, &[], false).is_err());
+        let _ = host.log_messages();
+        fit_root_signature(&mut params, &mut stages, &mut None);
+        assert!(root_signature(&host.device, &params, &[], false).is_ok());
+        assert_eq!(host.log_messages(), None);
+
+        // Case 2: 144 DWORDs (Phase 1 spill + Phase 2 deduplication).
+        let cbvs: Vec<u8> = (0..10).collect();
+        let srvs: Vec<u8> = (0..10).collect();
+        let mut params = Vec::new();
+        let mut stages = vec![
+            add_stage(
+                &mut params,
+                "vertex",
+                D3D12_SHADER_VISIBILITY_VERTEX,
+                32,
+                &cbvs,
+                &srvs,
+            ),
+            add_stage(
+                &mut params,
+                "pixel",
+                D3D12_SHADER_VISIBILITY_PIXEL,
+                32,
+                &cbvs,
+                &srvs,
+            ),
+        ];
+        assert!(root_signature(&host.device, &params, &[], false).is_err());
+        let _ = host.log_messages();
+        fit_root_signature(&mut params, &mut stages, &mut None);
+        assert!(root_signature(&host.device, &params, &[], false).is_ok());
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn fit_phase2_deduplicates_uavs_and_memory_params() {
+        let mut params = Vec::new();
+        let make = |params: &mut Vec<D3D12_ROOT_PARAMETER1>,
+                    name: &'static str,
+                    vis: D3D12_SHADER_VISIBILITY| {
+            let mut stage = add_stage(params, name, vis, 32, &[], &(0..16).collect::<Vec<_>>());
+            for slot in [0u8, 1u8] {
+                stage.root_uavs.push((slot, params.len() as u32));
+                params.push(view_param(
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    u32::from(slot),
+                    ROOT_CBV_SPACE,
+                    vis,
+                ));
+            }
+            stage.memory = Some(params.len() as u32);
+            params.push(view_param(
+                D3D12_ROOT_PARAMETER_TYPE_SRV,
+                0,
+                MEMORY_SPACE,
+                vis,
+            ));
+            stage.memory_dirty = Some(params.len() as u32);
+            params.push(view_param(
+                D3D12_ROOT_PARAMETER_TYPE_UAV,
+                0,
+                MEMORY_SPACE,
+                vis,
+            ));
+            stage.view_addresses = Some(params.len() as u32);
+            params.push(view_param(
+                D3D12_ROOT_PARAMETER_TYPE_SRV,
+                1,
+                MEMORY_SPACE,
+                vis,
+            ));
+            stage
+        };
+        let mut stages = vec![
+            make(&mut params, "vertex", D3D12_SHADER_VISIBILITY_VERTEX),
+            make(&mut params, "pixel", D3D12_SHADER_VISIBILITY_PIXEL),
+        ];
+        // Per stage: 32 (const) + 16*2 (srvs) + 2*2 (uavs) + 3*2 (memory) = 74 DWORDs; total 148.
+        assert_eq!(root_signature_cost(&params), 148);
+        fit_root_signature(&mut params, &mut stages, &mut None);
+        // After Phase 1 spill (4 DWORDs for both user_data CBVs) + Phase 2 dedup (21 shared root descriptors = 42): 46 DWORDs.
+        assert_eq!(root_signature_cost(&params), 46);
+        assert_eq!(params.len(), 23);
+        assert_eq!(stages[0].root_uavs, stages[1].root_uavs);
+        assert_eq!(stages[0].memory, stages[1].memory);
+        assert_eq!(stages[0].memory_dirty, stages[1].memory_dirty);
+        assert_eq!(stages[0].view_addresses, stages[1].view_addresses);
+        for param in [
+            stages[0].root_uavs[0].1,
+            stages[0].root_uavs[1].1,
+            stages[0].memory.unwrap(),
+            stages[0].memory_dirty.unwrap(),
+            stages[0].view_addresses.unwrap(),
+        ] {
+            assert_eq!(
+                params[param as usize].ShaderVisibility,
+                D3D12_SHADER_VISIBILITY_ALL
+            );
+        }
+    }
+
+    #[test]
+    fn fit_accounts_for_and_remaps_view_marks() {
+        // Case 1: 4 DWORDs of view marks push a 64-DWORD signature over the
+        // limit so Phase 1 spills stage 0's constants to a root CBV.
+        let mut params = Vec::new();
+        let mut stages = vec![
+            add_stage(
+                &mut params,
+                "vertex",
+                D3D12_SHADER_VISIBILITY_VERTEX,
+                32,
+                &[],
+                &[],
+            ),
+            add_stage(
+                &mut params,
+                "pixel",
+                D3D12_SHADER_VISIBILITY_PIXEL,
+                32,
+                &[],
+                &[],
+            ),
+        ];
+        let mut marks = Some((params.len() as u32, params.len() as u32 + 1));
+        params.push(view_param(
+            D3D12_ROOT_PARAMETER_TYPE_SRV,
+            victory_shader::emit::VIEW_MARKS,
+            MEMORY_SPACE,
+            D3D12_SHADER_VISIBILITY_ALL,
+        ));
+        params.push(view_param(
+            D3D12_ROOT_PARAMETER_TYPE_UAV,
+            victory_shader::emit::VIEW_WRITES,
+            MEMORY_SPACE,
+            D3D12_SHADER_VISIBILITY_ALL,
+        ));
+        assert_eq!(root_signature_cost(&params), 68);
+        fit_root_signature(&mut params, &mut stages, &mut marks);
+        assert_eq!(root_signature_cost(&params), 38);
+        assert_eq!(
+            stages[0].user_data,
+            Some(UserDataBind::Cbv {
+                param: 0,
+                dwords: 32
+            })
+        );
+        assert_eq!(marks, Some((2, 3)));
+
+        // Case 2: Phase 2 deduplication compacts prior parameters and remaps `marks`.
+        let srvs: Vec<u8> = (0..18).collect();
+        let mut params = Vec::new();
+        let mut stages = vec![
+            add_stage(
+                &mut params,
+                "vertex",
+                D3D12_SHADER_VISIBILITY_VERTEX,
+                2,
+                &[],
+                &srvs,
+            ),
+            add_stage(
+                &mut params,
+                "pixel",
+                D3D12_SHADER_VISIBILITY_PIXEL,
+                2,
+                &[],
+                &srvs,
+            ),
+        ];
+        let mut marks = Some((params.len() as u32, params.len() as u32 + 1));
+        params.push(view_param(
+            D3D12_ROOT_PARAMETER_TYPE_SRV,
+            victory_shader::emit::VIEW_MARKS,
+            MEMORY_SPACE,
+            D3D12_SHADER_VISIBILITY_ALL,
+        ));
+        params.push(view_param(
+            D3D12_ROOT_PARAMETER_TYPE_UAV,
+            victory_shader::emit::VIEW_WRITES,
+            MEMORY_SPACE,
+            D3D12_SHADER_VISIBILITY_ALL,
+        ));
+        // 2 + 36 + 2 + 36 + 4 = 80 DWORDs -> 18 SRVs merged -> 2 + 36 + 2 + 4 = 44 DWORDs.
+        assert_eq!(root_signature_cost(&params), 80);
+        fit_root_signature(&mut params, &mut stages, &mut marks);
+        assert_eq!(root_signature_cost(&params), 44);
+        assert_eq!(marks, Some((20, 21)));
+        // SAFETY: `params[20]` and `params[21]` are root SRV/UAV descriptors.
+        let (table_desc, bitmap_desc) = unsafe {
+            (
+                params[20].Anonymous.Descriptor,
+                params[21].Anonymous.Descriptor,
+            )
+        };
+        assert_eq!(table_desc.ShaderRegister, victory_shader::emit::VIEW_MARKS);
+        assert_eq!(bitmap_desc.ShaderRegister, victory_shader::emit::VIEW_WRITES);
     }
 }
