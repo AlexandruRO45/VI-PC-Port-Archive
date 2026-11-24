@@ -488,7 +488,12 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+        #[cfg(feature = "diagnostics")]
+        let root_started = std::time::Instant::now();
+        let made = root_signature(&host.device, &params, &samplers, compute.is_some());
+        #[cfg(feature = "diagnostics")]
+        super::timing::add(super::timing::Part::RootSignature, root_started.elapsed());
+        let (root, root_blob) = match made {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");

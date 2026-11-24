@@ -33,6 +33,9 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// When it entered the queue, for the queue wait (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    queued_at: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -56,12 +59,21 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            #[cfg(feature = "diagnostics")]
+            queued_at: AtomicU64::new(0),
         }
     }
 
     fn make(&self) {
+        let started = Instant::now();
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        note_typical(started.elapsed());
+        #[cfg(feature = "diagnostics")]
+        {
+            super::timing::add(super::timing::Part::Whole, started.elapsed());
+            super::timing::made(self.made.get().is_some_and(|made| made.is_some()));
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -146,6 +158,46 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
+/// How long a pipeline takes to make, in microseconds: the average of the
+/// recent ones, weighted towards the last, and 0 until one is done. A
+/// pipeline that cannot be made within what is left of a frame's budget is
+/// dropped by the caller anyway, so [`wait`] uses this to tell a wait worth
+/// taking (a menu's 30 ms pipeline) from one that only costs the frame (the
+/// world's 3 s stages; measured: 2.7 s of driver time per pipeline in the
+/// world against 0.4 s in loading, `VICTORY_PIPELINE_TIMING=1`).
+static TYPICAL_US: AtomicU64 = AtomicU64::new(0);
+
+/// One more make took `elapsed`.
+fn note_typical(elapsed: Duration) {
+    let us = elapsed.as_micros() as u64;
+    let previous = TYPICAL_US.load(Ordering::Relaxed);
+    let next = if previous == 0 {
+        us
+    } else {
+        (previous / 8 * 7).saturating_add(us / 8)
+    };
+    TYPICAL_US.store(next, Ordering::Relaxed);
+}
+
+/// Whether a wait of up to `left` is worth taking for a pipeline whose
+/// making typically takes `typical` (0: nothing is known yet, so as
+/// before). Twice the typical make, so a pipeline already half made still
+/// pays off and one with seconds to go does not: the 500 ms of budget a
+/// world frame spent on stages that take 2.7 s completed nothing.
+fn worth_waiting(typical: Duration, left: Duration) -> bool {
+    typical.is_zero() || typical <= left * 2
+}
+
+/// Whether a wait is skipped for a pipeline whose making is known to take
+/// longer than what is left of the frame's budget. On by default;
+/// `VICTORY_PIPELINE_WAIT_BY_DURATION=0` waits as before (runs up to
+/// 2026-11-24 spent the whole 500 ms of the budget in every world frame and
+/// completed no pipeline with it).
+fn wait_by_duration() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_BY_DURATION").is_none_or(|v| v != "0"))
+}
+
 /// Whether the frame's budget is one for all threads together: a thread
 /// that waits takes what is left of it and gives back what it did not
 /// use. Counted only when a wait had ended, the budget was one per thread:
@@ -181,6 +233,9 @@ fn wait(p: &Pending, frame: u64) {
         left
     };
     if left.is_zero() {
+        return;
+    }
+    if wait_by_duration() && !worth_waiting(Duration::from_micros(TYPICAL_US.load(Ordering::Relaxed)), left) {
         return;
     }
     let started = Instant::now();
@@ -244,6 +299,10 @@ impl Queue {
         } else {
             self.early.push_back(p.clone());
         }
+        #[cfg(feature = "diagnostics")]
+        if prev == NOT_QUEUED {
+            p.queued_at.store(crate::host::now_ms(), Ordering::Relaxed);
+        }
         Some(prev == NOT_QUEUED)
     }
 
@@ -253,6 +312,14 @@ impl Queue {
             std::iter::from_fn(|| self.early.pop_front())
                 .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         })?;
+        #[cfg(feature = "diagnostics")]
+        {
+            let queued = p.queued_at.swap(0, Ordering::Relaxed);
+            let now = crate::host::now_ms();
+            if queued != 0 && now >= queued {
+                super::timing::queued(now - queued);
+            }
+        }
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -292,12 +359,29 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// How many workers make pipelines: half the logical processors, 2 to 8;
+/// `VICTORY_PIPELINE_WORKERS=<n>` sets it (the driver compiles in parallel
+/// across threads, so the count is throughput in the loading phase, where
+/// the world's first frame finds every pipeline it will ask for).
+fn worker_count() -> usize {
+    std::env::var("VICTORY_PIPELINE_WORKERS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|n| (1..=64).contains(n))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)))
+}
+
+/// Starts the workers on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = worker_count();
+        #[cfg(feature = "diagnostics")]
+        {
+            super::timing::workers(workers as u64);
+            super::timing::report_thread();
+        }
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -348,6 +432,45 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame waits for the pipelines it can get and drops the draws
+    /// whose pipelines are seconds away: the world's stages take 2.7 s of
+    /// driver time each, so the 500 ms a frame spends waiting completed
+    /// nothing (measured, 2026-11-24). A menu's 30 ms pipeline is still
+    /// waited for, and with nothing known yet nothing changes.
+    #[test]
+    fn a_wait_is_taken_only_for_a_pipeline_that_can_arrive() {
+        let budget = Duration::from_millis(500);
+        // Nothing measured yet: as before, the frame waits.
+        assert!(worth_waiting(Duration::ZERO, budget));
+        // A menu pipeline (30 ms): the draw is worth waiting for.
+        assert!(worth_waiting(Duration::from_millis(30), budget));
+        // Half made inside the budget: still worth it.
+        assert!(worth_waiting(Duration::from_millis(1000), budget));
+        // A world stage (2.7 s) against the whole budget: two and a half
+        // budgets to go, so the wait would only cost the frame.
+        assert!(!worth_waiting(Duration::from_millis(2700), budget));
+        // And the same when most of the frame's budget is spent.
+        assert!(!worth_waiting(Duration::from_millis(300), Duration::from_millis(120)));
+    }
+
+    /// The typical make is an average of the recent ones, weighted to the
+    /// last, and it moves with them: a run that starts with menu pipelines
+    /// follows them into the world's slower ones.
+    #[test]
+    fn the_typical_make_follows_the_recent_ones() {
+        // The counter is the process's, so this test makes no claim about
+        // where it starts; only that slow makes move it and enough of them
+        // settle it near their own time.
+        note_typical(Duration::from_millis(30));
+        let fast = TYPICAL_US.load(Ordering::Relaxed);
+        for _ in 0..40 {
+            note_typical(Duration::from_millis(3_000));
+        }
+        let slow = TYPICAL_US.load(Ordering::Relaxed);
+        assert!(slow > fast, "slow makes move it up: {slow} > {fast}");
+        assert!(slow > 2_500_000, "enough 3 s makes settle near 3 s: {slow} us");
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
