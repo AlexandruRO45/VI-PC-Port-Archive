@@ -5103,6 +5103,79 @@ mod tests {
         std::fs::remove_dir_all(&scratch).unwrap();
     }
 
+    /// The subfolder itself, not a folder above it, already taken: a file,
+    /// a link to a file or a link that leads nowhere is an error naming the
+    /// path, with or without a trailing slash, and is left as it was; a link
+    /// to a folder is used as the subfolder, with nothing made in its place.
+    #[cfg(unix)]
+    #[test]
+    fn a_subfolder_that_is_itself_a_file_or_a_link_is_checked_where_it_leads() {
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-subdir-last-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        if ensure_outside_repo(&scratch).is_err() {
+            // `TMPDIR` is inside the checkout; every subfolder is refused,
+            // which `subfolders_are_created_nested_and_again_without_error`
+            // already checks.
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+        let data = scratch.join("data");
+        let elsewhere = scratch.join("elsewhere");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let note = scratch.join("note.txt");
+        std::fs::write(&note, b"keep").unwrap();
+        std::fs::write(data.join("saves"), b"slot1").unwrap();
+        std::os::unix::fs::symlink(&note, data.join("to-file")).unwrap();
+        std::os::unix::fs::symlink(scratch.join("moved-away"), data.join("dangling")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, data.join("linked")).unwrap();
+        let cfg = Config {
+            cache_dir: scratch.join("cache"),
+            data_dir: data.clone(),
+            ..Default::default()
+        };
+
+        for sub in [
+            "saves",
+            "saves/",
+            "to-file",
+            "to-file/",
+            "dangling",
+            "dangling/",
+        ] {
+            let err = format!("{:#}", cfg.data_subdir(sub).unwrap_err());
+            assert!(err.contains("creating"), "{sub}: {err}");
+            let name = sub.trim_end_matches('/');
+            assert!(
+                err.contains(&data.join(name).display().to_string()),
+                "{sub}: {err}"
+            );
+        }
+        assert_eq!(std::fs::read(data.join("saves")).unwrap(), b"slot1");
+        assert_eq!(std::fs::read(&note).unwrap(), b"keep");
+        for link in ["to-file", "dangling"] {
+            let kind = data.join(link).symlink_metadata().unwrap().file_type();
+            assert!(kind.is_symlink(), "{link}");
+        }
+        assert!(!scratch.join("moved-away").exists());
+
+        // A link to a folder: the subfolder path is the link, it is not
+        // replaced, and asking again is not an error.
+        for _ in 0..2 {
+            let dir = cfg.data_subdir("linked").unwrap();
+            assert_eq!(dir, data.join("linked"));
+            assert!(dir.is_dir());
+            let kind = dir.symlink_metadata().unwrap().file_type();
+            assert!(kind.is_symlink());
+        }
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
     #[test]
     fn subfolders_refuse_a_leading_dot_and_allow_a_trailing_slash() {
         // A leading `./` is a `.` component; a trailing slash or a doubled
