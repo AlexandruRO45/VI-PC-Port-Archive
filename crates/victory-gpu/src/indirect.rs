@@ -6,7 +6,7 @@
 //! just before its execution, by a compute shader of ours (HLSL compiled by
 //! the system's compiler; a 5.1 shader with its root signature inside).
 //!
-//! Each list also has a budget of 2^28 work units (one per vertex or index
+//! Each list also has a budget of 2^27 work units (one per vertex or index
 //! instance, 64 per compute group, 128 per mesh group). Records that do not
 //! fit run empty.
 //!
@@ -27,7 +27,7 @@ cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unuse
 RWByteAddressBuffer args : register(u0);
 // Work reserved by earlier records in the list.
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 28;
+static const uint BUDGET = 1u << 27;
 
 bool reserve(uint cost) {
     uint before;
@@ -312,7 +312,7 @@ mod tests {
     use crate::host::Host;
 
     const COMPUTE: u32 = 2;
-    const BUDGET: u32 = 1 << 28;
+    const BUDGET: u32 = 1 << 27;
     const FULL_DISPATCH: [u32; 3] = [1024, 1024, 1];
     const EMPTY_DISPATCH: [u32; 3] = [0, 1024, 1];
 
@@ -512,12 +512,12 @@ mod tests {
     fn rejected_reservations_cannot_wrap_the_budget() {
         let Some(host) = gpu_host() else { return };
         let list = host.new_list().unwrap();
-        let full = Arguments::record(host, &list, COMPUTE, &[FULL_DISPATCH; 4]);
+        let full = Arguments::record(host, &list, COMPUTE, &[FULL_DISPATCH; 2]);
         let rejected = Arguments::record(host, &list, COMPUTE, &[FULL_DISPATCH; 128]);
         let last = Arguments::record(host, &list, COMPUTE, &[[1, 1, 1]]);
         list.close();
         host.execute(&[&list]);
-        assert_eq!(full.read(), [FULL_DISPATCH; 4]);
+        assert_eq!(full.read(), [FULL_DISPATCH; 2]);
         let admitted = rejected.read().iter().filter(|g| g[0] != 0).count();
         assert_eq!(admitted, 0);
         assert_eq!(last.read(), [[0, 1, 1]]);
@@ -528,7 +528,7 @@ mod tests {
     fn rejected_reservation_leaves_room_for_smaller_dispatch() {
         let Some(host) = gpu_host() else { return };
         let list = host.new_list().unwrap();
-        let _full = Arguments::record(host, &list, COMPUTE, &[FULL_DISPATCH; 3]);
+        let _full = Arguments::record(host, &list, COMPUTE, &[FULL_DISPATCH]);
         let _almost = Arguments::record(host, &list, COMPUTE, &[[32767, 32, 1]]);
         let rejected = Arguments::record(host, &list, COMPUTE, &[[33, 1, 1]]);
         let fits = Arguments::record(host, &list, COMPUTE, &[[32, 1, 1]]);
@@ -730,21 +730,24 @@ mod tests {
     }
 
     #[test]
-    fn count_can_be_a_copy_destination_before_indirect_and_a_source_after() {
+    fn indirect_buffers_can_be_used_for_copies_before_and_after() {
         let Some(host) = gpu_host() else { return };
         let list = host.new_list().unwrap();
         let args = Arguments::new(host, &[[1, 1, 1]; 2]);
         let count = Arguments::new(host, &[[0]]);
         let input = Arguments::new(host, &[[1]]);
+        let first_arg = Arguments::new(host, &[[0]]);
         let result = Arguments::new(host, &[[0]]);
         let work = Arguments::new(host, &[[6, 2, 3]]);
         let signature = dispatch_signature(host, 12);
         // SAFETY: live buffers. The prelude selects enhanced barriers for
-        // count, allowing the initial copy-destination access.
+        // args and count, allowing them to start as copy source and destination.
         unsafe {
             list.list
-                .CopyBufferRegion(&count.buffer, 4, &input.buffer, 4, 4)
-        };
+                .CopyBufferRegion(&first_arg.buffer, 4, &args.buffer, 4, 4);
+            list.list
+                .CopyBufferRegion(&count.buffer, 4, &input.buffer, 4, 4);
+        }
         assert!(bound(
             &list,
             &args.buffer,
@@ -769,6 +772,7 @@ mod tests {
         list.close();
         host.execute(&[&list]);
         assert_eq!(used(&list), (2 + 36) * 64);
+        assert_eq!(first_arg.read(), [[1]]);
         assert_eq!(result.read(), [[1]]);
     }
 }

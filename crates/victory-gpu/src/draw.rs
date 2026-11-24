@@ -115,7 +115,8 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
-fn dropped() {
+fn dropped(pipeline: usize) {
+    crate::pipeline::note_drop(pipeline as This);
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -494,6 +495,8 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
             return;
         };
         if !p.compute {
@@ -565,7 +568,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped();
+            dropped(self.pipeline);
         }
     }
 
@@ -818,7 +821,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped();
+            dropped(self.pipeline);
         }
     }
 
@@ -905,7 +908,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped();
+            dropped(self.pipeline);
         }
     }
 }
@@ -928,26 +931,37 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        #[cfg(feature = "diagnostics")]
+        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        #[cfg(not(feature = "diagnostics"))]
+        let why = |_: &str| {};
         let Some(len) = crate::indirect::byte_len(kind, stride, max) else {
+            why("invalid indirect record layout");
             return false;
         };
         if max == 0 {
             return true;
         }
         let Some(args) = crate::shadow::find(arguments, len) else {
+            why("arguments outside title buffers");
             return false;
         };
         if !args.offset(arguments).is_multiple_of(4) {
+            why("unaligned argument offset in host buffer");
             return false;
         }
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
                 Some(s) if s.offset(at).is_multiple_of(4) => Some((s, at)),
-                _ => return false,
+                _ => {
+                    why("count outside title buffers or unaligned in host buffer");
+                    return false;
+                }
             },
             None => None,
         };
         let Some(signature) = host_signature(kind, stride) else {
+            why("no host signature");
             return false;
         };
         args.refresh(list, arguments, len);
@@ -963,6 +977,7 @@ impl State {
             count_buffer,
             (kind, stride, max),
         ) {
+            why("not bounded (no clamp, no enhanced barriers, or invalid argument range)");
             return false;
         }
         self.host_pipeline = 0;
@@ -980,6 +995,11 @@ impl State {
             _ => false,
         };
         if !ran {
+            #[cfg(feature = "diagnostics")]
+            match crate::pipeline::host_pipeline(self.pipeline as This) {
+                None => crate::pipeline::note_drop(self.pipeline as This),
+                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+            }
             return false;
         }
         #[cfg(feature = "diagnostics")]
