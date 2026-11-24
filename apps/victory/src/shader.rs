@@ -240,6 +240,15 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     Ok(())
 }
 
+fn format_instruction(i: &Instruction, wave64: bool) -> String {
+    let words: Vec<_> = i.words.iter().map(|w| format!("{w:08X}")).collect();
+    let text = match i.name() {
+        Some(_) => i.text(wave64),
+        None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
+    };
+    format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,13 +269,4 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(run(vec![dir.path().to_path_buf()], false, false).is_ok());
     }
-}
-
-fn format_instruction(i: &Instruction, wave64: bool) -> String {
-    let words: Vec<_> = i.words.iter().map(|w| format!("{w:08X}")).collect();
-    let text = match i.name() {
-        Some(_) => i.text(wave64),
-        None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
-    };
-    format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
 }
