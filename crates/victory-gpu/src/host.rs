@@ -794,7 +794,7 @@ impl Host {
         for list in runs {
             for rb in &list.deferred().readbacks {
                 let written = if rb.dst_pitch == rb.src_pitch {
-                    crate::watch::writing(rb.dst, rb.total);
+                    let _writing = crate::watch::writing(rb.dst, rb.total);
                     write_mapped(rb.dst as *mut u8, rb.src as *const u8, rb.total);
                     rb.total
                 } else {
@@ -802,7 +802,7 @@ impl Host {
                     for line in 0..rb.lines {
                         let to = rb.dst + line * rb.dst_pitch;
                         let from = rb.src + line * rb.src_pitch;
-                        crate::watch::writing(to, rb.row_bytes);
+                        let _writing = crate::watch::writing(to, rb.row_bytes);
                         write_mapped(to as *mut u8, from as *const u8, rb.row_bytes);
                         n += rb.row_bytes;
                     }
