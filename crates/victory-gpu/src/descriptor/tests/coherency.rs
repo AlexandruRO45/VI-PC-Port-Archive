@@ -220,7 +220,7 @@ fn test_host() -> Option<(&'static Host, std::ffi::OsString)> {
         shader_model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0,
         "SM 6.6 required"
     );
-    assert_eq!(options.ResourceBindingTier, D3D12_RESOURCE_BINDING_TIER_3);
+    assert!(options.ResourceBindingTier.0 >= D3D12_RESOURCE_BINDING_TIER_3.0);
     let end = adapter
         .Description
         .iter()

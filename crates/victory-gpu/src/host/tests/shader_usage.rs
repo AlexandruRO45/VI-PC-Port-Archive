@@ -107,9 +107,70 @@ fn pipeline(
     .expect("synthetic graphics pipeline")
 }
 
+fn fixture_host() -> Option<&'static Host> {
+    let strict = std::env::var_os("VICTORY_TEST_SRV_GBV").is_some();
+    let Some(gpu) = host() else {
+        assert!(!strict, "a D3D12 device is required for GPU validation");
+        return None;
+    };
+    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_6,
+    };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    // SAFETY: these feature queries write the two correctly sized structures.
+    let supported = unsafe {
+        gpu.device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut model).cast(),
+                size_of_val(&model) as u32,
+            )
+            .is_ok()
+            && gpu
+                .device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+    } && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0
+        && options.ResourceBindingTier.0 >= D3D12_RESOURCE_BINDING_TIER_3.0;
+    if !supported {
+        assert!(
+            !strict,
+            "expected SM 6.6 and binding tier 3 with GPU validation requested"
+        );
+        eprintln!("skipped direct SRV binding fixture: SM 6.6 and binding tier 3 required");
+        return None;
+    }
+    Some(gpu)
+}
+
+#[cfg(victory_test_agility)]
+#[test]
+fn agility_runtime_meets_the_requested_version() {
+    use windows::core::Interface;
+
+    let gpu = host().expect("a D3D12 device with the staged runtime");
+    let config = gpu
+        .device
+        .cast::<ID3D12DeviceConfiguration>()
+        .expect("device SDK configuration");
+    // SAFETY: read-only query of a live device. The loader may choose a newer
+    // inbox SDK over the staged runtime when both are installed.
+    let active = unsafe { config.GetDesc().SDKVersion };
+    let requested = crate::agility::D3D12SDKVersion;
+    assert!(
+        active >= requested,
+        "active D3D12 SDK version {active} is older than requested version {requested}"
+    );
+    eprintln!("GPU test process active D3D12 SDK version {active} (requested {requested})");
+}
+
 #[test]
 fn bind_keeps_shader_srv_usage_for_stable_view_heap() {
-    let Some(gpu) = host() else {
+    let Some(gpu) = fixture_host() else {
         return;
     };
     let title_heap = TitleHeap::new(0);
@@ -170,7 +231,7 @@ fn bind_keeps_shader_srv_usage_for_stable_view_heap() {
 
 #[test]
 fn no_buffer_srv_use_keeps_native_descriptor_owners_alive() {
-    let Some(gpu) = host() else { return };
+    let Some(gpu) = fixture_host() else { return };
     let heap = TitleHeap::new(0);
     let sampler = TitleHeap::new(1);
     let weak = std::sync::Arc::downgrade(crate::descriptor::heap(heap.0).host().unwrap());
