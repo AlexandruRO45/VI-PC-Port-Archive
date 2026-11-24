@@ -75,7 +75,9 @@ pub fn is_sgd5(file: &[u8]) -> bool {
 /// whose packed bytes run past the end of the file (a truncated file) is not
 /// yielded, and ends the search: every byte after its marker is its own.
 /// Sizes that no deflate stream of the stated unpacked size could have do
-/// not form a record, so such bytes neither end the search nor hide records.
+/// not form a record, and neither do bytes running past the end that do not
+/// start a deflate stream, so such bytes neither end the search nor hide
+/// records.
 pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     let finder = memchr::memmem::Finder::new(&MARKER);
     // Where the next record may start: after the magic, then after each
@@ -128,7 +130,14 @@ fn record(file: &[u8], at: usize) -> Found<'_> {
         return Found::Nothing;
     }
     let Some(packed) = at.checked_add(n).and_then(|end| file.get(at + 12..end)) else {
-        return Found::Truncated;
+        // Bytes that only look like a marker (in a container stored between
+        // records, say) may have sizes that fit and still run past the end.
+        // Only a record whose bytes so far are a deflate stream is one.
+        return if starts_stream(file.get(at + 12..).unwrap_or_default(), unpacked_size) {
+            Found::Truncated
+        } else {
+            Found::Nothing
+        };
     };
     Found::Record(Record {
         offset: at,
@@ -137,6 +146,17 @@ fn record(file: &[u8], at: usize) -> Found<'_> {
         packed,
         unpacked_size,
     })
+}
+
+/// Whether `bytes` are the start of a deflate stream of `unpacked` bytes:
+/// they run out before the stream ends, or the stream ends having produced
+/// exactly that many bytes.
+fn starts_stream(bytes: &[u8], unpacked: usize) -> bool {
+    use miniz_oxide::inflate::{TINFLStatus, decompress_to_vec_with_limit};
+    match decompress_to_vec_with_limit(bytes, unpacked) {
+        Ok(out) => out.len() == unpacked,
+        Err(e) => e.status == TINFLStatus::FailedCannotMakeProgress,
+    }
 }
 
 /// The printable name that ends at `nul` and follows its length byte.
@@ -356,6 +376,46 @@ mod tests {
         // Before: [] (the phantom was a truncated record and ended the search).
         let names: Vec<_> = records(&file).map(|r| r.name).collect();
         assert_eq!(names, [Some("PS_after")]);
+    }
+
+    #[test]
+    fn marker_running_past_the_end_without_a_stream_does_not_end_the_search() {
+        // Bytes between records that read as a marker with sizes that fit
+        // (64 KiB both ways) and run past the end of the file, followed by
+        // bytes that are no deflate stream (block type 3 is reserved).
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("PS_first", 0x32, b"first"));
+        file.extend_from_slice(b"DXBC");
+        for v in [0x1_0000_u32, 0x000D_DCE7, 0x1_0000, 0x1_0000] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&[0x07; 16]);
+        file.extend(record_bytes("PS_after", 0x32, b"after"));
+        // Before: [PS_first] (the phantom was a truncated record and ended
+        // the search).
+        let names: Vec<_> = records(&file).map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_first"), Some("PS_after")]);
+    }
+
+    #[test]
+    fn truncated_stream_is_told_from_noise() {
+        let payload: Vec<u8> = (0..4000u32).map(|i| (i * 7 % 251) as u8).collect();
+        for level in [0, 1, 6, 10] {
+            let packed = miniz_oxide::deflate::compress_to_vec(&payload, level);
+            for cut in 0..packed.len() {
+                assert!(
+                    starts_stream(&packed[..cut], payload.len()),
+                    "level {level}, cut at {cut}"
+                );
+            }
+            assert!(starts_stream(&packed, payload.len()), "level {level}");
+            // A whole stream of another size is not this record's.
+            assert!(!starts_stream(&packed, payload.len() + 1), "level {level}");
+            assert!(!starts_stream(&packed, payload.len() - 1), "level {level}");
+        }
+        // Reserved block type, and a stored block whose length check fails.
+        assert!(!starts_stream(&[0x07, 0, 0], 100));
+        assert!(!starts_stream(&[0x01, 0x05, 0x00, 0x00, 0x00, 1, 2, 3], 5));
     }
 
     #[test]
