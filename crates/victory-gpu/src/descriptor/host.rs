@@ -1048,7 +1048,20 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 
 /// The RDNA2 buffer SRD uses a 48-bit base in dwords 0 and 1.
 pub(crate) fn buffer_address_word(view: &View, high: bool) -> Option<u32> {
-    validate_binding(view, (11, 0)).ok()?;
+    // Local build: shaders read structured buffers raw now; a structured view's words are fine.
+    validate_binding(view, (11, 0)).or_else(|_| {
+        // SAFETY: buffer views' union members.
+        let stride = unsafe {
+            match view {
+                View::Shader(_, Some(d)) => srv_desc(d).Anonymous.Buffer.StructureByteStride,
+                View::Unordered(_, _, Some(d)) => uav_desc(d).Anonymous.Buffer.StructureByteStride,
+                View::Placed(false, _, d) => srv_desc(d[..10].try_into().unwrap_or(&[0; 10])).Anonymous.Buffer.StructureByteStride,
+                View::Placed(true, _, d) => uav_desc(d[..10].try_into().unwrap_or(&[0; 10])).Anonymous.Buffer.StructureByteStride,
+                _ => 0,
+            }
+        };
+        validate_binding(view, (12, stride))
+    }).ok()?;
     let (base, len) = buffer_range(view)?;
     if base == 0 || !base.is_multiple_of(4) || base >= 1 << 48 || len == 0 {
         return None;
@@ -1099,7 +1112,7 @@ fn buffer_srv(
         // Only where the view's first byte is 16-byte aligned (a raw view's rule); otherwise the
         // structured view stays (raw reads through it address bytes on AMD hardware).
         let start = address.wrapping_add(b.FirstElement.wrapping_mul(u64::from(b.StructureByteStride)));
-        if b.StructureByteStride > 0 && b.StructureByteStride.is_multiple_of(4) && b.Flags == D3D12_BUFFER_SRV_FLAG_NONE && start.is_multiple_of(16) {
+        if b.StructureByteStride > 0 && b.StructureByteStride.is_multiple_of(4) && b.Flags == D3D12_BUFFER_SRV_FLAG_NONE && start.is_multiple_of(16) && u64::from(b.NumElements) * u64::from(b.StructureByteStride) / 4 <= 1 << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP {
             let stride = u64::from(b.StructureByteStride);
             b.FirstElement = b.FirstElement * stride / 4;
             b.NumElements = (u64::from(b.NumElements) * stride / 4) as u32;
@@ -1162,7 +1175,7 @@ fn buffer_uav(
         // SAFETY: a buffer view's union member.
         let b = unsafe { &mut desc.Anonymous.Buffer };
         let start = address.wrapping_add(b.FirstElement.wrapping_mul(u64::from(b.StructureByteStride)));
-        if b.StructureByteStride > 0 && b.StructureByteStride.is_multiple_of(4) && b.Flags == D3D12_BUFFER_UAV_FLAG_NONE && b.CounterOffsetInBytes == 0 && start.is_multiple_of(16) {
+        if b.StructureByteStride > 0 && b.StructureByteStride.is_multiple_of(4) && b.Flags == D3D12_BUFFER_UAV_FLAG_NONE && b.CounterOffsetInBytes == 0 && start.is_multiple_of(16) && u64::from(b.NumElements) * u64::from(b.StructureByteStride) / 4 <= 1 << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP {
             let stride = u64::from(b.StructureByteStride);
             b.FirstElement = b.FirstElement * stride / 4;
             b.NumElements = (u64::from(b.NumElements) * stride / 4) as u32;

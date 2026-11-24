@@ -1521,11 +1521,11 @@ impl State {
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&t| crate::resource::host_resource(t as This))
-            .map(|t| {
+            .filter_map(|&t| crate::resource::host_resource(t as This).map(|h| (t, h)))
+            .map(|(t, h)| {
                 // SAFETY: a live resource.
-                let d = unsafe { t.GetDesc() };
-                format!("{}x{} f{}", d.Width, d.Height, d.Format.0)
+                let d = unsafe { h.GetDesc() };
+                format!("{:#x} {}x{} f{}", t as usize, d.Width, d.Height, d.Format.0)
             })
             .collect();
         let v = self.vertex[0];
@@ -1900,7 +1900,7 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!("{:#x} {}x{} f{} flags {:#x}", r as usize, d.Width, d.Height, d.Format.0, d.Flags.0)
         })
     };
     match view {
