@@ -29,6 +29,9 @@ import tempfile
 import time
 from typing import Callable, Optional, TextIO
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+
 CHUNK = 8 * 1024 * 1024
 DEFAULT_MANIFEST = os.path.join(os.path.dirname(__file__), "..", "reports", "manifest.json")
 CACHE_VERSION = 1
@@ -155,6 +158,8 @@ def save_cache(path: str, entries: dict[str, dict]) -> None:
         ) as f:
             tmp = f.name
             json.dump({"version": CACHE_VERSION, "files": dict(sorted(entries.items()))}, f, indent=1)
+        if os.name != "nt":
+            os.chmod(tmp, published_mode(path))  # do not publish NamedTemporaryFile's private 0600 mode
         os.replace(tmp, path)
     except BaseException:
         if tmp is not None:
