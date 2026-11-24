@@ -217,6 +217,9 @@ fn transform_aabb(m: &[[f32; 4]; 3], (mn, mx): Aabb) -> Aabb {
 fn world_to_object(m: &[[f32; 4]; 3]) -> [f32; 12] {
     let a = |r: usize, c: usize| m[r][c] as f64;
     let det = a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1)) - a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0)) + a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0));
+    if !det.is_finite() || det.abs() <= 1e-30 {
+        return [0f32; 12];
+    }
     let inv = [
         [a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1), a(0, 2) * a(2, 1) - a(0, 1) * a(2, 2), a(0, 1) * a(1, 2) - a(0, 2) * a(1, 1)],
         [a(1, 2) * a(2, 0) - a(1, 0) * a(2, 2), a(0, 0) * a(2, 2) - a(0, 2) * a(2, 0), a(0, 2) * a(1, 0) - a(0, 0) * a(1, 2)],
@@ -627,5 +630,63 @@ pub(crate) mod tests {
         let big = [[0.0, 0.0, 0.0], [1e10, 0.0, 0.0], [0.0, 1e10, 0.0]];
         assert!(triangle_hit(&big, [2e10, 2e10, -1.0], d).is_none());
         assert!(triangle_hit(&big, [2e9, 2e9, -1.0], d).is_some());
+    }
+
+    #[test]
+    fn zero_scale_or_singular_instance_transform_does_not_emit_nan() {
+        // Zero-scale / culled dynamic instance (det == 0.0)
+        let zero_transform = [[0.0f32; 4]; 3];
+        let w2o_zero = world_to_object(&zero_transform);
+        assert_eq!(w2o_zero, [0.0f32; 12]);
+        assert!(w2o_zero.iter().all(|x| x.is_finite() && !x.is_nan()));
+
+        // Singular affine transform (linearly dependent rows, det == 0.0)
+        let singular = [
+            [1.0, 2.0, 3.0, 10.0],
+            [2.0, 4.0, 6.0, 20.0],
+            [0.0, 0.0, 1.0, 5.0],
+        ];
+        let w2o_singular = world_to_object(&singular);
+        assert_eq!(w2o_singular, [0.0f32; 12]);
+        assert!(w2o_singular.iter().all(|x| x.is_finite() && !x.is_nan()));
+
+        // Non-finite transform entries (det is NaN)
+        let nan_matrix = [
+            [f32::NAN, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ];
+        let w2o_nan = world_to_object(&nan_matrix);
+        assert_eq!(w2o_nan, [0.0f32; 12]);
+        assert!(w2o_nan.iter().all(|x| x.is_finite() && !x.is_nan()));
+
+        // Build top-level BVH containing a zero-scale instance
+        let inst = Instance {
+            transform: zero_transform,
+            id: 42,
+            mask: 0xFF,
+            contribution: 0,
+            flags: 0,
+            blas_address: 0x1000,
+            blas_root: 0x10 | BOX32,
+            blas_bounds: ([-1.0; 3], [1.0; 3]),
+        };
+        let top = build_top(&[inst]);
+        assert_ne!(top.root, INVALID);
+
+        // Verify emitted instance node (leaf bytes 64..112) contains zero NaNs
+        let leaf_at = node_at(top.root);
+        let child_node = word(&top.data, leaf_at);
+        assert_ne!(child_node, INVALID);
+        let inst_at = node_at(child_node);
+        for k in 0..12 {
+            let f = f32::from_bits(word(&top.data, inst_at + 64 + 4 * k));
+            assert!(f.is_finite() && !f.is_nan(), "word {k} must be finite: {f}");
+        }
+
+        // Ray tracing scene with degenerate instance must cleanly miss or skip without panicking
+        let lookup = |_addr: u64| None;
+        let hit = top.trace_scene(&lookup, [0.0, 0.0, -5.0], [0.0, 0.0, 1.0], 100.0);
+        assert!(hit.is_none());
     }
 }
