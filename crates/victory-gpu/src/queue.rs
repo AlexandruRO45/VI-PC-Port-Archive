@@ -129,27 +129,56 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         // Held until they run: the title may reset its lists before.
-        let host_lists: Vec<_> = lists
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        queue(this).timeline.submit(Op::Run(Box::new(move || {
-            if let Some(host) = crate::host::host() {
-                let runs: Vec<_> = host_lists.iter().map(|l| &**l).collect();
-                host.execute(&runs);
-                for list in host_lists {
-                    if let Ok(orphan) = std::sync::Arc::try_unwrap(list) {
-                        host.recycle_list(orphan);
-                    }
-                }
+        let mut ops = Vec::new();
+        let mut batch = Vec::new();
+        for &list in lists {
+            let Some(tail) = crate::list::host_list(list) else {
+                continue;
+            };
+            let prefixes = crate::list::prefixes(list);
+            let split = !prefixes.is_empty();
+            for prefix in prefixes {
+                batch.push(prefix.list);
+                ops.push(run_lists(std::mem::take(&mut batch)));
+                ops.push(Op::Memory(crate::fence::MemoryWait::new(
+                    prefix.address,
+                    prefix.comparison,
+                    prefix.reference,
+                )));
             }
-        })));
+            batch.push(tail);
+            if split {
+                // Host::execute prepares CPU copies for its entire batch before
+                // publishing bottom-of-pipe writes. Finish the suffix before a
+                // following list can sample the memory it writes.
+                ops.push(run_lists(std::mem::take(&mut batch)));
+            }
+        }
+        if !batch.is_empty() {
+            ops.push(run_lists(batch));
+        }
+        queue(this).timeline.submit_batch(ops);
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
     if !ONCE.swap(true, Ordering::Relaxed) {
         tracing::warn!(count, "command lists submitted; no host GPU runs them");
     }
+}
+
+#[cfg(windows)]
+fn run_lists(lists: Vec<Arc<crate::host::HostList>>) -> Op {
+    Op::Run(Box::new(move || {
+        if let Some(host) = crate::host::host() {
+            let runs: Vec<_> = lists.iter().map(|l| &**l).collect();
+            host.execute(&runs);
+            for list in lists {
+                if let Ok(orphan) = Arc::try_unwrap(list) {
+                    host.recycle_list(orphan);
+                }
+            }
+        }
+    }))
 }
 
 /// The start of a present plane: frame token, then the plane's resources.
@@ -234,26 +263,26 @@ impl Written {
             }
             Written::SystemTimestamp => system_timestamp(),
         };
-        // SAFETY: the title names writable GPU memory (unified with ours).
-        // Use atomic Release stores when aligned so concurrent readers (such
-        // as a fence's `AtomicU64` value) observe them without a data race.
-        unsafe {
-            if bytes == 4 {
-                if (at as usize).is_multiple_of(align_of::<AtomicU32>()) {
-                    (*at.cast::<AtomicU32>()).store(value as u32, Ordering::Release);
+        crate::fence::write_and_collect(at as usize, bytes, || {
+            // SAFETY: the title names writable GPU memory (unified with ours).
+            // Use atomic Release stores when aligned so concurrent readers (such
+            // as a fence's `AtomicU64` value) observe them without a data race.
+            unsafe {
+                if bytes == 4 {
+                    if (at as usize).is_multiple_of(align_of::<AtomicU32>()) {
+                        (*at.cast::<AtomicU32>()).store(value as u32, Ordering::Release);
+                    } else {
+                        at.cast::<u32>().write_unaligned(value as u32);
+                        std::sync::atomic::fence(Ordering::Release);
+                    }
+                } else if (at as usize).is_multiple_of(align_of::<AtomicU64>()) {
+                    (*at.cast::<AtomicU64>()).store(value, Ordering::Release);
                 } else {
-                    at.cast::<u32>().write_unaligned(value as u32);
+                    at.cast::<u64>().write_unaligned(value);
                     std::sync::atomic::fence(Ordering::Release);
                 }
-            } else if (at as usize).is_multiple_of(align_of::<AtomicU64>()) {
-                (*at.cast::<AtomicU64>()).store(value, Ordering::Release);
-            } else {
-                at.cast::<u64>().write_unaligned(value);
-                std::sync::atomic::fence(Ordering::Release);
             }
-        }
-        // A write at a fence's GPU address moves its value.
-        crate::fence::written(at as usize, bytes)
+        })
     }
 }
 

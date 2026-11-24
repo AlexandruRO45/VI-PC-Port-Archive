@@ -120,6 +120,17 @@ struct List {
     host: std::sync::Mutex<Option<std::sync::Arc<crate::host::HostList>>>,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
+    #[cfg(windows)]
+    prefixes: std::sync::Mutex<Vec<Prefix>>,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct Prefix {
+    pub list: std::sync::Arc<crate::host::HostList>,
+    pub address: usize,
+    pub comparison: crate::fence::Comparison,
+    pub reference: u64,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -249,6 +260,8 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         })),
         #[cfg(windows)]
         state: Default::default(),
+        #[cfg(windows)]
+        prefixes: Default::default(),
     });
     object::hand_out(LIST, list, iid, &LIST_IIDS, out)
 }
@@ -288,6 +301,11 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     }
     // SAFETY: the title passes one of our lists.
     let list = unsafe { &*this.cast::<List>() };
+    #[cfg(windows)]
+    list.prefixes
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
     // A submission of the list still to run (its queue waits for a fence)
     // keeps the host list, its upload memory and its dynamic descriptor
@@ -959,7 +977,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, host_list, with_state};
+    use super::{This, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -981,25 +999,23 @@ mod state {
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
-        if let Some(list) = host_list(this) {
-            crate::draw::viewports(&list, items(viewports, count));
-        }
+        with_state(this, |list, state| {
+            state.set_viewports(list, items(viewports, count))
+        });
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        if let Some(list) = host_list(this) {
-            crate::draw::scissors(&list, items(rects, count));
-        }
+        with_state(this, |list, state| {
+            state.set_scissors(list, items(rects, count))
+        });
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        if let Some(list) = host_list(this) {
+        with_state(this, |list, state| {
             // SAFETY: the title passes four floats or null.
-            crate::draw::blend_factor(&list, unsafe { factor.as_ref() });
-        }
+            state.set_blend(list, unsafe { factor.as_ref() })
+        });
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        if let Some(list) = host_list(this) {
-            crate::draw::stencil_ref(&list, reference);
-        }
+        with_state(this, |list, state| state.set_stencil(list, reference));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
@@ -1266,10 +1282,70 @@ pub(crate) fn take_counts() -> (u64, u64) {
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
 }
 
-/// A GPU wait for a memory value `(address, comparison, reference, ...)`.
-/// Lists run one after another and to completion, so a value another queue
-/// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+/// The separate 32-bit, masked wait is not implemented.
+extern "system" fn wait32(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+
+#[cfg(windows)]
+pub(crate) fn prefixes(this: This) -> Vec<Prefix> {
+    // SAFETY: submitted guest list, live for the duration of the call.
+    let list = unsafe { &*this.cast::<List>() };
+    list.prefixes
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Wait64BitValueX(address, comparison, reference, flags). Flags are not a mask.
+extern "system" fn wait64(this: This, address: u64, comparison: u32, reference: u64, _flags: u32) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_COMPARISON_FUNC_EQUAL, D3D12_COMPARISON_FUNC_GREATER_EQUAL,
+        };
+        let comparison = match comparison as i32 {
+            n if n == D3D12_COMPARISON_FUNC_EQUAL.0 => crate::fence::Comparison::Equal,
+            n if n == D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 => {
+                crate::fence::Comparison::GreaterEqual
+            }
+            other => {
+                tracing::warn!(other, "unsupported 64-bit GPU memory comparison");
+                return;
+            }
+        };
+        if address == 0 || !address.is_multiple_of(8) {
+            tracing::warn!(address, "invalid 64-bit GPU wait address");
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        // SAFETY: called through the guest list's method table.
+        let list = unsafe { &*this.cast::<List>() };
+        let mut current = list.host.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(prefix) = current.as_ref() else {
+            return;
+        };
+        let next = host
+            .acquire_list()
+            .unwrap_or_else(|e| crate::host::fail(format_args!("wait segment: {e}")));
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        prefix.close();
+        prefix.keep_dynamic(state.take_dynamic());
+        state.resume_on(&next);
+        list.prefixes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Prefix {
+                list: prefix.clone(),
+                address: address as usize,
+                comparison,
+                reference,
+            });
+        *current = Some(std::sync::Arc::new(next));
+    }
+    #[cfg(not(windows))]
+    let _ = (this, address, comparison, reference);
+}
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
@@ -1372,8 +1448,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (68, ignored_state as *const ()),             // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
-    (71, wait_value as *const ()),                // 0x238, 32 bits
-    (72, wait_value as *const ()),                // 0x240, 64 bits
+    (71, wait32 as *const ()),                // 0x238, 32 bits
+    (72, wait64 as *const ()),                    // 0x240, 64 bits
     (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0
@@ -1446,6 +1522,245 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    #[ignore = "requires D3D12; set VICTORY_D3D12_WARP=1 for the software adapter"]
+    fn wait64_orders_two_guest_queues() {
+        for producer_first in [true, false] {
+            wait_case(7, 0, 1, 2, producer_first, false, false);
+        }
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    #[ignore = "requires D3D12; set VICTORY_D3D12_WARP=1 for the software adapter"]
+    fn wait64_in_the_middle_preserves_prefix_and_compares_full_words() {
+        let reference = 0x1_0000_0001;
+        for producer_first in [true, false] {
+            for separate_submit in [true, false] {
+                // Equality must reject a larger word with identical low bits.
+                wait_case(
+                    3,
+                    0x2_0000_0001,
+                    reference,
+                    reference,
+                    producer_first,
+                    true,
+                    separate_submit,
+                );
+                // A greater low word alone is insufficient. Publishing a value
+                // with bit 63 set must satisfy the unsigned comparison.
+                wait_case(
+                    7,
+                    u64::from(u32::MAX),
+                    reference,
+                    1 << 63,
+                    producer_first,
+                    true,
+                    separate_submit,
+                );
+            }
+        }
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn wait_case(
+        cmp: u32,
+        initial: u64,
+        reference: u64,
+        publish: u64,
+        producer_first: bool,
+        mid_list: bool,
+        separate_submit: bool,
+    ) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIFactory4,
+        };
+        let host = crate::host::host().expect("D3D12 host initialization failed");
+        // SAFETY: query the DXGI adapter of the actual device used for submission.
+        let desc = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(Default::default()).unwrap();
+            let adapter: IDXGIAdapter1 = factory
+                .EnumAdapterByLuid(host.device.GetAdapterLuid())
+                .unwrap();
+            adapter.GetDesc1().unwrap()
+        };
+        let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+        assert_eq!(software, std::env::var_os("VICTORY_D3D12_WARP").is_some());
+        let name_len = desc
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.Description.len());
+        eprintln!(
+            "D3D12: {}",
+            String::from_utf16_lossy(&desc.Description[..name_len])
+        );
+        type Write = extern "system" fn(This, u64, u64, u32, u32);
+        type Wait = extern "system" fn(This, u64, u32, u64, u32);
+        type CopyBytes = extern "system" fn(This, u64, u64, u64, u32);
+        type Submit = extern "system" fn(This, u32, *const This);
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Release = extern "system" fn(This) -> u32;
+        let null = std::ptr::null();
+        let make_pair = || {
+            let (mut queue, mut allocator, mut list) = (null, null, null);
+            // QueueDescX has four u32 fields. All zero selects a direct queue.
+            let direct = [0u32; 4];
+            assert_eq!(
+                crate::queue::create_x(null, direct.as_ptr().cast(), &PAGEABLE_IIDS[0], &mut queue),
+                S_OK
+            );
+            assert_eq!(
+                create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+                S_OK
+            );
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            assert!(host_list(list).is_some(), "no host list");
+            (queue, allocator, list)
+        };
+        let offset = |list: This, index: usize| {
+            // SAFETY: our list starts with its method table.
+            let table = unsafe { *list.cast::<*const *const ()>() };
+            if table == NEWER_LIST_FUNCTIONS.0.as_ptr() {
+                newer_slot(index) * 8
+            } else {
+                index * 8
+            }
+        };
+
+        let producer = make_pair();
+        let consumer = make_pair();
+        let mut follower = null;
+        assert_eq!(
+            create_list(null, 0, 0, consumer.1, null, &LIST_IIDS[1], &mut follower),
+            S_OK
+        );
+        const SENTINEL: u64 = 0xface_feed;
+        let (mut payload, mut counter, mut result) = (0u64, initial, SENTINEL);
+        let mut copied_marker = SENTINEL;
+        let following = AtomicU64::new(0);
+        let (source, source_ptr) = host.upload_buffer(8).unwrap();
+        let (native_result, native_ptr) = host.shared_buffer(16).unwrap();
+        // SAFETY: both resources are mapped here and outlive the final completion marker.
+        unsafe {
+            source_ptr.cast::<u64>().write(0x1234);
+            native_ptr.write_bytes(0, 16);
+        }
+        let gpu_copy = |offset| {
+            let segment = host_list(consumer.2).unwrap();
+            // SAFETY: both buffers are live and contain the full 8-byte range.
+            unsafe {
+                segment
+                    .list
+                    .CopyBufferRegion(&native_result, offset, &source, 0, 8)
+            };
+        };
+        let before = AtomicU64::new(0);
+        let after = AtomicU64::new(0);
+        let write = slot::<Write>(producer.2, offset(producer.2, 70));
+        write(producer.2, (&raw mut payload) as u64, 0x5a55a11c, 0, 0);
+        write(producer.2, (&raw mut counter) as u64, publish, 0, 0);
+        let consumer_write = slot::<Write>(consumer.2, offset(consumer.2, 70));
+        if mid_list {
+            gpu_copy(0);
+            consumer_write(consumer.2, before.as_ptr() as u64, 1, 0, 0);
+        }
+        let wait = slot::<Wait>(consumer.2, offset(consumer.2, 72));
+        wait(consumer.2, (&raw mut counter) as u64, cmp, reference, 0);
+        if mid_list {
+            gpu_copy(8);
+        }
+        slot::<CopyBytes>(consumer.2, offset(consumer.2, 60))(
+            consumer.2,
+            (&raw mut result) as u64,
+            (&raw mut payload) as u64,
+            8,
+            0,
+        );
+        consumer_write(consumer.2, after.as_ptr() as u64, 1, 0, 0);
+        // This copy is performed during host preparation. Its input is written
+        // only when the consumer's native suffix has completed.
+        slot::<CopyBytes>(follower, offset(follower, 60))(
+            follower,
+            (&raw mut copied_marker) as u64,
+            after.as_ptr() as u64,
+            8,
+            0,
+        );
+        slot::<Write>(follower, offset(follower, 70))(follower, following.as_ptr() as u64, 1, 0, 0);
+        assert_eq!(slot::<Close>(follower, 0x48)(follower), S_OK);
+        assert_eq!(slot::<Close>(producer.2, 0x48)(producer.2), S_OK);
+        assert_eq!(slot::<Close>(consumer.2, 0x48)(consumer.2), S_OK);
+        let submit = |queue, lists: &[This]| {
+            slot::<Submit>(queue, 0x50)(queue, lists.len() as u32, lists.as_ptr());
+        };
+        let submit_consumer = || {
+            if separate_submit {
+                submit(consumer.0, &[consumer.2]);
+                submit(consumer.0, &[follower]);
+            } else {
+                submit(consumer.0, &[consumer.2, follower]);
+            }
+        };
+        let mut while_waiting = None;
+        let mut native_before_signal = None;
+        if producer_first {
+            submit(producer.0, &[producer.2]);
+            submit_consumer();
+        } else {
+            submit_consumer();
+            // Both guest lists and all buffers remain live past completion.
+            while_waiting = Some((
+                before.load(Ordering::Acquire),
+                result,
+                after.load(Ordering::Acquire),
+                following.load(Ordering::Acquire),
+                copied_marker,
+            ));
+            if mid_list {
+                // SAFETY: the producer has not been submitted; the prefix has finished.
+                native_before_signal = Some(unsafe { native_ptr.cast::<[u64; 2]>().read() });
+                // The original suffix must survive an immediate guest reset.
+                assert_eq!(reset(consumer.2, consumer.1, null), S_OK);
+            }
+            submit(producer.0, &[producer.2]);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while following.load(Ordering::Acquire) != 1 {
+            assert!(Instant::now() < deadline, "consumer did not finish");
+            std::thread::yield_now();
+        }
+        slot::<Release>(follower, 0x10)(follower);
+        for (queue, allocator, list) in [consumer, producer] {
+            for object in [list, allocator, queue] {
+                slot::<Release>(object, 0x10)(object);
+            }
+        }
+        if mid_list {
+            // SAFETY: the end-of-pipe marker above follows the native copy.
+            assert_eq!(unsafe { native_ptr.cast::<[u64; 2]>().read() }, [0x1234; 2]);
+        }
+        if let Some(prefix) = native_before_signal {
+            assert_eq!(prefix, [0x1234, 0]);
+        }
+        if let Some(snapshot) = while_waiting {
+            assert_eq!(snapshot, (u64::from(mid_list), SENTINEL, 0, 0, SENTINEL));
+        }
+        assert_eq!(after.load(Ordering::Acquire), 1);
+        assert_eq!(
+            copied_marker, 1,
+            "following list prepared before suffix completed"
+        );
+        assert_eq!((counter, payload), (publish, 0x5a55a11c));
+        assert_eq!(result, payload, "producer_first={producer_first}");
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

@@ -96,10 +96,92 @@ fn watch_notify() {
     });
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Comparison {
+    Equal,
+    GreaterEqual,
+}
+
+/// One particular execution of a command-list memory predicate. Once observed,
+/// equality stays satisfied even if the producer has advanced again before wake().
+#[derive(Clone)]
+pub(crate) struct MemoryWait {
+    address: usize,
+    comparison: Comparison,
+    reference: u64,
+    observed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+static MEMORY: Mutex<Vec<(MemoryWait, Arc<Timeline>)>> = Mutex::new(Vec::new());
+
+impl MemoryWait {
+    pub(crate) fn new(address: usize, comparison: Comparison, reference: u64) -> Self {
+        Self {
+            address,
+            comparison,
+            reference,
+            observed: Default::default(),
+        }
+    }
+
+    fn observe(&self) -> bool {
+        // SAFETY: command-list callers keep this aligned GPU address mapped until
+        // completion. Bottom-of-pipe writes to aligned words use a release store.
+        let word = unsafe { &*(self.address as *const AtomicU64) }.load(Ordering::Acquire);
+        let ready = match self.comparison {
+            Comparison::Equal => word == self.reference,
+            Comparison::GreaterEqual => word >= self.reference,
+        };
+        if ready {
+            self.observed.store(true, Ordering::Release);
+        }
+        ready
+    }
+
+    pub(crate) fn register(&self, queue: &Arc<Timeline>) -> bool {
+        let mut pending = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        if self.observed.load(Ordering::Acquire) {
+            return true;
+        }
+        if pending
+            .iter()
+            .any(|(w, _)| Arc::ptr_eq(&w.observed, &self.observed))
+        {
+            return false;
+        }
+        if self.observe() {
+            return true;
+        }
+        pending.push((self.clone(), queue.clone()));
+        drop(pending);
+        watch_notify();
+        false
+    }
+}
+
+fn scan_memory(pending: &mut Vec<(MemoryWait, Arc<Timeline>)>, range: Option<std::ops::Range<usize>>) -> (Vec<Arc<Timeline>>, bool) {
+    let mut ready = Vec::new();
+    pending.retain(|(wait, queue)| {
+        let overlaps = range
+            .as_ref()
+            .is_none_or(|r| r.start < wait.address.saturating_add(8) && wait.address < r.end);
+        if overlaps && wait.observe() {
+            ready.push(queue.clone());
+            false
+        } else {
+            true
+        }
+    });
+    (ready, !pending.is_empty())
+}
+
 fn watch_loop() {
     loop {
         let seen = *WATCHER.generation.lock().unwrap_or_else(|e| e.into_inner());
-        let (woken, any_waiting) = scan_live_fences();
+        let (mut woken, fence_waiting) = scan_live_fences();
+        let (memory_ready, memory_waiting) = scan_memory(&mut MEMORY.lock().unwrap_or_else(|e| e.into_inner()), None);
+        woken.extend(memory_ready);
+        let any_waiting = fence_waiting || memory_waiting;
         if !woken.is_empty() {
             run_held(woken);
             continue;
@@ -346,16 +428,21 @@ impl Held {
     }
 }
 
-/// After a bottom-of-pipe write of `bytes` at `at`: wakes the waits of a
-/// fence whose value the write touched, and returns its held queues.
-pub(crate) fn written(at: usize, bytes: usize) -> Woken {
+/// Commit the write and remove satisfied waiters under the same registry
+/// locks used by the polling thread. Otherwise the watcher can steal a wake
+/// between the store and notification while Host::execute still holds its lock.
+pub(crate) fn write_and_collect(at: usize, bytes: usize, store: impl FnOnce()) -> Woken {
     let end = at.saturating_add(bytes);
     let live = live();
+    let mut pending = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    store();
+    let (mut ready, _) = scan_memory(&mut pending, Some(at..end));
+    drop(pending);
     let Some((&value_at, &fence)) = live.range(..end).next_back() else {
-        return Woken::default();
+        return Woken(ready);
     };
     if value_at + size_of::<u64>() <= at {
-        return Woken::default();
+        return Woken(ready);
     }
     // SAFETY: registered fences are alive until their drop, which takes
     // the registry lock we hold.
@@ -365,7 +452,13 @@ pub(crate) fn written(at: usize, bytes: usize) -> Woken {
         fence.waiters.lock().unwrap_or_else(|e| e.into_inner()),
     );
     drop(live);
-    Woken(queues)
+    ready.extend(queues);
+    Woken(ready)
+}
+
+#[cfg(test)]
+fn written(at: usize, bytes: usize) -> Woken {
+    write_and_collect(at, bytes, || {})
 }
 
 extern "system" fn creation_flags(this: This) -> u32 {
