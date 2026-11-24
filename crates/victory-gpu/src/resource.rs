@@ -1336,22 +1336,23 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
     }
-    r.host.used.store(crate::host::moment(), Relaxed);
+    if make {
+        r.host.used.store(crate::host::moment(), Relaxed);
+    }
     made.clone()
 }
 
 /// The host copy of title texture `this` if it is made, without making it
 /// (for diagnostics, which must not count as a use).
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn host_made<'a>(
+pub(crate) fn host_made(
     this: This,
-) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     if this.is_null() {
         return None;
     }
     let (host, _) = hosted(this, false)?;
-    // SAFETY: as in `host_resource`.
-    Some(unsafe { &*std::ptr::from_ref(&host.texture) })
+    Some(host.texture.clone())
 }
 
 /// Whether more host copies of textures the title fills may be made for
@@ -2617,6 +2618,16 @@ mod tests {
         }
         let readback = readback.unwrap();
         let host_image = host_resource(image).unwrap();
+        #[cfg(feature = "diagnostics")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let used = &resource(image).host.used;
+            let before = used.swap(u64::MAX, Relaxed);
+            let inspected = host_made(image).unwrap();
+            let after = used.swap(before, Relaxed);
+            assert_eq!(after, u64::MAX);
+            assert_eq!(inspected.as_raw(), host_image.as_raw());
+        }
         let back = host.new_list().unwrap();
         let (_, before) = host_transition(image, 0x800).unwrap();
         // The upload list holds the texture until it is reset.
