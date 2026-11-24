@@ -634,7 +634,7 @@ fn sampler_x_filter(mag: u32, min: u32, mip: u32, max_anisotropy: u32) -> D3D12_
 /// PC sampler desc of a console one (0x6C bytes; `u`: the dword at an offset). It carries the PC
 /// fields at other offsets (+4 / +8 / +0x10 magnification / minification / mip filter, +0x18
 /// address U / V / W, +0x24 / +0x28 min / max LOD, +0x2C bias, +0x34 max anisotropy, +0x40
-/// comparison); its further anisotropy fields are not modelled.
+/// comparison, +0x44 border colour); its further anisotropy fields are not modelled.
 fn pc_sampler_desc(u: impl Fn(usize) -> u32) -> D3D12_SAMPLER_DESC {
     D3D12_SAMPLER_DESC {
         Filter: sampler_x_filter(u(4), u(8), u(0x10), u(0x34)),
@@ -644,7 +644,7 @@ fn pc_sampler_desc(u: impl Fn(usize) -> u32) -> D3D12_SAMPLER_DESC {
         MipLODBias: f32::from_bits(u(0x2C)),
         MaxAnisotropy: u(0x34).clamp(1, 16),
         ComparisonFunc: D3D12_COMPARISON_FUNC(u(0x40) as i32),
-        BorderColor: [0.0; 4],
+        BorderColor: [0x44, 0x48, 0x4C, 0x50].map(|o| f32::from_bits(u(o))),
         MinLOD: f32::from_bits(u(0x24)),
         MaxLOD: f32::from_bits(u(0x28)),
     }
@@ -1105,6 +1105,18 @@ mod tests {
         // the other fields as before
         let d = pc([1, 1, 2, 2], 1);
         assert_eq!((d.AddressU.0, d.AddressV.0, d.AddressW.0, d.MinLOD, d.MaxLOD, d.ComparisonFunc.0), (1, 2, 3, 0.0, 12.0, 1));
+    }
+
+    /// The border colour is the desc's (it was transparent black whatever the title asked for).
+    #[test]
+    fn console_samplers_keep_their_border_colour() {
+        let mut d = console_sampler([1, 1, 2, 2], [4; 3], 1);
+        let border = |d: &[u32; 0x6C / 4]| pc_sampler_desc(|o| d[o / 4]).BorderColor;
+        assert_eq!(border(&d), [0.0; 4]);
+        for (k, v) in [0.25f32, 0.5, 0.75, 1.0].into_iter().enumerate() {
+            d[0x44 / 4 + k] = v.to_bits();
+        }
+        assert_eq!(border(&d), [0.25, 0.5, 0.75, 1.0]);
     }
 
     #[test]
