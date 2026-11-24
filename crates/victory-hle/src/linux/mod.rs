@@ -17,10 +17,18 @@ mod combase;
 pub(crate) mod handles;
 mod mmdevapi;
 mod oleaut32;
+mod winhttp;
+mod ws2_32;
 mod xaudio2;
 
 fn modules() -> Vec<HleModule> {
-    vec![combase::module(), oleaut32::module(), xaudio2::module()]
+    vec![
+        combase::module(),
+        oleaut32::module(),
+        winhttp::module(),
+        ws2_32::module(),
+        xaudio2::module(),
+    ]
 }
 
 static MODULES: LazyLock<Vec<HleModule>> = LazyLock::new(modules);
