@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
@@ -307,6 +307,23 @@ mod tests {
     }
 
     #[test]
+    fn first_scratch_is_small_and_growth_is_not_retained() {
+        let h = host().expect("D3D12 host");
+        let list = h.new_list().unwrap();
+        let (a, at, _) = list.scratch_buffer(32).unwrap();
+        let (b, next, _) = list.scratch_buffer(SCRATCH_FIRST - 256).unwrap();
+        assert_eq!(a, b);
+        assert_eq!((at, next), (0, 256));
+        let (c, at, _) = list.scratch_buffer(32).unwrap();
+        assert_ne!(a, c);
+        assert_eq!(at, 0);
+        list.reset();
+        let scratch = list.scratch.lock().unwrap();
+        assert_eq!(scratch.chunks.len(), 1);
+        assert_eq!(scratch.chunks[0].bytes, 256 << 10);
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -423,7 +440,7 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
 /// the bytes used in it.
 #[derive(Default)]
 struct Scratch {
-    chunks: Vec<(ID3D12Resource, usize, u64)>,
+    chunks: Vec<ScratchChunk>,
     current: usize,
     used: u64,
 }
@@ -431,7 +448,22 @@ struct Scratch {
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
 unsafe impl Send for Scratch {}
 
+const SCRATCH_FIRST: u64 = 256 << 10;
 const SCRATCH_CHUNK: u64 = 4 << 20;
+static SCRATCH_BYTES: AtomicU64 = AtomicU64::new(0);
+
+struct ScratchChunk {
+    resource: ID3D12Resource,
+    cpu: usize,
+    gpu: u64,
+    bytes: u64,
+}
+
+impl Drop for ScratchChunk {
+    fn drop(&mut self) {
+        SCRATCH_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -1158,6 +1190,7 @@ impl HostList {
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
+            scratch.chunks.truncate(1);
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -1479,32 +1512,46 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        let (_, _, gpu, cpu) = self.scratch_alloc(len)?;
+        Some((gpu, cpu))
+    }
+
+    /// Resource, offset and CPU pointer for an indirect record written by
+    /// the CPU, rather than a committed upload allocation per small record.
+    #[allow(dead_code)] // used by the mesh fallback port
+    pub(crate) fn scratch_buffer(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        let (buffer, offset, _, cpu) = self.scratch_alloc(len)?;
+        Some((buffer, offset, cpu))
+    }
+
+    fn scratch_alloc(&self, len: u64) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
         let host = host()?;
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        let len = len.max(1).next_multiple_of(256);
+        let len = len.max(1).checked_next_multiple_of(256)?;
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().uploads.push(buffer);
-            return Some((gpu, data));
+            self.deferred().uploads.push(buffer.clone());
+            return Some((buffer, 0, gpu, data));
         }
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        while s.chunks.get(s.current).is_some_and(|c| s.used + len > c.bytes) {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
-            let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
+            let bytes = if s.chunks.is_empty() && len <= SCRATCH_FIRST { SCRATCH_FIRST } else { SCRATCH_CHUNK };
+            let (buffer, data) = host.upload_buffer(bytes)?;
             name(&buffer, || "list scratch".into());
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            s.chunks.push((buffer, data as usize, gpu));
-            s.used = 0;
+            s.chunks.push(ScratchChunk { resource: buffer, cpu: data as usize, gpu, bytes });
+            SCRATCH_BYTES.fetch_add(bytes, Ordering::Relaxed);
         }
-        let (_, data, gpu) = s.chunks[s.current];
         let at = s.used;
         s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        let c = &s.chunks[s.current];
+        Some((c.resource.clone(), at, c.gpu + at, (c.cpu + at as usize) as *mut u8))
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -2015,6 +2062,7 @@ impl Meter {
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             crate::pipeline::library::trim_idle();
+            tracing::info!(bytes = SCRATCH_BYTES.load(Ordering::Relaxed), "list scratch upload chunks");
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
