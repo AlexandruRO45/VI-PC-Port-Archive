@@ -7933,6 +7933,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            options: super::TranslateOptions::default(),
         })
     }
 
