@@ -121,7 +121,18 @@ impl Shader {
                 let done = if deny.iter().any(|h| self.hash.to_string().starts_with(h.as_str())) {
                     Err("denied: its translation hangs the GPU (VICTORY_SHADER_DENY)".to_string())
                 } else {
-                    translate(&self.container)
+                    // Local build: `VICTORY_DENY_TITLE_MEMORY=1` refuses compute shaders that read
+                    // title memory through the mirror's views (to bisect corruption).
+                    translate(&self.container).and_then(|t| {
+                        let reads = t.host.root_srvs.contains(&victory_shader::emit::TITLE_MEMORY_SLOT);
+                        if reads {
+                            tracing::info!(hash = %self.hash, "shader reads title memory");
+                            if std::env::var_os("VICTORY_DENY_TITLE_MEMORY").is_some() {
+                                return Err("denied: reads title memory (VICTORY_DENY_TITLE_MEMORY)".to_string());
+                            }
+                        }
+                        Ok(t)
+                    })
                 };
                 match &done {
                     Ok(t) => tracing::info!(
