@@ -2,6 +2,8 @@
 //!
 //! Resolution order for each value: environment variable, then the config
 //! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default.
+//! A variable that is set but empty counts as unset. Relative paths in the
+//! config file are relative to the file, not to the working directory.
 //! See `victory.example.toml` at the repository root.
 
 use std::path::{Path, PathBuf};
@@ -43,10 +45,30 @@ struct FilePaths {
     test_titles: Vec<PathBuf>,
 }
 
+impl FileConfig {
+    /// The `[paths]` table with every relative path made relative to `dir`,
+    /// the directory holding the config file. With `VICTORY_CONFIG` pointing
+    /// elsewhere, `cache_dir = "cache"` then means the folder next to that
+    /// file, not one under whatever directory the tool was started from
+    /// (often the repository, which the asset policy refuses).
+    fn anchored_at(self, dir: &Path) -> FilePaths {
+        let anchor = |p: PathBuf| if p.is_relative() { dir.join(p) } else { p };
+        let paths = self.paths;
+        FilePaths {
+            game_dir: paths.game_dir.map(anchor),
+            cache_dir: paths.cache_dir.map(anchor),
+            data_dir: paths.data_dir.map(anchor),
+            test_titles: paths.test_titles.into_iter().map(anchor).collect(),
+        }
+    }
+}
+
 impl Config {
     /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
-        let explicit = std::env::var_os("VICTORY_CONFIG").map(PathBuf::from);
+        let explicit = std::env::var_os("VICTORY_CONFIG")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
         let path = explicit
             .clone()
             .unwrap_or_else(|| PathBuf::from("victory.toml"));
@@ -66,11 +88,12 @@ impl Config {
             Some((path, text)) => {
                 let parsed: FileConfig =
                     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-                (Some(path), parsed)
+                let dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
+                (Some(path), parsed.anchored_at(&dir))
             }
-            None => (None, FileConfig::default()),
+            None => (None, FilePaths::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        Self::resolve(parsed, source, |k| std::env::var_os(k))
     }
 
     fn resolve(
@@ -79,7 +102,7 @@ impl Config {
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Self> {
         let env_path = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-        let test_titles = match env("VICTORY_TEST_TITLES") {
+        let test_titles = match env("VICTORY_TEST_TITLES").filter(|v| !v.is_empty()) {
             Some(v) => std::env::split_paths(&v)
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect(),
@@ -277,6 +300,45 @@ mod tests {
         let nothing_usable = |k: &str| (k == "HOME").then(OsString::new);
         assert!(default_dir(Kind::Cache, nothing_usable).is_err());
         assert!(default_dir(Kind::Data, nothing_usable).is_err());
+    }
+
+    #[test]
+    fn empty_test_titles_variable_falls_back_to_the_file() {
+        let file = FilePaths {
+            test_titles: vec!["from-file".into()],
+            ..Default::default()
+        };
+        let env = |k: &str| match k {
+            "VICTORY_TEST_TITLES" => Some(OsString::new()),
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        let cfg = Config::resolve(file, None, env).unwrap();
+        assert_eq!(cfg.test_titles, vec![PathBuf::from("from-file")]);
+    }
+
+    #[test]
+    fn relative_file_paths_are_relative_to_the_file() {
+        let text = format!(
+            "[paths]\ngame_dir = 'game'\ncache_dir = {:?}\ntest_titles = ['t/one']\n",
+            PathBuf::from(abs("elsewhere")).display().to_string()
+        );
+        let parsed: FileConfig = toml::from_str(&text).unwrap();
+        let dir = PathBuf::from(abs("configs"));
+        let paths = parsed.anchored_at(&dir);
+        assert_eq!(paths.game_dir.unwrap(), dir.join("game"));
+        // Absolute paths are kept as written.
+        assert_eq!(paths.cache_dir.unwrap(), PathBuf::from(abs("elsewhere")));
+        assert_eq!(paths.data_dir, None);
+        assert_eq!(paths.test_titles, vec![dir.join("t/one")]);
+    }
+
+    #[test]
+    fn the_default_config_file_keeps_paths_as_written() {
+        // `./victory.toml` has an empty parent, so nothing changes.
+        let parsed: FileConfig = toml::from_str("[paths]\ngame_dir = 'game'\n").unwrap();
+        let paths = parsed.anchored_at(Path::new(""));
+        assert_eq!(paths.game_dir.unwrap(), PathBuf::from("game"));
     }
 
     #[test]

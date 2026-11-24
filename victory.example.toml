@@ -2,6 +2,7 @@
 # Every path must be OUTSIDE the repository; the tools refuse otherwise.
 # Environment variables (shown below) take precedence over this file.
 # VICTORY_CONFIG selects a different config file.
+# Relative paths here are relative to this file. An empty variable counts as unset.
 
 [paths]
 # Your own dump of Grand Theft Auto VI.     env: VICTORY_GAME_DIR
@@ -15,5 +16,5 @@ game_dir = 'D:\victory-data\game'
 # data_dir = 'D:\victory-data\data'
 
 # Other Xbox Series titles used to test platform-level code.
-# env: VICTORY_TEST_TITLES (separated by ';')
+# env: VICTORY_TEST_TITLES (separated by ';' on Windows, ':' elsewhere)
 test_titles = []
