@@ -534,6 +534,8 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let Some(staging) = staging(resource, texture) else {
         return;
     };
+    #[cfg(feature = "diagnostics")]
+    staging.dump_at_frame();
     use std::sync::atomic::Ordering::Relaxed;
     staging.used.store(crate::host::moment(), Relaxed);
     // The host texture has the staging buffer's contents: only the check
@@ -625,6 +627,36 @@ impl Staging {
         (self.memory as usize, self.layout.size as usize)
     }
 
+    /// With `VICTORY_MOVIE_DUMP` naming this frame, writes what the staging
+    /// buffer now holds — the detiled memory the host texture is copied from
+    /// — so the picture on screen and the decoder's own frame can be
+    /// compared byte for byte ([`crate::movie::dump_at`]).
+    #[cfg(feature = "diagnostics")]
+    fn dump_at_frame(&self) {
+        let frame = crate::frame::current();
+        let Some((folder, want)) = crate::movie::dump_at(frame) else {
+            return;
+        };
+        let _ = want;
+        let size = self.layout.size as usize;
+        let at = self.memory as usize;
+        let file = folder.join(format!("plane-{at:x}.bin"));
+        // SAFETY: the staging buffer's own mapping, `size` bytes, written by
+        // `detile` above and read by this thread.
+        let bytes = unsafe { std::slice::from_raw_parts(self.data, size) };
+        match std::fs::write(&file, bytes) {
+            Ok(()) => tracing::info!(
+                frame,
+                memory = format_args!("{at:#x}"),
+                size,
+                file = %file.display(),
+                "movie surface: the bytes this texture is uploaded from are in the file"
+            ),
+            Err(e) => tracing::warn!(%e, file = %file.display(), "movie surface: the frame was not written"),
+        }
+    }
+
+    /// Whether another view
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all), taking the title-memory
     /// read lock for itself.

@@ -153,6 +153,30 @@ pub(crate) fn said(resource: usize, desc: &str, memory: usize, size: usize, host
     );
 }
 
+/// `VICTORY_MOVIE_DUMP=<frame>:<folder>`: at that presented frame, the bytes
+/// each movie-sized texture is about to be uploaded from are written to
+/// `<folder>/plane-<memory>.bin` and `<folder>/plane-<memory>.txt`. The
+/// staging buffer holds the *detiled* memory — what the host texture is
+/// copied from — so a capture of the same frame and one of these files
+/// answer the question the counters cannot: does the picture on screen hold
+/// the decoder's current frame? `VICTORY_MOVIE_DUMP_SIZE` bounds it to bytes
+/// whose size ends in that many hex digits (default: the 3.1 MB-class luma
+/// plane, `7e9000`, and the 2.1 MB chroma planes, `21c000`, are both taken).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn dump_at(frame: u64) -> Option<(&'static std::path::PathBuf, u64)> {
+    static WANT: OnceLock<Option<(std::path::PathBuf, u64)>> = OnceLock::new();
+    let want = WANT.get_or_init(|| {
+        let spec = std::env::var("VICTORY_MOVIE_DUMP").ok()?;
+        let (frame, folder) = spec.split_once(':')?;
+        let frame = frame.trim().parse().ok()?;
+        let folder = std::path::PathBuf::from(folder);
+        std::fs::create_dir_all(&folder).ok()?;
+        tracing::info!(frame, folder = %folder.display(), "movie surface: a frame will be dumped");
+        Some((folder, frame))
+    });
+    want.as_ref().filter(|(_, want)| *want == frame).map(|(folder, want)| (folder, *want))
+}
+
 /// Every this many frames, a texture that reads a movie plane says what its
 /// refresh or its upload decided, with the caller's detail.
 const EVERY: u64 = 15;
