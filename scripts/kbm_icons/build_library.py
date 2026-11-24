@@ -21,6 +21,9 @@ Needs Python 3.10+ and fontTools (MIT).
 """
 import math, re, struct, sys, os, zlib
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
+from pathlib import Path
+from tempfile import mkstemp
 
 
 TW = 20
@@ -423,6 +426,19 @@ def load_master(path):
     return syms
 
 
+@contextmanager
+def staged_output(destination):
+    """Publish a completed output by replacing its directory entry."""
+    fd, name = mkstemp(suffix=".tmp", dir=destination.parent)
+    os.close(fd)
+    tmp = Path(name)
+    try:
+        yield tmp
+        tmp.replace(destination)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def main():
     import argparse, shutil
     here = os.path.dirname(os.path.abspath(__file__))
@@ -433,28 +449,35 @@ def main():
     ap.add_argument("--offset", type=lambda v: int(v, 0), default=KNOWN_OFFSET)
     ap.add_argument("--movie-out", help="also write the rebuilt movie here (made from game data: keep it local)")
     a = ap.parse_args()
-    src = os.path.join(a.game, "data.rpf")
+    game = Path(a.game).resolve()
+    src = (game / "data.rpf").resolve()
+    out = Path(a.out).resolve() if a.out else None
+    movie_out = Path(a.movie_out).resolve() if a.movie_out else None
+    for flag, destination in (("--out", out), ("--movie-out", movie_out)):
+        if destination is not None and (destination.is_relative_to(game) or destination == src):
+            ap.error(f"{flag} must be outside the game folder and must not overwrite data.rpf")
+
     off, orig, csize = find_entry(src, a.offset)
     movie, real, nshapes = build(orig, load_master(a.master), target_len=len(orig))
     c, data = pack_exact(movie, real, csize)
     assert zlib.decompress(c) == data and len(data) == len(orig) and len(c) == csize
     print(f"input_icons at {off:#x}: {len(orig)} bytes ({csize} packed); new library {real} bytes, "
           f"{nshapes} shapes, packed to {len(c)} bytes")
-    if a.movie_out:
-        with open(a.movie_out, "wb") as f: f.write(data)
-    if not a.out: return
-    game = os.path.abspath(a.game).lower(); out = os.path.abspath(a.out)
-    if out.lower().startswith(game + os.sep) or out.lower() == game:
-        raise SystemExit("--out is inside the game folder: the game folder is never written")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    tmp = out + ".tmp"
-    shutil.copyfile(src, tmp)
-    with open(tmp, "r+b") as f:
-        f.seek(off); f.write(c)
-    with open(tmp, "rb") as f:
-        back = read_stream(f, off)
-    if not back or back[0] != data: raise SystemExit("verification of the written copy failed")
-    os.replace(tmp, out)
+    if movie_out is not None:
+        with staged_output(movie_out) as tmp:
+            tmp.write_bytes(data)
+    if out is None:
+        return
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with staged_output(out) as tmp:
+        shutil.copyfile(src, tmp)
+        with tmp.open("r+b") as f:
+            f.seek(off)
+            f.write(c)
+        with tmp.open("rb") as f:
+            back = read_stream(f, off)
+        if not back or back[0] != data:
+            raise SystemExit("verification of the written copy failed")
     print(f"wrote {out}: only the input_icons entry differs from the game's data.rpf")
 
 

@@ -25,7 +25,8 @@ as usual. To undo, delete that `overlay\data.rpf`.
 
 The tool finds the icon library in your `data.rpf` (481,544,304 bytes in the version we have), rebuilds it
 from [`icons-master.svg`](icons-master.svg) and writes a full copy of `data.rpf` (about 480 MB) in which
-only that entry differs.
+only that entry differs. Both `--out` and the optional `--movie-out` must resolve to locations outside
+the game folder.
 
 ## What the icons are
 
