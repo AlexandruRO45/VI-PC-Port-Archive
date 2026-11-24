@@ -73,6 +73,9 @@ pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// at most every 20 s).
 pub(crate) static BLOB: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SAVED: AtomicU64 = AtomicU64::new(0);
+/// Stores the host refused: each one is a pipeline every later run compiles
+/// again.
+pub(crate) static STORE_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the library's file is mapped ([`Blob`]) and saved through a
 /// mapping. On by default; `VICTORY_LIBRARY_MAP=0` uses buffers, as before.
@@ -650,8 +653,25 @@ pub(crate) fn pipeline(
     let stored = unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) };
     #[cfg(feature = "diagnostics")]
     super::timing::add(super::timing::Part::Store, store_started.elapsed());
-    if stored.is_ok() {
-        library.added.fetch_add(1, Ordering::Relaxed);
+    match stored {
+        Ok(()) => {
+            library.added.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(why) => {
+            // A store the host refuses leaves the entry out for every later
+            // run, so the same pipeline is compiled again each time and the
+            // library file stays small while thousands are made. Said once,
+            // with the count on the save line beside it.
+            STORE_REFUSED.fetch_add(1, Ordering::Relaxed);
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    error = %why,
+                    pipeline = %name,
+                    "host pipeline: the library refused to store it"
+                );
+            }
+        }
     }
     Ok(pso)
 }
@@ -725,6 +745,7 @@ pub(crate) fn save(now: bool) {
             bytes,
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
+            store_refused = STORE_REFUSED.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
