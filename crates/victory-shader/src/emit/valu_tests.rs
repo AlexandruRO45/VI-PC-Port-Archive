@@ -1071,3 +1071,18 @@ fn lds_sub_dword_reads_extend_and_keep_halves() {
         v[3] & 0xFFFF | (v[0] & 0xFFFF) << 16
     });
 }
+
+#[test]
+fn lds_d16_hi_keeps_the_destinations_own_low_half() {
+    // The destination (v6) is neither the data nor the address register: its
+    // low half comes from its own previous value (v4), the high half from LDS.
+    let body = [
+        [vop1(0x001, 6, vgpr(4)), 0xBF80_0000], // v_mov_b32 v6, v4; s_nop
+        ds(DS_WRITE_B32, 0, 5, 1, 0),
+        ds(DS_READ_U16_D16_HI, 6, 5, 2, 0), // data field v2: not read
+        [vop1(0x001, 0, vgpr(6)), 0xBF80_0000], // v_mov_b32 v0, v6; s_nop
+    ];
+    lds_cases("d16_hi into another register", &body, &LDS_CASES, |v| {
+        v[3] & 0xFFFF | (v[0] & 0xFFFF) << 16
+    });
+}
