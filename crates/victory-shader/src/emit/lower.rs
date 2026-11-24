@@ -692,6 +692,26 @@ impl<'a> Lower<'a> {
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             });
             console_lanes = cross_32_lanes || local_32_lanes;
+            // `v_readfirstlane_b32` and whole-wave `Active`/`Prefix`
+            // reductions read across the host wave. They are fine on any host
+            // wave size by themselves, but once a Wave64 program already needs
+            // wave-sized execution (`local_32_lanes` or single-wave LDS), they
+            // must see all 64 lanes: `WaveSize(32)` would hand lanes 32..63 a
+            // different first lane, and barriers in place of `WaveSize(64)`
+            // would split the reduction into two half-waves.
+            let has_readfirstlane = insts().any(|i| i.name() == "v_readfirstlane_b32");
+            let has_wave_reduction = (0..p.blocks.len()).any(|b| {
+                super::wave::sections(p, b).values().any(|sec| {
+                    sec.shapes.values().any(|sh| {
+                        matches!(
+                            sh,
+                            super::wave::Shape::Active(..) | super::wave::Shape::Prefix(..)
+                        )
+                    })
+                })
+            });
+            let full_wave_only =
+                cross_32_lanes || (x.native.wave64 && (has_readfirstlane || has_wave_reduction));
             let wave = if x.native.wave64 { 64 } else { 32 };
             let total_threads = cs.threads.iter().product::<u32>();
             let one_wave = total_threads <= wave;
@@ -703,14 +723,14 @@ impl<'a> Lower<'a> {
             if needs_lds_wave
                 && x.native.wave64
                 && total_threads > 32
-                && !cross_32_lanes
+                && !full_wave_only
                 && let Some(barriers) = plan_lds_barriers(p, x.st)
             {
                 lds_barrier_before = barriers.before;
                 lds_barrier_end = barriers.at_end;
                 needs_lds_wave = false;
             }
-            if cross_32_lanes || needs_lds_wave {
+            if cross_32_lanes || needs_lds_wave || (local_32_lanes && full_wave_only) {
                 s.wave_size = Some(wave);
             } else if local_32_lanes {
                 s.wave_size = Some(32);
@@ -7163,10 +7183,12 @@ mod tests {
         };
         let (root, pso) = match host.compute_pipeline(hs) {
             Ok(p) => p,
-            // WARP supports no fixed WaveSize (32 or 64).
+            // WARP supports no fixed WaveSize (32 or 64), and Wave32-only
+            // adapters reject `WaveSize(64)`.
             Err(_)
-                if psv_wave_size(&hs.dxil).is_some()
-                    && std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") =>
+                if psv_wave_size(&hs.dxil) == Some(64)
+                    || (psv_wave_size(&hs.dxil).is_some()
+                        && std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1")) =>
             {
                 return None;
             }
@@ -7355,6 +7377,79 @@ mod tests {
         let (hs, p, st) = emit_synthetic_cs(&w, [64, 1, 1], 1);
         assert!(plan_lds_barriers(&p, &st).is_none());
         assert_eq!(psv_wave_size(&hs.dxil), Some(64));
+    }
+
+    #[test]
+    fn wave64_dpp_with_readfirstlane_keeps_wave_size_64() {
+        // An identity `quad_perm` DPP next to `v_readfirstlane_b32 s9, v0`:
+        // every lane stores lane 0's id. At `WaveSize(32)` lanes 32..63 would
+        // read their own first lane (32) instead.
+        let mut w = Vec::new();
+        w.push(sop1_mov_imm(1, 0x80)); // s1 = 0
+        w.extend(s_load_dwordx4(4, 0)); // s[4:7] = uav0 descriptor
+        w.push(vop2(0x1A, 1, 0x82, 0)); // v1 = tid * 4
+        // v_mov_b32_dpp v3, v0 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf
+        w.extend(v_mov_dpp(3, 0, 0xE4, 0xF, 0xF, false));
+        w.push(vop1(0x02, 9, 256)); // v_readfirstlane_b32 s9, v0
+        w.push(vop1(0x01, 2, 9)); // v_mov_b32 v2, s9
+        w.extend(buffer_store_dword(2, 1, 4)); // uav[tid * 4] = v2
+        w.push(S_ENDPGM);
+
+        let (hs, _, _) = emit_synthetic_cs(&w, [64, 1, 1], 0);
+        assert_eq!(psv_wave_size(&hs.dxil), Some(64));
+
+        #[cfg(windows)]
+        if let Some(out) = validate_and_run_cs(&hs, 64) {
+            for (tid, &v) in out[..64].iter().enumerate() {
+                assert_eq!(v, 0, "readfirstlane mismatch at lane {tid}");
+            }
+        }
+    }
+
+    #[test]
+    fn wave64_single_wave_lds_with_readfirstlane_keeps_wave_size_64() {
+        // Single-wave LDS exchange across the 32-lane halves plus a
+        // `v_readfirstlane_b32` that is only used as data, not for branching.
+        let mut w = Vec::new();
+        w.push(sop1_mov_imm(1, 0x80)); // s1 = 0
+        w.extend(s_load_dwordx4(4, 0)); // s[4:7] = uav0 descriptor
+        w.push(vop2(0x1A, 1, 0x82, 0)); // v1 = tid * 4
+        w.push(vop2(0x25, 2, 0xFF, 0)); // v2 = tid + 100
+        w.push(100);
+        w.extend(ds_write_b32(1, 2)); // lds[tid * 4] = tid + 100
+        w.push(vop2(0x1D, 3, 0xA0, 0)); // v3 = tid ^ 32
+        w.push(vop2(0x1A, 3, 0x82, 3)); // v3 = (tid ^ 32) * 4
+        w.extend(ds_read_b32(4, 3)); // v4 = lds[(tid ^ 32) * 4]
+        w.push(vop1(0x02, 9, 256)); // v_readfirstlane_b32 s9, v0
+        w.push(vop2(0x25, 4, 9, 4)); // v4 = s9 + v4
+        w.extend(buffer_store_dword(4, 1, 4)); // uav[tid * 4] = v4
+        w.push(S_ENDPGM);
+
+        let (hs, _, _) = emit_synthetic_cs(&w, [64, 1, 1], 1);
+        assert_eq!(psv_wave_size(&hs.dxil), Some(64));
+
+        #[cfg(windows)]
+        if let Some(out) = validate_and_run_cs(&hs, 64) {
+            let expected: Vec<u32> = (0..64u32).map(|tid| (tid ^ 32) + 100).collect();
+            assert_eq!(out[..64], expected[..]);
+        }
+    }
+
+    #[test]
+    fn wave64_readfirstlane_only_keeps_no_wave_size() {
+        // `v_readfirstlane_b32` alone (no DPP, `ds_swizzle` or single-wave
+        // LDS) needs no fixed wave size.
+        let mut w = Vec::new();
+        w.push(sop1_mov_imm(1, 0x80)); // s1 = 0
+        w.extend(s_load_dwordx4(4, 0)); // s[4:7] = uav0 descriptor
+        w.push(vop2(0x1A, 1, 0x82, 0)); // v1 = tid * 4
+        w.push(vop1(0x02, 9, 256)); // v_readfirstlane_b32 s9, v0
+        w.push(vop1(0x01, 2, 9)); // v_mov_b32 v2, s9
+        w.extend(buffer_store_dword(2, 1, 4)); // uav[tid * 4] = v2
+        w.push(S_ENDPGM);
+
+        let (hs, _, _) = emit_synthetic_cs(&w, [64, 1, 1], 0);
+        assert_eq!(psv_wave_size(&hs.dxil), None);
     }
 
     #[test]
