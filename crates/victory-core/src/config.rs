@@ -268,6 +268,22 @@ impl Config {
         }
         ensure_data_outside_cache(&cache_dir, &data_dir, &origins)?;
         ensure_data_outside_user_cache(&data_dir, origins.data_dir, &env)?;
+        for (name, dir, origin, setting) in [
+            (
+                "cache",
+                &cache_dir,
+                origins.cache_dir,
+                "VICTORY_CACHE_DIR or [paths].cache_dir",
+            ),
+            (
+                "data",
+                &data_dir,
+                origins.data_dir,
+                "VICTORY_DATA_DIR or [paths].data_dir",
+            ),
+        ] {
+            ensure_not_user_base(name, dir, origin, setting, &env)?;
+        }
         if let Some(game) = &game_dir {
             ensure_game_apart(game, &cache_dir, &data_dir, &origins)?;
         }
@@ -624,16 +640,92 @@ fn ensure_data_outside_user_cache(
     }
     if origin == Origin::Default {
         anyhow::bail!(
-            "the default data folder {} is inside your cache folder {} ({named}), which              may be deleted at any time, because XDG_DATA_HOME is inside it; point              XDG_DATA_HOME elsewhere, or set VICTORY_DATA_DIR or [paths].data_dir to a              folder outside the cache",
+            "the default data folder {} is inside your cache folder {} ({named}), which \
+             may be deleted at any time, because XDG_DATA_HOME is inside it; point \
+             XDG_DATA_HOME elsewhere, or set VICTORY_DATA_DIR or [paths].data_dir to a \
+             folder outside the cache",
             data_dir.display(),
             base.display()
         );
     }
     anyhow::bail!(
-        "the data folder {} (from {origin}) is inside your cache folder {} ({named}), which          may be deleted at any time; set VICTORY_DATA_DIR or [paths].data_dir to a folder          outside it, such as one under ~/.local/share",
+        "the data folder {} (from {origin}) is inside your cache folder {} ({named}), which \
+         may be deleted at any time; set VICTORY_DATA_DIR or [paths].data_dir to a folder \
+         outside it, such as one under ~/.local/share",
         data_dir.display(),
         base.display()
     );
+}
+
+/// The folders every program shares: the XDG base directories
+/// (`$XDG_CACHE_HOME`, `$XDG_DATA_HOME`, `$XDG_CONFIG_HOME`,
+/// `$XDG_STATE_HOME`), their defaults under the home folder (`~/.cache`,
+/// `~/.local/share`, `~/.local/state`, `~/.config`, and `~/.local` holding
+/// two of them), and on Windows `%LOCALAPPDATA%` and `%APPDATA%`. Each is
+/// named by the variable or path the user would recognise. Values that are
+/// unset, empty or relative are skipped, as [`default_dir`] skips them.
+fn user_bases(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<(PathBuf, String)> {
+    let absolute = |k: &str| env(k).map(PathBuf::from).filter(|p| p.is_absolute());
+    let mut bases: Vec<(PathBuf, String)> = [
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "LOCALAPPDATA",
+        "APPDATA",
+    ]
+    .into_iter()
+    .filter_map(|k| absolute(k).map(|p| (p, k.to_owned())))
+    .collect();
+    if let Some(home) = absolute("HOME") {
+        for rel in [
+            ".cache",
+            ".local/share",
+            ".local/state",
+            ".config",
+            ".local",
+        ] {
+            bases.push((home.join(rel), format!("~/{rel}")));
+        }
+    }
+    bases
+}
+
+/// Refuses a cache or data folder that is one of the [`user_bases`], or a
+/// folder holding one, rather than a folder of Victory's own inside it.
+/// The easy slip is leaving off the last part: `VICTORY_CACHE_DIR=~/.cache`
+/// or `VICTORY_DATA_DIR=$XDG_DATA_HOME`. Victory's cache may be deleted at
+/// any time, so clearing a cache of `~/.cache` would empty every program's
+/// cache, and a data folder of `~/.local/share` mixes saves and crashes.log
+/// in with every other program's files. Run after [`ensure_own_folder`],
+/// which refuses the home folder and the root, and compared like it:
+/// lexically, without the disk.
+fn ensure_not_user_base(
+    name: &str,
+    dir: &Path,
+    origin: Origin,
+    setting: &str,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<()> {
+    for (base, named) in user_bases(env) {
+        if !is_within(&base, dir, FOLD_CASE) {
+            continue;
+        }
+        let what = if is_within(dir, &base, FOLD_CASE) {
+            "is"
+        } else {
+            "holds"
+        };
+        anyhow::bail!(
+            "the {name} folder {} (from {origin}) {what} your shared {named} folder {}, \
+             used by every program; set {setting} to a folder used only by Victory, such \
+             as {}, or leave it unset for the default",
+            dir.display(),
+            base.display(),
+            base.join("victory").display()
+        );
+    }
+    Ok(())
 }
 
 /// The game folder is the user's own dump: Victory reads it and never
@@ -2219,6 +2311,113 @@ mod tests {
                 value.display()
             );
         }
+    }
+
+    #[test]
+    fn cache_or_data_at_a_shared_user_folder_is_refused() {
+        let home = PathBuf::from(abs("home")).join("me");
+        let xdg_cache = PathBuf::from(abs("xc"));
+        let xdg_config = PathBuf::from(abs("cfg"));
+        for (key, value, what) in [
+            // `$XDG_CACHE_HOME` with `/victory` left off.
+            (
+                "VICTORY_CACHE_DIR",
+                xdg_cache.clone(),
+                "is your shared XDG_CACHE_HOME",
+            ),
+            (
+                "VICTORY_CACHE_DIR",
+                xdg_cache.join(""),
+                "is your shared XDG_CACHE_HOME",
+            ),
+            (
+                "VICTORY_DATA_DIR",
+                xdg_config.clone(),
+                "is your shared XDG_CONFIG_HOME",
+            ),
+            (
+                "VICTORY_DATA_DIR",
+                home.join(".local/share"),
+                "is your shared ~/.local/share",
+            ),
+            (
+                "VICTORY_CACHE_DIR",
+                home.join(".config"),
+                "is your shared ~/.config",
+            ),
+            (
+                "VICTORY_DATA_DIR",
+                home.join(".local"),
+                "holds your shared ~/.local/share",
+            ),
+            (
+                "VICTORY_CACHE_DIR",
+                home.join(".cache").join("x").join(".."),
+                "is your shared ~/.cache",
+            ),
+        ] {
+            let env = |k: &str| match k {
+                "HOME" => Some(home.clone().into()),
+                "XDG_CACHE_HOME" => Some(xdg_cache.clone().into()),
+                "XDG_CONFIG_HOME" => Some(xdg_config.clone().into()),
+                k if k == key => Some(value.clone().into()),
+                _ => None,
+            };
+            let err = Config::resolve(FilePaths::default(), None, env)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(what), "{key}={}: {err}", value.display());
+            assert!(err.contains(&format!("(from {key})")), "{err}");
+            assert!(err.contains(&format!("set {key}")), "{err}");
+        }
+
+        // A folder holding one, from the config file, says which and how.
+        let file = FilePaths {
+            data_dir: Some(PathBuf::from(abs("nest"))),
+            ..FilePaths::default()
+        };
+        let nest = PathBuf::from(abs("nest"));
+        let env = |k: &str| match k {
+            "HOME" => Some(home.clone().into()),
+            "XDG_STATE_HOME" => Some(nest.join("state").into()),
+            _ => None,
+        };
+        let err = Config::resolve(file, None, env).unwrap_err().to_string();
+        assert!(
+            err.contains("the data folder")
+                && err.contains("(from config file)")
+                && err.contains("holds your shared XDG_STATE_HOME")
+                && err.contains(&nest.join("state").join("victory").display().to_string()),
+            "{err}"
+        );
+
+        // A folder of Victory's own inside each, and a sibling whose name
+        // merely starts with one, are fine; so are the defaults.
+        for value in [
+            xdg_cache.join("victory"),
+            home.join(".config/victory"),
+            home.join(".config2"),
+            PathBuf::from(abs("xcache")),
+        ] {
+            let env = |k: &str| match k {
+                "HOME" => Some(home.clone().into()),
+                "XDG_CACHE_HOME" => Some(xdg_cache.clone().into()),
+                "VICTORY_CACHE_DIR" => Some(value.clone().into()),
+                _ => None,
+            };
+            assert!(
+                Config::resolve(FilePaths::default(), None, env).is_ok(),
+                "{}",
+                value.display()
+            );
+        }
+        let env = |k: &str| match k {
+            "HOME" => Some(home.clone().into()),
+            "XDG_CACHE_HOME" => Some(xdg_cache.clone().into()),
+            "XDG_CONFIG_HOME" => Some(xdg_config.clone().into()),
+            _ => None,
+        };
+        assert!(Config::resolve(FilePaths::default(), None, env).is_ok());
     }
 
     #[test]
