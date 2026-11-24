@@ -327,6 +327,10 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sy
 /// These say for what.
 pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Title-memory read locks taken for texture refreshes: one a submission
+/// unless something between two textures releases it.
+pub(crate) static REFRESH_HOLDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
@@ -598,25 +602,39 @@ impl Staging {
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all).
+    /// since the last time (and is mapped at all), taking the title-memory
+    /// read lock for itself.
     pub(crate) fn refresh(&self) {
+        self.refresh_with(None)
+    }
+
+    /// The same under a hold the caller already has on that lock: a
+    /// submission refreshes tens of textures one after another, and taking
+    /// the lock each time waited 6,896.6 ms a frame for 48 ms of reading
+    /// (stability-01, 20:00:37), because the runtime holds the write side
+    /// for a whole run of page mappings while the world streams.
+    pub(crate) fn refresh_holding(&self, _held: &crate::watch::Reading) {
+        self.refresh_with(Some(_held))
+    }
+
+    fn refresh_with(&self, held: Option<&crate::watch::Reading>) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let read = self.refresh_now();
+        let read = self.refresh_now(held);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
     /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    fn refresh_now(&self, held: Option<&crate::watch::Reading>) -> usize {
         let whole = std::time::Instant::now();
-        let read = self.refresh_timed();
+        let read = self.refresh_timed(held);
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
     }
 
-    fn refresh_timed(&self) -> usize {
+    fn refresh_timed(&self, held: Option<&crate::watch::Reading>) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
@@ -664,16 +682,21 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
-        } else {
-            waited(2, crate::watch::title_memory_reading)
+        // Held by the caller when it refreshes several textures under one
+        // acquisition, taken here otherwise. Either way the mapping cannot
+        // change under the read.
+        let _mapped: Option<crate::watch::Reading> = match held {
+            Some(_) => None,
+            None if no_wait() => {
+                // Not waited for: while the runtime remaps title memory the
+                // texture is read through the kernel instead, whole or not at
+                // all (`no_wait`).
+                let Some(mapped) = crate::watch::title_memory_reading_now() else {
+                    return self.refresh_unlocked(last, size);
+                };
+                Some(mapped)
+            }
+            None => Some(waited(2, crate::watch::title_memory_reading)),
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages

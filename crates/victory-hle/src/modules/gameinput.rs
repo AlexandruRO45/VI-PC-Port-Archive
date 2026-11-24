@@ -1509,6 +1509,20 @@ mod host {
         (XINPUT_GAMEPAD_RIGHT_THUMB, RIGHT_STICK),
     ];
 
+    /// Every key any source reports held, before the host's async state is
+    /// added: the scripted presses (diagnostics only) and the title window's
+    /// own key messages. The window source is the one a bot can reach, and it
+    /// is read in a release build too.
+    fn key_sources() -> Vec<u8> {
+        #[cfg(feature = "diagnostics")]
+        let scripted = super::script::down();
+        #[cfg(not(feature = "diagnostics"))]
+        let scripted = Vec::new();
+        // Only while the window is foreground does it receive key messages, so
+        // this needs no focus check of its own.
+        super::union([scripted, victory_gpu::keys::pressed()])
+    }
+
     /// Raw values, no dead zone: titles apply their own.
     pub(super) fn convert(pad: &XINPUT_GAMEPAD) -> PadState {
         let stick = |v: i16| (f32::from(v) / 32767.0).max(-1.0);
@@ -1545,14 +1559,17 @@ mod host {
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
-            // The scripted keys (`VICTORY_KEYS`) also press the first
-            // pad's buttons, by the stand-in pad's table: with a real pad
-            // connected the stand-in is not there, and a title that listens
-            // to the pad (Grand Theft Auto VI's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
+            // Keys also press the first pad's buttons, by the stand-in pad's
+            // table: with a real pad connected the stand-in is not there, and a
+            // title that listens to the pad (Grand Theft Auto VI's start
+            // screen) hears nothing from a keyboard alone. This is the same
+            // path for a person and for an injected press, and it is not
+            // behind diagnostics, because the window's key messages are not.
             if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                for vk in key_sources() {
+                    if let Some(&(_, button)) =
+                        super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk)
+                    {
                         pad.buttons |= button;
                     }
                 }
@@ -1561,14 +1578,6 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
-            let scripted = super::script::down();
-            #[cfg(not(feature = "diagnostics"))]
-            let scripted = Vec::new();
-            // The window's own key messages: a person's keyboard and another
-            // process's `SendInput` both land here, and only while the window
-            // is foreground, so this needs no focus check of its own.
-            let window = victory_gpu::keys::pressed();
             let focused = focused();
             // The async state is the one a person's keyboard writes and an
             // injected key cannot reach, so it is read only while we are the
@@ -1584,7 +1593,7 @@ mod host {
             } else {
                 Vec::new()
             };
-            let down = super::union([scripted, window, held]);
+            let down = super::union([key_sources(), held]);
             tracing::trace!(focused, ?down, "keyboard poll");
             down.into_iter()
                 .map(|vk| KeyState {

@@ -5161,6 +5161,12 @@ impl HostList {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
+                    // A host step may take the title-memory read lock itself (a
+                    // rectangle's vertices are read in place at submission),
+                    // and a read taken twice on one thread with a writer
+                    // waiting is a deadlock: let go of ours first, and the next
+                    // texture takes it again.
+                    batch.reading = None;
                     work();
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
@@ -5193,7 +5199,8 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        let reading = batch.reading();
+                        staging.refresh_holding(reading);
                     }
                     continue;
                 }
@@ -5239,6 +5246,11 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// The title-memory read lock, held across this submission's texture
+    /// refreshes and dropped before any step that might take it itself. One
+    /// acquisition instead of one per texture: a hundred of them waited
+    /// 6,896.6 ms a frame for 48 ms of reading (stability-01, 20:00:37).
+    reading: Option<crate::watch::Reading>,
 }
 
 impl Batch {
@@ -5280,6 +5292,17 @@ impl Batch {
         crate::copystat::range(from, to - from, us, 0);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    }
+
+    /// The title-memory read lock for this submission's textures, taken on
+    /// the first refresh that needs it and kept until a step that could take
+    /// it itself (see the walk below).
+    fn reading(&mut self) -> &crate::watch::Reading {
+        self.reading.get_or_insert_with(|| {
+            crate::texture::REFRESH_HOLDS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::watch::title_memory_reading()
+        })
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -5743,9 +5766,10 @@ impl Meter {
         {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
-            if all >= 1.0 {
+            let holds = crate::texture::REFRESH_HOLDS.swap(0, Ordering::Relaxed) as f64 / frames;
+            if all >= 1.0 || holds > 0.0 {
                 tracing::info!(
-                    "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
+                    "texture refreshes per frame, all threads: {all:.1} ms in {holds:.0} holds of the title-memory lock, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
