@@ -1034,6 +1034,8 @@ impl PlanePass {
                 },
                 ..Default::default()
             };
+        let _serial = crate::pipeline::compiler();
+        // One call into the vendor's compiler at a time with the switch.
             let pipeline: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc)?;
             Ok((root, pipeline))
         }
@@ -3080,6 +3082,8 @@ impl Host {
         unsafe {
             let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
             let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+        let _serial = crate::pipeline::compiler();
+        // One call into the vendor's compiler at a time with the switch.
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {

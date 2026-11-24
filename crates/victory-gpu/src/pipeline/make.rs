@@ -189,13 +189,19 @@ fn worth_waiting(typical: Duration, left: Duration) -> bool {
 }
 
 /// Whether a wait is skipped for a pipeline whose making is known to take
-/// longer than what is left of the frame's budget. On by default;
-/// `VICTORY_PIPELINE_WAIT_BY_DURATION=0` waits as before (runs up to
-/// 2026-11-24 spent the whole 500 ms of the budget in every world frame and
-/// completed no pipeline with it).
+/// longer than what is left of the frame's budget: `VICTORY_PIPELINE_WAIT_BY_DURATION=1`,
+/// off by default.
+///
+/// Off because a skipped wait drops the draw: the frame gives up on the
+/// pipeline and draws nothing, and a whole cutscene came out black that way
+/// on 2026-11-24. The measurement behind it stands (every world frame spent
+/// its whole 500 ms budget waiting for stages that take 2.7 s and completed
+/// no pipeline with it), but a slow frame is a complaint and a black frame is
+/// a defect. Whatever replaces it has to keep the draw and drop the wait,
+/// not drop the draw.
 fn wait_by_duration() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_BY_DURATION").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_BY_DURATION").is_some_and(|v| v == "1"))
 }
 
 /// Waits skipped since the start.
@@ -467,11 +473,12 @@ fn drained() {
 mod tests {
     use super::*;
 
-    /// A frame waits for the pipelines it can get and drops the draws
-    /// whose pipelines are seconds away: the world's stages take 2.7 s of
-    /// driver time each, so the 500 ms a frame spends waiting completed
-    /// nothing (measured, 2026-11-24). A menu's 30 ms pipeline is still
-    /// waited for, and with nothing known yet nothing changes.
+    /// With the switch on, a frame waits for the pipelines it can get and
+    /// drops the draws whose pipelines are seconds away: the world's stages
+    /// take 2.7 s of driver time each, so the 500 ms a frame spends waiting
+    /// completed nothing (measured, 2026-11-24). A menu's 30 ms pipeline is
+    /// still waited for, and with nothing known yet nothing changes. The
+    /// switch is off by default because the draw it drops is the picture.
     #[test]
     fn a_wait_is_taken_only_for_a_pipeline_that_can_arrive() {
         let budget = Duration::from_millis(500);
