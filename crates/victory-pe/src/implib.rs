@@ -715,4 +715,92 @@ mod tests {
             }
         );
     }
+
+    /// Both signature words are checked: an object whose `Sig1` is a
+    /// machine rather than 0 is not an import, even with `Sig2` intact.
+    #[test]
+    fn a_nonzero_first_signature_word_is_another_member() {
+        let mut member = short_import("a.dll", "Plain", 0, CODE, BY_NAME);
+        member[0..2].copy_from_slice(&crate::MACHINE_AMD64.to_le_bytes());
+        let lib = ImportLibrary::parse(&archive(&[
+            member,
+            short_import("a.dll", "Kept", 0, CODE, BY_NAME),
+        ]))
+        .unwrap();
+        assert_eq!(lib.imports, [name("a.dll", "Kept", LibImportKind::Code)]);
+        assert_eq!(lib.other_members, 1);
+    }
+
+    /// A header with `SizeOfData` 0 has no room for the symbol's NUL, so
+    /// it is not an import, and the next member is still read.
+    #[test]
+    fn a_header_without_data_is_another_member() {
+        let mut member = short_import("a.dll", "Gone", 0, CODE, BY_NAME);
+        member.truncate(20);
+        member[12..16].copy_from_slice(&0u32.to_le_bytes());
+        let lib = ImportLibrary::parse(&archive(&[
+            member,
+            short_import("a.dll", "After", 0, CODE, BY_NAME),
+        ]))
+        .unwrap();
+        assert_eq!(lib.imports, [name("a.dll", "After", LibImportKind::Code)]);
+        assert_eq!(lib.other_members, 1);
+    }
+
+    /// An empty DLL name is still a terminated string: the import is read
+    /// with an empty `dll`, and sorts before any named DLL.
+    #[test]
+    fn an_empty_dll_name_is_kept() {
+        let lib = ImportLibrary::parse(&archive(&[
+            short_import("a.dll", "Named", 0, CODE, BY_NAME),
+            short_import("", "Nameless", 0, CODE, BY_NAME),
+        ]))
+        .unwrap();
+        assert_eq!(
+            lib.imports,
+            [
+                name("", "Nameless", LibImportKind::Code),
+                name("a.dll", "Named", LibImportKind::Code),
+            ]
+        );
+        assert_eq!(lib.other_members, 0);
+    }
+
+    /// The `EXPORTAS` string is the export as written: neither a prefix
+    /// nor an `@` suffix is stripped from it.
+    #[test]
+    fn the_export_as_name_is_not_undecorated() {
+        let lib = ImportLibrary::parse(&archive(&[export_as_import(
+            "a.dll",
+            "__imp_Sym",
+            "_Real@4",
+        )]))
+        .unwrap();
+        assert_eq!(lib.imports, [name("a.dll", "_Real@4", LibImportKind::Code)]);
+    }
+
+    /// One export of one DLL sorts code, then data, then const, whatever
+    /// the member order, and the `TimeDateStamp` of a repeat does not make
+    /// it a different import.
+    #[test]
+    fn kinds_sort_code_data_const_and_the_timestamp_is_ignored() {
+        let mut stamped = short_import("a.dll", "Sym", 0, DATA, BY_NAME);
+        stamped[8..12].copy_from_slice(&0x6000_0000u32.to_le_bytes());
+        let lib = ImportLibrary::parse(&archive(&[
+            short_import("a.dll", "Sym", 0, CONST, BY_NAME),
+            short_import("a.dll", "Sym", 0, DATA, BY_NAME),
+            stamped,
+            short_import("a.dll", "Sym", 0, CODE, BY_NAME),
+        ]))
+        .unwrap();
+        assert_eq!(
+            lib.imports,
+            [
+                name("a.dll", "Sym", LibImportKind::Code),
+                name("a.dll", "Sym", LibImportKind::Data),
+                name("a.dll", "Sym", LibImportKind::Const),
+            ]
+        );
+        assert_eq!(lib.other_members, 0);
+    }
 }
