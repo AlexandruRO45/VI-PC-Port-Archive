@@ -29,6 +29,8 @@ struct Pending {
     orphan: AtomicBool,
     /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
     late: AtomicBool,
+    /// a critical dispatch or indirect bind waited past its grace budget without finishing
+    critical_late: AtomicBool,
     /// lock-free mirror of `demand.wanted` for polling from worker queues without lock nesting
     wanted_flag: AtomicBool,
     demand: Mutex<Demand>,
@@ -380,6 +382,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         used: Default::default(),
         orphan: Default::default(),
         late: Default::default(),
+        critical_late: Default::default(),
         wanted_flag: AtomicBool::new(false),
         demand: Default::default(),
     });
@@ -656,20 +659,21 @@ mod used_tests {
         let e4 = entry(p4).unwrap();
 
         let t0 = Instant::now();
-        assert_eq!(resolve_within_with_frame(&e1, p1, per_pso, per_frame, 1, &mut fb), (p1, true));
-        assert_eq!(resolve_within_with_frame(&e2, p2, per_pso, per_frame, 1, &mut fb), (p2, true));
+        assert_eq!(resolve_within_with_frame(&e1, p1, per_pso, per_frame, 1, &mut fb, false), (p1, true));
+        assert_eq!(resolve_within_with_frame(&e2, p2, per_pso, per_frame, 1, &mut fb, false), (p2, true));
         // Even with remaining budget (~0-5 ms), p3 + p4 must finish within per_frame + timer slack,
-        // and once spent >= per_frame, p4 does not wait and is NOT marked late.
-        let _ = resolve_within_with_frame(&e3, p3, per_pso, per_frame, 1, &mut fb);
+        // and once spent >= per_frame, p4 does not wait and neither p3 nor p4 is marked late.
+        let _ = resolve_within_with_frame(&e3, p3, per_pso, per_frame, 1, &mut fb, false);
         let t4 = Instant::now();
-        assert_eq!(resolve_within_with_frame(&e4, p4, per_pso, per_frame, 1, &mut fb), (p4, true));
+        assert_eq!(resolve_within_with_frame(&e4, p4, per_pso, per_frame, 1, &mut fb, false), (p4, true));
         assert!(t4.elapsed() < Duration::from_millis(20), "exhausted frame budget must skip wait ({:?})", t4.elapsed());
         assert!(t0.elapsed() < Duration::from_millis(250), "burst waited {:?}", t0.elapsed());
+        assert!(!e3.late.load(Ordering::Acquire), "frame-truncated PSO wait must not be marked late");
         assert!(!e4.late.load(Ordering::Acquire), "budget-skipped PSO must not be marked late");
 
         // Moving to frame 2 resets the budget so p4 gets a fresh wait window.
         let t_next = Instant::now();
-        assert_eq!(resolve_within_with_frame(&e4, p4, per_pso, per_frame, 2, &mut fb), (p4, true));
+        assert_eq!(resolve_within_with_frame(&e4, p4, per_pso, per_frame, 2, &mut fb, false), (p4, true));
         assert!(t_next.elapsed() >= Duration::from_millis(20), "new frame must reset wait budget ({:?})", t_next.elapsed());
         assert!(e4.late.load(Ordering::Acquire), "timed-out PSO in fresh frame becomes late");
 
@@ -679,6 +683,64 @@ mod used_tests {
         let _ = tx4.send(());
         let start = Instant::now();
         for p in [p1, p2, p3, p4] {
+            while is_pending(p) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(!is_pending(p));
+            let _ = released(p);
+        }
+    }
+
+    #[test]
+    fn critical_wait_uses_grace_budget_and_truncated_remainder_stays_non_late() {
+        use std::time::{Duration, Instant};
+        assert_eq!(critical_frame_budget_for(Duration::from_millis(250)), Duration::from_millis(8_000));
+        assert_eq!(critical_frame_budget_for(Duration::from_millis(3_500)), Duration::from_millis(8_000));
+
+        let mut fb = FrameBudget::default();
+        let normal_per_pso = Duration::from_millis(25);
+        let normal_per_frame = Duration::from_millis(50);
+        let crit_per_pso = Duration::from_millis(500);
+        let crit_per_frame = Duration::from_millis(1_000);
+
+        let (tx1, rx1) = mpsc::channel();
+        let (tx2, rx2) = mpsc::channel();
+        let (tx3, rx3) = mpsc::channel();
+        let (p1, p2, p3) = (0x7E57_C021usize, 0x7E57_C022usize, 0x7E57_C023usize);
+        submit(p1, true, Box::new(move || { let _ = rx1.recv_timeout(Duration::from_secs(5)); 0xC1 }));
+        submit(p2, true, Box::new(move || { let _ = rx2.recv_timeout(Duration::from_secs(5)); 0xC2 }));
+        submit_lazy(p3, true, Box::new(move || { let _ = rx3.recv_timeout(Duration::from_secs(5)); 0xC3 }), 0);
+
+        let e1 = entry(p1).unwrap();
+        let e2 = entry(p2).unwrap();
+        let e3 = entry(p3).unwrap();
+
+        // Exhaust the normal per-frame budget via p1 and p2 (which becomes frame-truncated, not late).
+        assert_eq!(resolve_within_with_frame(&e1, p1, normal_per_pso, normal_per_frame, 1, &mut fb, false), (p1, true));
+        fb.record(1, Duration::from_millis(15));
+        assert_eq!(resolve_within_with_frame(&e2, p2, normal_per_pso, normal_per_frame, 1, &mut fb, false), (p2, true));
+        assert!(e1.late.load(Ordering::Acquire));
+        assert!(!e2.late.load(Ordering::Acquire), "truncated frame wait must not set late");
+        assert!(!e1.critical_late.load(Ordering::Acquire), "normal wait must not set critical_late");
+
+        // p3 takes ~40ms (longer than normal 25ms, well inside critical 500ms): even though the
+        // normal frame budget is exhausted, the critical grace frame budget lets it finish.
+        let wake_p3 = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            let _ = tx3.send(());
+        });
+        assert_eq!(resolve_within_with_frame(&e3, p3, crit_per_pso, crit_per_frame, 1, &mut fb, true), (0xC3, false));
+        wake_p3.join().unwrap();
+        // e1 timed out on normal wait (`e1.late == true`) but still gets one critical grace attempt.
+        let t_crit = Instant::now();
+        assert_eq!(resolve_within_with_frame(&e1, p1, Duration::from_millis(30), crit_per_frame, 1, &mut fb, true), (p1, true));
+        assert!(t_crit.elapsed() >= Duration::from_millis(15), "critical path must retry after normal late ({:?})", t_crit.elapsed());
+        assert!(e1.critical_late.load(Ordering::Acquire));
+
+        let _ = tx1.send(());
+        let _ = tx2.send(());
+        let start = Instant::now();
+        for p in [p1, p2, p3] {
             while is_pending(p) && start.elapsed() < Duration::from_secs(10) {
                 std::thread::sleep(Duration::from_millis(2));
             }
@@ -706,7 +768,7 @@ mod used_tests {
         assert!(!wanted_probe(), "timed-out wait must clear wanted_flag");
         let mut fb = FrameBudget::default();
         assert_eq!(
-            resolve_within_with_frame(&p, standin, Duration::from_millis(25), Duration::from_millis(200), 1, &mut fb),
+            resolve_within_with_frame(&p, standin, Duration::from_millis(25), Duration::from_millis(200), 1, &mut fb, false),
             (standin, true)
         );
         assert!(!wanted_probe(), "timed-out wait must clear wanted_flag so late build yields to throttling");
@@ -786,6 +848,8 @@ enum EnvWaitBudget {
     Millis(u64),
 }
 
+const CRITICAL_FRAME_WAIT_CAP_MS: u64 = 8_000;
+
 fn env_wait_budget() -> EnvWaitBudget {
     static B: OnceLock<EnvWaitBudget> = OnceLock::new();
     *B.get_or_init(|| match std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
@@ -803,6 +867,15 @@ fn wait_budget() -> Option<std::time::Duration> {
         EnvWaitBudget::Unbounded => None,
         EnvWaitBudget::Millis(ms) => Some(std::time::Duration::from_millis(ms)),
         EnvWaitBudget::Unset => crate::state::boot().is_some().then(|| std::time::Duration::from_millis(DEFAULT_TITLE_WAIT_MS)),
+    }
+}
+
+fn critical_wait_budget(base: Option<std::time::Duration>) -> Option<std::time::Duration> {
+    let base = base?;
+    if matches!(env_wait_budget(), EnvWaitBudget::Millis(_)) {
+        Some(base)
+    } else {
+        Some(base.saturating_mul(4))
     }
 }
 
@@ -838,6 +911,12 @@ fn frame_budget_for(per_pso: std::time::Duration) -> std::time::Duration {
     std::time::Duration::from_millis(DEFAULT_FRAME_WAIT_BUDGET_MS).max(per_pso)
 }
 
+fn critical_frame_budget_for(per_pso: std::time::Duration) -> std::time::Duration {
+    let scaled = frame_budget_for(per_pso).saturating_mul(4);
+    let cap = std::time::Duration::from_millis(CRITICAL_FRAME_WAIT_CAP_MS);
+    scaled.min(cap).max(per_pso)
+}
+
 /// `resolve`, waiting for a pipeline still being built – built here if unbounded and no worker
 /// has started it yet, or waited on workers up to the per-PSO and per-frame budget.
 pub fn resolve_wait(pso: usize) -> usize {
@@ -849,19 +928,35 @@ pub fn resolve_wait_checked(pso: usize) -> (usize, bool) {
     resolve_wait_checked_for(pso, wait_budget())
 }
 
+/// Critical wait for `Dispatch` / `ExecuteIndirect`: grants a 4x per-PSO and per-frame grace
+/// budget (when `XCL_PSO_WAIT_MS` is unset, still capped below a title's hang watchdog) and
+/// allows one critical retry even if an earlier non-critical bind already marked `late`.
+pub fn resolve_wait_critical(pso: usize) -> (usize, bool) {
+    resolve_wait_checked_with(pso, critical_wait_budget(wait_budget()), true)
+}
+
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
 #[cfg(test)]
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     resolve_wait_checked_for(pso, budget).0
 }
 
+#[cfg(test)]
+pub(super) fn resolve_wait_checked_for_test(pso: usize, budget: std::time::Duration) -> (usize, bool) {
+    resolve_wait_checked_for(pso, Some(budget))
+}
+
 fn resolve_wait_checked_for(pso: usize, budget: Option<std::time::Duration>) -> (usize, bool) {
+    resolve_wait_checked_with(pso, budget, false)
+}
+
+fn resolve_wait_checked_with(pso: usize, budget: Option<std::time::Duration>, critical: bool) -> (usize, bool) {
     let Some(p) = entry(pso) else { return (pso, false) };
     p.note_use();
     if let Some(budget) = budget {
         let frame = super::present::frame_generation();
-        let per_frame = frame_budget_for(budget);
-        return FRAME_BUDGET.with(|fb| resolve_within_with_frame(&p, pso, budget, per_frame, frame, &mut fb.borrow_mut()));
+        let per_frame = if critical { critical_frame_budget_for(budget) } else { frame_budget_for(budget) };
+        return FRAME_BUDGET.with(|fb| resolve_within_with_frame(&p, pso, budget, per_frame, frame, &mut fb.borrow_mut(), critical));
     }
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
@@ -880,9 +975,10 @@ fn resolve_wait_checked_for(pso: usize, budget: Option<std::time::Duration>) -> 
 }
 
 /// `resolve_wait` for at most `per_pso` (and `per_frame` cumulatively in `frame`): the build goes
-/// to the workers (never this thread), and a pipeline not built by then is `late` – its binds
-/// get the stand-in until a worker finishes it. When the per-frame budget is exhausted, binds do
-/// not wait or mark the pipeline `late`, preserving its chance on the next frame.
+/// to the workers (never this thread), and a pipeline not built after waiting the full `per_pso`
+/// is marked late – its binds go on without it until a worker finishes it. When the per-frame
+/// budget truncates or skips the wait (`wait < per_pso`), the pipeline is NOT marked late so it
+/// keeps its chance on the next frame (or on a critical bind).
 fn resolve_within_with_frame(
     p: &Arc<Pending>,
     pso: usize,
@@ -890,6 +986,7 @@ fn resolve_within_with_frame(
     per_frame: std::time::Duration,
     frame: u64,
     fb: &mut FrameBudget,
+    critical: bool,
 ) -> (usize, bool) {
     let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
         0 => pso,
@@ -905,7 +1002,8 @@ fn resolve_within_with_frame(
     if !p.sent.swap(true, Ordering::AcqRel) {
         enqueue_work(p.clone());
     }
-    if p.late.load(Ordering::Acquire) {
+    let late_flag = if critical { &p.critical_late } else { &p.late };
+    if late_flag.load(Ordering::Acquire) {
         let r = p.real.load(Ordering::Acquire);
         if r != 0 {
             return (r, false);
@@ -928,15 +1026,20 @@ fn resolve_within_with_frame(
     if finished {
         return (built(p), false);
     }
-    p.late.store(true, Ordering::Release);
-    static N: AtomicUsize = AtomicUsize::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    if n < 16 || n.is_power_of_two() {
-        crate::xlog_warn!(
-            "D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)",
-            wait.as_millis(),
-            n + 1
-        );
+    if wait >= per_pso {
+        late_flag.store(true, Ordering::Release);
+        if critical {
+            p.late.store(true, Ordering::Release);
+        }
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n.is_power_of_two() {
+            crate::xlog_warn!(
+                "D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)",
+                wait.as_millis(),
+                n + 1
+            );
+        }
     }
     (pso, true)
 }
@@ -968,6 +1071,11 @@ pub fn released(pso: usize) -> usize {
 /// `pso` is a stand-in whose real pipeline is still being built.
 pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
+}
+
+/// `pso` is a stand-in whose background build finished without a real pipeline (`0`).
+pub fn is_failed_standin(pso: usize) -> bool {
+    entry(pso).is_some_and(|p| *p.done.lock().unwrap() && p.real.load(Ordering::Acquire) == 0)
 }
 
 /// (built in the background, failed, still building)

@@ -1152,10 +1152,15 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
         }
     }
     let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
+    let is_compute = list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32);
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
-    if hr >= 0 && !ppv.is_null() && needs_root {
-        super::bind::note_root_changing_signature(*ppv as usize);
+    if hr >= 0 && !ppv.is_null() {
+        let sig = *ppv as usize;
+        if needs_root {
+            super::bind::note_root_changing_signature(sig);
+        }
+        super::bind::note_compute_signature(sig, is_compute);
     }
     hr
 }

@@ -1626,6 +1626,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::sparse::forget_buffer(this as usize);
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
+        super::list_x::forget_target(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -1954,7 +1955,8 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     if copy.is_none() {
         copy = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| default_dsv(&r.GetDesc()));
     }
-    f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
+    f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu);
+    super::list_x::note_dsv_handle(cpu as usize, res as usize, copy.as_ref());
 }
 
 /// The view a DSV without a description has, for a depth buffer `pc_resource_desc` made
@@ -2402,7 +2404,9 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     let mut clear_buf = [0u8; 24];
     let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf) as usize;
     // console-only state bits (e.g. 0x100000 on a display target) are not the PC's; a depth
-    // buffer the PC description took ALLOW_UNORDERED_ACCESS from does not start as a UAV
+    // buffer the PC description took ALLOW_UNORDERED_ACCESS from does not start as a UAV, and
+    // CREATE_NOT_ZEROED is stripped so committed RT/DS allocations start initialized
+    let flags = strip_not_zeroed_heap_flag(flags as i32) as usize;
     let st = pc_full.as_ref().map_or(state as u32 & PC_RESOURCE_STATES, |d| super::device_x::pc_initial_state(u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()), state as u32));
     let hr = dev_create_committed_resource(this, props, flags, desc, st as usize, clear, riid, ppv);
     if hr < 0 {
@@ -2480,6 +2484,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("SetPipelineState", cl_set_pipeline_state as usize),
             ("OMSetRenderTargets", cl_om_set_render_targets as usize),
             ("ClearRenderTargetView", cl_clear_rtv as usize),
+            ("DiscardResource", cl_discard_resource as usize),
             ("ExecuteIndirect", cl_execute_indirect as usize),
         ]),
         Kind::DmaList => v.extend_from_slice(&[
@@ -2796,13 +2801,28 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
         return hr;
     }
     let hr = dev_create_placed_resource(this, heap, offset, desc, state, clear, riid, ppv);
-    if hr >= 0 || desc == 0 || !crate::gpu::shader::readable(desc, 0x38) {
+    if hr >= 0 {
+        if !ppv.is_null() && !(*ppv).is_null() {
+            if let Some(res) = ID3D12Resource::from_raw_borrowed(&*ppv) {
+                let rd = res.GetDesc();
+                super::list_x::note_uninit_target_if_rt_ds(*ppv as usize, &rd, clear as *const c_void, false);
+            }
+        }
+        return hr;
+    }
+    if desc == 0 || !crate::gpu::shader::readable(desc, 0x38) {
         return hr;
     }
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = super::device_x::pc_resource_desc(&x);
     let st = super::device_x::pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state as u32);
     let hr2 = dev_create_placed_resource(this, heap, offset, d.as_ptr() as usize, st as usize, clear, riid, ppv);
+    if hr2 >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        if let Some(res) = ID3D12Resource::from_raw_borrowed(&*ppv) {
+            let rd = res.GetDesc();
+            super::list_x::note_uninit_target_if_rt_ds(*ppv as usize, &rd, clear as *const c_void, false);
+        }
+    }
     let heap_desc = pc_heap_desc(heap);
     let pc_size = pc_allocation_size(this, &d);
     // A texture the title placed by the console's size (`get_resource_allocation_info_x`
@@ -2940,17 +2960,28 @@ pub(super) unsafe extern "system" fn dev_create_reserved_resource1(this: *mut c_
 creator!(dev_create_heap_pc, "CreateHeap", Kind::Heap, [a1]);
 
 /// D3D12_HEAP_FLAGS the PC knows: SHARED 0x1, DENY_BUFFERS 0x4, ALLOW_DISPLAY 0x8,
+fn strip_not_zeroed_heap_flag(flags: i32) -> i32 {
+    flags & !D3D12_HEAP_FLAG_CREATE_NOT_ZEROED.0
+}
+
 /// SHARED_CROSS_ADAPTER 0x20, DENY_RT_DS_TEXTURES 0x40, DENY_NON_RT_DS_TEXTURES 0x80, then
-/// 0x100 … 0x2000 (HARDWARE_PROTECTED … TOOLS_USE_MANUAL_WRITE_TRACKING); 0x2 and 0x10 are
-/// the console's (Fortnite: 0xC2)
-const PC_HEAP_FLAGS: u32 = 0x3FED;
+/// 0x100 … 0x2000 excluding CREATE_NOT_ZEROED (0x1000) so placed RT/DS heaps are zeroed
+/// (avoiding D3D12 debug layer error 1422 / stale VRAM reads); 0x2 and 0x10 are the console's
+/// (Fortnite: 0xC2)
+const PC_HEAP_FLAGS: u32 = 0x2FED;
 
 /// CreateHeap(desc, riid, heap): a console description the PC refuses (console flags in the
 /// high bits, alignments other than 64 KiB / 4 MiB, console heap types – Fortnite's distance
 /// field atlas heap) is made the PC's way: known flags only, the alignment the PC has that
 /// covers it, an unknown type as DEFAULT. Logged with the console's values.
 pub(super) unsafe extern "system" fn dev_create_heap(this: *mut c_void, desc: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let hr = dev_create_heap_pc(this, desc, riid, ppv);
+    let mut clean: Option<D3D12_HEAP_DESC> = (desc != 0 && crate::gpu::shader::readable(desc, std::mem::size_of::<D3D12_HEAP_DESC>())).then(|| {
+        let mut d = std::ptr::read_unaligned(desc as *const D3D12_HEAP_DESC);
+        d.Flags = D3D12_HEAP_FLAGS(strip_not_zeroed_heap_flag(d.Flags.0));
+        d
+    });
+    let clean_ptr = clean.as_mut().map_or(desc, |d| d as *mut _ as usize);
+    let hr = dev_create_heap_pc(this, clean_ptr, riid, ppv);
     if hr >= 0 {
         note_heap_uma(desc, ppv);
     }
@@ -2981,7 +3012,13 @@ pub(super) unsafe extern "system" fn dev_create_heap(this: *mut c_void, desc: us
 creator!(dev_create_heap1_pc, "CreateHeap1", Kind::Heap, [a1, a2]);
 
 pub(super) unsafe extern "system" fn dev_create_heap1(this: *mut c_void, desc: usize, session: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let hr = dev_create_heap1_pc(this, desc, session, riid, ppv);
+    let mut clean: Option<D3D12_HEAP_DESC> = (desc != 0 && crate::gpu::shader::readable(desc, std::mem::size_of::<D3D12_HEAP_DESC>())).then(|| {
+        let mut d = std::ptr::read_unaligned(desc as *const D3D12_HEAP_DESC);
+        d.Flags = D3D12_HEAP_FLAGS(strip_not_zeroed_heap_flag(d.Flags.0));
+        d
+    });
+    let clean_ptr = clean.as_mut().map_or(desc, |d| d as *mut _ as usize);
+    let hr = dev_create_heap1_pc(this, clean_ptr, session, riid, ppv);
     if hr >= 0 {
         note_heap_uma(desc, ppv);
     }
@@ -3569,6 +3606,35 @@ fn big_compile_commit_free() -> bool {
     unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= 3 << 30 }
 }
 
+/// Concurrent cold background driver compiles: keeps at most `compile_threads - 2` (minimum 1)
+/// cold compiles running simultaneously so two worker lanes remain open for warm disk-cache
+/// loads and `wanted` foreground shaders.
+fn cold_compiles() -> &'static Slots {
+    static COLD_COMPILES: OnceLock<Slots> = OnceLock::new();
+    COLD_COMPILES.get_or_init(|| Slots {
+        n: Mutex::new(0),
+        cv: std::sync::Condvar::new(),
+        most: crate::gpu::recomp::dxc::compile_threads().saturating_sub(2).max(1),
+    })
+}
+
+/// Before a cold driver compile in the background: wait for a cold slot unless a title thread
+/// wants this pipeline (`wanted`), in which case it proceeds immediately without taking a slot.
+fn cold_compile_turn(slots: &'static Slots, wanted: impl Fn() -> bool) -> Option<SlotGuard> {
+    const LOOK: std::time::Duration = std::time::Duration::from_millis(25);
+    let mut n = slots.n.lock().unwrap();
+    loop {
+        if wanted() {
+            return None;
+        }
+        if *n < slots.most {
+            *n += 1;
+            return Some(SlotGuard(slots));
+        }
+        n = slots.cv.wait_timeout(n, LOOK).unwrap().0;
+    }
+}
+
 #[cfg(test)]
 mod big_compile_tests {
     use super::*;
@@ -3612,6 +3678,38 @@ mod big_compile_tests {
         drop(first);
         assert!(t.join().unwrap(), "the next one's turn");
         assert_eq!(*S.n.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn cold_compile_turn_caps_unwanted_and_lets_wanted_bypass() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 2 };
+        let s1 = cold_compile_turn(&S, || false).expect("slot 1");
+        let s2 = cold_compile_turn(&S, || false).expect("slot 2");
+        assert_eq!(*S.n.lock().unwrap(), 2);
+
+        static WANTED: AtomicBool = AtomicBool::new(false);
+        let t_wanted = std::thread::spawn(|| cold_compile_turn(&S, || WANTED.load(Ordering::Acquire)).is_none());
+        let t_queued = std::thread::spawn(|| cold_compile_turn(&S, || false).is_some());
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(!t_wanted.is_finished(), "unwanted cold build waits while slots are full");
+        assert!(!t_queued.is_finished(), "queued unwanted cold build waits while slots are full");
+
+        WANTED.store(true, Ordering::Release);
+        assert!(t_wanted.join().unwrap(), "wanted cold build bypasses slot limit");
+        assert!(!t_queued.is_finished(), "still-unwanted build remains queued");
+
+        drop(s1);
+        assert!(t_queued.join().unwrap(), "dropping a slot wakes queued cold build");
+        drop(s2);
+        assert_eq!(*S.n.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn strip_not_zeroed_heap_flag_clears_only_not_zeroed() {
+        let not_zeroed = D3D12_HEAP_FLAG_CREATE_NOT_ZEROED.0;
+        let other = D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES.0 | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES.0 | 0x2000;
+        assert_eq!(strip_not_zeroed_heap_flag(not_zeroed | other), other);
+        assert_eq!(PC_HEAP_FLAGS & not_zeroed as u32, 0);
     }
 }
 
@@ -3681,9 +3779,11 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         caller_wanted,
         lookup,
         |flight| -> Result<(HRESULT, std::time::Duration, bool), ()> {
-            // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
-            let _slot = (big && is_bg_pso_worker)
-                .then(|| big_compile_turn(&BIG_COMPILES, big_compile_commit_free, || super::pso_async::build_is_wanted() || flight.is_wanted()));
+            // in the background, cap cold compiles so warm disk-cache loads and wanted builds keep
+            // worker lanes open; big compiles still run one at a time within commit headroom
+            let is_wanted = || super::pso_async::build_is_wanted() || flight.is_wanted();
+            let _cold_slot = is_bg_pso_worker.then(|| cold_compile_turn(cold_compiles(), is_wanted));
+            let _big_slot = (big && is_bg_pso_worker).then(|| big_compile_turn(&BIG_COMPILES, big_compile_commit_free, is_wanted));
             let started = std::time::Instant::now();
             let hr = run_pso(None);
             let took = started.elapsed();
@@ -5275,6 +5375,7 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
     let desc = copy.as_ref().map_or(desc, |c| c as *const _ as *const c_void);
     f(this, res, desc, handle);
     super::present::note_rtv(handle, res);
+    super::list_x::note_rtv_handle(handle, res as usize, copy.as_ref());
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 12 {
@@ -5297,7 +5398,10 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
             super::present::note_use(r, super::present::USE_CLEAR);
         }
     }
-    f(this, rtv, color, n, rects)
+    f(this, rtv, color, n, rects);
+    if n == 0 {
+        super::list_x::mark_rtv_initialized(rtv);
+    }
 }
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
@@ -5361,6 +5465,30 @@ unsafe extern "system" fn cl_draw_indexed_instanced(this: *mut c_void, icount: u
 }
 
 #[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn cl_discard_resource(this: *mut c_void, res: *mut c_void, region: *const D3D12_DISCARD_REGION) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_DISCARD_REGION);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DiscardResource")));
+    f(this, res, region);
+    if res.is_null() {
+        return;
+    }
+    if region.is_null() {
+        super::list_x::mark_target_initialized(res as usize, None);
+    } else if crate::gpu::shader::readable(region as usize, std::mem::size_of::<D3D12_DISCARD_REGION>()) {
+        let r = &*region;
+        if r.NumRects == 0 {
+            if r.NumSubresources > 256 {
+                super::list_x::mark_target_initialized(res as usize, None);
+            } else {
+                for sub in r.FirstSubresource..r.FirstSubresource.saturating_add(r.NumSubresources) {
+                    super::list_x::mark_target_initialized(res as usize, Some(sub));
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 unsafe extern "system" fn cl_execute_indirect(
     this: *mut c_void,
     sig: *mut c_void,
@@ -5370,7 +5498,9 @@ unsafe extern "system" fn cl_execute_indirect(
     cnt_buf: *mut c_void,
     cnt_off: u64,
 ) {
-    super::list_x::prepare_draw(this);
+    if !super::bind::is_compute_signature(sig as usize) {
+        super::list_x::prepare_draw(this);
+    }
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteIndirect")));
     f(this, sig, max_count, arg_buf, arg_off, cnt_buf, cnt_off);
