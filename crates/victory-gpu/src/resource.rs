@@ -1849,20 +1849,41 @@ mod tests {
     }
 }
 
-/// Local build: released host textures kept alive for `KEEP` (see `Resource`'s drop).
+/// Local build: released host textures kept alive (see `Resource`'s drop). The title draws with
+/// views of textures it released long before (stale slots: harmless on the console, where the
+/// memory stays): freeing them removed the device in the world within 2-4 minutes, even after
+/// 30 s; never freeing them ran 5+ minutes. So the most recently released ones are kept up to a
+/// budget, `VICTORY_TEXTURE_GRAVE_MB` (default 3072), the oldest freed first; and none sooner
+/// than `VICTORY_TEXTURE_GRACE_S` (default 30) after its release.
 #[cfg(windows)]
 fn graveyard(host: std::sync::Arc<HostTexture>) {
     use std::time::{Duration, Instant};
-    const KEEP: Duration = Duration::from_secs(4);
-    static GRAVE: std::sync::Mutex<std::collections::VecDeque<(Instant, std::sync::Arc<HostTexture>)>> =
-        std::sync::Mutex::new(std::collections::VecDeque::new());
+    struct Grave {
+        list: std::collections::VecDeque<(Instant, u64, std::sync::Arc<HostTexture>)>,
+        bytes: u64,
+    }
+    static GRAVE: std::sync::Mutex<Grave> = std::sync::Mutex::new(Grave { list: std::collections::VecDeque::new(), bytes: 0 });
+    static KEEP: std::sync::OnceLock<(Duration, u64)> = std::sync::OnceLock::new();
+    let (keep, budget) = *KEEP.get_or_init(|| {
+        let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d);
+        (Duration::from_secs(env("VICTORY_TEXTURE_GRACE_S", 30)), env("VICTORY_TEXTURE_GRAVE_MB", 3072) << 20)
+    });
+    // SAFETY: a live texture's description.
+    let size = unsafe {
+        let desc = host.texture.GetDesc();
+        crate::host::host().map_or(0, |h| h.device.GetResourceAllocationInfo(0, &[desc]).SizeInBytes)
+    };
     let now = Instant::now();
     let dead: Vec<_> = {
         let mut g = GRAVE.lock().unwrap_or_else(|e| e.into_inner());
-        g.push_back((now, host));
+        g.list.push_back((now, size, host));
+        g.bytes += size;
         let mut dead = Vec::new();
-        while g.front().is_some_and(|(at, _)| now.duration_since(*at) > KEEP) {
-            dead.extend(g.pop_front());
+        while g.bytes > budget && g.list.front().is_some_and(|(at, _, _)| now.duration_since(*at) > keep) {
+            if let Some((_, n, t)) = g.list.pop_front() {
+                g.bytes -= n;
+                dead.push(t);
+            }
         }
         dead
     };

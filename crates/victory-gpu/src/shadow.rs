@@ -417,7 +417,7 @@ fn changed_pieces(data: usize, before: usize, start: usize, from: usize, to: usi
         host != old
     };
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 12);
-    if pieces.len() < 64 || threads < 2 {
+    if pieces.len() < 128 || threads < 2 {
         return pieces.iter().filter(|p| differs(p)).map(|p| p.0).collect();
     }
     let chunk = pieces.len().div_ceil(threads);
