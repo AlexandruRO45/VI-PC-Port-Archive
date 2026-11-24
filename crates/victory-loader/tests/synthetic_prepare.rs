@@ -1553,3 +1553,98 @@ fn errors_say_whether_parsing_or_patching_failed() {
         "cannot patch image: TLS directory is not file-backed"
     );
 }
+
+fn get16(b: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?))
+}
+
+#[test]
+fn a_relocation_is_cleared_exactly_when_it_touches_one_byte_of_the_field() {
+    // Each case is one entry beside the callback pointer's own DIR64 (which
+    // is always cleared). The field is bytes 0..8 from `callbacks_field()`:
+    // an entry is a no-op afterwards exactly when the bytes it writes reach
+    // into that range, by as little as one byte at either end.
+    let at = |kind: u16, offset: i32| {
+        let rva = callbacks_field().wrapping_add_signed(offset);
+        (kind << 12) | (rva - SECTION_RVA) as u16
+    };
+    let cases: [(&str, u16, bool); 10] = [
+        ("DIR64 four bytes before", at(10, -4), true),
+        ("DIR64 seven bytes before", at(10, -7), true),
+        ("DIR64 eight bytes before", at(10, -8), false),
+        ("DIR64 seven bytes in", at(10, 7), true),
+        ("HIGHLOW three bytes before", at(3, -3), true),
+        ("HIGHLOW four bytes before", at(3, -4), false),
+        ("HIGHLOW on the last four bytes", at(3, 4), true),
+        ("LOW one byte before", at(2, -1), true),
+        ("HIGH two bytes before", at(1, -2), false),
+        ("LOW right after", at(2, 8), false),
+    ];
+    for (what, entry, cleared) in cases {
+        let original = with_callback_entries(&[dir64(callbacks_field()), entry]);
+        let slot = file(RELOCS) + 8 + 2 * 2;
+        assert_eq!(
+            get16(&original, slot),
+            Some(entry),
+            "{what}: the fixture holds the entry"
+        );
+        let prepared = prepare(&original).unwrap_or_else(|e| panic!("{what}: {e}"));
+        let after = get16(&prepared.bytes, slot);
+        if cleared {
+            assert_eq!(after, Some(0), "{what}: the entry becomes ABSOLUTE");
+        } else {
+            assert_eq!(after, Some(entry), "{what}: the entry is left as written");
+        }
+        assert_eq!(
+            &prepared.bytes[file(RELOCS) + 10..][..2],
+            &[0, 0],
+            "{what}: the pointer's own entry is cleared all the same"
+        );
+    }
+}
+
+#[test]
+fn a_block_that_runs_past_the_directory_is_not_read() {
+    // The directory covers the first block whole and then 8 bytes of a
+    // second one that claims 12. The walk ends at the block that does not
+    // fit, so the callback-shaped entry in the overrun is left as written;
+    // the first block is patched as usual and the pointer is cleared.
+    let mut original = image();
+    let second = file(RELOCS) + 16;
+    put32(&mut original, second, SECTION_RVA);
+    put32(&mut original, second + 4, 12);
+    put16(&mut original, second + 8, dir64(callbacks_field()));
+    set_dir(&mut original, dir::BASERELOC, RELOCS, 24);
+
+    let prepared = prepare(&original).unwrap();
+    assert_eq!(&prepared.bytes[callbacks_reloc()..][..2], &[0, 0]);
+    assert_eq!(
+        &prepared.bytes[second..second + 12],
+        &original[second..second + 12],
+        "the overrunning block is left as it was"
+    );
+    assert_eq!(
+        ImageInfo::parse(&prepared.bytes)
+            .unwrap()
+            .tls
+            .unwrap()
+            .callbacks_va,
+        0
+    );
+}
+
+#[test]
+fn the_returned_info_is_the_original_parsed_on_its_own() {
+    // `info` is what a plain parse of the title's bytes gives, field for
+    // field, not something derived from the patched copy.
+    let original = image();
+    let prepared = prepare(&original).unwrap();
+    assert_eq!(
+        format!("{:?}", prepared.info),
+        format!("{:?}", ImageInfo::parse(&original).unwrap())
+    );
+    assert_ne!(
+        format!("{:?}", prepared.info),
+        format!("{:?}", ImageInfo::parse(&prepared.bytes).unwrap())
+    );
+}
