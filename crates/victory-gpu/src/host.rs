@@ -495,6 +495,84 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// Whether a host device can be made that runs translated programs: `Err`
+/// says what is missing. Every root signature we build indexes the
+/// descriptor heaps directly (shader model 6.6, resource binding tier 3);
+/// without them every pipeline is refused and the title, given none,
+/// fails somewhere far from the cause. `victory run` asks before it starts
+/// the title, on a device of its own (the host's is made at the title's
+/// first use, after the run is set up), which [`create`] checks again.
+pub fn host_check() -> Result<(), String> {
+    let mut device: Option<ID3D12Device> = None;
+    // SAFETY: plain device creation on the default adapter.
+    unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }
+        .map_err(|e| format!("no host D3D12 device: {e}"))?;
+    let device = device.ok_or("no host D3D12 device")?;
+    log_runtime();
+    missing_features(&device).map_or(Ok(()), Err)
+}
+
+/// Which D3D12 runtime the process loaded: the Agility SDK's copy beside
+/// the executable (`D3D12\D3D12Core.dll`, see `apps/victory/build.rs`) or
+/// the system's.
+fn log_runtime() {
+    use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+    // SAFETY: plain queries of a loaded module's name into our buffer.
+    let path = unsafe {
+        GetModuleHandleW(w!("D3D12Core.dll")).ok().map(|module| {
+            let mut buf = [0u16; 1024];
+            let len = GetModuleFileNameW(Some(module), &mut buf) as usize;
+            String::from_utf16_lossy(&buf[..len])
+        })
+    };
+    match path {
+        Some(path) => tracing::info!(%path, "D3D12 runtime"),
+        None => tracing::info!("D3D12 runtime: the system's (no D3D12Core.dll loaded)"),
+    }
+}
+
+/// What the host lacks for translated programs, or `None`.
+fn missing_features(device: &ID3D12Device) -> Option<String> {
+    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    // SAFETY: each query writes its own structure of the given size. A
+    // runtime that does not know shader model 6.6 refuses the first query.
+    let (model_ok, options_ok) = unsafe {
+        (
+            device
+                .CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, (&raw mut model).cast(), size_of_val(&model) as u32)
+                .is_ok(),
+            device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&raw mut options).cast(), size_of_val(&options) as u32)
+                .is_ok(),
+        )
+    };
+    let model_6_6 = model_ok && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+    let tier_3 = options_ok && options.ResourceBindingTier.0 >= D3D12_RESOURCE_BINDING_TIER_3.0;
+    tracing::info!(
+        shader_model = format!("{:#x}", if model_ok { model.HighestShaderModel.0 } else { 0 }),
+        binding_tier = options.ResourceBindingTier.0,
+        "host shader support"
+    );
+    if model_6_6 && tier_3 {
+        return None;
+    }
+    let mut what = Vec::new();
+    if !model_6_6 {
+        what.push("shader model 6.6");
+    }
+    if !tier_3 {
+        what.push("resource binding tier 3");
+    }
+    Some(format!(
+        "the host D3D12 device lacks {}, which every translated pipeline needs. On Windows 10 the \
+         system's D3D12 runtime has no shader model 6.6: run `cargo xtask agility` to put the D3D12 \
+         Agility SDK runtime beside victory.exe (target\\<profile>\\D3D12\\D3D12Core.dll). Otherwise \
+         update the GPU driver",
+        what.join(" and ")
+    ))
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
@@ -548,6 +626,10 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        log_runtime();
+        if let Some(missing) = missing_features(&device) {
+            return Err(windows::core::Error::new(DXGI_ERROR_UNSUPPORTED, missing));
+        }
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.
