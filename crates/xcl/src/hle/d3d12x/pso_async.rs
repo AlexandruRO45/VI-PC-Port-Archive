@@ -694,8 +694,9 @@ mod used_tests {
     #[test]
     fn critical_wait_uses_grace_budget_and_truncated_remainder_stays_non_late() {
         use std::time::{Duration, Instant};
-        assert_eq!(critical_frame_budget_for(Duration::from_millis(250)), Duration::from_millis(8_000));
-        assert_eq!(critical_frame_budget_for(Duration::from_millis(3_500)), Duration::from_millis(8_000));
+        assert_eq!(critical_frame_budget_for(Duration::from_millis(250)), Duration::from_millis(2_000));
+        assert_eq!(critical_frame_budget_for(Duration::from_millis(1_000)), Duration::from_millis(2_000));
+        assert_eq!(critical_frame_budget_for(Duration::from_millis(3_500)), Duration::from_millis(3_500));
 
         let mut fb = FrameBudget::default();
         let normal_per_pso = Duration::from_millis(25);
@@ -848,7 +849,7 @@ enum EnvWaitBudget {
     Millis(u64),
 }
 
-const CRITICAL_FRAME_WAIT_CAP_MS: u64 = 8_000;
+const CRITICAL_FRAME_WAIT_CAP_MS: u64 = 2_000;
 
 fn env_wait_budget() -> EnvWaitBudget {
     static B: OnceLock<EnvWaitBudget> = OnceLock::new();
@@ -928,8 +929,8 @@ pub fn resolve_wait_checked(pso: usize) -> (usize, bool) {
     resolve_wait_checked_for(pso, wait_budget())
 }
 
-/// Critical wait for `Dispatch` / `ExecuteIndirect`: grants a 4x per-PSO and per-frame grace
-/// budget (when `XCL_PSO_WAIT_MS` is unset, still capped below a title's hang watchdog) and
+/// Critical wait for `Dispatch` / `ExecuteIndirect`: grants a 4x per-PSO grace within the
+/// 2_000 ms (`CRITICAL_FRAME_WAIT_CAP_MS`) per-frame cap when `XCL_PSO_WAIT_MS` is unset, and
 /// allows one critical retry even if an earlier non-critical bind already marked `late`.
 pub fn resolve_wait_critical(pso: usize) -> (usize, bool) {
     resolve_wait_checked_with(pso, critical_wait_budget(wait_budget()), true)

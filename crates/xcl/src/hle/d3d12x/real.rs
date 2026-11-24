@@ -2404,9 +2404,14 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     let mut clear_buf = [0u8; 24];
     let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf) as usize;
     // console-only state bits (e.g. 0x100000 on a display target) are not the PC's; a depth
-    // buffer the PC description took ALLOW_UNORDERED_ACCESS from does not start as a UAV, and
-    // CREATE_NOT_ZEROED is stripped so committed RT/DS allocations start initialized
-    let flags = strip_not_zeroed_heap_flag(flags as i32) as usize;
+    // buffer the PC description took ALLOW_UNORDERED_ACCESS from does not start as a UAV;
+    // strip CREATE_NOT_ZEROED only for RT/DS targets and indirect buffers so streaming buffers
+    // and ordinary textures skip driver zero-initialization
+    let flags = if should_strip_not_zeroed_resource(desc, state) {
+        strip_not_zeroed_heap_flag(flags as i32) as usize
+    } else {
+        flags
+    };
     let st = pc_full.as_ref().map_or(state as u32 & PC_RESOURCE_STATES, |d| super::device_x::pc_initial_state(u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()), state as u32));
     let hr = dev_create_committed_resource(this, props, flags, desc, st as usize, clear, riid, ppv);
     if hr < 0 {
@@ -2959,27 +2964,51 @@ pub(super) unsafe extern "system" fn dev_create_reserved_resource1(this: *mut c_
 }
 creator!(dev_create_heap_pc, "CreateHeap", Kind::Heap, [a1]);
 
-/// D3D12_HEAP_FLAGS the PC knows: SHARED 0x1, DENY_BUFFERS 0x4, ALLOW_DISPLAY 0x8,
 fn strip_not_zeroed_heap_flag(flags: i32) -> i32 {
     flags & !D3D12_HEAP_FLAG_CREATE_NOT_ZEROED.0
 }
 
+unsafe fn should_strip_not_zeroed_resource(desc: usize, state: usize) -> bool {
+    if desc == 0 || !crate::gpu::shader::readable(desc, std::mem::size_of::<D3D12_RESOURCE_DESC>()) {
+        return false;
+    }
+    let rd = std::ptr::read_unaligned(desc as *const D3D12_RESOURCE_DESC);
+    let rt_ds = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0;
+    if (rd.Flags.0 & rt_ds) != 0 {
+        return true;
+    }
+    rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && (state as u32 & D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT.0 as u32) != 0
+}
+
+fn heap_allows_only_rt_ds(flags: i32) -> bool {
+    let only_rt_ds = D3D12_HEAP_FLAG_DENY_BUFFERS.0 | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES.0;
+    (flags & only_rt_ds) == only_rt_ds
+}
+
+unsafe fn sanitize_heap_desc(desc: usize) -> Option<D3D12_HEAP_DESC> {
+    if desc == 0 || !crate::gpu::shader::readable(desc, std::mem::size_of::<D3D12_HEAP_DESC>()) {
+        return None;
+    }
+    let mut d = std::ptr::read_unaligned(desc as *const D3D12_HEAP_DESC);
+    if heap_allows_only_rt_ds(d.Flags.0) {
+        d.Flags = D3D12_HEAP_FLAGS(strip_not_zeroed_heap_flag(d.Flags.0));
+    }
+    Some(d)
+}
+
+/// D3D12_HEAP_FLAGS the PC knows: SHARED 0x1, DENY_BUFFERS 0x4, ALLOW_DISPLAY 0x8,
 /// SHARED_CROSS_ADAPTER 0x20, DENY_RT_DS_TEXTURES 0x40, DENY_NON_RT_DS_TEXTURES 0x80, then
-/// 0x100 … 0x2000 excluding CREATE_NOT_ZEROED (0x1000) so placed RT/DS heaps are zeroed
-/// (avoiding D3D12 debug layer error 1422 / stale VRAM reads); 0x2 and 0x10 are the console's
-/// (Fortnite: 0xC2)
-const PC_HEAP_FLAGS: u32 = 0x2FED;
+/// 0x100 … 0x2000 (HARDWARE_PROTECTED … TOOLS_USE_MANUAL_WRITE_TRACKING, including
+/// CREATE_NOT_ZEROED 0x1000 so streaming heaps skip GPU zero-fill); 0x2 and 0x10 are the
+/// console's (Fortnite: 0xC2)
+const PC_HEAP_FLAGS: u32 = 0x3FED;
 
 /// CreateHeap(desc, riid, heap): a console description the PC refuses (console flags in the
 /// high bits, alignments other than 64 KiB / 4 MiB, console heap types – Fortnite's distance
 /// field atlas heap) is made the PC's way: known flags only, the alignment the PC has that
 /// covers it, an unknown type as DEFAULT. Logged with the console's values.
 pub(super) unsafe extern "system" fn dev_create_heap(this: *mut c_void, desc: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let mut clean: Option<D3D12_HEAP_DESC> = (desc != 0 && crate::gpu::shader::readable(desc, std::mem::size_of::<D3D12_HEAP_DESC>())).then(|| {
-        let mut d = std::ptr::read_unaligned(desc as *const D3D12_HEAP_DESC);
-        d.Flags = D3D12_HEAP_FLAGS(strip_not_zeroed_heap_flag(d.Flags.0));
-        d
-    });
+    let mut clean = sanitize_heap_desc(desc);
     let clean_ptr = clean.as_mut().map_or(desc, |d| d as *mut _ as usize);
     let hr = dev_create_heap_pc(this, clean_ptr, riid, ppv);
     if hr >= 0 {
@@ -2990,7 +3019,11 @@ pub(super) unsafe extern "system" fn dev_create_heap(this: *mut c_void, desc: us
     }
     let mut d: D3D12_HEAP_DESC = std::ptr::read_unaligned(desc as *const D3D12_HEAP_DESC);
     let orig = (d.SizeInBytes, d.Properties.Type.0, d.Alignment, d.Flags.0);
-    d.Flags = D3D12_HEAP_FLAGS(d.Flags.0 & PC_HEAP_FLAGS as i32);
+    let mut clean_flags = d.Flags.0 & PC_HEAP_FLAGS as i32;
+    if heap_allows_only_rt_ds(clean_flags) {
+        clean_flags = strip_not_zeroed_heap_flag(clean_flags);
+    }
+    d.Flags = D3D12_HEAP_FLAGS(clean_flags);
     d.Alignment = if d.Alignment <= 0x1_0000 { 0 } else { D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT as u64 };
     if !(1..=5).contains(&d.Properties.Type.0) {
         d.Properties = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
@@ -3012,11 +3045,7 @@ pub(super) unsafe extern "system" fn dev_create_heap(this: *mut c_void, desc: us
 creator!(dev_create_heap1_pc, "CreateHeap1", Kind::Heap, [a1, a2]);
 
 pub(super) unsafe extern "system" fn dev_create_heap1(this: *mut c_void, desc: usize, session: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let mut clean: Option<D3D12_HEAP_DESC> = (desc != 0 && crate::gpu::shader::readable(desc, std::mem::size_of::<D3D12_HEAP_DESC>())).then(|| {
-        let mut d = std::ptr::read_unaligned(desc as *const D3D12_HEAP_DESC);
-        d.Flags = D3D12_HEAP_FLAGS(strip_not_zeroed_heap_flag(d.Flags.0));
-        d
-    });
+    let mut clean = sanitize_heap_desc(desc);
     let clean_ptr = clean.as_mut().map_or(desc, |d| d as *mut _ as usize);
     let hr = dev_create_heap1_pc(this, clean_ptr, session, riid, ppv);
     if hr >= 0 {
@@ -3705,11 +3734,58 @@ mod big_compile_tests {
     }
 
     #[test]
-    fn strip_not_zeroed_heap_flag_clears_only_not_zeroed() {
+    fn strip_not_zeroed_heap_flag_targets_only_rt_ds_and_indirect() {
         let not_zeroed = D3D12_HEAP_FLAG_CREATE_NOT_ZEROED.0;
         let other = D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES.0 | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES.0 | 0x2000;
         assert_eq!(strip_not_zeroed_heap_flag(not_zeroed | other), other);
-        assert_eq!(PC_HEAP_FLAGS & not_zeroed as u32, 0);
+        assert_ne!(PC_HEAP_FLAGS & not_zeroed as u32, 0, "PC_HEAP_FLAGS preserves NOT_ZEROED for non-RT/DS heaps");
+
+        unsafe {
+            // Heaps for streaming buffers or non-RT/DS textures retain CREATE_NOT_ZEROED;
+            // RT/DS-only heaps strip CREATE_NOT_ZEROED.
+            let mut hd = D3D12_HEAP_DESC {
+                SizeInBytes: 0x10_0000,
+                Flags: D3D12_HEAP_FLAGS(not_zeroed | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES.0),
+                ..Default::default()
+            };
+            assert_ne!(sanitize_heap_desc(&hd as *const _ as usize).unwrap().Flags.0 & not_zeroed, 0);
+            hd.Flags = D3D12_HEAP_FLAGS(not_zeroed | D3D12_HEAP_FLAG_DENY_BUFFERS.0 | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES.0);
+            assert_eq!(sanitize_heap_desc(&hd as *const _ as usize).unwrap().Flags.0 & not_zeroed, 0);
+
+            // Committed resource gating: keep NOT_ZEROED for ordinary textures/streaming buffers,
+            // strip for RT/DS targets and indirect argument buffers.
+            let tex = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 128,
+                Height: 128,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+                ..Default::default()
+            };
+            assert!(!should_strip_not_zeroed_resource(&tex as *const _ as usize, D3D12_RESOURCE_STATE_COPY_DEST.0 as usize));
+
+            let rt = D3D12_RESOURCE_DESC { Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ..tex };
+            assert!(should_strip_not_zeroed_resource(&rt as *const _ as usize, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as usize));
+
+            let ds = D3D12_RESOURCE_DESC { Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, ..tex };
+            assert!(should_strip_not_zeroed_resource(&ds as *const _ as usize, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as usize));
+
+            let buf = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 4096,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+                ..Default::default()
+            };
+            assert!(!should_strip_not_zeroed_resource(&buf as *const _ as usize, D3D12_RESOURCE_STATE_COPY_DEST.0 as usize));
+            assert!(should_strip_not_zeroed_resource(
+                &buf as *const _ as usize,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT.0 as usize
+            ));
+        }
     }
 }
 
