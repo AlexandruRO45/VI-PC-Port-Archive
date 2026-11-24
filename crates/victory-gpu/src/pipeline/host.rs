@@ -517,6 +517,29 @@ impl HostPipeline {
                 ..Default::default()
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            // A fault inside the driver leaves no line of its own, so what the
+            // create was given has to be in the log before it is given
+            // (`VICTORY_PIPELINE_ARGS=1`, diagnostics builds). A description
+            // whose root signature or shader bytes are empty is the shape a
+            // null inside the compiler would explain.
+            #[cfg(feature = "diagnostics")]
+            if std::env::var_os("VICTORY_PIPELINE_ARGS").is_some() {
+                let tables = params
+                    .iter()
+                    .filter(|p| p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+                    .count();
+                tracing::warn!(
+                    pipeline = %name,
+                    cs_bytes = desc.CS.BytecodeLength,
+                    root_bytes = root_blob.len(),
+                    params = params.len(),
+                    tables,
+                    samplers = samplers.len(),
+                    bound_root = desc.pRootSignature.is_some(),
+                    node = desc.NodeMask,
+                    "compute create arguments"
+                );
+            }
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
