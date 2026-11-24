@@ -2179,6 +2179,94 @@ mod tests {
         assert!(!ran_hooks().is_empty(), "git am ran no tracked hook");
     }
 
+    /// Git clients started from a desktop launcher run hooks with a PATH
+    /// that often lacks `~/.cargo/bin`, where rustup puts cargo, and every
+    /// hook failed with only `cargo: not found`. Each tracked hook is run
+    /// here with an empty PATH: it must find cargo under `CARGO_HOME`, or
+    /// `~/.cargo` without it, and run the staged check; with cargo nowhere it
+    /// must refuse with a message naming cargo.
+    #[cfg(unix)]
+    #[test]
+    fn hooks_find_cargo_off_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let checkout = crate::workspace_root();
+        let Some(out) = super::git_command(&checkout)
+            .args(["ls-files", "-z", "--", ".githooks"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+        else {
+            eprintln!("skipped: not a git checkout");
+            return;
+        };
+        let hooks: Vec<std::path::PathBuf> = out
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| checkout.join(String::from_utf8_lossy(s).as_ref()))
+            .collect();
+        assert!(!hooks.is_empty(), ".githooks/ holds no tracked hooks");
+
+        let tmp = tempdir();
+        let empty_path = tmp.path().join("bin");
+        let home = tmp.path().join("home");
+        let bin = home.join(".cargo/bin");
+        let log = tmp.path().join("ran");
+        std::fs::create_dir(&empty_path).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let cargo = bin.join("cargo");
+        std::fs::write(
+            &cargo,
+            format!("#!/bin/sh\necho \"$*\" >> {}\n", sh_quote(&log)),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let nowhere = tmp.path().join("nowhere");
+
+        let run = |hook: &std::path::Path, vars: &[(&str, &std::path::Path)]| {
+            let mut command = std::process::Command::new(hook);
+            command
+                .current_dir(&checkout)
+                .env_clear()
+                .env("PATH", &empty_path);
+            for (var, value) in vars {
+                command.env(var, value);
+            }
+            let out = command.output().unwrap();
+            let ran = std::fs::read_to_string(&log).unwrap_or_default();
+            let _ = std::fs::remove_file(&log);
+            (out, ran)
+        };
+        for hook in &hooks {
+            for vars in [
+                &[("HOME", home.as_path())][..],
+                &[("HOME", &nowhere), ("CARGO_HOME", &home.join(".cargo"))],
+            ] {
+                let (out, ran) = run(hook, vars);
+                assert!(
+                    out.status.success(),
+                    "{} with {vars:?}: {}",
+                    hook.display(),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert_eq!(ran, "xtask policy --staged\n", "{}", hook.display());
+            }
+            let (out, ran) = run(hook, &[("HOME", &nowhere)]);
+            assert!(
+                !out.status.success(),
+                "{} ran without cargo",
+                hook.display()
+            );
+            assert!(ran.is_empty());
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("cargo not found"),
+                "{}: {}",
+                hook.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
     #[test]
     fn rejects_lfs_pointers() {
         assert!(!check("assets/model.txt", LFS_POINTER).is_empty());
