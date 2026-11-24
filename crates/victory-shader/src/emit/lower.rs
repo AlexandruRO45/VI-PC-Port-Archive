@@ -5859,10 +5859,78 @@ impl<'a> Lower<'a> {
                 return Err("a 16-bit image atomic");
             }
             // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
+            // 64-bit image atomics (two dwords, an R32G32 view) use the host's
+            // 64-bit atomics on typed resources (SM 6.6).
+            let cmpswap = code == u32::MAX;
+            if *dmask == if cmpswap { 0xF } else { 3 } {
+                let iu = self.s.m.undef(self.s.t.i32);
+                let mut cs = vec![iu; 3];
+                for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+                    *slot = addr_val(self, k)?;
+                }
+                let Operand::Vector { reg, .. } = *data else {
+                    return Err("image atomic data");
+                };
+                let vals = self.vgprs(inst, data, if cmpswap { 4 } else { 2 })?;
+                let i64t = self.s.m.int(64);
+                // a 64-bit value of two dwords, low first
+                let wide = |l: &mut Self, lo: V, hi: V| -> V {
+                    let c = l.cur;
+                    let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
+                    let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
+                    let k32 = l.s.m.int_const(i64t, 32);
+                    let hi = l.s.m.bin(c, Bin::Shl, hi, k32);
+                    l.s.m.bin(c, Bin::Or, lo, hi)
+                };
+                let mut value = wide(self, vals[0], vals[1]);
+                if op == "sub" {
+                    let z = self.s.m.int_const(i64t, 0);
+                    value = self.s.m.bin(self.cur, Bin::Sub, z, value);
+                }
+                let old = match (inst.read(Reg::V(reg)), inst.read(Reg::V(reg + 1))) {
+                    (Some(lo), Some(hi)) if cache.glc => {
+                        let lo = self.i32_of(lo)?;
+                        let hi = self.i32_of(hi)?;
+                        wide(self, lo, hi)
+                    }
+                    _ => self.s.m.int_const(i64t, 0),
+                };
+                let compare = if cmpswap { Some(wide(self, vals[2], vals[3])) } else { None };
+                let heap = matches!(src, Source::Loaded { .. });
+                let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+                self.s.flags |= flags::INT64
+                    | flags::ATOMIC_INT64_TYPED
+                    | if heap { flags::ATOMIC_INT64_HEAP } else { 0 };
+                let at = self.begin_guarded(guard);
+                let mut args = vec![h];
+                let r = match compare {
+                    Some(compare) => {
+                        args.extend(cs);
+                        args.extend([compare, value]);
+                        self.s.op(self.cur, "atomicCompareExchange.i64", Attr::NoUnwind, i64t, 79, &args)
+                    }
+                    None => {
+                        args.push(self.s.m.i32(code));
+                        args.extend(cs);
+                        args.push(value);
+                        self.s.op(self.cur, "atomicBinOp.i64", Attr::NoUnwind, i64t, 78, &args)
+                    }
+                };
+                let r = self.end_guarded(at, &[(r, old)])[0];
+                if cache.glc {
+                    let c = self.cur;
+                    let i32t = self.s.t.i32;
+                    let lo = self.s.m.cast(c, Cast::Trunc, r, i32t);
+                    let k32 = self.s.m.int_const(i64t, 32);
+                    let hi = self.s.m.bin(c, Bin::LShr, r, k32);
+                    let hi = self.s.m.cast(c, Cast::Trunc, hi, i32t);
+                    self.write(inst, Reg::V(reg), lo, None);
+                    self.write(inst, Reg::V(reg + 1), hi, None);
+                }
+                return Ok(());
+            }
+            if *dmask != if cmpswap { 3 } else { 1 } {
+                return Err("an image atomic of this width");
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
