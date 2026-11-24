@@ -6218,7 +6218,17 @@ impl<'a> Lower<'a> {
                     }
                     h
                 } else {
-                    let mut w = self.src(inst, 0)?;
+                    let op = *v.src.first().ok_or("a missing operand")?;
+                    let mut w = match self.src0 {
+                        Some(x) => x,
+                        None => {
+                            let x = self.operand(inst, &op)?;
+                            match Self::sdwa_src(inst, 0) {
+                                Some((sel, sext)) => self.select_bits(x, sel, sext),
+                                None => x,
+                            }
+                        }
+                    };
                     if v.abs & 1 != 0 {
                         let m = self.s.m.i32(0x7FFF_FFFF);
                         w = self.s.m.bin(c, Bin::And, w, m);
