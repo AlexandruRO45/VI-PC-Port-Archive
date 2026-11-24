@@ -2340,6 +2340,56 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// A rule's wildcards are read as `.gitignore` globs: `?` and `*` match
+    /// within one path component and never across `/`, `[st]` and `[!x]`
+    /// match one character in or out of a class, and `\*` matches only a
+    /// literal star. So `scratch`, `tmp`, `temp`, `star*` and `one/two/deep`
+    /// are taken, while `scr/tch`, `ump`, `xemp`, `starry` and
+    /// `one/two/three/deep`, each one character or component off, stay
+    /// visible and are refused.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_matched_by_the_globs_their_rules_spell() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(
+            root.join(".gitignore"),
+            "/scr?tch/\n/[st]mp/\n/[!x]emp/\n/star\\*/\n/one/*/deep/\n",
+        )
+        .unwrap();
+        let taken = ["scratch", "tmp", "temp", "star*", "one/two/deep"].map(|d| root.join(d));
+        let refused =
+            ["scr/tch", "ump", "xemp", "starry", "one/two/three/deep"].map(|d| root.join(d));
+        for dir in taken.iter().chain(&refused) {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let mut tmps = Vec::new();
+        for (seen, hidden) in refused.iter().zip(&taken) {
+            let tmp = tempdir_in_first(root, [seen.clone(), hidden.clone()]);
+            assert_eq!(tmp.path().parent(), Some(hidden.as_path()));
+            assert_eq!(std::fs::read_dir(seen).unwrap().count(), 0);
+            std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+            tmps.push(tmp);
+        }
+        for (i, dir) in refused.iter().enumerate() {
+            std::fs::write(dir.join(format!("f{i}.rs")), b"fn f() {}\n").unwrap();
+        }
+        assert_eq!(
+            names(root, false),
+            [
+                ".gitignore",
+                "one/two/three/deep/f4.rs",
+                "scr/tch/f0.rs",
+                "starry/f3.rs",
+                "ump/f1.rs",
+                "xemp/f2.rs",
+            ]
+        );
+        super::run(root, false).unwrap();
+    }
+
     /// A CARGO_TARGET_DIR that is the checkout itself is never passed over,
     /// whatever its tag says: the whole tree would go unchecked. What is
     /// built there is listed, in a repository and outside one, and passing
