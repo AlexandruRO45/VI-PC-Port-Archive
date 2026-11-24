@@ -90,7 +90,7 @@ fn refusal(owner: Option<u32>) -> String {
         None => String::new(),
     };
     format!(
-        "another title session is running, so this one stops here without touching the GPU: two sessions share one GPU, one save folder and one shader cache. Wait for it to end, or end it and try again.{who}"
+        "another title session is running, so this one stops here without touching the GPU: two sessions share one GPU, one save folder and one shader cache. Wait for it to end, or ask whoever started it to stop it — a session nobody started but you is not yours to end.{who}"
     )
 }
 
@@ -255,6 +255,10 @@ mod tests {
         let text = refusal(Some(4312));
         assert!(text.contains("victory.exe (pid 4312)"), "{text}");
         assert!(text.contains("without touching the GPU"), "{text}");
+        // The holder is a live session by construction, so the refusal must not
+        // invite the reader to end it: only whoever started it may stop it.
+        assert!(!text.contains("or end it"), "{text}");
+        assert!(text.contains("not yours to end"), "{text}");
         // A holder that published no pid still refuses, without inventing one.
         let text = refusal(None);
         assert!(text.contains("another title session is running"), "{text}");
