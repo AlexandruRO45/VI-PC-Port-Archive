@@ -186,8 +186,17 @@ pub struct UserData {
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// shader container (assuming a host GPU supporting 64-lane waves).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_for_wave(container, 64)
+}
+
+/// Translates the program of a console shader container for a host GPU whose
+/// maximum supported wave size is `max_wave` (e.g. `32` on NVIDIA, `64` on
+/// AMD). When `max_wave < 64`, wave64 compute shaders omit `WaveSize(64)` and
+/// lower wave-size-agnostic ops in host-wave mode (with LDS group barriers
+/// where a single 64-lane wave elided `s_barrier`).
+pub fn translate_for_wave(container: &[u8], max_wave: u32) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -211,10 +220,11 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_for_wave(&c, &native, &p, &st, &io, &res, max_wave)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran (assuming 64-lane host
+/// waves).
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -222,6 +232,20 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_for_wave(c, native, p, st, io, res, 64)
+}
+
+/// Emits a program whose earlier stages already ran, targeting a host GPU with
+/// maximum supported wave size `max_wave`.
+pub fn emit_for_wave(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    max_wave: u32,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -288,6 +312,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        max_wave,
     })?;
     Ok(HostShader {
         stage: native.stage,

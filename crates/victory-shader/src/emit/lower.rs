@@ -43,6 +43,12 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Declared DXIL wave size (`WaveSize`), if any.
+    #[cfg(test)]
+    pub wave_size: Option<u32>,
+    /// Number of `dx.op.barrier` calls emitted.
+    #[cfg(test)]
+    pub barriers: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -56,6 +62,8 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// Maximum wave size the host GPU supports (e.g. 32 on NVIDIA, 64 on AMD).
+    pub max_wave: u32,
 }
 
 enum Stop {
@@ -189,6 +197,18 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Single-wave wave64 compute shader with LDS running on a narrower host
+    /// wave (e.g. 32-lane NVIDIA): insert group barriers between conflicting
+    /// LDS accesses in uniform blocks where the console elided `s_barrier`.
+    sync_lds: bool,
+    /// Per IR block: whether inserting a synthetic group barrier is deadlock-free.
+    uniform_sync: Vec<bool>,
+    /// LDS access tracking for `sync_lds`.
+    lds_touched: bool,
+    lds_wrote: bool,
+    lds_read: bool,
+    /// Number of `dx.op.barrier` calls emitted.
+    barriers: u32,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -613,48 +633,61 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut sync_lds = false;
+        let mut cs_host_wave = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
-            // Code reading other lanes needs the console's wave size and
-            // lane order; so do lane masks read as numbers, and LDS shared
-            // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
-                let n = i.name();
-                n.starts_with("ds_swizzle")
-                    || n.contains("permute")
-                    || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || reads_mask_as_data(x.st, i)
-            }) || {
-                // Masks held as numbers or constant lane sets: the lane
-                // tests its own bit by its console lane.
-                let whens = x.st.exits.iter().filter_map(|e| match *e {
-                    LaneExit::Branch { when, .. } => Some(when),
-                    _ => None,
-                });
-                let mut all: Vec<Bool> =
-                    x.st.guards
+            let wave = if x.native.wave64 { 64 } else { 32 };
+            let threads = cs.threads.iter().product::<u32>();
+            let one_wave = threads <= wave;
+            if wave > x.max_wave {
+                // Host GPU does not support the console's wave size (e.g.
+                // wave64 compute on 32-lane NVIDIA). Omit `WaveSize(64)` and
+                // lower wave-size-agnostic ops in `MaskData::Host` mode;
+                // genuinely wave64-dependent cross-lane ops refuse cleanly.
+                cs_host_wave = true;
+                sync_lds = one_wave && s.lds_dwords > 0 && threads > x.max_wave;
+            } else {
+                // Code reading other lanes needs the console's wave size and
+                // lane order; so do lane masks read as numbers, and LDS shared
+                // within one wave, where the console compiler leaves out barriers.
+                console_lanes = insts().any(|i| {
+                    let n = i.name();
+                    n.starts_with("ds_swizzle")
+                        || n.contains("permute")
+                        || n.starts_with("v_mbcnt")
+                        || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                        || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                        || reads_mask_as_data(x.st, i)
+                }) || {
+                    // Masks held as numbers or constant lane sets: the lane
+                    // tests its own bit by its console lane.
+                    let whens = x.st.exits.iter().filter_map(|e| match *e {
+                        LaneExit::Branch { when, .. } => Some(when),
+                        _ => None,
+                    });
+                    let mut all: Vec<Bool> = x
+                        .st
+                        .guards
                         .iter()
                         .flatten()
                         .flatten()
                         .copied()
                         .chain(whens)
                         .collect();
-                all.sort_unstable();
-                all.dedup();
-                all.into_iter().any(|g| {
-                    x.st.bools
-                        .support(g)
-                        .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
-                })
-            };
-            let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
-                s.wave_size = Some(wave);
+                    all.sort_unstable();
+                    all.dedup();
+                    all.into_iter().any(|g| {
+                        x.st.bools
+                            .support(g)
+                            .iter()
+                            .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+                    })
+                };
+                if console_lanes || one_wave && s.lds_dwords > 0 {
+                    s.wave_size = Some(wave);
+                }
             }
         }
         let mut no_barrier = HashSet::new();
@@ -739,10 +772,17 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            sync_lds,
+            uniform_sync: vec![false; p.blocks.len()],
+            lds_touched: false,
+            lds_wrote: false,
+            lds_read: false,
+            barriers: 0,
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
+                HwStage::Cs if cs_host_wave => MaskData::Host,
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
                 _ => MaskData::None,
@@ -1099,6 +1139,34 @@ impl<'a> Lower<'a> {
                 self.counters.insert(b, (phi, Vec::new()));
             }
         }
+        if self.sync_lds {
+            let is_uniform = |bool_val: Bool| {
+                self.x
+                    .st
+                    .bools
+                    .support(bool_val)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(_)))
+            };
+            for &b in &order {
+                self.uniform_sync[b] = is_uniform(self.x.st.reach[b]);
+            }
+            for &q in &order {
+                let non_uniform_exit = matches!(
+                    self.x.st.exits[q],
+                    LaneExit::Branch { when, .. } if !is_uniform(when)
+                );
+                if non_uniform_exit {
+                    for s in p.blocks[q].exit.successors() {
+                        if self.block[s].is_some() && self.rpo[s] <= self.rpo[q] {
+                            for &m in &order[self.rpo[s]..=self.rpo[q]] {
+                                self.uniform_sync[m] = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
@@ -1115,6 +1183,10 @@ impl<'a> Lower<'a> {
                 .copied()
                 .filter(|&q| self.block[q].is_some())
                 .collect();
+            if self.sync_lds && !preds.is_empty() && self.lds_touched {
+                self.lds_wrote = true;
+                self.lds_read = true;
+            }
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
             for (i, phi) in p.blocks[b].phis.iter().enumerate() {
                 let val = match phi.reg {
@@ -1163,6 +1235,10 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            wave_size: self.s.wave_size,
+            #[cfg(test)]
+            barriers: self.barriers,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2125,7 +2201,9 @@ impl<'a> Lower<'a> {
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
             return Err("a cross-lane operation outside compute");
         }
-        debug_assert!(self.s.threads.is_none() || self.console_lanes);
+        if self.s.threads.is_some() && !self.console_lanes {
+            return Err("a cross-lane operation needing wave64");
+        }
         self.s.flags |= flags::WAVE_OPS;
         Ok(())
     }
@@ -2383,6 +2461,21 @@ impl<'a> Lower<'a> {
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
+        if self.sync_lds {
+            let is_read = name.starts_with("ds_read");
+            let is_write = name.starts_with("ds_write");
+            let is_atomic = !is_read && !is_write;
+            if guard.is_none()
+                && self.uniform_sync[b]
+                && ((is_read || is_atomic) && self.lds_wrote
+                    || (is_write || is_atomic) && self.lds_read)
+            {
+                self.emit_barrier();
+            }
+            self.lds_touched = true;
+            self.lds_wrote |= is_write || is_atomic;
+            self.lds_read |= is_read || is_atomic;
+        }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
         // (out-of-bounds console accesses read 0 and drop writes).
@@ -2501,6 +2594,19 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Emits a thread-group barrier with a shared-memory fence (and a UAV
+    /// fence when the program writes UAVs), clearing tracked LDS hazards.
+    fn emit_barrier(&mut self) {
+        let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+        let mode = self.s.m.i32(mode);
+        let void = self.s.t.void;
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.lds_wrote = false;
+        self.lds_read = false;
+        self.barriers += 1;
+    }
+
     // ---- instructions ----
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
@@ -2533,14 +2639,7 @@ impl<'a> Lower<'a> {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
-                // Thread-group sync with a shared-memory fence, and a UAV
-                // fence when the program writes UAVs (the waits before an
-                // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                let mode = self.s.m.i32(mode);
-                let void = self.s.t.void;
-                self.s
-                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                self.emit_barrier();
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -7338,6 +7437,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            max_wave: 64,
         })
         .map(|_| ())
     }
@@ -7388,6 +7488,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            max_wave: 64,
         })
     }
 
@@ -7491,6 +7592,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            max_wave: 64,
         }).unwrap();
 
         let container =
@@ -8037,5 +8139,125 @@ mod tests {
         #[cfg(windows)]
         validate_dxil(&mut lowered.dxil);
         let _ = lowered;
+    }
+
+    fn lower_cs_wave(
+        words: &[u32],
+        threads: [u32; 3],
+        wave64: bool,
+        max_wave: u32,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                // 512 bytes of LDS.
+                rsrc2: 1 << 15,
+                threads,
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, wave64, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            max_wave,
+        })
+    }
+
+    #[test]
+    fn wave64_one_wave_lds_inserts_barriers_on_wave32_host() {
+        // 64-thread wave64 compute shader sharing LDS without an s_barrier
+        // (console lockstep single wave).
+        let words = [
+            0x7E02_0281, // v_mov_b32 v1, 1
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xD8D8_0000,
+            0x0200_0000, // ds_read_b32 v2, v0
+            0xD834_0004,
+            0x0000_0200, // ds_write_b32 v0, v2 offset:4
+            S_ENDPGM,
+        ];
+        // On a 64-lane host (AMD), keep WaveSize(64) and no synthetic barriers.
+        let mut w64 = lower_cs_wave(&words, [64, 1, 1], true, 64).unwrap();
+        assert_eq!(w64.wave_size, Some(64));
+        assert_eq!(w64.barriers, 0);
+        #[cfg(windows)]
+        validate_dxil(&mut w64.dxil);
+
+        // On a 32-lane host (NVIDIA), omit WaveSize(64) and insert group
+        // barriers between conflicting LDS writes and reads.
+        let mut w32 = lower_cs_wave(&words, [64, 1, 1], true, 32).unwrap();
+        assert_eq!(w32.wave_size, None);
+        assert!(w32.barriers >= 2, "expected RAW + WAR LDS barriers");
+        #[cfg(windows)]
+        validate_dxil(&mut w32.dxil);
+    }
+
+    #[test]
+    fn wave64_host_wave_ballot_ops_lower_without_wave64_on_wave32_host() {
+        // Wave-size-agnostic ballot ops (WaveActiveCountBits + WavePrefixCountBits):
+        // v_cmp_eq_u32 vcc, 0, v0; s_bcnt1_i32_b64 s2, vcc; v_mbcnt_lo_u32_b32 v1, vcc_lo, 0
+        let words = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE82_106A, // s_bcnt1_i32_b64 s2, vcc
+            0xD765_0001,
+            0x0001_006A, // v_mbcnt_lo_u32_b32 v1, vcc_lo, 0
+            0x4A02_0202, // v_add_nc_u32 v1, s2, v1
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let mut w32 = lower_cs_wave(&words, [64, 1, 1], true, 32).unwrap();
+        assert_eq!(w32.wave_size, None);
+        assert!(w32.wave_ops);
+        #[cfg(windows)]
+        validate_dxil(&mut w32.dxil);
+    }
+
+    #[test]
+    fn wave64_constant_readlane_refuses_on_wave32_host() {
+        // Reading a constant console lane depends on exact 64-lane layout.
+        let words = [
+            0xD760_0002,
+            0x0001_0B00, // v_readlane_b32 s2, v0, 5
+            0x7E02_0202, // v_mov_b32 v1, s2
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let mut w64 = lower_cs_wave(&words, [64, 1, 1], true, 64).unwrap();
+        assert_eq!(w64.wave_size, Some(64));
+        #[cfg(windows)]
+        validate_dxil(&mut w64.dxil);
+
+        let Err(err) = lower_cs_wave(&words, [64, 1, 1], true, 32) else {
+            panic!("expected wave64 refusal on 32-lane host");
+        };
+        assert!(
+            matches!(
+                err,
+                crate::ShaderError::Unsupported {
+                    what: "a cross-lane operation needing wave64",
+                    ..
+                }
+            ),
+            "unexpected error: {err}"
+        );
     }
 }

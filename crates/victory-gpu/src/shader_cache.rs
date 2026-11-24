@@ -36,14 +36,37 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+fn host_max_wave() -> u32 {
+    #[cfg(windows)]
+    {
+        crate::host::max_wave_size()
+    }
+    #[cfg(not(windows))]
+    {
+        64
+    }
+}
+
+/// Computes the shader cache build fingerprint from our executable bytes and
+/// runtime translation settings (`loop_limit` and `max_wave`), isolating cache
+/// entries across GPUs with different maximum wave sizes (e.g. 32 vs 64).
+fn build_fingerprint(exe_bytes: &[u8], limit: u32, max_wave: u32) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(exe_bytes);
+    hasher.update(&limit.to_le_bytes());
+    hasher.update(&max_wave.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// the translation settings it runs with (the loop limit and host max wave
+/// size).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
         let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
+        let max_wave = host_max_wave();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
                 limit,
@@ -51,10 +74,7 @@ fn build() -> &'static [u8; 32] {
             );
         }
         match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
-            }
+            Ok(bytes) => build_fingerprint(&bytes, limit, max_wave),
             Err(e) => {
                 // Without it no entry can be trusted: a fresh key per run.
                 tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
@@ -70,7 +90,10 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let max_wave = host_max_wave();
+    let translate = |c: &[u8]| {
+        victory_shader::emit::translate_for_wave(c, max_wave).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),
@@ -355,5 +378,16 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    #[test]
+    fn build_fingerprint_isolates_max_wave_sizes() {
+        let exe = b"victory-exe-bytes";
+        let limit = victory_shader::emit::DEFAULT_LOOP_LIMIT;
+        let fp32 = build_fingerprint(exe, limit, 32);
+        let fp64 = build_fingerprint(exe, limit, 64);
+        assert_ne!(fp32, fp64, "32-lane and 64-lane hosts must not share cache keys");
+        assert_eq!(fp32, build_fingerprint(exe, limit, 32));
+        assert_ne!(fp32, build_fingerprint(exe, limit + 1, 32));
     }
 }

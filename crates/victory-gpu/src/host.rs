@@ -53,6 +53,8 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// Maximum supported wave size (`D3D12_FEATURE_DATA_D3D12_OPTIONS1::WaveLaneCountMax`).
+    max_wave: u32,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -131,6 +133,12 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// Maximum wave size supported by the host GPU (`WaveLaneCountMax`), or 64 if
+/// no host device is available.
+pub(crate) fn max_wave_size() -> u32 {
+    host().map_or(64, |h| h.max_wave)
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
@@ -207,7 +215,25 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        tracing::info!("host D3D12 device ready");
+        let mut opts1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        let (wave_lane_min, max_wave) = if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                std::ptr::from_mut(&mut opts1).cast(),
+                std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS1>() as u32,
+            )
+            .is_ok()
+            && opts1.WaveLaneCountMax > 0
+        {
+            (opts1.WaveLaneCountMin, opts1.WaveLaneCountMax)
+        } else {
+            (32, 32)
+        };
+        tracing::info!(
+            wave_lane_min,
+            wave_lane_max = max_wave,
+            "host D3D12 device ready"
+        );
         Ok(Host {
             device,
             queue,
@@ -222,6 +248,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            max_wave,
         })
     }
 }
