@@ -15,6 +15,9 @@
 //!   downloads) fails with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
 //! * A bind to all interfaces is narrowed to loopback, so nothing on the
 //!   network can connect in.
+//!
+//! Windows only: on Linux, `linux::ws2_32` and `linux::winhttp` are the
+//! Winsock and WinHTTP and keep this policy themselves.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]

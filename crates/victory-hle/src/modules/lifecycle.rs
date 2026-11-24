@@ -1,8 +1,10 @@
 //! The title's life cycle. A console title is never told it is closing:
 //! quitting it or launching a new game first suspends it (its suspend
 //! routines run, and it has a second to save) and then ends the process.
-//! Closing the title's window does the same here; a new launch then starts
-//! `victory` again, which waits for this process to be gone.
+//! Closing the title's window does the same here (on Linux, so do SIGINT,
+//! SIGTERM and SIGHUP; the window's owner raises SIGTERM when the user
+//! closes it); a new launch then starts `victory` again, which waits for
+//! this process to be gone.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
@@ -12,9 +14,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+#[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, HMENU};
+#[cfg(windows)]
 use windows_sys::core::{PCSTR, PCWSTR, w};
 
 use crate::{HleModule, hle_export};
@@ -56,9 +62,27 @@ pub extern "win64" fn UnregisterAppStateChangeNotification(registration: usize) 
     routines().retain(|&(id, ..)| id != registration);
 }
 
+/// A console title is never constrained, so the routine is never called.
+pub extern "win64" fn RegisterAppConstrainedChangeNotification(
+    routine: Option<Routine>,
+    _context: *mut c_void,
+    registration: *mut usize,
+) -> u32 {
+    if routine.is_none() || registration.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+    // SAFETY: checked non-null; the title passes room for its registration.
+    unsafe { registration.write(1) };
+    0
+}
+
+pub extern "win64" fn UnregisterAppConstrainedChangeNotification(_registration: usize) {}
+
+#[cfg(windows)]
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
 
+#[cfg(windows)]
 pub extern "win64" fn CreateWindowExW(
     ex_style: u32,
     class: PCWSTR,
@@ -84,6 +108,7 @@ pub extern "win64" fn CreateWindowExW(
     hwnd
 }
 
+#[cfg(windows)]
 /// See [`CreateWindowExW`].
 pub extern "win64" fn CreateWindowExA(
     ex_style: u32,
@@ -110,6 +135,7 @@ pub extern "win64" fn CreateWindowExA(
     hwnd
 }
 
+#[cfg(windows)]
 /// A console title sizes its window to its render target (Grand Theft
 /// Auto VI: 3840x2160 on a Series X), which can exceed the host's screen.
 /// A top-level window larger than the work area is shrunk to fit, keeping
@@ -131,6 +157,7 @@ fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32,
     (left, top, w, h)
 }
 
+#[cfg(windows)]
 /// `width` x `height` scaled down to fit `area`, or unchanged if it fits
 /// (or is `CW_USEDEFAULT`).
 fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
@@ -148,6 +175,7 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
     )
 }
 
+#[cfg(windows)]
 /// Puts our procedure in front of the title's.
 fn hook(hwnd: HWND) {
     if hwnd.is_null() {
@@ -162,6 +190,7 @@ fn hook(hwnd: HWND) {
     }
 }
 
+#[cfg(windows)]
 extern "win64" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -209,6 +238,9 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     // Not on the calling thread: titles hand the suspend to their window
     // thread and wait for it inside the routine.
     std::thread::spawn(move || {
+        // Title code: on Linux the thread needs a TEB first.
+        #[cfg(target_os = "linux")]
+        victory_loader::linux::thread::attach_current();
         for (_, routine, context) in suspend {
             routine(1, context as *mut c_void);
         }
@@ -220,13 +252,32 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     });
 }
 
-/// Set in the environment of a relaunched `victory`: an inherited handle
-/// of the process it replaces.
+/// Set in the environment of a relaunched `victory`: what identifies the
+/// process it replaces (Windows: an inherited process handle; Linux: its
+/// pid).
 const RELAUNCHED_FROM: &str = "VICTORY_RELAUNCHED_FROM";
 
 /// Starts `victory` again with `args` (after the title has suspended); the
 /// new process waits until this one has ended.
 pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
+    let me = this_process();
+    let spawned = std::env::current_exe().and_then(|exe| {
+        let mut command = std::process::Command::new(exe);
+        command.args(&args);
+        if let Some(me) = me {
+            command.env(RELAUNCHED_FROM, me.to_string());
+        }
+        command.spawn()
+    });
+    match spawned {
+        Ok(child) => tracing::info!(pid = child.id(), ?args, "relaunched"),
+        Err(e) => tracing::warn!(%e, "relaunch failed; the title just ends"),
+    }
+}
+
+/// An inheritable duplicate of our own process handle.
+#[cfg(windows)]
+fn this_process() -> Option<usize> {
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
     let mut me: HANDLE = std::ptr::null_mut();
     // SAFETY: an inheritable duplicate of our own process handle.
@@ -241,33 +292,31 @@ pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
             DUPLICATE_SAME_ACCESS,
         )
     } != 0;
-    let spawned = std::env::current_exe().and_then(|exe| {
-        let mut command = std::process::Command::new(exe);
-        command.args(&args);
-        if duplicated {
-            command.env(RELAUNCHED_FROM, (me as usize).to_string());
-        }
-        command.spawn()
-    });
-    match spawned {
-        Ok(child) => tracing::info!(pid = child.id(), ?args, "relaunched"),
-        Err(e) => tracing::warn!(%e, "relaunch failed; the title just ends"),
-    }
+    duplicated.then_some(me as usize)
+}
+
+#[cfg(target_os = "linux")]
+fn this_process() -> Option<usize> {
+    Some(std::process::id() as usize)
+}
+
+/// [`RELAUNCHED_FROM`], taken out of our environment.
+fn previous() -> Option<usize> {
+    let value = std::env::var(RELAUNCHED_FROM).ok()?.parse().ok()?;
+    // SAFETY: removing our own variable before any other thread reads it.
+    unsafe { std::env::remove_var(RELAUNCHED_FROM) };
+    Some(value)
 }
 
 /// In a relaunched `victory`: waits (30 s at most) for the process it
 /// replaces to be gone, so the two never share the title's files.
+#[cfg(windows)]
 pub fn wait_for_previous() {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
-    let Some(handle) = std::env::var(RELAUNCHED_FROM)
-        .ok()
-        .and_then(|h| h.parse::<usize>().ok())
-    else {
+    let Some(handle) = previous() else {
         return;
     };
-    // SAFETY: removing our own variable before any other thread reads it.
-    unsafe { std::env::remove_var(RELAUNCHED_FROM) };
     let handle = handle as HANDLE;
     // SAFETY: the inherited process handle the previous process gave us.
     unsafe {
@@ -276,12 +325,92 @@ pub fn wait_for_previous() {
     }
 }
 
+/// See the Windows twin; a pidfd turns readable when the process ends.
+#[cfg(target_os = "linux")]
+pub fn wait_for_previous() {
+    let Some(pid) = previous() else {
+        return;
+    };
+    // SAFETY: pidfd_open takes a pid and no flags.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as i32;
+    if fd < 0 {
+        return; // already gone
+    }
+    let mut ended = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one pollfd over the descriptor we just opened, closed after.
+    unsafe {
+        libc::poll(&mut ended, 1, 30_000);
+        libc::close(fd);
+    }
+}
+
+/// SIGINT, SIGTERM and SIGHUP end the title as the console ends it
+/// ([`end_title`]), as closing its window does on Windows; the Linux
+/// window's owner raises SIGTERM when the user closes it. Install before
+/// the title starts (SDL then leaves these signals alone).
+#[cfg(target_os = "linux")]
+pub fn end_on_signals() {
+    use std::sync::atomic::AtomicI32;
+    static PIPE: AtomicI32 = AtomicI32::new(-1);
+    extern "C" fn on_signal(signal: libc::c_int) {
+        let byte = signal as u8;
+        // SAFETY: write(2) is async-signal-safe; the pipe is never closed.
+        unsafe { libc::write(PIPE.load(Ordering::Relaxed), (&raw const byte).cast(), 1) };
+    }
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 fills the two descriptors.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        tracing::warn!("no signal pipe; signals end the process at once");
+        return;
+    }
+    PIPE.store(fds[1], Ordering::Relaxed);
+    let read = fds[0];
+    let watcher = std::thread::Builder::new()
+        .name("victory signals".into())
+        .spawn(move || {
+            let mut signal = 0u8;
+            // SAFETY: reads one byte into a local; retried on EINTR.
+            while unsafe { libc::read(read, (&raw mut signal).cast(), 1) } != 1 {}
+            let why = match i32::from(signal) {
+                libc::SIGINT => "SIGINT",
+                libc::SIGHUP => "SIGHUP",
+                _ => "SIGTERM",
+            };
+            end_title(why, Box::new(|| {}));
+        });
+    if watcher.is_err() {
+        return;
+    }
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: a handler that only writes to the pipe; zeroed is a valid
+        // empty sigaction.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_signal as *const () as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
+    }
+}
+
 fn end() {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
     // SAFETY: ends this process, as the console ends a suspended title.
-    unsafe { TerminateProcess(GetCurrentProcess(), 0) };
+    #[cfg(windows)]
+    unsafe {
+        TerminateProcess(GetCurrentProcess(), 0)
+    };
+    // SAFETY: as above; no exit handlers run, as with TerminateProcess.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::_exit(0)
+    };
 }
 
 pub(crate) fn module() -> HleModule {
@@ -294,7 +423,11 @@ pub(crate) fn module() -> HleModule {
         exports: vec![
             hle_export!(RegisterAppStateChangeNotification),
             hle_export!(UnregisterAppStateChangeNotification),
+            hle_export!(RegisterAppConstrainedChangeNotification),
+            hle_export!(UnregisterAppConstrainedChangeNotification),
+            #[cfg(windows)]
             hle_export!(CreateWindowExW),
+            #[cfg(windows)]
             hle_export!(CreateWindowExA),
         ],
     }
@@ -322,6 +455,25 @@ mod tests {
         assert_eq!(left, [b]);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_relaunch_waits_for_the_previous_process() {
+        let mut child = std::process::Command::new("sleep").arg("0.3").spawn().unwrap();
+        // SAFETY: no other test reads this variable.
+        unsafe { std::env::set_var(RELAUNCHED_FROM, child.id().to_string()) };
+        let started = std::time::Instant::now();
+        wait_for_previous();
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(250) && waited < Duration::from_secs(10), "{waited:?}");
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(std::env::var(RELAUNCHED_FROM).is_err());
+        // Gone (and reaped) already: returns at once.
+        // SAFETY: as above.
+        unsafe { std::env::set_var(RELAUNCHED_FROM, child.id().to_string()) };
+        wait_for_previous();
+    }
+
+    #[cfg(windows)]
     #[test]
     fn oversized_windows_shrink_to_the_screen() {
         let area = RECT {
@@ -338,6 +490,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn hooked_windows_still_reach_the_title_procedure() {
         let null = std::ptr::null_mut();

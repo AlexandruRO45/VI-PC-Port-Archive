@@ -85,4 +85,6 @@ calling convention; check before you bind.
 | UCRT | every import the title and its DLLs take (`ucrt_*.rs`); C locale only |
 | GPU, window, input | not started |
 | Audio, network (offline), crypto, COM and the other host DLLs | done: every import of these DLLs resolves. Sound through PulseAudio/PipeWire (`libpulse-simple`, loaded at run time): the game's Spatial Audio stream (`mmdevapi.rs`) and Bink's XAudio2 (`xaudio2.rs`); loopback-only Winsock, WinHTTP that cannot connect, Media Foundation without sources, an empty registry |
-| Windows-only `victory-hle` modules (files, xmem, lifecycle, ...) | not started |
+| `victory-hle` modules lifecycle, xsystem, apu, dstorage | done: suspend on SIGINT/SIGTERM/SIGHUP (the window's owner raises SIGTERM when the user closes it), relaunch waits on a pidfd, the device type over the empty registry; dstorage reads through the Linux file layer, physical-page destinations wait for xmem |
+| `net`, `media` | Windows only: on Linux `ws2_32`, `winhttp` and `mfplat` keep the same offline policy themselves |
+| Windows-only `victory-hle` modules files, xmem, storage | not started |

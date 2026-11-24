@@ -3,6 +3,7 @@
 //! URLs over the network, past `modules::net`. Titles get a proxy that
 //! opens local files only, with paths on our virtual drives rewritten to
 //! their host folders, and forwards everything else to the host's resolver.
+//! Windows only: on Linux `linux::mfplat` has no resolver to guard.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 

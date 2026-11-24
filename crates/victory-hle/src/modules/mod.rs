@@ -10,19 +10,19 @@
 //! `file` (package paths), `thread` (TLS callbacks for title threads),
 //! `xaudio2`, `xstore` stubs.
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub mod apu;
 pub mod audio;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub mod dstorage;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub mod lifecycle;
 #[cfg(windows)]
 pub mod media;
@@ -56,21 +56,21 @@ pub(crate) fn all() -> Vec<HleModule> {
         dsp::module(),
         xg::module(),
     ];
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     all.push(apu::module());
     #[cfg(windows)]
     all.push(media::module());
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     all.push(dstorage::module());
     #[cfg(windows)]
     all.push(files::module());
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     all.push(lifecycle::module());
     #[cfg(windows)]
     all.push(net::module());
     #[cfg(windows)]
     all.push(xmem::module());
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     all.push(xsystem::module());
     all
 }
