@@ -48,7 +48,9 @@ bind time, resolved with `shadow::find`, and bound as a root SRV. That is the
 same two steps as `Root::Pointer` in `victory-shader/src/emit/host.rs`, one
 level deeper, and it needs a wider root-view register encoding than
 `((dword + 1) << 8) | slot` because the location is `(param, offset)` of
-another parameter, not necessarily the constants.
+another parameter, not necessarily the constants. Main already binds the
+one-hop form (`victory-gpu/src/draw.rs`, the `reg.checked_sub(256)` branch), so
+the register encoding is the only thing in the way.
 
 Examples: `compute-190fbf0ebe040169` at `0xcc`, `compute-6d7fe7745ab9c6d8` at
 `0x834`, `compute-f22a76fcb967ee59` at `0x7e8`, `compute-17829ac71aab4e8d` at
