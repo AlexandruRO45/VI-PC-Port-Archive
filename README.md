@@ -126,12 +126,14 @@ Negative results on this machine (do not use):
 - `VICTORY_WIDE_REFRESH=1`, `VICTORY_CARD_REHASH_RUNS=1`,
   `VICTORY_UNWATCHED_FRAMES=2`: no frame-rate gain (the refresh copies are kernel
   page-fault bound, not thread bound).
-- The newer `fxceless/victory-fork` **shader clean-up optimizer, full on, renders
-  the scene black**, and its **#11 lane-mask pair-restore removes world geometry**
-  on this base — those shader-side changes do not transfer to this fork's wave64
-  emitter unchanged. A safe subset of the optimizer (dead code, folding, reuse,
-  load-CSE = `VICTORY_SHADER_OPT=23`, excluding branch facts and the wave64
-  first-lane exchange) is under test.
+- The newer `fxceless/victory-fork` **shader clean-up optimizer renders the scene
+  black** here, and its **#11 lane-mask pair-restore removes world geometry**
+  (floor/walls) on this base — those shader-side changes do not transfer to this
+  fork's wave64 emitter unchanged. **Even a "safe" optimizer subset** (dead code,
+  folding, reuse, load-CSE = `VICTORY_SHADER_OPT=23`, excluding branch facts and
+  the wave64 first-lane exchange) renders black with missing geometry at
+  500-700 ms/frame: the optimizer is written for victory-fork's different emitter
+  and is unusable on this base in any combination.
 
 The intro pre-rendered video logo jitters in every mode (a frame-token pacing
 issue in `frame.rs`, not the relay or the shaders); the world itself presents in
