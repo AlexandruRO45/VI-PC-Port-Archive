@@ -13,9 +13,16 @@ use crate::HleModule;
 
 #[allow(dead_code)] // used by the slices as they land
 pub(crate) mod handles;
+mod kernel32_process;
+mod kernel32_sync;
+mod kernel32_wait;
 
 fn modules() -> Vec<HleModule> {
-    vec![]
+    vec![
+        kernel32_wait::module(),
+        kernel32_sync::module(),
+        kernel32_process::module(),
+    ]
 }
 
 static MODULES: LazyLock<Vec<HleModule>> = LazyLock::new(modules);
