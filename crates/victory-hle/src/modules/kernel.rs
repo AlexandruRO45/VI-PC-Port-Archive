@@ -28,6 +28,33 @@ pub extern "win64" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
     find_module(&narrow(name), false).unwrap_or_else(|| host::get_module_handle_a(name))
 }
 
+/// By name as [`GetModuleHandleW`]; by address, the image holding it.
+/// Reference counts are not kept: title images stay mapped.
+pub extern "win64" fn GetModuleHandleExW(
+    flags: u32,
+    name: *const u16,
+    out: *mut *mut c_void,
+) -> i32 {
+    const FROM_ADDRESS: u32 = 4;
+    if out.is_null() {
+        host::set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let module = if flags & FROM_ADDRESS != 0 {
+        host::module_at(name as usize)
+    } else {
+        GetModuleHandleW(name)
+    };
+    // SAFETY: checked non-null; the title passes room for a handle.
+    unsafe { out.write(module) };
+    if module.is_null() {
+        host::set_last_error(ERROR_MOD_NOT_FOUND);
+    }
+    i32::from(!module.is_null())
+}
+
+const ERROR_INVALID_PARAMETER: u32 = 87;
+
 /// A NUL-terminated string from the title.
 fn narrow(text: *const u8) -> String {
     // SAFETY: the title passes a NUL-terminated string.
@@ -369,6 +396,7 @@ pub(crate) fn module() -> HleModule {
         exports: vec![
             hle_export!(GetModuleHandleW),
             hle_export!(GetModuleHandleA),
+            hle_export!(GetModuleHandleExW),
             hle_export!(GetModuleFileNameW),
             hle_export!(GetModuleFileNameA),
             hle_export!(LoadLibraryExA),
@@ -426,6 +454,24 @@ mod host {
     pub(super) fn get_module_handle_a(name: *const u8) -> *mut c_void {
         // SAFETY: see above.
         unsafe { GetModuleHandleA(name) }
+    }
+
+    /// Title images are host modules here.
+    pub(super) fn module_at(address: usize) -> *mut c_void {
+        use windows_sys::Win32::System::LibraryLoader::{
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            GetModuleHandleExW,
+        };
+        let mut module = std::ptr::null_mut();
+        // SAFETY: an address lookup into a local; no reference is taken.
+        unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                address as *const u16,
+                &mut module,
+            )
+        };
+        module
     }
 
     pub(super) fn get_module_file_name_w(module: *mut c_void, out: *mut u16, size: u32) -> u32 {
@@ -560,6 +606,10 @@ mod host {
         module(&super::narrow(name))
     }
 
+    pub(super) fn module_at(address: usize) -> *mut c_void {
+        victory_loader::linux::seh::image_base(address).unwrap_or(0) as *mut c_void
+    }
+
     pub(super) fn load_library_ex_a(name: *const u8, _: *mut c_void, _: u32) -> *mut c_void {
         if name.is_null() {
             return std::ptr::null_mut();
@@ -684,6 +734,10 @@ mod host {
         std::ptr::null_mut()
     }
 
+    pub(super) fn module_at(_: usize) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
     pub(super) fn load_library_ex_a(_: *const u8, _: *mut c_void, _: u32) -> *mut c_void {
         std::ptr::null_mut()
     }
@@ -740,6 +794,19 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_handles_by_name_and_by_address() {
+        let mut module = 1 as *mut c_void;
+        let name = w("kernel32.dll");
+        assert_eq!(GetModuleHandleExW(0, name.as_ptr(), &mut module), 1);
+        assert!(!module.is_null());
+        assert_eq!(module, GetModuleHandleW(name.as_ptr()));
+        // An address in no image.
+        assert_eq!(GetModuleHandleExW(4, 0x10 as *const u16, &mut module), 0);
+        assert!(module.is_null());
+        assert_eq!(GetModuleHandleExW(0, name.as_ptr(), std::ptr::null_mut()), 0);
+    }
 
     #[test]
     #[cfg_attr(not(windows), ignore = "title paths are Windows paths")]

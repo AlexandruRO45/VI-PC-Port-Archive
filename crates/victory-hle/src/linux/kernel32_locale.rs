@@ -421,6 +421,163 @@ pub extern "win64" fn GetLocaleInfoW(lcid: u32, kind: u32, out: *mut u16, capaci
     locale_info(by_lcid(lcid), kind, out, capacity)
 }
 
+// ---- dates and times ------------------------------------------------------------------------
+
+use super::kernel32_time::{GetLocalTime, SystemTime, days_from_civil};
+
+/// `t` in a Windows picture format (`dddd, MMMM d, yyyy`, `h:mm:ss tt`):
+/// the date letters if `date`, else the time letters; `'...'` is literal
+/// (`''` a quote), anything else is copied.
+fn picture(format: &str, t: &SystemTime, date: bool) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = format.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let run = chars[i..].iter().take_while(|&&x| x == c).count();
+        if c == '\'' {
+            // `''` is a quote, in a quoted stretch or not.
+            if chars.get(i + 1) == Some(&'\'') {
+                out.push('\'');
+                i += 2;
+                continue;
+            }
+            i += 1;
+            while let Some(&x) = chars.get(i) {
+                i += 1;
+                match x {
+                    '\'' if chars.get(i) == Some(&'\'') => {
+                        out.push('\'');
+                        i += 1;
+                    }
+                    '\'' => break,
+                    x => out.push(x),
+                }
+            }
+            continue;
+        }
+        let n = |v: u16, run: usize| if run >= 2 { format!("{v:02}") } else { v.to_string() };
+        let weekday = || {
+            let days = days_from_civil(t.year.into(), t.month.into(), t.day.into());
+            DAYS[(days + 3).rem_euclid(7) as usize]
+        };
+        let month = MONTHS[usize::from(t.month - 1)];
+        let hour12 = if t.hour % 12 == 0 { 12 } else { t.hour % 12 };
+        let marker = if t.hour < 12 { "AM" } else { "PM" };
+        let text = match (date, c) {
+            (true, 'd') if run >= 4 => weekday().to_string(),
+            (true, 'd') if run == 3 => weekday()[..3].to_string(),
+            (true, 'd') => n(t.day, run),
+            (true, 'M') if run >= 4 => month.to_string(),
+            (true, 'M') if run == 3 => month[..3].to_string(),
+            (true, 'M') => n(t.month, run),
+            (true, 'y') if run >= 3 => format!("{:04}", t.year),
+            (true, 'y') => n(t.year % 100, run),
+            (true, 'g') => "A.D.".to_string(),
+            (false, 'h') => n(hour12, run),
+            (false, 'H') => n(t.hour, run),
+            (false, 'm') => n(t.minute, run),
+            (false, 's') => n(t.second, run),
+            (false, 't') if run >= 2 => marker.to_string(),
+            (false, 't') => marker[..1].to_string(),
+            _ => chars[i..i + run].iter().collect(),
+        };
+        out.push_str(&text);
+        i += run;
+    }
+    out
+}
+
+/// The title's time, or now (local); `None` if a field is out of range.
+fn when(time: *const SystemTime) -> Option<SystemTime> {
+    let mut t = SystemTime::default();
+    if time.is_null() {
+        GetLocalTime(&mut t);
+    } else {
+        // SAFETY: the title's SYSTEMTIME.
+        t = unsafe { time.read_unaligned() };
+    }
+    let ok = (1..=12).contains(&t.month)
+        && (1..=31).contains(&t.day)
+        && t.hour < 24
+        && t.minute < 60
+        && t.second < 60;
+    ok.then_some(t)
+}
+
+fn format_time(
+    locale: *const u16,
+    time: *const SystemTime,
+    format: *const u16,
+    default: impl FnOnce() -> String,
+    date: bool,
+    out: *mut u16,
+    capacity: i32,
+) -> i32 {
+    let (Some(_), Some(t)) = (named(locale), when(time)) else {
+        return fail(ERROR_INVALID_PARAMETER);
+    };
+    let format = wide(format).map_or_else(default, String::from_utf16_lossy);
+    deliver(&picture(&format, &t, date), out, capacity)
+}
+
+pub extern "win64" fn GetDateFormatEx(
+    locale: *const u16,
+    flags: u32,
+    date: *const SystemTime,
+    format: *const u16,
+    out: *mut u16,
+    capacity: i32,
+    _calendar: *const u16,
+) -> i32 {
+    const DATE_LONGDATE: u32 = 0x2;
+    const DATE_YEARMONTH: u32 = 0x8;
+    const DATE_MONTHDAY: u32 = 0x80;
+    let default = || {
+        if flags & DATE_LONGDATE != 0 {
+            "dddd, MMMM d, yyyy"
+        } else if flags & DATE_YEARMONTH != 0 {
+            "MMMM yyyy"
+        } else if flags & DATE_MONTHDAY != 0 {
+            "MMMM d"
+        } else {
+            "M/d/yyyy"
+        }
+        .to_string()
+    };
+    format_time(locale, date, format, default, true, out, capacity)
+}
+
+/// The flags shape the default format only.
+pub extern "win64" fn GetTimeFormatEx(
+    locale: *const u16,
+    flags: u32,
+    time: *const SystemTime,
+    format: *const u16,
+    out: *mut u16,
+    capacity: i32,
+) -> i32 {
+    const TIME_NOMINUTESORSECONDS: u32 = 0x1;
+    const TIME_NOSECONDS: u32 = 0x2;
+    const TIME_NOTIMEMARKER: u32 = 0x4;
+    const TIME_FORCE24HOURFORMAT: u32 = 0x8;
+    let default = || {
+        let h24 = flags & TIME_FORCE24HOURFORMAT != 0;
+        let mut f = String::from(if h24 { "H" } else { "h" });
+        if flags & TIME_NOMINUTESORSECONDS == 0 {
+            f.push_str(":mm");
+            if flags & TIME_NOSECONDS == 0 {
+                f.push_str(":ss");
+            }
+        }
+        if !h24 && flags & TIME_NOTIMEMARKER == 0 {
+            f.push_str(" tt");
+        }
+        f
+    };
+    format_time(locale, time, format, default, false, out, capacity)
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel32-locale",
@@ -428,8 +585,11 @@ pub(crate) fn module() -> HleModule {
             "kernel32.dll",
             "kernelbase.dll",
             "api-ms-win-core-localization-*",
+            "api-ms-win-core-datetime-*",
         ],
         exports: vec![
+            hle_export!(GetDateFormatEx),
+            hle_export!(GetTimeFormatEx),
             hle_export!(GetUserDefaultLocaleName),
             hle_export!(GetSystemDefaultLocaleName),
             hle_export!(GetUserDefaultLCID),
@@ -462,6 +622,36 @@ mod tests {
         let n = f(buf.as_mut_ptr(), 128);
         assert!(n > 0);
         String::from_utf16_lossy(&buf[..n as usize - 1])
+    }
+
+    #[test]
+    fn dates_and_times_in_pictures_and_defaults() {
+        let t = SystemTime {
+            year: 2026,
+            month: 11,
+            day_of_week: 0, // ignored: computed
+            day: 4,
+            hour: 15,
+            minute: 7,
+            second: 9,
+            milliseconds: 0,
+        };
+        let null = std::ptr::null();
+        let date = |flags, format: *const u16| text(|out, n| GetDateFormatEx(null, flags, &t, format, out, n, null));
+        let time = |flags, format: *const u16| text(|out, n| GetTimeFormatEx(null, flags, &t, format, out, n));
+        assert_eq!(date(0, null), "11/4/2026");
+        assert_eq!(date(2, null), "Wednesday, November 4, 2026");
+        let f = w("ddd dd MMM yy 'o''clock' ''");
+        assert_eq!(date(0, f.as_ptr()), "Wed 04 Nov 26 o'clock '");
+        assert_eq!(time(0, null), "3:07:09 PM");
+        assert_eq!(time(8 | 2, null), "15:07");
+        let f = w("HH'h'mm t");
+        assert_eq!(time(0, f.as_ptr()), "15h07 P");
+        let bad = SystemTime { month: 13, ..t };
+        assert_eq!(GetDateFormatEx(null, 0, &bad, null, std::ptr::null_mut(), 0, null), 0);
+        assert_eq!(last_error(), ERROR_INVALID_PARAMETER);
+        // Now, when no time is given.
+        assert!(GetTimeFormatEx(null, 0, std::ptr::null(), null, std::ptr::null_mut(), 0) > 0);
     }
 
     #[test]

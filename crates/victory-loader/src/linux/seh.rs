@@ -44,6 +44,11 @@ pub fn name_image(base: usize, name: &str) {
     unwind::name_image(base, name);
 }
 
+/// The base of the registered image holding `address`.
+pub fn image_base(address: usize) -> Option<usize> {
+    unwind::image_of(address).map(|(base, _)| base)
+}
+
 /// `module+rva` of a registered image, or the bare address.
 pub fn locate(address: usize) -> String {
     match unwind::image_of(address) {
