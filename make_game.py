@@ -73,6 +73,7 @@ from mc_command import mc_command  # noqa: E402
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
+from stale_build import newer_sources  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -900,12 +901,16 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
              "Free some space or choose another drive with --work." + hint)
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         cross_configure()
-    if "pipelines" in stages and os.name != "nt" and not pipeline_check_exe():
-        build_pipeline_check(jobs)
-        if not pipeline_check_exe():
-            fail("vk_pipeline_check built, but not as runtime/build/linux/vk_pipeline_check (a multi-config "
-                 "generator puts it in a subfolder): unset CMAKE_GENERATOR if it names one, delete "
-                 "runtime/build/linux and run the build again.")
+    if "pipelines" in stages and os.name != "nt":
+        checker = pipeline_check_exe()
+        # A checker built before a pull is rebuilt too; cmake --build only recompiles what changed. Without CMake
+        # the pipelines stage says it is out of date and uses it.
+        if not checker or (stale_checker(checker) and shutil.which("cmake")):
+            build_pipeline_check(jobs)
+            if not pipeline_check_exe():
+                fail("vk_pipeline_check built, but not as runtime/build/linux/vk_pipeline_check (a multi-config "
+                     "generator puts it in a subfolder): unset CMAKE_GENERATOR if it names one, delete "
+                     "runtime/build/linux and run the build again.")
     if "assets" in stages:
         ensure_submodule()
 
@@ -1318,6 +1323,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     verify_translation_completeness(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
+    library_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
 
@@ -1392,14 +1398,83 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
     py("fspx_unpack.py", dll, "--out", unpacked, "--disasm")
     extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
     py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", *extra)
-    clash = fspx_key_clash(spirv)
-    if clash:
-        drop(translated)   # the runtime must not load an index whose keys pick between different modules
-        fail(f"shaders: FSPX programs {clash[0]} and {clash[1]} have the same kind-6 and kind-0 bytes "
-             "(fspx_code_sha256 and fspx_state_sha256) but different translated modules, so the runtime could not "
-             "tell which one a pipeline means (docs/fspx.md, \"Build and run-time lookup\")")
+    verify_fspx_key_clash(spirv, translated, "FSPX")
     with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
         f.write(settings + "\n")
+
+
+LIBRARY_ARCHIVE = "shaders.rpf"
+LIBRARY_TOOLS = ("shader_library.py", "fspx_unpack.py", "shader_disasm.py")  # with TRANSLATION_SOURCES
+
+
+def library_settings(archive: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
+    """What the pipeline library's compute translations depend on, as one line: shaders.rpf, the unpacking and
+    translating tools, llvm-mc, the wave64 mode and the fallback flags."""
+    return json.dumps({"archive": file_sha256(archive), "tools": sources_digest(TOOLS, LIBRARY_TOOLS),
+                       "translator": translation_sources_digest(), "llvm_mc": mc_signature,
+                       "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)}, sort_keys=True)
+
+
+def library_shaders(game: str, work: str, mc_signature: str, jobs: int, emulate: bool = False,
+                    fallbacks: tuple[str, ...] = ()) -> None:
+    """The compute pipelines of the pipeline library in shaders.rpf (docs/shader_library.md). The executable reads
+    the library through DirectStorage and creates each compute pipeline with Xbox device slot 67
+    (DeserializeComputePipelineStateX), passing the record's four parts as FSPX kinds 0, 1, 6 and 7 (docs/fspx.md).
+    tools/shader_library.py unpacks the compute programs with their kind-0 state into <work>/shaders/library, and
+    translate() runs rdna2spirv.py across jobs processes into <work>/shaders/spirv/library, where the runtime's
+    shader library finds them by fspx_code_sha256 and fspx_state_sha256 as it finds the FidelityFX DLL's. Graphics
+    pipelines are not translated here. The game's own shaders neither feed nor depend on this step, apart from the
+    carve that names each program's source container (the translator reads its signatures).
+
+    The step runs whole. Reuse requires the translation index, its named modules and a matching library_build.json
+    (library_settings)."""
+    archive = os.path.join(game, LIBRARY_ARCHIVE)
+    unpacked = os.path.join(work, "shaders", "library")
+    spirv = os.path.join(work, "shaders", "spirv", "library")
+    translated = os.path.join(spirv, "index.json")
+    shard_plan = os.path.join(spirv, SHARD_PLAN)
+    settings_file = os.path.join(spirv, "library_build.json")
+    if not os.path.isfile(archive):
+        drop(translated, settings_file, shard_plan)
+        log(f"shaders: no {LIBRARY_ARCHIVE} in the game folder, so no pipeline library to translate")
+        return
+    settings = library_settings(archive, mc_signature, emulate, fallbacks)
+    if read_shader_setting(settings_file) == settings and fspx_cache_complete(spirv):
+        return
+    log(f"shaders: unpacking and translating the compute pipelines of the pipeline library in {LIBRARY_ARCHIVE}")
+    drop(translated, settings_file, shard_plan)
+    # A program that no longer translates or lost its carve container must not keep outputs from the run before.
+    for folder, suffixes in ((unpacked, (".dxbc",)),
+                             (os.path.join(unpacked, "fspx"), (".code", ".state", ".json")),
+                             (os.path.join(unpacked, "disasm"), (".s",)),
+                             (spirv, (".spv", ".spvasm"))):
+        if os.path.isdir(folder):
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
+                        os.unlink(entry.path)
+    carve = os.path.join(work, "shaders", "dxbc")
+    py("shader_library.py", archive, "--out", unpacked, "--stages", "cs", "--disasm", "--jobs", str(jobs),
+       *(["--carve", carve] if os.path.isdir(carve) else []))
+    translate(os.path.join(unpacked, "disasm"), spirv, jobs, emulate=emulate, fallbacks=fallbacks)
+    verify_fspx_key_clash(spirv, translated, "pipeline library")
+    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write(settings + "\n")
+
+
+def verify_fspx_key_clash(spirv: str, translated: str, label: str) -> None:
+    """Reject an unreadable translation index or one whose kind-6 and kind-0 keys pick between different modules."""
+    try:
+        clash = fspx_key_clash(spirv)
+    except (OSError, ValueError, TypeError) as error:
+        drop(translated)
+        fail(f"shaders: {label} translation wrote an unreadable index "
+             f"({getattr(error, 'strerror', None) or error}); run the shaders stage again")
+    if clash:
+        drop(translated)   # the runtime must not load an index whose keys pick between different modules
+        fail(f"shaders: {label} programs {clash[0]} and {clash[1]} have the same kind-6 and kind-0 bytes "
+             "(fspx_code_sha256 and fspx_state_sha256) but different translated modules, so the runtime could not "
+             "tell which one a pipeline means (docs/fspx.md, \"Build and run-time lookup\")")
 
 
 def fspx_key_clash(spirv: str):
@@ -1408,6 +1483,8 @@ def fspx_key_clash(spirv: str):
     picks by both keys when the bytecode carries kind 0, and refuses a bare kind-6 program whose modules differ."""
     with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
         index = json.load(f)
+    if not isinstance(index, dict):
+        raise ValueError("index.json must contain a JSON object")
     first = {}
     for name in sorted(index):
         meta = index[name]
@@ -2369,6 +2446,18 @@ def pipeline_check_exe(runtime_build: str | None = None) -> str | None:
     return next((p for p in found if os.path.isfile(p) and (windows or os.access(p, os.X_OK))), None)
 
 
+def stale_checker(exe: str) -> list:
+    """The sources of vk_pipeline_check changed after `exe` was built, when `exe` is in this checkout's runtime/build.
+    A checker from elsewhere (--runtime-build) isn't compared: its time stamp says nothing about these sources."""
+    build = os.path.abspath(os.path.join(ROOT, "runtime", "build"))
+    try:
+        if os.path.commonpath([build, os.path.abspath(exe)]) != build:
+            return []
+    except ValueError:   # another drive
+        return []
+    return newer_sources(exe, ROOT, "vk_pipeline_check")
+
+
 def require_translated_shaders(work: str) -> str:
     spirv = os.path.join(work, "shaders", "spirv")
     index = os.path.join(spirv, "index.json")
@@ -2394,6 +2483,13 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         fail("vk_pipeline_check wasn't built. With CMake 3.24+, a C++20 compiler and the Vulkan headers and "
              "loader installed, run: cmake -S runtime -B runtime/build/linux && "
              "cmake --build runtime/build/linux --parallel")
+    newer = stale_checker(exe)
+    if newer:
+        rebuild = ("run the runtime stage with VULKAN_SDK set" if os.name == "nt" else
+                   "cmake --build runtime/build/linux --target vk_pipeline_check")
+        more = f" and {len(newer) - 3} more" if len(newer) > 3 else ""
+        log(f"pipelines: WARNING: {exe} is older than {', '.join(newer[:3])}{more}, so it is not this checkout's "
+            f"checker; to rebuild it, {rebuild}")
     spirv = require_translated_shaders(work)
     log("pipelines: creating every shader module and pipeline (compute and graphics) on this GPU")
     os.makedirs(out, exist_ok=True)

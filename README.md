@@ -20,7 +20,7 @@
   <a href="#want-to-help">Want to help?</a> |
   <a href="#credits">Credits</a> |
   <a href="#license">License</a> |
-  <a href="https://discord.gg/qSweusNuVP">Discord</a>
+  <a href="https://discord.gg/gKahTPWWF4">Discord</a>
 </p>
 
 Leonida is a static recompilation project. The Xbox Series CPU is x86-64 like a PC, so the game's code is loaded
@@ -39,7 +39,7 @@ happens **on your PC, from your own copy of the game**.
 > author has left the project, and development continues here with its full commit history. Credit for the work up to
 > that point belongs to NotRexed and the contributors listed in the history.
 
-Discord: https://discord.gg/qSweusNuVP
+Discord: https://discord.gg/gKahTPWWF4
 
 Original author's Git Mirror: https://git.notrexed.dev/notrexed/Leonida
 <br>
