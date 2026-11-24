@@ -1202,4 +1202,102 @@ mod tests {
             }
         }
     }
+
+    /// A bare record header (NUL, kind, `n`, no name) with its marker.
+    fn bare_record(nul: u8, kind: u8, payload: &[u8]) -> Vec<u8> {
+        let packed = miniz_oxide::deflate::compress_to_vec(payload, 6);
+        let n = (packed.len() + 12) as u32;
+        let mut out = vec![nul, kind];
+        out.extend_from_slice(&n.to_le_bytes());
+        for v in [0x000D_DCE7, n, payload.len() as u32] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&packed);
+        out
+    }
+
+    #[test]
+    fn header_right_after_the_magic_is_a_record() {
+        // The header's 6 bytes start at the magic's end: the earliest
+        // marker the search reads. Nothing before them reads as a name.
+        let mut file = MAGIC.to_vec();
+        file.extend(bare_record(0, 0x3c, b"compute"));
+        let found: Vec<_> = records(&file).collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].offset, MAGIC.len() + 6);
+        assert_eq!(found[0].name, None);
+        assert_eq!(found[0].kind, 0x3c);
+        assert_eq!(found[0].unpack().as_deref(), Some(&b"compute"[..]));
+    }
+
+    #[test]
+    fn header_reaching_into_the_magic_is_not_a_record() {
+        // One header byte short: its NUL would be the magic's last byte, so
+        // the marker (one byte earlier than the earliest) is not looked at,
+        // whatever the sizes say. A real record after it is still found.
+        let mut file = MAGIC.to_vec();
+        let mut cut = bare_record(0, 0x32, b"inside the magic");
+        cut.remove(0);
+        file.extend(&cut);
+        assert_eq!(records(&file).count(), 0);
+        file.extend(record_bytes("PS_after", 0x32, b"after"));
+        let names: Vec<_> = records(&file).map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_after")]);
+    }
+
+    #[test]
+    fn record_without_a_nul_before_its_kind_has_no_name() {
+        // The NUL is not checked to find a record, only to read its name.
+        for nul in [0x01, 0x41, 0xFF] {
+            let mut file = MAGIC.to_vec();
+            file.extend_from_slice(b"\x05PS_x");
+            file.extend(bare_record(nul, 0x32, b"no name"));
+            let found: Vec<_> = records(&file).collect();
+            assert_eq!(found.len(), 1, "nul {nul:#x}");
+            assert_eq!(found[0].name, None, "nul {nul:#x}");
+            assert_eq!(found[0].unpack().as_deref(), Some(&b"no name"[..]));
+        }
+    }
+
+    #[test]
+    fn header_right_after_a_record_is_a_record_and_one_byte_earlier_is_not() {
+        // Back to back: the next header starts where the packed bytes end.
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("PS_first", 0x32, b"first"));
+        let end = file.len();
+        let mut back_to_back = file.clone();
+        back_to_back.extend(bare_record(0, 0x41, b"second"));
+        let found: Vec<_> = records(&back_to_back).collect();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].span().end, end);
+        assert_eq!(found[1].offset, end + 6);
+        assert_eq!(found[1].kind, 0x41);
+        assert_eq!(found[1].unpack().as_deref(), Some(&b"second"[..]));
+
+        // Its NUL laid over the first record's last packed byte: that byte
+        // is the first record's, so the second is not read.
+        let mut overlap = file.clone();
+        let mut second = bare_record(0, 0x41, b"second");
+        second.remove(0);
+        overlap.extend(&second);
+        let names: Vec<_> = records(&overlap).map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_first")]);
+    }
+
+    #[test]
+    fn record_stating_no_packed_bytes_is_not_a_record() {
+        // `n` of 12 (header only) and 13 hold fewer packed bytes than the
+        // smallest deflate stream, even for an empty container.
+        for n in [12_u32, 13] {
+            let mut file = MAGIC.to_vec();
+            file.extend_from_slice(b"\x05PS_e\0\x32");
+            for v in [n, 0x000D_DCE7, n, 0] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            file.extend_from_slice(&[0x03, 0x00][..(n - 12) as usize]);
+            file.extend(record_bytes("PS_after", 0x32, b"after"));
+            let names: Vec<_> = records(&file).map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_after")], "n {n}");
+        }
+    }
 }
