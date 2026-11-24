@@ -24,6 +24,10 @@ env:
   LINUX_CRATES: >-
     -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
     -p victory-game -p victory-loader -p xtask
+  # Crates that are clippy-clean for the Windows target today.
+  WINDOWS_CLIPPY_CRATES: >-
+    -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
+    -p victory-game -p victory-loader -p victory-shader
 
 jobs:
   linux:
@@ -64,3 +68,36 @@ jobs:
           --skip prepare::tests::patches_own_test_binary
           --skip prepare::tests::keeps_iat_slots_when_import_size_excludes_the_terminator
           --skip prepare::tests::file_name_is_stable_per_build
+
+  # Type-checks the Windows build from Linux: no MSVC, no linking, nothing runs.
+  # Catches compile errors in cfg(windows) code (most of victory-gpu,
+  # victory-hle and apps/victory, and the Windows-only tests) that the job
+  # above never compiles.
+  windows-target-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # blake3's build script compiles C/assembly with MSVC tools for this
+      # target. Its build script reads this variable to select the pure-Rust
+      # implementation; nothing is linked here, so the choice has no effect.
+      CARGO_FEATURE_PURE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml already lists the x86_64-pc-windows-msvc target.
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-target
+
+      - name: cargo check (workspace, all targets)
+        run: cargo check --locked --workspace --all-targets --target x86_64-pc-windows-msvc
+
+      # victory-gpu, victory-hle and apps/victory are not clippy-clean for
+      # Windows yet; add them here once they are.
+      - name: clippy (Windows target, clean crates)
+        run: >
+          cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc
+          $WINDOWS_CLIPPY_CRATES -- -D warnings

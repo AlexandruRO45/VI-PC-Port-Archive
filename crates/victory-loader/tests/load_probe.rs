@@ -41,8 +41,18 @@ fn under_wine() -> bool {
 /// `cargo xwin build --manifest-path tests/fixtures/hle-probe/Cargo.toml
 /// --target x86_64-pc-windows-msvc` and its path in `VICTORY_HLE_PROBE_DLL`.
 fn probe_dll() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(PREBUILT_PROBE) {
-        return Some(PathBuf::from(path));
+    if let Some(path) = std::env::var_os(PREBUILT_PROBE).filter(|p| !p.is_empty()) {
+        let path = PathBuf::from(path);
+        // Under Wine a bare Unix path (`/home/...`) resolves against the
+        // current drive and silently misses; fail with the fix instead of a
+        // bare "not found" from the read below.
+        assert!(
+            path.is_file(),
+            "{PREBUILT_PROBE}={} is not a file; under Wine use its Windows \
+             path, e.g. Z:/home/you/VIctory/target/fixtures/.../hle_probe.dll",
+            path.display()
+        );
+        return Some(path);
     }
     if under_wine() {
         eprintln!(
