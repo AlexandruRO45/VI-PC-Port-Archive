@@ -321,24 +321,30 @@ fn dxil_wave_lanes(dxil: &[u8]) -> Option<(u32, u32)> {
 ///
 /// - If the emitted DXIL module declares a `PSV0` wave-lane range (e.g.
 ///   `WaveSize(64)` or `WaveSize(32)`), it is refused whenever the host's
-///   `[min, max]` range does not overlap it. This lets per-lane or split
-///   wave64 compute translations (declaring `WaveSize(32)` or unconstrained)
-///   run on 32-lane hosts while still refusing modules that require 64 lanes
-///   (and refusing 32/64-lane modules on 4-lane WARP).
-/// - Console `wave64` mesh programs do not carry `PSV0` `WaveSize(64)`
-///   metadata, so they are refused whenever `host_lanes.1 < 64`.
-/// - Vertex and pixel programs run per lane and are kept unless their emitted
-///   DXIL explicitly requires an unsupported wave size.
+///   `[min, max]` range does not overlap it (and on `< 64`-lane hosts, a
+///   console `wave64` mesh/compute shader is only allowed when `PSV0`
+///   explicitly bounds `req_max <= host_max`, such as split `WaveSize(32)`
+///   emulation).
+/// - Console `wave64` mesh and compute programs whose emitted DXIL declares no
+///   `PSV0` wave-lane range are refused whenever `host_lanes.1 < 64`: some
+///   console `wave64` compute programs still assume 64-lane wave semantics
+///   even without `WaveSize(64)` metadata and hang 32-lane hosts.
+/// - Wave32 compute and vertex/pixel programs run per lane and are kept unless
+///   their emitted DXIL explicitly requires an unsupported wave size.
 fn wave_lanes_unsupported(
     stage: &str,
     console_wave64: bool,
     emitted_wave: Option<(u32, u32)>,
     (host_min, host_max): (u32, u32),
 ) -> bool {
+    let wave64_stage = matches!(stage, "mesh" | "compute") && console_wave64;
     if let Some((req_min, req_max)) = emitted_wave {
-        return host_max < req_min || host_min > req_max;
+        if host_max < req_min || host_min > req_max {
+            return true;
+        }
+        return wave64_stage && host_max < 64 && req_max > host_max;
     }
-    stage == "mesh" && console_wave64 && host_max < 64
+    wave64_stage && host_max < 64
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -958,13 +964,19 @@ mod tests {
             (32, 64)
         ));
 
-        // Wave64 compute lowered to WaveSize(32) (e.g. split emulation) or per-lane
-        // (no WaveSize) runs on 32-lane hosts; WaveSize(32) is still refused on 4-lane WARP.
+        // Wave64 compute lowered to WaveSize(32) (e.g. split emulation) runs on
+        // 32-lane and 32..=64-lane hosts, and is still refused on 4-lane WARP.
         assert!(!wave_lanes_unsupported(
             "compute",
             true,
             Some((32, 32)),
             (32, 32)
+        ));
+        assert!(!wave_lanes_unsupported(
+            "compute",
+            true,
+            Some((32, 32)),
+            (32, 64)
         ));
         assert!(wave_lanes_unsupported(
             "compute",
@@ -972,8 +984,22 @@ mod tests {
             Some((32, 32)),
             (4, 4)
         ));
-        assert!(!wave_lanes_unsupported("compute", true, None, (32, 32)));
-        assert!(!wave_lanes_unsupported("compute", true, None, (4, 4)));
+
+        // Console wave64 compute with no PSV0 wave-lane range (or an upper
+        // bound wider than the host) is refused on <64-lane hosts, and allowed
+        // on 64-lane hosts; console wave32 compute without PSV0 runs everywhere.
+        assert!(wave_lanes_unsupported("compute", true, None, (32, 32)));
+        assert!(wave_lanes_unsupported("compute", true, None, (4, 4)));
+        assert!(wave_lanes_unsupported(
+            "compute",
+            true,
+            Some((32, 64)),
+            (32, 32)
+        ));
+        assert!(!wave_lanes_unsupported("compute", true, None, (32, 64)));
+        assert!(!wave_lanes_unsupported("compute", true, None, (64, 64)));
+        assert!(!wave_lanes_unsupported("compute", false, None, (32, 32)));
+        assert!(!wave_lanes_unsupported("compute", false, None, (4, 4)));
 
         // Console wave64 mesh has no PSV0 WaveSize metadata and still needs 64-lane hosts.
         assert!(wave_lanes_unsupported("mesh", true, None, (32, 32)));
