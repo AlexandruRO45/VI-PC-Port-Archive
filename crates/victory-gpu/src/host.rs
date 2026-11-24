@@ -1375,6 +1375,8 @@ pub(crate) fn test_submission_copy_bytes() -> u64 {
     PREPARING[1].load(Ordering::Relaxed)
 }
 
+type ShadowReadRanges = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+
 /// Refresh live mirrored SRVs after deferred title writes and before
 /// GPU work. Retain the resources until the submission has finished.
 /// Brings host copies' ready ranges up to date. Ranges of several copies
@@ -1382,7 +1384,7 @@ pub(crate) fn test_submission_copy_bytes() -> u64 {
 /// small title buffers placed side by side) share one question for written
 /// pages; the rest goes through each copy's own grouping
 /// (`Shadow::update_ready`).
-fn refresh_across(per: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)]) -> usize {
+fn refresh_across(per: &[ShadowReadRanges]) -> usize {
     use crate::watch::PAGE;
     const SPAN_GAP: usize = 1 << 20;
     #[cfg(feature = "diagnostics")]
@@ -1490,7 +1492,7 @@ fn refresh_direct_srvs(
         let mut current: Option<&Arc<crate::shadow::Shadow>> = None;
         let mut uncovered = Vec::new();
         // Each copy's ready ranges, refreshed together below.
-        let mut per: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        let mut per: Vec<ShadowReadRanges> = Vec::new();
         #[cfg(feature = "diagnostics")]
         let (mut requested, mut visits, mut remaining) = (0usize, 0u64, 0usize);
         visit_direct_ranges(snapshots, |shadow, from, to| {
