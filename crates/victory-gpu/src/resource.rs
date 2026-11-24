@@ -2015,6 +2015,43 @@ mod tests {
         };
         copy(list, &d16s8_loc, 0, 0, 0, &tex_loc, std::ptr::null());
 
+        let committed = |desc: &ResourceDesc| {
+            let mut resource = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, desc, 0, null.cast(), iid, &mut resource),
+                S_OK
+            );
+            resource
+        };
+        let read_back = |source| {
+            let output = committed(&buffer(1024));
+            let from = Location { resource: source, kind: 0, footprint: full_rows };
+            let to = Location { resource: output, kind: 1, footprint: full_rows };
+            copy(list, &to, 0, 0, 0, &from, std::ptr::null());
+            output
+        };
+        let cpu_desc = ResourceDesc { layout: 1, ..tex_desc };
+        let cpu_source = committed(&cpu_desc);
+        let (cpu_data, _) = texture_memory(cpu_source).unwrap();
+        let cpu_size = texture_layout(&cpu_desc).unwrap().size;
+        // SAFETY: the committed linear texture owns its complete layout.
+        unsafe { cpu_data.cast_mut().write_bytes(0x5a, cpu_size as usize) };
+        let cpu_result = read_back(cpu_source);
+
+        let target_desc = ResourceDesc {
+            flags: 1, // ALLOW_RENDER_TARGET
+            ..cpu_desc
+        };
+        let target = committed(&target_desc);
+        let mut descriptor = [0u64; 16];
+        let handle = descriptor.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(null, target, null.cast(), handle);
+        let clear_color = [1.0, 0.0, 1.0, 1.0];
+        type ClearRtv =
+            extern "system" fn(This, u64, *const [f32; 4], u32, *const crate::list::Rect);
+        slot::<ClearRtv>(list, 0x1a0)(list, handle, &clear_color, 0, std::ptr::null());
+        let target_result = read_back(target);
+
         assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
 
@@ -2076,6 +2113,28 @@ mod tests {
                     );
                 }
             }
+        }
+
+        for (output, expected, label) in [
+            (cpu_result, [0x5a; 4], "CPU-written linear texture"),
+            (target_result, [255, 0, 255, 255], "GPU-cleared linear render target"),
+        ] {
+            let (data, len) = buffer_bytes(output).unwrap();
+            // SAFETY: the queue submission completed and this buffer is live.
+            let pixels = unsafe { std::slice::from_raw_parts(data, len as usize) };
+            for y in 0..4 {
+                for x in 0..4 {
+                    let at = y * 256 + x * 4;
+                    assert_eq!(
+                        &pixels[at..at + 4],
+                        expected.as_slice(),
+                        "{label} pixel ({x}, {y})"
+                    );
+                }
+            }
+        }
+        for resource in [cpu_source, cpu_result, target, target_result] {
+            assert_eq!(slot::<Release>(resource, 0x10)(resource), 0);
         }
     }
 
