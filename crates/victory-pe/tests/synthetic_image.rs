@@ -2099,3 +2099,115 @@ fn dll_characteristic_flags_are_distinct_single_bits() {
     put16(&mut d, OPT + layout::OPT_DLL_CHARACTERISTICS, seen);
     assert_eq!(ImageInfo::parse(&d).unwrap().dll_characteristics, seen);
 }
+
+#[test]
+fn each_flag_directory_sets_only_its_own_flag() {
+    // The three presence flags come from three separate directory slots;
+    // filling one slot does not report the other two.
+    let flags = |info: &ImageInfo| {
+        (
+            info.has_relocations,
+            info.has_exception_table,
+            info.has_load_config,
+        )
+    };
+    for (index, expected) in [
+        (dir::BASERELOC, (true, false, false)),
+        (dir::EXCEPTION, (false, true, false)),
+        (dir::LOAD_CONFIG, (false, false, true)),
+    ] {
+        let mut d = image();
+        set_directory(&mut d, index, 0x1380, 12);
+        let info = ImageInfo::parse(&d).unwrap();
+        assert_eq!(flags(&info), expected, "directory {index}");
+    }
+    // The neighbouring slots that are not flags (bound imports, the IAT)
+    // report none of them.
+    for index in [dir::BOUND_IMPORT, dir::IAT] {
+        let mut d = image();
+        set_directory(&mut d, index, 0x1380, 12);
+        let info = ImageInfo::parse(&d).unwrap();
+        assert_eq!(flags(&info), (false, false, false), "directory {index}");
+    }
+}
+
+#[test]
+fn overlapping_sections_map_through_the_first_one_in_the_table() {
+    // Section headers are untrusted and may overlap. The lookup takes the
+    // first section in table order that holds the RVA, so reordering the
+    // table changes the answer but never makes it ambiguous.
+    use victory_pe::SectionInfo;
+    let mut info = ImageInfo::parse(&image()).unwrap();
+    let shadow = SectionInfo {
+        name: ".shadow".into(),
+        rva: SECTION_RVA + 0x100,
+        virtual_size: 0x100,
+        file_offset: 0x8000,
+        file_size: 0x100,
+        characteristics: 0,
+    };
+    info.sections.push(shadow.clone());
+    let inside = SECTION_RVA + 0x180;
+    assert_eq!(info.rva_to_file_offset(inside), Some(at(inside) as u32));
+
+    info.sections.reverse();
+    assert_eq!(info.rva_to_file_offset(inside), Some(0x8080));
+    // Outside the shadow, the original section still answers.
+    assert_eq!(
+        info.rva_to_file_offset(SECTION_RVA),
+        Some(SECTION_FILE_OFFSET)
+    );
+    assert_eq!(
+        info.rva_to_file_offset(SECTION_RVA + 0x200),
+        Some(at(SECTION_RVA + 0x200) as u32)
+    );
+}
+
+#[test]
+fn a_section_below_the_rva_does_not_wrap_around() {
+    // An RVA below a section's start is not inside it, even when the
+    // subtraction would wrap to a small offset in unsigned arithmetic.
+    let info = ImageInfo::parse(&image()).unwrap();
+    for rva in [0, 1, SECTION_RVA - 1, SECTION_FILE_OFFSET] {
+        assert_eq!(info.rva_to_file_offset(rva), None, "{rva:#x}");
+    }
+}
+
+#[test]
+fn only_exact_subsystem_values_have_names() {
+    use layout::subsystem::*;
+    // Values next to the named ones, and the known ones with high bits set,
+    // are all "other": the name is a lookup, not a mask.
+    for value in [
+        0,
+        WINDOWS_GUI - 1,
+        WINDOWS_CUI + 1,
+        XBOX - 1,
+        XBOX + 1,
+        XBOX_CODE_CATALOG + 1,
+        WINDOWS_GUI | 0x100,
+        XBOX | 0x8000,
+        u16::MAX,
+    ] {
+        let mut d = image();
+        put16(&mut d, OPT + 68, value);
+        let info = ImageInfo::parse(&d).unwrap();
+        assert_eq!(info.subsystem, value);
+        assert_eq!(info.subsystem_name(), "other", "{value:#x}");
+    }
+}
+
+#[test]
+fn the_dll_bit_alone_decides_is_dll() {
+    use layout::file_flags::DLL;
+    let mut info = ImageInfo::parse(&image()).unwrap();
+    for (characteristics, dll) in [
+        (DLL, true),
+        (u16::MAX, true),
+        (!DLL, false),
+        (0, false),
+    ] {
+        info.characteristics = characteristics;
+        assert_eq!(info.is_dll(), dll, "{characteristics:#x}");
+    }
+}
