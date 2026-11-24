@@ -572,6 +572,14 @@ impl Shader {
         h
     }
 
+    /// Refactoring lets the host fuse a multiply and an add the console
+    /// rounds apart (NVIDIA does); only `FMad` needs it, to fuse at all.
+    pub(crate) fn settle_flags(&mut self) {
+        if !self.fused {
+            self.flags |= flags::NO_REFACTORING;
+        }
+    }
+
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
@@ -845,11 +853,7 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
-        // Refactoring lets the host fuse a multiply and an add the console
-        // rounds apart (NVIDIA does); only `FMad` needs it, to fuse at all.
-        if !self.fused {
-            self.flags |= flags::NO_REFACTORING;
-        }
+        self.settle_flags();
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
