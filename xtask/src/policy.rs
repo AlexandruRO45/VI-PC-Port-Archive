@@ -147,7 +147,14 @@ fn read(root: &Path, file: &File) -> Result<Option<Vec<u8>>, String> {
                 return Ok(Some(link_bytes(&target)));
             }
             if kind.is_dir() {
-                return Err("a directory tracked as a file (a submodule?)".to_owned());
+                // `git ls-files --others` lists an untracked repository
+                // inside this one as its directory, with a trailing `/`.
+                return Err(if file.name.ends_with('/') {
+                    "a git repository nested in this one: its files bypass this check"
+                } else {
+                    "a directory tracked as a file (a submodule?)"
+                }
+                .to_owned());
             }
             if !kind.is_file() {
                 // A FIFO or device: reading it could block or never end.
@@ -756,6 +763,25 @@ mod tests {
 
     /// Git's own settings can hide a submodule from `git diff`; the staged
     /// check must see it anyway.
+    /// An untracked repository inside the checkout is listed as one
+    /// directory; it is refused as what it is, not as a tracked directory.
+    #[cfg(unix)]
+    #[test]
+    fn nested_repositories_are_violations() {
+        let tmp = tempdir();
+        let root = tmp.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::create_dir(root.join("inner")).unwrap();
+        git_str(&root.join("inner"), &["init", "-q"]);
+        std::fs::write(root.join("inner/a.rs"), b"fn a() {}\n").unwrap();
+
+        assert_eq!(names(root, false), ["inner/"]);
+        let files = super::list_files(root, false).unwrap();
+        let problem = super::read(root, &files[0]).unwrap_err();
+        assert!(problem.contains("nested"), "{problem}");
+        assert!(super::run(root, false).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn staged_submodules_are_seen_whatever_git_ignores() {
