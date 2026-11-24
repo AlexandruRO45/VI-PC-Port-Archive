@@ -18,6 +18,10 @@ ApplicationWindow {
     readonly property color paper: "#f2eee8"
     readonly property color muted: "#a09b94"
     readonly property color accent: "#d83b4f"
+    readonly property color iris: "#6257e8"
+    readonly property color orchid: "#a445c4"
+    readonly property color coral: "#e05c68"
+    readonly property color sky: "#2b91ad"
     readonly property color surface: "#c715171b"
     readonly property color edge: "#2a2d32"
 
@@ -65,7 +69,12 @@ ApplicationWindow {
             Rectangle {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 70
-                color: "#cc0f1114"
+                gradient: Gradient {
+                    orientation: Gradient.Horizontal
+                    GradientStop { position: 0.0; color: "#eb10121b" }
+                    GradientStop { position: 0.48; color: "#e2181421" }
+                    GradientStop { position: 1.0; color: "#e00e1821" }
+                }
                 border.color: "#25282c"
                 border.width: 1
                 RowLayout {
@@ -80,8 +89,12 @@ ApplicationWindow {
                             width: 36
                             height: 36
                             radius: 9
-                            color: "#282026"
-                            border.color: "#4b3039"
+                            gradient: Gradient {
+                                orientation: Gradient.Horizontal
+                                GradientStop { position: 0.0; color: window.iris }
+                                GradientStop { position: 1.0; color: window.coral }
+                            }
+                            border.color: "#8f798e"
                             border.width: 1
                             Text {
                                 anchors.centerIn: parent
@@ -123,7 +136,11 @@ ApplicationWindow {
                                 Layout.preferredWidth: 94
                                 Layout.preferredHeight: 40
                                 radius: 7
-                                color: window.pageIndex === modelData.page ? "#242025" : topNavMouse.containsMouse ? "#191b1f" : "transparent"
+                                gradient: Gradient {
+                                    orientation: Gradient.Horizontal
+                                    GradientStop { position: 0.0; color: window.pageIndex === modelData.page ? "#9a6257e8" : topNavMouse.containsMouse ? "#311f2534" : "transparent" }
+                                    GradientStop { position: 1.0; color: window.pageIndex === modelData.page ? "#8ce05c68" : topNavMouse.containsMouse ? "#311f2534" : "transparent" }
+                                }
                                 Text {
                                     anchors.centerIn: parent
                                     text: modelData.label
@@ -254,10 +271,14 @@ ApplicationWindow {
                             Rectangle {
                                 id: featureCard
                                 Layout.fillWidth: true
-                                Layout.preferredHeight: 560
+                                Layout.preferredHeight: 500
                                 radius: 12
-                                color: "#d917191d"
-                                border.color: "#33363a"
+                                gradient: Gradient {
+                                    orientation: Gradient.Horizontal
+                                    GradientStop { position: 0.0; color: "#d3151b2c" }
+                                    GradientStop { position: 1.0; color: "#e01b1620" }
+                                }
+                                border.color: "#5b414d"
                                 border.width: 1
                                 clip: true
 
@@ -339,7 +360,10 @@ ApplicationWindow {
                                         Layout.fillWidth: true
                                         Layout.preferredWidth: featureCard.width * 0.5
                                         Layout.minimumWidth: 270
-                                        color: "#d917191d"
+                                        gradient: Gradient {
+                                            GradientStop { position: 0.0; color: "#e01a1725" }
+                                            GradientStop { position: 1.0; color: "#e00d1a20" }
+                                        }
                                         ColumnLayout {
                                             width: Math.min(parent.width - 72, 560)
                                             anchors.centerIn: parent
@@ -402,7 +426,12 @@ ApplicationWindow {
                                                 Layout.topMargin: 11
                                                 Layout.preferredHeight: 51
                                                 radius: 8
-                                                color: playMouse.containsMouse ? "#e34b5c" : window.accent
+                                                gradient: Gradient {
+                                                    orientation: Gradient.Horizontal
+                                                    GradientStop { position: 0.0; color: playMouse.containsMouse ? "#8b6b62ef" : window.iris }
+                                                    GradientStop { position: 0.52; color: playMouse.containsMouse ? "#a74f90df" : window.orchid }
+                                                    GradientStop { position: 1.0; color: playMouse.containsMouse ? "#f27b72" : window.coral }
+                                                }
                                                 RowLayout {
                                                     anchors.fill: parent
                                                     anchors.leftMargin: 15
@@ -463,14 +492,17 @@ ApplicationWindow {
 
                             RowLayout {
                                 Layout.fillWidth: true
-                                Layout.preferredHeight: 174
+                                Layout.preferredHeight: 150
                                 spacing: 12
 
                                 Rectangle {
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
                                     radius: 12
-                                    color: window.surface
+                                    gradient: Gradient {
+                                        GradientStop { position: 0.0; color: "#db211e30" }
+                                        GradientStop { position: 1.0; color: "#de151b22" }
+                                    }
                                     border.color: window.edge
                                     border.width: 1
                                     ColumnLayout {
@@ -531,7 +563,10 @@ ApplicationWindow {
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
                                     radius: 12
-                                    color: window.surface
+                                    gradient: Gradient {
+                                        GradientStop { position: 0.0; color: "#db221a2d" }
+                                        GradientStop { position: 1.0; color: "#de17191f" }
+                                    }
                                     border.color: window.edge
                                     border.width: 1
                                     ColumnLayout {
@@ -562,7 +597,11 @@ ApplicationWindow {
                                                     Layout.fillWidth: true
                                                     Layout.preferredHeight: 32
                                                     radius: 6
-                                                    color: launcher.consoleModel === modelData ? "#3c2730" : "#1d2024"
+                                                    gradient: Gradient {
+                                                        orientation: Gradient.Horizontal
+                                                        GradientStop { position: 0.0; color: launcher.consoleModel === modelData ? "#6242a1" : "#25232a" }
+                                                        GradientStop { position: 1.0; color: launcher.consoleModel === modelData ? "#a84f76" : "#1b1d22" }
+                                                    }
                                                     border.color: launcher.consoleModel === modelData ? "#81505c" : "#363a3f"
                                                     border.width: 1
                                                     Text {
@@ -586,7 +625,10 @@ ApplicationWindow {
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
                                     radius: 12
-                                    color: window.surface
+                                    gradient: Gradient {
+                                        GradientStop { position: 0.0; color: "#db1e202e" }
+                                        GradientStop { position: 1.0; color: "#de171923" }
+                                    }
                                     border.color: window.edge
                                     border.width: 1
                                     ColumnLayout {
@@ -631,6 +673,106 @@ ApplicationWindow {
                                                 hoverEnabled: true
                                                 cursorShape: Qt.PointingHandCursor
                                                 onClicked: window.pageIndex = 1
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 24
+                                Layout.topMargin: 1
+                                Text {
+                                    text: "QUICK ACCESS"
+                                    color: "#c3bdc3"
+                                    font.pixelSize: 9
+                                    font.weight: Font.Bold
+                                    font.letterSpacing: 1.6
+                                }
+                                Item { Layout.fillWidth: true }
+                                Text {
+                                    text: "LOCAL TOOLS  ·  THIS PC"
+                                    color: "#85888e"
+                                    font.pixelSize: 8
+                                    font.weight: Font.DemiBold
+                                    font.letterSpacing: 1
+                                }
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 74
+                                spacing: 10
+                                Repeater {
+                                    model: [
+                                        { icon: "↻", label: "Run again", detail: "Last game", action: "run", c1: "#5140b7", c2: "#9c4eb8" },
+                                        { icon: "⌖", label: "Check this PC", detail: "System details", action: "check", c1: "#295aaf", c2: "#5574d5" },
+                                        { icon: "▤", label: "Open data folder", detail: "Saves & logs", action: "data", c1: "#246a83", c2: "#399d9d" },
+                                        { icon: "⌂", label: "Set game folder", detail: "Install location", action: "folder", c1: "#73519f", c2: "#bb578f" },
+                                        { icon: "⌨", label: "Keyboard controls", detail: "Play without pad", action: "controls", c1: "#883f83", c2: "#cf5675" },
+                                        { icon: "◉", label: "Console model", detail: launcher.consoleModel, action: "console", c1: "#9a4c58", c2: "#dd6e66" },
+                                        { icon: "×", label: "Quit launcher", detail: "Close VIctory", action: "quit", c1: "#563650", c2: "#984f71" }
+                                    ]
+                                    delegate: Rectangle {
+                                        required property var modelData
+                                        Layout.fillWidth: true
+                                        Layout.fillHeight: true
+                                        Layout.minimumWidth: 110
+                                        radius: 10
+                                        opacity: modelData.action === "run" && (!launcher.hasGame || !launcher.gameExists || launcher.running) ? 0.55 : 1.0
+                                        gradient: Gradient {
+                                            orientation: Gradient.Horizontal
+                                            GradientStop { position: 0.0; color: actionMouse.containsMouse ? modelData.c1 : Qt.darker(modelData.c1, 1.24) }
+                                            GradientStop { position: 1.0; color: actionMouse.containsMouse ? modelData.c2 : Qt.darker(modelData.c2, 1.32) }
+                                        }
+                                        border.color: actionMouse.containsMouse ? "#bfc2d8" : "#555360"
+                                        border.width: 1
+                                        RowLayout {
+                                            anchors.fill: parent
+                                            anchors.leftMargin: 12
+                                            anchors.rightMargin: 9
+                                            spacing: 9
+                                            Text {
+                                                text: modelData.icon
+                                                color: "#f5eaf1"
+                                                font.pixelSize: 20
+                                                font.weight: Font.Light
+                                            }
+                                            ColumnLayout {
+                                                Layout.fillWidth: true
+                                                spacing: 3
+                                                Text {
+                                                    Layout.fillWidth: true
+                                                    text: modelData.label
+                                                    color: "#fff8f5"
+                                                    font.pixelSize: 10
+                                                    font.weight: Font.DemiBold
+                                                    elide: Text.ElideRight
+                                                }
+                                                Text {
+                                                    Layout.fillWidth: true
+                                                    text: modelData.action === "console" ? launcher.consoleModel : modelData.detail
+                                                    color: "#dfd5e2"
+                                                    font.pixelSize: 8
+                                                    elide: Text.ElideRight
+                                                }
+                                            }
+                                        }
+                                        MouseArea {
+                                            id: actionMouse
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            enabled: modelData.action !== "run" || (launcher.hasGame && launcher.gameExists && !launcher.running)
+                                            onClicked: {
+                                                if (modelData.action === "run") launcher.launch()
+                                                else if (modelData.action === "check") window.pageIndex = 3
+                                                else if (modelData.action === "data") launcher.openDataFolder()
+                                                else if (modelData.action === "folder") launcher.setGameFolder()
+                                                else if (modelData.action === "controls") controlsDialog.open()
+                                                else if (modelData.action === "console") launcher.setConsoleModel(launcher.consoleModel === "Series X" ? "Series S" : "Series X")
+                                                else if (modelData.action === "quit") window.close()
                                             }
                                         }
                                     }
@@ -697,7 +839,10 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             Layout.fillHeight: true
                             radius: 12
-                            color: window.surface
+                            gradient: Gradient {
+                                GradientStop { position: 0.0; color: "#d91c2033" }
+                                GradientStop { position: 1.0; color: "#d9171a20" }
+                            }
                             border.color: window.edge
                             border.width: 1
                             ListView {
@@ -786,7 +931,10 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 Layout.preferredHeight: 104
                                 radius: 12
-                                color: window.surface
+                                gradient: Gradient {
+                                    GradientStop { position: 0.0; color: "#d8211b31" }
+                                    GradientStop { position: 1.0; color: "#d71b1924" }
+                                }
                                 border.color: window.edge
                                 border.width: 1
                                 RowLayout {
@@ -817,7 +965,11 @@ ApplicationWindow {
                                             Layout.preferredWidth: 102
                                             Layout.preferredHeight: 34
                                             radius: 7
-                                            color: launcher.consoleModel === modelData ? "#3c2730" : "#1d2024"
+                                            gradient: Gradient {
+                                                orientation: Gradient.Horizontal
+                                                GradientStop { position: 0.0; color: launcher.consoleModel === modelData ? "#6242a1" : "#25232a" }
+                                                GradientStop { position: 1.0; color: launcher.consoleModel === modelData ? "#a84f76" : "#1b1d22" }
+                                            }
                                             border.color: launcher.consoleModel === modelData ? "#81505c" : "#363a3f"
                                             border.width: 1
                                             Text {
@@ -839,7 +991,10 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 Layout.preferredHeight: 142
                                 radius: 12
-                                color: window.surface
+                                gradient: Gradient {
+                                    GradientStop { position: 0.0; color: "#d71c2940" }
+                                    GradientStop { position: 1.0; color: "#d9171a25" }
+                                }
                                 border.color: window.edge
                                 border.width: 1
                                 ColumnLayout {
@@ -891,7 +1046,10 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 Layout.preferredHeight: 115
                                 radius: 12
-                                color: window.surface
+                                gradient: Gradient {
+                                    GradientStop { position: 0.0; color: "#d824202b" }
+                                    GradientStop { position: 1.0; color: "#d7191922" }
+                                }
                                 border.color: window.edge
                                 border.width: 1
                                 ColumnLayout {
@@ -923,7 +1081,265 @@ ApplicationWindow {
                         }
                     }
                 }
+
+                Item {
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.margins: 34
+                        spacing: 18
+                        RowLayout {
+                            Layout.fillWidth: true
+                            ColumnLayout {
+                                spacing: 4
+                                Text {
+                                    text: "SYSTEM PROFILE  ·  LOCAL DIAGNOSTICS"
+                                    color: "#a99dd1"
+                                    font.pixelSize: 9
+                                    font.weight: Font.Bold
+                                    font.letterSpacing: 1.6
+                                }
+                                Text {
+                                    text: "This PC"
+                                    color: window.paper
+                                    font.family: "Georgia"
+                                    font.pixelSize: 30
+                                }
+                            }
+                            Item { Layout.fillWidth: true }
+                            Rectangle {
+                                Layout.preferredWidth: 132
+                                Layout.preferredHeight: 38
+                                radius: 9
+                                gradient: Gradient {
+                                    orientation: Gradient.Horizontal
+                                    GradientStop { position: 0.0; color: "#634eae" }
+                                    GradientStop { position: 1.0; color: "#ac527e" }
+                                }
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "BACK TO LIBRARY"
+                                    color: "#fff7f3"
+                                    font.pixelSize: 9
+                                    font.weight: Font.Bold
+                                    font.letterSpacing: 0.7
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: window.pageIndex = 0
+                                }
+                            }
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            text: "A quick readout of Windows, processor, graphics adapter, and memory. Rendering feature level is confirmed by the game when it starts."
+                            color: window.muted
+                            font.pixelSize: 12
+                            wrapMode: Text.WordWrap
+                        }
+                        GridLayout {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            columns: 2
+                            rowSpacing: 12
+                            columnSpacing: 12
+                            Repeater {
+                                model: launcher.systemInfo
+                                delegate: Rectangle {
+                                    required property var modelData
+                                    required property int index
+                                    Layout.fillWidth: true
+                                    Layout.fillHeight: true
+                                    Layout.minimumHeight: 145
+                                    radius: 13
+                                    gradient: Gradient {
+                                        orientation: Gradient.Horizontal
+                                        GradientStop { position: 0.0; color: ["#29234a", "#202b4b", "#242548", "#3a2446"][index] }
+                                        GradientStop { position: 1.0; color: ["#211b34", "#1c273b", "#1c2e38", "#30202e"][index] }
+                                    }
+                                    border.color: ["#53427b", "#3e5380", "#3b6973", "#77415e"][index]
+                                    border.width: 1
+                                    ColumnLayout {
+                                        anchors.fill: parent
+                                        anchors.margins: 22
+                                        spacing: 8
+                                        RowLayout {
+                                            Layout.fillWidth: true
+                                            Text {
+                                                text: modelData.label
+                                                color: "#bdb5d5"
+                                                font.pixelSize: 9
+                                                font.weight: Font.Bold
+                                                font.letterSpacing: 1.3
+                                            }
+                                            Item { Layout.fillWidth: true }
+                                            Text {
+                                                text: modelData.status
+                                                color: modelData.status === "READY" ? "#9be3bd" : modelData.status === "INFO" ? "#a6dce5" : "#efc38e"
+                                                font.pixelSize: 8
+                                                font.weight: Font.Bold
+                                                font.letterSpacing: 0.8
+                                            }
+                                        }
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: modelData.value
+                                            color: window.paper
+                                            font.family: "Georgia"
+                                            font.pixelSize: 19
+                                            maximumLineCount: 2
+                                            elide: Text.ElideRight
+                                            wrapMode: Text.WordWrap
+                                        }
+                                        Item { Layout.fillHeight: true }
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: modelData.detail
+                                            color: "#b4b0ba"
+                                            font.pixelSize: 10
+                                            wrapMode: Text.WordWrap
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 10
+                            Text {
+                                Layout.fillWidth: true
+                                text: "Game folder: " + (launcher.gameDirectory || "Not set")
+                                color: "#aaa4b0"
+                                font.pixelSize: 10
+                                elide: Text.ElideMiddle
+                            }
+                            Rectangle {
+                                Layout.preferredWidth: 152
+                                Layout.preferredHeight: 36
+                                radius: 8
+                                color: "#25304a"
+                                border.color: "#485c87"
+                                border.width: 1
+                                Text { anchors.centerIn: parent; text: "SET GAME FOLDER"; color: "#e8e1f1"; font.pixelSize: 9; font.weight: Font.DemiBold }
+                                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: launcher.setGameFolder() }
+                            }
+                            Rectangle {
+                                Layout.preferredWidth: 144
+                                Layout.preferredHeight: 36
+                                radius: 8
+                                color: "#3d2444"
+                                border.color: "#75486f"
+                                border.width: 1
+                                Text { anchors.centerIn: parent; text: "OPEN DATA FOLDER"; color: "#f0e0ee"; font.pixelSize: 9; font.weight: Font.DemiBold }
+                                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: launcher.openDataFolder() }
+                            }
+                        }
+                    }
+                }
             }
+            }
+        }
+    }
+
+    Dialog {
+        id: controlsDialog
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: Math.min(window.width - 40, 780)
+        height: Math.min(window.height - 40, 560)
+        padding: 0
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        background: Rectangle {
+            radius: 18
+            gradient: Gradient {
+                orientation: Gradient.Horizontal
+                GradientStop { position: 0.0; color: "#f0211b35" }
+                GradientStop { position: 0.55; color: "#f01d2137" }
+                GradientStop { position: 1.0; color: "#f02d1c31" }
+            }
+            border.color: "#80576f"
+            border.width: 1
+        }
+        contentItem: ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 26
+            spacing: 15
+            RowLayout {
+                Layout.fillWidth: true
+                ColumnLayout {
+                    spacing: 4
+                    Text { text: "KEYBOARD CONTROLS"; color: "#d1a8e0"; font.pixelSize: 9; font.weight: Font.Bold; font.letterSpacing: 1.6 }
+                    Text { text: "Play your way"; color: window.paper; font.family: "Georgia"; font.pixelSize: 26 }
+                }
+                Item { Layout.fillWidth: true }
+                Rectangle {
+                    width: 36; height: 36; radius: 18
+                    color: "#3b2b47"; border.color: "#775279"; border.width: 1
+                    Text { anchors.centerIn: parent; text: "×"; color: "#f4e6f0"; font.pixelSize: 19 }
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: controlsDialog.close() }
+                }
+            }
+            Text {
+                Layout.fillWidth: true
+                text: "Use these keyboard bindings as a fallback when a controller is not connected."
+                color: "#b7afbd"
+                font.pixelSize: 11
+                wrapMode: Text.WordWrap
+            }
+            GridLayout {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                columns: 2
+                rowSpacing: 9
+                columnSpacing: 9
+                Repeater {
+                    model: [
+                        { key: "W A S D  /  I J K L", label: "Left and right sticks" },
+                        { key: "ARROW KEYS", label: "D-pad" },
+                        { key: "ENTER", label: "A button" },
+                        { key: "BACKSPACE", label: "B button" },
+                        { key: "X  /  Y", label: "X and Y buttons" },
+                        { key: "Q  /  E", label: "Left and right shoulders" },
+                        { key: "Z  /  C", label: "Left and right triggers" },
+                        { key: "F  /  H", label: "Stick clicks" },
+                        { key: "ESC  /  TAB", label: "Menu and View" }
+                    ]
+                    delegate: Rectangle {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        Layout.minimumHeight: 66
+                        radius: 10
+                        gradient: Gradient {
+                            orientation: Gradient.Horizontal
+                            GradientStop { position: 0.0; color: "#7b392d3e" }
+                            GradientStop { position: 1.0; color: "#68312f47" }
+                        }
+                        border.color: "#654966"
+                        border.width: 1
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: 15
+                            anchors.rightMargin: 15
+                            spacing: 12
+                            Text {
+                                text: modelData.key
+                                color: "#f1d1e4"
+                                font.family: "Cascadia Mono"
+                                font.pixelSize: 10
+                                font.weight: Font.Bold
+                            }
+                            Rectangle { width: 1; height: 28; color: "#705270" }
+                            Text {
+                                Layout.fillWidth: true
+                                text: modelData.label
+                                color: "#e3dce3"
+                                font.pixelSize: 11
+                                wrapMode: Text.WordWrap
+                            }
+                        }
+                    }
+                }
             }
         }
     }

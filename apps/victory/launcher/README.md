@@ -30,6 +30,10 @@ Leonida skyline. Images remain outside the repository in accordance with the
 The desktop UI is a VIctory-branded Rockstar and GTA VI fan launcher. It uses
 the original game's palette and setting as visual context, while keeping the
 game location, console profile, launch status, and local activity easy to find.
+The library also provides quick actions to rerun the selected game, check this
+PC's Windows, processor, graphics adapter, and memory, choose the game folder,
+open local data, view keyboard bindings, switch console profiles, and quit the
+launcher. Graphics feature-level support is confirmed by the game at launch.
 
 ## Build a portable Windows launcher folder
 
