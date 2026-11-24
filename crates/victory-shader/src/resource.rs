@@ -2425,6 +2425,35 @@ pub(crate) mod tests {
         assert_eq!(moved(&[0xBE80_04FF, 0x1234_5678, S_ENDPGM], 0), None);
     }
 
+    /// The folds stop where the compiler's constants do: a 32-bit register
+    /// move copies the one dword it names; the 1/(2*pi) and half inline
+    /// floats keep their bits; `s_movk_i32` of zero is zero; and a
+    /// bit-reversed or inverted literal, a 64-bit move of a float, or a
+    /// move of `vccz` (no inline value) is left untraced.
+    #[test]
+    fn folds_stop_at_literals_floats_and_condition_codes() {
+        let moved = |words: &[u32], k: usize| copy_source(&first_inst(words).1, k);
+        let c = |x: u32| Some(Moved::Const(x));
+        // s_mov_b32 s0, s4
+        let (_, inst) = first_inst(&[0xBE80_0304, S_ENDPGM]);
+        let read = inst.read(Reg::S(4)).unwrap();
+        assert_eq!(copy_source(&inst, 0), Some(Moved::Value(read)));
+        // s_mov_b32 s0, 0.5 / -4.0 / 1/(2*pi)
+        assert_eq!(moved(&[0xBE80_03F0, S_ENDPGM], 0), c(0.5f32.to_bits()));
+        assert_eq!(moved(&[0xBE80_03F7, S_ENDPGM], 0), c((-4.0f32).to_bits()));
+        assert_eq!(moved(&[0xBE80_03F8, S_ENDPGM], 0), c(0x3E22_F983));
+        // s_movk_i32 s0, 0
+        assert_eq!(moved(&[0xB000_0000, S_ENDPGM], 0), c(0));
+        // s_brev_b32 s0, 0x1 and s_not_b32 s0, 0x1 as literals
+        assert_eq!(moved(&[0xBE80_0BFF, 1, S_ENDPGM], 0), None);
+        assert_eq!(moved(&[0xBE80_07FF, 1, S_ENDPGM], 0), None);
+        // s_mov_b64 s[0:1], 0.5 in either dword
+        assert_eq!(moved(&[0xBE80_04F0, S_ENDPGM], 0), None);
+        assert_eq!(moved(&[0xBE80_04F0, S_ENDPGM], 1), None);
+        // s_mov_b32 s0, vccz
+        assert_eq!(moved(&[0xBE80_03FB, S_ENDPGM], 0), None);
+    }
+
     fn track_err(words: &[u32], layout: &[RootParam], stage: HwStage) -> ShaderError {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
