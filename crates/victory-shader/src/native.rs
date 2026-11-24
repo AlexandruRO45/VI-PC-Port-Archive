@@ -2850,6 +2850,79 @@ mod tests {
         );
     }
 
+    /// A `stage` program with these (root type, SGPRs, user data, slot)
+    /// parameters.
+    fn stage_layout(
+        stage: HwStage,
+        params: &[(u32, u32, u8, u8)],
+    ) -> Result<Vec<NativeProgram>, ShaderError> {
+        let code: &[u8] = if stage == HwStage::Ps {
+            &PS_CODE
+        } else {
+            &VS_CODE
+        };
+        let mut blob = fssm(&[(stage, code)]);
+        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(stage)).unwrap() as usize;
+        let table = (blob.len() - FSSM_HEADER) as u64;
+        for &(root, sgprs, user_data, slot) in params {
+            for v in [root, 0, sgprs, 0] {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+            blob.extend_from_slice(&[user_data, slot, 0, 0]);
+        }
+        let payload = (blob.len() - FSSM_HEADER) as u64;
+        blob[8..16].copy_from_slice(&payload.to_le_bytes());
+        blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
+        let count = params.len() as u64;
+        blob[record + RECORD_COUNTS..][..8].copy_from_slice(&count.to_le_bytes());
+        native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+    }
+
+    #[test]
+    fn merged_stage_root_params_share_sgprs_as_a_legacy_stage_does() {
+        let (constants, descriptor, table, sampler) = (0, 1, 3, 4);
+        // Sharing is judged in user-data dwords, which every stage moves by
+        // the same system SGPRs: what a pixel program allows or refuses, a
+        // merged stage or mesh shader (from s8) does too.
+        for stage in [
+            HwStage::Ls,
+            HwStage::Hs,
+            HwStage::Es,
+            HwStage::Gs,
+            HwStage::Ms,
+            HwStage::Vs,
+            HwStage::Ps,
+        ] {
+            for params in [
+                &[(constants, 2, 0, 0), (descriptor, 2, 2, 1)][..],
+                &[(table, 1, 4, 2), (table, 1, 4, 2)],
+                &[(constants, 2, 0, 0), (sampler, 0, 0, 3)],
+                // Constants in the last two dwords, a descriptor before them.
+                &[(descriptor, 2, 28, 0), (constants, 2, 30, 1)],
+            ] {
+                let p = stage_layout(stage, params)
+                    .unwrap_or_else(|e| panic!("{stage:?}: {params:?}: {e:?}"));
+                // The layout keeps the dword, not the SGPR it lands in.
+                let dwords: Vec<u8> = p[0].layout.iter().map(|r| r.user_data).collect();
+                let stated: Vec<u8> = params.iter().map(|&(_, _, d, _)| d).collect();
+                assert_eq!(dwords, stated, "{stage:?}: {params:?}");
+            }
+            for params in [
+                &[(constants, 2, 0, 0), (table, 1, 1, 1)][..],
+                &[(table, 1, 3, 0), (table, 1, 3, 1)],
+                &[(descriptor, 1, 0, 0), (constants, 1, 1, 1)],
+                &[(descriptor, 2, 30, 0), (constants, 1, 31, 1)],
+                &[(constants, 1, 31, 0), (constants, 1, 31, 0)],
+            ] {
+                assert_eq!(
+                    why_refused(stage_layout(stage, params)),
+                    "root parameters share an SGPR",
+                    "{stage:?}: {params:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_merged_stage_fixed_sampler_may_name_the_end_of_the_sgprs() {
         // One fixed sampler stating no SGPRs at user-data dword `user_data`
