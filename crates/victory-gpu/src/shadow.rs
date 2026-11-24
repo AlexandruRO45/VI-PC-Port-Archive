@@ -821,6 +821,9 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
+    if let Some(what) = crate::mirror::describe(va) {
+        return format!("; inside {what}");
+    }
     let mut all: Vec<(u64, u64, u64)> = buffers()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))

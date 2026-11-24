@@ -50,6 +50,23 @@ unsafe impl Send for Mirror {}
 // SAFETY: as above.
 unsafe impl Sync for Mirror {}
 
+/// Host GPU ranges this module made (start, bytes, what), for device-removed reports.
+static RANGES: Mutex<Vec<(u64, u64, String)>> = Mutex::new(Vec::new());
+
+fn note_range(res: &ID3D12Resource, what: String) {
+    // SAFETY: a live buffer.
+    let (va, bytes) = unsafe { (res.GetGPUVirtualAddress(), res.GetDesc().Width) };
+    RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((va, bytes, what));
+}
+
+/// What of ours holds host GPU address `va`, if anything.
+pub(crate) fn describe(va: u64) -> Option<String> {
+    let r = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    r.iter()
+        .find(|(start, bytes, _)| va >= *start && va < start + bytes)
+        .map(|(start, _, what)| format!("{what} (offset {:#x})", va - start))
+}
+
 pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_MIRROR").map_or(true, |v| v.trim() != "0"))
@@ -156,6 +173,7 @@ impl Mirror {
                 .ok()?;
         }
         let buffer = buffer?;
+        note_range(&buffer, format!("mirror alias of {} title pages", pages.len()));
         let p = self.pages.lock().unwrap_or_else(|e| e.into_inner());
         let mut by_chunk: HashMap<usize, (Vec<u32>, Vec<u32>)> = HashMap::new();
         for (k, &(_, chunk, tile)) in pages.iter().enumerate() {
@@ -196,6 +214,7 @@ fn new_chunk(device: &ID3D12Device) -> Option<Chunk> {
             .CreatePlacedResource(&heap, 0, &buffer_desc(desc.SizeInBytes), D3D12_RESOURCE_STATE_COMMON, None, &mut view)
             .ok()?;
         let view = view?;
+        note_range(&view, "mirror page chunk view".into());
         view.Map(0, None, Some(&mut cpu)).ok()?;
         Some(Chunk { heap, _view: view, cpu: cpu as usize, used: 0 })
     }
