@@ -242,30 +242,35 @@ impl Tables {
 /// the block count. The stream carries no size: bytes after the last one the
 /// lanes need are ignored, a stream that runs out is an error.
 pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(), Error> {
-    let block = match bc {
-        1 | 4 => 8,
-        3 | 5 | 6 | 7 => 16,
-        _ => return Err(Error("unsupported BC format")),
-    };
+    let (block, widths, per) = layout(bc)?;
     if dst.is_empty() || !dst.len().is_multiple_of(block) {
         return Err(Error("destination is not a whole number of blocks"));
     }
     let blocks = dst.len() / block;
-    let (widths, per): (&[u8], usize) = match bc {
-        1 => (&[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1),
-        3 => (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
-        4 => (&[7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 1),
-        5 => (&[3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 2),
-        6 => (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
-        _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
-    };
-    let stride = widths.len() * per;
-    let mut records = vec![0u8; blocks * stride];
+    let mut records = vec![0u8; blocks * widths.len() * per];
     let mut next = src.iter().copied();
     lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
-    let records = records.chunks_exact(stride);
+    unpack(bc, &records, dst, tables)
+}
+
+/// Block bytes, lane widths and symbols per lane per block of BC `bc`.
+fn layout(bc: u8) -> Result<(usize, &'static [u8], usize), Error> {
+    Ok(match bc {
+        1 => (8, &[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1),
+        3 => (16, &[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
+        4 => (8, &[7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 1),
+        5 => (16, &[3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 2),
+        6 => (16, &[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
+        7 => (16, &[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
+        _ => return Err(Error("unsupported BC format")),
+    })
+}
+
+/// Turns the lanes' records (one per block of `dst`) into BC blocks.
+fn unpack(bc: u8, records: &[u8], dst: &mut [u8], t: &Tables) -> Result<(), Error> {
+    let (block, widths, per) = layout(bc)?;
+    let records = records.chunks_exact(widths.len() * per);
     let out = dst.chunks_exact_mut(block);
-    let t = tables;
     match bc {
         1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
         3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
@@ -723,10 +728,21 @@ fn pbits(mode: u16) -> bool {
     matches!(mode, 0 | 1 | 3 | 6 | 7)
 }
 
+/// The channel swapped with alpha (0 none). Only modes 4 and 5 rotate; in
+/// a control word for another mode the bits mean nothing, and acting on them
+/// would leave red without precision.
+fn rotation(ctrl: u16) -> usize {
+    if matches!(ctrl & 7, 4 | 5) {
+        usize::from(ctrl >> 3 & 3)
+    } else {
+        0
+    }
+}
+
 /// Channel precisions: the p-bit is red's lowest bit; rotation swaps alpha
 /// with the rotated channel.
 fn bc7_precision(ctrl: u16) -> [u8; 4] {
-    let (mode, rot) = (ctrl & 7, usize::from(ctrl >> 3 & 3));
+    let (mode, rot) = (ctrl & 7, rotation(ctrl));
     let mut p = BC7_BITS[usize::from(mode)];
     if rot != 0 {
         p.swap(3, rot - 1);
@@ -831,7 +847,7 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
     let mode = ctrl & 7;
     let subsets = usize::from((ctrl & 0xff) >> 6);
     let part = usize::from(ctrl >> 8 & 63);
-    let rot = usize::from(ctrl >> 3 & 3);
+    let rot = rotation(ctrl);
     let mut w = Bits::default();
     w.put(1 << mode, u32::from(mode) + 1);
     match mode {
@@ -1367,6 +1383,54 @@ mod tests {
                 let _ = decode(bc, &src, &mut dst, &t);
             }
         }
+    }
+
+    /// Records the lanes can deliver (each lane's symbols below 2^(width + 1))
+    /// through the block stage with the shipped tables, so real dictionary
+    /// entries and BC7 control codes are the references; then the same with
+    /// those tables' ranks, control codes and dictionaries overwritten by
+    /// noise, which `Tables::parse` accepts. Noise streams also go through
+    /// `decode` with the shipped tables. Some record sets must decode and some
+    /// must be errors (BC6H modes past 14, unused BC7 control codes).
+    #[test]
+    fn shipped_tables_never_panic() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let shipped = include_bytes!("bcpack-tables.bin");
+        let mut noisy = shipped.to_vec();
+        for b in &mut noisy[MODELS * BUCKETS * 2..] {
+            *b = next() as u8;
+        }
+        let (mut ok, mut err) = (0, 0);
+        for (pass, bytes) in [&shipped[..], &noisy].into_iter().enumerate() {
+            let t = Tables::parse(bytes).unwrap();
+            for round in 0..64 {
+                for bc in [1, 3, 4, 5, 6, 7] {
+                    let (block, widths, per) = layout(bc).unwrap();
+                    // Up to 300 blocks: references reach back past the 256-block history.
+                    let blocks = 1 + next() as usize % 300;
+                    let records: Vec<u8> = (0..blocks)
+                        .flat_map(|_| widths.iter().flat_map(|&w| [w; 2][..per].to_vec()))
+                        .map(|w| (next() % (2 << w)) as u8)
+                        .collect();
+                    let mut dst = vec![0xa5u8; blocks * block];
+                    match unpack(bc, &records, &mut dst, &t) {
+                        Ok(()) => ok += 1,
+                        Err(_) => err += 1,
+                    }
+                    if pass == 0 && round % 8 == 0 {
+                        let src: Vec<u8> = (0..next() % 2000).map(|_| next() as u8).collect();
+                        let _ = decode(bc, &src, &mut dst, &t);
+                    }
+                }
+            }
+        }
+        assert!(ok > 0 && err > 0);
     }
 
     /// Compares with reference outputs made outside the repository:
