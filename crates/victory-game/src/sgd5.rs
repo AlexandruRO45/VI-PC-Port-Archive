@@ -2458,4 +2458,48 @@ mod tests {
             assert_eq!(found[1].span().end, file.len(), "break at {broken_at}");
         }
     }
+
+    #[test]
+    fn stream_of_another_size_over_a_stored_record_is_noise() {
+        // A container holding a record, stored as is in one final stored
+        // block, under a record stating one byte more or one fewer than the
+        // container: its bytes are no stream of that size, so it is noise
+        // and the record it stores wins. Stating the container's size
+        // exactly, it is a stream and wins over the record it stores.
+        let inner = record_bytes("PS_inner", 0x41, b"stored inside");
+        let mut container = b"DXBC head ".to_vec();
+        let inner_at = container.len();
+        container.extend_from_slice(&inner);
+        container.extend_from_slice(b" DXBC tail");
+        let packed = miniz_oxide::deflate::compress_to_vec(&container, 0);
+        for stated in [container.len() - 1, container.len(), container.len() + 1] {
+            let (file, marker) = outer_then_after(&packed, stated);
+            let stored =
+                marker + 12 + 5 + inner_at + memchr::memmem::find(&inner, &MARKER).unwrap();
+            assert_eq!(&file[stored..stored + 4], &MARKER, "stated {stated}");
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            if stated == container.len() {
+                assert_eq!(
+                    names,
+                    [Some("PS_outer"), Some("PS_after")],
+                    "stated {stated}"
+                );
+                assert_eq!(found[0].unpack(), Some(container.clone()));
+                assert!(in_record(&found, stored), "stated {stated}");
+            } else {
+                assert_eq!(
+                    names,
+                    [Some("PS_inner"), Some("PS_after")],
+                    "stated {stated}"
+                );
+                assert_eq!(found[0].offset, stored, "stated {stated}");
+                assert_eq!(found[0].kind, 0x41, "stated {stated}");
+                assert_eq!(found[0].unpack().as_deref(), Some(&b"stored inside"[..]));
+                assert!(!in_record(&found, marker), "stated {stated}");
+            }
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "stated {stated}");
+        }
+    }
 }
