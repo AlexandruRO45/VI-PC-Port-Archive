@@ -1510,4 +1510,76 @@ mod tests {
             assert_eq!(names, [Some("PS_before")], "cut {cut} packed bytes in");
         }
     }
+
+    #[test]
+    fn search_stays_ended_once_it_ends() {
+        // Past the last record, or at a cut-off one, the iterator keeps
+        // returning `None` (no rescan from the start, no out-of-bounds
+        // read), and a new search over the same bytes finds the same.
+        let mut whole = MAGIC.to_vec();
+        whole.extend(record_bytes("PS_a", 0x32, b"first"));
+        whole.extend(record_bytes("PS_b", 0x41, b"second"));
+        let cut = whole.len() - 1;
+        for file in [&whole[..], &whole[..cut]] {
+            let want = if file.len() == whole.len() { 2 } else { 1 };
+            let mut it = records(file);
+            for _ in 0..want {
+                assert!(it.next().is_some(), "{} bytes", file.len());
+            }
+            for _ in 0..3 {
+                assert_eq!(it.next(), None, "{} bytes", file.len());
+            }
+            assert_eq!(records(file).count(), want, "{} bytes", file.len());
+        }
+    }
+
+    #[test]
+    fn stream_is_checked_only_as_far_as_the_probe() {
+        // At most PROBE bytes are inflated, from at most PROBE packed bytes.
+        // Within both, a stream's size is checked exactly; past either,
+        // only as far as the probe goes, and such a record is still one
+        // (it covers no other), with `unpack` saying it is the wrong size.
+        let payload =
+            |size: usize| -> Vec<u8> { (0..size as u32).map(|i| (i * 13 % 251) as u8).collect() };
+        let deflated = |size: usize| miniz_oxide::deflate::compress_to_vec(&payload(size), 6);
+
+        // Exactly PROBE bytes, packed well within the probe: exact.
+        let packed = deflated(PROBE);
+        assert!(packed.len() < PROBE);
+        assert!(starts_stream(&packed, PROBE));
+        assert!(!starts_stream(&packed, PROBE - 1));
+        assert!(!starts_stream(&packed, PROBE + 1));
+
+        // One byte more than PROBE: a stated size past it is not checked.
+        let packed = deflated(PROBE + 1);
+        assert!(starts_stream(&packed, PROBE + 1));
+        assert!(!starts_stream(&packed, PROBE), "the limit is reached");
+        assert!(starts_stream(&packed, PROBE + 2), "past the probe");
+
+        // Stored as is (level 0), fewer bytes than PROBE take more packed
+        // bytes than it: the probe ends inside the stored block.
+        let stored = miniz_oxide::deflate::compress_to_vec(&payload(PROBE - 1), 0);
+        assert!(stored.len() > PROBE);
+        assert!(starts_stream(&stored, PROBE - 1));
+        assert!(starts_stream(&stored, PROBE - 2), "cut by the probe");
+        // Within the probe, stored bytes past the stated size still show.
+        assert!(!starts_stream(&stored[..PROBE / 2], PROBE / 4));
+
+        for (packed, stated) in [(deflated(PROBE + 1), PROBE + 2), (stored, PROBE - 2)] {
+            let n = (packed.len() + 12) as u32;
+            let mut file = MAGIC.to_vec();
+            file.extend_from_slice(b"\x05PS_p\0\x32");
+            for v in [n, 0x000D_DCE7, n, stated as u32] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            file.extend_from_slice(&packed);
+            file.extend(record_bytes("PS_after", 0x32, b"after"));
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_p"), Some("PS_after")], "stated {stated}");
+            assert!(found[0].is_stream(), "stated {stated}");
+            assert_eq!(found[0].unpack(), None, "stated {stated}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+        }
+    }
 }
