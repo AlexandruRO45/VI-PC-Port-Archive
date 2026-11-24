@@ -5,13 +5,13 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{VIEW_TAG, View, with_view_at};
+use super::{VIEW_TAG, View, Views, with_live_views, with_view_at};
 use crate::host::host;
 use crate::shadow::Shadow;
 
@@ -38,6 +38,19 @@ struct Slots {
     made: Vec<u64>,
     /// Mirrored SRV slots and their associated shadow, once materialized.
     direct: BTreeMap<u32, (u64, Option<SrvRange>)>,
+    /// Slots still awaiting native SRV creation. Failures can be retried
+    /// without enumerating slots already materialized.
+    pending_srvs: BTreeSet<u32>,
+    srv_ranges: Option<SrvCache>,
+    shadow_retirements: u64,
+}
+
+struct SrvCache {
+    retired_srvs: u64,
+    /// Resource-backed views used by these ranges. Their packed keys do
+    /// not retain the title objects when their generation is retired.
+    object_views: Vec<u64>,
+    ranges: Arc<[SrvRange]>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -131,6 +144,9 @@ impl HostHeap {
             slots: Mutex::new(Slots {
                 made: vec![0; count as usize],
                 direct: BTreeMap::new(),
+                pending_srvs: BTreeSet::new(),
+                srv_ranges: None,
+                shadow_retirements: crate::shadow::retirement_revision(),
             }),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
@@ -340,7 +356,13 @@ impl HostHeap {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        let Slots { made, direct } = &mut *slots;
+        let Slots {
+            made,
+            direct,
+            pending_srvs,
+            srv_ranges,
+            ..
+        } = &mut *slots;
         let view = (tag == VIEW_TAG)
             .then(|| {
                 with_view_at(i, generation, |view| {
@@ -351,14 +373,23 @@ impl HostHeap {
                     if *previous != key {
                         *previous = key;
                         *range = None;
+                        *srv_ranges = None;
+                        pending_srvs.insert(index);
                         made[index as usize] = 0;
                         null_for(view, self.cpu(index));
                         self.keep(index, None);
                     }
-                    if for_draw && range.is_none() {
-                        *range = buffer_srv(parts, self.cpu(index));
+                    if for_draw
+                        && range.as_ref().is_none_or(|r| r.shadow.superseded())
+                        && self.bind_srv(index, parts, range)
+                    {
+                        *srv_ranges = None;
                         if range.is_some() {
+                            pending_srvs.remove(&index);
                             made[index as usize] = key;
+                        } else {
+                            pending_srvs.insert(index);
+                            made[index as usize] = 0;
                         }
                     }
                     (view.clone(), true)
@@ -372,13 +403,19 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.make_null(index);
             }
-            direct.remove(&index);
+            if direct.remove(&index).is_some() {
+                pending_srvs.remove(&index);
+                *srv_ranges = None;
+            }
             return None;
         };
         if is_direct_srv {
             return Some(view);
         }
-        direct.remove(&index);
+        if direct.remove(&index).is_some() {
+            pending_srvs.remove(&index);
+            *srv_ranges = None;
+        }
         if made[index as usize] != key {
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };
@@ -395,26 +432,156 @@ impl HostHeap {
         Some(view)
     }
 
-    /// Materialize any newly mirrored SRVs and capture the native buffers
-    /// that must live through this submission. No other slots are visited.
-    pub(crate) fn snapshot_srvs(&self, output: &mut Vec<(u64, SrvRange)>) -> usize {
-        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        let Slots { made, direct } = &mut *slots;
-        for (&index, (key, range)) in direct.iter_mut() {
-            if range.is_none() {
-                *range = with_view_at(*key as u32, (*key >> 32) as u32, |view| {
-                    buffer_srv(buffer_srv_parts(view)?, self.cpu(index))
-                })
-                .flatten();
-                if range.is_some() {
-                    made[index as usize] = *key;
-                }
+    /// Creates or replaces a native buffer SRV, keeping the previous buffer
+    /// alive until the native slot has been rewritten.
+    fn bind_srv(
+        &self,
+        index: u32,
+        parts: (u64, u64, D3D12_SHADER_RESOURCE_VIEW_DESC),
+        range: &mut Option<SrvRange>,
+    ) -> bool {
+        let replacement = buffer_srv(parts, self.cpu(index));
+        if range.is_some() && replacement.is_none() {
+            null_buffer_view(self.cpu(index));
+        }
+        let changed = range.is_some() || replacement.is_some();
+        *range = replacement;
+        changed
+    }
+
+    fn srv_slot<'a>(
+        &self,
+        slots: &'a mut Slots,
+        views: &Views,
+        index: u32,
+    ) -> Option<&'a SrvRange> {
+        let (key, range) = slots.direct.get_mut(&index)?;
+        let Some(view) = views.live(*key) else {
+            slots.pending_srvs.remove(&index);
+            return None;
+        };
+        if range.as_ref().is_none_or(|r| r.shadow.superseded()) {
+            if let Some(parts) = buffer_srv_parts(view)
+                && self.bind_srv(index, parts, range)
+            {
+                slots.srv_ranges = None;
             }
-            if let Some(range) = range {
-                output.push((*key, range.clone()));
+            if range.is_some() {
+                slots.made[index as usize] = *key;
+                slots.pending_srvs.remove(&index);
+            } else {
+                slots.made[index as usize] = 0;
+                slots.pending_srvs.insert(index);
             }
         }
-        direct.len()
+        range.as_ref().filter(|r| r.address != r.end)
+    }
+
+    fn srv_ranges(
+        &self,
+        slots: &mut Slots,
+        views: &Views,
+        selection: SrvSelection<'_>,
+    ) -> Arc<[SrvRange]> {
+        #[cfg(feature = "diagnostics")]
+        use crate::copystat::{C, add};
+        if let SrvSelection::Exact(indices) = selection {
+            #[cfg(feature = "diagnostics")]
+            {
+                add(C::DirectEligibleSlots, indices.len() as u64);
+                add(C::DirectSlots, indices.len() as u64);
+            }
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            let ranges = merge_srv_ranges(
+                indices
+                    .iter()
+                    .filter_map(|&index| self.srv_slot(slots, views, index).cloned())
+                    .collect(),
+            );
+            #[cfg(feature = "diagnostics")]
+            add(C::DirectRangeBuildUs, started.elapsed().as_micros() as u64);
+            return ranges.into();
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            add(C::DirectEligibleSlots, slots.direct.len() as u64);
+            add(C::DirectSlots, slots.pending_srvs.len() as u64);
+        }
+        for index in std::mem::take(&mut slots.pending_srvs) {
+            self.srv_slot(slots, views, index);
+        }
+        let shadow_retirements = crate::shadow::retirement_revision();
+        if slots.shadow_retirements != shadow_retirements {
+            slots.shadow_retirements = shadow_retirements;
+            // A raw placed view keeps the same descriptor key when its
+            // title address is reused. Only walk this heap's slots if a
+            // cached live range pointed to a superseded registration.
+            if slots
+                .srv_ranges
+                .as_ref()
+                .is_none_or(|cache| cache.ranges.iter().any(|range| range.shadow.superseded()))
+            {
+                #[cfg(feature = "diagnostics")]
+                let started = std::time::Instant::now();
+                #[cfg(feature = "diagnostics")]
+                add(C::DirectSlots, slots.direct.len() as u64);
+                let retired: Vec<_> = slots
+                    .direct
+                    .iter()
+                    .filter_map(|(&index, (_, range))| {
+                        range
+                            .as_ref()
+                            .is_some_and(|range| range.shadow.superseded())
+                            .then_some(index)
+                    })
+                    .collect();
+                #[cfg(feature = "diagnostics")]
+                add(C::DirectSlots, retired.len() as u64);
+                for index in retired {
+                    self.srv_slot(slots, views, index);
+                }
+                #[cfg(feature = "diagnostics")]
+                add(C::DirectRangeBuildUs, started.elapsed().as_micros() as u64);
+            }
+        }
+        if let Some(cache) = &mut slots.srv_ranges
+            && (cache.retired_srvs == views.retired_srvs
+                || cache
+                    .object_views
+                    .iter()
+                    .all(|&key| views.live(key).is_some()))
+        {
+            cache.retired_srvs = views.retired_srvs;
+            return cache.ranges.clone();
+        }
+        #[cfg(feature = "diagnostics")]
+        add(C::DirectSlots, slots.direct.len() as u64);
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let mut object_views = Vec::new();
+        let ranges: Vec<_> = slots
+            .direct
+            .values()
+            .filter_map(|(key, range)| {
+                let range = range.as_ref().filter(|range| range.address != range.end)?;
+                if matches!(views.live(*key)?, View::Shader(..)) {
+                    object_views.push(*key);
+                }
+                Some(range.clone())
+            })
+            .collect();
+        object_views.sort_unstable();
+        object_views.dedup();
+        let ranges: Arc<[_]> = merge_srv_ranges(ranges).into();
+        #[cfg(feature = "diagnostics")]
+        add(C::DirectRangeBuildUs, started.elapsed().as_micros() as u64);
+        slots.srv_ranges = Some(SrvCache {
+            retired_srvs: views.retired_srvs,
+            object_views,
+            ranges: ranges.clone(),
+        });
+        ranges
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -545,6 +712,52 @@ pub(crate) struct SrvRange {
     pub(crate) shadow: Arc<Shadow>,
     pub(crate) address: usize,
     pub(crate) end: usize,
+}
+
+/// Which mirrored slots the submitted shaders may read from a heap.
+#[derive(Clone, Copy)]
+pub(crate) enum SrvSelection<'a> {
+    All,
+    Exact(&'a [u32]),
+}
+
+/// Holds live title views during refresh and returns the native shadows to
+/// retain through execution. The submitting host passes distinct heaps
+/// under its submission lock. Mirroring also locks slots before views.
+pub(crate) fn with_srv_ranges(
+    heaps: &[(&HostHeap, SrvSelection<'_>)],
+    refresh: impl FnOnce(&[Arc<[SrvRange]>]),
+) -> Vec<Arc<[SrvRange]>> {
+    if heaps.is_empty() {
+        return Vec::new();
+    }
+    let mut slots: Vec<_> = heaps
+        .iter()
+        .map(|(heap, _)| heap.slots.lock().unwrap_or_else(|e| e.into_inner()))
+        .collect();
+    with_live_views(|views| {
+        let ranges: Vec<_> = heaps
+            .iter()
+            .zip(&mut slots)
+            .map(|(&(heap, selection), slots)| heap.srv_ranges(slots, views, selection))
+            .collect();
+        drop(slots);
+        refresh(&ranges);
+        ranges
+    })
+}
+
+pub(crate) fn merge_srv_ranges(mut ranges: Vec<SrvRange>) -> Vec<SrvRange> {
+    ranges.sort_unstable_by_key(|range| (Arc::as_ptr(&range.shadow), range.address));
+    ranges.dedup_by(|next, current| {
+        if Arc::ptr_eq(&next.shadow, &current.shadow) && next.address <= current.end {
+            current.end = current.end.max(next.end);
+            true
+        } else {
+            false
+        }
+    });
+    ranges
 }
 
 fn buffer_srv_parts(view: &View) -> Option<(u64, u64, D3D12_SHADER_RESOURCE_VIEW_DESC)> {

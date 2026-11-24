@@ -184,7 +184,11 @@ fn test_host() -> Option<(&'static Host, std::ffi::OsString)> {
         eprintln!("skipped direct SRV GPU test: VICTORY_PC_DXC unset");
         return None;
     };
+    let strict = enable_validation();
     let host = crate::host::host().expect("D3D12 adapter for direct SRV GPU test");
+    if strict {
+        check_validation(host);
+    }
     let mut shader_model = D3D12_FEATURE_DATA_SHADER_MODEL {
         HighestShaderModel: D3D_SHADER_MODEL_6_6,
     };
@@ -223,10 +227,84 @@ fn test_host() -> Option<(&'static Host, std::ffi::OsString)> {
         .position(|&c| c == 0)
         .unwrap_or(adapter.Description.len());
     eprintln!(
-        "direct SRV GPU test on {}, SM 6.6",
-        String::from_utf16_lossy(&adapter.Description[..end])
+        "direct SRV GPU test on {}, SM 6.6, full GBV={strict}",
+        String::from_utf16_lossy(&adapter.Description[..end]),
     );
     Some((host, dxc))
+}
+
+fn enable_validation() -> bool {
+    if std::env::var_os("VICTORY_TEST_SRV_GBV").is_none() {
+        return false;
+    }
+    static ENABLED: std::sync::Once = std::sync::Once::new();
+    ENABLED.call_once(|| {
+        assert!(std::env::var_os("VICTORY_D3D12_GBV").is_none());
+        let mut debug: Option<ID3D12Debug1> = None;
+        // SAFETY: the test sets validation before the host creates its device.
+        unsafe {
+            D3D12GetDebugInterface(&mut debug).expect("D3D12 debug layer for direct SRV GBV");
+            let debug = debug.unwrap();
+            debug.EnableDebugLayer();
+            debug.SetEnableGPUBasedValidation(true);
+        }
+    });
+    true
+}
+
+fn check_validation(host: &Host) {
+    use windows::core::Interface;
+
+    let config = host.device.cast::<ID3D12DeviceConfiguration>().unwrap();
+    // SAFETY: read-only query of a live device configuration.
+    let config = unsafe { config.GetDesc() };
+    assert_ne!(
+        config.Flags.0 & D3D12_DEVICE_FLAG_GPU_BASED_VALIDATION_ENABLED.0,
+        0
+    );
+    assert_eq!(
+        config.GpuBasedValidationFlags
+            & D3D12_GPU_BASED_VALIDATION_FLAGS_DISABLE_STATE_TRACKING.0 as u32,
+        0
+    );
+    static CALLBACK: std::sync::Once = std::sync::Once::new();
+    CALLBACK.call_once(|| {
+        let queue = host
+            .device
+            .cast::<ID3D12InfoQueue1>()
+            .expect("active D3D12 debug layer");
+        let mut cookie = 0;
+        // SAFETY: the callback and its null context stay valid until process exit.
+        unsafe {
+            queue
+                .RegisterMessageCallback(
+                    Some(validation_error),
+                    D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                    std::ptr::null_mut(),
+                    &mut cookie,
+                )
+                .unwrap();
+        }
+    });
+}
+
+unsafe extern "system" fn validation_error(
+    _: D3D12_MESSAGE_CATEGORY,
+    severity: D3D12_MESSAGE_SEVERITY,
+    id: D3D12_MESSAGE_ID,
+    message: windows::core::PCSTR,
+    _: *mut std::ffi::c_void,
+) {
+    if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+        // SAFETY: D3D12 supplies a null-terminated message for this callback.
+        let message = unsafe { std::ffi::CStr::from_ptr(message.as_ptr().cast()) };
+        eprintln!(
+            "D3D12 validation error {}: {}",
+            id.0,
+            message.to_string_lossy()
+        );
+        std::process::abort();
+    }
 }
 
 fn record(
@@ -246,6 +324,81 @@ fn record(
             .SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
         list.list.Dispatch(1, 1, 1);
     }
+}
+
+#[test]
+fn directly_indexed_srv_cached_ranges_follow_mirrored_slot_changes() {
+    let strict = enable_validation();
+    let Some(gpu) = crate::host::host() else {
+        assert!(!strict, "D3D12 adapter for cache validation");
+        return;
+    };
+    if strict {
+        check_validation(gpu);
+    }
+    let title = TitleBuffer::new(65536);
+    let first_heap = TestHeap::new(8);
+    let second_heap = TestHeap::new(8);
+    let heaps = [
+        heap(first_heap.0).host().unwrap().as_ref(),
+        heap(second_heap.0).host().unwrap().as_ref(),
+    ];
+    title.srv(first_heap.handle(0), 0, 16);
+    title.srv(first_heap.handle(1), 16, 16);
+    title.srv(first_heap.handle(2), 64, 16);
+    copy_simple(
+        std::ptr::null(),
+        1,
+        first_heap.handle(3),
+        first_heap.handle(0),
+        0,
+    );
+    title.srv(second_heap.handle(0), 0, 16);
+    title.srv(second_heap.handle(1), 32, 16);
+
+    let snapshot =
+        || host::with_srv_ranges(&heaps.map(|heap| (heap, host::SrvSelection::All)), |_| {});
+    let offsets = |ranges: &[host::SrvRange]| {
+        ranges
+            .iter()
+            .map(|range| {
+                let base = title.base as usize;
+                (range.address - base, range.end - base)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let selected = host::with_srv_ranges(&[(heaps[0], host::SrvSelection::Exact(&[2, 7]))], |_| {});
+    assert_eq!(offsets(&selected[0]), [(64, 80)]);
+    #[cfg(feature = "diagnostics")]
+    {
+        assert_eq!(heaps[0].describe_slot(0).as_deref(), Some("null"));
+        assert_ne!(heaps[0].describe_slot(2).as_deref(), Some("null"));
+    }
+
+    let initial = snapshot();
+    assert_eq!(offsets(&initial[0]), [(0, 32), (64, 80)]);
+    assert_eq!(offsets(&initial[1]), [(0, 16), (32, 48)]);
+    let combined = host::merge_srv_ranges(initial.iter().flat_map(|r| r.iter().cloned()).collect());
+    assert_eq!(offsets(&combined), [(0, 48), (64, 80)]);
+
+    let reused = snapshot();
+    assert_eq!(offsets(&reused[0]), [(0, 32), (64, 80)]);
+    assert_eq!(offsets(&reused[1]), [(0, 16), (32, 48)]);
+
+    // Copy an unwritten descriptor over the only slot covering [64, 80).
+    copy_simple(
+        std::ptr::null(),
+        1,
+        first_heap.handle(2),
+        second_heap.handle(7),
+        0,
+    );
+    let changed = snapshot();
+    assert_eq!(offsets(&changed[0]), [(0, 32)]);
+    assert_eq!(offsets(&changed[1]), [(0, 16), (32, 48)]);
+    let errors = gpu.log_messages();
+    assert!(errors.is_none(), "D3D12 descriptor validation: {errors:?}");
 }
 
 #[test]
@@ -367,6 +520,97 @@ fn directly_indexed_srv_ignores_released_resource_generations() {
     host.execute(&[&list]);
     assert_eq!(read(mapped), 82);
     assert_eq!(release(replacement), 0);
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
+fn directly_indexed_srv_rebinds_raw_placed_address_after_allocation_reuse() {
+    let Some((host, dxc)) = test_host() else {
+        return;
+    };
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, ResetWriteWatch, VirtualAlloc,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    const SIZE: usize = crate::watch::PAGE;
+    const GPU_WORD: u32 = 733;
+
+    let pipeline = pipeline(host, &dxc);
+    for exact in [false, true] {
+        let title = TitleBuffer::watched(SIZE as u64);
+        title.set(0, 19);
+        let address = title.base;
+        let heap = TestHeap::new(8);
+        // Use a whole watched page so the shadow can remember it as copied.
+        title.srv(heap.handle(0), 0, SIZE as u32);
+        let (output, mapped) = host.shared_buffer(4).unwrap();
+        let consumer = host.new_list().unwrap();
+        record(&consumer, heap.0, &pipeline, 0, &output);
+        consumer.close();
+        host.execute(&[&consumer]);
+        assert_eq!(read(mapped), 19);
+        drop(title);
+
+        // SAFETY: exactly this owned title allocation was released above.
+        let replacement = unsafe {
+            VirtualAlloc(
+                address as *const _,
+                SIZE,
+                MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert_eq!(
+            replacement as u64, address,
+            "replacement must reuse the title VA"
+        );
+        let replacement = TitleBuffer {
+            memory: None,
+            base: address,
+            size: SIZE as u64,
+        };
+        crate::shadow::register(address as usize, address, SIZE as u64);
+        // SAFETY: the replacement is a live, clean, zero-filled allocation.
+        unsafe {
+            assert_eq!(read(address as *mut u8), 0);
+            assert_eq!(ResetWriteWatch(address as *const _, SIZE), 0);
+        }
+
+        if exact {
+            let native_heap = super::heap(heap.0).host().unwrap();
+            let ranges = host::with_srv_ranges(
+                &[(native_heap.as_ref(), host::SrvSelection::Exact(&[0]))],
+                |_| {},
+            );
+            let fresh = crate::shadow::find(address, SIZE as u64).unwrap();
+            assert!(std::sync::Arc::ptr_eq(&ranges[0][0].shadow, &fresh));
+        }
+        // Neither the raw descriptor bytes nor the recorded list changed.
+        host.execute(&[&consumer]);
+        let clean_reuse = read(mapped);
+
+        let producer = host.new_list().unwrap();
+        let shadow = crate::shadow::find(replacement.base, replacement.size).unwrap();
+        shadow.gpu_writes(&producer, replacement.base, 4);
+        let (upload, source) = host.shared_buffer(4).unwrap();
+        // SAFETY: live buffers, with the explicit copy-to-SRV handoff.
+        unsafe {
+            source.cast::<u32>().write(GPU_WORD);
+            producer
+                .list
+                .CopyBufferRegion(&shadow.buffer, 0, &upload, 0, 4);
+            producer.list.ResourceBarrier(&[crate::host::transition(
+                &shadow.buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            )]);
+        }
+        producer.close();
+        host.execute(&[&producer, &consumer]);
+        let gpu_reuse = read(mapped);
+        assert_eq!((clean_reuse, gpu_reuse), (0, GPU_WORD));
+        assert_eq!(read(replacement.base as *mut u8), GPU_WORD);
+    }
 }
 
 #[test]
@@ -552,6 +796,34 @@ fn directly_indexed_srv_sparse_heap_benchmark() {
     warm.close();
     host.execute(&[&warm]);
     assert_eq!(read(mapped), 13);
+
+    // Retiring an unrelated object view and its shadow must not make the
+    // warmed heap enumerate its slots.
+    let unrelated = TitleBuffer::watched(PAGE);
+    crate::shadow::unregister(unrelated.base as usize, unrelated.base);
+    let resource = crate::resource::test_buffer_at(unrelated.base, PAGE);
+    let unrelated_heap = TestHeap::new(1);
+    let handle = unrelated_heap.handle(0);
+    let mut view = [0; 10];
+    view[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+    view[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+    view[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view[6] = 1;
+    view[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+    create_srv(std::ptr::null(), resource, &view, handle);
+    assert!(
+        super::heap(unrelated_heap.0)
+            .host()
+            .unwrap()
+            .mirror(0, handle, true)
+            .is_some()
+    );
+    assert_eq!(
+        slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource),
+        0
+    );
+    drop(unrelated);
+
     let lists: Vec<_> = (0..BUFFERS)
         .map(|i| {
             let list = host.new_list().unwrap();
@@ -567,10 +839,12 @@ fn directly_indexed_srv_sparse_heap_benchmark() {
         })
         .collect();
     let before = [
+        counter(C::DirectEligibleSlots),
         counter(C::DirectSlots),
         counter(C::DirectRanges),
         counter(C::DirectBytes),
         counter(C::DirectUs),
+        counter(C::DirectRangeBuildUs),
     ];
     let (prep_before, back_before) = crate::host::test_submission_counters();
     let started = std::time::Instant::now();
@@ -582,14 +856,17 @@ fn directly_indexed_srv_sparse_heap_benchmark() {
     let elapsed = started.elapsed();
     let (prep_after, back_after) = crate::host::test_submission_counters();
     let after = [
+        counter(C::DirectEligibleSlots),
         counter(C::DirectSlots),
         counter(C::DirectRanges),
         counter(C::DirectBytes),
         counter(C::DirectUs),
+        counter(C::DirectRangeBuildUs),
     ];
-    let [slots, ranges, bytes, sync_us] = std::array::from_fn(|i| after[i] - before[i]);
+    let [eligible, slots, ranges, bytes, sync_us, build_us] =
+        std::array::from_fn(|i| after[i] - before[i]);
     eprintln!(
-        "sparse SRV bench: {RUNS} runs, slots={slots}, merged={ranges}, copied={bytes}, refresh_us={sync_us}, prep_us={}, copyback={}, elapsed_us={}, output={}",
+        "sparse SRV bench: {RUNS} runs, eligible={eligible}, slots={slots}, merged={ranges}, copied={bytes}, refresh_us={sync_us}, build_us={build_us}, prep_us={}, copyback={}, elapsed_us={}, output={}",
         prep_after - prep_before,
         back_after - back_before,
         elapsed.as_micros(),
@@ -597,7 +874,8 @@ fn directly_indexed_srv_sparse_heap_benchmark() {
     );
     if std::env::var_os("VICTORY_COH_BASELINE").is_none() {
         assert_eq!(read(mapped), 563);
-        assert_eq!(slots, (RUNS * BUFFERS * SLOTS_PER_BUFFER) as u64);
+        assert_eq!(eligible, (RUNS * BUFFERS * SLOTS_PER_BUFFER) as u64);
+        assert_eq!(slots, 0);
         assert_eq!(ranges, (RUNS * BUFFERS) as u64);
         assert_eq!(bytes, RUNS as u64 * PAGE);
         let copied = counter(C::DirectBytes);
@@ -649,6 +927,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         "unwatched" => false,
         _ => panic!("unknown VICTORY_COH_MIXED_MEMORY: {mode}"),
     };
+    let unique = std::env::var_os("VICTORY_COH_MIXED_UNIQUE_SLOTS").is_some();
     let slot = |buffer, within| ((buffer * SLOTS_PER_BUFFER + within) * 8) as u32;
     let pipeline = compile(host, &dxc, SOURCE);
     let heap = TestHeap::new(HEAP_CAPACITY);
@@ -679,7 +958,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         for local in 0..SLOTS_PER_BUFFER {
             // Four descriptors form three disjoint intervals, one overlapping.
             let section = (local / 4 * 3 + (local % 4).min(2)) as u64;
-            let offset = section * 1024 + if local % 4 == 3 { 128 } else { 0 };
+            let offset = if unique {
+                local as u64 * 1024
+            } else {
+                section * 1024 + if local % 4 == 3 { 128 } else { 0 }
+            };
             let index = slot(i, local);
             let handle = heap.handle(index);
             title.srv(handle, offset, RANGE_LEN);
@@ -758,11 +1041,13 @@ void main(uint3 id : SV_DispatchThreadID) {
     let sample = || {
         let (prep, back) = crate::host::test_submission_counters();
         [
+            counter(C::DirectEligibleSlots),
             counter(C::DirectSlots),
             counter(C::DirectRanges),
             counter(C::DirectRequested),
             counter(C::DirectBytes),
             counter(C::DirectUs),
+            counter(C::DirectRangeBuildUs),
             counter(C::Refreshes),
             counter(C::RefreshBytes),
             counter(C::ConventionalRanges),
@@ -792,11 +1077,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         let wall_us = started.elapsed().as_micros();
         let after = sample();
         let [
+            eligible,
             slots,
             direct_ranges,
             direct_requested,
             direct,
             direct_us,
+            build_us,
             conventional_calls,
             conventional_scheduled,
             conventional_ranges,
@@ -821,14 +1108,22 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(conventional_calls, (RUNS * LISTS * CONVENTIONAL * 4) as u64);
         assert_eq!(total, conventional + direct);
         assert_eq!((shadow_allocations, srv_materializations), (0, 0));
+        assert_eq!(
+            slots,
+            if control || dirty {
+                0
+            } else {
+                (BUFFERS * SLOTS_PER_BUFFER) as u64
+            }
+        );
         let watched_copied = watched_checked - watched_unchanged;
         eprintln!(
-            "mixed SRV bench memory={mode} control={control} dirty={dirty} runs={RUNS} lists={LISTS} \
+            "mixed SRV bench memory={mode} unique={unique} control={control} dirty={dirty} runs={RUNS} lists={LISTS} \
              dispatches={} shadows={BUFFERS} logical_shadow_bytes={} heap_slots={HEAP_CAPACITY} populated_slots={} \
-             slots={slots} direct_ranges={direct_ranges} conventional_calls={conventional_calls} \
+             eligible={eligible} slots={slots} direct_ranges={direct_ranges} conventional_calls={conventional_calls} \
              conventional_scheduled={conventional_scheduled} conventional_ranges={conventional_ranges} \
              conventional_requested={conventional_requested} conventional_bytes={conventional} conventional_us={conventional_us} \
-             direct_requested={direct_requested} direct_bytes={direct} direct_us={direct_us} \
+             direct_requested={direct_requested} direct_bytes={direct} direct_us={direct_us} build_us={build_us} \
              prep_bytes={total} prep_us={prep_us} \
              watched_checked={watched_checked} watched_bytes={watched_copied} unwatched_bytes={} \
              copyback={copyback} wall_us={wall_us} gpu_direct={gpu_direct} gpu_conventional={gpu_conventional}",
@@ -861,4 +1156,197 @@ void main(uint3 id : SV_DispatchThreadID) {
     host.execute(&[&producer, refs[0]]);
     assert_eq!(read(lists[0].2), 733);
     assert_eq!(read(title.base as *mut u8), 733);
+}
+
+/// Full-size synthetic traffic using a bounded title and shadow working set.
+#[cfg(feature = "diagnostics")]
+#[test]
+fn directly_indexed_srv_report_scale_benchmark() {
+    if std::env::var_os("VICTORY_COH_REPORT_SCALE").is_none() {
+        return;
+    }
+    use crate::copystat::{C, read as counter};
+    use std::time::Instant;
+    use victory_shader::emit::HeapBufferSrvUsage;
+
+    let (gpu, dxc) = test_host().expect("DXC and a shader-model-6.6 device");
+    const PAGE: u64 = crate::watch::PAGE as u64;
+    const BUFFERS: usize = 128;
+    const DISTINCT_PER_BUFFER: usize = 8;
+    const DUPLICATES: usize = 8;
+    const HEAP_SIZE: u32 = 65_536;
+    const LISTS: usize = 4;
+    const CONVENTIONAL_BUFFERS: usize = 32;
+    const DIRECT_READ: usize = 64;
+    const SLOT_MULTIPLIER: u32 = 4;
+    let runs: usize = std::env::var("VICTORY_COH_REPORT_SCALE_RUNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(320);
+    let mode = std::env::var("VICTORY_COH_REPORT_SCALE_MODE").unwrap_or_else(|_| "mixed".into());
+    let watched = |i: usize| match mode.as_str() {
+        "mixed" => i.is_multiple_of(2),
+        "watched" => true,
+        "unwatched" => false,
+        _ => panic!("invalid synthetic memory mode"),
+    };
+    let slot = |buffer: usize, window: usize, duplicate: usize| {
+        ((buffer * DISTINCT_PER_BUFFER + window) * DUPLICATES + duplicate) as u32 * SLOT_MULTIPLIER
+    };
+
+    let selected = slot(DIRECT_READ, 0, 0);
+    let exact = std::env::var_os("VICTORY_COH_REPORT_SCALE_EXACT").is_some();
+    let native_pipeline = if exact {
+        compile(
+            gpu,
+            &dxc,
+            &SOURCE.replace("[index]", &format!("[{selected}]")),
+        )
+    } else {
+        pipeline(gpu, &dxc)
+    };
+    let usage = if exact {
+        HeapBufferSrvUsage::Exact(vec![selected])
+    } else {
+        HeapBufferSrvUsage::All
+    };
+    let heap = TestHeap::new(HEAP_SIZE);
+    let native_heap = super::heap(heap.0).host().unwrap();
+    let titles: Vec<_> = (0..BUFFERS)
+        .map(|i| {
+            let size = 2 * PAGE * DISTINCT_PER_BUFFER as u64;
+            if watched(i) {
+                TitleBuffer::watched(size)
+            } else {
+                TitleBuffer::new(size)
+            }
+        })
+        .collect();
+    let initial = gpu.new_list().unwrap();
+    for (i, title) in titles.iter().enumerate() {
+        // SAFETY: the benchmark owns each committed synthetic mapping.
+        unsafe { (title.base as *mut u8).write_bytes(0, title.size as usize) };
+        title.set(0, 13);
+        for window in 0..DISTINCT_PER_BUFFER {
+            let partial = window == DISTINCT_PER_BUFFER - 1;
+            let offset = window as u64 * 2 * PAGE + u64::from(partial) * 128;
+            let bytes = PAGE as u32 - u32::from(partial) * 256;
+            for duplicate in 0..DUPLICATES {
+                let index = slot(i, window, duplicate);
+                let handle = heap.handle(index);
+                title.srv(handle, offset, bytes);
+                native_heap
+                    .mirror(index, handle, true)
+                    .expect("live SRV fixture");
+            }
+        }
+        crate::shadow::find(title.base, title.size)
+            .unwrap()
+            .refresh(&initial, title.base, title.size);
+    }
+    initial.close();
+    gpu.execute(&[&initial]);
+
+    let (seed, seed_map) = gpu.shared_buffer(4).unwrap();
+    // SAFETY: four bytes of this test's persistent buffer mapping.
+    unsafe { seed_map.cast::<u32>().write(73) };
+    let lists: Vec<_> = (0..LISTS)
+        .map(|i| {
+            let list = gpu.new_list().unwrap();
+            let (output, mapped) = gpu.shared_buffer(4).unwrap();
+            let conventional = i * CONVENTIONAL_BUFFERS / LISTS;
+            for title in &titles[conventional..conventional + CONVENTIONAL_BUFFERS / LISTS] {
+                let shadow = crate::shadow::find(title.base, PAGE).unwrap();
+                shadow.refresh(&list, title.base, PAGE);
+            }
+            // Each list produces a native write inside one selected SRV page. The
+            // sampled input is a different buffer, so both native usages are valid.
+            for k in 0..4 {
+                let title = &titles[80 + i * 4 + k];
+                let at = title.base + (k as u64 + 1) * 2 * PAGE + 32;
+                let shadow = crate::shadow::find(at, 4).unwrap();
+                shadow.refresh(&list, at, 4);
+                shadow.gpu_writes(&list, at, 4);
+                // SAFETY: live buffers and four-byte ranges.
+                unsafe {
+                    list.list
+                        .CopyBufferRegion(&shadow.buffer, at - title.base, &seed, 0, 4)
+                };
+            }
+            list.use_view_heap(native_heap, &usage);
+            // SAFETY: all native objects are kept by the test. This intentionally
+            // chooses the input with a runtime root constant.
+            unsafe {
+                let commands = &list.list;
+                commands.SetDescriptorHeaps(&[Some(native_heap.heap.clone())]);
+                commands.SetComputeRootSignature(&native_pipeline.root);
+                commands.SetPipelineState(&native_pipeline.pso);
+                commands.SetComputeRoot32BitConstant(0, slot(DIRECT_READ, 0, 0), 0);
+                commands.SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
+                for _ in 0..16 {
+                    commands.Dispatch(1, 1, 1);
+                }
+            }
+            list.close();
+            (list, output, mapped)
+        })
+        .collect();
+    let refs: Vec<_> = lists.iter().map(|(list, _, _)| list).collect();
+    // Warm the actual recorded lists, not only the materialized descriptors.
+    for _ in 0..4 {
+        gpu.execute(&refs);
+    }
+
+    assert!(runs > 0);
+    let sample = || {
+        let (prep, _) = crate::host::test_submission_counters();
+        [
+            counter(C::DirectSlots),
+            counter(C::DirectRanges),
+            counter(C::DirectRequested),
+            counter(C::DirectBytes),
+            counter(C::DirectOverlapBytes),
+            counter(C::DirectRangeBuildUs),
+            counter(C::Watches),
+            counter(C::WatchUs),
+            counter(C::ConventionalBytes),
+            prep,
+        ]
+    };
+    let before = sample();
+    let start = Instant::now();
+    for run in 0..runs {
+        let value = 1000 + run as u32;
+        titles[0].set(0, value);
+        titles[DIRECT_READ].set(0, value);
+        gpu.execute(&refs);
+    }
+    let wall = start.elapsed().as_millis();
+    let after = sample();
+    let [
+        inspected,
+        ranges,
+        requested,
+        filled,
+        reused,
+        build_us,
+        watch_queries,
+        watch_us,
+        conventional,
+        prep_us,
+    ] = std::array::from_fn(|i| after[i] - before[i]);
+    // SAFETY: waited for the native output, mapped through the last submit.
+    let actual = unsafe { lists[0].2.cast::<u32>().read() };
+    let expected = 1000 + runs as u32 - 1;
+    assert_eq!(actual, expected);
+    eprintln!(
+        "report-scale SRVs mode={mode} exact={exact} submissions={runs} lists={LISTS} unique_heaps=1 \
+         unique_slots={} distinct_ranges={} shadow_bytes={} inspected={inspected} merged_ranges={ranges} \
+         requested={requested} filled={filled} reused={reused} range_build_us={build_us} \
+         watch_queries={watch_queries} watch_us={watch_us} conventional_bytes={conventional} \
+         prep_us={prep_us} wall_ms={wall} observed={actual}",
+        BUFFERS * DISTINCT_PER_BUFFER * DUPLICATES,
+        BUFFERS * DISTINCT_PER_BUFFER,
+        BUFFERS as u64 * 2 * PAGE * DISTINCT_PER_BUFFER as u64,
+    );
 }

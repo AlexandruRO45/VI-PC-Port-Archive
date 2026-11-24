@@ -40,9 +40,13 @@ pub(crate) enum C {
     TexHashed,
     TexChanged,
     DirectSlots,
+    DirectEligibleSlots,
+    DirectHeaps,
+    DirectRangeBuildUs,
     DirectRanges,
     DirectRequested,
     DirectBytes,
+    DirectOverlapBytes,
     DirectUs,
     ConventionalRanges,
     ConventionalRequested,
@@ -187,14 +191,18 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
     );
-    if c[C::DirectSlots as usize] > 0.0 {
+    if c[C::DirectHeaps as usize] > 0.0 {
         tracing::info!(
-            "direct SRVs per frame: {:.0} slots, {:.0} merged ranges, {:.2} MB requested, {:.2} MB filled, {:.2} ms preparing",
+            "direct SRVs per frame: {:.0} heap submissions, {:.0} slots inspected ({:.0} eligible), {:.0} merged ranges, {:.2} MB requested, {:.2} MB reused from conventional refreshes, {:.2} MB filled, {:.2} ms preparing ({:.2} ms building ranges)",
+            c[C::DirectHeaps as usize],
             c[C::DirectSlots as usize],
+            c[C::DirectEligibleSlots as usize],
             c[C::DirectRanges as usize],
             mb(c[C::DirectRequested as usize]),
+            mb(c[C::DirectOverlapBytes as usize]),
             mb(c[C::DirectBytes as usize]),
             ms(c[C::DirectUs as usize]),
+            ms(c[C::DirectRangeBuildUs as usize]),
         );
     }
     let value = |counter: C| c[counter as usize];

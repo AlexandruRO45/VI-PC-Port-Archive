@@ -323,6 +323,9 @@ struct Views {
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
+    /// Changes when a resource-backed buffer SRV stops naming live title memory.
+    #[cfg(windows)]
+    retired_srvs: u64,
 }
 
 static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
@@ -330,6 +333,8 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
+    #[cfg(windows)]
+    retired_srvs: 0,
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
@@ -390,6 +395,10 @@ pub(crate) fn forget(resource: usize) {
         if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
             continue;
         }
+        #[cfg(windows)]
+        if matches!(&view, View::Shader(_, Some(words)) if words[1] == 1) {
+            views.retired_srvs = views.retired_srvs.wrapping_add(1);
+        }
         views.index.remove(&view);
         views.list[i as usize].1 = generation.wrapping_add(1).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
@@ -411,17 +420,20 @@ fn with_view_at<T>(i: u32, generation: u32, f: impl FnOnce(&View) -> T) -> Optio
     (*current == generation).then(|| f(view))
 }
 
-/// Protect object-backed title memory from release during CPU refresh.
-/// Take snapshots of heap metadata before entering this section.
 #[cfg(windows)]
-pub(crate) fn with_live_views<T>(f: impl FnOnce(&dyn Fn(u64) -> bool) -> T) -> T {
+impl Views {
+    fn live(&self, key: u64) -> Option<&View> {
+        let (view, generation) = self.list.get(key as u32 as usize)?;
+        (*generation == (key >> 32) as u32).then_some(view)
+    }
+}
+
+/// Protect object-backed title memory from release during CPU refresh.
+/// Callers also using heap slot locks acquire them before this lock.
+#[cfg(windows)]
+fn with_live_views<T>(f: impl FnOnce(&Views) -> T) -> T {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    f(&|key| {
-        views
-            .list
-            .get(key as u32 as usize)
-            .is_some_and(|(_, generation)| *generation == (key >> 32) as u32)
-    })
+    f(&views)
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
