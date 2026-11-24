@@ -187,6 +187,56 @@ pub(crate) enum Written {
     GpuTimestamp,
     /// The CPU's performance counter.
     SystemTimestamp,
+    /// A host query result the list resolved into read-back memory at
+    /// `at`; a host GPU timestamp if `timestamp`, put on the title's clock.
+    Read {
+        at: usize,
+        timestamp: bool,
+    },
+}
+
+/// When the title's GPU clock started, by the CPU's clocks: on its first
+/// reading, or before the first host timestamp a list records.
+pub(crate) fn clock_start() -> &'static (std::time::Instant, u64) {
+    static START: std::sync::OnceLock<(std::time::Instant, u64)> = std::sync::OnceLock::new();
+    START.get_or_init(|| (std::time::Instant::now(), system_timestamp()))
+}
+
+/// The host queue's clock against the CPU's performance counter: host GPU
+/// ticks, performance counter, host ticks per second (`host::calibrate`).
+pub(crate) static HOST_CLOCK: std::sync::OnceLock<Option<(u64, u64, u64)>> =
+    std::sync::OnceLock::new();
+
+/// A host GPU timestamp on the title's clock ([`Written::GpuTimestamp`]).
+fn from_host_ticks(ticks: u64) -> u64 {
+    let (Some(&Some((gpu, cpu, frequency))), Some(counter)) =
+        (HOST_CLOCK.get(), counter_frequency())
+    else {
+        return title_ticks(clock_start().0.elapsed());
+    };
+    let cpu = i128::from(cpu)
+        + (i128::from(ticks) - i128::from(gpu)) * i128::from(counter) / i128::from(frequency);
+    let since = (cpu - i128::from(clock_start().1)).max(0);
+    (since * i128::from(TIMESTAMP_FREQUENCY) / i128::from(counter)) as u64
+}
+
+fn title_ticks(elapsed: std::time::Duration) -> u64 {
+    (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
+}
+
+/// Performance counter ticks per second.
+fn counter_frequency() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        let mut frequency = 0;
+        // SAFETY: a valid out pointer.
+        unsafe {
+            windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut frequency)
+        };
+        (frequency > 0).then_some(frequency as u64)
+    }
+    #[cfg(not(windows))]
+    None
 }
 
 impl Written {
@@ -194,12 +244,20 @@ impl Written {
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
         let value = match self {
             Written::Value(v) => v,
-            Written::GpuTimestamp => {
-                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
-            }
+            Written::GpuTimestamp => title_ticks(clock_start().0.elapsed()),
             Written::SystemTimestamp => system_timestamp(),
+            Written::Read {
+                at: from,
+                timestamp,
+            } => {
+                // SAFETY: mapped read-back memory the list keeps until reset.
+                let value = unsafe { (from as *const u64).read_unaligned() };
+                if timestamp {
+                    from_host_ticks(value)
+                } else {
+                    value
+                }
+            }
         };
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {

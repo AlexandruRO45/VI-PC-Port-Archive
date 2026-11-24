@@ -801,29 +801,48 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     }
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// `BeginQuery(heap, type, index)`: begun on the host list too, for heaps
+/// with a host query heap (`query`).
+extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        crate::query::begin(list, heap, kind, index);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
+
+/// `EndQuery(heap, type, index)`: as `BeginQuery`.
+extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        crate::query::end(list, heap, kind, index);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
-/// each query's result into the buffer once the list has run. Timestamps
-/// (type 2) are the GPU clock then; occlusion counts (0) say a million
-/// samples passed and binary occlusion (1) visible, so nothing is culled
-/// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
+/// each query's result into the buffer once the list has run. Occlusion
+/// (type 0), binary occlusion (1) and timestamps (2) are the host GPU's
+/// results when every query was ended on the host (`query::resolve`).
+/// Otherwise, and for a query whose draws did not all run on the host,
+/// they are plausible values: occlusion counts say a million samples
+/// passed and binary occlusion visible, so nothing is culled by a query;
+/// timestamps are the GPU clock when the list has run.
+/// shortcut: pipeline statistics are zeros.
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
 ) {
-    const OCCLUSION: u32 = 0;
-    const BINARY: u32 = 1;
-    const TIMESTAMP: u32 = 2;
+    const OCCLUSION: u32 = crate::query::OCCLUSION;
+    const BINARY: u32 = crate::query::BINARY_OCCLUSION;
+    const TIMESTAMP: u32 = crate::query::TIMESTAMP;
     const PIPELINE_STATISTICS: u32 = 3;
     let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
         return;
@@ -838,6 +857,15 @@ extern "system" fn resolve_queries(
     if offset + u64::from(count) * bytes > size {
         return;
     }
+    #[cfg(windows)]
+    if bytes == 8
+        && let Some(list) = host_list(this)
+        // SAFETY: inside the buffer, checked above.
+        && crate::query::resolve(list, heap, (kind, first, count), unsafe { data.add(offset as usize) }, what)
+    {
+        return;
+    }
+    let _ = (heap, first);
     for i in 0..u64::from(count) {
         // Wider results are written as 8-byte pieces.
         for piece in 0..bytes / 8 {
@@ -1082,6 +1110,9 @@ mod state {
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            if let Some(list) = super::host_list(this) {
+                list.note_dropped();
+            }
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1185,6 +1216,10 @@ extern "system" fn execute_indirect(
     }
     if ran {
         return;
+    }
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.note_dropped();
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
@@ -1340,8 +1375,8 @@ const METHODS: [(usize, *const ()); 52] = [
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
 const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
+    (28, begin_query as *const ()),            // 0xe0 BeginQuery
+    (29, end_query as *const ()),              // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310

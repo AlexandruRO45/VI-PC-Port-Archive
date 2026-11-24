@@ -119,6 +119,24 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
+/// Pairs the host queue's timestamp clock with the CPU's performance
+/// counter once, so resolved GPU timestamps share the title's clock
+/// ([`crate::queue::Written::GpuTimestamp`]).
+pub(crate) fn calibrate() {
+    let Some(host) = host() else { return };
+    // Host timestamps the list takes come after this.
+    crate::queue::clock_start();
+    crate::queue::HOST_CLOCK.get_or_init(|| {
+        let (mut gpu, mut cpu) = (0, 0);
+        // SAFETY: plain queries of our queue.
+        unsafe {
+            let frequency = host.queue.GetTimestampFrequency().ok()?;
+            host.queue.GetClockCalibration(&mut gpu, &mut cpu).ok()?;
+            (frequency != 0).then_some((gpu, cpu, frequency))
+        }
+    });
+}
+
 pub(crate) fn host() -> Option<&'static Host> {
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
@@ -301,6 +319,11 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// The title's occlusion queries begun in this list and not yet ended.
+    queries: Mutex<Vec<crate::query::Open>>,
+    /// Draws and dispatches recorded but not run on the host: a query whose
+    /// span saw this grow does not count all of the title's samples.
+    dropped: std::sync::atomic::AtomicU64,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -481,6 +504,8 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                queries: Mutex::default(),
+                dropped: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -860,6 +885,8 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        let open = std::mem::take(&mut *self.open_queries());
+        crate::query::end_open(self, open);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -882,6 +909,7 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.open_queries().clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1063,6 +1091,70 @@ impl HostList {
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
+    }
+
+    /// The title's occlusion queries open in this list.
+    pub(crate) fn open_queries(&self) -> std::sync::MutexGuard<'_, Vec<crate::query::Open>> {
+        self.queries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Draws and dispatches dropped in this list so far.
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// A draw or dispatch the title recorded did not run on the host.
+    pub(crate) fn note_dropped(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A mapped read-back buffer of `size` bytes, alive until the list is
+    /// reset: the GPU copies into it, the CPU reads it once the list ran.
+    pub(crate) fn readback(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let host = host()?;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(8),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a CPU-readable buffer.
+        let made = unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        if let Err(e) = made {
+            tracing::warn!(error = %e, size, "no read-back buffer");
+            return None;
+        }
+        let buffer = buffer?;
+        name(&buffer, || format!("list read-back {size:#x}"));
+        self.deferred().uploads.push(buffer.clone());
+        Some((buffer, data.cast()))
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is

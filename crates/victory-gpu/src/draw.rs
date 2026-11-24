@@ -521,6 +521,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.note_dropped();
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
@@ -530,16 +531,19 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.note_dropped();
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            list.note_dropped();
             return;
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.note_dropped();
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -605,6 +609,7 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.note_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -864,6 +869,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.note_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -951,6 +957,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.note_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
