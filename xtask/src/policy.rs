@@ -2265,6 +2265,22 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+
+        // Git for Windows can run cargo.exe. A searchable directory called
+        // cargo must not mask that executable, and a policy failure from it
+        // must reach Git through each hook.
+        std::fs::rename(&cargo, bin.join("cargo.exe")).unwrap();
+        std::fs::create_dir(&cargo).unwrap();
+        std::fs::write(
+            bin.join("cargo.exe"),
+            format!("#!/bin/sh\necho \"$*\" >> {}\nexit 37\n", sh_quote(&log)),
+        )
+        .unwrap();
+        for hook in &hooks {
+            let (out, ran) = run(hook, &[("HOME", &home)]);
+            assert_eq!(ran, "xtask policy --staged\n", "{}", hook.display());
+            assert_eq!(out.status.code(), Some(37), "{}", hook.display());
+        }
     }
 
     #[test]
