@@ -279,7 +279,8 @@ enum MaskData {
     /// lanes throughout (`v_mbcnt`, `v_readlane` at a computed lane).
     Host,
     /// Mesh programs: their lanes and waves (LDS per console wave) are the
-    /// console's but no host wave size can be declared.
+    /// console's, but no host wave size can be declared for a mesh stage, so
+    /// a mask read as data has no wave whose bits it could be.
     None,
 }
 
@@ -571,12 +572,12 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
-            // A wave64 mesh shader cannot run correctly on a wave32 device:
-            // declare the required wave size so D3D12 refuses the pipeline
-            // cleanly instead of hanging the GPU (TDR) on wave32 hardware.
-            if x.native.wave64 {
-                s.wave_size = Some(64);
-            }
+            // No wave size for a mesh shader: DXIL allows the attribute only
+            // on compute and node shaders, and the validator rejects a
+            // container whose PSV0 lane counts disagree with the module, so a
+            // wave64 mesh program cannot ask the runtime for 64-wide waves.
+            // Its lanes are the device's, which is why a mask read as data
+            // stays refused for mesh (see `MaskData`).
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -9419,6 +9420,21 @@ mod tests {
         assert!(lower_mesh(256, 128, 128).is_err());
         assert!(lower_mesh(32, 512, 128).is_err());
         assert!(lower_mesh(32, 128, 512).is_err());
+    }
+
+    #[test]
+    fn a_mesh_shader_declares_no_wave_size() {
+        // DXIL allows the wave-size attribute only on compute and node
+        // shaders, and the validator rejects a container whose PSV0 lane
+        // counts disagree with the module, so a mesh program asks for
+        // neither: its wave is the device's.
+        let l = lower_mesh(128, 128, 128).unwrap();
+        let c = crate::Container::parse(&l.dxil).unwrap();
+        // PSV0: the runtime info's wave lane counts (min, max), after the
+        // part's size dword.
+        let psv0 = c.part(crate::FourCC::PSV0).unwrap().data;
+        assert_eq!(&psv0[20..24], &0u32.to_le_bytes());
+        assert_eq!(&psv0[24..28], &u32::MAX.to_le_bytes());
     }
 
     #[test]
