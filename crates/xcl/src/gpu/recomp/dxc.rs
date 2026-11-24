@@ -477,6 +477,10 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
+/// HLSL over this size is compiled at -O0 and one at a time (`compile_here`).
+const ENORMOUS_SOURCE: usize = 8 * 1024 * 1024;
+static ENORMOUS_ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
@@ -487,8 +491,13 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // compile). -O0 only as a safety net for enormous sources.
     // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
     // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
+    // Enormous sources (over ENORMOUS_SOURCE, a handful in a retail pack) one at a time: each takes
+    // GBs in DXC, and the commit checks that hold compiles back (`wait_for_memory`) do not see that
+    // under Wine, where the commit limit includes all of the host's swap. Three of them at once
+    // took 29 GB of RAM and 20 GB of swap in `xcl pipelines` on a 32 GB machine.
+    let _enormous = (src.len() > ENORMOUS_SOURCE).then(|| ENORMOUS_ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner()));
     if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 8 * 1024 * 1024 {
+        if src.len() > ENORMOUS_SOURCE {
             args.push(crate::util::wide("-O0"));
         } else if src.len() > 1024 * 1024 {
             args.push(crate::util::wide("-O1"));
