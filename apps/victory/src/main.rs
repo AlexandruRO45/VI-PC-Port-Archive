@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
 mod translate;
 
 use std::path::PathBuf;
@@ -152,6 +153,7 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
+        #[cfg(windows)]
         Command::Translate {
             paths,
             validate,
@@ -160,6 +162,9 @@ fn main() -> Result<()> {
             jobs,
             host_lanes,
         } => translate::run(paths, validate, pipelines, list, jobs, host_lanes),
+        // Emitting DXIL ends in the host's D3D compiler and validator.
+        #[cfg(not(windows))]
+        Command::Translate { .. } => anyhow::bail!("shader translation requires Windows"),
         Command::Run {
             exe,
             unimplemented,
