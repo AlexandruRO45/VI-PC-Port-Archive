@@ -47,7 +47,8 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
    `cargo xtask install-hooks`) is an allowlist: files must have an allowed
    type, be under 512 KiB, contain no binary data or known binary
    signatures, and hold no long hex/base64 runs, base64url (`-`, `_`) included (a run
-   wrapped onto several lines, as `base64` writes it, is one run) and no long
+   wrapped onto several lines, as `base64` writes it, is one run), no long
+   runs without whitespace (ascii85, Z85, uuencode), and no long
    numeric arrays or `\xHH` escape strings (`xxd -i` output; tables over 512
    entries are split into rows). File names must
    be UTF-8, and submodules, like untracked git repositories nested in the

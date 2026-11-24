@@ -551,6 +551,13 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
         let run = longest_encoded_run(content);
         if run > MAX_ENCODED_RUN {
             problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
+        } else {
+            let run = longest_printable_run(content);
+            if run > MAX_ENCODED_RUN {
+                problems.push(format!(
+                    "{run}-character run without whitespace (ascii85, Z85 or uuencoded data?)"
+                ));
+            }
         }
         let run = longest_literal_run(content);
         if run > MAX_LITERAL_RUN {
@@ -600,6 +607,51 @@ fn longest_run(content: &[u8], extra: &[u8]) -> usize {
             continue;
         }
         run = 0;
+        i += 1;
+    }
+    longest
+}
+
+/// Shortest line after which a line break continues a printable run.
+const MIN_WRAPPED_LINE: usize = 40;
+
+/// Longest run of printable ASCII without whitespace (`!` to `~`).
+///
+/// ascii85 (`!` to `u`: Python's `a85encode`, PostScript, PDF), Z85
+/// (`basenc --z85`, ZeroMQ) and uuencode (`` ` `` to `_`) put punctuation in
+/// almost every few characters, so their output never makes a long hex or
+/// base64 run and a file of it passed. Text has whitespace far more often:
+/// the longest such run in the tree is a few dozen characters.
+///
+/// A single line break continues the run as for base64, but only after a
+/// line of at least `MIN_WRAPPED_LINE` characters: encoders wrap at 60 to 80
+/// columns (`basenc` 76, `uuencode` 61), while a list of short entries
+/// without spaces, such as `.gitignore` patterns, is not one long run.
+fn longest_printable_run(content: &[u8]) -> usize {
+    let is_payload = |b: &u8| b.is_ascii_graphic();
+    let (mut longest, mut run, mut line, mut i) = (0, 0, 0, 0);
+    while let Some(b) = content.get(i) {
+        if is_payload(b) {
+            run += 1;
+            line += 1;
+            longest = longest.max(run);
+            i += 1;
+            continue;
+        }
+        let line_break = match &content[i..] {
+            [b'\r', b'\n', ..] => 2,
+            [b'\n', ..] => 1,
+            _ => 0,
+        };
+        if line_break > 0
+            && line >= MIN_WRAPPED_LINE
+            && content.get(i + line_break).is_some_and(is_payload)
+        {
+            line = 0;
+            i += line_break;
+            continue;
+        }
+        (run, line) = (0, 0);
         i += 1;
     }
     longest
@@ -1670,6 +1722,67 @@ mod tests {
         assert_eq!(run(b""), 0);
         let paragraph = "The quick brown fox\njumps over the lazy dog\n".repeat(200);
         assert!(run(paragraph.as_bytes()) < 20);
+    }
+
+    /// ascii85, Z85 and uuencode alphabets, unwrapped and wrapped: punctuation
+    /// breaks every hex/base64 run, the data is there all the same.
+    #[test]
+    fn rejects_ascii85_z85_and_uuencoded_data() {
+        let ascii85: Vec<u8> = (b'!'..=b'u').collect();
+        let uuencode: Vec<u8> = (b'!'..=b'`').collect();
+        let z85 = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
+        for (what, alphabet, width) in [
+            ("ascii85", &ascii85[..], 76),
+            ("Z85", &z85[..], 76),
+            ("uuencode", &uuencode[..], 61),
+        ] {
+            let encoded: String = (0..MAX_ENCODED_RUN * 2)
+                .map(|i| alphabet[i * 7 % alphabet.len()] as char)
+                .collect();
+            assert!(
+                super::longest_encoded_run(encoded.as_bytes()) < 32,
+                "{what}: the hex/base64 check alone sees only short runs"
+            );
+            let wrapped: String = encoded
+                .as_bytes()
+                .chunks(width)
+                .map(|line| String::from_utf8_lossy(line) + "\n")
+                .collect();
+            for blob in [
+                encoded.clone(),
+                wrapped.clone(),
+                wrapped.replace('\n', "\r\n"),
+            ] {
+                assert_eq!(
+                    super::longest_printable_run(blob.as_bytes()),
+                    encoded.len(),
+                    "{what}"
+                );
+                assert!(
+                    check("strings.txt", blob.as_bytes())
+                        .iter()
+                        .any(|p| p.contains("without whitespace")),
+                    "{what}: {blob:?}"
+                );
+            }
+        }
+    }
+
+    /// Whitespace ends a printable run, and a line break continues one only
+    /// after a line as long as an encoder writes.
+    #[test]
+    fn printable_runs_join_only_long_lines() {
+        let run = super::longest_printable_run;
+        assert_eq!(run(b"a+b c"), 3);
+        assert_eq!(run(b"ab\n\ncd"), 2);
+        let long = "x!".repeat(super::MIN_WRAPPED_LINE / 2);
+        assert_eq!(run(format!("{long}\n{long}").as_bytes()), long.len() * 2);
+        assert_eq!(run(format!("{long}\n {long}").as_bytes()), long.len());
+        assert_eq!(run(format!("x!\n{long}").as_bytes()), long.len());
+        let gitignore = "/target/\n*.exe\n*.dll\n**/*.bin\n".repeat(100);
+        assert!(check(".gitignore", gitignore.as_bytes()).is_empty());
+        let url = format!("<https://example.com/{}?a=1&b=2>\n", "p/".repeat(150));
+        assert!(check("README.md", url.as_bytes()).is_empty());
     }
 
     /// `xxd -i` output, a Rust byte array and a byte-escape string: every
