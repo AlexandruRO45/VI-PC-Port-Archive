@@ -1744,6 +1744,73 @@ mod tests {
         assert!(!listed.iter().any(|n| n.starts_with("x/")), "{listed:?}");
     }
 
+    /// A TMPDIR that is a directory but cannot be written to (a shared
+    /// `/tmp` mounted read-only, or one made `0555`) is passed over for the
+    /// next candidate, as a regular file is, and nothing is left in it.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_pass_over_a_read_only_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+        let outer = tempdir();
+        let locked = outer.path().join("locked");
+        let plain = outer.path().join("plain");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let restore = || {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        if std::fs::write(locked.join("probe"), b"").is_ok() {
+            // Root, or a capability like it, writes through the mode bits.
+            restore();
+            return;
+        }
+
+        let tmp = tempdir_in_first(&crate::workspace_root(), [locked.clone(), plain.clone()]);
+        assert!(tmp.path().starts_with(plain.canonicalize().unwrap()));
+        assert_eq!(std::fs::read_dir(&locked).unwrap().count(), 0);
+        restore();
+    }
+
+    /// A TMPDIR's name is matched against ignore rules as the literal path
+    /// it is, never as a glob: under `/a/`, a visible directory named
+    /// `[ab]` or `a*` (each a glob that would match `a`) is refused and
+    /// left empty, while a directory named in non-ASCII UTF-8 (`scrätch`,
+    /// `日本`), which `core.quotePath` would print quoted and escaped, is
+    /// accepted when a rule ignores it, and listed unquoted when none does.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_matched_by_their_literal_utf8_name() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        git_str(root, &["config", "core.quotePath", "true"]);
+        std::fs::write(root.join(".gitignore"), "/a/\n/scrätch/\n/日本/\n").unwrap();
+        let bracket = root.join("[ab]");
+        let star = root.join("a*");
+        let ignored = root.join("a");
+        let accented = root.join("scrätch");
+        let japanese = root.join("日本");
+        let seen = root.join("vüe");
+        for dir in [&bracket, &star, &ignored, &accented, &japanese, &seen] {
+            std::fs::create_dir(dir).unwrap();
+        }
+
+        let tmp = tempdir_in_first(root, [bracket.clone(), star.clone(), accented.clone()]);
+        assert_eq!(tmp.path().parent(), Some(accented.as_path()));
+        let tmp_jp = tempdir_in_first(root, [seen.clone(), japanese.clone()]);
+        assert_eq!(tmp_jp.path().parent(), Some(japanese.as_path()));
+        for dir in [&bracket, &star, &ignored, &seen] {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        for dir in [tmp.path(), tmp_jp.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        std::fs::write(seen.join("a.rs"), b"fn a() {}\n").unwrap();
+        assert_eq!(names(root, false), [".gitignore", "vüe/a.rs"]);
+        super::run(root, false).unwrap();
+    }
+
     /// A TMPDIR that is unset to nothing, missing, or a dangling symlink is
     /// passed over for the next candidate, not panicked on, and nothing is
     /// made in its place.
