@@ -2142,6 +2142,14 @@ mod tests {
                 continue;
             };
             let mode = h.recommended_wave64_mode();
+            let expected = if h.supports_wave64() {
+                Wave64Mode::Native
+            } else if h.supports_wave32() {
+                Wave64Mode::Wave32
+            } else {
+                Wave64Mode::Emulate
+            };
+            assert_eq!(mode, expected);
             let required_wave = match mode {
                 Wave64Mode::Native => Some(64),
                 Wave64Mode::Wave32 => Some(32),
@@ -2149,10 +2157,6 @@ mod tests {
             };
             h.compute_pipeline(&cs_with_wave_size(required_wave))
                 .expect("recommended Wave64 mode should build a compute PSO");
-            if warp {
-                assert_eq!(mode, Wave64Mode::Emulate);
-            }
         }
->>>>>>> e799ec5 (Shaders: emulate Wave64 compute shaders on Wave32 and narrower hosts)
     }
 }
