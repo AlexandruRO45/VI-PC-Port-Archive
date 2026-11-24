@@ -198,6 +198,7 @@ enum MdDef {
 
 #[derive(Default)]
 pub(crate) struct Module {
+    pub native_low_precision: bool,
     types: Vec<TypeDef>,
     type_ids: HashMap<TypeDef, u32>,
     consts: Vec<(Ty, Const)>,
@@ -594,12 +595,12 @@ impl Module {
         w.exit();
 
         w.record(2, &chars("dxil-ms-dx"));
-        w.record(
-            3,
-            &chars(
-                "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64",
-            ),
-        );
+        let layout = if self.native_low_precision {
+            "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-n8:16:32:64"
+        } else {
+            "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64"
+        };
+        w.record(3, &chars(layout));
         let first_const = (self.globals.len() + self.funcs.len()) as u64;
         for g in &self.globals {
             // [type, address space << 2 | explicit type | constant, init id

@@ -34,6 +34,7 @@ pub(crate) struct HostHeap {
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
     image_data: OnceLock<ImageData>,
+    title_memory: Mutex<Option<D3D12_GPU_DESCRIPTOR_HANDLE>>,
 }
 
 /// Image dimensions and base mip at the slot indices used by the shader.
@@ -168,6 +169,7 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             image_data: OnceLock::new(),
+            title_memory: Mutex::new(None),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -283,6 +285,28 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    pub(crate) fn title_memory(&self) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
+        use victory_shader::emit::TITLE_MEMORY_VIEWS;
+
+        let mut handle = self.title_memory.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = *handle {
+            return Some(handle);
+        }
+        let mirror = crate::mirror::get()?;
+        let slot = self.dynamic(TITLE_MEMORY_VIEWS)?;
+        if mirror.read_views(self.cpu(slot), self.step).is_none() {
+            self.release(slot, TITLE_MEMORY_VIEWS);
+            return None;
+        }
+        // SAFETY: this is a live shader-visible heap with the reserved slots.
+        let base = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
+        let start = D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: base.ptr + u64::from(self.step) * u64::from(slot),
+        };
+        *handle = Some(start);
+        Some(start)
     }
 
     /// A bounded raw view of the image fields. Allocate it on first use,

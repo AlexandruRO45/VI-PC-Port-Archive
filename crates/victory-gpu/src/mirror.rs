@@ -17,7 +17,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_TYPELESS, DXGI_SAMPLE_DESC};
+use victory_shader::emit::{TITLE_MEMORY_VIEW_SHIFT, TITLE_MEMORY_VIEWS};
 
 /// Mirrored title addresses: below 128 GiB (Grand Theft Auto VI's reach about 65 GiB).
 const BYTES: u64 = 128 << 30;
@@ -118,6 +119,55 @@ pub(crate) fn get() -> Option<&'static Mirror> {
 }
 
 impl Mirror {
+    /// Puts the bounded raw SRVs in consecutive slots of a live view heap.
+    pub(crate) fn read_views(
+        &self,
+        first: D3D12_CPU_DESCRIPTOR_HANDLE,
+        step: u32,
+    ) -> Option<()> {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        let host = crate::host::host()?;
+        if !*SUPPORTED.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            // SAFETY: the query writes this feature's structure.
+            let supported = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            };
+            supported.is_ok()
+                && options.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_2.0
+                && options.ResourceBindingTier.0 >= D3D12_RESOURCE_BINDING_TIER_2.0
+        }) {
+            return None;
+        }
+        let elements = 1 << (TITLE_MEMORY_VIEW_SHIFT - 2);
+        debug_assert_eq!(u64::from(elements) * 4 * u64::from(TITLE_MEMORY_VIEWS), BYTES);
+        for index in 0..TITLE_MEMORY_VIEWS {
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: u64::from(index) * u64::from(elements),
+                        NumElements: elements,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            };
+            let slot = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: first.ptr + (index * step) as usize,
+            };
+            // SAFETY: the caller reserved this range in a live view heap.
+            unsafe { host.device.CreateShaderResourceView(&self.buffer, Some(&desc), slot) };
+        }
+        Some(())
+    }
+
     /// Whether `[start, start + len)` lies in the mirror.
     pub(crate) fn covers(&self, start: u64, len: u64) -> bool {
         start.checked_add(len).is_some_and(|end| end <= BYTES)
@@ -157,6 +207,29 @@ impl Mirror {
         }
         Some(out)
     }
+}
+
+/// A heap for shaders that read the mirror without a title view heap.
+pub(crate) fn read_heap() -> Option<&'static ID3D12DescriptorHeap> {
+    static HEAP: OnceLock<Option<ID3D12DescriptorHeap>> = OnceLock::new();
+    HEAP.get_or_init(|| {
+        let mirror = get()?;
+        let host = crate::host::host()?;
+        // SAFETY: plain creation of a shader-visible heap.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(
+                &D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: TITLE_MEMORY_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                },
+            ).ok()?;
+            let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            mirror.read_views(heap.GetCPUDescriptorHandleForHeapStart(), step)?;
+            Some(heap)
+        }
+    }).as_ref()
 }
 
 impl Mirror {

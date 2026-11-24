@@ -104,6 +104,13 @@ pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 /// resource heap. The register is outside the title's possible root slots.
 pub const DESCRIPTOR_DATA_SLOT: u8 = u8::MAX;
 
+/// Internal binding for the SRV table covering the title's GPU address space.
+pub const TITLE_MEMORY_SLOT: u8 = u8::MAX - 1;
+pub const TITLE_MEMORY_SPACE: u32 = 2;
+/// Each SRV holds at most 2^27 dwords. The 256 views cover 128 GiB.
+pub const TITLE_MEMORY_VIEW_SHIFT: u32 = 29;
+pub const TITLE_MEMORY_VIEWS: u32 = 256;
+
 /// Local build: the loop limit without an override (see [`loop_limit`]).
 const LOCAL_LOOP_LIMIT: u32 = 1024;
 
@@ -165,6 +172,8 @@ pub struct HostShader {
     /// The host binds [`DESCRIPTOR_DATA_SLOT`] through a descriptor table
     /// and the title's root SRVs as root descriptors.
     pub root_srvs: Vec<u8>,
+    /// Raw buffer UAVs bound as root descriptors by title root slot.
+    pub root_uavs: Vec<u8>,
 }
 
 impl HostShader {
@@ -217,7 +226,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let res = resource::track_native(&p, &native, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
@@ -317,6 +326,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
     })
 }
 
@@ -473,7 +483,7 @@ mod tests {
             half: false,
         };
         let osg1 =
-            container::signature(&[el("SV_Depth", 17, 9), el("SV_StencilRef", 20, 5)], false);
+            container::signature(&[el("SV_Depth", 17, 9), el("SV_StencilRef", 20, 5)], false, false);
         let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
@@ -569,8 +579,18 @@ mod tests {
             usage: 15,
             half: false,
         };
-        let isg = container::signature(&[element("SV_Position", 3)], true);
-        let osg = container::signature(&[element("SV_Target", 16)], false);
+        let texcoord = |index| SigElement {
+            index,
+            row: Some(index + 1),
+            usage: 0,
+            ..element("TEXCOORD", 0)
+        };
+        let isg = container::signature(
+            &[element("SV_Position", 3), texcoord(0), texcoord(1)],
+            true,
+            false,
+        );
+        let osg = container::signature(&[element("SV_Target", 16)], false, false);
         let c = crate::dxbc::build(&[(FourCC::ISG1, &isg), (FourCC::OSG1, &osg)]);
         let c = Container::parse(&c).unwrap();
         let p = ir::build(&native.code, false, native.vgprs).unwrap();
@@ -635,6 +655,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -645,6 +666,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -734,8 +756,8 @@ mod tests {
                 usage,
                 half: false,
             };
-            let isg1 = super::container::signature(&[el("TEXCOORD", 0, 0)], true);
-            let osg1 = super::container::signature(&[el("SV_Target", 16, 15)], false);
+            let isg1 = super::container::signature(&[el("TEXCOORD", 0, 0)], true, false);
+            let osg1 = super::container::signature(&[el("SV_Target", 16, 15)], false, false);
             let bytes =
                 crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
             let c = super::Container::parse(&bytes).unwrap();
@@ -806,7 +828,7 @@ mod tests {
             usage: 0,
             half: false,
         };
-        let isg1 = super::container::signature(&[w_only], true);
+        let isg1 = super::container::signature(&[w_only], true, false);
         let bytes = crate::dxbc::build(&[(super::FourCC::ISG1, &isg1)]);
         let c = super::Container::parse(&bytes).unwrap();
         let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();

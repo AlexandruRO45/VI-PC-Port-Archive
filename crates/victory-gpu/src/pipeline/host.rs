@@ -8,7 +8,10 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{DESCRIPTOR_DATA_SLOT, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    DESCRIPTOR_DATA_SLOT, ROOT_CBV_SPACE, SAMPLER_SPACE, TITLE_MEMORY_SLOT, TITLE_MEMORY_SPACE,
+    TITLE_MEMORY_VIEWS, USER_DATA_SPACE,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -251,6 +254,7 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    pub(crate) root_uavs: Vec<(u8, u32)>,
 }
 
 impl Stage {
@@ -339,6 +343,7 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -366,12 +371,19 @@ impl HostPipeline {
                     D3D12_ROOT_PARAMETER_TYPE_SRV,
                     &mut stage.root_srvs,
                 ),
+                (
+                    &t.root_uavs,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    &mut stage.root_uavs,
+                ),
             ] {
                 for &slot in slots {
                     out.push((slot, params.len() as u32));
                     let image_data =
                         kind == D3D12_ROOT_PARAMETER_TYPE_SRV && slot == DESCRIPTOR_DATA_SLOT;
-                    let (kind, binding) = if image_data {
+                    let title_memory =
+                        kind == D3D12_ROOT_PARAMETER_TYPE_SRV && slot == TITLE_MEMORY_SLOT;
+                    let (kind, binding) = if image_data || title_memory {
                         static RANGE: D3D12_DESCRIPTOR_RANGE1 = D3D12_DESCRIPTOR_RANGE1 {
                             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
                             NumDescriptors: 1,
@@ -380,12 +392,20 @@ impl HostPipeline {
                             Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
                             OffsetInDescriptorsFromTableStart: 0,
                         };
+                        static TITLE: D3D12_DESCRIPTOR_RANGE1 = D3D12_DESCRIPTOR_RANGE1 {
+                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                            NumDescriptors: TITLE_MEMORY_VIEWS,
+                            BaseShaderRegister: 0,
+                            RegisterSpace: TITLE_MEMORY_SPACE,
+                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                            OffsetInDescriptorsFromTableStart: 0,
+                        };
                         (
                             D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
                             D3D12_ROOT_PARAMETER1_0 {
                                 DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
                                     NumDescriptorRanges: 1,
-                                    pDescriptorRanges: &RANGE,
+                                    pDescriptorRanges: if title_memory { &TITLE } else { &RANGE },
                                 },
                             },
                         )

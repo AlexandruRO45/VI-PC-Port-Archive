@@ -132,22 +132,50 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        let mut views: Vec<(u8, bool)> = stages
+        let mut views: Vec<_> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, false));
-                cbvs.chain(s.root_srvs.iter().map(|&r| (r, true)))
+                s.root_cbvs
+                    .iter()
+                    .map(|&r| (r, D3D12_ROOT_PARAMETER_TYPE_CBV.0))
+                    .chain(
+                        s.root_srvs
+                            .iter()
+                            .map(|&r| (r, D3D12_ROOT_PARAMETER_TYPE_SRV.0)),
+                    )
+                    .chain(
+                        s.root_uavs
+                            .iter()
+                            .map(|&r| (r, D3D12_ROOT_PARAMETER_TYPE_UAV.0)),
+                    )
             })
             .collect();
         views.sort_unstable();
         views.dedup();
-        for (slot, srv) in views {
+        for (slot, kind) in views {
+            if slot == super::TITLE_MEMORY_SLOT && kind == D3D12_ROOT_PARAMETER_TYPE_SRV.0 {
+                static RANGE: D3D12_DESCRIPTOR_RANGE1 = D3D12_DESCRIPTOR_RANGE1 {
+                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                    NumDescriptors: super::TITLE_MEMORY_VIEWS,
+                    BaseShaderRegister: 0,
+                    RegisterSpace: super::TITLE_MEMORY_SPACE,
+                    Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                    OffsetInDescriptorsFromTableStart: 0,
+                };
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                            NumDescriptorRanges: 1,
+                            pDescriptorRanges: &RANGE,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                });
+                continue;
+            }
             params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: if srv {
-                    D3D12_ROOT_PARAMETER_TYPE_SRV
-                } else {
-                    D3D12_ROOT_PARAMETER_TYPE_CBV
-                },
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE(kind),
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                         ShaderRegister: u32::from(slot),
@@ -528,6 +556,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
     }
 }
 
