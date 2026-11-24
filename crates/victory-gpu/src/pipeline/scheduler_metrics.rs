@@ -91,11 +91,11 @@ impl Tracker {
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]
-    fn update(&self, change: impl FnOnce(&mut State)) {
-        self.update_at(Instant::now(), change);
+    fn update(&self, change: impl FnOnce(&mut State)) -> bool {
+        self.update_at(Instant::now(), change)
     }
 
-    fn update_at(&self, now: Instant, change: impl FnOnce(&mut State)) {
+    fn update_at(&self, now: Instant, change: impl FnOnce(&mut State)) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let now = now.max(state.last_event);
         let elapsed_us = now.duration_since(state.last_event).as_micros() as u64;
@@ -122,9 +122,9 @@ impl Tracker {
             state.queued_with_dependency_wait_periods =
                 state.queued_with_dependency_wait_periods.saturating_add(1);
         }
-        if !had_all_workers_waiting_with_queue
-            && state.has_all_workers_waiting_with_queue()
-        {
+        let entered_full_worker_backlog = !had_all_workers_waiting_with_queue
+            && state.has_all_workers_waiting_with_queue();
+        if entered_full_worker_backlog {
             state.all_workers_waiting_with_queue_periods = state
                 .all_workers_waiting_with_queue_periods
                 .saturating_add(1);
@@ -134,6 +134,8 @@ impl Tracker {
         state.peak_queued_jobs = state.peak_queued_jobs.max(state.queued_jobs);
         state.peak_dependency_waiters =
             state.peak_dependency_waiters.max(state.dependency_waiters);
+
+        entered_full_worker_backlog
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -169,6 +171,15 @@ fn tracker() -> &'static Tracker {
     TRACKER.get_or_init(Tracker::new)
 }
 
+/// Applies a state change and reports immediately when every worker becomes
+/// dependency-blocked while at least one pipeline remains queued.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn update(change: impl FnOnce(&mut State)) {
+    if tracker().update(change) {
+        report();
+    }
+}
+
 /// Marks a pipeline worker thread for the lifetime of its receive loop.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(super) struct WorkerGuard;
@@ -176,7 +187,7 @@ pub(super) struct WorkerGuard;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(super) fn worker() -> WorkerGuard {
     PIPELINE_WORKER.with(|worker| worker.set(true));
-    tracker().update(|state| state.worker_threads = state.worker_threads.saturating_add(1));
+    update(|state| state.worker_threads = state.worker_threads.saturating_add(1));
     WorkerGuard
 }
 
@@ -184,7 +195,7 @@ pub(super) fn worker() -> WorkerGuard {
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
         PIPELINE_WORKER.with(|worker| worker.set(false));
-        tracker().update(|state| {
+        update(|state| {
             state.worker_threads = state.worker_threads.saturating_sub(1);
         });
     }
@@ -193,7 +204,7 @@ impl Drop for WorkerGuard {
 /// Records one pipeline entering the worker queue.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(super) fn job_queued() {
-    tracker().update(|state| state.queued_jobs = state.queued_jobs.saturating_add(1));
+    update(|state| state.queued_jobs = state.queued_jobs.saturating_add(1));
 }
 
 /// Moves one queued pipeline to the active-worker count until its guard drops.
@@ -202,7 +213,7 @@ pub(super) struct JobGuard;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(super) fn job_started() -> JobGuard {
-    tracker().update(|state| {
+    update(|state| {
         state.queued_jobs = state.queued_jobs.saturating_sub(1);
         state.active_jobs = state.active_jobs.saturating_add(1);
     });
@@ -212,7 +223,7 @@ pub(super) fn job_started() -> JobGuard {
 #[cfg(all(windows, feature = "diagnostics"))]
 impl Drop for JobGuard {
     fn drop(&mut self) {
-        tracker().update(|state| {
+        update(|state| {
             state.active_jobs = state.active_jobs.saturating_sub(1);
         });
     }
@@ -227,7 +238,7 @@ pub(super) fn dependency_wait() -> Option<DependencyWaitGuard> {
     if !PIPELINE_WORKER.with(Cell::get) {
         return None;
     }
-    tracker().update(|state| {
+    update(|state| {
         state.dependency_waiters = state.dependency_waiters.saturating_add(1);
     });
     Some(DependencyWaitGuard)
@@ -237,7 +248,7 @@ pub(super) fn dependency_wait() -> Option<DependencyWaitGuard> {
 impl Drop for DependencyWaitGuard {
     fn drop(&mut self) {
         let tracker = tracker();
-        tracker.update(|state| {
+        update(|state| {
             state.dependency_waiters = state.dependency_waiters.saturating_sub(1);
         });
 
@@ -311,6 +322,47 @@ mod tests {
         assert_eq!(s.peak_dependency_waiters, 2);
         assert_eq!(s.worker_threads, 2);
         assert_eq!(s.queued_jobs, 0);
+    }
+
+    #[test]
+    fn reports_only_new_full_worker_backlog_intervals() {
+        let start = Instant::now();
+        let tracker = Tracker::new_at(start);
+
+        assert!(!tracker.update_at(start, |s| {
+            s.worker_threads = 2;
+        }));
+        assert!(!tracker.update_at(start + Duration::from_millis(10), |s| {
+            s.queued_jobs = 1;
+        }));
+        assert!(!tracker.update_at(start + Duration::from_millis(20), |s| {
+            s.dependency_waiters = 1;
+        }));
+
+        // The second waiter blocks the final worker while work is still queued.
+        assert!(tracker.update_at(start + Duration::from_millis(30), |s| {
+            s.dependency_waiters = 2;
+        }));
+
+        // More queued work must not emit another "entered full backlog" event.
+        assert!(!tracker.update_at(start + Duration::from_millis(40), |s| {
+            s.queued_jobs = 2;
+        }));
+
+        // A worker becoming available ends the interval; blocking it again
+        // starts a distinct interval that should be reported once.
+        assert!(!tracker.update_at(start + Duration::from_millis(50), |s| {
+            s.dependency_waiters = 1;
+        }));
+        assert!(tracker.update_at(start + Duration::from_millis(60), |s| {
+            s.dependency_waiters = 2;
+        }));
+
+        let s = tracker.snapshot_at(start + Duration::from_millis(70));
+        assert_eq!(s.all_workers_waiting_with_queue_periods, 2);
+        assert_eq!(s.queued_jobs, 2);
+        assert_eq!(s.dependency_waiters, 2);
+        assert_eq!(s.worker_threads, 2);
     }
 
     #[test]
