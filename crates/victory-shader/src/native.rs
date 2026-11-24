@@ -2375,6 +2375,99 @@ mod tests {
         assert!(program(&[(constants, 8, 0, 0), (descriptor, 2, 8, 1)]).is_ok());
     }
 
+    #[test]
+    fn user_data_follows_each_stage_system_sgprs() {
+        // Merged stages and mesh shaders have 8 system SGPRs before their
+        // user data; the legacy stages and compute start it at s0.
+        for stage in [
+            HwStage::Ls,
+            HwStage::Hs,
+            HwStage::Es,
+            HwStage::Gs,
+            HwStage::Ms,
+        ] {
+            assert_eq!(
+                (stage.user_sgpr(0), stage.user_sgpr(31)),
+                (8, 39),
+                "{stage:?}"
+            );
+        }
+        for stage in [HwStage::Vs, HwStage::Ps, HwStage::Cs] {
+            assert_eq!(
+                (stage.user_sgpr(0), stage.user_sgpr(31)),
+                (0, 31),
+                "{stage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn merged_stage_root_params_count_from_s8() {
+        // One (root type, SGPRs, user data) parameter in a `stage` program.
+        let program = |stage: HwStage, root: u32, sgprs: u32, user_data: u8| {
+            let mut blob = fssm(&[(stage, &VS_CODE)]);
+            let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(stage)).unwrap() as usize;
+            let table = (blob.len() - FSSM_HEADER) as u64;
+            for v in [root, 0, sgprs, 0] {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+            blob.extend_from_slice(&[user_data, 0, 0, 0]);
+            let payload = (blob.len() - FSSM_HEADER) as u64;
+            blob[8..16].copy_from_slice(&payload.to_le_bytes());
+            blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
+            blob[record + RECORD_COUNTS..][..8].copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        let (constants, descriptor) = (0, 1);
+        for stage in [
+            HwStage::Ls,
+            HwStage::Hs,
+            HwStage::Es,
+            HwStage::Gs,
+            HwStage::Ms,
+        ] {
+            // All 32 user-data dwords are s8-s39, and a descriptor's high
+            // half may be the last of them.
+            let p = program(stage, constants, 32, 0).unwrap();
+            assert_eq!((p[0].stage, p[0].layout[0].sgprs), (stage, 32));
+            assert!(program(stage, descriptor, 2, 30).is_ok(), "{stage:?}");
+            // Dword 32 is past the user data while its SGPR (s40) exists;
+            // dword 97 is s105, the last SGPR, and dword 98 would be s106,
+            // which no program has.
+            for (root, sgprs, user_data) in
+                [(constants, 1, 32), (descriptor, 1, 31), (constants, 1, 97)]
+            {
+                assert_eq!(
+                    why_refused(program(stage, root, sgprs, user_data)),
+                    "root parameter past the user data",
+                    "{stage:?}: {root}/{sgprs} at dword {user_data}"
+                );
+            }
+            for (root, sgprs, user_data) in [
+                (constants, 1, 98),
+                (descriptor, 2, 97),
+                (constants, 1, 0xFF),
+            ] {
+                assert_eq!(
+                    why_refused(program(stage, root, sgprs, user_data)),
+                    "root parameter outside the SGPRs",
+                    "{stage:?}: {root}/{sgprs} at dword {user_data}"
+                );
+            }
+        }
+        // The same dword 98 is still an SGPR (s98) in a vertex program, so
+        // it is refused only as past the user data there; s106 is the first
+        // dword that program can't address.
+        assert_eq!(
+            why_refused(program(HwStage::Vs, constants, 1, 98)),
+            "root parameter past the user data"
+        );
+        assert_eq!(
+            why_refused(program(HwStage::Vs, constants, 1, 106)),
+            "root parameter outside the SGPRs"
+        );
+    }
+
     /// A pixel program with a table in s4 (slot 2), a root descriptor in
     /// s6-s7 (slot 3), and these (kind, root type, table offset) reads.
     fn reading(reads: &[(u8, u8, u32)]) -> Result<Vec<NativeProgram>, ShaderError> {
