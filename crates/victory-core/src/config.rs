@@ -87,10 +87,10 @@ impl Config {
         };
         let cache_dir = env_path("VICTORY_CACHE_DIR")
             .or(file.cache_dir)
-            .map_or_else(|| default_dir("cache"), Ok)?;
+            .map_or_else(|| default_dir(Kind::Cache, &env), Ok)?;
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
-            .map_or_else(|| default_dir("data"), Ok)?;
+            .map_or_else(|| default_dir(Kind::Data, &env), Ok)?;
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
@@ -126,14 +126,36 @@ fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// `%LOCALAPPDATA%/victory/<name>` (elsewhere the XDG or home cache).
-fn default_dir(name: &str) -> Result<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+#[derive(Clone, Copy)]
+enum Kind {
+    Cache,
+    Data,
+}
+
+/// `%LOCALAPPDATA%/victory/{cache,data}`. Without `LOCALAPPDATA` (a native
+/// non-Windows host), the XDG base directories: the cache under
+/// `$XDG_CACHE_HOME` (`~/.cache`), the data under `$XDG_DATA_HOME`
+/// (`~/.local/share`), so clearing the user's cache does not take what titles
+/// must keep with it.
+fn default_dir(kind: Kind, env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<PathBuf> {
+    let var = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if let Some(local) = var("LOCALAPPDATA") {
+        let name = match kind {
+            Kind::Cache => "cache",
+            Kind::Data => "data",
+        };
+        return Ok(local.join("victory").join(name));
+    }
+    let (xdg, fallback) = match kind {
+        Kind::Cache => ("XDG_CACHE_HOME", Path::new(".cache")),
+        Kind::Data => ("XDG_DATA_HOME", Path::new(".local/share")),
+    };
+    // The XDG spec ignores a relative value.
+    let base = var(xdg)
+        .filter(|p| p.is_absolute())
+        .or_else(|| var("HOME").map(|h| h.join(fallback)))
         .context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")?;
-    Ok(base.join("victory").join(name))
+    Ok(base.join("victory"))
 }
 
 #[cfg(test)]
@@ -146,6 +168,7 @@ mod tests {
         let file = FilePaths {
             game_dir: Some("from-file".into()),
             cache_dir: Some("cache-from-file".into()),
+            data_dir: Some("data-from-file".into()),
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
@@ -160,9 +183,59 @@ mod tests {
             game_dir: Some("from-file".into()),
             ..Default::default()
         };
-        let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
+        let env = |k: &str| match k {
+            "VICTORY_GAME_DIR" => Some(OsString::new()),
+            "HOME" => Some(OsString::from("/h")),
+            _ => None,
+        };
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));
+    }
+
+    fn defaults(vars: &[(&str, &str)]) -> Config {
+        let vars: Vec<(String, OsString)> = vars
+            .iter()
+            .map(|&(k, v)| (k.to_owned(), OsString::from(v)))
+            .collect();
+        let env = |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        Config::resolve(FilePaths::default(), None, env).unwrap()
+    }
+
+    #[test]
+    fn local_app_data_holds_cache_and_data() {
+        let cfg = defaults(&[("LOCALAPPDATA", "/l"), ("XDG_CACHE_HOME", "/x")]);
+        assert_eq!(cfg.cache_dir, Path::new("/l/victory/cache"));
+        assert_eq!(cfg.data_dir, Path::new("/l/victory/data"));
+    }
+
+    #[test]
+    fn data_is_not_under_the_xdg_cache() {
+        let cfg = defaults(&[("XDG_CACHE_HOME", "/c"), ("XDG_DATA_HOME", "/d")]);
+        assert_eq!(cfg.cache_dir, Path::new("/c/victory"));
+        assert_eq!(cfg.data_dir, Path::new("/d/victory"));
+
+        let cfg = defaults(&[("HOME", "/h")]);
+        assert_eq!(cfg.cache_dir, Path::new("/h/.cache/victory"));
+        assert_eq!(cfg.data_dir, Path::new("/h/.local/share/victory"));
+        assert!(!cfg.data_dir.starts_with(&cfg.cache_dir));
+    }
+
+    #[test]
+    fn empty_or_relative_xdg_values_are_ignored() {
+        let cfg = defaults(&[
+            ("LOCALAPPDATA", ""),
+            ("XDG_CACHE_HOME", ""),
+            ("XDG_DATA_HOME", "relative"),
+            ("HOME", "/h"),
+        ]);
+        assert_eq!(cfg.cache_dir, Path::new("/h/.cache/victory"));
+        assert_eq!(cfg.data_dir, Path::new("/h/.local/share/victory"));
+    }
+
+    #[test]
+    fn no_user_directory_is_an_error() {
+        let env = |_: &str| None;
+        assert!(Config::resolve(FilePaths::default(), None, env).is_err());
     }
 
     #[test]
