@@ -927,6 +927,11 @@ OperationResult run_ray_query(const OperationContext& ctx)
     return skip_if_false(check_dxr_rays(ctx.device, false));
 }
 
+OperationResult run_dxr_address_ranges(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_address_ranges(ctx.device));
+}
+
 OperationResult run_dxr_pipeline(const OperationContext& ctx)
 {
     return skip_if_false(check_dxr_rays(ctx.device, true));
@@ -1246,6 +1251,7 @@ const OperationSpec kOperations[] = {
     {"--dxr-opacity", 3, 3, nullptr, kNoGate, run_dxr_opacity},
     {"--dxr-opacity-pipeline", 3, 3, nullptr, kNoGate, run_dxr_opacity_pipeline},
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
+    {"--dxr-address-ranges", 3, 3, nullptr, kNoGate, run_dxr_address_ranges},
     {"--dxr-pipeline", 3, 3, nullptr, kNoGate, run_dxr_pipeline},
     {"--gpu-alias", 3, 3, nullptr, kNoGate, run_gpu_alias},
     {"--gpu-alias-window", 3, 3, nullptr, kNoGate, run_gpu_alias_window},

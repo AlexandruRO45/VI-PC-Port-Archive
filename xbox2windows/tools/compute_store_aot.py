@@ -1141,13 +1141,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             address_words = (1 if a16 else 2) + int(mip)
             base, high = int(m[4]), int(m[5])
             dmask = int(m[6], 16)
-            count = bin(dmask).count("1")
+            # DMASK selects components in XYZW order and packs them into consecutive VGPRs.
+            channels = [component for index, component in enumerate("xyzw") if dmask & (1 << index)]
+            count = len(channels)
             destination = [int(n) for n in re.findall(r"\d+", m[2])]
             first, last = destination[0], destination[-1]
             if (cpu != "gfx1030" or image_format is None or guard_span is not None
                     or len(vaddr) != min(address_words, 2) or vaddr[-1] != vaddr[0] + address_words - 1
                     or vaddr[-1] > 255 or last != first + count - 1
-                    or dmask != (1 << count) - 1 or count > IMAGE_FORMATS[image_format][1]
+                    or not 0 < dmask < (1 << IMAGE_FORMATS[image_format][1])
                     or any(first + index > 255 or first + index in loading for index in range(count))):
                 raise ValueError("Unsupported image load target")
             if high != base + 7 or base % 4 or pending.intersection(range(base, high + 1)):
@@ -1171,10 +1173,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             name = f"image_load_{image_step_count}"
             image_step_count += 1
             staged_steps.append((None, f"    {IMAGE_FORMATS[image_format][0]} {name} = imageData.Load({address});"))
-            for index in range(count):
+            for index, component in enumerate(channels):
                 reg = first + index
                 vector.pop(reg, None)
-                loading[reg] = ("alu", f"{name}.{'xyzw'[index]}")
+                loading[reg] = ("alu", f"{name}.{component}")
         elif m := re.fullmatch(r"(?:buffer_store_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>byte|short)(?P<store_hi>_d16_hi)?)|"
                                r"tbuffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+|v\[\d+:\d+\]), "

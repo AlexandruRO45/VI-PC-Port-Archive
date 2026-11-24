@@ -1,0 +1,38 @@
+# Keeps the archive in step with the projects still on GitHub: code, pull requests, issues and the site data.
+# Pushes use the workflow's own token, so they never start the archived projects' own workflows in this repo.
+name: Sync projects
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # commit as the repo owner so no bot shows up as a contributor
+          git config user.name Guernica4u
+          git config user.email 261697299+Guernica4u@users.noreply.github.com
+          status=0
+          python3 -I .github/sync.py --push || status=$?
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -q -m "Sync with the projects on GitHub ($(date -u '+%Y-%m-%d %H:%M') UTC)"
+            git push origin HEAD:main
+          fi
+          exit $status

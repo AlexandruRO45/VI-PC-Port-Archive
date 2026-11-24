@@ -41,6 +41,13 @@ Get one project on its own:
 git clone --branch leonida-new/main --single-branch https://github.com/Guernica4u/GTA6-PC-Port-Archive.git leonida-new
 ```
 
+## Updates
+
+Every 6 hours, [`sync.yml`](.github/workflows/sync.yml) runs [`.github/sync.py`](.github/sync.py). For each project still
+on GitHub, it fetches the code, branches and pull requests, re-exports issues and comments, and rebuilds the site.
+Nothing is deleted: issues and comments removed upstream stay in the archive, and a project that disappears keeps
+its last copy. The old Leonida is no longer on GitHub, so it doesn't change.
+
 ## Issues and comments
 
 `github-export/<project>/data/` holds gzipped JSON Lines straight from the GitHub API: one issue, pull request or

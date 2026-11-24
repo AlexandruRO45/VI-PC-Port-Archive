@@ -844,18 +844,29 @@ class Stage:
         target, vals, flags = m.group(1), [v.strip() for v in m.group(2).split(',')], m.group(3).split()
         if 'vm' in flags and not self.exec_known:
             self.emit('if (!(exec & 1)) discard;')
-        if 'compr' in flags:
-            a, b = self.u(vals[0]), self.u(vals[2])
-            exprs = ['f16tof32(%s)' % a, 'f16tof32(%s >> 16)' % a, 'f16tof32(%s)' % b, 'f16tof32(%s >> 16)' % b]
-            words = ['U(%s)' % e for e in exprs]
-        else:
-            exprs = ['0.0' if v == 'off' else 'F(%s)' % self.u(v) for v in vals]
-            words = ['0u' if v == 'off' else self.u(v) for v in vals]
         name = {'pos0': 'pos'}.get(target, target)
         if not re.fullmatch(r'pos|param\d+|mrt[0-7]', name):
             raise Unsupported('export target %s' % target)
+        kind = self.pipe.mrt_kind(int(name[3:])) if name.startswith('mrt') else 'float'
+        if 'compr' in flags:
+            if kind in ('uint', 'int'):
+                raise Unsupported('packed integer export %s' % name)
+            a, b = self.u(vals[0]), self.u(vals[2])
+            exprs = ['f16tof32(%s)' % a, 'f16tof32(%s >> 16)' % a, 'f16tof32(%s)' % b, 'f16tof32(%s >> 16)' % b]
+            words = ['U(%s)' % e for e in exprs]
+        elif kind in ('uint', 'int'):
+            exprs = ['0u' if v == 'off' else self.u(v) for v in vals]
+            words = exprs
+        elif kind == 'bits':
+            ud = self.pipe.ud(('mrtbits',))
+            exprs = ['0.0' if v == 'off' else 'F((%s) ^ ud%d)' % (self.u(v), ud) for v in vals]
+            words = None
+        else:
+            exprs = ['0.0' if v == 'off' else 'F(%s)' % self.u(v) for v in vals]
+            words = ['0u' if v == 'off' else self.u(v) for v in vals]
         self.exports[name] = True
-        self.emit('o.%s = float4(%s);' % (name, ', '.join(exprs)))
+        expr = '%s(%s)' % ('uint4' if kind in ('uint', 'int') else 'float4', ', '.join(exprs))
+        self.emit('o.%s = %s;' % (name, 'asint(%s)' % expr if kind == 'int' else expr))
         if name.startswith('param'):
             # The flat copy read by v_interp_mov_f32 carries the register words. A float copy would let
             # FXC fold asfloat() of a constant and flush integer bit patterns that are binary32
@@ -1005,9 +1016,16 @@ SAMPLER_HEAP_SPACE = 1
 SAMPLER_HEAP_FALLBACK = SAMPLER_HEAP_SIZE - 1
 
 
+# DXGI_FORMAT values for integer RTVs and the binary32 float targets.
+UINT_RTVS = frozenset((3, 7, 12, 17, 25, 30, 36, 42, 50, 57, 62))
+SINT_RTVS = frozenset((4, 8, 14, 18, 32, 38, 43, 52, 59, 64))
+FLOAT32_RTVS = frozenset((2, 6, 16, 41))
+
+
 class Pipeline:
-    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None):
+    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=()):
         self.root = parse_root(root_blob)
+        self.rtv_formats = rtv_formats
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
         self.resources = {}   # key -> dict(index, kind)
@@ -1025,6 +1043,20 @@ class Pipeline:
             raise Unsupported('pixel stage reads attributes %s the vertex stage does not export' % missing)
         if 'pos' not in self.vs.exports:
             raise Unsupported('vertex stage exports no position')
+
+    def mrt_kind(self, slot):
+        if slot >= len(self.rtv_formats):
+            return 'float'
+        fmt = self.rtv_formats[slot]
+        if fmt in UINT_RTVS:
+            if fmt != 42:
+                raise Unsupported('unverified UINT RTV format %d' % fmt)
+            return 'uint'
+        if fmt in SINT_RTVS:
+            if fmt != 43:
+                raise Unsupported('unverified SINT RTV format %d' % fmt)
+            return 'int'
+        return 'bits' if fmt in FLOAT32_RTVS else 'float'
 
     def ud(self, source):
         if source not in self.uds:
@@ -1094,7 +1126,10 @@ class Pipeline:
         s = self.ps
         targets = sorted(int(k[3:]) for k in s.exports if k.startswith('mrt'))
         out = self.common() + ['struct PSIn {'] + self.interface(True) + ['};', 'struct PSOut {']
-        out += ['    float4 mrt%d : SV_Target%d;' % (t, t) for t in targets] + ['};', 'PSOut main(PSIn i) {', '    PSOut o = (PSOut)0;']
+        for t in targets:
+            kind = self.mrt_kind(t)
+            out.append('    %s mrt%d : SV_Target%d;' % ({'int': 'int4', 'uint': 'uint4'}.get(kind, 'float4'), t, t))
+        out += ['};', 'PSOut main(PSIn i) {', '    PSOut o = (PSOut)0;']
         out += s.declarations() + s.body() + ['    return o;', '}']
         return '\n'.join(out) + '\n'
 
@@ -1132,12 +1167,14 @@ def pipeline_key(vs_code, ps_code, root_blob):
 FXC = os.environ.get('X2W_FXC', r'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe')
 
 
-def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True):
+def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request=''):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
-        pipe = Pipeline(vs_code, ps_code, root_blob)
+        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats)
         vs, ps, manifest = pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest()
+        if rtv_request:
+            manifest += rtv_request + '\n'
     except Unsupported as reason:
         open(name + '.fail', 'w').write(str(reason) + '\n')
         return 'unsupported: %s' % reason
@@ -1151,7 +1188,10 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True):
             if r.returncode:
                 open(name + '.fail', 'w').write('fxc %s: %s\n' % (stage, r.stderr[-2000:]))
                 return 'fxc %s failed: %s' % (stage, r.stderr.strip().splitlines()[-1] if r.stderr.strip() else '?')
-    open(name + '.txt', 'w').write(manifest)
+    temporary = '%s.txt.%d.tmp' % (name, os.getpid())
+    with open(temporary, 'w') as result:
+        result.write(manifest)
+    os.replace(temporary, name + '.txt')
     return 'ok'
 
 
@@ -1161,10 +1201,24 @@ def classify(blob):
 
 
 def translate_request(out_dir, key):
-    """Translate <dir>/req_<key>.{a,b,root} (the two code blobs of a pipeline, in description order)."""
+    """Translate a base shader request or an RTV variant referencing its source blobs."""
     name = os.path.join(out_dir, 'req_%016x' % key)
-    a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
+    request = ''
+    formats = ()
     try:
+        base = key
+        if os.path.isfile(name + '.rtv'):
+            with open(name + '.rtv', encoding='ascii') as file:
+                request = file.read(256)
+            if not re.fullmatch(r'rtv1 [0-9]{1,20}(?: [0-9]{1,10}){1,8}', request) or fnv(request.encode('ascii')) != key:
+                raise Unsupported('invalid RTV variant request')
+            base, *formats = map(int, request.split()[1:])
+            if base > 0xffffffffffffffff or any(fmt > 0xffffffff for fmt in formats):
+                raise Unsupported('invalid RTV variant values')
+            name = os.path.join(out_dir, 'req_%016x' % base)
+        a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
+        if request and pipeline_key(a, b, root) != base:
+            raise Unsupported('RTV variant source key mismatch')
         if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
             # Slot 86 records complete containers in canonical (VS, PS) order.
             # Keep the container bytes in the cache key; translate only the bounded native code.
@@ -1181,13 +1235,13 @@ def translate_request(out_dir, key):
             kinds = {'vs': a, 'ps': b}
         else:
             kinds = {classify(a): a, classify(b): b}
-    except Unsupported as reason:
+    except (Unsupported, OSError, UnicodeError) as reason:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
         return 'unsupported: %s' % reason
     if set(kinds) != {'vs', 'ps'}:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write('stages %s\n' % sorted(kinds))
         return 'stages %s' % sorted(kinds)
-    return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root)
+    return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request)
 
 
 def main():
@@ -1220,7 +1274,7 @@ def main():
             print('pso %x -> request %016x' % (w & 0xffffff, key))
     # translate every request that has no result yet
     for name in sorted(os.listdir(out_dir)):
-        m = re.fullmatch(r'req_([0-9a-f]{16})\.a', name)
+        m = re.fullmatch(r'req_([0-9a-f]{16})\.(?:a|rtv)', name)
         if not m:
             continue
         key = int(m.group(1), 16)

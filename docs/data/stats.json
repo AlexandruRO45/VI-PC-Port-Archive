@@ -1,9 +1,9 @@
 {
  "leonida-new": {
   "issues": 13,
-  "prs": 536,
-  "comments": 634,
-  "updated": 1795503588
+  "prs": 542,
+  "comments": 690,
+  "updated": 1795506056
  },
  "leonida-old": {
   "issues": 371,
@@ -13,20 +13,20 @@
  },
  "xcl": {
   "issues": 229,
-  "prs": 651,
-  "comments": 2550,
+  "prs": 658,
+  "comments": 2609,
   "updated": 1795504328
  },
  "victory": {
-  "issues": 100,
+  "issues": 105,
   "prs": 612,
-  "comments": 1705,
-  "updated": 1795481872
+  "comments": 1788,
+  "updated": 1795506755
  },
  "xbox2windows": {
-  "issues": 173,
-  "prs": 1131,
-  "comments": 2765,
-  "updated": 1795505290
+  "issues": 175,
+  "prs": 1137,
+  "comments": 2780,
+  "updated": 1795506551
  }
 }

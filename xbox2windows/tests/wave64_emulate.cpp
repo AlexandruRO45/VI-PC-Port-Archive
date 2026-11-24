@@ -57,20 +57,22 @@ std::pair<unsigned, unsigned> run_variant(ID3D12Device* device, const char* labe
 
 void check_wave64_emulate(ID3D12Device* device)
 {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 caps{};
+    D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+    check(check_feature(device, D3D12_FEATURE_D3D12_OPTIONS1, &caps, sizeof(caps)), "Query wave range");
+    check(check_feature(device, D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)), "Query wave shader model");
+    // The native build has no wave intrinsics, so it cannot observe its width; report the adapter's range.
+    std::printf("wave64_emulate native_lane_range=%u..%u\n", caps.WaveLaneCountMin, caps.WaveLaneCountMax);
+
     unsigned errors = run_variant(device, "native", {Wave64Emulate, sizeof(Wave64Emulate)}).first;
     const auto skew = run_variant(device, "skew", {Wave64EmulateSkew, sizeof(Wave64EmulateSkew)});
     if (skew.first != threads || skew.second != threads)
         throw std::runtime_error("Negative control: the skewed affine read was not reported on every thread");
 
-    D3D12_FEATURE_DATA_D3D12_OPTIONS1 caps{};
-    D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
-    check(check_feature(device, D3D12_FEATURE_D3D12_OPTIONS1, &caps, sizeof(caps)), "Query wave range");
-    check(check_feature(device, D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model)), "Query wave shader model");
     if (caps.WaveOps && model.HighestShaderModel >= D3D_SHADER_MODEL_6_6 && caps.WaveLaneCountMin <= 64 &&
         caps.WaveLaneCountMax >= 64)
         errors += run_variant(device, "forced64", {Wave64Emulate64, sizeof(Wave64Emulate64)}).first;
     else
-        std::printf("wave64_emulate forced width=64 skipped, native_lane_range=%u..%u\n",
-                    caps.WaveLaneCountMin, caps.WaveLaneCountMax);
+        std::printf("wave64_emulate forced width=64 skipped\n");
     if (errors) throw std::runtime_error("Wave64 emulation differs from the CPU reference");
 }

@@ -82,20 +82,40 @@ u64 __stdcall bc64_element(Computer*, UINT plane, UINT level, u64 x, UINT y, UIN
     return bc64::offset(level, static_cast<UINT>(x), y);
 }
 
-long __stdcall bc64_tiling(Computer*, UINT* tiles, D3D12_PACKED_MIP_INFO* packed, D3D12_TILE_SHAPE* shape,
-                            UINT* count, UINT first, D3D12_SUBRESOURCE_TILING* tilings)
+long __stdcall bc64_tiling(Computer* self, UINT* tiles, D3D12_PACKED_MIP_INFO* packed, D3D12_TILE_SHAPE* shape,
+                           UINT* count, UINT first, D3D12_SUBRESOURCE_TILING* tilings)
 {
-    if (tiles) *tiles = bc64::bytes / 65536;
-    if (packed) *packed = {3, 3, 1, 0};
-    if (shape) *shape = {256, 256, 1};
+    const auto& desc = self->desc;
+    constexpr UINT tile_side = 256;
+    std::array<D3D12_SUBRESOURCE_TILING, bc64::first_tail> standard{};
+    UINT slice_tiles = 1;  // The packed mips occupy tile zero of each slice.
+    for (UINT level = bc64::first_tail; level-- > 0;) {
+        const UINT wide = (static_cast<UINT>(desc.Width >> level) + tile_side - 1) / tile_side;
+        const UINT high = ((desc.Height >> level) + tile_side - 1) / tile_side;
+        standard[level] = {wide, static_cast<UINT16>(high), 1, slice_tiles};
+        slice_tiles += wide * high;
+    }
+
+    if (tiles) *tiles = slice_tiles * desc.DepthOrArraySize;
+    if (packed) *packed = {static_cast<UINT8>(bc64::first_tail),
+                           static_cast<UINT8>(desc.MipLevels - bc64::first_tail), 1, 0};
+    if (shape) *shape = {tile_side, tile_side, 1};
     if (count) {
-        const UINT available = first < bc64::first_tail ? bc64::first_tail - first : 0;
-        *count = (std::min)(*count, available);
-        for (UINT i = 0; tilings && i < *count; ++i) {
-            const auto level = first + i;
-            const UINT across = bc64::side(level) / 64;
-            tilings[i] = {across, static_cast<UINT16>(across), 1, bc64::offsets[level] / 65536};
+        const UINT subresources = UINT{desc.MipLevels} * desc.DepthOrArraySize;
+        const UINT available = first < subresources ? subresources - first : 0;
+        const UINT requested = (std::min)(*count, available);
+        UINT written = 0;
+        for (UINT i = 0; i < requested; ++i) {
+            const UINT subresource = first + i;
+            const UINT level = subresource % desc.MipLevels;
+            if (level >= bc64::first_tail) continue;
+            if (tilings) {
+                tilings[i] = standard[level];
+                tilings[i].StartTileIndexInOverallResource += (subresource / desc.MipLevels) * slice_tiles;
+            }
+            ++written;
         }
+        *count = written;
     }
     return S_OK;
 }

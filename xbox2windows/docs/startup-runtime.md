@@ -112,7 +112,7 @@ ctest --preset release --no-tests=error -R '^startup_launch$' -V
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` |
-| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes `req_<key>.{a,b,root}` for untranslated pipelines; `tools/startup/gfx2hlsl.py --pending <dir>` translates them |
+| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>`, then replay the draw. |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. |
@@ -227,6 +227,14 @@ These are measured on one executable; treat them as hypotheses for others.
   hardware. Swapping the red/green shader changes the 16 covered pixels. Reproduce with
   `ctest --preset release --no-tests=error -R "^startup_stream_(request|draw)_"`.
   Other stage combinations and full stream rasterizer/depth state remain open.
+- Translated draws use the bound typed RTV formats to request colour-export variants. The
+  manifest's `targets` line lists exported slots. A separate `rtv1` line identifies the base
+  shader and the ordered RTV formats, and the draw rejects a variant with a mismatched line.
+  Uncompressed `R32_UINT` and `R32_SINT` outputs use integer shader signatures.
+  Uncompressed binary32 FLOAT outputs bitcast the export words after XOR with a private
+  zero-valued entry constant so optimized FXC keeps denormal bit patterns. UNORM outputs still
+  undergo float-to-UNORM conversion. Packed integer exports and other integer formats remain
+  unsupported by this path.
 - Translating the captured console colour-blend register state blocks remains open (#1216).
   A graphics stream can supply a desktop `D3D12_BLEND_DESC` directly. `src/startup_stubs/cb_blend.h`
   decodes `CB_BLENDn_CONTROL` and a `CB_TARGET_MASK` nibble into `D3D12_RENDER_TARGET_BLEND_DESC`. It

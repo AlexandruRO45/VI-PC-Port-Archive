@@ -370,7 +370,15 @@ extern "C" __declspec(noinline) long XGCreateTextureComputer(u64 rcx, u64 rdx, u
         slots[10] = reinterpret_cast<void*>(&bc64_tiling);
         return slots;
     }();
-    auto* computer = new Computer{bc64::supports(desc) ? bc_table.data() : table.data(), desc, 1, use_bc7_4k_s_layout(desc)};
+    static const auto bc_tiling_table = [] {
+        auto slots = table;
+        slots[10] = reinterpret_cast<void*>(&bc64_tiling);
+        return slots;
+    }();
+    const auto* selected = table.data();
+    if (bc64::supports(desc)) selected = bc_table.data();
+    else if (bc64::supports_nine_mip_tiling(desc)) selected = bc_tiling_table.data();
+    auto* computer = new Computer{selected, desc, 1, use_bc7_4k_s_layout(desc)};
     *reinterpret_cast<Computer**>(rdx) = computer;
     static LONG calls;
     if (InterlockedIncrement(&calls) <= 3)

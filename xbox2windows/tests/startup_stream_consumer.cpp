@@ -1,6 +1,7 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <cstdio>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <wrl/client.h>
@@ -64,7 +65,7 @@ struct Stream {
 
 int main(int argc, char** argv)
 {
-    if (argc != 4 && argc != 6 && argc != 7 && argc != 10) return 2;
+    if (argc != 4 && (argc < 6 || argc > 8) && argc != 10) return 2;
     const bool draw = argc != 4;
     StartupBc7Input bc7{};
     if (argc == 10) {
@@ -144,11 +145,18 @@ int main(int argc, char** argv)
     if (!submit(sizeof(stream))) return 9;
     if (argc == 4) return 0;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    if (argc == 7) {
+    UINT export_word = 0;
+    if (argc == 7 && !std::isdigit(static_cast<unsigned char>(argv[6][0]))) {
         const std::string mode(argv[6]);
         if (mode != "parent-a8" && mode != "child-a8" && mode != "child-r8") return 2;
         if (!derive(device, pso, mode != "parent-a8")) return 10;
         format = mode == "child-r8" ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_A8_UNORM;
+    } else if (argc == 7 || argc == 8) {
+        // A render-target format for the translated MRT export, and an optional root constant.
+        format = static_cast<DXGI_FORMAT>(std::strtoul(argv[6], nullptr, 10));
+        if (format != DXGI_FORMAT_R32_UINT && format != DXGI_FORMAT_R32_SINT &&
+            format != DXGI_FORMAT_R32G32B32A32_FLOAT) return 2;
+        if (argc == 8) export_word = static_cast<UINT>(std::strtoul(argv[7], nullptr, 0));
     }
-    return check_stream_draw(adapter.Get(), device, pso, argv[5], bc7.blocks ? &bc7 : nullptr, format);
+    return check_stream_draw(adapter.Get(), device, pso, argv[5], bc7.blocks ? &bc7 : nullptr, format, export_word);
 }

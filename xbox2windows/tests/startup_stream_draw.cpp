@@ -2,8 +2,9 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 
-#include <cstdint>
 #include <array>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -24,6 +25,12 @@ Word invoke(void* object, unsigned index, Word a = 0, Word b = 0, Word c = 0, Wo
     using Slot = Word (WINAPI*)(void*, Word, Word, Word, Word, Word, Word, Word, Word);
     return reinterpret_cast<Slot>((*static_cast<void***>(object))[index])(object, a, b, c, d, e, f, g, h);
 }
+
+struct StreamTarget {
+    ComPtr<ID3D12Resource> texture, readback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT row_bytes = 0;
+};
 
 int draw_logical_tables(ID3D12Device* desktop, void* guest, void* list)
 {
@@ -182,29 +189,52 @@ bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, 
 }
 }  // namespace
 
-int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7, DXGI_FORMAT format)
+int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7,
+                      DXGI_FORMAT format, std::uint32_t export_word)
 {
     const bool bc = GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", nullptr, 0) != 0;
     const bool bc_chain = GetEnvironmentVariableW(L"X2W_TEST_BC_CHAIN", nullptr, 0) != 0;
-    const UINT width = bc_chain ? 384 : bc7 ? bc7->width : bc ? 4 * 128 : 8;
-    const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : 4;
+    const bool integer = format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R32_SINT;
+    // The translated MRT formats draw one pixel; the other formats keep the 8x4 target.
+    const bool single = integer || format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+    const bool legacy = !single;
+    const bool narrow = format == DXGI_FORMAT_A8_UNORM || format == DXGI_FORMAT_R8_UNORM;
+    const UINT width = bc_chain ? 384 : bc7 ? bc7->width : bc ? 4 * 128 : single ? 1 : 8;
+    const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
+    const UINT count = integer ? 2 : 1;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
     Bc7Binding binding;
     if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC target_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
-        format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
-    const bool rgba = format == DXGI_FORMAT_R8G8B8A8_UNORM;
-    const D3D12_CLEAR_VALUE clear{format, {0, 0, 1, rgba ? 1.0f : 0.0f}};
-    ComPtr<ID3D12Resource> target;
-    if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &target_desc,
-                                                D3D12_RESOURCE_STATE_COMMON, &clear, IID_PPV_ARGS(&target)))) return 21;
-    D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
-    ComPtr<ID3D12DescriptorHeap> rtv_heap;
-    if (FAILED(desktop->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtv_heap)))) return 22;
-    const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
-    invoke(guest, 20, arg(target.Get()), 0, rtv.ptr);
+    // The wrapped heap gives the stand-in a descriptor shadow for the typed RTV.
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        Word backing, bytes;
+    } rtv_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, count}, 0, 0};
+    void* rtv_heap = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, arg(&rtv_desc), arg(&__uuidof(ID3D12DescriptorHeap)),
+                                           arg(&rtv_heap))))) return 22;
+    const SIZE_T first_rtv = invoke(rtv_heap, 9);
+    const auto stride = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    std::array<StreamTarget, 2> targets;
+    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 2> rtvs{};
+    const float clear[] = {0, 0, 1, narrow ? 0.0f : 1.0f};
+    for (UINT i = 0; i < count; ++i) {
+        auto& target = targets[i];
+        const auto view_format = i ? DXGI_FORMAT_R8G8B8A8_UNORM : format;
+        const auto resource_format = !i && integer ? DXGI_FORMAT_R32_TYPELESS : view_format;
+        D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
+            resource_format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+        const D3D12_CLEAR_VALUE optimized_clear{view_format, {clear[0], clear[1], clear[2], clear[3]}};
+        if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COMMON, &optimized_clear, IID_PPV_ARGS(&target.texture)))) return 21;
+        D3D12_RENDER_TARGET_VIEW_DESC view{view_format, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
+        rtvs[i] = {first_rtv + SIZE_T{i} * stride};
+        invoke(guest, 20, arg(target.texture.Get()), arg(&view), rtvs[i].ptr);
+        target.row_bytes = width * (view_format == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16 : view_format == DXGI_FORMAT_A8_UNORM ||
+                                    view_format == DXGI_FORMAT_R8_UNORM ? 1 : 4);
+    }
 
     void* list = nullptr;
     void* queue = nullptr;
@@ -218,14 +248,15 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         FAILED(static_cast<HRESULT>(invoke(guest, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&fence))))) return 23;
 
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
-    const D3D12_RECT rect{0, 0, static_cast<LONG>(bc7 || bc_chain ? width : width / 2), static_cast<LONG>(height)};
+    const D3D12_RECT rect{0, 0, static_cast<LONG>(legacy && !bc7 && !bc_chain ? width / 2 : width), static_cast<LONG>(height)};
     invoke(list, 139, arg(allocator));
-    invoke(list, 52, rtv.ptr, arg(clear.Color));
-    invoke(list, 50, 1, arg(&rtv));
+    for (UINT i = 0; i < count; ++i) invoke(list, 52, rtvs[i].ptr, arg(clear));
+    invoke(list, 50, count, arg(rtvs.data()));
     invoke(list, 21, 1, arg(&viewport));
     invoke(list, 22, 1, arg(&rect));
     invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     invoke(list, 25, arg(pso));
+    if (export_word) invoke(list, 40, 0, 1, arg(&export_word), 0);
     if (GetEnvironmentVariableW(L"X2W_TEST_LOGICAL_VIEW", nullptr, 0)) {
         if (int result = draw_logical_tables(desktop.Get(), guest, list)) return result;
     } else if (bc_chain) {
@@ -258,19 +289,21 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         FAILED(desktop->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, copy_allocator.Get(), nullptr, IID_PPV_ARGS(&copy))) ||
         FAILED(desktop->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&complete)))) return 26;
 
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-    UINT64 total = 0;
-    desktop->GetCopyableFootprints(&target_desc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
-    D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, total, 1, 1, 1,
-                               DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
     heap.Type = D3D12_HEAP_TYPE_READBACK;
-    ComPtr<ID3D12Resource> readback;
-    if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
-                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)))) return 27;
-    D3D12_TEXTURE_COPY_LOCATION destination{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    destination.PlacedFootprint = footprint;
-    D3D12_TEXTURE_COPY_LOCATION source{target.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-    copy->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    for (UINT i = 0; i < count; ++i) {
+        auto& target = targets[i];
+        UINT64 total = 0;
+        const auto desc = target.texture->GetDesc();
+        desktop->GetCopyableFootprints(&desc, 0, 1, 0, &target.footprint, nullptr, nullptr, &total);
+        const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, total, 1, 1, 1,
+                                   DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+        if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&target.readback)))) return 27;
+        D3D12_TEXTURE_COPY_LOCATION destination{target.readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        destination.PlacedFootprint = target.footprint;
+        D3D12_TEXTURE_COPY_LOCATION source{target.texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        copy->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    }
     if (FAILED(copy->Close())) return 28;
     ID3D12CommandList* submit[] = {copy.Get()};
     observer->ExecuteCommandLists(1, submit);
@@ -281,11 +314,14 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
                            WaitForSingleObject(event, 10000) == WAIT_OBJECT_0 && complete->GetCompletedValue() == 1;
     CloseHandle(event);
     if (!completed) return 31;
-    void* memory = nullptr;
-    if (FAILED(readback->Map(0, nullptr, &memory))) return 32;
     std::ofstream out(pixels, std::ios::binary);
-    for (UINT y = 0; y < height; ++y)
-        out.write(static_cast<const char*>(memory) + y * footprint.Footprint.RowPitch, width * (rgba ? 4 : 1));
-    readback->Unmap(0, nullptr);
+    for (UINT i = 0; i < count; ++i) {
+        auto& target = targets[i];
+        void* memory = nullptr;
+        if (FAILED(target.readback->Map(0, nullptr, &memory))) return 32;
+        for (UINT y = 0; y < height; ++y)
+            out.write(static_cast<const char*>(memory) + y * target.footprint.Footprint.RowPitch, target.row_bytes);
+        target.readback->Unmap(0, nullptr);
+    }
     return out ? 0 : 33;
 }

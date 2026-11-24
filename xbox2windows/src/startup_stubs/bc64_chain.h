@@ -11,13 +11,25 @@ namespace x2w_startup::bc64 {
 constexpr UINT bytes = 0x160000, levels = 6, first_tail = 3;
 constexpr std::array<UINT, levels> offsets{0x60000, 0x20000, 0x10000, 0x8000, 0x4000, 0x2000};
 
-inline bool supports(const D3D12_RESOURCE_DESC& d)
+inline bool standard_bc(const D3D12_RESOURCE_DESC& d)
 {
     return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Alignment == 0 && d.Width == 1024 &&
-           d.Height == 1024 && d.DepthOrArraySize == 1 && d.MipLevels == levels && d.SampleDesc.Count == 1 &&
-           d.SampleDesc.Quality == 0 && static_cast<UINT>(d.Layout) == 0x109 && d.Flags == D3D12_RESOURCE_FLAG_NONE &&
+           d.SampleDesc.Count == 1 && d.SampleDesc.Quality == 0 && static_cast<UINT>(d.Layout) == 0x109 &&
+           d.Flags == D3D12_RESOURCE_FLAG_NONE &&
            (d.Format == DXGI_FORMAT_BC5_UNORM || d.Format == DXGI_FORMAT_BC7_UNORM);
 }
+
+inline bool supports(const D3D12_RESOURCE_DESC& d)
+{
+    return standard_bc(d) && d.Height == 1024 && d.DepthOrArraySize == 1 && d.MipLevels == levels;
+}
+
+inline bool supports_nine_mip_tiling(const D3D12_RESOURCE_DESC& d)
+{
+    return standard_bc(d) && (d.Height == 512 || d.Height == 1024) && d.MipLevels == 9 &&
+           (d.DepthOrArraySize == 1 || d.DepthOrArraySize == 2);
+}
+
 constexpr UINT side(UINT mip) { return 256 >> mip; }
 
 // Coordinates are 4x4 BC blocks. Each macro tile contains 64x64 blocks.

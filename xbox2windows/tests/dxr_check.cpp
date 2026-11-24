@@ -1,4 +1,5 @@
 #include "dxr_fixture.h"
+#include "era_title_va.h"
 #include "ray_candidates.h"
 #include "ray_candidates_pipeline.h"
 #include "ray_pipeline.h"
@@ -10,6 +11,8 @@
 #include <cstring>
 #include <iterator>
 #include <stdexcept>
+#include <string>
+#include <utility>
 
 using Microsoft::WRL::ComPtr;
 
@@ -144,9 +147,20 @@ static RayPipeline make_ray_pipeline(ID3D12Device5* device, ID3D12RootSignature*
     return pipeline;
 }
 
-std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Vertex>& vertices,
+// This fixture registers two distinct, live AS buffers whose synthetic title
+// bases have the same low 40 bits. Each AS starts inside its mapped range.
+struct AddressScene {
+    std::vector<Vertex> otherTriangle;
+    bool truncate;
+};
+constexpr UINT64 lowTitle = 0x2300000000ull;
+constexpr UINT64 highTitle = lowTitle + (1ull << 40);
+constexpr UINT64 asOffset = 2 * D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;
+
+static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const std::vector<Vertex>& vertices,
     std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances, const std::vector<Ray>& rays,
-    Backend backend, const SceneUpdate* update, const std::vector<D3D12_RAYTRACING_GEOMETRY_FLAGS>* triangleGeometries) {
+    Backend backend, const SceneUpdate* update, const std::vector<D3D12_RAYTRACING_GEOMETRY_FLAGS>* triangleGeometries,
+    const AddressScene* addressScene) {
     const bool usePipeline = backend == Backend::pipeline;
     if (usePipeline) {
         if (triangleGeometries && (triangleGeometries->empty() || triangleGeometries->size() > 4))
@@ -215,15 +229,44 @@ std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Ver
         throw std::runtime_error("No acceleration structure prebuild size");
     constexpr auto writable = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     constexpr auto as_state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
-    auto blas = make_buffer(device, bottom_size.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, as_state, writable);
-    auto tlas = make_buffer(device, top_size.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, as_state, writable);
+    const UINT64 prefix = addressScene ? asOffset : 0;
+    const UINT64 blasBytes = prefix + bottom_size.ResultDataMaxSizeInBytes;
+    auto blas = make_buffer(device, blasBytes, D3D12_HEAP_TYPE_DEFAULT, as_state, writable);
+    auto tlas = make_buffer(device, prefix + top_size.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, as_state, writable);
     auto scratch = make_buffer(device, (std::max)({bottom_size.ScratchDataSizeInBytes, top_size.ScratchDataSizeInBytes,
                                bottom_size.UpdateScratchDataSizeInBytes, top_size.UpdateScratchDataSizeInBytes}),
                                D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, writable);
     bottom.DestAccelerationStructureData = blas->GetGPUVirtualAddress();
-    top.DestAccelerationStructureData = tlas->GetGPUVirtualAddress();
+    top.DestAccelerationStructureData = tlas->GetGPUVirtualAddress() + prefix;
     bottom.ScratchAccelerationStructureData = top.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
-    for (auto& desc : instances) desc.AccelerationStructure = bottom.DestAccelerationStructureData;
+    ComPtr<ID3D12Resource> otherBlas, otherVertices;
+    auto otherGeometry = geometries.front();
+    auto otherBuild = bottom;
+    if (addressScene) {
+        // Keep both geometries and BLAS alive until the GPU has completed every ray.
+        otherBlas = make_buffer(device, blasBytes, D3D12_HEAP_TYPE_DEFAULT, as_state, writable);
+        otherVertices = bvh_fixture::upload(device, addressScene->otherTriangle);
+        otherGeometry.Triangles.VertexBuffer.StartAddress = otherVertices->GetGPUVirtualAddress();
+        otherBuild.Inputs.pGeometryDescs = &otherGeometry;
+        era_title_va::Table ranges;
+        if (!ranges.add(lowTitle, blasBytes, blas->GetGPUVirtualAddress()) ||
+            !ranges.add(highTitle, blasBytes, otherBlas->GetGPUVirtualAddress()))
+            throw std::runtime_error("DXR fixture could not register AS ranges");
+        const UINT64 bytes = bottom_size.ResultDataMaxSizeInBytes;
+        bottom.DestAccelerationStructureData = ranges.translate(lowTitle + prefix, bytes);
+        otherBuild.DestAccelerationStructureData = ranges.translate(highTitle + prefix, bytes);
+        if (bottom.DestAccelerationStructureData != blas->GetGPUVirtualAddress() + prefix ||
+            otherBuild.DestAccelerationStructureData != otherBlas->GetGPUVirtualAddress() + prefix)
+            throw std::runtime_error("DXR range lookup lost the AS allocation or its interior offset");
+        for (auto& desc : instances) {
+            const UINT64 title = desc.AccelerationStructure;
+            const UINT64 key = addressScene->truncate ? title & ((1ull << 40) - 1) : title;
+            desc.AccelerationStructure = ranges.translate(key, bytes);
+            if (!desc.AccelerationStructure) throw std::runtime_error("Unmapped fixture BLAS");
+        }
+    } else {
+        for (auto& desc : instances) desc.AccelerationStructure = bottom.DestAccelerationStructureData;
+    }
     auto instanceBuffer = bvh_fixture::upload(device, instances);
     top.Inputs.InstanceDescs = instanceBuffer->GetGPUVirtualAddress();
     const UINT result_bytes = static_cast<UINT>(rays.size() * sizeof(bvh_fixture::Row));
@@ -262,6 +305,10 @@ std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Ver
     // Order both the BLAS write and the reused scratch storage before building the TLAS.
     list->BuildRaytracingAccelerationStructure(&bottom, 0, nullptr);
     list->ResourceBarrier(1, &order);
+    if (addressScene) {
+        list->BuildRaytracingAccelerationStructure(&otherBuild, 0, nullptr);
+        list->ResourceBarrier(1, &order);
+    }
     list->BuildRaytracingAccelerationStructure(&top, 0, nullptr);
     ComPtr<ID3D12Resource> updatedVertices, updatedInstances;
     if (update) {
@@ -284,7 +331,7 @@ std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Ver
     order.UAV.pResource = tlas.Get();
     list->ResourceBarrier(1, &order);
     list->SetComputeRootSignature(root.Get());
-    list->SetComputeRootShaderResourceView(0, tlas->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(0, top.DestAccelerationStructureData);
     list->SetComputeRootUnorderedAccessView(1, results->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(2, rayBuffer->GetGPUVirtualAddress());
     if (usePipeline) {
@@ -299,6 +346,45 @@ std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Ver
 
     return bvh_fixture::read(readback.Get(), rays.size()*4);
 }
+
+std::vector<bvh_fixture::Word> trace(ID3D12Device* device, const std::vector<Vertex>& vertices,
+    std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances, const std::vector<Ray>& rays,
+    Backend backend, const SceneUpdate* update, const std::vector<D3D12_RAYTRACING_GEOMETRY_FLAGS>* triangleGeometries) {
+    return trace_scene(device, vertices, std::move(instances), rays, backend, update, triangleGeometries, nullptr);
+}
+
+}
+
+bool check_dxr_address_ranges(ID3D12Device* device) {
+    using namespace dxr_fixture;
+    if (!supported(device, Backend::pipeline)) return false;
+    const std::vector<Vertex> left{{-1,-1,1}, {1,-1,1}, {0,1,1}};
+    AddressScene scene{{{3,-1,2}, {5,-1,2}, {4,1,2}}, false};
+    auto low = instance(7, 1), high = instance(11, 2);
+    low.AccelerationStructure = lowTitle + asOffset;
+    high.AccelerationStructure = highTitle + asOffset;
+    const std::vector<Ray> rays{{0,0,0,.01f,0,0,1,4,1}, {4,0,0,.01f,0,0,1,4,1},
+                               {0,0,0,.01f,0,0,1,4,2}, {4,0,0,.01f,0,0,1,4,2}};
+    const auto probe = [&] {
+        return trace_scene(device, left, {low, high}, rays, Backend::pipeline, nullptr, nullptr, &scene);
+    };
+    const auto full = probe();
+    scene.truncate = true;
+    const auto truncated = probe(); // Both instance masks now select the valid left BLAS.
+    constexpr bvh_fixture::Row miss{};
+    constexpr bvh_fixture::Row hitLow{1, 7, 0, 0x3f800000};
+    constexpr bvh_fixture::Row hitHigh{1, 11, 0, 0x40000000};
+    constexpr bvh_fixture::Row wrongHit{1, 11, 0, 0x3f800000};
+    const std::array<bvh_fixture::Row,4> expected{hitLow, miss, miss, hitHigh};
+    const std::array<bvh_fixture::Row,4> wrong{hitLow, miss, wrongHit, miss};
+    for (std::size_t i = 0; i < rays.size(); ++i) {
+        if (!std::equal(expected[i].begin(), expected[i].end(), full.begin() + 4 * i) ||
+            !std::equal(wrong[i].begin(), wrong[i].end(), truncated.begin() + 4 * i))
+            throw std::runtime_error("DXR address range or truncation-control mismatch at ray " + std::to_string(i));
+    }
+    std::puts("DXR address ranges: interior offset=512 full=[hit7@1,miss,miss,hit11@2] "
+              "truncated=[hit7@1,miss,hit11@1,miss]");
+    return true;
 }
 
 bool check_dxr_rays(ID3D12Device* device, bool usePipeline) {

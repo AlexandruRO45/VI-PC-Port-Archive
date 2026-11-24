@@ -2,6 +2,19 @@
 
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
+## Typed startup colour exports
+
+The [startup draw fixture](startup-runtime.md) uses a source-built gfx1013 pixel shader
+with a typed `R32_UINT` or `R32_SINT` RTV over typeless storage and a second UNORM
+target. It checks both attachments and rejects a stale signedness variant before PSO
+creation. A separate `R32G32B32A32_FLOAT` draw checks the four bit patterns from #1259.
+Optimized FXC preserves them with a run-time zero operand. The same shader without
+that operand loses three patterns under optimized FXC.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_mrt_' -V
+```
+
 ## CPU-written R8 planes across frames
 
 The startup draw uploader checks a single-mip, single-slice R8_UNORM texture of up to 32 MiB
@@ -153,6 +166,8 @@ The [comparison](../tests/cpu/archive_texture_gpu_check.py) runs native Windows,
 The consumer and `QuadFrames` return errors instead of throwing C++ exceptions. In the mapped run, the codec DLL is mapped by `pe_map`. There, a C++ exception thrown and caught inside that DLL escaped the `catch` as `0xE06D7363`, while the same DLL loaded by Windows caught it. Structured exceptions are dispatched through the mapped image, as `cpu_native_seh` shows.
 
 On Windows 10 Pro 22H2 (build 19045) with MSVC 19.52, all 18 runs passed on the in-box WARP (driver 10.0.19041.7811) and on an NVIDIA GeForce RTX 3080 Ti (driver 32.0.16.1047), in the `dev` and `release` builds. The hardware test exits 77 without a physical D3D12 adapter.
+
+With an app-local WARP (`OFFSCREEN_WARP_DIR`), the three runners must load the same `d3d10warp.dll`, because the trace includes the driver version. The native reader runs from `archive_gpu/`, so the build places the app-local copy there too, and the `pe_map` host (`python.exe`) loads the copy beside the native reader before mapping. Without this, the native and `pe_map` runs reported the in-box WARP (10.0.19041) and the AOT run, beside the build's copy, reported WARP 1.0.22.
 
 ```powershell
 cmake --build --preset dev --target archive_texture_gpu_lifted archive_gpu_reader pe_map
@@ -2101,19 +2116,21 @@ ctest --preset dev --no-tests=error -R '^cpu_native_forwarder$' -V
 
 The [translator](../tools/cpu_vex_aot.py) lifts Windows x64 leaf functions that use VEX.128 word forms. It supports:
 - `vpaddw`, `vpsubw`, `vpmaxsw`, `vpminsw`, `vpmulhw` and `vpavgw`;
+- `vpaddsw`, `vpaddusw`, `vpsubsw` and `vpsubusw` (saturating), `vpmullw` and `vpmulhuw`, `vpmaxuw` and `vpminuw`;
+- `vpcmpeqw` and `vpcmpgtw` (signed), which set a lane to all ones or all zeros;
 - `vpsraw`, `vpsllw` and `vpsrlw` with an immediate count;
 - `vpunpcklbw`, `vpunpckhbw`, `vpunpcklwd` and `vpunpckhwd`;
 - `vpackuswb`;
 - the 16-byte moves `vmovdqu` and `vmovdqa`, the logic ops `vpxor`, `vpand` and `vpor`, and `vzeroupper`.
 
-The ABI belongs to this profile: RCX and RDX hold the addresses of two 16-byte inputs, R8 the address of a 16-byte output, and no return bits are defined. Each XMM register becomes a 16-byte value and each form an explicit per-lane loop, so the generated C++ states the wraparound, the unsigned saturation of signed words in `vpackuswb`, the shift-count limits and the `vpavgw` rounding instead of using intrinsics. Memory operands must be exactly `[RCX]`, `[RDX]` or `[R8]` with a 16-byte access, and stores go only to `[R8]`. Only VEX encodings and the volatile XMM0-XMM5 are accepted. Any other instruction, an EVEX form such as a masked `vpaddw`, a legacy SSE encoding, XMM6-XMM15, a VEX.256 operand or another operand shape is rejected with its RVA. Decoding uses iced-x86, and function bounds come from `cpu_leaf_aot.bounded_code`.
+The ABI belongs to this profile: RCX and RDX hold the addresses of two 16-byte inputs, R8 the address of a 16-byte output, and no return bits are defined. Each XMM register becomes a 16-byte value and each form an explicit per-lane loop, so the generated C++ states the wraparound, the unsigned saturation of signed words in `vpackuswb`, the signed and unsigned clamps of the saturating adds and subtracts, the signedness of each multiply, maximum, minimum and compare, the shift-count limits and the `vpavgw` rounding instead of using intrinsics. These are integer forms: they read no MXCSR bits, raise no exceptions and have no NaN or signed-zero cases. The VEX.128 encoding zeroes bits 128 and up of the destination, which the profile never reads. Memory operands must be exactly `[RCX]`, `[RDX]` or `[R8]` with a 16-byte access, and stores go only to `[R8]`. Only VEX encodings and the volatile XMM0-XMM5 are accepted. Any other instruction, an EVEX form such as a masked `vpaddw`, a legacy SSE encoding, XMM6-XMM15, a VEX.256 operand or another operand shape is rejected with its RVA. Decoding uses iced-x86, and function bounds come from `cpu_leaf_aot.bounded_code`.
 
 ```powershell
 cmake --build --preset dev --target cpu_vex_words_original_lifted cpu_vex_words_altered_lifted
 ctest --preset dev --no-tests=error -R '^cpu_aot_vex_words$' -V
 ```
 
-The [fixture](../tests/cpu/vex_words.asm) has five functions. The test runs each through the native and lifted DLLs on the same 4096 input pairs:
+The [fixture](../tests/cpu/vex_words.asm) has nine functions. The test runs each through the native and lifted DLLs on the same 4096 input pairs:
 - every pairing of eight edge words, including 0x7fff, 0x8000, 0xffff and 0x00ff, broadcast to all lanes;
 - the edge words rotated across lanes;
 - seeded random lanes.
@@ -2124,7 +2141,9 @@ Each call runs in one 16-byte-aligned arena in which the two inputs and the outp
 
 **Aliases.** The output may alias either input exactly. Reads and the store then happen in program order, each as one 16-byte copy. With the output aliasing A and then B, and with RCX equal to RDX, all five functions match on 512 pairs. `store_reload` stores, reads the inputs again and stores a second result; with the output aliasing an input, its result differs from the non-aliased one in 955 of these cases, so the order is observed. Partial overlaps are not tested.
 
-**Controls.** A second fixture build replaces one `vpsraw` with `vpsrlw` in `shift_edges`. Its lifted DLL matches its own native build and differs from the original in 4044 of 4096 outputs, while the other functions are unchanged. Translation rejects three patched copies: a VEX.256 load, a VEX.256 store, which uses a three-byte VEX prefix because of R8, and a `vpaddw` turned into `vpaddd`. It also rejects eight hand-encoded bodies, each first checked against its iced disassembly: an EVEX `vpaddw xmm0{k1}`, a legacy `paddw`, `xmm6` as destination and as source, `[rcx+10h]`, `[rax]`, a store to `[rcx]` and `vpsraw` with an XMM count.
+**Reference.** `sat_words` (the four saturating forms), `mul_minmax_words` (`vpmullw`, `vpmulhuw`, `vpmaxuw`, `vpminuw`) and `cmp_words` (`vpcmpeqw`, `vpcmpgtw` in both operand orders) are also compared with a per-lane integer model in the test that shares no code with the translator. It covers the signed clamps at 0x7fff and 0x8000, the unsigned clamps at 0 and 0xffff, and lanes with bit 15 set, where the signed and unsigned forms differ.
+
+**Controls.** A second fixture build replaces one `vpsraw` with `vpsrlw` in `shift_edges`. Its lifted DLL matches its own native build and differs from the original in 4044 of 4096 outputs, while the other functions are unchanged. The same build also replaces `vpmulhuw` with `vpmulhw` in `mul_minmax_words`; its lifted DLL matches the signed model and differs from the original model in 4071 of 4096 outputs. Translation rejects three patched copies: a VEX.256 load, a VEX.256 store, which uses a three-byte VEX prefix because of R8, and a `vpaddw` turned into `vpaddd`. It also rejects eight hand-encoded bodies, each first checked against its iced disassembly: an EVEX `vpaddw xmm0{k1}`, a legacy `paddw`, `xmm6` as destination and as source, `[rcx+10h]`, `[rax]`, a store to `[rcx]` and `vpsraw` with an XMM count.
 
 Sixteen mutations of the translator each fail the test:
 - `vpavgw` without rounding;
@@ -2141,6 +2160,10 @@ Sixteen mutations of the translator each fail the test:
 - input reads cached.
 
 Only the alias checks catch the last two.
+
+Six more mutations, one per new form family, fail the comparison with the model: `vpmulhuw` as the signed product (4071 of 4096 `mul_minmax_words` outputs), `vpaddusw` without the clamp (4042 of `sat_words`), `vpsubsw` without the clamp (3665), `vpmaxuw` as signed (4041), `vpcmpgtw` as unsigned (4041 of `cmp_words`) and `vpcmpeqw` setting 1 instead of all ones (17, the equal lanes).
+
+The lifted functions were also run on Linux, outside the CTest, against the same machine code assembled with GNU as and executed on an AVX2 host. All four builds above matched the model on the 4096 pairs. The CTest `cpu_aot_vex_words`, which assembles with ML64 and builds with MSVC, was not run for this change.
 
 ## String memory transfers in the control-flow CPU lifter
 
@@ -2835,13 +2858,16 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_(warp|hard
 ### gfx1030 2D image loads
 
 The `gfx1030` compute store profile lowers the typed MIMG form
-`image_load vD, v[x:y], s[A:A+7] dmask:0x1|0x3|0x7|0xf
+`image_load vD, v[x:y], s[A:A+7] dmask:0x1..0xf
 dim:SQ_RSRC_IMG_2D`, with the `unorm` flag optional, and its packed-address
 `a16` spelling `image_load vD, vP, s[A:A+7] ... unorm a16`. The lowering is one
-`Texture2D<uint4>.Load(int3(x, y, 0))` from `t0`; the DMASK-selected leading
-components are written to consecutive destination VGPRs in ascending channel
-order and stored to the output UAV. The accepted form requires a `gfx1030`
-target, `dim:SQ_RSRC_IMG_2D`, known address values and a contiguous DMASK.
+`Texture2D<uint4>.Load(int3(x, y, 0))` from `t0`. The DMASK-selected
+components are packed into consecutive destination VGPRs in ascending
+channel order and stored to the output UAV. For example, `dmask:0xa` writes Y and W to the first and
+second destination registers. A zero mask, bits outside XYZW and a mismatch
+between the destination tuple width and the number of enabled channels are
+rejected. The accepted form requires a `gfx1030` target,
+`dim:SQ_RSRC_IMG_2D` and known address values.
 Without `a16` the address is two consecutive VGPRs (x then y); with `a16` it
 is one VGPR holding x in bits [15:0] and y in bits [31:16]. `d16`, `tfe`,
 `glc`, `slc`, `dlc`, `r128` and the NSA address spelling are refused, as is
@@ -2865,18 +2891,19 @@ that behavior is not measured here.
 
 The source-built wave32 fixture uses an 8x8 thread group and a 32x8
 `R32G32B32A32_UINT` source texture whose words are carried in the case file.
-Dispatches of four, two, one and one groups exercise `dmask:0x1`, `0x3`,
-`0x7` and `0xf` and fill the 320-word output UAV, once with the two-dword
-address and once with the packed `a16` address; the packed address is built
-from `tid.y * 0x10000 + tid.x`. The independent CPU reference recomputes every
+Dispatches of four, two, one and one groups exercise one-, two-, three- and
+four-channel results for all 15 nonzero DMASKs. Each mask runs once with the
+two-dword address and once with the packed `a16` address built from
+`tid.y * 0x10000 + tid.x`. The independent CPU reference recomputes every
 written word and expects the sentinel in the untouched words. A single flipped
 written word (`word=0`) and a single flipped untouched word (`word=300`) must
 both be reported. Each mutated translation must differ at a named word:
 reordering the emitted components fails at word 0, swapping the two address
 registers fails at word 4, and reading the whole packed address as the y
-coordinate fails at word 4. The LLVM 15 binary check assembles and decodes
-every DMASK form in both address families and lowers the decoded program
-through the CLI. These are desktop DXIL executions, not native runs of the
+coordinate fails at word 4. Treating `dmask:0xa` as `0x3` must fail at word 0
+in both address families and both opcodes. The LLVM 15 binary check assembles
+and decodes every DMASK form in both address families and lowers the decoded
+program through the CLI. These are desktop DXIL executions, not native runs of the
 assembled gfx1030 program.
 
 ```powershell
@@ -2890,7 +2917,7 @@ VGPR packs x and y as above, and the low 16 bits of the second VGPR hold the
 mip level. The high 16 bits of that second VGPR are ignored. The translator
 emits `Texture2D<uint4>.Load(int3(x, y, mip))`. The caller guarantees that the
 mip and the coordinates are in range for the selected subresource. The
-lowering covers the same contiguous DMASKs and refuses other dimensions,
+lowering covers the same nonzero DMASKs and refuses other dimensions,
 NSA, `d16`, `tfe` and the cache policy flags.
 
 The mip fixture uploads a 32×8 base image and 16×4 and 8×2 mips. Every
@@ -5714,6 +5741,18 @@ ctest --test-dir out/build/w10 --no-tests=error
 
 `OFFSCREEN_WARP_DIR` requires `OFFSCREEN_AGILITY_620_DIR`. On the in-box runtime, WARP 1.0.22 reports DXR tier 1.2, but `dxr_query_warp`, `dxr_update_warp` and `bvh_differential_warp` fail with every ray reported as a miss. With the Agility runtime the same WARP passes them. Configuring the same build directory again without `OFFSCREEN_WARP_DIR` deletes the copied `d3d10warp.dll`, so `offscreen_check` goes back to the in-box WARP. `app_local_warp_toggle` checks this with a stand-in DLL.
 
+### DXR output with colliding low 40-bit addresses
+
+`dxr_address_ranges_{hardware,warp}` builds two bottom-level acceleration structures for different triangles, and a top-level structure containing two masked instances. Two synthetic title ranges have identical low 40 bits and bases 1 TiB apart. Each maps through `era_title_va::Table` to its own desktop result buffer. Both BLAS destinations, both instance references and the TLAS GPU binding point 512 bytes into their buffers. The selected byte span must fit the registered range.
+
+Four rays return the hit flag, instance ID, primitive index and distance. The full-address lookup gives instance 7 at distance 1, two misses, and instance 11 at distance 2. A second dispatch deliberately drops the high address bits before resolving the instance references, so both point to the valid first BLAS. The third ray now hits instance 11 at distance 1, and the fourth misses. This measures host range translation and DXR traversal on synthetic guest addresses. The encoding of addresses stored in an external acceleration structure remains unmeasured.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error --output-on-failure -R '^dxr_address_ranges_'
+```
+
+
 In this configuration all `bvh_*_warp`, `dxr_*_warp` and `bvh_differential_warp` tests pass, and the hardware wave64 check skips at its 32-lane range with SM 6.6 available. `bvh_wave64_warp` now runs and fails at field 25, `WaveReadLaneAt(v, (lane*7+3) % 64)`. In two groups, all 128 lanes received the value of lane m where `7m+3 ≡ lane (mod 64)`, which is the inverse of the requested shuffle. Field 24's shuffle, the mirror read and the native-width run pass. At WARP's native width of 8, `7n+3 ≡ 3-n (mod 8)` is self-inverse, so the default `bvh_waves_warp` cannot show the difference. `wave_shuffle_warp` narrows the cause. WARP 1.0.22 runs a forced wave as blocks of its native 8 lanes, and it picks the source block using the request of the wrong lane: the lane of the reader's block that sits at the requested position. For this shuffle that equals the inverse permutation. A rotation by one lane gets 16 of 64 reads wrong at widths 16, 32 and 64, and none of them match its inverse. Reads where every lane of a block requests the same source block are unaffected. [Open question](https://github.com/R0Y00/Xbox2Windows/issues/145)
 
 On Windows 11 build 26200 at `1ccc326`, the in-box WARP (10.0.26100.9818) reports a 4..4 lane range with SM 6.6, so `bvh_wave64_warp` and the forced 16/32/64 variants of `wave_shuffle_warp` skip on capability; its native-width shuffle reads are all correct (affine and rotation 64/64, no block-misrouted reads, no control errors). The GTX 1660 SUPER (driver 32.0.16.1074) reports 32..32 lanes: `bvh_wave64_hardware` skips, and `wave_shuffle_hardware` passes at native and forced width 32 with every read from the requested lane. The lane-block misroute was observed in the app-local WARP 1.0.22 + Agility SDK setup above. The in-box WARP run could exercise only native width 4, because the fixture has no override for the reported lane range. [Cross-check report](https://github.com/R0Y00/Xbox2Windows/issues/145#issuecomment-7114625084)
@@ -7000,15 +7039,29 @@ With SPIRV-Tools and SPIRV-Cross available at configure time, run
 
 ### Ordinary and comparison sampler views in the SPIR-V bridge
 
-The named profile can use one indexed sampler table for ordinary samples and
-depth-reference operations. In mixed modules SPIRV-Cross infers one comparison
-type for that table. The bridge keeps ordinary accesses at set 0, binding 1.
-For each depth-reference use it loads the same descriptor index from set 3,
-binding 1. The host must populate both views from the guest sampler descriptors,
-using ordinary filters in the first and comparison filters and the guest
-comparison function in the second. Both operations retain their texture and
-coordinates. Set 3 must be free. The supported path has a direct access chain,
-sampler load and sampled image. Decorated sampler paths require separate support.
+A module can use an indexed sampler table for ordinary samples and
+depth-reference operations. The table is any uniform-constant variable whose
+type is an array of samplers, fixed or runtime sized, under any ID, in any
+descriptor set except 3, at any binding. In mixed modules SPIRV-Cross infers
+one comparison type for that table. The bridge keeps ordinary accesses where
+the module put them. For each depth-reference use it loads the same descriptor
+index from set 3, at the table's binding. The host must populate both views
+from the guest sampler descriptors, using ordinary filters in the first and
+comparison filters and the guest comparison function in the second. Both
+operations retain their texture and coordinates. Set 3 must be free. The
+supported path has a direct `OpAccessChain` or `OpInBoundsAccessChain` with
+one index, a sampler load and a sampled image. Decorated sampler paths require
+separate support.
+
+Each table is decided on its own. A table gets a set 3 view only if some
+depth-reference sample and some ordinary sample (including a sparse one) both
+reach it; a table used for only one of the two is left alone. The first view
+is `%bridge_cmp` and later ones `%bridge_cmp_table_N`. These are refused with
+a message: a table without exactly one literal `DescriptorSet` and `Binding`
+decoration, a decorated or initialized table, set 3 already in use or a
+`bridge_cmp` ID, two tables whose views would overlap in the set 3 register range (a fixed table covers its binding plus its size, a runtime one has no end), and a
+depth-reference sample whose sampled image, load or chain does not lead to a
+sampler. A variable that is not an array of samplers is not a table.
 
 With SPIRV-Tools and SPIRV-Cross installed, run:
 
@@ -7020,6 +7073,15 @@ ctest --preset dev --no-tests=error -R '^spirv_sampler_views_' -V
 The fixture compiles both shaders at Shader Model 6.0 and dispatches the compute
 shader for readback. The compiled pixel shader uses implicit LOD and the
 compute shader uses explicit LOD. Both compare against a depth reference.
+The same modules are also run with every ID of the table renamed and an
+`OpInBoundsAccessChain`; the readback expects the same four words as the
+original, so a view wired to the wrong table changes a precise word. The
+driver also checks, without a GPU, a runtime-sized table at set 2, binding 7
+(the emitted HLSL has the comparison view at `register(s7, space3)`), two
+split tables at their own bindings with an ordinary-only and a
+comparison-only table left alone, `;` comments after any declaration, and each refusal above. The renamed GPU run
+has not been executed on a physical adapter by the author; the Windows CI jobs
+`spirv_sampler_views_{hardware,warp}` are the check.
 
 On Windows 10 build 19045.6456, the GTX 1060 (32.0.15.6094) and in-box WARP
 (10.0.19041.5794) matched all four readback words in each of the three sampler
@@ -7102,11 +7164,23 @@ The pass first looks for a directly loaded standalone sampler that feeds both ki
 sampling. Modules without one are returned byte-for-byte unchanged. That includes the
 indexed table above and unrelated samples on other samplers. For the sampler it splits,
 the profile covers direct float32 `Texture1D`, `Texture2D`, `TextureCube` and `Texture3D`
-sampling, including the array forms of the first three, in one compute entry point at a
-constant LOD of zero. A `Texture3D` takes ordinary sampling only: depth comparison on it and
+sampling, including the array forms of the first three, in one compute entry point. The
+depth-comparison kind needs a constant LOD of zero (SM 6.0 has only `SampleCmpLevelZero` for it). The
+ordinary kind takes any LOD operand whose result type is the sampled float type, a constant of any value
+or a computed one, and is a plain `SampleLevel`; it does not check the value of a computed LOD. A `Texture3D` takes ordinary sampling only: depth comparison on it and
 an arrayed 3D image are refused, each with its own diagnostic.
-Other uses of that sampler, an occupied binding and a
-nonzero LOD are rejected with a specific diagnostic.
+Other uses of that sampler, an occupied binding, a nonzero depth-comparison LOD and an ordinary LOD
+that is not of the sampled float type are rejected with a specific diagnostic.
+
+The ordinary LOD is checked by the result type of the operand ID, which the pass reads from the
+assembly; `spirv-val` already requires a float scalar LOD. On Linux, modules with the ordinary sample at
+LOD 1.0, 0.75 and a computed 0.5 + 0.5 are split, validated for Vulkan 1.2 and cross-compiled, and the
+`SampleLevel` call keeps that LOD while both comparison calls stay `SampleCmpLevelZero`. A comparison
+sample at LOD 1.0, a computed LOD or 0.25 is still refused. The Windows stage reads back LOD 1.0, 0.75
+and the computed LOD from the existing fixture (point mip filter, mip 0 holds 0.375, mip 1 holds 0.625), all expecting
+0.625 at word 2, and a zero-LOD reference fails at word 2 only, so a pass that forced the LOD to zero is
+caught. LOD 0.5 is avoided because the nearest-mip choice of a tie is not specified. Not run here: that Windows GPU stage
+(`spirv_compare_sampler_warp`).
 
 A module may hold several such samplers. Repeat `--ordinary-binding` once per mixed sampler, in
 the order the sampler variables are declared; the values must be distinct and each must be free in its
@@ -8539,4 +8613,15 @@ The fixture checks the XG layout, tile spans, block offsets, copy in and out, an
 
 ```powershell
 ctest --preset release --no-tests=error --output-on-failure -R '^startup_xg_bc_chain_'
+```
+
+### Nine-mip BC5/BC7 tile queries
+
+XG texture-computer slot 10 reports a 64 KiB standard tile layout for 1024×512 and 1024×1024 single-sample BC5_UNORM and BC7_UNORM textures with nine mips, one or two array slices, explicit layout `0x109`, default alignment and zero flags. Each slice starts with one packed tile containing six mips. The 1024×512 standard mips start at tiles 4, 2 and 1 in a 12-tile slice. The 1024×1024 standard mips start at tiles 6, 2 and 1 in a 22-tile slice.
+
+`startup_xg_bc_tiling` checks 80 subresource queries, including a request spanning the last packed mip in one slice and the first standard mips of the next. The returned count includes only standard mips. Their entries use their original positions in the requested range. Sentinel bytes cover packed entries and the remainder of the caller's array. The field values were compared with XCL's slot 10 implementation on source-built inputs. The optional AMD AddrLib test independently verifies the surface size, slice stride, first packed mip and standard and packed macro-tile offsets for all eight shapes and formats. [XCL implementation](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/xg.rs#L610-L658) · [AMD AddrLib revision](https://gitlab.freedesktop.org/mesa/mesa/-/tree/5c142e46f3f6e752ed745fd48912ebb8fad67145/src/amd/addrlib)
+
+```powershell
+cmake --build --preset release --target startup_stub_xg_xs xg_swizzle_select_check
+ctest --preset release --no-tests=error --output-on-failure -R '^(startup_xg_bc_tiling|xg_bc64_tiling_reference)$'
 ```

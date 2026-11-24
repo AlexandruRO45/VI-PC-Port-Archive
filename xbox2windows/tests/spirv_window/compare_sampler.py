@@ -49,6 +49,23 @@ for old, new in (
     SHARED_VOLUME = substitute(SHARED_VOLUME, old, new)
 # Slice 1 of the 3D texture holds 0.3125 at its top-left texel (slice 0 holds 0.375, as the 2D case does).
 EXPECTED_VOLUME = [0x3f800000, 0x00000000, 0x3ea00000] + [0xc5c5c5c5] * 13
+# The base module whose ordinary sample reads t1's mip 1 (LOD 1.0), and one at LOD 0.75 (point mip filter:
+# the nearest mip is 1); both read 0.625 where LOD zero reads 0.375. A third computes the LOD (0.5 + 0.5).
+SHARED_LOD1 = substitute(substitute(SHARED, "%float_0 = OpConstant %float 0", "%float_0 = OpConstant %float 0\n%float_1 = OpConstant %float 1"),
+                         "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_0",
+                         "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_1")
+SHARED_LOD075 = substitute(SHARED, "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_0",
+                           "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_0_75")
+SHARED_LOD_COMPUTED = substitute(substitute(SHARED, "%float_0 = OpConstant %float 0",
+                                           "%float_0 = OpConstant %float 0\n%float_0_5 = OpConstant %float 0.5"),
+                                 "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_0",
+                                 "%lod = OpFAdd %float %float_0_5 %float_0_5\n"
+                                 "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %lod")
+SHARED_VOLUME_LOD1 = substitute(substitute(SHARED_VOLUME, "%float_0 = OpConstant %float 0",
+                                          "%float_0 = OpConstant %float 0\n%float_1 = OpConstant %float 1"),
+                                "%43 = OpImageSampleExplicitLod %v4float %42 %uv3 Lod %float_0",
+                                "%43 = OpImageSampleExplicitLod %v4float %42 %uv3 Lod %float_1")
+EXPECTED_LOD1 = [0x3f800000, 0x00000000, 0x3f200000] + [0xc5c5c5c5] * 13
 # Two mixed samplers (cmpA at binding 2, cmpB at 6): word 0 SampleCmp(cmpA, ref 0.25 vs 0.5) = 1, word 1
 # SampleCmp(cmpB, ref 0.875 vs 0.75) = 0, word 2 ordinary A 0.375, word 3 ordinary B 0.875; 12 guards.
 SHARED_MULTI = Path(__file__).with_name("shared_sampler_multi.spvasm").read_text(encoding="utf-8")
@@ -114,8 +131,11 @@ def multi_controls(directory):
                  MULTI_BINDINGS, "Reserved sampler split ID is already in use")
     # The narrow profile applies to every mixed sampler: a nonzero LOD on cmpB's ordinary sample is refused.
     rejected(substitute(SHARED_MULTI, "%49 = OpImageSampleExplicitLod %v4float %48 %uv_b Lod %float_0",
-                        "%49 = OpImageSampleExplicitLod %v4float %48 %uv_b Lod %float_0_25"),
-             MULTI_BINDINGS, "requires a constant LOD of zero")
+                        "%49 = OpImageSampleExplicitLod %v4float %48 %uv_b Lod %uv_b"),
+             MULTI_BINDINGS, "requires a LOD operand of the sampled float type")
+    assert split_comparison_sampler(substitute(
+        SHARED_MULTI, "%49 = OpImageSampleExplicitLod %v4float %48 %uv_b Lod %float_0",
+        "%49 = OpImageSampleExplicitLod %v4float %48 %uv_b Lod %float_0_25"), MULTI_BINDINGS)[1][1]["ordinary_binding"] == 7
     rejected(substitute(SHARED_MULTI, "%cmpA %cmpB %results", "%cmpA %results"),
              MULTI_BINDINGS, "%cmpB: sampler must be listed in the entry-point interface")
     # Occupancy is per descriptor set: binding 6 is taken in set 0 but free for a sampler moved to set 1.
@@ -161,6 +181,9 @@ def controls(directory):
     assert volume_mapping == mapping, volume_mapping
     assert "%x2w_plain_sampler_0 = OpLoad %type_sampler %x2w_plain_sampler" in volume_lowered.splitlines()
     assert "OpTypeImage %float 3D 2 0 0 1 Unknown" in volume_lowered
+    # The ordinary kind takes any LOD of the sampled float type: a constant or a computed value.
+    for module in (SHARED_LOD1, SHARED_LOD075, SHARED_LOD_COMPUTED, SHARED_VOLUME_LOD1):
+        assert split_comparison_sampler(module, ORDINARY_BINDING)[1] == mapping, module
     # The arrayed variant splits to the same mapping and only the ordinary load moves.
     array_lowered, array_mapping = split_comparison_sampler(SHARED_ARRAY, ORDINARY_BINDING)
     assert array_mapping == mapping, array_mapping
@@ -195,11 +218,18 @@ def controls(directory):
     rejected(substitute(SHARED, "%43 = OpImageSampleExplicitLod %v4float %42 ",
                         "%43 = OpImageSampleExplicitLod %v4float %34 "),
              ORDINARY_BINDING, "one sampled image is used for both sampling kinds")
+    # The depth-comparison kind stays at constant LOD zero, whatever the ordinary sample does.
     rejected(substitute(SHARED, "%float_0_75 Lod %float_0", "%float_0_75 Lod %float_0_25"),
-             ORDINARY_BINDING, "requires a constant LOD of zero")
-    rejected(substitute(SHARED, "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_0",
-                        "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_0_25"),
-             ORDINARY_BINDING, "requires a constant LOD of zero")
+             ORDINARY_BINDING, "OpImageSampleDrefExplicitLod requires a constant LOD of zero")
+    rejected(substitute(SHARED_LOD1, "%float_0_75 Lod %float_0", "%float_0_75 Lod %float_1"),
+             ORDINARY_BINDING, "OpImageSampleDrefExplicitLod requires a constant LOD of zero")
+    rejected(substitute(SHARED_LOD_COMPUTED, "%float_0_75 Lod %float_0", "%float_0_75 Lod %lod"),
+             ORDINARY_BINDING, "OpImageSampleDrefExplicitLod requires a constant LOD of zero")
+    # An ordinary LOD that is not of the sampled float type (a float2 constant, an undefined ID) is refused.
+    for operand in ("%15", "%undefined_lod"):
+        rejected(substitute(SHARED, "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_0",
+                            f"%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod {operand}"),
+                 ORDINARY_BINDING, "OpImageSampleExplicitLod requires a LOD operand of the sampled float type")
     rejected(substitute(SHARED, "%33 = OpLoad %type_sampler %cmpSampler",
                         "%copy = OpCopyObject %_ptr_UniformConstant_type_sampler %cmpSampler\n"
                         "%33 = OpLoad %type_sampler %cmpSampler"),
@@ -222,12 +252,9 @@ def controls(directory):
     for image in ("OpTypeImage %float 3D 2 0 1 1 Unknown", "OpTypeImage %float 3D 2 1 0 1 Unknown"):
         rejected(substitute(SHARED_VOLUME, "OpTypeImage %float 3D 2 0 0 1 Unknown", image),
                  ORDINARY_BINDING, profile)
-    # Depth comparison on a 3D image is refused (the depth texture becomes 3D here), as is a nonzero LOD.
+    # Depth comparison on a 3D image is refused (the depth texture becomes 3D here).
     rejected(substitute(SHARED, "OpTypeImage %float 2D 2 0 0 1 Unknown", "OpTypeImage %float 3D 2 0 0 1 Unknown"),
              ORDINARY_BINDING, "depth-comparison sampling is not supported on Texture3D")
-    rejected(substitute(SHARED_VOLUME, "%43 = OpImageSampleExplicitLod %v4float %42 %uv3 Lod %float_0",
-                        "%43 = OpImageSampleExplicitLod %v4float %42 %uv3 Lod %float_0_25"),
-             ORDINARY_BINDING, "requires a constant LOD of zero")
     rejected(substitute(SHARED_ARRAY, "OpTypeImage %float 2D 2 1 0 1 Unknown",
                         "OpTypeImage %float 2D 2 1 1 1 Unknown"),
              ORDINARY_BINDING, profile)
@@ -270,7 +297,11 @@ def emit(directory, assembler, validator, cross):
     layer1_lowered, layer1_mapping = split_comparison_sampler(SHARED_ARRAY_LAYER1, ORDINARY_BINDING)
     assert layer1_mapping["ordinary_binding"] == ORDINARY_BINDING, layer1_mapping
     volume_lowered = split_comparison_sampler(SHARED_VOLUME, ORDINARY_BINDING)[0]
-    for name, assembly in (("shared", SHARED), ("lowered", lowered),
+    lod1_lowered = split_comparison_sampler(SHARED_LOD1, ORDINARY_BINDING)[0]
+    lod075_lowered = split_comparison_sampler(SHARED_LOD075, ORDINARY_BINDING)[0]
+    computed_lowered = split_comparison_sampler(SHARED_LOD_COMPUTED, ORDINARY_BINDING)[0]
+    for name, assembly in (("lowered_lod1", lod1_lowered), ("lowered_lod075", lod075_lowered),
+                           ("lowered_lod_computed", computed_lowered),("shared", SHARED), ("lowered", lowered),
                            ("shared_volume", SHARED_VOLUME), ("lowered_volume", volume_lowered),
                            ("shared_array", SHARED_ARRAY), ("lowered_array", array_lowered),
                            ("lowered_array_layer1", layer1_lowered),
@@ -290,6 +321,11 @@ def emit(directory, assembler, validator, cross):
     assert comparison and ordinary, source
     assert source.count(f"SampleCmpLevelZero({comparison[1]},") == 2, source
     assert source.count(f"SampleLevel({ordinary[1]},") == 1, source
+    # The ordinary LOD survives into SampleLevel (it is not folded to zero); the comparison stays at zero.
+    for name, lod in (("lowered_lod1", "1.0f"), ("lowered_lod075", "0.75f"), ("lowered_lod_computed", None)):
+        lod_source = outputs[name].read_text(encoding="utf-8")
+        assert lod_source.count(f"SampleCmpLevelZero({comparison[1]},") == 2, lod_source
+        assert len(re.findall(rf"SampleLevel\({ordinary[1]},[^;]*, {lod or '[^;]*'}\)", lod_source)) == 1, lod_source
     array_source = outputs["lowered_array"].read_text(encoding="utf-8")
     comparison = re.search(r"SamplerComparisonState\s+(\w+)\s*:\s*register\(s2\b", array_source)
     ordinary = re.search(rf"SamplerState\s+(\w+)\s*:\s*register\(s{ORDINARY_BINDING}\b", array_source)
@@ -337,7 +373,7 @@ def compile_dxil(directory, dxc, outputs):
         raise AssertionError(f"Expected the Texture3D shared-sampler DXC diagnostic\n{shared.stdout}\n{shared.stderr}")
     print("Texture3D shared-sampler HLSL: DXC rejected SampleLevel as expected", flush=True)
     dxil = {}
-    for name in ("lowered", "lowered_volume", "lowered_array", "lowered_array_layer1", "lowered_multi", "lowered_multi_swapped"):
+    for name in ("lowered", "lowered_lod1", "lowered_lod075", "lowered_lod_computed", "lowered_volume", "lowered_array", "lowered_array_layer1", "lowered_multi", "lowered_multi_swapped"):
         dxil[name] = directory / f"{name}.dxil"
         subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", dxil[name], outputs[name]], check=True)
     print("DXC compiled the lowered module and both arrayed lowered modules (layers 0 and 1)", flush=True)
@@ -407,6 +443,15 @@ DRAWS = [
     ("ordinary descriptor vs baseline", "lowered", "ordinary-min-lod1", EXPECTED,
      ["word=2 expected=3ec00000 actual=3f200000"]),
     ("ordinary descriptor", "lowered", "ordinary-min-lod1", with_words(w2=0x3f200000), []),
+    # Ordinary LOD 1.0 and 0.75 read t1's 1x1 mip (0.625), not mip 0 (0.375); the zero-LOD reference fails at word 2
+    # only, which is also what a pass that forced the ordinary LOD to zero would produce.
+    ("ordinary LOD 1.0", "lowered_lod1", "baseline", EXPECTED_LOD1, []),
+    ("ordinary LOD 0.75", "lowered_lod075", "baseline", EXPECTED_LOD1, []),
+    ("ordinary computed LOD 1.0", "lowered_lod_computed", "baseline", EXPECTED_LOD1, []),
+    ("ordinary LOD 1.0 vs zero-LOD reference", "lowered_lod1", "baseline", EXPECTED,
+     ["word=2 expected=3ec00000 actual=3f200000"]),
+    ("ordinary LOD 0.75 vs zero-LOD reference", "lowered_lod075", "baseline", EXPECTED,
+     ["word=2 expected=3ec00000 actual=3f200000"]),
     # Texture2DArray: two-layer t0 and t1 whose layer 1 differs from layer 0 in each sampled texel.
     ("array layer 0", "lowered_array", "array", EXPECTED, []),
     ("array layer 1", "lowered_array_layer1", "array", EXPECTED_LAYER1, []),

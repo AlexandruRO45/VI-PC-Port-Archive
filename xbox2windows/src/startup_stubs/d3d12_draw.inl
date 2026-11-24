@@ -11,7 +11,8 @@
 
 struct Translation {
     struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 3 3D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
-    struct Ud { int kind, a, b; };           // 0 rect list, 1 base vertex, 2 start instance, 3 root constant(param a, word b), 4 stride of srv a
+    enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits };
+    struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
     std::vector<Srv> srvs;
     std::vector<Ud> uds;
@@ -88,8 +89,25 @@ bool read_text(const wchar_t* path, std::string& out)
     return true;
 }
 
-void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
-                      const std::vector<unsigned char>& root_blob)
+// Publish only complete inputs. The offline scanner treats .a and .rtv as ready markers.
+bool publish_shader_request(u64 key, const wchar_t* ext, const void* data, std::size_t bytes)
+{
+    wchar_t path[MAX_PATH], temporary[MAX_PATH], suffix[32];
+    if (!cache_path(path, L"req_", key, ext)) return false;
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return true;
+    swprintf(suffix, std::size(suffix), L"%s.%lu.tmp", ext, GetCurrentProcessId());
+    if (!cache_path(temporary, L"req_", key, suffix)) return false;
+    HANDLE file = CreateFileW(temporary, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const bool complete = WriteFile(file, data, static_cast<DWORD>(bytes), &written, nullptr) && written == bytes;
+    CloseHandle(file);
+    if (complete && MoveFileExW(temporary, path, 0)) return true;
+    DeleteFileW(temporary);
+    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+void load_translation(Translation& tr, const std::string& rtv_request = {})
 {
     tr.state = 2;
     wchar_t path[MAX_PATH];
@@ -97,31 +115,34 @@ void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const
     if (!cache_path(path, L"", tr.key, L".txt")) return;
     if (!read_text(path, manifest)) {
         InterlockedIncrement(&translation_missing);
-        if (cache_path(path, L"req_", tr.key, L".a") && GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
-            write_file(path, a, a_bytes);
-            cache_path(path, L"req_", tr.key, L".b");
-            write_file(path, b, b_bytes);
-            cache_path(path, L"req_", tr.key, L".root");
-            write_file(path, root_blob.data(), root_blob.size());
-            static LONG logged;
-            if (first_calls(logged, 12)) log("x2w-draw no translation for pipeline %016llx: request written", tr.key);
-        }
+        static LONG missing;
+        if (rtv_request.empty() && first_calls(missing, 12))
+            log("x2w-draw no translation for pipeline %016llx", tr.key);
         return;
     }
+    bool matched_rtv = false;
     for (std::size_t at = 0; at < manifest.size();) {
         std::size_t end = manifest.find('\n', at);
         if (end == std::string::npos) end = manifest.size();
-        const std::string line = manifest.substr(at, end - at);
+        std::string line = manifest.substr(at, end - at);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         at = end + 1;
         int i = 0, x = 0, y = 0;
         char kind[16] = "", source[16] = "";
-        if (std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y) >= 2) {
+        if (line.compare(0, 5, "rtv1 ") == 0) {
+            if (matched_rtv || line != rtv_request) {
+                log("x2w-draw RTV manifest mismatch for %016llx", tr.key);
+                return;
+            }
+            matched_rtv = true;
+        } else if (std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y) >= 2) {
             Translation::Ud ud{-1, x, y};
-            if (!std::strcmp(source, "rect")) ud.kind = 0;
-            else if (!std::strcmp(source, "basevertex")) ud.kind = 1;
-            else if (!std::strcmp(source, "startinstance")) ud.kind = 2;
-            else if (!std::strcmp(source, "rootconst")) ud.kind = 3;
-            else if (!std::strcmp(source, "stride")) ud.kind = 4;
+            if (!std::strcmp(source, "rect")) ud.kind = Translation::rect;
+            else if (!std::strcmp(source, "basevertex")) ud.kind = Translation::base_vertex;
+            else if (!std::strcmp(source, "startinstance")) ud.kind = Translation::start_instance;
+            else if (!std::strcmp(source, "rootconst")) ud.kind = Translation::root_constant;
+            else if (!std::strcmp(source, "stride")) ud.kind = Translation::stride;
+            else if (!std::strcmp(source, "mrtbits") && !rtv_request.empty()) ud.kind = Translation::mrt_bits;
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
             Translation::Srv srv{!std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex3d") ? 3 : 0, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
@@ -130,6 +151,10 @@ void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const
             log("x2w-draw invalid sampler heap manifest for %016llx", tr.key);
             return;
         }
+    }
+    if (matched_rtv != !rtv_request.empty()) {
+        log("x2w-draw RTV manifest missing for %016llx", tr.key);
+        return;
     }
     if (tr.uds.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32) return;
     if (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))) return;
@@ -159,7 +184,11 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
     if (!entry) {
         entry = new Translation;
         entry->key = key;
-        load_translation(*entry, a, a_bytes, b, b_bytes, root_blob);
+        // A legacy cache hit still needs source blobs for late RTV specialization.
+        if (publish_shader_request(key, L".b", b, b_bytes) &&
+            publish_shader_request(key, L".root", root_blob.data(), root_blob.size()))
+            publish_shader_request(key, L".a", a, a_bytes);
+        load_translation(*entry);
     }
     return entry;
 }
@@ -282,9 +311,51 @@ BoundPipeline* translation_for(Wrapper* pipeline)
     return bound;
 }
 
-ID3D12PipelineState* pipeline_for(BoundPipeline& bound, const Pass& pass)
+bool needs_rtv_variant(DXGI_FORMAT format)
 {
-    Translation& tr = *bound.translation;
+    switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32_FLOAT:
+    case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT:
+    case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R32G32B32_SINT:
+    case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SINT:
+    case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT:
+    case DXGI_FORMAT_R10G10B10A2_UINT:
+    case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SINT:
+    case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R16G16_SINT:
+    case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT:
+    case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SINT:
+    case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SINT:
+    case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SINT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+Translation* translation_for_targets(Translation* base, const Pass& pass)
+{
+    if (!base || std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant))
+        return base;
+    std::string request = "rtv1 " + std::to_string(base->key);
+    for (UINT i = 0; i < pass.target_count; ++i)
+        request += " " + std::to_string(static_cast<unsigned>(pass.target_formats[i]));
+    const u64 key = fnv_bytes(request.data(), request.size());
+    auto& entry = translation_by_key()[key];
+    if (!entry) {
+        entry = new Translation;
+        entry->key = key;
+        load_translation(*entry, request);
+        if (entry->state != 1) {
+            publish_shader_request(key, L".rtv", request.data(), request.size());
+            log("x2w-draw no RTV translation for %016llx (%s)", key, request.c_str());
+        }
+    }
+    return entry;
+}
+
+ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass)
+{
     u64 key = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
     const auto found = bound.pipelines.find(key);
@@ -672,8 +743,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     if (!list || !pass.pipeline || !pass.targets_bound || !(rect || pass.topology == 4 || pass.topology == 5) || (rect && indexed)) return false;
     AcquireSRWLockExclusive(&draw_lock);
     BoundPipeline* bound = translation_for(pass.pipeline);
-    Translation* tr = bound ? bound->translation : nullptr;
-    ID3D12PipelineState* pipeline = tr && tr->state == 1 && ensure_draw_heap() ? pipeline_for(*bound, pass) : nullptr;
+    Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
+    ID3D12PipelineState* pipeline = tr && tr->state == 1 && ensure_draw_heap() ? pipeline_for(*bound, *tr, pass) : nullptr;
     if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
@@ -828,9 +899,11 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     std::uint32_t values[32] = {};
     for (std::size_t i = 0; i < tr->uds.size(); ++i) {
         const Translation::Ud& ud = tr->uds[i];
-        values[i] = ud.kind == 0 ? (rect ? 1u : 0u) : ud.kind == 1 ? static_cast<std::uint32_t>((indexed ? base_vertex : static_cast<INT>(start)) - vertex_first)
-            : ud.kind == 2 ? start_instance : ud.kind == 3 ? ((ud.a < 16 && ud.b < 8) ? pass.constants[ud.a][ud.b] : 0)
-            : (ud.a >= 0 && ud.a < 32 ? strides[ud.a] : 0);
+        values[i] = ud.kind == Translation::rect ? (rect ? 1u : 0u)
+            : ud.kind == Translation::base_vertex ? static_cast<std::uint32_t>((indexed ? base_vertex : static_cast<INT>(start)) - vertex_first)
+            : ud.kind == Translation::start_instance ? start_instance
+            : ud.kind == Translation::root_constant ? ((ud.a >= 0 && ud.a < 16 && ud.b >= 0 && ud.b < 8) ? pass.constants[ud.a][ud.b] : 0)
+            : ud.kind == Translation::stride && ud.a >= 0 && ud.a < 32 ? strides[ud.a] : 0;
     }
     list->SetPipelineState(pipeline);
     list->SetGraphicsRootSignature(tr->root);

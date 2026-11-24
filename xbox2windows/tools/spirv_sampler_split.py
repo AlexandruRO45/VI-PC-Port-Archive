@@ -12,7 +12,9 @@ The pass first looks for a standalone UniformConstant sampler, loaded directly, 
 images feed both kinds of sampling. Modules without one, including indexed sampler tables and
 unrelated sampling, are returned byte-for-byte unchanged. For the sampler being split, the profile
 is limited to direct float32 Texture1D, Texture2D, TextureCube and Texture3D sampling, including the
-array forms of the first three, in a single compute entry point at constant LOD zero. Texture3D is
+array forms of the first three, in a single compute entry point. The ordinary kind takes any LOD
+operand whose result type is the sampled float type (a constant of any value or a computed value); the
+depth-comparison kind stays at constant LOD zero, the only form SM 6.0 has for it (SampleCmpLevelZero). Texture3D is
 only sampled by the ordinary kind: depth comparison on it, and an arrayed 3D image, are refused. The sampler must appear in the
 entry-point interface. Any other use of that sampler is rejected with a specific diagnostic.
 """
@@ -81,8 +83,13 @@ def _ordinary_images(sampler, uses, definitions):
             if compare and texture[2] == "3D":
                 raise ValueError(f"{image}: depth-comparison sampling is not supported on Texture3D")
             lod = definitions.get(use[-1], [])
-            if len(lod) != 3 or lod[:2] != ["OpConstant", texture[1]] or lod[2] not in ZERO:
-                raise ValueError(f"{image}: {use[0]} requires a constant LOD of zero")
+            if compare:
+                if len(lod) != 3 or lod[:2] != ["OpConstant", texture[1]] or lod[2] not in ZERO:
+                    raise ValueError(f"{image}: {use[0]} requires a constant LOD of zero")
+            elif len(lod) < 2 or lod[1] != texture[1]:
+                # An ordinary sample is a plain SampleLevel at any LOD: a constant or a computed value
+                # whose result type is the sampled float type (spirv-val also requires a float scalar).
+                raise ValueError(f"{image}: {use[0]} requires a LOD operand of the sampled float type")
             kinds.add("ordinary" if ordinary else "compare")
         if len(kinds) > 1:
             raise ValueError(f"{image}: one sampled image is used for both sampling kinds")

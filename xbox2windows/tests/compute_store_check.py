@@ -3056,9 +3056,9 @@ def mimg_load_binary(directory, assembler, objcopy, library):
     mimg_load_controls()
     mimg_a16_controls()
     mimg_mip_controls()
-    cases = [(f"{op}{'_a16' if a16 else ''}_{count}", lines, MIMG_BINDING)
+    cases = [(f"{op}{'_a16' if a16 else ''}_{mask:x}", lines, MIMG_BINDING)
              for op in ("image_load", "image_load_mip") for a16 in (False, True)
-             for count, _, _, lines in mimg_load_cases(a16, mip=op == "image_load_mip")]
+             for mask, _, _, _, lines in mimg_load_cases(a16, mip=op == "image_load_mip")]
     gfx1030_binary(directory, assembler, objcopy, library, cases, "image_", group=(8, 8, 1))
 
 
@@ -3676,13 +3676,21 @@ def texture_word(x, y, channel):
     return TEXTURE_WORDS[y * TEXTURE_WIDTH + x][channel]
 
 
-def mimg_load_cases(a16=False, *, mip=False):
-    """dmask x/xy/xyz/xyzw on one descriptor, with dispatch counts that fill the 320-word UAV.
+# Literal channel orders keep the CPU expectation independent of the lowerer's bit walk.
+MIMG_CHANNELS = {
+    0x1: (0,), 0x2: (1,), 0x3: (0, 1), 0x4: (2,),
+    0x5: (0, 2), 0x6: (1, 2), 0x7: (0, 1, 2), 0x8: (3,),
+    0x9: (0, 3), 0xa: (1, 3), 0xb: (0, 1, 3), 0xc: (2, 3),
+    0xd: (0, 2, 3), 0xe: (1, 2, 3), 0xf: (0, 1, 2, 3),
+}
+MIMG_PREFIX_MASKS = (0x1, 0x3, 0x7, 0xf)
 
-    The a16 spelling packs both coordinates into one address VGPR: x in bits [15:0], y in [31:16].
-    """
-    for count, groups, shift in ((1, 4, 2), (2, 2, 3), (3, 1, 4), (4, 1, 4)):
-        mask = (1 << count) - 1
+
+def mimg_load_cases(a16=False, *, mip=False):
+    """All nonzero masks on one descriptor, with a dispatch size per result width."""
+    for mask, channels in MIMG_CHANNELS.items():
+        count = len(channels)
+        groups, shift = ((4, 2), (2, 3), (1, 4), (1, 4))[count - 1]
         data = "v14" if count == 1 else f"v[14:{13 + count}]"
         store = "buffer_store_dword" if count == 1 else f"buffer_store_dwordx{count}"
         lines = [
@@ -3717,7 +3725,7 @@ def mimg_load_cases(a16=False, *, mip=False):
             f"{store} {data}, v[12:13], s[20:23], 0 idxen offen",
             "s_endpgm",
         ]
-        yield count, groups, shift, lines
+        yield mask, channels, groups, shift, lines
 
 
 def mimg_mip_texels():
@@ -3727,19 +3735,19 @@ def mimg_mip_texels():
             for x in range(TEXTURE_WIDTH >> level) for channel in range(TEXTURE_CHANNELS)]
 
 
-def mimg_load_words(count, shift, groups, *, mip=False):
+def mimg_load_words(channels, shift, groups, *, mip=False):
     """Independent readback: lane (tid.x, tid.y) stores its texel at tid.y*32 + tid.x*step."""
     step = 1 << (shift - 2)
     words = [SENTINEL] * 320
     for y in range(TEXTURE_HEIGHT):
         for x in range(8 * groups):
             base = y * 32 + x * step
-            for channel in range(count):
+            for index, channel in enumerate(channels):
                 if mip:
                     level = min(y, 2)
-                    words[base + channel] = texture_word(x // 4, y // 4, channel) | (level << 24)
+                    words[base + index] = texture_word(x // 4, y // 4, channel) | (level << 24)
                 else:
-                    words[base + channel] = texture_word(x, y, channel)
+                    words[base + index] = texture_word(x, y, channel)
     return words
 
 
@@ -3752,7 +3760,7 @@ def mimg_ds_program():
 
 
 def mimg_load_controls():
-    count, groups, shift, lines = next(mimg_load_cases())
+    _, _, _, _, lines = next(mimg_load_cases())
     binding = MIMG_BINDING
     image = next(line for line in lines if line.startswith("image_load"))
 
@@ -3762,6 +3770,8 @@ def mimg_load_controls():
     for old, new, diagnostic in (
         ("dmask:0x1", "dmask:0x3", "Unsupported image load target"),
         ("dmask:0x1", "dmask:0x0", "Unsupported image load target"),
+        ("dmask:0x1", "dmask:0x10", "Unsupported image load target"),
+        ("dmask:0x1", "dmask:0xa", "Unsupported image load target"),
         ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_1D", "Unsupported compute instruction"),
         ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D a16", "Unsupported image load target"),
         ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D d16", "Unsupported compute instruction"),
@@ -3800,7 +3810,7 @@ def mimg_load_controls():
 
 
 def mimg_a16_controls():
-    count, groups, shift, lines = next(mimg_load_cases(a16=True))
+    _, _, _, _, lines = next(mimg_load_cases(a16=True))
     image = next(line for line in lines if line.startswith("image_load"))
 
     def changed(old, new):
@@ -3822,7 +3832,7 @@ def mimg_a16_controls():
 
 def mimg_mip_controls():
     for a16 in (False, True):
-        _, _, _, lines = next(mimg_load_cases(a16, mip=True))
+        _, _, _, _, lines = next(mimg_load_cases(a16, mip=True))
         image = next(line for line in lines if line.startswith("image_load_mip"))
         addr = "v[17:18]" if a16 else "v[16:18]"
         for original, replacement, diagnostic in (
@@ -3846,13 +3856,13 @@ def mimg_load_draw(directory, compiler, renderer, backend, *, mip=False):
     # dmask selects ascending texel components, and the first address dword is the x coordinate.
     families = (
         (False, {
-            1: [("component order", "image_load_0.x", "image_load_0.y", 0)],
-            4: [("coordinate order", "int3(asint(tid.x), asint(tid.y), 0)",
+            0x1: [("component order", "image_load_0.x", "image_load_0.y", 0)],
+            0xf: [("coordinate order", "int3(asint(tid.x), asint(tid.y), 0)",
                  "int3(asint(tid.y), asint(tid.x), 0)", 4),
                 ("channel order", "uint4(image_load_0.x, image_load_0.y, image_load_0.z, image_load_0.w)",
                  "uint4(image_load_0.y, image_load_0.x, image_load_0.z, image_load_0.w)", 0)],
         }),
-        (True, {4: [("packed high half", ">> 16u", ">> 0u", 4)]}),
+        (True, {0xf: [("packed high half", ">> 16u", ">> 0u", 4)]}),
     )
     if mip:
         mimg_mip_controls()
@@ -3862,22 +3872,23 @@ def mimg_load_draw(directory, compiler, renderer, backend, *, mip=False):
         texture += mimg_mip_texels()
     packed_texture = struct.pack(f"<{len(texture)}I", *texture)
     for a16, mutations in families:
-        for count, groups, shift, lines in mimg_load_cases(a16, mip=mip):
-            stem = f"mimg_load{'_mip' if mip else ''}{'_a16' if a16 else ''}_{count}"
+        for mask, channels, groups, shift, lines in mimg_load_cases(a16, mip=mip):
+            stem = f"mimg_load{'_mip' if mip else ''}{'_a16' if a16 else ''}_{mask:x}"
             src, cso, case = (directory / f"{stem}.{ext}" for ext in ("hlsl", "cso", "case"))
             source = aot.lower(lines, (8, 8, 1), **MIMG_BINDING)
             src.write_text(source, encoding="ascii")
             compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
             subprocess.run(compile_shader, check=True)
             run = [renderer, backend, "--compute-texture-case", cso, case]
-            expected = mimg_load_words(count, shift, groups, mip=mip)
+            expected = mimg_load_words(channels, shift, groups, mip=mip)
             reference = struct.pack("<321I", groups, *expected) + packed_texture
             case.write_bytes(reference)
             result = subprocess.run(run)
             if result.returncode:
                 return result.returncode
             # The comparison itself must fail on one wrong written word and one wrong untouched word.
-            for word in (0, 300):
+            reference_mutations = (0, 300) if mask in MIMG_PREFIX_MASKS else ()
+            for word in reference_mutations:
                 wrong = list(expected)
                 wrong[word] ^= 1
                 case.write_bytes(struct.pack("<321I", groups, *wrong) + packed_texture)
@@ -3886,8 +3897,11 @@ def mimg_load_draw(directory, compiler, renderer, backend, *, mip=False):
                     raise AssertionError(f"{stem}: wrong word {word} escaped detection\n{bad.stderr}")
                 print(bad.stderr, end="")
             case.write_bytes(reference)
-            controls = mutations.get(count, ())
-            if mip and count == 4:
+            controls = mutations.get(mask, ())
+            if mask == 0xa:
+                controls = [("treat sparse mask as xy", "uint2(image_load_0.y, image_load_0.w)",
+                             "uint2(image_load_0.x, image_load_0.y)", 0)]
+            if mip and mask == 0xf:
                 load = next(line for line in source.splitlines() if "imageData.Load" in line)
                 zero_lod = load[:load.rindex(", asint(")] + ", 0));"
                 controls = [("fixed LOD", load, zero_lod, 32)]
