@@ -2187,9 +2187,10 @@ mod tests {
         }
 
         // Simulate a same-list GPU write into the guest buffer's host shadow:
-        // write 0x1111_0000+i at offset 0 (512-byte aligned) and 0x2222_0000+i
-        // at offset 516 (NOT 512-byte aligned!) via GPU CopyBufferRegion while
-        // CPU title memory remains stale 0xDEAD_BEEF.
+        // write 0x1111_0000+i at offset 0 (512-byte aligned, bytes 0..784) and
+        // 0x2222_0000+i at offset 1028 (NOT 512-byte aligned, bytes 1028..1812)
+        // via GPU CopyBufferRegion while CPU title memory remains stale 0xDEAD_BEEF.
+        const UNALIGNED_OFF: usize = 1028;
         let hl = host_list(list).expect("host list");
         let shadow = crate::shadow::find(buf_ptr as u64, buf_len).expect("shadow");
         let (upload_buf, upload_ptr) = hl.upload(host, 4096).expect("upload");
@@ -2202,7 +2203,7 @@ mod tests {
                     let v1 = 0x1111_0000u32 + (y * 4 + x) as u32;
                     let v2 = 0x2222_0000u32 + (y * 4 + x) as u32;
                     slice[y * 256 + x * 4..y * 256 + x * 4 + 4].copy_from_slice(&v1.to_le_bytes());
-                    let off2 = 516 + y * 256 + x * 4;
+                    let off2 = UNALIGNED_OFF + y * 256 + x * 4;
                     slice[off2..off2 + 4].copy_from_slice(&v2.to_le_bytes());
                 }
             }
@@ -2216,7 +2217,7 @@ mod tests {
         shadow.gpu_writes(hl, buf_ptr as u64, 4096);
 
         // Now record guest CopyTextureRegion (slot 16) from BOTH aligned offset 0
-        // and unaligned offset 516 in the SAME command list.
+        // and unaligned offset 1028 in the SAME command list.
         let copy_tex = |dst_tex: This, src_offset: u64| {
             let dst = CopyLocation {
                 resource: dst_tex,
@@ -2245,7 +2246,7 @@ mod tests {
             copy_texture_region(list, &dst, 0, 0, 0, &src, std::ptr::null());
         };
         copy_tex(tex_aligned, 0);
-        copy_tex(tex_unaligned, 516);
+        copy_tex(tex_unaligned, UNALIGNED_OFF as u64);
 
         // Read both destination textures back to verify GPU-written bytes landed.
         let (rb_a, ptr_a) = host.readback_buffer(1024).expect("readback aligned");
@@ -2304,7 +2305,7 @@ mod tests {
                     )
                 };
                 assert_eq!(got_a, 0x1111_0000 + idx, "aligned ({x},{y})");
-                assert_eq!(got_u, 0x2222_0000 + idx, "unaligned 516 ({x},{y})");
+                assert_eq!(got_u, 0x2222_0000 + idx, "unaligned 1028 ({x},{y})");
             }
         }
 
