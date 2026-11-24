@@ -107,6 +107,12 @@ impl<'a> DxilProgram<'a> {
         if bitcode.get(0..4) != Some(&LLVM_BITCODE_MAGIC) {
             return Err(ShaderError::Malformed("bitcode lacks LLVM magic"));
         }
+        // LLVM reads bitcode as 32-bit words and its writer pads to one
+        // ("Bitcode stream should be a multiple of 4 bytes in length"); a
+        // ragged size cuts the last word short.
+        if !len.is_multiple_of(4) {
+            return Err(ShaderError::Malformed("bitcode size not a multiple of 4"));
+        }
         let prefix = part
             .get(24..start)
             .ok_or(ShaderError::Malformed("bitcode offset too small"))?;
@@ -282,6 +288,21 @@ mod tests {
         let mut bytes = build_standard(0, (6, 0), 0x100, &bitcode);
         set_u32(&mut bytes, 16, u32::MAX);
         assert_eq!(malformed(&bytes), "bitcode out of bounds");
+    }
+
+    #[test]
+    fn rejects_bitcode_cut_mid_word() {
+        // The last word's bytes stay in the program; only the size is short.
+        let bitcode = fake_bitcode();
+        for cut in 1..4 {
+            let mut bytes = build_standard(0, (6, 0), 0x100, &bitcode);
+            set_u32(&mut bytes, 20, (bitcode.len() - cut) as u32);
+            assert_eq!(malformed(&bytes), "bitcode size not a multiple of 4");
+        }
+        // A whole word fewer is still a word-aligned (if short) stream.
+        let mut bytes = build_standard(0, (6, 0), 0x100, &bitcode);
+        set_u32(&mut bytes, 20, (bitcode.len() - 4) as u32);
+        assert_eq!(DxilProgram::parse(&bytes).unwrap().bitcode.len(), 12);
     }
 
     #[test]
