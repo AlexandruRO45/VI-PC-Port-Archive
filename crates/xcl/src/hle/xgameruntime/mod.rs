@@ -15,6 +15,7 @@ pub mod xsign;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::util::{write_cstr_out, E_INVALIDARG, E_NOT_FOUND, E_NOT_SUFFICIENT_BUFFER, E_NOT_SUPPORTED, HRESULT, S_OK};
 use accessibility::*;
@@ -847,11 +848,30 @@ pub struct DeviceAssociationChange {
     pub new_user: u64,
 }
 
-/// device association callbacks the title registered: (token, queue, context, callback)
-static ASSOCIATION_CALLBACKS: std::sync::Mutex<Vec<(u64, usize, usize, usize)>> = std::sync::Mutex::new(Vec::new());
-/// the local user was handed to the title (XUserAddResult): the input devices are associated
-/// with it from then on
-static USER_SIGNED_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[derive(Default)]
+struct AssociationCallState {
+    stopped: bool,
+    in_flight: usize,
+    owner: Option<std::thread::ThreadId>,
+}
+
+struct AssociationEntry {
+    token: u64,
+    queue: usize,
+    ctx: usize,
+    cb: usize,
+    state: Arc<(Mutex<AssociationCallState>, Condvar)>,
+}
+
+struct AssociationRegistry {
+    /// the local user was handed to the title (XUserAddResult): the input devices are associated
+    /// with it from then on
+    signed_in: bool,
+    callbacks: Vec<AssociationEntry>,
+}
+
+/// device association callbacks the title registered, serialized with `signed_in`
+static ASSOCIATIONS: Mutex<AssociationRegistry> = Mutex::new(AssociationRegistry { signed_in: false, callbacks: Vec::new() });
 
 /// The association a device gets when it becomes the signed-in user's: none → the user.
 pub fn gamepad_association() -> DeviceAssociationChange {
@@ -862,18 +882,44 @@ struct AssociationCall {
     cb: usize,
     ctx: usize,
     change: DeviceAssociationChange,
+    state: Arc<(Mutex<AssociationCallState>, Condvar)>,
 }
 
-unsafe extern "system" fn association_call(rec: *mut c_void, _canceled: bool) {
+struct InFlightGuard<'a>(&'a (Mutex<AssociationCallState>, Condvar));
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut s = self.0.0.lock().unwrap();
+        s.in_flight -= 1;
+        if s.in_flight == 0 {
+            s.owner = None;
+            self.0.1.notify_all();
+        }
+    }
+}
+
+unsafe extern "system" fn association_call(rec: *mut c_void, canceled: bool) {
     let r = Box::from_raw(rec as *mut AssociationCall);
+    if canceled {
+        return;
+    }
+    let _guard = {
+        let mut s = r.state.0.lock().unwrap();
+        if s.stopped {
+            return;
+        }
+        s.in_flight += 1;
+        s.owner = Some(std::thread::current().id());
+        InFlightGuard(&r.state)
+    };
     let f: unsafe extern "system" fn(*mut c_void, *const DeviceAssociationChange) = std::mem::transmute(r.cb);
     f(r.ctx as *mut c_void, &r.change);
 }
 
 /// The title's association callback gets the gamepad → user association, on its queue's
 /// completion port.
-unsafe fn notify_association(queue: usize, ctx: usize, cb: usize) {
-    let rec = Box::into_raw(Box::new(AssociationCall { cb, ctx, change: gamepad_association() }));
+unsafe fn notify_association(queue: usize, ctx: usize, cb: usize, state: Arc<(Mutex<AssociationCallState>, Condvar)>) {
+    let rec = Box::into_raw(Box::new(AssociationCall { cb, ctx, change: gamepad_association(), state }));
     let hr = xasync::submit_callback(queue as *mut c_void, PORT_COMPLETION, rec as *mut c_void, association_call as usize);
     if hr < 0 {
         drop(Box::from_raw(rec));
@@ -894,31 +940,51 @@ pub unsafe extern "system" fn XUserRegisterForDeviceAssociationChanged(queue: *m
     }
     let t = NEXT_ASSOCIATION_TOKEN.fetch_add(1, Ordering::Relaxed);
     *token = t;
-    ASSOCIATION_CALLBACKS.lock().unwrap().push((t, queue as usize, ctx as usize, cb));
-    crate::xlog_info!("XUser: device association callback #{t:#x} registered (queue {queue:?}){}", if USER_SIGNED_IN.load(Ordering::Acquire) { "" } else { " – before the user is signed in" });
-    if USER_SIGNED_IN.load(Ordering::Acquire) {
-        notify_association(queue as usize, ctx as usize, cb);
+    let state = Arc::new((Mutex::new(AssociationCallState::default()), Condvar::new()));
+    let signed_in = {
+        let mut reg = ASSOCIATIONS.lock().unwrap();
+        reg.callbacks.push(AssociationEntry { token: t, queue: queue as usize, ctx: ctx as usize, cb, state: Arc::clone(&state) });
+        reg.signed_in
+    };
+    crate::xlog_info!("XUser: device association callback #{t:#x} registered (queue {queue:?}){}", if signed_in { "" } else { " – before the user is signed in" });
+    if signed_in {
+        notify_association(queue as usize, ctx as usize, cb, state);
     }
     S_OK
 }
 
 static NEXT_ASSOCIATION_TOKEN: AtomicU64 = AtomicU64::new(0x4153_0001);
 
-pub unsafe extern "system" fn XUserUnregisterForDeviceAssociationChanged(token: u64, _wait: bool) -> bool {
-    ASSOCIATION_CALLBACKS.lock().unwrap().retain(|c| c.0 != token);
+pub unsafe extern "system" fn XUserUnregisterForDeviceAssociationChanged(token: u64, wait: bool) -> bool {
+    let Some(entry) = ({
+        let mut reg = ASSOCIATIONS.lock().unwrap();
+        reg.callbacks.iter().position(|c| c.token == token).map(|pos| reg.callbacks.remove(pos))
+    }) else {
+        return false;
+    };
+    let mut s = entry.state.0.lock().unwrap();
+    s.stopped = true;
+    let me = std::thread::current().id();
+    while wait && s.in_flight > 0 && s.owner != Some(me) {
+        s = entry.state.1.wait(s).unwrap();
+    }
     true
 }
 
 /// The local user reached the title: the gamepad becomes its device (each registered
 /// association callback hears of it once).
 fn user_signed_in() {
-    if USER_SIGNED_IN.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    crate::xlog_info!("XUser: the local user reached the title (XUserAddResult); {} device association callback(s)", ASSOCIATION_CALLBACKS.lock().unwrap().len());
-    let calls: Vec<_> = ASSOCIATION_CALLBACKS.lock().unwrap().clone();
-    for (_, q, ctx, cb) in calls {
-        unsafe { notify_association(q, ctx, cb) };
+    let calls: Vec<_> = {
+        let mut reg = ASSOCIATIONS.lock().unwrap();
+        if reg.signed_in {
+            return;
+        }
+        reg.signed_in = true;
+        crate::xlog_info!("XUser: the local user reached the title (XUserAddResult); {} device association callback(s)", reg.callbacks.len());
+        reg.callbacks.iter().map(|c| (c.queue, c.ctx, c.cb, Arc::clone(&c.state))).collect()
+    };
+    for (q, ctx, cb, state) in calls {
+        unsafe { notify_association(q, ctx, cb, state) };
     }
 }
 
@@ -1164,6 +1230,111 @@ mod tests {
             assert!(info.available_free_bytes <= info.total_free_bytes);
             assert!(info.total_free_bytes + info.used_bytes <= info.total_bytes);
             let _ = std::fs::remove_file(&probe);
+        }
+    }
+
+    #[test]
+    fn device_association_unregister_and_cancel_do_not_invoke_or_race() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Condvar, Mutex};
+
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        user_signed_in();
+
+        static CANCELED_HITS: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn count_cb(_ctx: *mut c_void, _change: *const DeviceAssociationChange) {
+            CANCELED_HITS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        // Case 1: unregister before queued completion dispatches must suppress callback.
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut q), S_OK);
+            let before = CANCELED_HITS.load(Ordering::SeqCst);
+            let mut tok = 0u64;
+            assert_eq!(XUserRegisterForDeviceAssociationChanged(q, std::ptr::null_mut(), count_cb as usize, &mut tok), S_OK);
+            assert!(XUserUnregisterForDeviceAssociationChanged(tok, true));
+            assert!(!XUserUnregisterForDeviceAssociationChanged(tok, true), "double unregister must return false");
+            while XTaskQueueDispatch(q, PORT_COMPLETION, 0) {}
+            assert_eq!(CANCELED_HITS.load(Ordering::SeqCst), before, "unregistered callback must not run on queued completion");
+            XTaskQueueCloseHandle(q);
+        }
+
+        // Case 2: XTaskQueueTerminate cancels queued completion without running callback.
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut q), S_OK);
+            let before = CANCELED_HITS.load(Ordering::SeqCst);
+            let mut tok = 0u64;
+            assert_eq!(XUserRegisterForDeviceAssociationChanged(q, std::ptr::null_mut(), count_cb as usize, &mut tok), S_OK);
+            assert_eq!(XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0), S_OK);
+            assert_eq!(CANCELED_HITS.load(Ordering::SeqCst), before, "terminated queue must not invoke canceled association callback");
+            let _ = XUserUnregisterForDeviceAssociationChanged(tok, true);
+            XTaskQueueCloseHandle(q);
+        }
+
+        // Case 3: unregister(wait = true) must block until an in-flight callback returns.
+        struct WaitSync {
+            entered: bool,
+            allow_exit: bool,
+            exited: bool,
+        }
+        unsafe extern "system" fn slow_cb(ctx: *mut c_void, _change: *const DeviceAssociationChange) {
+            let sync = &*(ctx as *const (Mutex<WaitSync>, Condvar));
+            {
+                let mut s = sync.0.lock().unwrap();
+                s.entered = true;
+                sync.1.notify_all();
+                while !s.allow_exit {
+                    s = sync.1.wait(s).unwrap();
+                }
+                s.exited = true;
+            }
+        }
+
+        unsafe {
+            let sync = Arc::new((
+                Mutex::new(WaitSync { entered: false, allow_exit: false, exited: false }),
+                Condvar::new(),
+            ));
+            let mut q = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut q), S_OK);
+            let mut tok = 0u64;
+            let ctx = Arc::as_ptr(&sync) as *mut c_void;
+            assert_eq!(XUserRegisterForDeviceAssociationChanged(q, ctx, slow_cb as usize, &mut tok), S_OK);
+
+            let q_addr = q as usize;
+            let disp = std::thread::spawn(move || {
+                while XTaskQueueDispatch(q_addr as *mut c_void, PORT_COMPLETION, 0) {}
+            });
+
+            {
+                let mut s = sync.0.lock().unwrap();
+                while !s.entered {
+                    s = sync.1.wait(s).unwrap();
+                }
+            }
+
+            let unreg_done = Arc::new(AtomicBool::new(false));
+            let unreg_done_c = Arc::clone(&unreg_done);
+            let unreg = std::thread::spawn(move || {
+                assert!(XUserUnregisterForDeviceAssociationChanged(tok, true));
+                unreg_done_c.store(true, Ordering::SeqCst);
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            assert!(!unreg_done.load(Ordering::SeqCst), "wait=true returned while callback was still running");
+
+            {
+                let mut s = sync.0.lock().unwrap();
+                s.allow_exit = true;
+                sync.1.notify_all();
+            }
+            unreg.join().unwrap();
+            disp.join().unwrap();
+            assert!(sync.0.lock().unwrap().exited);
+            assert!(unreg_done.load(Ordering::SeqCst));
+            XTaskQueueCloseHandle(q);
         }
     }
 }
