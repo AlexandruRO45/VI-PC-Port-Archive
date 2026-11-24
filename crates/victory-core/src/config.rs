@@ -5722,6 +5722,78 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn a_data_folder_inside_the_game_only_as_written_is_refused_through_a_link() {
+        // A scratch folder under the system temp folder, never the
+        // repository; removed at the end.
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-data-linked-into-game-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let game = scratch.join("gta");
+        let cache = scratch.join("cache");
+        std::fs::create_dir_all(game.join("saves")).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        // `data` is a sibling of the dump only as written; the link leads
+        // into the game folder.
+        std::os::unix::fs::symlink("gta/saves", scratch.join("data")).unwrap();
+        let with = |game: PathBuf, cache: PathBuf, data: PathBuf| {
+            move |k: &str| match k {
+                "VICTORY_GAME_DIR" => Some(game.clone().into_os_string()),
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let err = |game: PathBuf, cache: PathBuf, data: PathBuf| {
+            Config::resolve(FilePaths::default(), None, with(game, cache, data))
+                .unwrap_err()
+                .to_string()
+        };
+        let real = std::fs::canonicalize(&scratch).unwrap();
+
+        // Data under a link into the dump, with the folder itself not made
+        // yet: named with both settings and where each one is on disk.
+        let data = scratch.join("data").join("files");
+        let e = err(game.clone(), cache.clone(), data.clone());
+        assert_eq!(
+            e,
+            format!(
+                "the data folder {} (from VICTORY_DATA_DIR) is inside the game folder {} (from \
+                 VICTORY_GAME_DIR) once links are followed ({} is inside {}), which holds your \
+                 dump and is only read; set VICTORY_DATA_DIR or [paths].data_dir to a folder \
+                 outside it",
+                data.display(),
+                game.display(),
+                real.join("gta").join("saves").join("files").display(),
+                real.join("gta").display()
+            )
+        );
+        // The link itself as the data folder, and a folder below a `..`
+        // after a link, still inside the dump.
+        let e = err(game.clone(), cache.clone(), scratch.join("data"));
+        assert!(e.contains("once links are followed"), "{e}");
+        let e = err(
+            game.clone(),
+            cache.clone(),
+            scratch.join("data").join("..").join("saves").join("state"),
+        );
+        assert!(e.contains("inside the game folder"), "{e}");
+        assert!(e.contains("once links are followed"), "{e}");
+
+        // Siblings on disk stay allowed, through a link or not.
+        let ok = with(
+            game.clone(),
+            cache.clone(),
+            scratch.join("outside").join("data"),
+        );
+        assert!(Config::resolve(FilePaths::default(), None, ok).is_ok());
+        assert!(!game.join("saves").join("files").exists());
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
     fn test_titles_are_kept_apart_from_cache_and_data() {
         let with = |titles: Vec<PathBuf>, cache: PathBuf, data: PathBuf| {
             move |k: &str| match k {
