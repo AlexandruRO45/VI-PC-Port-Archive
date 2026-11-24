@@ -1191,4 +1191,64 @@ mod tests {
             }
         );
     }
+
+    /// A wave64 has lanes 32-63: a spill to lane 35 sits beside the one to
+    /// lane 3 rather than overwriting it, so lane 3 still holds s9.
+    #[test]
+    fn a_spill_lane_past_32_is_its_own_lane_in_a_wave64() {
+        let words = [
+            0xD761_0000,
+            0x0001_0609, // v_writelane_b32 v0, s9, 3
+            0xD761_0000,
+            0x0001_460A, // v_writelane_b32 v0, s10, 35
+            0xD760_0002,
+            0x0001_0700, // v_readlane_b32 s2, v0, 3
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0001,
+            0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w: &u32| w.to_le_bytes()).collect();
+        let layout = [param(Table, 9, 1), param(Table, 10, 1)];
+        let p = crate::ir::build(&code, true, 256).unwrap();
+        let r = track(&p, &layout, HwStage::Ps).unwrap();
+        assert_eq!(r.scalar, [((0, 4), at(0, 0x20))]);
+    }
+
+    /// Lane selects keep 5 bits in a wave32 and 6 in a wave64, whether an
+    /// inline constant or a literal; a register select is not a constant.
+    #[test]
+    fn lane_selects_keep_only_the_waves_bits() {
+        let lane = |op: Operand| (lane_of(op, false), lane_of(op, true));
+        assert_eq!(lane(Operand::Const(128 + 3)), (Some(3), Some(3)));
+        assert_eq!(lane(Operand::Const(128 + 35)), (Some(3), Some(35)));
+        assert_eq!(lane(Operand::Const(128 + 64)), (Some(0), Some(0)));
+        assert_eq!(lane(Operand::Literal(99)), (Some(3), Some(35)));
+        assert_eq!(lane(Operand::Literal(u32::MAX)), (Some(31), Some(63)));
+        // -1 as an inline constant is all ones too.
+        assert_eq!(lane(Operand::Const(193)), (Some(31), Some(63)));
+        assert_eq!(lane(Operand::Const(251)), (None, None), "vccz");
+        assert_eq!(lane(Operand::Scalar { code: 4, dwords: 1 }), (None, None));
+        assert_eq!(lane(Operand::Vector { reg: 0, dwords: 1 }), (None, None));
+    }
+
+    /// Inline constants: 0-64, -1 to -16, the nine floats, and nothing for
+    /// the codes between or past them.
+    #[test]
+    fn inline_constants_cover_integers_and_floats_only() {
+        assert_eq!(inline(128), Some(0));
+        assert_eq!(inline(192), Some(64));
+        assert_eq!(inline(193), Some(u32::MAX));
+        assert_eq!(inline(208), Some(-16i32 as u32));
+        let floats: Vec<_> = (240..=247)
+            .map(|c| f32::from_bits(inline(c).unwrap()))
+            .collect();
+        assert_eq!(floats, [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0]);
+        // 1 / (2 * pi), rounded as the hardware has it.
+        let inv_2pi = f32::from_bits(inline(248).unwrap());
+        assert!((inv_2pi - 1.0 / (2.0 * std::f32::consts::PI)).abs() < 1e-7);
+        for c in (0..128).chain(209..240).chain(249..=255) {
+            assert_eq!(inline(c), None, "code {c}");
+        }
+    }
 }
