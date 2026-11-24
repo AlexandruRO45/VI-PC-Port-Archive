@@ -276,17 +276,17 @@ fn name_before(file: &[u8], nul: usize) -> Option<&str> {
     // the bytes before it (the previous record's packed tail, say) and the
     // name's own characters: any of them that equals its distance to the NUL
     // reads as a length byte as well. Shader names are identifiers (letters,
-    // digits, `_`), and a length byte from 33 to 47 (names of 32 to 46
-    // characters) is punctuation, so the earliest length byte whose name is
-    // an identifier wins over a stray byte before it; failing that, the
-    // earliest.
+    // digits, `_`, not starting with a digit), and a length byte from 33 to
+    // 47 (names of 32 to 46 characters) is punctuation and from 48 to 57 a
+    // digit, so the earliest length byte whose name is an identifier wins
+    // over a stray byte before it; failing that, the earliest.
     let mut lengths = (run.saturating_sub(1)..nul).filter(|&l| usize::from(file[l]) == nul - l);
     let first = lengths.clone().next();
     lengths
         .find(|&l| {
-            file[l + 1..nul]
-                .iter()
-                .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+            let name = &file[l + 1..nul];
+            !name.first().is_some_and(u8::is_ascii_digit)
+                && name.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
         })
         .or(first)
         .and_then(|l| std::str::from_utf8(&file[l + 1..nul]).ok())
@@ -735,6 +735,32 @@ mod tests {
             file.extend(record_bytes(&long, 0x32, b"long"));
             let names: Vec<_> = records(&file).map(|r| r.name).collect();
             assert_eq!(names, [Some(&long[..])]);
+        }
+    }
+
+    #[test]
+    fn a_name_does_not_start_with_its_length_byte() {
+        // A name of 47 to 56 characters has a digit for its length byte, so a
+        // stray byte right before it that equals its distance to the NUL
+        // reads as a length byte whose name (the digit, then the name) is all
+        // letters, digits and `_`. Names are identifiers, which do not start
+        // with a digit.
+        for name in [
+            format!("PS_{}", "w".repeat(44)),
+            format!(
+                "PS_DeferredLightingComposite_0011aabb_{}_Wrapped",
+                "x".repeat(3)
+            ),
+            format!("PS_{}", "w".repeat(53)),
+        ] {
+            let len = name.len() as u8 + 1;
+            assert!(len.is_ascii_digit(), "{name}");
+            let mut file = MAGIC.to_vec();
+            file.extend_from_slice(&[0, 0, len + 1]);
+            let header = record_bytes(&name, 0x32, b"container");
+            file.extend_from_slice(&header[4..]);
+            let names: Vec<_> = records(&file).map(|r| r.name).collect();
+            assert_eq!(names, [Some(&name[..])]);
         }
     }
 
