@@ -989,4 +989,167 @@ mod tests {
         bad_record[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&bad_record))])).is_err());
     }
+
+    /// Why `data` (a `DXIL` part) is refused.
+    fn refused(data: &[u8]) -> &'static str {
+        match native_programs(data) {
+            Err(Malformed(why)) => why,
+            other => panic!("expected a malformed blob, got {other:?}"),
+        }
+    }
+
+    /// Why a part holding `blob` as its only native entry is refused.
+    fn refused_blob(blob: &[u8]) -> &'static str {
+        refused(&part(&[(KIND_NATIVE, blob)]))
+    }
+
+    #[test]
+    fn names_each_xdat_refusal() {
+        let native = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
+        let mut data = part(&[(KIND_NATIVE, &native)]);
+        data[XDAT_OFFSET + 4..][..4].copy_from_slice(&(MAX_XDAT_ENTRIES as u32 + 1).to_le_bytes());
+        assert_eq!(refused(&data), "implausible XDAT entry count");
+
+        // A native entry whose size runs past the part.
+        let mut data = part(&[(KIND_NATIVE, &native)]);
+        let size = XDAT_OFFSET + 12 + 8;
+        data[size..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(refused(&data), "XDAT entry out of bounds");
+
+        // Entries of other kinds are never read, so their bounds do not matter.
+        let mut data = part(&[(0x0e, b"tbl."), (KIND_NATIVE, &native)]);
+        data[size..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(native_programs(&data).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn names_each_xbch_refusal() {
+        let good = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
+        let with = |at: usize, value: &[u8]| {
+            let mut blob = good.clone();
+            blob[at..at + value.len()].copy_from_slice(value);
+            blob
+        };
+        assert_eq!(
+            refused_blob(&with(0, b"XBCX")),
+            "native blob lacks XBCH magic"
+        );
+        assert_eq!(
+            refused_blob(&with(4, &(XBCH_VERSION + 1).to_le_bytes())),
+            "unknown XBCH version"
+        );
+        assert_eq!(
+            refused_blob(&with(16, &(MAX_UNPACKED + 1).to_le_bytes())),
+            "implausible XBCH unpacked size"
+        );
+        let packed = u64_at(&good, 8).unwrap();
+        assert_eq!(
+            refused_blob(&with(8, &(packed + 1).to_le_bytes())),
+            "XBCH stream out of bounds"
+        );
+        // A stated size either side of what the stream holds.
+        let unpacked = u64_at(&good, 16).unwrap();
+        for stated in [unpacked - 1, unpacked + 1] {
+            assert_eq!(
+                refused_blob(&with(16, &stated.to_le_bytes())),
+                "XBCH stream does not inflate to its stated size"
+            );
+        }
+        // A header with no stream after it.
+        assert_eq!(refused_blob(&good[..20]), "truncated");
+    }
+
+    #[test]
+    fn names_each_fssm_header_refusal() {
+        let good = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let with = |at: usize, value: &[u8]| {
+            let mut blob = good.clone();
+            blob[at..at + value.len()].copy_from_slice(value);
+            xbch(&blob)
+        };
+        assert_eq!(
+            refused_blob(&with(0, b"FSSX")),
+            "native blob lacks FSSM magic"
+        );
+        assert_eq!(
+            refused_blob(&with(4, &(FSSM_VERSION + 1).to_le_bytes())),
+            "unknown FSSM version"
+        );
+        let payload = (good.len() - FSSM_HEADER) as u64;
+        assert_eq!(
+            refused_blob(&with(8, &(payload - 1).to_le_bytes())),
+            "FSSM payload size disagrees"
+        );
+        assert_eq!(
+            refused_blob(&with(FSSM_HEADER, &(GRAPHICS_SLOT_COUNT + 1).to_le_bytes())),
+            "unexpected FSSM slot count"
+        );
+        assert_eq!(
+            refused_blob(&with(
+                FSSM_HEADER + slot(HwStage::Vs),
+                &payload.to_le_bytes()
+            )),
+            "FSSM record out of bounds"
+        );
+    }
+
+    #[test]
+    fn names_each_record_refusal() {
+        let good = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let record = stage_data_at(&good, HwStage::Vs) - RECORD_SIZE as usize;
+        let with = |at: usize, value: &[u8]| {
+            let mut blob = good.clone();
+            blob[at..at + value.len()].copy_from_slice(value);
+            xbch(&blob)
+        };
+        // One byte more code than the payload holds.
+        assert_eq!(
+            refused_blob(&with(record + 8, &(VS_CODE.len() as u64 + 1).to_le_bytes())),
+            "native code out of bounds"
+        );
+        assert_eq!(
+            refused_blob(&with(record + RECORD_REGS, &257u32.to_le_bytes())),
+            "implausible VGPR count"
+        );
+        // 256 is the most a program can have.
+        let blob = with(record + RECORD_REGS, &256u32.to_le_bytes());
+        assert_eq!(
+            native_programs(&part(&[(KIND_NATIVE, &blob)])).unwrap()[0].vgprs,
+            256
+        );
+        // One root parameter, at an offset past the payload.
+        let mut blob = good.clone();
+        blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        blob[record + RECORD_COUNTS..][..4].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(refused_blob(&xbch(&blob)), "FSSM root table out of bounds");
+    }
+
+    #[test]
+    fn names_each_stage_data_refusal() {
+        let vs = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let e = stage_data_at(&vs, HwStage::Vs);
+        for count_at in [VS_INPUT_COUNT, VS_OUTPUT_COUNT] {
+            let mut blob = vs.clone();
+            blob[e + count_at..][..4].copy_from_slice(&(MAX_SEMANTICS + 1).to_le_bytes());
+            assert_eq!(refused_blob(&xbch(&blob)), "implausible semantic count");
+        }
+
+        let ps = fssm(&[(HwStage::Ps, &PS_CODE)]);
+        let e = stage_data_at(&ps, HwStage::Ps);
+        let mut blob = ps.clone();
+        blob[e + PS_INPUT_COUNT..][..4].copy_from_slice(&(MAX_SEMANTICS + 1).to_le_bytes());
+        assert_eq!(refused_blob(&xbch(&blob)), "implausible semantic count");
+        let mut blob = ps.clone();
+        let size = PATCH_SLOT_DWORDS as u32 + 1;
+        blob[e + PS_PATCH_SIZE..][..4].copy_from_slice(&size.to_le_bytes());
+        assert_eq!(refused_blob(&xbch(&blob)), "implausible export patch size");
+        // A one-dword patch at the code's last dword fits; one past it does not.
+        let mut blob = ps.clone();
+        blob[e + PS_PATCH_SIZE..][..4].copy_from_slice(&1u32.to_le_bytes());
+        let last = (PS_CODE.len() / 4) as u32;
+        blob[e + PS_PATCHES..][..4].copy_from_slice(&(last - 1).to_le_bytes());
+        assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_ok());
+        blob[e + PS_PATCHES..][..4].copy_from_slice(&last.to_le_bytes());
+        assert_eq!(refused_blob(&xbch(&blob)), "export patch outside the code");
+    }
 }
