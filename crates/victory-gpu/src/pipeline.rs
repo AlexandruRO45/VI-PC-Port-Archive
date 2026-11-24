@@ -133,8 +133,11 @@ impl Shader {
                         // container, for `victory shader-info --disasm`.
                         #[cfg(feature = "diagnostics")]
                         if let Some(dir) = failed_dump_dir() {
-                            let path = dir.join(format!("{}-{}.dxbc", self.stage, self.hash));
-                            if let Err(e) = std::fs::write(&path, &self.container) {
+                            let mut dumped = DUMPED.lock().unwrap_or_else(|e| e.into_inner());
+                            let dumped = dumped.get_or_insert_with(std::collections::HashSet::new);
+                            if let Some((path, Err(e))) =
+                                dump_failed(dir, dumped, self.stage, &self.hash, &self.container)
+                            {
                                 tracing::warn!(path = %path.display(), error = %e, "VICTORY_DUMP_FAILED: not written");
                             }
                         }
@@ -165,6 +168,32 @@ fn failed_dump_dir() -> Option<&'static std::path::Path> {
         Some(dir)
     })
     .as_deref()
+}
+
+/// The file names `VICTORY_DUMP_FAILED` wrote (or tried to) this run.
+#[cfg(all(windows, feature = "diagnostics"))]
+static DUMPED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+/// Writes a container that does not translate to `<dir>/<stage>-<hash>.shader`:
+/// the console container as the title passed it (not PC DXBC bytecode), which
+/// `victory shader-info` finds in any file by its magic. Once per name per
+/// run (`dumped` holds the names written): `None` if written already, else
+/// the path and how the write went.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_failed(
+    dir: &std::path::Path,
+    dumped: &mut std::collections::HashSet<String>,
+    stage: &str,
+    hash: &str,
+    container: &[u8],
+) -> Option<(std::path::PathBuf, std::io::Result<()>)> {
+    let name = format!("{stage}-{hash}.shader");
+    if !dumped.insert(name.clone()) {
+        return None;
+    }
+    let path = dir.join(name);
+    let written = std::fs::write(&path, container);
+    Some((path, written))
 }
 
 #[cfg(windows)]
@@ -580,6 +609,26 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_failed_container_is_dumped_once_per_run_as_a_shader_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dumped = std::collections::HashSet::new();
+        let (path, written) =
+            super::dump_failed(dir.path(), &mut dumped, "pixel", "00112233", b"DXBC1").unwrap();
+        written.unwrap();
+        assert_eq!(path, dir.path().join("pixel-00112233.shader"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"DXBC1");
+        // A retried translation of the same container writes nothing.
+        std::fs::write(&path, b"kept").unwrap();
+        let again = super::dump_failed(dir.path(), &mut dumped, "pixel", "00112233", b"DXBC1");
+        assert!(again.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"kept");
+        // Another stage or hash is its own file.
+        let other = super::dump_failed(dir.path(), &mut dumped, "vertex", "00112233", b"DXBC2");
+        assert!(other.is_some());
     }
 
     use super::*;
