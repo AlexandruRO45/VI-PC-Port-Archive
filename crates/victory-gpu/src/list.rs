@@ -1620,19 +1620,16 @@ mod state {
             }
         });
     }
-    /// `(count, handles, one range, depth)`: with one range, the handles
-    /// follow the first at the render target view size (128 bytes). Caps at
-    /// D3D12's 8 simultaneous render targets and guards null / zero / overflow (#796).
-    pub(super) extern "system" fn targets(
-        this: This,
+    /// Collects and validates render target handles for `OMSetRenderTargets`:
+    /// caps at D3D12's 8 simultaneous targets and guards null / zero / overflow (#796).
+    pub(super) fn collect_target_handles(
         count: u32,
         handles: *const u64,
         one_range: i32,
-        depth: *const u64,
-    ) {
+    ) -> Vec<u64> {
         const MAX_RENDER_TARGETS: u32 = 8;
         let count = count.min(MAX_RENDER_TARGETS);
-        let handles: Vec<u64> = if count == 0 || handles.is_null() {
+        if count == 0 || handles.is_null() {
             Vec::new()
         } else if one_range != 0 {
             // SAFETY: `count > 0` and `handles` is non-null.
@@ -1646,7 +1643,19 @@ mod state {
             }
         } else {
             items(handles, count).to_vec()
-        };
+        }
+    }
+
+    /// `(count, handles, one range, depth)`: with one range, the handles
+    /// follow the first at the render target view size (128 bytes).
+    pub(super) extern "system" fn targets(
+        this: This,
+        count: u32,
+        handles: *const u64,
+        one_range: i32,
+        depth: *const u64,
+    ) {
+        let handles = collect_target_handles(count, handles, one_range);
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
         with_state(this, |list, s| s.set_targets(list, &handles, depth));
@@ -2716,12 +2725,24 @@ mod tests {
             S_OK
         );
 
-        // Edge-case OMSetRenderTargets calls must not panic or fault (#796).
+        // Edge-case OMSetRenderTargets handle collection: count=0, null, first=0,
+        // cap at 8, and overflow stop without wrapping (#796).
         let zero_handle = 0u64;
         let max_handle = u64::MAX - 64;
-        state::targets(list, 0, &zero_handle, 1, std::ptr::null());
+        let valid_first = 0x1000u64;
+        assert!(state::collect_target_handles(0, &max_handle, 1).is_empty());
+        assert!(state::collect_target_handles(4, std::ptr::null(), 1).is_empty());
+        assert!(state::collect_target_handles(4, &zero_handle, 1).is_empty());
+        assert_eq!(
+            state::collect_target_handles(16, &valid_first, 1).len(),
+            8
+        );
+        assert_eq!(
+            state::collect_target_handles(4, &max_handle, 1),
+            vec![max_handle]
+        );
+        state::targets(list, 0, std::ptr::null(), 1, std::ptr::null());
         state::targets(list, 4, &zero_handle, 1, std::ptr::null());
-        state::targets(list, 16, &max_handle, 1, std::ptr::null());
 
         // Create a 4x1 R8G8B8A8_UNORM render target texture + RTV heap.
         #[repr(C)]
@@ -2747,12 +2768,7 @@ mod tests {
             ),
             S_OK
         );
-        let heap_start = |h: This| {
-            let mut out = 0u64;
-            slot::<extern "system" fn(This, *mut u64) -> *mut u64>(h, 0x48)(h, &mut out);
-            out
-        };
-        let rtv_handle = heap_start(rtv_heap);
+        let rtv_handle = slot::<extern "system" fn(This) -> u64>(rtv_heap, 0x48)(rtv_heap);
 
         #[repr(C)]
         struct RawDesc {

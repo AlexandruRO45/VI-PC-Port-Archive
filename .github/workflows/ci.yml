@@ -55,6 +55,6 @@ jobs:
           code=$?
           cat /tmp/test.log
           if [ $code -ne 0 ]; then
-            grep -E '(FAILED|panicked|assertion|error\[|thread .+ panicked)' /tmp/test.log | head -n 40 | while IFS= read -r line; do echo "::error::$line"; done
+            { grep -E '(FAILED|panicked|assertion|error\[|thread .+ panicked|Running |process didn)' /tmp/test.log; tail -n 30 /tmp/test.log; } | tail -n 45 | while IFS= read -r line; do echo "::error::$line"; done
             exit $code
           fi
