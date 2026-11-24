@@ -33,6 +33,9 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// When it entered the queue, for the queue wait (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    queued_at: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -56,12 +59,21 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            #[cfg(feature = "diagnostics")]
+            queued_at: AtomicU64::new(0),
         }
     }
 
     fn make(&self) {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        #[cfg(feature = "diagnostics")]
+        {
+            super::timing::add(super::timing::Part::Whole, started.elapsed());
+            super::timing::made(self.made.get().is_some_and(|made| made.is_some()));
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -244,6 +256,10 @@ impl Queue {
         } else {
             self.early.push_back(p.clone());
         }
+        #[cfg(feature = "diagnostics")]
+        if prev == NOT_QUEUED {
+            p.queued_at.store(crate::host::now_ms(), Ordering::Relaxed);
+        }
         Some(prev == NOT_QUEUED)
     }
 
@@ -253,6 +269,14 @@ impl Queue {
             std::iter::from_fn(|| self.early.pop_front())
                 .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         })?;
+        #[cfg(feature = "diagnostics")]
+        {
+            let queued = p.queued_at.swap(0, Ordering::Relaxed);
+            let now = crate::host::now_ms();
+            if queued != 0 && now >= queued {
+                super::timing::queued(now - queued);
+            }
+        }
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -298,6 +322,11 @@ fn workers() -> bool {
     *RUNNING.get_or_init(|| {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        #[cfg(feature = "diagnostics")]
+        {
+            super::timing::workers(workers as u64);
+            super::timing::report_thread();
+        }
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))

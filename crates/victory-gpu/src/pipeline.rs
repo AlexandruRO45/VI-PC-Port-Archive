@@ -133,9 +133,21 @@ impl Shader {
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
+        #[cfg(feature = "diagnostics")]
+        let asked = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let mut worked = std::time::Duration::ZERO;
+        let done = self
+            .translated
             .get_or_init(|| {
+                #[cfg(feature = "diagnostics")]
+                let started = std::time::Instant::now();
                 let done = translate(&self.container);
+                #[cfg(feature = "diagnostics")]
+                {
+                    worked = started.elapsed();
+                    timing::add(timing::Part::Translate, worked);
+                }
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -177,7 +189,15 @@ impl Shader {
                 }
                 done.ok()
             })
-            .as_ref()
+            .as_ref();
+        #[cfg(feature = "diagnostics")]
+        if timing::on() {
+            timing::add(
+                timing::Part::TranslateWait,
+                asked.elapsed().saturating_sub(worked),
+            );
+        }
+        done
     }
 }
 
@@ -724,6 +744,10 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+/// `VICTORY_PIPELINE_TIMING=1`: where a host pipeline's time goes, a line a
+/// second (`timing`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod timing;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
