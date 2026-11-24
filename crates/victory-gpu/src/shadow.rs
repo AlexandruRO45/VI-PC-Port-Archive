@@ -470,6 +470,7 @@ impl Shadow {
     fn update_ready(&self, mut ranges: &[(usize, usize)]) -> usize {
         let mut copied = 0;
         let mut allocation: Option<crate::watch::Allocation> = None;
+        let mut unreadable_watch: Option<crate::watch::Allocation> = None;
         while let Some((&(from, to), remaining)) = ranges.split_first() {
             if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
                 return copied
@@ -477,6 +478,11 @@ impl Shadow {
                         .iter()
                         .map(|&(from, to)| self.update_unwatched(from, to))
                         .sum::<usize>();
+            }
+            if unreadable_watch.is_some_and(|a| a.is_private_span(from, to)) {
+                copied += self.update_unwatched(from, to);
+                ranges = remaining;
+                continue;
             }
             // Sparse requests need no allocation lookup. For dense ranges,
             // bound the candidate group before walking it, even if the
@@ -513,6 +519,21 @@ impl Shadow {
                     written = &written[written.partition_point(|&(page, _)| page < from / PAGE)..];
                     copied += self.update_watched(from, to, now, written);
                 }
+            } else if count > 1 && allocation.is_some_and(|a| a.is_private_span(from, end)) {
+                // A failed query inside one verified private reservation need
+                // not be retried for every view. Copy only requested bytes,
+                // with the usual sparse fallback, for this preparation pass.
+                unreadable_watch = allocation;
+                let start = self.start as usize;
+                if self.watched.load(Ordering::Relaxed) == WATCH_UNKNOWN
+                    && crate::watch::private_region_covers(start, start + self.len as usize, None)
+                {
+                    self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+                }
+                copied += group
+                    .iter()
+                    .map(|&(from, to)| self.update_unwatched(from, to))
+                    .sum::<usize>();
             } else {
                 copied += group
                     .iter()
@@ -1733,6 +1754,40 @@ mod tests {
             assert_eq!(shadow.data.add(2 * PAGE + 9).read(), 5);
         }
         assert_eq!(shadow.copy_back(base + 24, 8), 8);
+    }
+
+    #[test]
+    fn grouped_watch_keeps_changes_for_the_oldest_shadow_coverage() {
+        let Some((title, shadow)) = fixture(true, 3) else {
+            return;
+        };
+        let base = title.0 as usize;
+        let last = base + 2 * PAGE;
+        let Some(other) = shadow_at(base, 3 * PAGE) else {
+            return;
+        };
+        let ranges = [(base + 8, base + 16), (last + 8, last + 16)];
+        assert_eq!(shadow.update_ranges(&ranges), 16);
+        assert_eq!(other.update(last + 8, 8), 8);
+
+        // SAFETY: both bytes belong to the live watched title reservation.
+        unsafe {
+            title.0.cast::<u8>().add(8).write(3);
+            title.0.cast::<u8>().add(2 * PAGE + 8).write(9);
+        }
+        // The other shadow resets the second page's native dirty bit.
+        assert_eq!(other.update(last + 8, 8), 8);
+        assert_eq!(shadow.update(base + 8, 8), 8);
+        assert_eq!(shadow.update_ranges(&ranges), 8);
+        assert_eq!(native_byte(&shadow, 8), 3);
+        assert_eq!(native_byte(&shadow, 2 * PAGE + 8), 9);
+
+        // A new preparation phase must observe another CPU write.
+        // SAFETY: this is the same still-live title reservation.
+        unsafe { title.0.cast::<u8>().add(8).write(11) };
+        assert_eq!(shadow.update_ranges(&ranges), 8);
+        assert_eq!(native_byte(&shadow, 8), 11);
+        assert_eq!(shadow.update_ranges(&ranges), 0);
     }
 
     #[test]
