@@ -1589,7 +1589,15 @@ static SNAPSHOT_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::a
 /// older than what was merged, and putting it in would take title memory
 /// back until the newer flight lands. Kept only while such flights are in
 /// the air ([`forget_merged_upto`]).
-static MERGED_UPTO: Mutex<Option<std::collections::HashMap<(usize, u32), u64>>> = Mutex::new(None);
+///
+/// By bytes, not pieces: a fetch merges a piece cut to the landing plan's
+/// own span, so another flight's range elsewhere in the same piece was not
+/// brought by it (each entry: offsets in the copy, and the fetch's order).
+static MERGED_UPTO: Mutex<Option<MergedUpto>> = Mutex::new(None);
+
+/// [`MERGED_UPTO`]'s table: by copy and piece, the byte ranges fetches
+/// merged, each with the queue order the fetch ran behind.
+type MergedUpto = std::collections::HashMap<(usize, u32), Vec<(usize, usize, u64)>>;
 
 /// The flights numbered up to `landed` have landed: an entry of
 /// [`MERGED_UPTO`] no later flight is numbered below is of no use.
@@ -1602,42 +1610,64 @@ fn forget_merged_upto(landed: Option<u64>) {
 
 /// [`forget_merged_upto`] on a table: a later flight is numbered above
 /// `landed`, so an entry at `landed + 1` or below can leave out none.
-fn forget_upto(upto: &mut std::collections::HashMap<(usize, u32), u64>, landed: u64) {
-    upto.retain(|_, w| *w > landed + 1);
+fn forget_upto(upto: &mut MergedUpto, landed: u64) {
+    upto.retain(|_, ranges| {
+        ranges.retain(|r| r.2 > landed + 1);
+        !ranges.is_empty()
+    });
 }
 
-/// A fetch that ran behind queue order `after` merged `keys`.
-fn note_upto(upto: &mut std::collections::HashMap<(usize, u32), u64>, keys: impl IntoIterator<Item = (usize, u32)>, after: u64) {
-    for key in keys {
-        let w = upto.entry(key).or_insert(0);
-        *w = (*w).max(after);
+/// A fetch that ran behind queue order `after` merged these byte ranges
+/// (copy, piece, offsets in the copy).
+fn note_upto(upto: &mut MergedUpto, merged: impl IntoIterator<Item = ((usize, u32), (usize, usize))>, after: u64) {
+    for (key, (lo, hi)) in merged {
+        let ranges = upto.entry(key).or_default();
+        match ranges.iter_mut().find(|r| r.0 == lo && r.1 == hi) {
+            Some(r) => r.2 = r.2.max(after),
+            None => ranges.push((lo, hi, after)),
+        }
     }
 }
 
 /// What a landing from the ring does with a flagged piece of a flight
-/// numbered `sent_as`: `slot` is what the compare left for it (`None`: no
-/// flag with a slot), `upto` the order of a fetch that merged it already.
+/// numbered `sent_as`, cut to `[lo, hi)`: `slot` is what the compare left
+/// for it (`None`: no flag with a slot), `merged` what fetches merged of
+/// the piece already ([`MERGED_UPTO`]).
 #[derive(Debug, PartialEq, Eq)]
 enum RingPiece {
     /// Merge its bytes from this slot.
     Merge(u32),
-    /// Leave it out: a fetch that ran after this flight merged newer bytes.
+    /// Leave it out: fetches that ran after this flight merged newer bytes
+    /// of all of it.
     Older,
-    /// The ring cannot serve it: the landing fetches, as before.
+    /// The ring cannot serve it (no slot), or a later fetch merged part of
+    /// it only: the landing fetches, as before, which brings the newest
+    /// bytes of all of it.
     Fetch,
 }
 
-fn ring_piece(slot: Option<u32>, slots: u32, sent_as: u64, upto: Option<u64>) -> RingPiece {
-    match slot {
-        Some(slot) if slot < slots => {
-            if upto.is_some_and(|w| sent_as < w) {
-                RingPiece::Older
-            } else {
-                RingPiece::Merge(slot)
-            }
-        }
-        _ => RingPiece::Fetch,
+fn ring_piece(slot: Option<u32>, slots: u32, sent_as: u64, merged: &[(usize, usize, u64)], lo: usize, hi: usize) -> RingPiece {
+    let Some(slot) = slot.filter(|&s| s < slots) else {
+        return RingPiece::Fetch;
+    };
+    // The parts of [lo, hi) a fetch that ran after this flight merged.
+    let mut newer: Vec<(usize, usize)> = merged
+        .iter()
+        .filter(|r| sent_as < r.2 && r.0 < hi && r.1 > lo)
+        .map(|r| (r.0.max(lo), r.1.min(hi)))
+        .collect();
+    if newer.is_empty() {
+        return RingPiece::Merge(slot);
     }
+    newer.sort_unstable();
+    let mut covered = lo;
+    for (a, b) in newer {
+        if a > covered {
+            return RingPiece::Fetch;
+        }
+        covered = covered.max(b);
+    }
+    if covered >= hi { RingPiece::Older } else { RingPiece::Fetch }
 }
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
@@ -1996,21 +2026,34 @@ mod relay_tests {
         let mut upto = std::collections::HashMap::new();
         let piece = (0x1000usize, 7u32);
         let other = (0x1000usize, 8u32);
+        let notes = |upto: &std::collections::HashMap<(usize, u32), Vec<(usize, usize, u64)>>, key| {
+            upto.get(&key).cloned().unwrap_or_default()
+        };
         // Flights 8, 9 and 10 are in the air; flight 7's landing fetches
-        // behind queue order 10 and merges `piece`, which flight 9 wrote.
-        note_upto(&mut upto, [piece], 10);
-        // Flight 8 and 9 land from the ring with their copies of `piece`.
-        assert_eq!(ring_piece(Some(3), 16, 8, upto.get(&piece).copied()), RingPiece::Older);
-        assert_eq!(ring_piece(Some(4), 16, 9, upto.get(&piece).copied()), RingPiece::Older);
+        // behind queue order 10 and merges [0x70000, 0x71000) of `piece`,
+        // where flight 9 wrote too.
+        note_upto(&mut upto, [(piece, (0x70000, 0x71000))], 10);
+        // Flights 8 and 9 land from the ring with their copies of those bytes.
+        assert_eq!(ring_piece(Some(3), 16, 8, &notes(&upto, piece), 0x70000, 0x71000), RingPiece::Older);
+        assert_eq!(ring_piece(Some(4), 16, 9, &notes(&upto, piece), 0x70800, 0x70c00), RingPiece::Older);
         // Another piece the fetch did not bring is merged.
-        assert_eq!(ring_piece(Some(5), 16, 9, upto.get(&other).copied()), RingPiece::Merge(5));
+        assert_eq!(ring_piece(Some(5), 16, 9, &notes(&upto, other), 0x80000, 0x81000), RingPiece::Merge(5));
+        // Another range of the same piece that the fetch did not bring
+        // (flight 9 wrote [0x78000, 0x79000)): merged, not left out.
+        assert_eq!(ring_piece(Some(5), 16, 9, &notes(&upto, piece), 0x78000, 0x79000), RingPiece::Merge(5));
+        // A range the fetch brought only part of: the landing fetches, which
+        // brings the newest bytes of all of it.
+        assert_eq!(ring_piece(Some(5), 16, 9, &notes(&upto, piece), 0x70800, 0x71800), RingPiece::Fetch);
+        // Two fetched ranges that together cover it: left out.
+        note_upto(&mut upto, [(piece, (0x71000, 0x72000))], 10);
+        assert_eq!(ring_piece(Some(5), 16, 9, &notes(&upto, piece), 0x70800, 0x71800), RingPiece::Older);
         // Flight 10 took its sends' number before the fetch: its lists may
         // have run after it, so its copy is merged.
-        assert_eq!(ring_piece(Some(6), 16, 10, upto.get(&piece).copied()), RingPiece::Merge(6));
-        // A later fetch only raises the note.
-        note_upto(&mut upto, [piece], 9);
-        assert_eq!(upto[&piece], 10);
-        // Flight 8 landed: flight 9 still needs the note.
+        assert_eq!(ring_piece(Some(6), 16, 10, &notes(&upto, piece), 0x70000, 0x71000), RingPiece::Merge(6));
+        // A later fetch of the same bytes only raises the note.
+        note_upto(&mut upto, [(piece, (0x70000, 0x71000))], 9);
+        assert_eq!(notes(&upto, piece), [(0x70000, 0x71000, 10), (0x71000, 0x72000, 10)]);
+        // Flight 8 landed: flight 9 still needs the notes.
         forget_upto(&mut upto, 8);
         assert!(upto.contains_key(&piece));
         // Flight 9 landed: no flight below 10 is left.
@@ -2018,10 +2061,10 @@ mod relay_tests {
         assert!(upto.is_empty());
         // Without a note, a slot merges; a piece flagged with no slot (the
         // ring was full) or with a slot past the ring makes the landing fetch.
-        assert_eq!(ring_piece(Some(0), 1, 3, None), RingPiece::Merge(0));
-        assert_eq!(ring_piece(None, 16, 3, None), RingPiece::Fetch);
-        assert_eq!(ring_piece(Some(16), 16, 3, None), RingPiece::Fetch);
-        assert_eq!(ring_piece(None, 16, 3, Some(99)), RingPiece::Fetch);
+        assert_eq!(ring_piece(Some(0), 1, 3, &[], 0, 16), RingPiece::Merge(0));
+        assert_eq!(ring_piece(None, 16, 3, &[], 0, 16), RingPiece::Fetch);
+        assert_eq!(ring_piece(Some(16), 16, 3, &[], 0, 16), RingPiece::Fetch);
+        assert_eq!(ring_piece(None, 16, 3, &[(0, 16, 99)], 0, 16), RingPiece::Fetch);
     }
 
     /// Two flights and what follows each: nothing of the second lands
@@ -3531,8 +3574,9 @@ impl Host {
             return;
         }
         let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        // The pieces fetched, by copy and piece (`MERGED_UPTO`).
-        let mut keys: Vec<(usize, u32)> = Vec::new();
+        // What is fetched, by copy and piece, and the bytes of the piece
+        // fetched (`MERGED_UPTO`).
+        let mut keys: Vec<((usize, u32), (usize, usize))> = Vec::new();
         let mut total = 0u64;
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
@@ -3561,7 +3605,7 @@ impl Host {
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi && seen.insert((copy, lo, hi)) {
                             pieces.push((r.shadow.clone(), lo, hi, total));
-                            keys.push((copy, r.span.first + p));
+                            keys.push(((copy, r.span.first + p), (lo, hi)));
                             total += (hi - lo) as u64;
                         }
                     }
@@ -3710,11 +3754,17 @@ impl Host {
                     if !flagged.contains(&(copy, piece)) {
                         continue;
                     }
+                    let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                    if lo >= hi || !seen.insert((copy, lo, hi)) {
+                        continue;
+                    }
                     let slot = match ring_piece(
                         slot_of.get(&(copy, piece)).copied().flatten(),
                         slots,
                         plan.sent_as,
-                        upto.get(&(copy, piece)).copied(),
+                        upto.get(&(copy, piece)).map_or(&[][..], Vec::as_slice),
+                        lo,
+                        hi,
                     ) {
                         RingPiece::Fetch => return false,
                         RingPiece::Older => {
@@ -3723,10 +3773,6 @@ impl Host {
                         }
                         RingPiece::Merge(slot) => slot,
                     };
-                    let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                    if lo >= hi || !seen.insert((copy, lo, hi)) {
-                        continue;
-                    }
                     let base = card_slot_start(piece, r.span.skew);
                     if lo < base || hi - base > CARD_SLOT_BYTES {
                         return false;
