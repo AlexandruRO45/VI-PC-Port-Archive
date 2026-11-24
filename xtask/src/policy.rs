@@ -1779,6 +1779,87 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// A TMPDIR that is the checkout itself (`TMPDIR=.` run from it, or a
+    /// link from elsewhere to it) puts each temporary directory at the top
+    /// of the checkout, where nothing ignores it: it is refused, and the
+    /// attempt left behind, so the next candidate is used and the checkout
+    /// holds nothing new. Under a `/*` rule the same place is ignored and
+    /// taken: the top of the checkout is judged like any other directory.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_judged_at_the_top_of_the_checkout() {
+        let repo = tempdir();
+        let outside = tempdir();
+        let root = repo.path().canonicalize().unwrap();
+        git_str(&root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "/ignored/\n").unwrap();
+        let ignored = root.join("ignored");
+        std::fs::create_dir(&ignored).unwrap();
+        let link = outside.path().join("checkout");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let entries = |dir: &std::path::Path| -> Vec<std::ffi::OsString> {
+            let mut names: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = entries(&root);
+
+        let tmp = tempdir_in_first(&root, [root.clone(), link, ignored.clone()]);
+        assert_eq!(tmp.path().parent(), Some(ignored.as_path()));
+        assert_eq!(entries(&root), before);
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        assert_eq!(names(&root, false), [".gitignore"]);
+        drop(tmp);
+
+        std::fs::write(root.join(".gitignore"), "/*\n!/.gitignore\n").unwrap();
+        let tmp = tempdir_in_first(&root, [root.clone()]);
+        assert_eq!(tmp.path().parent(), Some(root.as_path()));
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        assert_eq!(names(&root, false), [".gitignore"]);
+        super::run(&root, false).unwrap();
+    }
+
+    /// A CARGO_TARGET_DIR that is the checkout itself is never passed over,
+    /// whatever its tag says: the whole tree would go unchecked. What is
+    /// built there is listed, in a repository and outside one, and passing
+    /// over is left to `.gitignore` as for any other file.
+    #[cfg(unix)]
+    #[test]
+    fn a_build_directory_at_the_top_of_the_checkout_is_still_read() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join("a.rs"), b"fn a() {}\n").unwrap();
+        let exe = fake_build_dir(root);
+        assert_eq!(super::build_dir_in(root, &exe), None);
+        assert!(!super::leads_to_build_dir(root, &exe));
+        let listed = names_built_by(root, &exe);
+        for name in [
+            "a.rs",
+            "CACHEDIR.TAG",
+            "debug/main.o",
+            "debug/deps/xtask-0123",
+        ] {
+            assert!(listed.contains(&name.to_owned()), "{name}: {listed:?}");
+        }
+        std::fs::write(root.join(".gitignore"), "/debug/\n").unwrap();
+        assert_eq!(
+            names_built_by(root, &exe),
+            [".gitignore", "CACHEDIR.TAG", "a.rs"]
+        );
+
+        let outer = tempdir();
+        let plain = outer.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join("a.rs"), b"fn a() {}\n").unwrap();
+        let exe = fake_build_dir(&plain);
+        let listed = names_built_by(&plain, &exe);
+        assert!(listed.contains(&"debug/main.o".to_owned()), "{listed:?}");
+    }
+
     /// `path` quoted for `sh`, for the scripts tests write: a TMPDIR holding
     /// `'` made the hook and filter commands built from it shell syntax
     /// errors, and the git commands running them failed.
