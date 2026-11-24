@@ -11,6 +11,13 @@ use std::sync::LazyLock;
 
 use crate::HleModule;
 
+mod advapi32_eventing;
+mod advapi32_registry;
+mod audio_out;
+mod bcrypt;
+mod combase;
+mod crypt32;
+mod dbghelp;
 #[allow(dead_code)] // used by the slices as they land
 pub(crate) mod handles;
 mod kernel32_exception;
@@ -29,7 +36,10 @@ mod kernel32_thread;
 mod kernel32_threadpool;
 mod kernel32_time;
 mod kernel32_wait;
+mod mfplat;
+mod mmdevapi;
 mod ntdll_exception;
+mod oleaut32;
 pub(crate) mod system_dlls;
 mod ucrt_convert;
 mod ucrt_environment;
@@ -44,7 +54,10 @@ mod ucrt_stdio;
 mod ucrt_string;
 mod ucrt_time;
 mod ucrt_utility;
-
+pub(crate) mod user32;
+mod winhttp;
+mod ws2_32;
+mod xaudio2;
 fn modules() -> Vec<HleModule> {
     vec![
         kernel32_wait::module(),
@@ -75,6 +88,18 @@ fn modules() -> Vec<HleModule> {
         kernel32_text::module(),
         kernel32_exception::module(),
         ntdll_exception::module(),
+        advapi32_eventing::module(),
+        advapi32_registry::module(),
+        bcrypt::module(),
+        combase::module(),
+        crypt32::module(),
+        dbghelp::module(),
+        mfplat::module(),
+        oleaut32::module(),
+        user32::module(),
+        winhttp::module(),
+        ws2_32::module(),
+        xaudio2::module(),
     ]
 }
 

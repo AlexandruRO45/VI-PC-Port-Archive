@@ -52,9 +52,13 @@ impl Default for HostPolicy {
             "mfplat.dll",
             "mfreadwrite.dll",
         ];
-        HostPolicy {
-            allow: allow.iter().map(|s| s.to_string()).collect(),
+        let mut allow: Vec<String> = allow.iter().map(|s| s.to_string()).collect();
+        // vccorlib140's BSTRs: ours on Linux (`linux::oleaut32`); on
+        // Windows they stay unresolved, as they always were.
+        if cfg!(target_os = "linux") {
+            allow.push("oleaut32.dll".into());
         }
+        HostPolicy { allow }
     }
 }
 
