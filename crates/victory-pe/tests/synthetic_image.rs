@@ -1306,3 +1306,94 @@ fn a_codeview_path_without_its_nul_inside_the_record_is_malformed() {
         "tt.pdb"
     );
 }
+
+#[test]
+fn a_tls_directory_entry_without_a_size_is_still_read() {
+    // Unlike the relocation, exception and load-config entries, which need
+    // both an RVA and a size, TLS is found by its RVA alone: the directory's
+    // own layout says how much to read.
+    let mut d = image();
+    set_directory(&mut d, DIR_TLS, TLS_DIRECTORY, 0);
+    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
+    assert_eq!(tls.directory_rva, TLS_DIRECTORY);
+    assert_eq!(tls.callback_rvas, [0x1010, 0x1020]);
+}
+
+#[test]
+fn directory_slots_past_number_of_rva_and_sizes_are_ignored() {
+    // Values left in slots the header does not count are not directories.
+    let mut d = image();
+    set_directory(&mut d, dir::EXCEPTION, 0x1390, 12);
+    set_directory(&mut d, dir::BASERELOC, 0x1380, 12);
+    set_directory(&mut d, dir::LOAD_CONFIG, 0x13A0, 0x40);
+    put32(&mut d, OPT + layout::OPT_NUMBER_OF_RVA_AND_SIZES, 1);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert!(info.imports.is_empty());
+    assert_eq!(info.import_count(), 0);
+    assert!(info.tls.is_none());
+    assert!(!info.has_exception_table);
+    assert!(!info.has_relocations);
+    assert!(!info.has_load_config);
+    // The section table still follows the full optional header.
+    assert_eq!(info.sections.len(), 1);
+    assert_eq!(info.rva_to_file_offset(ENTRY), Some(SECTION_FILE_OFFSET));
+
+    // Counting the import slot brings the imports back, but not TLS.
+    put32(&mut d, OPT + layout::OPT_NUMBER_OF_RVA_AND_SIZES, 2);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.import_count(), 2);
+    assert!(info.tls.is_none());
+}
+
+#[test]
+fn tls_vas_are_taken_relative_to_the_image_base_in_the_header() {
+    const DLL_BASE: u64 = 0x1_8000_0000;
+    let rebase = |d: &mut [u8]| put64(d, OPT + 24, DLL_BASE);
+
+    // VAs written for the old base now lie below the image: malformed.
+    let mut d = image();
+    rebase(&mut d);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+
+    // Rewritten for the new base, the same RVAs come back.
+    put64(
+        &mut d,
+        at(TLS_DIRECTORY) + layout::TLS64_ADDRESS_OF_CALLBACKS,
+        DLL_BASE + u64::from(TLS_CALLBACKS),
+    );
+    put64(&mut d, at(TLS_CALLBACKS), DLL_BASE + 0x1010);
+    put64(&mut d, at(TLS_CALLBACKS) + 8, DLL_BASE + 0x1020);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.image_base, DLL_BASE);
+    let tls = info.tls.unwrap();
+    assert_eq!(tls.callbacks_va, DLL_BASE + u64::from(TLS_CALLBACKS));
+    assert_eq!(tls.callback_rvas, [0x1010, 0x1020]);
+}
+
+#[test]
+fn a_tls_callback_at_the_image_base_is_rva_zero_not_the_terminator() {
+    // Only a null VA ends the array; the image base itself is a (strange but
+    // representable) callback at RVA 0, and the walk continues past it.
+    let mut d = image();
+    put64(&mut d, at(TLS_CALLBACKS), IMAGE_BASE);
+    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
+    assert_eq!(tls.callback_rvas, [0, 0x1020]);
+}
+
+#[test]
+fn an_image_without_sections_or_directories_has_only_headers() {
+    let mut d = image();
+    put16(&mut d, 0x46, 0); // no sections
+    for index in [dir::IMPORT, DIR_TLS] {
+        set_directory(&mut d, index, 0, 0);
+    }
+    let info = ImageInfo::parse(&d).unwrap();
+    assert!(info.sections.is_empty());
+    assert!(info.imports.is_empty() && info.delay_imports.is_empty());
+    assert!(info.exports.is_empty());
+    assert!(info.tls.is_none() && info.codeview.is_none());
+    assert_eq!(info.entry_rva, ENTRY);
+    // Nothing is file-backed without a section to map it.
+    assert_eq!(info.rva_to_file_offset(ENTRY), None);
+    assert_eq!(info.rva_to_file_offset(0), None);
+}
