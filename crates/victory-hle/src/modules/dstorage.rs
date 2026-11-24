@@ -1027,7 +1027,6 @@ fn into_destination(
     into_pages(pages, offset, len, fill)
 }
 
-#[cfg(windows)]
 fn into_pages(
     pages: &[usize],
     offset: usize,
@@ -1046,19 +1045,6 @@ fn into_pages(
     } else {
         Err(E_INVALIDARG)
     }
-}
-
-// ponytail: physical pages are xmem's, not on Linux yet; use the Windows
-// twin once modules/xmem.rs builds there.
-#[cfg(not(windows))]
-fn into_pages(
-    _: &[usize],
-    _: usize,
-    _: usize,
-    _: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
-) -> Result<(), HRESULT> {
-    tracing::warn!("dstorage: physical-page destinations need xmem");
-    Err(E_NOTIMPL)
 }
 
 /// Slots by the 2020 order, which the argument shapes at Grand Theft Auto

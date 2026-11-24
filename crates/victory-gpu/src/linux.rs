@@ -198,8 +198,11 @@ fn pump(jobs: Receiver<Job>, ready: Sender<Result<bool, String>>) {
             let which = u32::from_ne_bytes(event[EVENT_WHICH..EVENT_WHICH + 4].try_into().unwrap());
             match kind {
                 EVENT_QUIT | EVENT_WINDOW_CLOSE_REQUESTED => {
+                    // The runtime's SIGTERM handler ends the title as the
+                    // console does (suspend, then end).
                     tracing::info!("window closed; ending the run");
-                    std::process::exit(0);
+                    // SAFETY: raise has no preconditions.
+                    unsafe { libc::raise(libc::SIGTERM) };
                 }
                 EVENT_GAMEPAD_ADDED => connect(&api, which),
                 EVENT_GAMEPAD_REMOVED => disconnect(&api, which),

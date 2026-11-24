@@ -103,7 +103,7 @@ impl Port {
             // The worker ends once it holds the last reference (every queue
             // using the port is closed) and nothing is left to run.
             let worker = port.clone();
-            std::thread::spawn(move || {
+            title_thread(move || {
                 loop {
                     match worker.take(1000) {
                         Some(task) => task.run(false),
@@ -164,7 +164,7 @@ impl Pool {
         let mut state = lock(&self.state);
         state.0.push_back(task);
         if state.0.len() > state.1 {
-            std::thread::spawn(move || self.work());
+            title_thread(move || self.work());
         } else {
             self.ready.notify_one();
         }
@@ -216,7 +216,7 @@ impl Queue {
             self.deliver(port, task);
         } else {
             let queue = self.clone();
-            std::thread::spawn(move || {
+            title_thread(move || {
                 std::thread::sleep(Duration::from_millis(delay_ms.into()));
                 queue.deliver(port, task);
             });
@@ -763,7 +763,7 @@ pub fn pending_with(
                 // SAFETY: as above; cleanup waits for completion.
                 let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
                 let (block, state) = (data.block as usize, state as usize);
-                std::thread::spawn(move || {
+                title_thread(move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
                     let (hr, len) = match &result {
                         Ok(bytes) => (S_OK, bytes.len()),
@@ -1208,4 +1208,14 @@ mod tests {
         );
         XTaskQueueCloseHandle(q);
     }
+}
+
+/// A host thread that runs title callbacks: on Linux it needs a TEB first,
+/// which Windows gives every thread.
+fn title_thread(f: impl FnOnce() + Send + 'static) {
+    std::thread::spawn(move || {
+        #[cfg(target_os = "linux")]
+        victory_loader::linux::thread::attach_current();
+        f()
+    });
 }
