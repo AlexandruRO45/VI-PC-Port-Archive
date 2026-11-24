@@ -130,6 +130,9 @@ pub struct D3d12Stats {
     /// DXIL cache and compiler statistics.
     #[serde(default)]
     pub dxil_cache: crate::gpu::recomp::dxc::CacheStats,
+    /// views with an empty descriptor and resources made outside unified memory
+    #[serde(default)]
+    pub outside_uma: OutsideUma,
 }
 
 static ADAPTER: Mutex<String> = Mutex::new(String::new());
@@ -395,6 +398,7 @@ pub fn stats() -> D3d12Stats {
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
+        outside_uma: outside_uma(),
     }
 }
 
@@ -1169,13 +1173,51 @@ fn resource_dim_to_view(r: &D3D12_RESOURCE_DESC) -> i32 {
     }
 }
 
-static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
+/// What console code cannot reach through unified memory, by kind (`OutsideUma`): views that
+/// got an empty descriptor, and resources unified memory had no room for.
+static OUTSIDE_UMA: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+const EMPTY_SRV: usize = 0;
+const EMPTY_UAV: usize = 1;
+const EMPTY_CBV: usize = 2;
+const EMPTY_TEXTURE_VIEW: usize = 3;
+const NO_ROOM_BUFFER: usize = 4;
+const NO_ROOM_TEXTURE: usize = 5;
+
+/// What console code cannot reach through unified memory (report.json `d3d12.outside_uma`,
+/// the `XCL_ACTIVITY` line of console code): a shader reading an empty descriptor gets zeros
+/// and its writes go nowhere.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
+pub struct OutsideUma {
+    /// buffer SRVs / UAVs / CBVs whose buffer is not in unified memory: an empty V#
+    pub empty_srv: u64,
+    pub empty_uav: u64,
+    pub empty_cbv: u64,
+    /// texture views whose shape XCL could not take: an empty T#
+    pub empty_texture_views: u64,
+    /// console buffers / committed textures made as plain PC resources because unified memory
+    /// had no room left (the coherent window full, the sparse windows too for buffers)
+    pub buffers_without_room: u64,
+    pub textures_without_room: u64,
+}
+
+pub fn outside_uma() -> OutsideUma {
+    let n = |k: usize| OUTSIDE_UMA[k].load(Ordering::Relaxed);
+    OutsideUma {
+        empty_srv: n(EMPTY_SRV),
+        empty_uav: n(EMPTY_UAV),
+        empty_cbv: n(EMPTY_CBV),
+        empty_texture_views: n(EMPTY_TEXTURE_VIEW),
+        buffers_without_room: n(NO_ROOM_BUFFER),
+        textures_without_room: n(NO_ROOM_TEXTURE),
+    }
+}
 
 /// V# of a buffer view (raw: 4-byte elements, num_records in bytes; structured / typed:
-/// stride = element size, num_records in elements); empty when the buffer is not in UMA.
-fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
+/// stride = element size, num_records in elements); empty when the buffer is not in UMA
+/// (counted as `kind`, `EMPTY_SRV` / `EMPTY_UAV`).
+fn buffer_view(kind: usize, res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
     let Some((at, bytes)) = console_buffer(res) else {
-        note_buffer_view();
+        note_outside_uma(kind);
         return [0; 4];
     };
     let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
@@ -1233,9 +1275,13 @@ unsafe fn place_console_texture(this: *mut c_void, desc: usize, state: usize, cl
     let align = (align as usize).max(0x1_0000);
     let bytes = (size as usize).div_ceil(align) * align;
     if u.size().saturating_sub(u.used()) < bytes + COHERENT_KEPT {
+        note_outside_uma(NO_ROOM_TEXTURE);
         return None;
     }
-    let p = u.alloc(bytes, align)? as usize;
+    let Some(p) = u.alloc(bytes, align).map(|a| a as usize) else {
+        note_outside_uma(NO_ROOM_TEXTURE);
+        return None;
+    };
     let hr = super::device_x::create_placed_resource_x(this, p as u64, desc as *const u8, state as u32, clear as *const c_void, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         u.free(p);
@@ -1345,10 +1391,11 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
         }
     }
     let Some(p) = u.alloc(rounded, 0x1_0000).map(|a| a as usize) else {
-        if prefer_coherent && u.has_sparse() {
-            return place_console_buffer_sparse(this, &d, bytes, st, readback_on_null_map, riid, ppv);
+        let r = if prefer_coherent && u.has_sparse() { place_console_buffer_sparse(this, &d, bytes, st, readback_on_null_map, riid, ppv) } else { None };
+        if r.is_none() {
+            note_outside_uma(NO_ROOM_BUFFER);
         }
-        return None;
+        return r;
     };
     // the heap from OpenExistingHeapFromAddress is cross-adapter: row-major + sanitized flags & state
     let (d, st) = sanitize_coherent_buffer(&d, state);
@@ -1765,9 +1812,18 @@ unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
     Some(p)
 }
 
-fn note_buffer_view() {
-    if NON_UMA_BUFFER_VIEWS.fetch_add(1, Ordering::Relaxed) == 0 {
-        crate::xlog_warn!("buffer view in the console heap: the buffer is not in UMA – the shader gets an empty V# (num_records 0)");
+/// Count one of `OUTSIDE_UMA`; the first of each kind is logged (its time shows when it starts).
+fn note_outside_uma(kind: usize) {
+    if OUTSIDE_UMA[kind].fetch_add(1, Ordering::Relaxed) == 0 {
+        match kind {
+            EMPTY_SRV | EMPTY_UAV | EMPTY_CBV => crate::xlog_warn!(
+                "{} buffer view in the console heap: the buffer is not in UMA – the shader gets an empty V# (num_records 0)",
+                ["an SRV", "a UAV", "a CBV"][kind]
+            ),
+            EMPTY_TEXTURE_VIEW => crate::xlog_warn!("a texture view in the console heap XCL cannot shape – the shader gets an empty T#"),
+            NO_ROOM_BUFFER => crate::xlog_warn!("a console buffer has no room in unified memory – a plain PC resource, its views get empty V#s"),
+            _ => crate::xlog_warn!("a committed console texture has no room in the coherent window – a plain PC resource the title cannot write through its address"),
+        }
     }
 }
 
@@ -1782,7 +1838,7 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
     let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
     if !in_uma {
-        note_buffer_view();
+        note_outside_uma(EMPTY_CBV);
     }
     let (va, size) = if in_uma { (va, size) } else { (0, 0) };
     super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(va, size));
@@ -2030,7 +2086,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+        return super::console_heap::write(&slot, &buffer_view(EMPTY_SRV, res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
     }
     let (format, dim, array, mips) = match desc.as_ref() {
         Some(v) => {
@@ -2056,7 +2112,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     match view_shape(r, format, dim, array, mips) {
         Some((fmt, ty, w, h, d, m)) => super::console_heap::write(&slot, &crate::gpu::desc::xcl_image_for_view(slot.index, fmt, ty, w, h, d, m)),
         None => {
-            note_buffer_view();
+            note_outside_uma(EMPTY_TEXTURE_VIEW);
             super::console_heap::write(&slot, &[0; 8]);
         }
     }
@@ -2207,7 +2263,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+        return super::console_heap::write(&slot, &buffer_view(EMPTY_UAV, res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
     }
     // UAV dimensions: 1 buffer, 2 tex1d, 3 tex1d array, 4 tex2d, 5 tex2d array, 8 tex3d
     let (format, dim, array, mip) = match desc.as_ref() {
@@ -2226,7 +2282,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         None => (rd.Format, resource_dim_to_view(&rd), rd.DepthOrArraySize as u32, 0),
     };
     let Some((fmt, ty, w, h, d, _)) = view_shape(r, format, dim, array, 1) else {
-        note_buffer_view();
+        note_outside_uma(EMPTY_TEXTURE_VIEW);
         return super::console_heap::write(&slot, &[0; 8]);
     };
     // RDNA images have no SRV / UAV distinction: console shaders may read this slot too
@@ -5763,5 +5819,31 @@ mod console_format_query_tests {
             let pc = unsafe { dev.GetResourceAllocationInfo(0, &[d]) };
             assert!(pc.SizeInBytes != u64::MAX && pc.SizeInBytes >= 1920 * 1080 * 4 && pc.Alignment > 0, "PC {format} as {}: {:#x}", d.Format.0, pc.SizeInBytes);
         }
+    }
+}
+
+#[cfg(test)]
+mod outside_uma_tests {
+    use super::*;
+
+    /// Each kind is counted in its own field of `OutsideUma` (other tests may count too: deltas).
+    #[test]
+    fn each_kind_lands_in_its_own_field() {
+        let field = |o: &OutsideUma, k: usize| [o.empty_srv, o.empty_uav, o.empty_cbv, o.empty_texture_views, o.buffers_without_room, o.textures_without_room][k];
+        for k in [EMPTY_SRV, EMPTY_UAV, EMPTY_CBV, EMPTY_TEXTURE_VIEW, NO_ROOM_BUFFER, NO_ROOM_TEXTURE] {
+            let before = outside_uma();
+            note_outside_uma(k);
+            let after = outside_uma();
+            assert!(field(&after, k) > field(&before, k), "kind {k}: {before:?} → {after:?}");
+        }
+    }
+
+    /// A report.json written before `outside_uma` existed still reads (the field defaults).
+    #[test]
+    fn an_older_report_without_the_field_reads() {
+        let mut v = serde_json::to_value(D3d12Stats::default()).unwrap();
+        v.as_object_mut().unwrap().remove("outside_uma");
+        let s: D3d12Stats = serde_json::from_value(v).unwrap();
+        assert_eq!(s.outside_uma, OutsideUma::default());
     }
 }

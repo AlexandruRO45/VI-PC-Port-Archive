@@ -61,8 +61,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
                 let mb = |b: u64| b >> 20;
+                let (coherent_used, coherent_total) = crate::gpu::uma::get().map_or((0, 0), |u| (u.used() as u64, u.size() as u64));
+                let o = crate::hle::d3d12x::real::outside_uma();
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped); coherent window {}/{} MB; empty views SRV {} UAV {} CBV {} texture {}, no room in unified memory for {} buffers / {} textures",
                     mb(private as u64),
                     mb(local),
                     mb(non_local),
@@ -71,7 +73,15 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(arenas as u64),
                     mb(arenas_made as u64),
                     mb(pools as u64),
-                    mb(pools_mapped as u64)
+                    mb(pools_mapped as u64),
+                    mb(coherent_used),
+                    mb(coherent_total),
+                    o.empty_srv,
+                    o.empty_uav,
+                    o.empty_cbv,
+                    o.empty_texture_views,
+                    o.buffers_without_room,
+                    o.textures_without_room
                 );
                 last = now;
             }

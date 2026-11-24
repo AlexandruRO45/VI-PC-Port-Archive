@@ -58,9 +58,11 @@ fn count(k: usize) {
         let (allocators, blocks) = console_list::pending_blocks();
         let (coherent_used, coherent_total, sparse_used) = crate::gpu::uma::get()
             .map_or((0, 0, 0), |u| (u.used() >> 20, u.size() >> 20, u.sparse_used() >> 20));
+        let o = super::real::outside_uma();
         crate::xlog_info!(
-            "D3D12.X: console code so far: {} draws with translated pipelines ({} skipped, {} with PC pipelines), {} dispatches ({} skipped); coherent {coherent_used}/{coherent_total} MB, sparse {sparse_used} MB, {blocks} blocks held for {allocators} allocators",
+            "D3D12.X: console code so far: {} draws with translated pipelines ({} skipped, {} with PC pipelines), {} dispatches ({} skipped); coherent {coherent_used}/{coherent_total} MB, sparse {sparse_used} MB, {blocks} blocks held for {allocators} allocators; empty views SRV {} UAV {} CBV {} texture {}, no room in unified memory for {} buffers / {} textures",
             c[DRAWS], c[DRAWS_SKIPPED], c[DRAWS_PC], c[DISPATCHES], c[DISPATCHES_SKIPPED],
+            o.empty_srv, o.empty_uav, o.empty_cbv, o.empty_texture_views, o.buffers_without_room, o.textures_without_room,
         );
     }
 }
