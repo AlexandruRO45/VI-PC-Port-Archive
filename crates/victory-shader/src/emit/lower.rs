@@ -2155,7 +2155,7 @@ impl<'a> Lower<'a> {
             "min_u32" => Some(Rmw::UMin),
             "max_u32" => Some(Rmw::UMax),
             "wrxchg_b32" => Some(Rmw::Xchg),
-            "cmpst_b32" => None,
+            "cmpst_b32" | "max_f32" | "min_f32" => None,
             _ => return Err("an LDS operation"),
         };
         let v0 = self.vgprs(inst, data.first().ok_or("an LDS atomic")?, 1)?[0];
@@ -2169,6 +2169,19 @@ impl<'a> Lower<'a> {
             None => self.s.m.i32(0),
         };
         let p = dword(self, offset);
+        if let Some(max) = match op.as_str() {
+            "max_f32" => Some(true),
+            "min_f32" => Some(false),
+            _ => None,
+        } {
+            let at = self.begin_guarded(guard);
+            let r = self.lds_float_min_max(p, v0, max);
+            let r = self.end_guarded(at, &[(r, outside)])[0];
+            if let Some(reg) = dst_reg {
+                self.write(inst, Reg::V(reg), r, None);
+            }
+            return Ok(());
+        }
         let at = self.begin_guarded(guard);
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
@@ -2185,6 +2198,48 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// `ds_max_f32` (`max`) or `ds_min_f32` on the LDS dword at `p` with
+    /// the float bits `data`, as integer atomics; the old bits return.
+    ///
+    /// Floats with the sign bit clear order as signed integers, and those
+    /// with it set order in reverse as unsigned ones, so the maximum is a
+    /// signed max for data with the sign bit clear and an unsigned min for
+    /// the rest (the minimum: signed min, unsigned max). Each lane does both
+    /// atomics, one of them with a value that leaves the dword as it is, so
+    /// each lane still changes it in one atomic step. -0 orders below +0.
+    /// NaN data leaves the dword (the ISA's `DATA > tmp ? DATA : tmp`).
+    // shortcut: a NaN already in the dword compares as an integer (the
+    // largest positive or negative value), not as the ISA's compare would.
+    fn lds_float_min_max(&mut self, p: V, data: V, max: bool) -> V {
+        use super::bitcode::Rmw;
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (abs_mask, inf, zero) = (k(self, 0x7FFF_FFFF), k(self, 0x7F80_0000), k(self, 0));
+        let mag = self.s.m.bin(c, Bin::And, data, abs_mask);
+        let nan = self.s.m.cmp(c, pred::IUGT, mag, inf);
+        let sign = self.s.m.cmp(c, pred::SLT, data, zero);
+        // (signed op, its no-op value), (unsigned op, its no-op value)
+        let ((sop, skeep), (uop, ukeep)) = if max {
+            ((Rmw::Max, 0x8000_0000), (Rmw::UMin, u32::MAX))
+        } else {
+            ((Rmw::Min, 0x7FFF_FFFF), (Rmw::UMax, 0))
+        };
+        let (skeep, ukeep) = (k(self, skeep), k(self, ukeep));
+        let skip_s = self.s.m.bin(c, Bin::Or, nan, sign);
+        let sval = self.s.m.select(c, skip_s, skeep, data);
+        let not_sign = {
+            let t = self.s.m.bool(true);
+            self.s.m.bin(c, Bin::Xor, sign, t)
+        };
+        let skip_u = self.s.m.bin(c, Bin::Or, nan, not_sign);
+        let uval = self.s.m.select(c, skip_u, ukeep, data);
+        let rs = self.s.m.atomic(c, sop, p, sval);
+        let ru = self.s.m.atomic(c, uop, p, uval);
+        // A NaN lane changed nothing; either result is the old value.
+        self.s.m.select(c, sign, ru, rs)
+    }
+
+    // ---- instructions ----
     // ---- instructions ----
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
