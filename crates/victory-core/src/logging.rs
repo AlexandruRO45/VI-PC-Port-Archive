@@ -4,7 +4,9 @@
 //! `VICTORY_LOG=victory_loader=trace,info`. Debug and trace output exist
 //! only in builds with the `diagnostics` feature; a plain release build
 //! logs info and above whatever the filter asks for. A filter that does not
-//! parse is reported on stderr and the default level is used instead.
+//! parse is reported on stderr and the default level is used instead, and
+//! so is one asking for debug or trace output from a build that cannot
+//! produce it. A variable that is set but empty counts as unset.
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
@@ -24,8 +26,9 @@ pub fn init(default_level: &str) {
         std::env::var("RUST_LOG").ok(),
         default_level,
     );
-    if let Some(warning) = warning {
-        // The subscriber is not installed yet, so this cannot go through it.
+    let capped = capped_warning(&filter, CAP);
+    // The subscriber is not installed yet, so these cannot go through it.
+    for warning in warning.into_iter().chain(capped) {
         eprintln!("victory: {warning}");
     }
     let _ = tracing_subscriber::registry()
@@ -47,9 +50,12 @@ fn choose_filter(
     rust_log: Option<String>,
     default_level: &str,
 ) -> (EnvFilter, Option<String>) {
-    let chosen = victory_log
+    // `VICTORY_LOG=` (or `RUST_LOG=`) would otherwise be an empty filter
+    // that hides everything but errors, and would shadow the other variable.
+    let set = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+    let chosen = set(victory_log)
         .map(|v| ("VICTORY_LOG", v))
-        .or_else(|| rust_log.map(|v| ("RUST_LOG", v)));
+        .or_else(|| set(rust_log).map(|v| ("RUST_LOG", v)));
     match chosen {
         None => (EnvFilter::new(default_level), None),
         Some((name, value)) => match EnvFilter::try_new(&value) {
@@ -64,9 +70,23 @@ fn choose_filter(
     }
 }
 
+/// Says so when `filter` asks for more detail than `cap` lets through, so
+/// `VICTORY_LOG=trace` on a build without the `diagnostics` feature does not
+/// look like the code has nothing to say.
+fn capped_warning(filter: &EnvFilter, cap: LevelFilter) -> Option<String> {
+    let wanted = filter.max_level_hint()?;
+    (wanted > cap).then(|| {
+        format!(
+            "the log filter asks for {wanted} output, but this build logs {cap} and above; \
+             rebuild with `--features diagnostics` for debug and trace"
+        )
+        .to_lowercase()
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::choose_filter;
+    use super::{EnvFilter, LevelFilter, capped_warning, choose_filter};
 
     fn s(v: &str) -> Option<String> {
         Some(v.to_owned())
@@ -106,5 +126,32 @@ mod tests {
     fn a_bad_rust_log_names_rust_log() {
         let (_, warning) = choose_filter(None, s("x=nope"), "info");
         assert!(warning.expect("a warning").contains("RUST_LOG"));
+    }
+
+    #[test]
+    fn empty_values_count_as_unset() {
+        let (filter, warning) = choose_filter(s(""), s("warn"), "info");
+        assert_eq!(filter.to_string(), "warn");
+        assert_eq!(warning, None);
+        let (filter, warning) = choose_filter(s(" "), s(""), "info");
+        assert_eq!(filter.to_string(), "info");
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn a_filter_above_the_cap_is_reported() {
+        let filter = EnvFilter::new("victory_loader=trace,info");
+        let warning = capped_warning(&filter, LevelFilter::INFO).expect("a warning");
+        assert!(warning.contains("trace"), "{warning}");
+        assert!(warning.contains("diagnostics"), "{warning}");
+        assert_eq!(capped_warning(&filter, LevelFilter::TRACE), None);
+        assert_eq!(
+            capped_warning(&EnvFilter::new("warn"), LevelFilter::INFO),
+            None
+        );
+        assert_eq!(
+            capped_warning(&EnvFilter::new("info"), LevelFilter::INFO),
+            None
+        );
     }
 }
