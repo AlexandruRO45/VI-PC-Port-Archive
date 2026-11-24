@@ -112,7 +112,12 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                         let mut list = Vec::new();
                         for n in &programs {
                             *t.native_stages.entry(n.stage).or_default() += 1;
-                            list.push(format!("{:?} {} B", n.stage, n.code.len()));
+                            list.push(format!(
+                                "{:?} {} B wave{}",
+                                n.stage,
+                                n.code.len(),
+                                if n.wave64 { 64 } else { 32 }
+                            ));
                             match gfx10::decode(&n.code) {
                                 Ok(insts) => {
                                     t.decoded += 1;

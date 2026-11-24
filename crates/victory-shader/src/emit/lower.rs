@@ -279,7 +279,8 @@ enum MaskData {
     /// lanes throughout (`v_mbcnt`, `v_readlane` at a computed lane).
     Host,
     /// Mesh programs: their lanes and waves (LDS per console wave) are the
-    /// console's but no host wave size can be declared.
+    /// console's, but no host wave size can be declared for a mesh stage, so
+    /// a mask read as data has no wave whose bits it could be.
     None,
 }
 
@@ -571,12 +572,12 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
-            // A wave64 mesh shader cannot run correctly on a wave32 device:
-            // declare the required wave size so D3D12 refuses the pipeline
-            // cleanly instead of hanging the GPU (TDR) on wave32 hardware.
-            if x.native.wave64 {
-                s.wave_size = Some(64);
-            }
+            // No wave size for a mesh shader: DXIL allows the attribute only
+            // on compute and node shaders, and the validator rejects a
+            // container whose PSV0 lane counts disagree with the module, so a
+            // wave64 mesh program cannot ask the runtime for 64-wide waves.
+            // Its lanes are the device's, which is why a mask read as data
+            // stays refused for mesh (see `MaskData`).
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -5578,6 +5579,16 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_readlane_b32" => {
+                // A scalar the program spilled through a VGPR lane with
+                // `v_writelane_b32` (the console compiler's way of moving an
+                // SGPR through a VGPR) is that scalar, at a constant lane, in
+                // any stage: no lane read at all.
+                if let (Some(op0), Some(op1)) = (v.src.first(), v.src.get(1))
+                    && let Some(sv) = self.spilled_value(inst, op0, op1)
+                {
+                    let x = self.i32_of(sv)?;
+                    return int(self, x);
+                }
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
@@ -8785,6 +8796,76 @@ mod tests {
         }
     }
 
+    /// Lowers a synthetic pixel program.
+    fn lower_pixel(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+    }
+
+    fn lowers_pixel(words: &[u32]) -> Result<(), crate::ShaderError> {
+        lower_pixel(words).map(|_| ())
+    }
+
+    #[test]
+    fn a_pixel_shader_reads_a_scalar_it_spilled_through_a_lane() {
+        // The console compiler moves an SGPR through a VGPR lane
+        // (`pixel-ee41ebc3eb3fbbdc` does this to feed a descriptor offset):
+        // the lane write and the constant-lane read back are one scalar, in
+        // a pixel program too, with no wave read at all.
+        let read_at = |write_lane: u32, read_lane: u32, constant: u32| {
+            let lane = |k: u32| (128 + k) << 9;
+            [
+                0xBE8E_0300 | constant, // s_mov_b32 s14, constant
+                0xD761_009E,
+                lane(write_lane) | 0x0E, // v_writelane_b32 v158, s14, write_lane
+                0xD760_0000,
+                lane(read_lane) | 0x019E, // v_readlane_b32 s0, v158, read_lane
+                0xBF07_8000,              // s_cmp_lg_u32 s0, 0
+                0xBF85_0000,              // s_cbranch_scc1 -> s_endpgm
+                S_ENDPGM,
+            ]
+        };
+        // The lane the write set resolves ...
+        assert!(lowers_pixel(&read_at(0, 0, 0x85)).is_ok());
+        // ... a lane no lane write reached does not, rather than another
+        // lane's scalar.
+        assert!(lowers_pixel(&read_at(0, 1, 0x85)).is_err());
+        // And the scalar reaches the code: a different constant is a
+        // different module, so the read back is not resolving to something
+        // else.
+        let five = lower_pixel(&read_at(0, 0, 0x85)).unwrap();
+        let nine = lower_pixel(&read_at(0, 0, 0x89)).unwrap();
+        assert_ne!(five.dxil, nine.dxil);
+    }
+
     fn perm_features(selector: u32) -> u64 {
         // Synthetic compute shader:
         // v0 is the thread ID and can supply a dynamic selector.
@@ -9355,6 +9436,21 @@ mod tests {
         assert!(lower_mesh(256, 128, 128).is_err());
         assert!(lower_mesh(32, 512, 128).is_err());
         assert!(lower_mesh(32, 128, 512).is_err());
+    }
+
+    #[test]
+    fn a_mesh_shader_declares_no_wave_size() {
+        // DXIL allows the wave-size attribute only on compute and node
+        // shaders, and the validator rejects a container whose PSV0 lane
+        // counts disagree with the module, so a mesh program asks for
+        // neither: its wave is the device's.
+        let l = lower_mesh(128, 128, 128).unwrap();
+        let c = crate::Container::parse(&l.dxil).unwrap();
+        // PSV0: the runtime info's wave lane counts (min, max), after the
+        // part's size dword.
+        let psv0 = c.part(crate::FourCC::PSV0).unwrap().data;
+        assert_eq!(&psv0[20..24], &0u32.to_le_bytes());
+        assert_eq!(&psv0[24..28], &u32::MAX.to_le_bytes());
     }
 
     #[test]

@@ -710,7 +710,10 @@ impl Shader {
                 }
             }
         }
-        if let Some(n) = self.wave_size {
+        // A mesh shader's wave is the device's to choose, and the validator
+        // refuses the property on one ("WaveSize only allowed on compute or
+        // node shaders").
+        if let Some(n) = self.wave_size.filter(|_| self.mesh.is_none()) {
             props.push(i32c(&mut self, 11));
             let n = Some(i32c(&mut self, n));
             props.push(self.m.md_node(vec![n]));
