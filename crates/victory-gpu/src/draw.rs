@@ -1018,10 +1018,17 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        // The clamp writes the argument shadow as UAV, then leaves it
+        // in INDIRECT_ARGUMENT for ExecuteIndirect.
+        crate::list::ensure_shadow_state(list, &args, 0x8);
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
+        }
+        list.note_shadow_state(&args, 0x200);
+        if let Some((shadow, _)) = &counter {
+            crate::list::ensure_shadow_state(list, shadow, 0x200);
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
@@ -1060,6 +1067,7 @@ impl State {
             )
         };
         crate::indirect::done(list, &args.buffer);
+        list.note_shadow_state(&args, 0x8);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
