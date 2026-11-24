@@ -131,7 +131,7 @@ pub(crate) fn log(frames: f64) {
     let (placed_count, placed_bytes) = crate::resource::placed_texture_cache_stats();
     let kept_slots = crate::descriptor::host::kept_slots();
     tracing::info!(
-        "retained GPU mirrors: {loose_count} loose shadows ({:.1} MiB),          {placed_count} placed textures ({:.1} MiB estimated), {kept_slots} descriptor slots holding resources",
+        "retained GPU mirrors: {loose_count} loose shadows ({:.1} MiB); {placed_count} placed textures ({:.1} MiB estimated); {kept_slots} descriptor slots holding resources",
         loose_bytes as f64 / (1 << 20) as f64,
         placed_bytes as f64 / (1 << 20) as f64,
     );
