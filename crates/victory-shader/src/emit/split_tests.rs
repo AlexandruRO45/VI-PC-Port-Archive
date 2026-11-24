@@ -1211,7 +1211,7 @@ fn nested_exec_masks_keep_shared_visibility_results_across_halves() {
             let values = run(&host, &program_lds(&body, 64), 2)
                 .unwrap_or_else(|e| panic!("{name}, [{start}, {end}): {e}"));
             assert_eq!(values.len(), 128);
-            for (group, lanes) in values.chunks_exact(64).enumerate() {
+            for (group, lanes) in values.as_chunks::<64>().0.iter().enumerate() {
                 let mut first = 255;
                 let mut halves = 0;
                 for lane in start..end {
