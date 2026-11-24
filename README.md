@@ -13,6 +13,10 @@
 </h4>
 
 <p align="center">
+  <a href="https://recomplauncher.com/game/leonida"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+</p>
+
+<p align="center">
   <a href="docs/i18n/README.md">Other languages</a> |
   <a href="#project-status">Status</a> |
   <a href="#how-to-build">How to build</a> |
