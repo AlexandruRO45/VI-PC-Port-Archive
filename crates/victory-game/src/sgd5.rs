@@ -1358,4 +1358,58 @@ mod tests {
             assert_eq!(found[0].unpack().as_deref(), Some(&b"first"[..]));
         }
     }
+
+    #[test]
+    fn sizes_that_disagree_are_not_a_record() {
+        // The two copies of `n` must match: one more or one less in either
+        // copy is bytes that only look like a record, whatever stream
+        // follows, and the real record after them is still found.
+        let packed = miniz_oxide::deflate::compress_to_vec(b"phantom", 6);
+        let n = (packed.len() + 12) as u32;
+        for (first, second) in [(n, n + 1), (n, n - 1), (n + 1, n), (n - 1, n)] {
+            let mut file = MAGIC.to_vec();
+            file.extend_from_slice(b"\x05PS_d\0\x32");
+            for v in [first, 0x000D_DCE7, second, 7] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            file.extend_from_slice(&packed);
+            file.extend(record_bytes("PS_after", 0x32, b"after"));
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_after")], "n {first} and {second}");
+            assert_eq!(found[0].unpack().as_deref(), Some(&b"after"[..]));
+        }
+    }
+
+    #[test]
+    fn record_whose_size_reads_as_a_marker_is_one_record() {
+        // `n` of 0x000DDCE7 (908519): both copies of it, before and after
+        // the real marker, are marker bytes too. Neither is another record
+        // (the first's sizes are its name and the real marker, the second's
+        // lie inside its own header), and the record unpacks.
+        let n = 0x000D_DCE7_u32;
+        let packed_len = n as usize - 12;
+        // Stored blocks: a few bytes per block on top of the container.
+        let mut payload = vec![0x5A_u8; packed_len];
+        let mut packed = miniz_oxide::deflate::compress_to_vec(&payload, 0);
+        payload.truncate(2 * packed_len - packed.len());
+        packed = miniz_oxide::deflate::compress_to_vec(&payload, 0);
+        assert!(packed.len() <= packed_len);
+        // The stream's end is not checked: pad it out to `n`.
+        packed.resize(packed_len, 0);
+        let mut file = MAGIC.to_vec();
+        file.extend_from_slice(b"\x05PS_m\0\x32");
+        for v in [n, 0x000D_DCE7, n, payload.len() as u32] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&packed);
+        file.extend(record_bytes("PS_after", 0x32, b"after"));
+        let found: Vec<_> = records(&file).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_m"), Some("PS_after")]);
+        assert_eq!(found[0].offset, MAGIC.len() + 11);
+        assert_eq!(found[0].span().len(), n as usize);
+        assert_eq!(found[0].unpack().as_deref(), Some(&payload[..]));
+        assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+    }
 }
