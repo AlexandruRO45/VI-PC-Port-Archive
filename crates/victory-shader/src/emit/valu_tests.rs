@@ -1740,3 +1740,46 @@ fn non_active_bitwise_mask_combining_branch_masks_lowers_and_runs() {
         assert_eq!(val, 0x0020_5555, "lane {i}");
     }
 }
+
+#[test]
+fn nested_loops_share_total_iteration_budget() {
+    const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
+        (op << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (src0 as u32 & 0x1FF)
+    }
+    const fn s_cbranch_vccnz(rel: i16) -> u32 {
+        0xBF87_0000 | (rel as u16 as u32)
+    }
+    // Nested loops (`v1` outer, `v2` inner) write `v0` (total iterations) to
+    // UAV dword 0 on each inner step so a shared-budget abort preserves the
+    // exact iteration count reached.
+    let inner_cmp = vop3(0x0c1, 106, vgpr(6), vgpr(2), 0);
+    let outer_cmp = vop3(0x0c1, 106, vgpr(5), vgpr(1), 0);
+    let store = buffer_store_dword(0, 8, 0);
+    let body = [
+        vop1(0x001, 0, 0x80),         // 0: v0 = 0
+        vop1(0x001, 5, 0x80),         // 1: v5 = 0
+        vop1(0x001, 6, 0x80),         // 2 (outer): v6 = 0
+        vop2(0x025, 0, 0, 0x81),      // 3 (inner): v0 += 1
+        store[0],                     // 4: store v0 -> UAV[0]
+        store[1],                     // 5
+        vop2(0x025, 6, 6, 0x81),      // 6: v6 += 1
+        inner_cmp[0],                 // 7: v_cmp_lt_u32 vcc, v6, v2
+        inner_cmp[1],                 // 8
+        s_cbranch_vccnz(-7),          // 9 -> 3
+        vop2(0x025, 5, 5, 0x81),      // 10: v5 += 1
+        outer_cmp[0],                 // 11: v_cmp_lt_u32 vcc, v5, v1
+        outer_cmp[1],                 // 12
+        s_cbranch_vccnz(-12),         // 13 -> 2
+    ];
+    let shader = build_valu_cs(&body);
+    run_cases(&shader, &[[3, 4, 0, 0], [200, 200, 0, 0]], |label, case, _, val| {
+        if case == 0 {
+            assert_eq!(val, 12, "{label}: 3x4 nested loop completes normally");
+        } else {
+            assert!(
+                (3800..=4096).contains(&val),
+                "{label}: 200x200 nested loop must stop within shared LOOP_LIMIT (got {val})"
+            );
+        }
+    });
+}

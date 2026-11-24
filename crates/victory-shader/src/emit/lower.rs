@@ -233,9 +233,14 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
-    /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
-    /// IR block, and its incoming (value, DXIL block) pairs.
-    counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Reachable loop header IR blocks (targets of at least one back edge).
+    loop_headers: HashSet<usize>,
+    /// Cumulative back-edge iteration count live at entry of each IR block
+    /// (shared across nested loops so total back-edge steps per invocation <= `LOOP_LIMIT`).
+    iter_in: Vec<Option<V>>,
+    /// Entry phis for join blocks and loop headers when loops exist:
+    /// `block -> (phi, incoming (value, DXIL predecessor block))`.
+    iter_phis: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
 }
@@ -924,7 +929,9 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
-            counters: HashMap::new(),
+            loop_headers: HashSet::new(),
+            iter_in: vec![None; x.p.blocks.len()],
+            iter_phis: HashMap::new(),
             abort: None,
         }
     }
@@ -1311,16 +1318,31 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
+        // Find loop headers and share a single per-invocation back-edge budget
+        // across all blocks so nested loops cannot multiply `LOOP_LIMIT`.
         for &b in &order {
             let header = p.blocks[b]
                 .preds
                 .iter()
                 .any(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q]);
             if header {
-                let blk = self.block[b].expect("reachable");
-                let phi = self.s.m.phi(blk, self.s.t.i32);
-                self.counters.insert(b, (phi, Vec::new()));
+                self.loop_headers.insert(b);
+            }
+        }
+        if !self.loop_headers.is_empty() {
+            self.iter_in[order[0]] = Some(self.s.m.i32(0));
+            for &b in &order[1..] {
+                let n_preds = p.blocks[b]
+                    .preds
+                    .iter()
+                    .filter(|&&q| self.block[q].is_some())
+                    .count();
+                if n_preds >= 2 || self.loop_headers.contains(&b) {
+                    let blk = self.block[b].expect("reachable");
+                    let phi = self.s.m.phi(blk, self.s.t.i32);
+                    self.iter_in[b] = Some(phi);
+                    self.iter_phis.insert(b, (phi, Vec::new()));
+                }
             }
         }
         self.cur = self.s.entry;
@@ -1331,6 +1353,15 @@ impl<'a> Lower<'a> {
             self.block[order[0]] = Some(self.cur);
         }
         for &b in &order {
+            if !self.loop_headers.is_empty() && self.iter_in[b].is_none() {
+                let pred = p.blocks[b]
+                    .preds
+                    .iter()
+                    .copied()
+                    .find(|&q| self.block[q].is_some())
+                    .expect("reachable predecessor");
+                self.iter_in[b] = self.iter_in[pred];
+            }
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
             let preds: Vec<usize> = p.blocks[b]
@@ -7596,13 +7627,13 @@ impl<'a> Lower<'a> {
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
-            LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
-                let ok = self.count_iteration(t, pred::IULT);
+            LaneExit::Jump(t) if self.loop_headers.contains(&t) && self.rpo[t] <= self.rpo[b] => {
+                let ok = self.count_iteration(b, t, pred::IULT);
                 let abort = self.abort_block();
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
-                self.enter_loop(b, t, self.cur);
+                self.enter_block(b, t, self.cur);
                 Term::Br(self.block[t].expect("reachable"))
             }
             LaneExit::Branch {
@@ -7625,16 +7656,17 @@ impl<'a> Lower<'a> {
                         (c, taken, not_taken)
                     }
                 };
-                // A back edge is taken only below the iteration limit.
-                let back =
-                    |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
+                // A back edge is taken only below the invocation's iteration limit.
+                let back = |l: &Self, to: usize| {
+                    l.loop_headers.contains(&to) && l.rpo[to] <= l.rpo[b]
+                };
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
                 let cond = if back(self, taken) {
-                    let ok = self.count_iteration(taken, pred::IULT);
+                    let ok = self.count_iteration(b, taken, pred::IULT);
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
-                    let stop = self.count_iteration(not_taken, pred::IUGE);
+                    let stop = self.count_iteration(b, not_taken, pred::IUGE);
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
                 } else {
                     cond
@@ -7650,7 +7682,7 @@ impl<'a> Lower<'a> {
                         } else {
                             via
                         };
-                        self.enter_loop(b, to, from);
+                        self.enter_block(b, to, from);
                     }
                 }
                 Term::CondBr(cond, t, f)
@@ -7671,25 +7703,25 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// A forward edge into loop header `to` (from DXIL block `via`) starts
-    /// its count at 0.
-    fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
-        if let Some((_, incoming)) = self.counters.get_mut(&to) {
-            let z = self.s.m.i32(0);
-            incoming.push((z, via));
+    /// A forward edge from `from` into block `to` (via DXIL block `via`)
+    /// carries `from`'s cumulative back-edge iteration count.
+    fn enter_block(&mut self, from: usize, to: usize, via: usize) {
+        if let Some((_, incoming)) = self.iter_phis.get_mut(&to) {
+            let count = self.iter_in[from].expect("iter_in");
+            incoming.push((count, via));
         }
     }
 
-    /// A back edge to header `to` (a back edge keeps its block, no
-    /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
-    fn count_iteration(&mut self, to: usize, p: u8) -> V {
+    /// A back edge from `from` to header `to`: increments the invocation's
+    /// cumulative iteration count and compares it against [`LOOP_LIMIT`] by `p`
+    /// (`IULT`: go on; `IUGE`: stop).
+    fn count_iteration(&mut self, from: usize, to: usize, p: u8) -> V {
         let c = self.cur;
-        let (phi, _) = self.counters[&to];
+        let cur_count = self.iter_in[from].expect("iter_in");
         let one = self.s.m.i32(1);
-        let next = self.s.m.bin(c, Bin::Add, phi, one);
+        let next = self.s.m.bin(c, Bin::Add, cur_count, one);
         let limit = self.s.m.i32(super::loop_limit());
-        self.counters
+        self.iter_phis
             .get_mut(&to)
             .expect("header")
             .1
@@ -7773,7 +7805,7 @@ impl<'a> Lower<'a> {
             }
             self.s.m.set_phi(v, incoming);
         }
-        for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
+        for (phi, incoming) in std::mem::take(&mut self.iter_phis).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
         while let Some((v, b, i)) = self.pending_masks.pop() {
