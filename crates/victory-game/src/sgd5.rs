@@ -2681,4 +2681,67 @@ mod tests {
             assert_eq!(found[0].unpack(), Some(container.clone()));
         }
     }
+
+    /// One final fixed-code block: the literal `A`, then a copy coded by
+    /// length symbol `length` (257 to 287) and distance code `distance` (0
+    /// to 31), neither with extra bits read (285 is 258 bytes; the copy
+    /// takes them from 1 byte back), then the end of the block.
+    fn literal_then_coded_copy(length: u32, distance: u32) -> Vec<u8> {
+        let mut bits = Bits::default();
+        bits.put(1, 1); // BFINAL
+        bits.put(1, 2); // fixed codes
+        bits.code(0x30 + u32::from(b'A'), 8); // literals 0-143: 8 bits from 0x30
+        match length {
+            257..=279 => bits.code(length - 256, 7), // 256-279: 7 bits from 0
+            _ => bits.code(0xC0 + length - 280, 8),  // 280-287: 8 bits from 0xC0
+        }
+        bits.code(distance, 5);
+        bits.code(0, 7); // end of block (256)
+        bits.out
+    }
+
+    #[test]
+    fn copy_coded_with_symbols_deflate_never_uses_is_noise() {
+        // Fixed codes have room for length symbols 286 and 287 and distance
+        // codes 30 and 31, but deflate gives them no meaning: a stream using
+        // one breaks there, though its bits are laid out as a real one's.
+        // Such a record covers no other, so it is yielded and does not
+        // unpack, and the record after it is found either way.
+        let good = literal_then_coded_copy(285, 0);
+        let want = vec![b'A'; 259];
+        assert_eq!(
+            miniz_oxide::inflate::decompress_to_vec(&good).ok(),
+            Some(want.clone())
+        );
+        assert!(starts_stream(&good, want.len()));
+        let bad = [(286, 0), (287, 0), (285, 30), (285, 31), (287, 31)];
+        for (length, distance) in bad {
+            let what = format!("length {length}, distance {distance}");
+            let packed = literal_then_coded_copy(length, distance);
+            assert_eq!(packed.len(), good.len(), "{what}");
+            assert!(
+                miniz_oxide::inflate::decompress_to_vec(&packed).is_err(),
+                "{what}"
+            );
+            assert!(!starts_stream(&packed, want.len()), "{what}");
+        }
+
+        for (length, distance) in [(285, 0)].into_iter().chain(bad) {
+            let what = format!("length {length}, distance {distance}");
+            let packed = literal_then_coded_copy(length, distance);
+            let (file, marker) = outer_then_after(&packed, want.len());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            let unpacked = (length, distance) == (285, 0);
+            assert_eq!(found[0].unpack(), unpacked.then(|| want.clone()), "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "{what}");
+        }
+    }
 }
