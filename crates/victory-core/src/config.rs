@@ -3126,6 +3126,65 @@ mod tests {
     }
 
     #[test]
+    fn lexical_keeps_leading_dot_dots_and_drops_trailing_slashes() {
+        let l = |p: &str| lexical(Path::new(p));
+        // Each `..` with nothing to remove is kept, in order.
+        assert_eq!(l("../../a"), PathBuf::from("../../a"));
+        assert_eq!(l("./../a/./"), PathBuf::from("../a"));
+        // A trailing slash or a doubled separator is not a component.
+        assert_eq!(l("a//b/"), PathBuf::from("a/b"));
+        #[cfg(unix)]
+        {
+            assert_eq!(l("/.."), PathBuf::from("/"));
+            assert_eq!(l("/a/../../.."), PathBuf::from("/"));
+        }
+    }
+
+    #[test]
+    fn folder_overlap_ignores_trailing_slashes_and_dot_dot_in_the_parent() {
+        for fold in [false, true] {
+            // Trailing slashes and doubled separators do not split a match.
+            assert!(is_within(
+                Path::new("/v/cache//data/"),
+                Path::new("/v/cache/"),
+                fold
+            ));
+            // `..` is folded in the parent as in the path.
+            assert!(is_within(
+                Path::new("/v/data"),
+                Path::new("/v/cache/.."),
+                fold
+            ));
+            assert!(!is_within(
+                Path::new("/v/cache"),
+                Path::new("/v/cache/../data"),
+                fold
+            ));
+            // A parent longer than the path never holds it.
+            assert!(!is_within(Path::new("/v"), Path::new("/v/cache"), fold));
+        }
+    }
+
+    #[test]
+    fn home_dir_prefers_home_and_skips_empty_values() {
+        let both = |k: &str| match k {
+            "HOME" => Some(abs("home")),
+            "USERPROFILE" => Some(abs("profile")),
+            _ => None,
+        };
+        assert_eq!(home_dir(both), Some(PathBuf::from(abs("home"))));
+        // An empty HOME (`HOME= cmd`) is not absolute, so it is skipped.
+        let empty = |k: &str| match k {
+            "HOME" => Some(OsString::new()),
+            "USERPROFILE" => Some(abs("profile")),
+            _ => None,
+        };
+        assert_eq!(home_dir(empty), Some(PathBuf::from(abs("profile"))));
+        let neither = |k: &str| matches!(k, "HOME" | "USERPROFILE").then(OsString::new);
+        assert_eq!(home_dir(neither), None);
+    }
+
+    #[test]
     fn origins_name_the_setting_that_won() {
         let file = FilePaths {
             game_dir: Some(abs("file-game").into()),
