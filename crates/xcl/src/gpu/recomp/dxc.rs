@@ -471,17 +471,22 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
 
 /// Compile HLSL to signed DXIL. `profile` e.g. "cs_6_6"; `extra` are dxc arguments.
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    // Enormous sources wait for their turn here, on the caller's thread, so that a waiting one
+    // holds neither a DXC worker nor a `wait_for_memory` slot, and is admitted against the
+    // memory left once the one before it has finished.
+    let _enormous = EnormousTurn::wanted(src).then(EnormousTurn::take);
     let (reply, rx) = std::sync::mpsc::channel();
     let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply, wanted: crate::hle::d3d12x::pso_async::wanted_here() };
     pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
-/// HLSL over this size is compiled at -O0 and one at a time (`compile_here`).
+/// HLSL over this size is compiled at -O0 (`compile_here`) and one at a time (`compile`).
 const ENORMOUS_SOURCE: usize = 8 * 1024 * 1024;
 static ENORMOUS_ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// A compile's turn among enormous sources (`compile_here`): held for the whole DXC call.
+/// A compile's turn among enormous sources (`compile`): held from before the memory check to the
+/// end of the DXC call.
 struct EnormousTurn(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
 impl EnormousTurn {
@@ -522,8 +527,8 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // Enormous sources (over ENORMOUS_SOURCE, a handful in a retail pack) one at a time: each takes
     // GBs in DXC, and the commit checks that hold compiles back (`wait_for_memory`) do not see that
     // under Wine, where the commit limit includes all of the host's swap. Three of them at once
-    // took 29 GB of RAM and 20 GB of swap in `xcl pipelines` on a 32 GB machine.
-    let _enormous = EnormousTurn::wanted(src).then(EnormousTurn::take);
+    // took 29 GB of RAM and 20 GB of swap in `xcl pipelines` on a 32 GB machine. `compile` takes
+    // their turn (`EnormousTurn`).
     if !extra.iter().any(|a| a.starts_with("-O")) {
         if src.len() > ENORMOUS_SOURCE {
             args.push(crate::util::wide("-O0"));
@@ -1323,7 +1328,7 @@ mod enormous_tests {
                         src.push_str(&format!("    v = (v ^ {k}u) * 2654435761u + (v >> {});\n", k % 31 + 1));
                     }
                     src.push_str("    o.Store(t.x * 4, v);\n}\n");
-                    compile_here(&src, "main", "cs_6_6", &[]).map(|d| d.len())
+                    compile(&src, "main", "cs_6_6", &[]).map(|d| d.len())
                 })
             })
             .collect();
