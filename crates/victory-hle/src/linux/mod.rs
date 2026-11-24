@@ -11,6 +11,9 @@ use std::sync::LazyLock;
 
 use crate::HleModule;
 
+#[allow(dead_code)] // used by the slices as they land
+pub(crate) mod handles;
+
 fn modules() -> Vec<HleModule> {
     vec![]
 }
