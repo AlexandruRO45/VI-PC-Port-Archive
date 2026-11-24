@@ -71,14 +71,28 @@ fn probe_dll() -> Option<PathBuf> {
     // triple directory the path below does not expect. The fixture's build
     // script passes MSVC linker flags, hence `-msvc`.
     let triple = format!("{}-pc-windows-msvc", std::env::consts::ARCH);
-    let status = Command::new(env!("CARGO"))
+    // The cargo that built this test, recorded at compile time. A test exe
+    // cross-built elsewhere and copied here names a cargo that is not on this
+    // machine; say so instead of a bare "not found" from the spawn below.
+    let cargo = Path::new(env!("CARGO"));
+    assert!(
+        cargo.is_file(),
+        "{} (the cargo that built this test) is not on this machine; build \
+         hle-probe and set {PREBUILT_PROBE} to its hle_probe.dll",
+        cargo.display()
+    );
+    let status = Command::new(cargo)
         .args(["build", "--quiet", "--locked", "--manifest-path"])
         .arg(&manifest)
         .args(["--target", &triple, "--target-dir"])
         .arg(&target)
         .status()
-        .expect("running cargo");
-    assert!(status.success(), "building hle-probe failed");
+        .unwrap_or_else(|e| panic!("running {}: {e}", cargo.display()));
+    assert!(
+        status.success(),
+        "building {} for {triple} failed ({status})",
+        manifest.display()
+    );
     let dll = target.join(&triple).join("debug").join("hle_probe.dll");
     assert!(
         dll.is_file(),
