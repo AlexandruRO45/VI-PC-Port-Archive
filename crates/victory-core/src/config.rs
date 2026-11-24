@@ -246,6 +246,22 @@ impl Config {
             data_dir: data_origin,
             test_titles: test_titles_origin,
         };
+        for (name, dir, origin, setting) in [
+            (
+                "cache",
+                &cache_dir,
+                origins.cache_dir,
+                "VICTORY_CACHE_DIR or [paths].cache_dir",
+            ),
+            (
+                "data",
+                &data_dir,
+                origins.data_dir,
+                "VICTORY_DATA_DIR or [paths].data_dir",
+            ),
+        ] {
+            ensure_own_folder(name, dir, home.as_deref(), origin, setting)?;
+        }
         ensure_data_outside_cache(&cache_dir, &data_dir, &origins)?;
         if let Some(game) = &game_dir {
             ensure_game_apart(game, &cache_dir, &data_dir, &origins)?;
@@ -415,6 +431,41 @@ fn config_file(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
     anyhow::bail!(
         "VICTORY_CONFIG points at {}, which does not exist",
         path.display()
+    );
+}
+
+/// Refuses a cache or data folder that is the root of a drive, the home
+/// directory, or a folder holding it (`/home`). The cache may be deleted at
+/// any time, so clearing a cache of `~` would take the whole home folder
+/// with it, and a data folder of `~` mixes saves, settings and crashes.log
+/// into it. It is an easy slip with a variable that expanded to nothing:
+/// `VICTORY_CACHE_DIR=$HOME/$APP` with `APP` unset is `~/`, and
+/// `VICTORY_DATA_DIR=$XDG_DATA_HOME/` with `XDG_DATA_HOME` unset is `/`.
+/// Compared lexically like [`ensure_data_outside_cache`]. `name` is the
+/// folder ("cache", "data") and `setting` the variable and key that set it.
+fn ensure_own_folder(
+    name: &str,
+    dir: &Path,
+    home: Option<&Path>,
+    origin: Origin,
+    setting: &str,
+) -> Result<()> {
+    let folded = lexical(dir);
+    let what = if folded.parent().is_none() {
+        "the root of the drive"
+    } else if home.is_some_and(|h| is_within(h, &folded, FOLD_CASE)) {
+        if home.is_some_and(|h| is_within(&folded, h, FOLD_CASE)) {
+            "your home folder"
+        } else {
+            "a folder holding your home folder"
+        }
+    } else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "the {name} folder {} (from {origin}) is {what}; set {setting} to a folder used \
+         only by Victory, or leave it unset for the default",
+        dir.display()
     );
 }
 
@@ -1639,6 +1690,79 @@ mod tests {
     }
 
     #[test]
+    fn cache_or_data_at_the_root_or_home_is_refused() {
+        let home = PathBuf::from(abs("home")).join("me");
+        let root = PathBuf::from(abs("x")).parent().unwrap().to_path_buf();
+        for (key, value, what) in [
+            ("VICTORY_CACHE_DIR", home.clone(), "your home folder"),
+            // `$HOME/$APP` with `APP` unset.
+            ("VICTORY_DATA_DIR", home.join(""), "your home folder"),
+            (
+                "VICTORY_CACHE_DIR",
+                home.join("games").join(".."),
+                "your home folder",
+            ),
+            (
+                "VICTORY_DATA_DIR",
+                PathBuf::from(abs("home")),
+                "a folder holding",
+            ),
+            ("VICTORY_CACHE_DIR", root.clone(), "the root of the drive"),
+            (
+                "VICTORY_DATA_DIR",
+                root.join("tmp").join(".."),
+                "the root of the drive",
+            ),
+        ] {
+            let env = |k: &str| match k {
+                "HOME" => Some(home.clone().into()),
+                k if k == key => Some(value.clone().into()),
+                _ => None,
+            };
+            let err = Config::resolve(FilePaths::default(), None, env)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(what), "{key}={}: {err}", value.display());
+            assert!(err.contains(&format!("(from {key})")), "{err}");
+            assert!(err.contains(&format!("set {key}")), "{err}");
+        }
+
+        // From the config file too, and without a home only the root counts.
+        let file = FilePaths {
+            cache_dir: Some(root.clone()),
+            ..FilePaths::default()
+        };
+        let no_home = |k: &str| (k == "XDG_DATA_HOME").then(|| abs("share"));
+        let err = Config::resolve(file, None, no_home)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the cache folder") && err.contains("(from config file)"),
+            "{err}"
+        );
+
+        // A folder inside home, a sibling of it and a folder whose name
+        // merely starts with home's are fine.
+        for value in [
+            home.join("victory"),
+            PathBuf::from(abs("home")).join("other"),
+            PathBuf::from(abs("home")).join("me2"),
+        ] {
+            let env = |k: &str| match k {
+                "HOME" => Some(home.clone().into()),
+                "VICTORY_CACHE_DIR" => Some(value.clone().into()),
+                "VICTORY_DATA_DIR" => Some(home.join("data").into()),
+                _ => None,
+            };
+            assert!(
+                Config::resolve(FilePaths::default(), None, env).is_ok(),
+                "{}",
+                value.display()
+            );
+        }
+    }
+
+    #[test]
     fn data_inside_the_cache_is_refused() {
         let env = |k: &str| match k {
             "VICTORY_CACHE_DIR" => Some(abs("v")),
@@ -1868,13 +1992,14 @@ mod tests {
 
     #[test]
     fn data_inside_the_cache_names_both_origins() {
-        // The cache from the file is the home folder, which holds the
-        // default data folder: the error must say which setting is which.
+        // The cache from the file holds the default data folder: the error
+        // must say which setting is which.
         let file = FilePaths {
-            cache_dir: Some(abs("home").into()),
+            cache_dir: Some(abs("v").into()),
             ..Default::default()
         };
-        let env = |k: &str| (k == "HOME").then(|| abs("home"));
+        let env =
+            |k: &str| (k == "XDG_DATA_HOME").then(|| PathBuf::from(abs("v")).join("share").into());
         let err = Config::resolve(file, None, env).unwrap_err().to_string();
         assert!(err.contains("(from default)"), "{err}");
         assert!(err.contains("(from config file)"), "{err}");
