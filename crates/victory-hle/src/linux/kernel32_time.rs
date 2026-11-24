@@ -150,7 +150,7 @@ pub extern "win64" fn FileTimeToSystemTime(file_time: *const u64, time: *mut Sys
 pub extern "win64" fn SystemTimeToFileTime(time: *const SystemTime, file_time: *mut u64) -> i32 {
     // SAFETY: the title's SYSTEMTIME.
     let t = unsafe { time.read_unaligned() };
-    let leap = |y: u16| y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let leap = |y: u16| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
     let days_in_month = match t.month {
         2 if leap(t.year) => 29,
         2 => 28,

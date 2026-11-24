@@ -792,7 +792,7 @@ mod tests {
                     for round in 0..ROUNDS {
                         EnterCriticalSection(cs);
                         // SAFETY: `turn` is read and written under the CS.
-                        while unsafe { (*s).turn } != round * THREADS + me {
+                        while unsafe { (&raw const (*s).turn).read_volatile() } != round * THREADS + me {
                             SleepConditionVariableCS(cv, cs, 5000);
                         }
                         // SAFETY: as above.

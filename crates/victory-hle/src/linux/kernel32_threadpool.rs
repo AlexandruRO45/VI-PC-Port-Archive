@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn work_runs_every_submission_and_waits_for_them() {
         let (count, context) = counter();
-        let work = CreateThreadpoolWork(bump as usize, context, 0);
+        let work = CreateThreadpoolWork(bump as *const () as usize, context, 0);
         for _ in 0..20 {
             SubmitThreadpoolWork(work);
         }
@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn timers_fire_once_or_periodically_and_stop() {
         let (count, context) = counter();
-        let timer = CreateThreadpoolTimer(bump as usize, context, 0);
+        let timer = CreateThreadpoolTimer(bump as *const () as usize, context, 0);
         let due = -20 * 10_000i64; // 20 ms from now
         SetThreadpoolTimer(timer, &due, 0, 0);
         std::thread::sleep(Duration::from_millis(80));
@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn waits_report_the_object_or_the_time() {
         let (seen, context) = counter();
-        let wait = CreateThreadpoolWait(record as usize, context, 0);
+        let wait = CreateThreadpoolWait(record as *const () as usize, context, 0);
         let event = Event::new(true, false);
         let h = handles::insert(event.clone());
         SetThreadpoolWait(wait, h, std::ptr::null());
@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn queued_work_items_run() {
         let (count, context) = counter();
-        assert_eq!(QueueUserWorkItem(simple as usize, context, 0), 1);
+        assert_eq!(QueueUserWorkItem(simple as *const () as usize, context, 0), 1);
         let start = Instant::now();
         while count.load(Relaxed) == 0 && start.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_millis(1));

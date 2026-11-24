@@ -80,7 +80,8 @@ calling convention; check before you bind.
 | Title-facing ABI is `win64` | done |
 | PE mapper, TEB, guest threads, TLS, entry | not started |
 | SEH, signals, unwinding | not started |
-| kernel32/ntdll: handles, sync, threads, memory, heap, time, system | not started |
+| kernel32: handles, waits, sync objects and locks, threads, TLS/FLS, thread pool, time, system, process | done (`victory-hle/src/linux/handles.rs`, `kernel32_*.rs`; SuspendThread uses `SIGRTMIN+6`) |
+| kernel32/ntdll: memory, heap | not started |
 | UCRT | not started |
 | GPU, window, input | not started |
 | Audio, network (offline), crypto, COM and the other host DLLs | not started |

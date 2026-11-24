@@ -6,7 +6,7 @@
 //!
 //! Adding a kind of object (the file and socket slices):
 //!
-//! ```ignore
+//! ```text
 //! struct File { .. }
 //! impl Object for File {
 //!     fn as_waitable(&self) -> Option<&dyn Waitable> { Some(self) } // if it is waitable
@@ -874,9 +874,12 @@ pub(crate) fn suspend(thread: &Arc<Thread>) -> Option<u32> {
         // SAFETY: tgkill to one of our own threads with our own signal.
         unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), thread.id(), suspend_signal()) };
         let until = Deadline::after(Duration::from_millis(20));
-        while thread.ack.load(Ordering::SeqCst) == seen
-            && futex_wait(thread.ack.as_ptr(), seen, until)
-        {}
+        // Until it answers or 20 ms pass.
+        while thread.ack.load(Ordering::SeqCst) == seen {
+            if !futex_wait(thread.ack.as_ptr(), seen, until) {
+                break;
+            }
+        }
         if thread.ack.load(Ordering::SeqCst) != seen
             && thread.answer.load(Ordering::SeqCst) != ANSWER_HOST
         {

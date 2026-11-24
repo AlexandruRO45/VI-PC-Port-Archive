@@ -381,7 +381,7 @@ pub extern "win64" fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32 {
     unsafe {
         status.write_unaligned(MemoryStatusEx {
             length: size_of::<MemoryStatusEx>() as u32,
-            memory_load: if total == 0 { 0 } else { (100 - avail * 100 / total) as u32 },
+            memory_load: (avail * 100).checked_div(total).map_or(0, |free| 100 - free as u32),
             total_phys: total,
             avail_phys: avail,
             total_page_file: total + kib("SwapTotal"),
@@ -461,7 +461,8 @@ mod tests {
         assert_eq!(t.packages.iter().fold(0, |m, p| m | p), t.all());
         // Siblings are neighbours: every core's mask is one run of bits.
         for core in &t.cores {
-            assert_eq!((core >> core.trailing_zeros()) + 1 & (core >> core.trailing_zeros()), 0);
+            let run = core >> core.trailing_zeros();
+            assert_eq!((run + 1) & run, 0);
         }
         assert_eq!(cpu_list("0-2,5,7-8"), [0, 1, 2, 5, 7, 8]);
     }
