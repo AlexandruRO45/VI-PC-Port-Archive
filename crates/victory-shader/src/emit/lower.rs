@@ -808,6 +808,11 @@ impl<'a> Lower<'a> {
         let h = self.pointer_handle(&a)?;
         let c = self.cur;
         let mut addr = self.s.m.i32(a.bias.wrapping_add(offset as u32));
+        if let Some(RelOffset { value, base, .. }) = a.rel {
+            let mut local = HashMap::new();
+            let d = self.rel_offset(value, base, &mut local)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, d);
+        }
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(inst, &soffset)?;
             addr = self.s.m.bin(c, Bin::Add, addr, so);
@@ -902,13 +907,23 @@ impl<'a> Lower<'a> {
             let Fields::Flat { addr, offset, .. } = &inst.fields else {
                 unreachable!()
             };
-            let addr = addr.as_ref().ok_or("a global address not in VGPRs")?;
-            if !matches!(addr, Operand::Vector { .. }) {
-                return Err("a global address not in VGPRs");
-            }
             let base = self.s.m.i32((*offset as i32 as u32).wrapping_add(a.bias));
-            let v = self.operand(inst, addr)?;
-            self.s.m.bin(c, Bin::Add, base, v)
+            let rel = match a.rel {
+                // The program added its own terms to the pointer: they are
+                // what the address has beyond it, not the pointer itself.
+                Some(RelOffset { value, base: at, .. }) => {
+                    let mut local = HashMap::new();
+                    self.rel_offset(value, at, &mut local)?
+                }
+                None => {
+                    let addr = addr.as_ref().ok_or("a global address not in VGPRs")?;
+                    if !matches!(addr, Operand::Vector { .. }) {
+                        return Err("a global address not in VGPRs");
+                    }
+                    self.operand(inst, addr)?
+                }
+            };
+            self.s.m.bin(c, Bin::Add, base, rel)
         } else {
             self.address_offset(a)?
         };
