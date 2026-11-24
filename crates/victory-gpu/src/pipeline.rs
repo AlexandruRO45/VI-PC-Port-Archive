@@ -100,22 +100,39 @@ pub(crate) fn kept() -> [u64; 7] {
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
-    let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders
-        .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
-        .or_insert_with(|| {
-            KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            Arc::new(Shader {
-                stage,
-                hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
-                #[cfg(windows)]
-                translated: OnceLock::new(),
+    let kept = {
+        let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        shaders
+            .get_or_insert_with(HashMap::new)
+            .entry(*full.as_bytes())
+            .or_insert_with(|| {
+                KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                Arc::new(Shader {
+                    stage,
+                    hash: full.to_hex()[..16].to_owned(),
+                    container: bytes.to_vec(),
+                    #[cfg(windows)]
+                    translated: OnceLock::new(),
+                })
             })
-        })
-        .clone()
+            .clone()
+    };
+    // `VICTORY_SHADER_SAVE=<dir>`: what `victory precompile` replays, written
+    // where the container enters the process rather than where a frame's create
+    // translates it. With the pipeline fallback off most requests never reach a
+    // translation, and a container saved only from there is missing for every
+    // pipeline the run was asked to skip: 2,860 of the 19,105 programs in one
+    // 150 s dump. Written outside the map's lock, and once per container.
+    if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
+        let path = std::path::PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&path);
+        let file = path.join(format!("{}.{}.cdxil", kept.hash, kept.stage));
+        if !file.is_file() {
+            let _ = std::fs::write(&file, &kept.container);
+        }
+    }
+    kept
 }
 
 /// A translated shader and the console resources its code reads.
@@ -161,15 +178,17 @@ impl Shader {
                     worked = started.elapsed();
                     timing::add(timing::Part::Translate, worked);
                 }
-                // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
-                // translated (`.dxil`), by the hash crash reports name it with
+                // `VICTORY_SHADER_SAVE=<dir>`: the translation too, by the hash
+                // crash reports name it with (the container itself is written when
+                // it enters the process, in `shader()`).
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
-                    let dir = std::path::PathBuf::from(dir);
-                    let _ = std::fs::create_dir_all(&dir);
-                    let stem = format!("{}.{}", self.hash, self.stage);
-                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
                     if let Ok(t) = &done {
-                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
+                        let dir = std::path::PathBuf::from(dir);
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::fs::write(
+                            dir.join(format!("{}.{}.dxil", self.hash, self.stage)),
+                            &t.host.dxil,
+                        );
                     }
                 }
                 if let Ok(t) = &done {
