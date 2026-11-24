@@ -378,15 +378,22 @@ fn copy_args(
         return None;
     }
     let m = l.mips.get(mip as usize)?;
-    let bytes = (m.width as usize).checked_mul(l.desc.element_bytes as usize)?;
-    let depths = l.subresource_depth(mip) as usize;
-    let height = m.height as usize;
+    let bytes = m.width.checked_mul(l.desc.element_bytes)?;
+    let depths = l.subresource_depth(mip);
+    let height = m.height;
     if depths == 0 || height == 0 {
         return None;
     }
-    let depth_span = depths.checked_sub(1)?.checked_mul(depth as usize)?;
-    let row_span = height.checked_sub(1)?.checked_mul(row as usize)?;
-    let linear = depth_span.checked_add(row_span)?.checked_add(bytes)?;
+    if height > 1 && row < bytes {
+        return None;
+    }
+    let row_span = height.checked_sub(1)?.checked_mul(row)?;
+    let slice_bytes = row_span.checked_add(bytes)?;
+    if depths > 1 && depth < slice_bytes {
+        return None;
+    }
+    let depth_span = (depths - 1).checked_mul(depth)?;
+    let linear = depth_span.checked_add(slice_bytes)? as usize;
     let tiled_offset = usize::try_from(p.offset).ok()?;
     let tiled_len = usize::try_from(l.size).ok()?;
     let _ = tiled_offset.checked_add(tiled_len)?;

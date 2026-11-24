@@ -696,7 +696,11 @@ impl<'a> Tracer<'a> {
     }
 
     fn sum(&self, t: Term) -> Sum {
-        self.sum_inner(t, &mut Vec::new())
+        self.sum_inner(t, &mut Vec::new(), false)
+    }
+
+    fn sum_with_const_base(&self, t: Term) -> Sum {
+        self.sum_inner(t, &mut Vec::new(), true)
     }
 
     fn combine_add(x: Sum, y: Sum, v: Value) -> Sum {
@@ -720,15 +724,20 @@ impl<'a> Tracer<'a> {
         }
     }
 
-    fn sum_inner(&self, t: Term, visiting: &mut Vec<Value>) -> Sum {
+    fn sum_inner(&self, t: Term, visiting: &mut Vec<Value>, allow_const_base: bool) -> Sum {
         let v = match t {
             Term::Const(c) => return Sum::plain(c),
             Term::Value(v) => v,
         };
-        if self
-            .param_of_value(v)
-            .is_some_and(|(p, d)| d == 0 && self.is_pointer_param(p))
-        {
+        if self.param_of_value(v).is_some_and(|(p, d)| {
+            if self.is_pointer_param(p) {
+                d == 0
+            } else {
+                allow_const_base
+                    && self.layout[p].root == RootType::Constants
+                    && d.checked_add(1).is_some_and(|hi| hi < self.layout[p].sgprs)
+            }
+        }) {
             return Sum::base(v);
         }
         if self.inputs[v.0 as usize].is_some() {
@@ -745,7 +754,7 @@ impl<'a> Tracer<'a> {
             let mut agreed: Option<Value> = None;
             let mut ok = true;
             for &arg in &self.p.blocks[b].phis[pi].args {
-                let s = self.sum_inner(self.origin(arg), visiting);
+                let s = self.sum_inner(self.origin(arg), visiting, allow_const_base);
                 if s.cyclic {
                     continue;
                 }
@@ -774,19 +783,25 @@ impl<'a> Tracer<'a> {
             return Sum::dynamic(v);
         };
         visiting.push(v);
-        let out = self.sum_inst(v, inst, visiting);
+        let out = self.sum_inst(v, inst, visiting, allow_const_base);
         visiting.pop();
         out
     }
 
-    fn sum_inst(&self, v: Value, inst: &'a Inst, visiting: &mut Vec<Value>) -> Sum {
+    fn sum_inst(
+        &self,
+        v: Value,
+        inst: &'a Inst,
+        visiting: &mut Vec<Value>,
+        allow_const_base: bool,
+    ) -> Sum {
         let name = inst.name();
         match &inst.fields {
             Fields::Sop { dst, src, imm } if inst.writes.first().is_some_and(|w| w.1 == v) => {
                 match name {
                     "s_mov_b32" => {
                         if let Some(t) = src.first().and_then(|o| self.term(inst, o)) {
-                            return self.sum_inner(t, visiting);
+                            return self.sum_inner(t, visiting, allow_const_base);
                         }
                     }
                     "s_add_u32" | "s_add_i32" => {
@@ -795,8 +810,8 @@ impl<'a> Tracer<'a> {
                             src.get(1).and_then(|o| self.term(inst, o)),
                         ) {
                             let (x, y) = (
-                                self.sum_inner(a, visiting),
-                                self.sum_inner(b, visiting),
+                                self.sum_inner(a, visiting, allow_const_base),
+                                self.sum_inner(b, visiting, allow_const_base),
                             );
                             return Self::combine_add(x, y, v);
                         }
@@ -805,7 +820,7 @@ impl<'a> Tracer<'a> {
                         if let (Some(d), Some(k)) = (dst.as_ref(), *imm)
                             && let Some(a) = self.term(inst, d)
                         {
-                            let x = self.sum_inner(a, visiting);
+                            let x = self.sum_inner(a, visiting, allow_const_base);
                             let off = i32::from(k as i16) as u32;
                             return Self::combine_add(x, Sum::plain(off), v);
                         }
@@ -822,14 +837,14 @@ impl<'a> Tracer<'a> {
                             src.first().and_then(|o| self.term(inst, o)),
                             src.get(1).and_then(|o| self.term(inst, o)),
                         ) {
-                            let sb = self.sum_inner(b, visiting);
+                            let sb = self.sum_inner(b, visiting, allow_const_base);
                             if sb.cyclic {
                                 return Sum::cyclic();
                             }
                             if let Term::Const(c) = a {
                                 return Self::combine_add(sb, Sum::plain(c.wrapping_shl(shift)), v);
                             }
-                            let sa = self.sum_inner(a, visiting);
+                            let sa = self.sum_inner(a, visiting, allow_const_base);
                             if sa.cyclic {
                                 return Sum::cyclic();
                             }
@@ -850,8 +865,8 @@ impl<'a> Tracer<'a> {
                             src.get(1).and_then(|o| self.term(inst, o)),
                         ) {
                             let (sa, sb) = (
-                                self.sum_inner(a, visiting),
-                                self.sum_inner(b, visiting),
+                                self.sum_inner(a, visiting, allow_const_base),
+                                self.sum_inner(b, visiting, allow_const_base),
                             );
                             if sa.cyclic || sb.cyclic {
                                 return Sum::cyclic();
@@ -885,7 +900,7 @@ impl<'a> Tracer<'a> {
                                 (x, Term::Const(c)) | (Term::Const(c), x) if c < 256 => (x, c),
                                 _ => return Sum::dynamic(v),
                             };
-                            let sx = self.sum_inner(x, visiting);
+                            let sx = self.sum_inner(x, visiting, allow_const_base);
                             if sx.cyclic {
                                 return Sum::cyclic();
                             }
@@ -918,18 +933,25 @@ impl<'a> Tracer<'a> {
                 match name {
                     "v_mov_b32" | "v_readfirstlane_b32" | "v_readlane_b32" => {
                         if let Some(a) = f.src.first().and_then(|o| self.vterm(inst, o)) {
-                            let sa = self.sum_inner(a, visiting);
+                            let sa = self.sum_inner(a, visiting, allow_const_base);
                             if sa.cyclic {
                                 return Sum::cyclic();
                             }
-                            if sa.base.is_some() && name != "v_mov_b32" {
-                                return Sum {
-                                    base: sa.base,
-                                    offset: sa.offset,
-                                    dynamic: Some(v),
-                                    multi: true,
-                                    cyclic: false,
-                                };
+                            if name != "v_mov_b32" {
+                                // `v_readfirstlane_b32` / `v_readlane_b32`
+                                // extracts a scalar from a VGPR: preserve its
+                                // own SSA value (`v`) so waterfall detection
+                                // still sees the readfirstlane instruction.
+                                if sa.base.is_some() {
+                                    return Sum {
+                                        base: sa.base,
+                                        offset: sa.offset,
+                                        dynamic: Some(v),
+                                        multi: true,
+                                        cyclic: false,
+                                    };
+                                }
+                                return Sum::dynamic(v);
                             }
                             return sa;
                         }
@@ -940,8 +962,8 @@ impl<'a> Tracer<'a> {
                             f.src.get(1).and_then(|o| self.vterm(inst, o)),
                         ) {
                             let (x, y) = (
-                                self.sum_inner(a, visiting),
-                                self.sum_inner(b, visiting),
+                                self.sum_inner(a, visiting, allow_const_base),
+                                self.sum_inner(b, visiting, allow_const_base),
                             );
                             return Self::combine_add(x, y, v);
                         }
@@ -953,12 +975,15 @@ impl<'a> Tracer<'a> {
                             f.src.get(2).and_then(|o| self.vterm(inst, o)),
                         ) {
                             let ab = Self::combine_add(
-                                self.sum_inner(a, visiting),
-                                self.sum_inner(b, visiting),
+                                self.sum_inner(a, visiting, allow_const_base),
+                                self.sum_inner(b, visiting, allow_const_base),
                                 v,
                             );
-                            let mut abc =
-                                Self::combine_add(ab, self.sum_inner(c, visiting), v);
+                            let mut abc = Self::combine_add(
+                                ab,
+                                self.sum_inner(c, visiting, allow_const_base),
+                                v,
+                            );
                             if abc.base.is_some() {
                                 abc.multi = true;
                                 abc.dynamic = Some(v);
@@ -972,15 +997,15 @@ impl<'a> Tracer<'a> {
                             f.src.get(1).and_then(|o| self.vterm(inst, o)),
                             f.src.get(2).and_then(|o| self.vterm(inst, o)),
                         ) {
-                            let sb = self.sum_inner(b, visiting);
+                            let sb = self.sum_inner(b, visiting, allow_const_base);
                             if sb.cyclic {
                                 return Sum::cyclic();
                             }
                             if let (Term::Const(cv), Term::Const(sv)) = (a, sh) {
                                 return Self::combine_add(sb, Sum::plain(cv.wrapping_shl(sv & 31)), v);
                             }
-                            let sa = self.sum_inner(a, visiting);
-                            let ss = self.sum_inner(sh, visiting);
+                            let sa = self.sum_inner(a, visiting, allow_const_base);
+                            let ss = self.sum_inner(sh, visiting, allow_const_base);
                             if sa.cyclic || ss.cyclic {
                                 return Sum::cyclic();
                             }
@@ -1006,8 +1031,8 @@ impl<'a> Tracer<'a> {
                                 (s0, s1)
                             };
                             let (sa, sb) = (
-                                self.sum_inner(a, visiting),
-                                self.sum_inner(b, visiting),
+                                self.sum_inner(a, visiting, allow_const_base),
+                                self.sum_inner(b, visiting, allow_const_base),
                             );
                             if sa.cyclic || sb.cyclic {
                                 return Sum::cyclic();
@@ -1041,7 +1066,7 @@ impl<'a> Tracer<'a> {
                                 (x, Term::Const(c)) | (Term::Const(c), x) if c < 256 => x,
                                 _ => return Sum::dynamic(v),
                             };
-                            let sx = self.sum_inner(x, visiting);
+                            let sx = self.sum_inner(x, visiting, allow_const_base);
                             if sx.cyclic {
                                 return Sum::cyclic();
                             }
@@ -1135,7 +1160,10 @@ impl<'a> Tracer<'a> {
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
-        let s = self.sum(lo);
+        let mut s = self.sum(lo);
+        if s.base.is_none() {
+            s = self.sum_with_const_base(lo);
+        }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         let use_rel = s.multi || (s.dynamic.is_some() && extra.dynamic.is_some());
         let rel = if use_rel {

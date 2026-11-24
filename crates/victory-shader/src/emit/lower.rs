@@ -8644,24 +8644,28 @@ mod tests {
 
     #[test]
     fn missing_value_through_chained_phis_is_rejected() {
-        // Unmapped input s2 joins twice before feeding a branch condition.
-        // Transitive phi liveness must reject it instead of substituting 0.
+        // An unlowerable value (`s_memtime`) joins twice before feeding a
+        // branch condition. Transitive phi liveness must reject it instead of
+        // substituting 0.
         let words = [
-            0xBE80_0380, // s_mov_b32 s0, 0
-            0xBE81_0380, // s_mov_b32 s1, 0
-            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xF490_0080,
+            0,           // s_memtime s[2:3]
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
             0xBF85_0001, // s_cbranch_scc1 +1
             0xBE82_0381, // s_mov_b32 s2, 1
-            0xBF06_8001, // s_cmp_eq_u32 s1, 0  (join 1: phi1(s2_in, 1))
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0 (s1 = group id Y; join 1: phi1(s2, 1))
             0xBF85_0001, // s_cbranch_scc1 +1
             0xBE82_0382, // s_mov_b32 s2, 2
-            0xBF07_8002, // s_cmp_lg_u32 s2, 0  (join 2: phi2(phi1, 2))
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0 (join 2: phi2(phi1, 2))
             0xBF85_0001, // s_cbranch_scc1 +1
             0xBE83_0380, // s_mov_b32 s3, 0
             S_ENDPGM,
         ];
         assert!(
-            matches!(lowers(&words, 0), Err(crate::ShaderError::Unsupported { .. })),
+            matches!(
+                lowers(&words, 3 << 7),
+                Err(crate::ShaderError::Unsupported { .. })
+            ),
             "missing value crossing two phi joins must not silently become 0"
         );
     }
@@ -8684,7 +8688,7 @@ mod tests {
             matches!(
                 lowers(&words, 0),
                 Err(crate::ShaderError::Unsupported {
-                    what: "ds_swizzle_b32 mode outside quad-permute",
+                    what: "a rotate or FFT swizzle",
                     ..
                 })
             ),
