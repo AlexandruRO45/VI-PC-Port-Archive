@@ -975,6 +975,12 @@ impl Drop for Resource {
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        // Local build: the host copy lives on a few seconds. The title still drew with views of
+        // a texture it had just released (harmless on the console, where its memory stays): a
+        // GPU page fault "inside freed texture 1024x1024" removed the device in the world.
+        if let Some(host) = self.host.take() {
+            graveyard(host);
+        }
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
                 std::ptr::from_ref::<Resource>(self) as usize,
@@ -1841,4 +1847,25 @@ mod tests {
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
+}
+
+/// Local build: released host textures kept alive for `KEEP` (see `Resource`'s drop).
+#[cfg(windows)]
+fn graveyard(host: std::sync::Arc<HostTexture>) {
+    use std::time::{Duration, Instant};
+    const KEEP: Duration = Duration::from_secs(4);
+    static GRAVE: std::sync::Mutex<std::collections::VecDeque<(Instant, std::sync::Arc<HostTexture>)>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+    let now = Instant::now();
+    let dead: Vec<_> = {
+        let mut g = GRAVE.lock().unwrap_or_else(|e| e.into_inner());
+        g.push_back((now, host));
+        let mut dead = Vec::new();
+        while g.front().is_some_and(|(at, _)| now.duration_since(*at) > KEEP) {
+            dead.extend(g.pop_front());
+        }
+        dead
+    };
+    // released outside the lock
+    drop(dead);
 }

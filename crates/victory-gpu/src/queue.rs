@@ -287,9 +287,28 @@ extern "system" fn present(
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // Local build: plane 1 (0x48 bytes on) over plane 0 (`crate::compose`)
+        let over = (planes > 1)
+            .then(|| {
+                // SAFETY: the title passes `planes` plane descriptions, 0x48 bytes apart.
+                let p1 = unsafe { &*((plane_parameters as *const u8).add(0x48) as *const Plane) };
+                (p1.count > 0 && !p1.resources.is_null()).then(|| unsafe { *p1.resources })
+            })
+            .flatten()
+            .filter(|r| !r.is_null() && *r != resource);
+        let over_texture = over.and_then(crate::resource::host_resource);
+        let read = if over_texture.is_some() { 0x80 } else { COPY_SOURCE };
+        let state = crate::resource::host_transition(resource, read)
+            .map_or(read, |(_, before)| before);
+        let shown = match (over, over_texture) {
+            (Some(o), Some(t)) => {
+                let over_state = crate::resource::host_transition(o, 0x80).map_or(0x80, |(_, before)| before);
+                let shown = host.present_planes(texture, state, Some((t, over_state)), frame);
+                crate::resource::host_transition(o, over_state);
+                shown
+            }
+            _ => host.present(texture, state, frame),
+        };
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);

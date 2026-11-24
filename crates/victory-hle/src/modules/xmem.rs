@@ -342,7 +342,51 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section: its handle, size, and whether it is committed whole (`SEC_COMMIT`).
+struct Section(HANDLE, usize, bool);
+
+/// Local build: largest section of physical pages: a host GPU heap opens at most 4095 MiB, and
+/// Grand Theft Auto VI's tile heap (3977 MiB of pages in one call) must fit in one section, or
+/// the runs of pages it maps cross sections and are copied.
+const CHUNK: usize = 4095 << 20;
+
+/// Local build: the committed section and byte offset in it behind `[address, address +
+/// len)`, when one run of mapped views of consecutive pages covers it (`victory_gpu::direct`).
+fn section_behind(address: usize, len: usize) -> Option<(isize, u64, u64)> {
+    let physical = physical();
+    let (&at, (size, slice)) = physical.views.range(..=address).next_back()?;
+    if address >= at + size || !slice.section.2 {
+        return None;
+    }
+    let offset = slice.index * PAGE + (address - at);
+    // views after it showing the next slices of the same section
+    let (mut end, mut next) = (at + size, slice.index + size / PAGE);
+    while end < address + len {
+        let Some((size, s)) = physical.views.get(&end) else {
+            note_split(address, len, end, "no view");
+            return None;
+        };
+        if !Arc::ptr_eq(&s.section, &slice.section) || s.index != next {
+            note_split(address, len, end, if Arc::ptr_eq(&s.section, &slice.section) { "pages not consecutive" } else { "another section" });
+            return None;
+        }
+        end += size;
+        next += size / PAGE;
+    }
+    Some((slice.section.0 as isize, offset as u64, slice.section.1 as u64))
+}
+
+fn note_split(address: usize, len: usize, at: usize, why: &str) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+        tracing::info!(address = format_args!("{address:#x}"), len, at = format_args!("{at:#x}"), why, "title buffer over physical pages not in one run: copied");
+    }
+}
+
+/// Tells the GPU side where physical pages are (once).
+pub(crate) fn register_sections() {
+    victory_gpu::set_section_lookup(section_behind);
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -398,44 +442,59 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    // Local build: pagefile-backed sections of at most `CHUNK` bytes, committed (`SEC_COMMIT`)
+    // so the host GPU can open each as a heap and read title buffers in them in place
+    // (`victory_gpu::direct`); reserved (`SEC_RESERVE`, pages committed when first mapped) if
+    // the host cannot commit them or `VICTORY_DIRECT=0`. Grand Theft Auto VI asks for 6.1 GiB
+    // at once.
+    // Off unless `VICTORY_DIRECT_SECTIONS=1`: committed sections the host GPU opened as heaps
+    // stayed committed after the process ended (the driver kept them: ~6 GB per run, 70 GB of
+    // the system's commit after a dozen runs, until a restart).
+    let direct = std::env::var("VICTORY_DIRECT_SECTIONS").is_ok_and(|v| v.trim() == "1") && !on_wine();
+    let mut sections: Vec<Arc<Section>> = Vec::new();
+    let mut left = size;
+    while left > 0 {
+        let part = left.min(CHUNK);
+        let make = |flag: u32| unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | flag,
+                (part as u64 >> 32) as u32,
+                part as u32,
+                std::ptr::null(),
+            )
+        };
+        let mut committed = direct;
+        let mut handle = if direct { make(SEC_COMMIT) } else { std::ptr::null_mut() };
+        if handle.is_null() {
+            committed = false;
+            handle = make(if on_wine() { SEC_COMMIT } else { SEC_RESERVE });
+        }
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
+        sections.push(Arc::new(Section(handle, part, committed)));
+        left -= part;
     }
-    tracing::debug!(
+    tracing::info!(
         n,
+        sections = sections.len(),
+        committed = sections.iter().all(|s| s.2),
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
     for index in 0..n {
         let slice = Slice {
-            section: section.clone(),
-            index,
+            section: sections[index * PAGE / CHUNK].clone(),
+            index: index % (CHUNK / PAGE),
         };
         let number = first + index * FRAMES;
         physical.pages.insert(number, slice);
@@ -895,6 +954,7 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 }
 
 pub(crate) fn module() -> HleModule {
+    register_sections();
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll"],

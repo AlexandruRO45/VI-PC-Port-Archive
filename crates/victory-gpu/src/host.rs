@@ -1312,7 +1312,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = read_parallel(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -1320,8 +1320,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
+    // Local build: something is unmapped: the regions the kernel reports, read where committed
+    // and readable, zeros elsewhere. (Trying 64 KiB, then 4 KiB pieces cost ~33,000 failed reads
+    // per frame in the world: Grand Theft Auto VI's tile heap has 132 MB of holes.)
+    if copy_by_regions(src, dst, len) {
+        return;
+    }
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
         if !read(at as *const u8, to, n) {
@@ -1346,6 +1350,72 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
+/// Local build: [`read`] of a big range in 2 MiB pieces on several threads (the copies of title
+/// memory took one core of twenty: ~0.5 GB/s in the world). True if every piece was whole.
+fn read_parallel(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    const PIECE: usize = 2 << 20;
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let threads = *THREADS.get_or_init(|| {
+        std::env::var("VICTORY_COPY_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 12)
+        })
+    });
+    if len < 2 * PIECE || threads < 2 {
+        return read(src, dst, len);
+    }
+    let pieces = len.div_ceil(PIECE);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let whole = std::sync::atomic::AtomicBool::new(true);
+    let (src, dst) = (src as usize, dst as usize);
+    std::thread::scope(|scope| {
+        for _ in 0..threads.min(pieces) {
+            scope.spawn(|| loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if k >= pieces {
+                    break;
+                }
+                let at = k * PIECE;
+                let n = PIECE.min(len - at);
+                if !read((src + at) as *const u8, (dst + at) as *mut u8, n) {
+                    whole.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    whole.into_inner()
+}
+
+/// [`copy_mapped`]'s fallback by memory regions; false if the kernel does not answer.
+fn copy_by_regions(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let (start, end) = (src as usize, src as usize + len);
+    let mut at = start;
+    while at < end {
+        // SAFETY: a query only.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(at as *const _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+            return false;
+        }
+        let region_end = (info.BaseAddress as usize + info.RegionSize).min(end);
+        if region_end <= at {
+            return false;
+        }
+        let n = region_end - at;
+        let to = dst.wrapping_add(at - start);
+        let readable = info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && info.Protect != 0;
+        if !(readable && read_parallel(at as *const u8, to, n)) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: inside the destination, which is mapped.
+            unsafe { to.write_bytes(0, n) };
+        }
+        at = region_end;
+    }
+    true
+}
+
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -1461,6 +1531,8 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// Local build: plane composition (`crate::compose`), made on the first frame with two planes.
+    compositor: Option<crate::compose::Compositor>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -1588,6 +1660,17 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        self.present_planes(texture, state, None, frame)
+    }
+
+    /// Plane 0 and, when the title presents one, plane 1 over it (`crate::compose`).
+    pub(crate) fn present_planes(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -1629,6 +1712,28 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
+            if let Some((over, over_state)) = overlay.filter(|_| crate::compose::enabled()) {
+                if p.compositor.is_none() {
+                    match crate::compose::Compositor::new(&self.device, format) {
+                        Ok(c) => p.compositor = Some(c),
+                        Err(e) => tracing::warn!(error = %e, "no plane composition"),
+                    }
+                }
+                if let Some(c) = &p.compositor {
+                    let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                    let over_state = D3D12_RESOURCE_STATES(over_state as i32);
+                    let over_format = swap_format(over.GetDesc().Format).unwrap_or(format);
+                    list.ResourceBarrier(&[transition(texture, state, read), transition(over, over_state, read)]);
+                    c.record(&self.device, list, &back, width, height, (texture, format), Some((over, over_format)));
+                    list.ResourceBarrier(&[transition(texture, read, state), transition(over, read, over_state)]);
+                    p.copy.close();
+                    self.execute(&[&p.copy]);
+                    let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+                    p.meter.frame(p.hwnd);
+                    let _ = frame;
+                    return Some(false);
+                }
+            }
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 transition(
@@ -1709,6 +1814,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                compositor: None,
             })
         }
     }

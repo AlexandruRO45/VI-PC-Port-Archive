@@ -43,6 +43,8 @@ pub(crate) struct Shadow {
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// Local build: the buffer is title memory itself (`crate::direct`): nothing to copy.
+    direct: bool,
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -102,6 +104,11 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.direct {
+            // nothing to bring up to date; the list still keeps the buffer alive
+            list.defer_refresh(self, address as usize, 0);
+            return;
+        }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
@@ -118,7 +125,15 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
+            direct: false,
         }
+    }
+
+    /// A buffer over title memory itself (`crate::direct`).
+    fn direct(buffer: ID3D12Resource, gpu: u64, start: u64, len: u64) -> Shadow {
+        let mut s = Shadow::new(buffer, start as *mut u8, gpu, start, len);
+        s.direct = true;
+        s
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -138,6 +153,9 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.direct {
+            return;
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
@@ -149,6 +167,9 @@ impl Shadow {
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
     /// ~2.3 million page faults per world frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        if self.direct {
+            return;
+        }
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -188,6 +209,9 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        if self.direct {
+            return 0;
+        }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -203,9 +227,16 @@ impl Shadow {
             const PIECE: usize = 64 << 10;
             let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
+            // Local build: which pieces the GPU changed, compared on several threads (one core
+            // compared ~100 MB per submission, 27 submissions a frame: ~170 ms).
+            let changed = changed_pieces(self.data as usize, before.as_ptr() as usize, start, from, to);
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
+                if !changed.contains(&at) {
+                    at += n;
+                    continue;
+                }
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
@@ -263,6 +294,9 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        if self.direct {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -365,6 +399,37 @@ impl Shadow {
     }
 }
 
+/// Offsets (from the copy's start) of the 64 KiB pieces of `[from, to)` whose bytes in the copy
+/// at `data` differ from `before` (the snapshot of `[from, to)`), compared on several threads.
+fn changed_pieces(data: usize, before: usize, start: usize, from: usize, to: usize) -> std::collections::HashSet<usize> {
+    const PIECE: usize = 64 << 10;
+    let mut pieces = Vec::new();
+    let mut at = from;
+    while at < to {
+        let n = (PIECE - (start + at) % PIECE).min(to - at);
+        pieces.push((at, n));
+        at += n;
+    }
+    let differs = |&(at, n): &(usize, usize)| {
+        // SAFETY: inside the copy and the snapshot.
+        let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
+        let old = unsafe { std::slice::from_raw_parts((before + at - from) as *const u8, n) };
+        host != old
+    };
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 12);
+    if pieces.len() < 64 || threads < 2 {
+        return pieces.iter().filter(|p| differs(p)).map(|p| p.0).collect();
+    }
+    let chunk = pieces.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = pieces
+            .chunks(chunk)
+            .map(|part| scope.spawn(move || part.iter().filter(|p| differs(p)).map(|p| p.0).collect::<Vec<_>>()))
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    })
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -398,6 +463,19 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
+    // direct buffers over memory mapped anew show the old pages: made again
+    let remapped = crate::direct::take_remapped();
+    if !remapped.is_empty() {
+        for e in map.values_mut() {
+            if e.shadow.as_ref().is_some_and(|s| s.direct && remapped.iter().any(|&(a, b)| a < s.start + s.len && b > s.start)) {
+                e.shadow = None;
+            }
+        }
+        LOOSE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, s| !(s.direct && remapped.iter().any(|&(a, b)| a < s.start + s.len && b > s.start)));
+    }
     let key = map
         .range(..=(address, usize::MAX))
         .rev()
@@ -411,9 +489,15 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
+        if let Some((buffer, gpu)) = crate::direct::buffer(&host()?.device, key.0, len) {
+            entry.shadow = Some(Arc::new(Shadow::direct(buffer, gpu, key.0, len)));
+            return entry.shadow.clone();
+        }
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        // Local build: 1 MiB past the end: shaders read past a buffer's end (memory goes on
+        // there on the console; here a GPU page fault removed the device)
+        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16) + (1 << 20))?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -452,7 +536,12 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    if let Some((buffer, gpu)) = crate::direct::buffer(&host()?.device, start, len) {
+        let shadow = Arc::new(Shadow::direct(buffer, gpu, start, len));
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
+    let (buffer, data) = host()?.shared_buffer(len + (1 << 20))?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };

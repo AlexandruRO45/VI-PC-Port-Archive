@@ -43,7 +43,9 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
-    let title_dir = exe.parent().unwrap_or(Path::new("."));
+    // local: the title's files may live apart from a decrypted exe (VICTORY_TITLE_DIR)
+    let title_dir_env = std::env::var_os("VICTORY_TITLE_DIR").map(std::path::PathBuf::from);
+    let title_dir = title_dir_env.as_deref().unwrap_or(exe.parent().unwrap_or(Path::new(".")));
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();

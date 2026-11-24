@@ -45,6 +45,10 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod compose;
+#[cfg(windows)]
+mod direct;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
 #[cfg(windows)]
@@ -56,3 +60,7 @@ mod watch;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{title_memory_remapped, writing as kernel_will_write};
+
+/// Local build: see `direct`.
+#[cfg(windows)]
+pub use direct::set_section_lookup;

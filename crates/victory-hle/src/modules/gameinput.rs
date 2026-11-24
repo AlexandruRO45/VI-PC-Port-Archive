@@ -1144,7 +1144,13 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
+            let mut pad = convert(&state.Gamepad);
+            // local build: the automatic A goes to a connected pad too (the keyboard is no
+            // stand-in pad while one is connected)
+            if super::auto_a() {
+                pad.buttons |= super::A;
+            }
+            Some(pad)
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1152,6 +1158,9 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
+            if super::auto_a() && !down.contains(&0x0D) {
+                down.push(0x0D);
+            }
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1612,4 +1621,24 @@ mod tests {
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
     }
+}
+
+
+/// Local build: set when the title starts loading the game (it opens its world pack).
+pub(crate) static GAME_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Local build: `VICTORY_AUTO_A=1` holds A (the stand-in pad's Enter) for 0.3 s every 2 s,
+/// whether or not the window has focus, until the title loads the game: the profile screen
+/// ("PLAYER A") is passed without anyone at the keyboard.
+fn auto_a() -> bool {
+    use std::sync::LazyLock;
+    use std::time::Instant;
+    static START: LazyLock<Option<Instant>> =
+        LazyLock::new(|| std::env::var("VICTORY_AUTO_A").is_ok_and(|v| v.trim() == "1").then(Instant::now));
+    let Some(start) = *START else { return false };
+    if GAME_LOADING.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let ms = start.elapsed().as_millis();
+    ms > 3000 && ms % 2000 < 300
 }
