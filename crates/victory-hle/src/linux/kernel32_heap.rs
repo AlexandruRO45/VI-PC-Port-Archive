@@ -242,11 +242,8 @@ mod tests {
             assert_eq!(p as usize % 16, 0);
             assert_eq!(HeapSize(heap, 0, p), n);
             // SAFETY: n zeroed bytes.
-            assert!(
-                unsafe { std::slice::from_raw_parts(p.cast::<u8>(), n) }
-                    .iter()
-                    .all(|&b| b == 0)
-            );
+            let bytes = unsafe { std::slice::from_raw_parts(p.cast::<u8>(), n) };
+            assert!(bytes.iter().all(|&b| b == 0));
             assert_eq!(HeapFree(heap, 0, p), 1);
         }
         let a = alloc(100, 256, true);

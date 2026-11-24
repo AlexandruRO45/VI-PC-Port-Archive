@@ -81,6 +81,7 @@ calling convention; check before you bind.
 | PE mapper, TEB, guest threads, TLS, entry | not started |
 | SEH, signals, unwinding | not started |
 | kernel32/ntdll: handles, sync, threads, memory, heap, time, system | not started |
+| Region table (`vm.rs`), kernel32 memory, heap, files at host level, text, locale | done: `kernel32_{memory,heap,file,io,path,text,locale}.rs`; overlapped I/O completes inside the call |
 | UCRT | not started |
 | GPU, window, input | not started |
 | Audio, network (offline), crypto, COM and the other host DLLs | not started |

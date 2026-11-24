@@ -16,16 +16,20 @@ pub(crate) mod handles;
 pub(crate) mod kernel32_file;
 pub(crate) mod kernel32_heap;
 mod kernel32_io;
+mod kernel32_locale;
 mod kernel32_memory;
 mod kernel32_path;
+mod kernel32_text;
 
 fn modules() -> Vec<HleModule> {
     vec![
         kernel32_file::module(),
         kernel32_heap::module(),
         kernel32_io::module(),
+        kernel32_locale::module(),
         kernel32_memory::module(),
         kernel32_path::module(),
+        kernel32_text::module(),
     ]
 }
 

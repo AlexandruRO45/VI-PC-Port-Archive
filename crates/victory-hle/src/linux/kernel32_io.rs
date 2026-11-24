@@ -334,6 +334,76 @@ mod tests {
         }
     }
 
+    /// With `VICTORY_GAME_DIR`: a file of the dump, named in upper case,
+    /// reads through an overlapped handle what the host reads.
+    #[test]
+    fn overlapped_reads_of_the_game_dump() {
+        use crate::linux::kernel32_path::{FindClose, FindDataW, FindFirstFileW, FindNextFileW};
+        let Some(dir) = std::env::var_os("VICTORY_GAME_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        // SAFETY: an all-zero WIN32_FIND_DATAW is valid.
+        let mut fd: FindDataW = unsafe { std::mem::zeroed() };
+        let find = FindFirstFileW(w(&format!("{}\\*", guest_path(&dir))).as_ptr(), &mut fd);
+        assert_ne!(find, INVALID_HANDLE_VALUE);
+        let name = loop {
+            let n = fd.name.iter().position(|&c| c == 0).unwrap();
+            let name = String::from_utf16_lossy(&fd.name[..n]);
+            if fd.attributes & 0x10 == 0
+                && (u64::from(fd.size_high) << 32 | u64::from(fd.size_low)) > 0
+            {
+                break name;
+            }
+            assert_eq!(
+                FindNextFileW(find, &mut fd),
+                1,
+                "no file in the dump's folder"
+            );
+        };
+        FindClose(find);
+        let size = u64::from(fd.size_high) << 32 | u64::from(fd.size_low);
+        let upper = w(&format!("{}\\{}", guest_path(&dir), name.to_uppercase()));
+        let flags = FILE_FLAG_OVERLAPPED;
+        let h = CreateFileW(
+            upper.as_ptr(),
+            GENERIC_READ,
+            1,
+            std::ptr::null(),
+            3,
+            flags,
+            std::ptr::null_mut(),
+        );
+        assert_ne!(h, INVALID_HANDLE_VALUE, "{name}");
+        let at = size / 2;
+        let mut ov = Overlapped {
+            offset_low: at as u32,
+            offset_high: (at >> 32) as u32,
+            ..Default::default()
+        };
+        let mut buf = vec![0u8; 1 << 16];
+        let mut n = 0;
+        assert_eq!(
+            ReadFile(
+                h,
+                buf.as_mut_ptr().cast(),
+                buf.len() as u32,
+                &mut n,
+                &mut ov
+            ),
+            1
+        );
+        let mut host = vec![0u8; n as usize];
+        use std::os::unix::fs::FileExt;
+        std::fs::File::open(dir.join(&name))
+            .unwrap()
+            .read_exact_at(&mut host, at)
+            .unwrap();
+        assert_eq!(&buf[..n as usize], &host[..]);
+        assert_eq!(u64::from(n), (size - at).min(1 << 16));
+        handles::close(h as Handle);
+    }
+
     #[test]
     fn layouts_match_windows() {
         assert_eq!(size_of::<Overlapped>(), 32);
