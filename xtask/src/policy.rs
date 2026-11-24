@@ -2764,6 +2764,67 @@ mod tests {
         super::run(&root, false).unwrap();
     }
 
+    /// A `.git` file may name its repository relative to itself, and end
+    /// its line in CRLF as an editor on Windows saves it: git reads
+    /// `gitdir: ../repo.git` from the checkout's directory, not from where
+    /// it runs, and drops the trailing `\r\n`. That repository's
+    /// `info/exclude` then ignores `shared`, which is taken, while
+    /// `visible` is refused and left empty, and run from a subdirectory the
+    /// same rule holds. The repository beside the checkout is never listed.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_may_be_ignored_through_a_relative_git_file() {
+        let repo = tempdir();
+        let root = repo.path().join("checkout");
+        let git_dir = repo.path().join("repo.git");
+        std::fs::create_dir(&root).unwrap();
+        git_str(
+            &root,
+            &[
+                "init",
+                "-q",
+                "--separate-git-dir",
+                git_dir.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(root.join(".git"), "gitdir: ../repo.git\r\n").unwrap();
+        std::fs::create_dir_all(git_dir.join("info")).unwrap();
+        std::fs::write(git_dir.join("info/exclude"), "/shared/\n").unwrap();
+        let visible = root.join("visible");
+        let shared = root.join("shared");
+        let sub = root.join("sub");
+        for dir in [&visible, &shared, &sub] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let top = git_str(&root, &["rev-parse", "--absolute-git-dir"]);
+        let top = String::from_utf8(top).unwrap();
+        assert_eq!(
+            std::path::Path::new(top.trim()),
+            git_dir.canonicalize().unwrap()
+        );
+        let from_sub = super::git_command(&root)
+            .args([
+                "-C",
+                "sub",
+                "check-ignore",
+                "--",
+                "../shared/a.rs",
+                "../visible/a.rs",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(from_sub.status.code(), Some(0));
+        assert_eq!(from_sub.stdout, b"../shared/a.rs\n");
+
+        let tmp = tempdir_in_first(&root, [visible.clone(), shared.clone()]);
+        assert_eq!(tmp.path().parent(), Some(shared.as_path()));
+        assert_eq!(std::fs::read_dir(&visible).unwrap().count(), 0);
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        std::fs::write(visible.join("a.rs"), b"fn a() {}\n").unwrap();
+        assert_eq!(names(&root, false), ["visible/a.rs"]);
+        super::run(&root, false).unwrap();
+    }
+
     /// Ignore sources are opened as git opens them: a UTF-8 byte order mark
     /// at the start of `.gitignore` is dropped, so its first rule ignores
     /// `bom`, which is taken, while the same mark before a later rule is
