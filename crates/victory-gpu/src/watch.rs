@@ -172,27 +172,27 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         }
         found.extend(j.found[..count].iter().map(|&at| at / PAGE));
     }
-    let guarded = if failed {
-        // Not write-watched memory (the kernel answers for a whole
-        // allocation or not at all), so none of the range went in `swept`.
-        found.clear();
-        if !guarded {
-            return None;
-        }
-        guard(first * PAGE, last * PAGE)?
+    let guarded_pages = if failed {
+        // A failed gap does not undo successful kernel queries, which
+        // already reset their dirty bits. Leave the sweep coverage as is.
+        if guarded { guard(first * PAGE, last * PAGE) } else { None }
     } else {
         if sweeping {
             for &(a, e) in &asks {
                 sweep_in(&mut j.swept, a, e);
             }
         }
-        Vec::new()
+        Some(Vec::new())
     };
+    if found.is_empty() && guarded_pages.is_none() {
+        return None;
+    }
     j.asked += 1;
     let now = j.asked;
-    for page in found.into_iter().chain(guarded) {
+    for page in found.into_iter().chain(guarded_pages.iter().flatten().copied()) {
         j.written.insert(page, now);
     }
+    guarded_pages?;
     Some((
         now,
         j.written
@@ -391,6 +391,7 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    static SWEEP_TEST: Mutex<()> = Mutex::new(());
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
@@ -465,6 +466,7 @@ mod tests {
     /// the outer asking found; after the sweep the kernel is asked as before.
     #[test]
     fn a_sweep_shares_the_kernels_answer_with_nested_ranges() {
+        let _serial = SWEEP_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let p = watched(4);
         // SAFETY: committed pages of ours.
         unsafe { ((p + 2 * PAGE) as *mut u8).write(1) };
@@ -487,6 +489,7 @@ mod tests {
     /// seen by the next asking in the same sweep.
     #[test]
     fn a_sweep_asks_again_after_its_own_write() {
+        let _serial = SWEEP_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let p = watched(2);
         let sweep = Sweep::begin();
         let (_, before) = writes(p, p + 2 * PAGE, false).expect("watched");
@@ -497,6 +500,23 @@ mod tests {
         let (now, after) = writes(p, p + 2 * PAGE, false).expect("watched");
         assert_eq!(after, [(p / PAGE + 1, now)]);
         drop(sweep);
+    }
+
+    #[test]
+    fn partial_sweep_keeps_writes_when_a_later_query_fails() {
+        let _serial = SWEEP_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        for guarded in [false, true] {
+            let p = watched(2);
+            let sweep = Sweep::begin();
+            writes(p + PAGE, p + 2 * PAGE, false).expect("second page is watched");
+            // SAFETY: the first page of our committed allocation.
+            unsafe { (p as *mut u8).write(1) };
+            assert!(writes(p, p + 3 * PAGE, guarded).is_none());
+            let (_, pages) = writes(p, p + PAGE, false).expect("first page is watched");
+            assert_eq!(pages.len(), 1);
+            assert_eq!(pages[0].0, p / PAGE);
+            drop(sweep);
+        }
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
