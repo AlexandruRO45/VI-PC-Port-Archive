@@ -3271,7 +3271,9 @@ fn memory_windows_above_4_gib(heap: bool) {
     let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
     assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
-    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + xcl_w)]"), heap);
+    // 2 of 4 window slots: windows 2.. take the null view after the slots, as `xcl_w` past them
+    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + select(xcl_w < 2u, xcl_w, 4u))]"), heap);
+    assert!(!t.hlsl.contains("if (xcl_w"), "heap windows: no branch around an access");
     let hlsl_dxil = || super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
     // the direct translator binds windows as root UAVs only (no heap windows yet)
     let dxil = if heap { hlsl_dxil() } else { direct_or(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() }), hlsl_dxil()) };
@@ -3315,21 +3317,28 @@ fn memory_windows_above_4_gib(heap: bool) {
 ///   on `global_load`/`global_store` updates the target window accurately.
 #[test]
 fn gpu_memory_windows_reject_out_of_uma_aliasing() {
-    memory_windows_reject_out_of_uma_aliasing(false);
+    memory_windows_reject_out_of_uma_aliasing(false, 2);
 }
 
 /// The same with the windows taken from the descriptor heap (`Options::heap_windows`): an
 /// address outside them reads 0 and drops its stores and atomics there too.
 #[test]
 fn gpu_heap_windows_reject_out_of_uma_aliasing() {
-    memory_windows_reject_out_of_uma_aliasing(true);
+    memory_windows_reject_out_of_uma_aliasing(true, 2);
 }
 
-fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
+/// The same with every window slot used: `min(xcl_w, 4)` sends what lies outside them to the
+/// null view.
+#[test]
+fn gpu_heap_windows_reject_out_of_uma_aliasing_all_slots() {
+    memory_windows_reject_out_of_uma_aliasing(true, 4);
+}
+
+fn memory_windows_reject_out_of_uma_aliasing(heap: bool, windows: u32) {
     if !gpu_ready() {
         return;
     }
-    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let arena = crate::gpu::uma::Uma::with_windows(windows as usize, 1 << 20).unwrap();
     let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
     assert_eq!(w1 - w0, 1 << 32);
     let base_hi = (w0 >> 32) as u32;
@@ -3379,7 +3388,7 @@ fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     ];
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let p = prog(&refs);
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
+    let t = translate(&p, &on_gpu(Options { mem_windows: windows, heap_windows: heap, ..Default::default() })).unwrap();
     assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
 
