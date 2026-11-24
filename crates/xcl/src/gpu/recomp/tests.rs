@@ -7637,7 +7637,14 @@ attributes #1 = { nounwind }
         runner::skip_test("no DXC");
         return;
     }
-    let dxil = super::dxc::assemble(IR).unwrap();
+    // a Windows SDK's `bin\<ver>\x64` has dxcompiler.dll without dxil.dll: nothing to sign with
+    let dxil = match super::dxc::assemble(IR) {
+        Err(e) if e.contains("no dxil.dll") => {
+            runner::skip_test("no dxil.dll");
+            return;
+        }
+        r => r.unwrap(),
+    };
     assert_eq!(&dxil[..4], b"DXBC");
     // a value used before it is defined: refused by the assembler or the validator
     assert!(super::dxc::assemble(&IR.replace("%3 = mul i32 %2, 3", "%3 = mul i32 %4, 3")).is_err());
