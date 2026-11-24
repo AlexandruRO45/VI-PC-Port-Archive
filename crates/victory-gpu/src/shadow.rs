@@ -78,6 +78,88 @@ pub(crate) fn merge_ranges(ranges: &mut Vec<(usize, usize)>) {
     ranges.truncate(out + 1);
 }
 
+/// Subtracts sorted, disjoint `covered` intervals from `[start, end)`,
+/// returning the remaining uncovered sub-ranges in ascending order.
+fn subtract_covered(start: u64, end: u64, covered: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut kept = Vec::new();
+    let mut cur = start;
+    for &(c0, c1) in covered {
+        if c1 <= cur {
+            continue;
+        }
+        if c0 >= end {
+            break;
+        }
+        if c0 > cur {
+            kept.push((cur, c0));
+        }
+        cur = cur.max(c1);
+        if cur >= end {
+            break;
+        }
+    }
+    if cur < end {
+        kept.push((cur, end));
+    }
+    kept
+}
+
+/// Merges `[start, end)` into a sorted, disjoint interval list in place.
+fn insert_covered(covered: &mut Vec<(u64, u64)>, start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    covered.push((start, end));
+    covered.sort_unstable();
+    let mut out = 0;
+    for i in 1..covered.len() {
+        let (a, b) = covered[i];
+        if a <= covered[out].1 {
+            covered[out].1 = covered[out].1.max(b);
+        } else {
+            out += 1;
+            covered[out] = (a, b);
+        }
+    }
+    covered.truncate(out + 1);
+}
+
+/// Trims or drops earlier [`UploadCopy`] ranges that are overwritten by a later
+/// upload to the same shadow buffer, ensuring every `CopyBufferRegion` recorded
+/// into one upload prelude writes strictly disjoint destination bytes (last
+/// write wins, matching the previous CPU `memcpy` order without extra barriers).
+pub(crate) fn trim_overlapping_uploads(uploads: &mut Vec<UploadCopy>) {
+    if uploads.len() <= 1 {
+        return;
+    }
+    let mut covered: std::collections::HashMap<usize, Vec<(u64, u64)>> =
+        std::collections::HashMap::new();
+    let mut kept = Vec::with_capacity(uploads.len());
+    for u in uploads.drain(..).rev() {
+        if u.len == 0 {
+            continue;
+        }
+        let dst_start = u.dst_offset;
+        let dst_end = dst_start.saturating_add(u.len);
+        let entry = covered.entry(Arc::as_ptr(&u.shadow) as usize).or_default();
+        let pieces = subtract_covered(dst_start, dst_end, entry);
+        for &(s, e) in pieces.iter().rev() {
+            kept.push(UploadCopy {
+                shadow: u.shadow.clone(),
+                src: u.src.clone(),
+                src_offset: u.src_offset + (s - dst_start),
+                dst_offset: s,
+                len: e - s,
+            });
+        }
+        if !pieces.is_empty() {
+            insert_covered(entry, dst_start, dst_end);
+        }
+    }
+    kept.reverse();
+    *uploads = kept;
+}
+
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
@@ -290,7 +372,7 @@ impl Shadow {
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
-        self.stage(from, to, alloc, out)
+        self.stage(from, to, alloc, out).unwrap_or(0)
     }
 
     /// Stages the pages of `[from, to)` written after their last copy
@@ -305,11 +387,33 @@ impl Shadow {
         alloc: &mut impl FnMut(usize) -> Option<(ID3D12Resource, u64, *mut u8)>,
         out: &mut Vec<UploadCopy>,
     ) -> usize {
-        let base = self.start as usize / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run) = (0, None);
         let last = (to - 1) / PAGE;
+        // Mark pages current only after their run's staging allocation succeeds;
+        // if `alloc` returns `None`, leave `copied` unchanged so the next
+        // submission retries them.
+        let mut flush_run = |first: usize, end_page: usize, copied: &mut [u64]| -> usize {
+            let Some(staged) = self.stage(
+                (first * PAGE).max(from),
+                (end_page * PAGE).min(to),
+                alloc,
+                out,
+            ) else {
+                return 0;
+            };
+            for p in first..end_page {
+                // A page only partly in the range is copied in part: it
+                // stays stale for the rest.
+                if (p * PAGE).max(start) >= from && ((p + 1) * PAGE).min(end) <= to {
+                    copied[p - base] = now;
+                }
+            }
+            staged
+        };
         for page in from / PAGE..=last {
             let write = match writes.peek() {
                 Some(&&(p, w)) if p == page => {
@@ -318,49 +422,37 @@ impl Shadow {
                 }
                 _ => 0,
             };
-            let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
-                }
+            let at = copied[page - base];
+            if at == 0 || write > at {
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.stage((first * PAGE).max(from), (page * PAGE).min(to), alloc, out);
+                bytes += flush_run(first, page, &mut copied);
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.stage(
-                (first * PAGE).max(from),
-                ((last + 1) * PAGE).min(to),
-                alloc,
-                out,
-            );
+            bytes += flush_run(first, last + 1, &mut copied);
         }
         bytes
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into upload
     /// staging memory and records the GPU copy into this default-heap buffer.
+    /// Returns `None` if staging allocation fails.
     fn stage(
         self: &Arc<Self>,
         from: usize,
         to: usize,
         alloc: &mut impl FnMut(usize) -> Option<(ID3D12Resource, u64, *mut u8)>,
         out: &mut Vec<UploadCopy>,
-    ) -> usize {
+    ) -> Option<usize> {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         let len = to.saturating_sub(from);
         if len == 0 {
-            return 0;
+            return Some(0);
         }
-        let Some((src, src_offset, dst_ptr)) = alloc(len) else {
-            return 0;
-        };
+        let (src, src_offset, dst_ptr) = alloc(len)?;
         crate::host::copy_mapped(dst_ptr, from as *const u8, len, false);
         out.push(UploadCopy {
             shadow: self.clone(),
@@ -369,7 +461,7 @@ impl Shadow {
             dst_offset: (from - start) as u64,
             len: len as u64,
         });
-        len
+        Some(len)
     }
 }
 
@@ -557,6 +649,9 @@ mod tests {
             unregister(self.resource_id, self.addr());
             // SAFETY: frees the allocation obtained from VirtualAlloc.
             unsafe { VirtualFree(self.ptr.cast(), 0, MEM_RELEASE) };
+            // Clear watch journal entries for the freed virtual address range so
+            // subsequent tests that reuse the address start clean.
+            crate::watch::forget_pages(self.ptr as usize, self.ptr as usize + self.len);
         }
     }
 
@@ -799,5 +894,111 @@ mod tests {
         );
         assert_eq!(staged, PAGE);
         assert_eq!(uploads.len(), 1);
+    }
+
+    #[test]
+    fn failed_upload_alloc_leaves_pages_stale() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mut mem = WatchedAlloc::new(2 * PAGE, 0x5000_0003);
+        mem.bytes_mut().fill(0);
+        mem.bytes_mut()[0..4].copy_from_slice(&0xAAAA_BBBBu32.to_le_bytes());
+        mem.bytes_mut()[PAGE..PAGE + 4].copy_from_slice(&0xCCCC_DDDDu32.to_le_bytes());
+
+        let shadow = find(mem.addr(), (2 * PAGE) as u64).expect("default shadow");
+
+        // Simulate staging allocation failure: nothing is staged and `copied` stays 0.
+        let mut uploads = Vec::new();
+        let staged = shadow.update(mem.addr() as usize, 2 * PAGE, &mut |_| None, &mut uploads);
+        assert_eq!(staged, 0);
+        assert!(uploads.is_empty());
+        assert_eq!(
+            *shadow.copied.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![0, 0]
+        );
+
+        // Next submission with working allocation still stages both pages.
+        let staged = shadow.update(
+            mem.addr() as usize,
+            2 * PAGE,
+            &mut |n| {
+                let (b, p) = host.upload_buffer(n as u64)?;
+                Some((b, 0, p))
+            },
+            &mut uploads,
+        );
+        assert_eq!(staged, 2 * PAGE);
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].dst_offset, 0);
+        assert_eq!(uploads[0].len, (2 * PAGE) as u64);
+    }
+
+    #[test]
+    fn trim_overlapping_uploads_keeps_latest_bytes_disjoint() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mem_a = WatchedAlloc::new(PAGE, 0x5000_0004);
+        let mem_b = WatchedAlloc::new(PAGE, 0x5000_0005);
+        let shadow_a = find(mem_a.addr(), PAGE as u64).expect("shadow a");
+        let shadow_b = find(mem_b.addr(), PAGE as u64).expect("shadow b");
+        let (src0, _) = host.upload_buffer(256).expect("upload 0");
+        let (src1, _) = host.upload_buffer(256).expect("upload 1");
+        let (src2, _) = host.upload_buffer(256).expect("upload 2");
+
+        // Earlier upload [0..128) on shadow_a, then middle overwrite [32..96) on shadow_a,
+        // then full overwrite of [0..64) on shadow_a, plus independent [0..128) on shadow_b.
+        let mut uploads = vec![
+            UploadCopy {
+                shadow: shadow_a.clone(),
+                src: src0.clone(),
+                src_offset: 10,
+                dst_offset: 0,
+                len: 128,
+            },
+            UploadCopy {
+                shadow: shadow_b.clone(),
+                src: src0.clone(),
+                src_offset: 0,
+                dst_offset: 0,
+                len: 128,
+            },
+            UploadCopy {
+                shadow: shadow_a.clone(),
+                src: src1.clone(),
+                src_offset: 20,
+                dst_offset: 32,
+                len: 64,
+            },
+            UploadCopy {
+                shadow: shadow_a.clone(),
+                src: src2.clone(),
+                src_offset: 30,
+                dst_offset: 0,
+                len: 64,
+            },
+        ];
+
+        trim_overlapping_uploads(&mut uploads);
+
+        // shadow_a should have strictly disjoint ranges covering [0..128):
+        //   [96..128) from src0 (src_offset 10 + 96 = 106),
+        //   [64..96) from src1 (src_offset 20 + 32 = 52),
+        //   [0..64) from src2 (src_offset 30).
+        // shadow_b keeps its full [0..128) untouched.
+        let a_ranges: Vec<(u64, u64, u64)> = uploads
+            .iter()
+            .filter(|u| Arc::ptr_eq(&u.shadow, &shadow_a))
+            .map(|u| (u.dst_offset, u.len, u.src_offset))
+            .collect();
+        assert_eq!(a_ranges, vec![(96, 32, 106), (64, 32, 52), (0, 64, 30)]);
+
+        let b_ranges: Vec<(u64, u64, u64)> = uploads
+            .iter()
+            .filter(|u| Arc::ptr_eq(&u.shadow, &shadow_b))
+            .map(|u| (u.dst_offset, u.len, u.src_offset))
+            .collect();
+        assert_eq!(b_ranges, vec![(0, 128, 0)]);
     }
 }

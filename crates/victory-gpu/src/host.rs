@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -392,9 +392,8 @@ unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
 
-/// Pooled staging chunks (4 MiB each) reused across submissions for `Shadow`
-/// `UPLOAD` and `READBACK` transfers; oversized allocations live for one
-/// submission and are released on reset.
+/// Pooled staging chunks (4 MiB each) and size-class-matched oversized buffers
+/// reused across submissions for `Shadow` `UPLOAD` and `READBACK` transfers.
 #[derive(Clone, Copy)]
 enum StagingKind {
     Upload,
@@ -406,7 +405,9 @@ struct StagingArena {
     chunks: Vec<(ID3D12Resource, usize, u64)>,
     current: usize,
     used: u64,
-    transient: Vec<(ID3D12Resource, usize, u64)>,
+    /// Oversized (`> STAGING_CHUNK`) pooled staging buffers:
+    /// `(resource, mapped_ptr, capacity, in_use)`.
+    large: Vec<(ID3D12Resource, usize, u64, bool)>,
 }
 
 // SAFETY: pointers are persistent mappings of D3D12 upload/readback buffers
@@ -414,7 +415,8 @@ struct StagingArena {
 unsafe impl Send for StagingArena {}
 
 const STAGING_CHUNK: u64 = 4 << 20;
-const MAX_POOLED_STAGING_CHUNKS: usize = 4;
+const MAX_POOLED_STAGING_CHUNKS: usize = 8;
+const MAX_POOLED_LARGE_STAGING: usize = 4;
 
 impl StagingArena {
     fn alloc(
@@ -437,8 +439,21 @@ impl StagingArena {
             }
         };
         if alloc_len > STAGING_CHUNK {
-            let (buf, ptr) = make(alloc_len)?;
-            self.transient.push((buf.clone(), ptr as usize, alloc_len));
+            let max_cap = alloc_len.saturating_mul(2);
+            if let Some((idx, _)) = self
+                .large
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, _, cap, in_use))| !*in_use && *cap >= alloc_len && *cap <= max_cap)
+                .min_by_key(|(_, (_, _, cap, _))| *cap)
+            {
+                let (buf, ptr, _, in_use) = &mut self.large[idx];
+                *in_use = true;
+                return Some((buf.clone(), 0, *ptr as *mut u8));
+            }
+            let cap = alloc_len.next_multiple_of(STAGING_CHUNK);
+            let (buf, ptr) = make(cap)?;
+            self.large.push((buf.clone(), ptr as usize, cap, true));
             return Some((buf, 0, ptr));
         }
         if self.used + alloc_len > STAGING_CHUNK && self.current < self.chunks.len() {
@@ -458,8 +473,14 @@ impl StagingArena {
     fn reset(&mut self) {
         self.current = 0;
         self.used = 0;
-        self.transient.clear();
         self.chunks.truncate(MAX_POOLED_STAGING_CHUNKS);
+        for entry in &mut self.large {
+            entry.3 = false;
+        }
+        if self.large.len() > MAX_POOLED_LARGE_STAGING {
+            self.large.sort_by_key(|a| std::cmp::Reverse(a.2));
+            self.large.truncate(MAX_POOLED_LARGE_STAGING);
+        }
     }
 }
 
@@ -646,27 +667,37 @@ impl Host {
             crate::shadow::merge_ranges(&mut ranges);
             for (from, to) in ranges {
                 let len = to - from;
-                if let (
-                    Some((before_res, before_off, before_ptr)),
-                    Some((after_res, after_off, after_ptr)),
-                ) = (
-                    readback_arena.alloc(self, StagingKind::Readback, len),
-                    readback_arena.alloc(self, StagingKind::Readback, len),
-                ) {
-                    readback_plans.push(ReadbackPlan {
-                        shadow: shadow.clone(),
-                        from,
-                        len,
-                        before_res,
-                        before_off,
-                        before_ptr: before_ptr.cast_const(),
-                        after_res,
-                        after_off,
-                        after_ptr: after_ptr.cast_const(),
+                let (before_res, before_off, before_ptr) = readback_arena
+                    .alloc(self, StagingKind::Readback, len)
+                    .unwrap_or_else(|| {
+                        fail(format_args!(
+                            "shadow readback staging allocation failed ({len} bytes)"
+                        ))
                     });
-                }
+                let (after_res, after_off, after_ptr) = readback_arena
+                    .alloc(self, StagingKind::Readback, len)
+                    .unwrap_or_else(|| {
+                        fail(format_args!(
+                            "shadow readback staging allocation failed ({len} bytes)"
+                        ))
+                    });
+                readback_plans.push(ReadbackPlan {
+                    shadow: shadow.clone(),
+                    from,
+                    len,
+                    before_res,
+                    before_off,
+                    before_ptr: before_ptr.cast_const(),
+                    after_res,
+                    after_off,
+                    after_ptr: after_ptr.cast_const(),
+                });
             }
         }
+        // Trim or drop earlier uploads overwritten by later uploads to the same
+        // shadow buffer so every CopyBufferRegion in this prelude targets
+        // strictly disjoint destination bytes (last write wins).
+        crate::shadow::trim_overlapping_uploads(&mut batch.uploads);
         let upload_list: Option<ID3D12CommandList> =
             if !batch.uploads.is_empty() || !readback_plans.is_empty() {
                 let (alloc, list) = &self.shadow_upload_list;
@@ -777,9 +808,21 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        let status = WaitForSingleObject(self.event, INFINITE);
+                        if status != WAIT_OBJECT_0 {
+                            fail(format_args!(
+                                "host submission fence wait returned {:#x}{}{}",
+                                status.0,
+                                self.removal_data(runs),
+                                last_notes(runs)
+                            ));
+                        }
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => fail(format_args!(
+                        "host submission could not wait on fence ({e}){}{}",
+                        self.removal_data(runs),
+                        last_notes(runs)
+                    )),
                 }
             }
         };
@@ -2466,5 +2509,36 @@ mod batch {
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn staging_arena_reuses_oversized_buffers_across_submissions() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let mut arena = super::StagingArena::default();
+        let big = (super::STAGING_CHUNK as usize) + (1 << 20);
+        let (r1, off1, ptr1) = arena
+            .alloc(host, super::StagingKind::Readback, big)
+            .expect("first large readback");
+        let (r2, off2, ptr2) = arena
+            .alloc(host, super::StagingKind::Readback, big)
+            .expect("second large readback");
+        assert_eq!((off1, off2), (0, 0));
+        assert_ne!(ptr1, ptr2, "in-use large buffers must be distinct");
+        drop((r1, r2));
+
+        // After reset, the same two pooled large buffers are reused without reallocating.
+        arena.reset();
+        let (_, _, ptr1_next) = arena
+            .alloc(host, super::StagingKind::Readback, big)
+            .expect("reused first");
+        let (_, _, ptr2_next) = arena
+            .alloc(host, super::StagingKind::Readback, big)
+            .expect("reused second");
+        let first_pair = [ptr1 as usize, ptr2 as usize];
+        assert!(first_pair.contains(&(ptr1_next as usize)));
+        assert!(first_pair.contains(&(ptr2_next as usize)));
+        assert_ne!(ptr1_next, ptr2_next);
     }
 }
