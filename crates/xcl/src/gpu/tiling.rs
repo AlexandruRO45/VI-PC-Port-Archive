@@ -171,11 +171,13 @@ impl Layout {
     /// `offset` of element (x, y, z) of a thick block row (z < `block_d`; the caller places
     /// the z / `block_d` layers)
     pub fn offset_z(&self, x: usize, y: usize, z: usize, w: usize) -> usize {
-        let pitch_blocks = w.div_ceil(self.block_w);
+        let pitch_blocks = w.max(1).div_ceil(self.block_w);
         let block = (y / self.block_h) * pitch_blocks + x / self.block_w;
         let hi = |t: &[u32], c: usize, b: usize| t[(c / b) % t.len()];
+        let in_blk_mask = self.block_bytes - 1;
         let xor = self.ox[x % self.block_w] ^ self.oy[y % self.block_h] ^ self.oz[z % self.block_d] ^ hi(&self.hx, x, self.block_w) ^ hi(&self.hy, y, self.block_h) ^ hi(&self.hz, z, self.block_d);
-        block * self.block_bytes + (xor as usize ^ self.base_xor)
+        let base = if self.mode == 0 { 0 } else { self.base_xor & in_blk_mask };
+        block * self.block_bytes + ((xor as usize ^ base) & in_blk_mask)
     }
 
     /// tiled → linear rows (`w << elem_log2` bytes each); bytes past the end of `src` read as 0
@@ -202,7 +204,9 @@ impl Layout {
             for x in 0..w {
                 let o = self.offset(x, y, w);
                 let s = (y * w + x) * e;
-                out[o..o + e].copy_from_slice(&linear[s..s + e]);
+                if let (Some(d), Some(src)) = (out.get_mut(o..o + e), linear.get(s..s + e)) {
+                    d.copy_from_slice(src);
+                }
             }
         }
         out
@@ -230,7 +234,7 @@ pub fn element(format: u32) -> Option<(u32, u32)> {
 pub fn image_layout(t: &super::desc::Image, cfg: PipeConfig) -> Option<(Layout, usize, usize)> {
     let (e, side) = element(t.format)?;
     let mut l = Layout::new(t.swizzle_mode, e, cfg)?;
-    l.base_xor = (t.address as usize) & (l.block_bytes - 1);
+    l.base_xor = if t.swizzle_mode == 0 { 0 } else { (t.address as usize) & (l.block_bytes - 1) };
     Some((l, t.width.div_ceil(side) as usize, t.height.div_ceil(side) as usize))
 }
 
@@ -269,13 +273,15 @@ impl Chain {
     /// `width` × `height` pixels, `side` pixels per element side (4 for BCn), `mips` levels;
     /// a level is the pixel size halved, rounded up to whole elements (as D3D12 sizes it).
     pub fn new(layout: Layout, width: u32, height: u32, side: u32, mips: u32) -> Chain {
-        Self::new_3d(layout, width, height, 1, side, mips)
+        Self::new_3d(layout, width, height, 1, side.max(1), mips)
     }
 
     /// `new` for a 3D texture `depth` slices deep (levels halve the depth too); a thin layout
     /// (`block_d` 1) is 2D per depth slice.
     pub fn new_3d(layout: Layout, width: u32, height: u32, depth: u32, side: u32, mips: u32) -> Chain {
         let mips = mips.max(1) as usize;
+        let side = side.max(1);
+        let depth = depth.max(1);
         let (bw, bh) = (layout.block_w, layout.block_h);
         let thick = layout.block_d > 1;
         let blk = layout.block_bytes.trailing_zeros() as usize;
@@ -287,19 +293,20 @@ impl Chain {
         let depth_of = |i: usize| (depth >> i).max(1) as usize;
         // the largest level the tail holds (GetMipTailDim: a thick block halves h, w or d by
         // log2(block) % 3) and at most this many levels in it (GetMaxNumMipsInTail)
-        let (tw, th) = if !thick {
+        let (tw, th, td) = if !thick {
             // Z (depth) modes of 1- and 2-byte elements: 64 × 128 elements, as for 4-byte ones
             // (seen on the console's layout library)
-            if layout.mode != 0 && layout.mode.is_multiple_of(4) && layout.elem_log2 <= 1 {
+            let (w, h) = if layout.mode != 0 && layout.mode.is_multiple_of(4) && layout.elem_log2 <= 1 {
                 (bw / 4, bh >> (1 - layout.elem_log2))
             } else {
                 (bw / 2, bh)
-            }
+            };
+            (w, h, 1)
         } else {
             match blk % 3 {
-                0 => (bw, bh / 2),
-                1 => (bw / 2, bh),
-                _ => (bw, bh),
+                0 => (bw, bh / 2, layout.block_d),
+                1 => (bw / 2, bh, layout.block_d),
+                _ => (bw, bh, layout.block_d / 2),
             }
         };
         let eff = if thick { blk - (blk - 8) / 3 } else { blk };
@@ -312,7 +319,8 @@ impl Chain {
             (0..mips)
                 .find(|&i| {
                     let (w, h) = padded(i);
-                    w <= tw && h <= th && mips - i <= max_tail
+                    let d = if thick { (depth as usize).div_ceil(1 << i) } else { 1 };
+                    w <= tw && h <= th && d <= td && mips - i <= max_tail
                 })
                 .unwrap_or(mips)
         } else {
@@ -372,8 +380,9 @@ impl Chain {
             for y in 0..l.height {
                 for x in 0..l.width {
                     let o = self.element_at_z(&l, x, y, z);
-                    if let Some(s) = mem.get(o..o + e) {
-                        out[((z * l.height + y) * l.width + x) * e..][..e].copy_from_slice(s);
+                    let d = ((z * l.height + y) * l.width + x) * e;
+                    if let (Some(dst), Some(s)) = (out.get_mut(d..d + e), mem.get(o..o + e)) {
+                        dst.copy_from_slice(s);
                     }
                 }
             }
@@ -389,7 +398,10 @@ impl Chain {
             for y in 0..l.height {
                 for x in 0..l.width {
                     let o = self.element_at_z(&l, x, y, z);
-                    dst[o..o + e].copy_from_slice(&linear[((z * l.height + y) * l.width + x) * e..][..e]);
+                    let s = ((z * l.height + y) * l.width + x) * e;
+                    if let (Some(d), Some(src)) = (dst.get_mut(o..o + e), linear.get(s..s + e)) {
+                        d.copy_from_slice(src);
+                    }
                 }
             }
         }
@@ -420,20 +432,22 @@ impl Chain {
         // Element by element it was most of a retail game's render thread while it streamed
         // textures the CPU writes.
         let hi = |tab: &[u32], c: usize, b: usize| tab[(c / b) % tab.len()];
-        let pitch_blocks = l.pitch.div_ceil(t.block_w);
+        let pitch_blocks = l.pitch.max(1).div_ceil(t.block_w);
         let columns: Vec<(usize, u32)> = (0..l.width)
             .map(|x| {
                 let x = x + l.origin.0;
                 (x / t.block_w, t.ox[x % t.block_w] ^ hi(&t.hx, x, t.block_w))
             })
             .collect();
+        let in_blk_mask = t.block_bytes - 1;
+        let base = if t.mode == 0 { 0 } else { t.base_xor & in_blk_mask };
         let z = t.oz[slice % t.block_d] ^ hi(&t.hz, slice, t.block_d);
         for (y, row) in out.chunks_exact_mut(l.width * e).enumerate() {
             let y = y + l.origin.1;
             let row_blocks = (y / t.block_h) * pitch_blocks;
             let yz = t.oy[y % t.block_h] ^ hi(&t.hy, y, t.block_h) ^ z;
             for (&(block_x, x), dst) in columns.iter().zip(row.chunks_exact_mut(e)) {
-                let o = l.offset + (row_blocks + block_x) * t.block_bytes + ((x ^ yz) as usize ^ t.base_xor);
+                let o = l.offset + (row_blocks + block_x) * t.block_bytes + (((x ^ yz) as usize ^ base) & in_blk_mask);
                 if let Some(s) = src.get(o..o + e) {
                     dst.copy_from_slice(s);
                 }
@@ -449,7 +463,10 @@ impl Chain {
         for y in 0..l.height {
             for x in 0..l.width {
                 let o = self.element_at(&l, x, y, slice);
-                dst[o..o + e].copy_from_slice(&linear[(y * l.width + x) * e..][..e]);
+                let s = (y * l.width + x) * e;
+                if let (Some(d), Some(src)) = (dst.get_mut(o..o + e), linear.get(s..s + e)) {
+                    d.copy_from_slice(src);
+                }
             }
         }
     }
@@ -461,7 +478,7 @@ pub fn image_chain(t: &super::desc::Image, cfg: PipeConfig) -> Option<Chain> {
     let (e, side) = element(t.format)?;
     let d3 = matches!(t.ty, super::desc::ImageType::D3);
     let mut l = if d3 { Layout::new_3d(t.swizzle_mode, e, cfg)? } else { Layout::new(t.swizzle_mode, e, cfg)? };
-    l.base_xor = (t.address as usize) & (l.block_bytes - 1);
+    l.base_xor = if t.swizzle_mode == 0 { 0 } else { (t.address as usize) & (l.block_bytes - 1) };
     let depth = if d3 { t.depth.max(1) } else { 1 };
     Some(Chain::new_3d(l, t.width, t.height, depth, side, t.max_mip + 1))
 }
@@ -811,6 +828,134 @@ mod tests {
                 .collect();
             assert_eq!(got, want, "mode {mode}, {} B elements", 1 << e);
         }
+    }
+
+    /// Non-power-of-two (NPOT) BCn compressed mip chains: odd dimensions (137×93 and 17×17)
+    /// round-trip correctly and do not overlap across mip levels.
+    #[test]
+    fn npot_bcn_mip_chains_round_trip() {
+        let cfg = PipeConfig { pipes_log2: 0, pkrs_log2: 0 };
+        // (mode, format, width, height, mips)
+        for (mode, format, w, h, mips) in [
+            (5u32, 170u32, 137u32, 93u32, 6u32), // BC1 8 B/block, 4 KB tile
+            (10, 181, 137, 93, 7),               // BC7 16 B/block, 64 KB tile
+            (5, 181, 17, 17, 4),                 // BC7 small odd size
+            (10, 170, 33, 45, 5),                // BC1 rectangular odd
+        ] {
+            let (e, side) = element(format).unwrap();
+            let l = Layout::new(mode, e, cfg).unwrap();
+            let c = Chain::new(l, w, h, side, mips);
+            let mut slice = vec![0u8; c.slice_bytes];
+            let mut want = Vec::new();
+            let mut n = 1234u32;
+            for (i, lvl) in c.levels.iter().enumerate() {
+                let lin: Vec<u8> = (0..lvl.width * lvl.height << e)
+                    .map(|_| {
+                        n = n.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                        (n >> 16) as u8 | 1
+                    })
+                    .collect();
+                c.tile_level(&mut slice, i, 0, &lin);
+                want.push(lin);
+            }
+            for (i, lin) in want.iter().enumerate() {
+                assert_eq!(&c.detile_level(&slice, i, 0), lin, "NPOT BCn format {format} mode {mode} level {i} mismatch");
+            }
+        }
+    }
+
+    /// 3D thick textures with depth > tail depth (td): levels with depth exceeding td must
+    /// remain in the main chain and not be incorrectly classified into the mip tail.
+    #[test]
+    fn thick_3d_tail_depth_bounds() {
+        let cfg = PipeConfig { pipes_log2: 0, pkrs_log2: 0 };
+        // Mode 5 (4KB_S thick, e=2 -> 8x16x8 block, blk=12 -> td=8)
+        let l = Layout::new_3d(5, 2, cfg).unwrap();
+        assert_eq!((l.block_w, l.block_h, l.block_d), (8, 16, 8));
+        // Deep 3D texture: small w/h (8x8) but depth 64 with 6 mips.
+        // Mip 0 (8x8x64) and Mip 1 (4x4x32) and Mip 2 (2x2x16) have depth > 8, so they cannot be in tail.
+        let c = Chain::new_3d(l.clone(), 8, 8, 64, 1, 6);
+        assert!(c.levels[0].tail.is_none(), "mip 0 with depth 64 must not be in tail");
+        assert!(c.levels[1].tail.is_none(), "mip 1 with depth 32 must not be in tail");
+        assert!(c.levels[2].tail.is_none(), "mip 2 with depth 16 must not be in tail");
+        // All tail levels must satisfy depth <= block_d
+        for (i, lvl) in c.levels.iter().enumerate() {
+            if lvl.tail.is_some() {
+                assert!(lvl.depth <= l.block_d, "tail level {i} depth {} exceeds block_d {}", lvl.depth, l.block_d);
+            }
+        }
+        // Round-trip test to verify levels do not collide
+        let mut mem = vec![0u8; c.slice_bytes * c.layers()];
+        let mut want = Vec::new();
+        let mut n = 54321u32;
+        for (i, lvl) in c.levels.iter().enumerate() {
+            let lin: Vec<u8> = (0..(lvl.width * lvl.height * lvl.depth) << 2)
+                .map(|_| {
+                    n = n.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    (n >> 16) as u8 | 1
+                })
+                .collect();
+            c.tile_volume(&mut mem, i, &lin);
+            want.push(lin);
+        }
+        for (i, lin) in want.iter().enumerate() {
+            assert_eq!(&c.detile_volume(&mem, i), lin, "deep 3D level {i} overwritten");
+        }
+    }
+
+    /// Linear mode ignores base address swizzle and preserves element alignment.
+    #[test]
+    fn linear_mode_ignores_unaligned_base_xor() {
+        let t = crate::gpu::desc::Image {
+            address: 0x1_2345_0000 | 0x7F, // unaligned low bits in address
+            format: 28,                    // RGBA8 (4 B/elem)
+            width: 100,
+            height: 30,
+            depth: 1,
+            ty: crate::gpu::desc::ImageType::D2,
+            base_level: 0,
+            last_level: 0,
+            max_mip: 0,
+            base_array: 0,
+            dst_sel: [4, 5, 6, 7],
+            swizzle_mode: 0,               // linear
+            min_lod: 0.0,
+        };
+        let (l, w, h) = image_layout(&t, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap();
+        assert_eq!(l.base_xor, 0, "linear layout base_xor must be 0");
+        assert_eq!((w, h), (100, 30));
+        let c = image_chain(&t, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap();
+        assert_eq!(c.layout.base_xor, 0, "linear chain base_xor must be 0");
+        // Detiling a row must be contiguous (stride of 128 elements = 512 bytes)
+        assert_eq!(l.offset(0, 0, 100), 0);
+        assert_eq!(l.offset(1, 0, 100), 4);
+        assert_eq!(l.offset(0, 1, 100), 512);
+    }
+
+    /// `offset_z` with zero width does not divide by zero and preserves non-zero row offsets.
+    #[test]
+    fn offset_z_zero_width_preserves_row_pitch() {
+        let l = Layout::new(1, 0, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap();
+        assert_eq!(l.offset_z(0, 0, 0, 0), 0);
+        // Row 1 with w=0 should not collapse to 0
+        assert_eq!(l.offset_z(0, 16, 0, 0), 256);
+    }
+
+    /// Short input buffers for tile, tile_level, and tile_volume are handled safely without panic.
+    #[test]
+    fn short_buffer_bounds_safety() {
+        let l = Layout::new(5, 2, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap();
+        let short_buf = vec![0xABu8; 16]; // much shorter than 64*64*4
+        let tiled = l.tile(&short_buf, 64, 64);
+        assert_eq!(tiled.len(), l.size(64, 64));
+        // Check partial copy succeeded without panic
+        assert_eq!(&tiled[..4], &short_buf[..4]);
+
+        let c = Chain::new(l, 32, 32, 1, 2);
+        let mut slice = vec![0u8; c.slice_bytes];
+        c.tile_level(&mut slice, 0, 0, &short_buf);
+        let detiled = c.detile_level(&slice, 0, 0);
+        assert_eq!(detiled.len(), 32 * 32 * 4);
     }
 }
 
