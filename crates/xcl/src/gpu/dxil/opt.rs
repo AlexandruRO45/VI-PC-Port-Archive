@@ -2,7 +2,9 @@
 //!
 //! Runs after IR construction and before metadata/bitcode serialization:
 //! 1. Fixpoint loop over CFG simplification & RPO normalization, trivial/duplicate
-//!    PHI elimination, and iterative mark-and-sweep DCE.
+//!    PHI elimination, constant folding & algebraic/bitcast/select simplification,
+//!    dominator-scoped CSE (excluding implicit derivatives and non-pure intrinsics),
+//!    and iterative mark-and-sweep DCE.
 //! 2. Dense compaction of live instructions, constants, declarations, and globals.
 //! 3. Synchronization of [`Shader::features`] with the remaining live IR.
 //!
@@ -10,7 +12,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use super::module::{BinOp, Block, ConstDef, FnAttrs, MdDef, Module, Op, Ty, Value};
+use super::module::{BinOp, Block, CastOp, ConstDef, FnAttrs, MdDef, Module, Op, Pred, Ty, Value};
 use super::shader::{kind, Feature, Shader};
 
 const MAX_ROUNDS: usize = 8;
@@ -73,6 +75,8 @@ fn optimize_core(m: &mut Module) {
         let mut changed = false;
         changed |= simplify_cfg(m);
         changed |= simplify_phis(m);
+        changed |= simplify_insts(m);
+        changed |= cse(m);
         changed |= dce(m);
         if !changed {
             break;
@@ -98,6 +102,16 @@ fn mask_for(w: u32) -> u64 {
     }
 }
 
+fn sext_i64(v: u64, w: u32) -> i64 {
+    if w >= 64 {
+        v as i64
+    } else if w == 0 {
+        0
+    } else {
+        ((v << (64 - w)) as i64) >> (64 - w)
+    }
+}
+
 fn const_int_u64(m: &Module, v: Value) -> Option<u64> {
     match v {
         Value::Const(c) => match &m.consts[c as usize] {
@@ -108,6 +122,70 @@ fn const_int_u64(m: &Module, v: Value) -> Option<u64> {
             ConstDef::Null(t) if m.int_width(*t).is_some() => Some(0),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn scalar_bits(m: &Module, ty: Ty) -> Option<u32> {
+    if let Some(w) = m.int_width(ty) {
+        return Some(w);
+    }
+    if m.is_float(ty) {
+        return match m.alloc_size_layout(ty, true) {
+            2 => Some(16),
+            4 => Some(32),
+            8 => Some(64),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn const_bitcast(m: &mut Module, v: Value, dst: Ty) -> Option<Value> {
+    if m.value_ty(v) == dst {
+        return Some(v);
+    }
+    let Value::Const(c) = v else { return None };
+    let dst_bits = scalar_bits(m, dst)?;
+    let def = m.consts[c as usize].clone();
+    match def {
+        ConstDef::Undef(t) => (scalar_bits(m, t) == Some(dst_bits)).then(|| m.undef(dst)),
+        ConstDef::Null(t) if scalar_bits(m, t) == Some(dst_bits) => {
+            if m.int_width(dst).is_some() {
+                Some(m.const_int(dst, 0))
+            } else if m.is_float(dst) {
+                Some(m.const_float(dst, 0))
+            } else {
+                None
+            }
+        }
+        ConstDef::Int(t, x) => {
+            let w = m.int_width(t)?;
+            if w != dst_bits {
+                return None;
+            }
+            let raw = (x as u64) & mask_for(w);
+            if m.int_width(dst).is_some() {
+                Some(m.const_int(dst, raw))
+            } else if m.is_float(dst) {
+                Some(m.const_float(dst, raw))
+            } else {
+                None
+            }
+        }
+        ConstDef::Float(t, bits) => {
+            let w = scalar_bits(m, t)?;
+            if w != dst_bits {
+                return None;
+            }
+            if m.int_width(dst).is_some() {
+                Some(m.const_int(dst, bits))
+            } else if m.is_float(dst) {
+                Some(m.const_float(dst, bits))
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -258,6 +336,60 @@ fn block_succs(m: &Module, b: usize) -> Vec<usize> {
     }
 }
 
+fn invert_pred(p: Pred) -> Pred {
+    match p {
+        Pred::Eq => Pred::Ne,
+        Pred::Ne => Pred::Eq,
+        Pred::UGt => Pred::ULe,
+        Pred::UGe => Pred::ULt,
+        Pred::ULt => Pred::UGe,
+        Pred::ULe => Pred::UGt,
+        Pred::SGt => Pred::SLe,
+        Pred::SGe => Pred::SLt,
+        Pred::SLt => Pred::SGe,
+        Pred::SLe => Pred::SGt,
+        Pred::FFalse => Pred::FTrue,
+        Pred::FTrue => Pred::FFalse,
+        Pred::FOEq => Pred::FUNe,
+        Pred::FUNe => Pred::FOEq,
+        Pred::FOGt => Pred::FULe,
+        Pred::FULe => Pred::FOGt,
+        Pred::FOGe => Pred::FULt,
+        Pred::FULt => Pred::FOGe,
+        Pred::FOLt => Pred::FUGe,
+        Pred::FUGe => Pred::FOLt,
+        Pred::FOLe => Pred::FUGt,
+        Pred::FUGt => Pred::FOLe,
+        Pred::FONe => Pred::FUEq,
+        Pred::FUEq => Pred::FONe,
+        Pred::FOrd => Pred::FUno,
+        Pred::FUno => Pred::FOrd,
+    }
+}
+
+fn swap_pred(p: Pred) -> Pred {
+    match p {
+        Pred::UGt => Pred::ULt,
+        Pred::ULt => Pred::UGt,
+        Pred::UGe => Pred::ULe,
+        Pred::ULe => Pred::UGe,
+        Pred::SGt => Pred::SLt,
+        Pred::SLt => Pred::SGt,
+        Pred::SGe => Pred::SLe,
+        Pred::SLe => Pred::SGe,
+        Pred::FOGt => Pred::FOLt,
+        Pred::FOLt => Pred::FOGt,
+        Pred::FOGe => Pred::FOLe,
+        Pred::FOLe => Pred::FOGe,
+        Pred::FUGt => Pred::FULt,
+        Pred::FULt => Pred::FUGt,
+        Pred::FUGe => Pred::FULe,
+        Pred::FULe => Pred::FUGe,
+        other => other,
+    }
+}
+
+/// If `v` computes logical NOT (`xor i1 x, true`) returns `Some(x)`.
 fn match_not_i1(m: &Module, v: Value) -> Option<Value> {
     let Value::Inst(id) = v else { return None };
     if m.int_width(m.insts[id as usize].ty) != Some(1) {
@@ -865,6 +997,853 @@ pub(super) fn simplify_phis(m: &mut Module) -> bool {
     any_changed
 }
 
+// --------------------------------------------------- InstCombine & Folding
+
+fn eval_int_binop(op: BinOp, w: u32, ua: u64, ub: u64) -> Option<u64> {
+    let mask = mask_for(w);
+    let ua = ua & mask;
+    let ub = ub & mask;
+    let r = match op {
+        BinOp::Add => ua.wrapping_add(ub),
+        BinOp::Sub => ua.wrapping_sub(ub),
+        BinOp::Mul => ua.wrapping_mul(ub),
+        BinOp::And => ua & ub,
+        BinOp::Or => ua | ub,
+        BinOp::Xor => ua ^ ub,
+        BinOp::UDiv => {
+            if ub == 0 {
+                return None;
+            }
+            ua / ub
+        }
+        BinOp::URem => {
+            if ub == 0 {
+                return None;
+            }
+            ua % ub
+        }
+        BinOp::SDiv => {
+            let (sa, sb) = (sext_i64(ua, w), sext_i64(ub, w));
+            let smin = sext_i64(1u64 << (w - 1), w);
+            if sb == 0 || (sb == -1 && sa == smin) {
+                return None;
+            }
+            (sa / sb) as u64
+        }
+        BinOp::SRem => {
+            let (sa, sb) = (sext_i64(ua, w), sext_i64(ub, w));
+            let smin = sext_i64(1u64 << (w - 1), w);
+            if sb == 0 || (sb == -1 && sa == smin) {
+                return None;
+            }
+            (sa % sb) as u64
+        }
+        BinOp::Shl => {
+            if ub >= w as u64 {
+                return None;
+            }
+            ua.wrapping_shl(ub as u32)
+        }
+        BinOp::LShr => {
+            if ub >= w as u64 {
+                return None;
+            }
+            ua >> (ub as u32)
+        }
+        BinOp::AShr => {
+            if ub >= w as u64 {
+                return None;
+            }
+            (sext_i64(ua, w) >> (ub as u32)) as u64
+        }
+    };
+    Some(r & mask)
+}
+
+fn eval_icmp(p: Pred, w: u32, ua: u64, ub: u64) -> Option<bool> {
+    let mask = mask_for(w);
+    let ua = ua & mask;
+    let ub = ub & mask;
+    let (sa, sb) = (sext_i64(ua, w), sext_i64(ub, w));
+    Some(match p {
+        Pred::Eq => ua == ub,
+        Pred::Ne => ua != ub,
+        Pred::UGt => ua > ub,
+        Pred::UGe => ua >= ub,
+        Pred::ULt => ua < ub,
+        Pred::ULe => ua <= ub,
+        Pred::SGt => sa > sb,
+        Pred::SGe => sa >= sb,
+        Pred::SLt => sa < sb,
+        Pred::SLe => sa <= sb,
+        _ => return None,
+    })
+}
+
+fn make_not_op(m: &mut Module, x: Value) -> Op {
+    if let Value::Inst(xi) = x {
+        if let Op::Cmp(p, a, b) = m.insts[xi as usize].op {
+            return Op::Cmp(invert_pred(p), a, b);
+        }
+    }
+    let t = m.i1c(true);
+    Op::Bin(BinOp::Xor, x, t, 0)
+}
+
+fn unwrap_bitcast_src(m: &mut Module, v: Value, dst: Ty) -> Option<Value> {
+    if m.value_ty(v) == dst {
+        return Some(v);
+    }
+    if let Some(c) = const_bitcast(m, v, dst) {
+        return Some(c);
+    }
+    if let Value::Inst(id) = v {
+        if let Op::Cast(CastOp::BitCast, inner, _) = m.insts[id as usize].op {
+            if m.value_ty(inner) == dst {
+                return Some(inner);
+            }
+        }
+    }
+    None
+}
+
+fn simplify_int_bin(m: &mut Module, id: u32, ty: Ty, w: u32) -> Result<Value, Option<Op>> {
+    let Op::Bin(op, mut a, mut b, _flags) = m.insts[id as usize].op else {
+        return Err(None);
+    };
+    if matches!(op, BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor)
+        && const_int_u64(m, a).is_some()
+        && const_int_u64(m, b).is_none()
+    {
+        std::mem::swap(&mut a, &mut b);
+        return simplify_rewritten_bin(m, ty, w, op, a, b, true);
+    }
+    simplify_rewritten_bin(m, ty, w, op, a, b, false)
+}
+
+fn simplify_rewritten_bin(
+    m: &mut Module, ty: Ty, w: u32, op: BinOp, a: Value, b: Value, swapped: bool,
+) -> Result<Value, Option<Op>> {
+    let mask = mask_for(w);
+    let ca = const_int_u64(m, a);
+    let cb = const_int_u64(m, b);
+    if let (Some(ua), Some(ub)) = (ca, cb) {
+        if let Some(r) = eval_int_binop(op, w, ua, ub) {
+            return Ok(m.const_int(ty, r));
+        }
+    }
+
+    // Reassociate `(inner_op x, c1) outer_op c2` when `b = c2`.
+    if let (Value::Inst(ai), Some(c2)) = (a, cb) {
+        if let Op::Bin(op1, x, c1_val, _) = m.insts[ai as usize].op {
+            if let Some(c1) = const_int_u64(m, c1_val) {
+                let reassociated: Option<(BinOp, u64)> = match (op1, op) {
+                    (BinOp::Add, BinOp::Add) => Some((BinOp::Add, c1.wrapping_add(c2) & mask)),
+                    (BinOp::Sub, BinOp::Add) => Some((BinOp::Add, c2.wrapping_sub(c1) & mask)),
+                    (BinOp::Add, BinOp::Sub) => Some((BinOp::Add, c1.wrapping_sub(c2) & mask)),
+                    (BinOp::Sub, BinOp::Sub) => Some((BinOp::Add, 0u64.wrapping_sub(c1.wrapping_add(c2)) & mask)),
+                    (BinOp::Mul, BinOp::Mul) => Some((BinOp::Mul, c1.wrapping_mul(c2) & mask)),
+                    (BinOp::And, BinOp::And) => Some((BinOp::And, c1 & c2)),
+                    (BinOp::Or, BinOp::Or) => Some((BinOp::Or, c1 | c2)),
+                    (BinOp::Xor, BinOp::Xor) => Some((BinOp::Xor, c1 ^ c2)),
+                    (BinOp::Shl, BinOp::Shl)
+                    | (BinOp::LShr, BinOp::LShr)
+                    | (BinOp::AShr, BinOp::AShr)
+                        if (c1 as u128 + c2 as u128) < w as u128 =>
+                    {
+                        Some((op, c1 + c2))
+                    }
+                    _ => None,
+                };
+                if let Some((new_op, nc)) = reassociated {
+                    let nc_val = m.const_int(ty, nc);
+                    // Apply immediate identity check (e.g. `(x ^ c) ^ c -> x`).
+                    if let Ok(folded) = simplify_rewritten_bin(m, ty, w, new_op, x, nc_val, true) {
+                        return Ok(folded);
+                    }
+                    return Err(Some(Op::Bin(new_op, x, nc_val, 0)));
+                }
+            }
+        }
+    }
+
+    match op {
+        BinOp::Add => {
+            if cb == Some(0) {
+                return Ok(a);
+            }
+            if a == b && w == 1 {
+                return Ok(m.const_int(ty, 0));
+            }
+        }
+        BinOp::Sub => {
+            if cb == Some(0) {
+                return Ok(a);
+            }
+            if a == b {
+                return Ok(m.const_int(ty, 0));
+            }
+            if ca == Some(0) && w == 1 {
+                return Ok(b);
+            }
+            if let Some(c) = cb {
+                let neg = (0u64.wrapping_sub(c)) & mask;
+                let neg_val = m.const_int(ty, neg);
+                return Err(Some(Op::Bin(BinOp::Add, a, neg_val, 0)));
+            }
+        }
+        BinOp::Mul => {
+            if cb == Some(0) {
+                return Ok(m.const_int(ty, 0));
+            }
+            if cb == Some(1) {
+                return Ok(a);
+            }
+            if a == b && w == 1 {
+                return Ok(a);
+            }
+        }
+        BinOp::UDiv | BinOp::SDiv => {
+            if cb == Some(1) {
+                return Ok(a);
+            }
+        }
+        BinOp::URem | BinOp::SRem => {
+            if cb == Some(1) {
+                return Ok(m.const_int(ty, 0));
+            }
+        }
+        BinOp::Shl | BinOp::LShr | BinOp::AShr => {
+            if cb == Some(0) {
+                return Ok(a);
+            }
+        }
+        BinOp::And => {
+            if cb == Some(0) {
+                return Ok(m.const_int(ty, 0));
+            }
+            if cb == Some(mask) || a == b {
+                return Ok(a);
+            }
+            // `x & ~x == 0`
+            let is_comp = |lhs: Value, rhs: Value| -> bool {
+                let Value::Inst(ri) = rhs else { return false };
+                if let Op::Bin(BinOp::Xor, x, y, _) = m.insts[ri as usize].op {
+                    (x == lhs && const_int_u64(m, y) == Some(mask))
+                        || (y == lhs && const_int_u64(m, x) == Some(mask))
+                } else {
+                    false
+                }
+            };
+            if is_comp(a, b) || is_comp(b, a) {
+                return Ok(m.const_int(ty, 0));
+            }
+        }
+        BinOp::Or => {
+            if cb == Some(0) || a == b {
+                return Ok(a);
+            }
+            if cb == Some(mask) {
+                return Ok(m.const_int(ty, mask));
+            }
+            let is_comp = |lhs: Value, rhs: Value| -> bool {
+                let Value::Inst(ri) = rhs else { return false };
+                if let Op::Bin(BinOp::Xor, x, y, _) = m.insts[ri as usize].op {
+                    (x == lhs && const_int_u64(m, y) == Some(mask))
+                        || (y == lhs && const_int_u64(m, x) == Some(mask))
+                } else {
+                    false
+                }
+            };
+            if is_comp(a, b) || is_comp(b, a) {
+                return Ok(m.const_int(ty, mask));
+            }
+        }
+        BinOp::Xor => {
+            if cb == Some(0) {
+                return Ok(a);
+            }
+            if a == b {
+                return Ok(m.const_int(ty, 0));
+            }
+            // `(x ^ y) ^ y -> x`
+            if let Value::Inst(ai) = a {
+                if let Op::Bin(BinOp::Xor, u, v, _) = m.insts[ai as usize].op {
+                    if v == b {
+                        return Ok(u);
+                    }
+                    if u == b {
+                        return Ok(v);
+                    }
+                }
+            }
+            if let Value::Inst(bi) = b {
+                if let Op::Bin(BinOp::Xor, u, v, _) = m.insts[bi as usize].op {
+                    if v == a {
+                        return Ok(u);
+                    }
+                    if u == a {
+                        return Ok(v);
+                    }
+                }
+            }
+            // `xor(cmp(p, u, v), true) -> cmp(invert(p), u, v)`
+            if cb == Some(1) && w == 1 {
+                if let Value::Inst(ai) = a {
+                    if let Op::Cmp(p, u, v) = m.insts[ai as usize].op {
+                        return Err(Some(Op::Cmp(invert_pred(p), u, v)));
+                    }
+                }
+            }
+        }
+    }
+
+    if swapped {
+        Err(Some(Op::Bin(op, a, b, 0)))
+    } else {
+        Err(None)
+    }
+}
+
+fn simplify_cast(m: &mut Module, id: u32) -> Result<Value, Option<Op>> {
+    let Op::Cast(op, v, dst) = m.insts[id as usize].op else {
+        return Err(None);
+    };
+    let src = m.value_ty(v);
+    if src == dst && matches!(op, CastOp::Trunc | CastOp::ZExt | CastOp::SExt | CastOp::FPTrunc | CastOp::FPExt | CastOp::BitCast) {
+        return Ok(v);
+    }
+
+    match op {
+        CastOp::Trunc | CastOp::ZExt => {
+            if let (Some(uv), Some(_)) = (const_int_u64(m, v), m.int_width(dst)) {
+                return Ok(m.const_int(dst, uv));
+            }
+        }
+        CastOp::SExt => {
+            if let (Some(uv), Some(sw), Some(_)) = (const_int_u64(m, v), m.int_width(src), m.int_width(dst)) {
+                let sv = sext_i64(uv, sw);
+                return Ok(m.const_int(dst, sv as u64));
+            }
+        }
+        CastOp::BitCast => {
+            if let Some(c) = const_bitcast(m, v, dst) {
+                return Ok(c);
+            }
+        }
+        _ => {}
+    }
+
+    if let Value::Inst(vi) = v {
+        match (op, m.insts[vi as usize].op.clone()) {
+            (CastOp::Trunc, Op::Cast(CastOp::Trunc, x, _)) => return Err(Some(Op::Cast(CastOp::Trunc, x, dst))),
+            (CastOp::ZExt, Op::Cast(CastOp::ZExt, x, _)) => return Err(Some(Op::Cast(CastOp::ZExt, x, dst))),
+            (CastOp::SExt, Op::Cast(CastOp::SExt, x, _)) => return Err(Some(Op::Cast(CastOp::SExt, x, dst))),
+            (CastOp::SExt, Op::Cast(CastOp::ZExt, x, _)) => {
+                if let (Some(wx), Some(wsrc)) = (m.int_width(m.value_ty(x)), m.int_width(src)) {
+                    if wx < wsrc {
+                        return Err(Some(Op::Cast(CastOp::ZExt, x, dst)));
+                    }
+                }
+            }
+            (CastOp::Trunc, Op::Cast(CastOp::ZExt, x, _)) => {
+                if let (Some(wx), Some(wd)) = (m.int_width(m.value_ty(x)), m.int_width(dst)) {
+                    if wx == wd {
+                        return Ok(x);
+                    } else if wx > wd {
+                        return Err(Some(Op::Cast(CastOp::Trunc, x, dst)));
+                    } else {
+                        return Err(Some(Op::Cast(CastOp::ZExt, x, dst)));
+                    }
+                }
+            }
+            (CastOp::Trunc, Op::Cast(CastOp::SExt, x, _)) => {
+                if let (Some(wx), Some(wd)) = (m.int_width(m.value_ty(x)), m.int_width(dst)) {
+                    if wx == wd {
+                        return Ok(x);
+                    } else if wx > wd {
+                        return Err(Some(Op::Cast(CastOp::Trunc, x, dst)));
+                    } else {
+                        return Err(Some(Op::Cast(CastOp::SExt, x, dst)));
+                    }
+                }
+            }
+            (CastOp::BitCast, Op::Cast(CastOp::BitCast, x, _)) => {
+                let xt = m.value_ty(x);
+                if xt == dst {
+                    return Ok(x);
+                }
+                if scalar_bits(m, xt).is_some() && scalar_bits(m, xt) == scalar_bits(m, dst) {
+                    return Err(Some(Op::Cast(CastOp::BitCast, x, dst)));
+                }
+            }
+            (CastOp::BitCast, Op::Select(c, a, b)) => {
+                if scalar_bits(m, src).is_some() && scalar_bits(m, src) == scalar_bits(m, dst) {
+                    if let (Some(ua), Some(ub)) = (unwrap_bitcast_src(m, a, dst), unwrap_bitcast_src(m, b, dst)) {
+                        if ua == ub {
+                            return Ok(ua);
+                        }
+                        return Err(Some(Op::Select(c, ua, ub)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Err(None)
+}
+
+fn simplify_cmp(m: &mut Module, id: u32) -> Result<Value, Option<Op>> {
+    let Op::Cmp(mut p, mut a, mut b) = m.insts[id as usize].op else {
+        return Err(None);
+    };
+    let ty = m.value_ty(a);
+    let Some(w) = m.int_width(ty) else {
+        return Err(None);
+    };
+    let mut swapped = false;
+    if const_int_u64(m, a).is_some() && const_int_u64(m, b).is_none() {
+        std::mem::swap(&mut a, &mut b);
+        p = swap_pred(p);
+        swapped = true;
+    }
+
+    if let (Some(ua), Some(ub)) = (const_int_u64(m, a), const_int_u64(m, b)) {
+        if let Some(res) = eval_icmp(p, w, ua, ub) {
+            return Ok(m.i1c(res));
+        }
+    }
+    if a == b {
+        if let Some(res) = eval_icmp(p, w, 0, 0) {
+            return Ok(m.i1c(res));
+        }
+    }
+
+    let mask = mask_for(w);
+    if let Some(cb) = const_int_u64(m, b) {
+        if cb == 0 && p == Pred::ULt {
+            return Ok(m.i1c(false));
+        }
+        if cb == 0 && p == Pred::UGe {
+            return Ok(m.i1c(true));
+        }
+        if cb == mask && p == Pred::UGt {
+            return Ok(m.i1c(false));
+        }
+        if cb == mask && p == Pred::ULe {
+            return Ok(m.i1c(true));
+        }
+        if cb == 0 && p == Pred::ULe {
+            return Err(Some(Op::Cmp(Pred::Eq, a, b)));
+        }
+        if cb == 0 && p == Pred::UGt {
+            return Err(Some(Op::Cmp(Pred::Ne, a, b)));
+        }
+        if cb == mask && p == Pred::UGe {
+            return Err(Some(Op::Cmp(Pred::Eq, a, b)));
+        }
+        if cb == mask && p == Pred::ULt {
+            return Err(Some(Op::Cmp(Pred::Ne, a, b)));
+        }
+
+        if w == 1 {
+            return match (p, cb) {
+                (Pred::Eq, 1) | (Pred::Ne, 0) => Ok(a),
+                (Pred::Eq, 0) | (Pred::Ne, 1) => Err(Some(make_not_op(m, a))),
+                _ => {
+                    if swapped {
+                        Err(Some(Op::Cmp(p, a, b)))
+                    } else {
+                        Err(None)
+                    }
+                }
+            };
+        }
+
+        // Collapse `(zext i1 x) cmp k` and `(sext i1 x) cmp k` (`set_scc` / `scc_bit` idioms)
+        // and `select(c, const, const) cmp k`.
+        if let Value::Inst(ai) = a {
+            match m.insts[ai as usize].op {
+                Op::Cast(CastOp::ZExt, inner, _) if m.int_width(m.value_ty(inner)) == Some(1) => {
+                    if let (Some(f0), Some(f1)) = (eval_icmp(p, w, 0, cb), eval_icmp(p, w, 1, cb)) {
+                        if f0 == f1 {
+                            return Ok(m.i1c(f0));
+                        }
+                        return if f1 { Ok(inner) } else { Err(Some(make_not_op(m, inner))) };
+                    }
+                }
+                Op::Cast(CastOp::SExt, inner, _) if m.int_width(m.value_ty(inner)) == Some(1) => {
+                    if let (Some(f0), Some(f1)) = (eval_icmp(p, w, 0, cb), eval_icmp(p, w, mask, cb)) {
+                        if f0 == f1 {
+                            return Ok(m.i1c(f0));
+                        }
+                        return if f1 { Ok(inner) } else { Err(Some(make_not_op(m, inner))) };
+                    }
+                }
+                Op::Select(cond, tc, fc) => {
+                    if let (Some(ct), Some(cf)) = (const_int_u64(m, tc), const_int_u64(m, fc)) {
+                        if let (Some(bt), Some(bf)) = (eval_icmp(p, w, ct, cb), eval_icmp(p, w, cf, cb)) {
+                            if bt == bf {
+                                return Ok(m.i1c(bt));
+                            }
+                            return if bt { Ok(cond) } else { Err(Some(make_not_op(m, cond))) };
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if swapped {
+        Err(Some(Op::Cmp(p, a, b)))
+    } else {
+        Err(None)
+    }
+}
+
+fn simplify_select(m: &mut Module, id: u32) -> Result<Value, Option<Op>> {
+    let Op::Select(c, mut t, mut f) = m.insts[id as usize].op else {
+        return Err(None);
+    };
+    if let Some(cv) = const_int_u64(m, c) {
+        return Ok(if cv & 1 != 0 { t } else { f });
+    }
+    if t == f {
+        return Ok(t);
+    }
+    if let Some(inner) = match_not_i1(m, c) {
+        return Err(Some(Op::Select(inner, f, t)));
+    }
+
+    let ty = m.insts[id as usize].ty;
+    if m.int_width(ty) == Some(1) {
+        let ct = const_int_u64(m, t);
+        let cf = const_int_u64(m, f);
+        if ct == Some(1) && cf == Some(0) {
+            return Ok(c);
+        }
+        if ct == Some(0) && cf == Some(1) {
+            return Err(Some(make_not_op(m, c)));
+        }
+        if (t == c && cf == Some(0)) || (ct == Some(1) && f == c) {
+            return Ok(c);
+        }
+        if t == c && cf == Some(1) {
+            return Ok(m.i1c(true));
+        }
+        if ct == Some(0) && f == c {
+            return Ok(m.i1c(false));
+        }
+    }
+
+    // `select c, (select c, t1, _), f -> select c, t1, f` (and analogously in `f`).
+    let mut folded_arm = false;
+    if let Value::Inst(ti) = t {
+        if let Op::Select(c2, t2, _) = m.insts[ti as usize].op {
+            if c2 == c {
+                t = t2;
+                folded_arm = true;
+            }
+        }
+    }
+    if let Value::Inst(fi) = f {
+        if let Op::Select(c2, _, f2) = m.insts[fi as usize].op {
+            if c2 == c {
+                f = f2;
+                folded_arm = true;
+            }
+        }
+    }
+    if folded_arm {
+        if t == f {
+            return Ok(t);
+        }
+        return Err(Some(Op::Select(c, t, f)));
+    }
+
+    Err(None)
+}
+
+fn simplify_pure_dxop_call(m: &mut Module, id: u32) -> Option<Value> {
+    let Op::Call(f, args) = &m.insts[id as usize].op else { return None };
+    let name = &m.funcs[*f as usize].name;
+    let opc = args.first().and_then(|&v| const_int_u64(m, v))?;
+
+    if is_op_name(name, "dx.op.unaryBits") && args.len() == 2 {
+        let uv = const_int_u64(m, args[1])?;
+        let sw = m.int_width(m.value_ty(args[1]))?;
+        let mask = mask_for(sw);
+        let u = uv & mask;
+        let res = match opc {
+            31 => u.count_ones() as u64,
+            32 => {
+                if u == 0 {
+                    u32::MAX as u64
+                } else {
+                    u.trailing_zeros() as u64
+                }
+            }
+            33 => {
+                if u == 0 {
+                    u32::MAX as u64
+                } else {
+                    (u.leading_zeros() - (64 - sw)) as u64
+                }
+            }
+            34 => {
+                let sign = (u >> (sw - 1)) & 1 != 0;
+                let bits = if sign { (!u) & mask } else { u };
+                if bits == 0 {
+                    u32::MAX as u64
+                } else {
+                    (bits.leading_zeros() - (64 - sw)) as u64
+                }
+            }
+            _ => return None,
+        };
+        return Some(m.i32c(res as u32));
+    }
+
+    if is_op_name(name, "dx.op.unary") && opc == 30 && args.len() == 2 {
+        let ty = m.insts[id as usize].ty;
+        let sw = m.int_width(ty)?;
+        let uv = const_int_u64(m, args[1])?;
+        let rev = (uv & mask_for(sw)).reverse_bits() >> (64 - sw);
+        return Some(m.const_int(ty, rev));
+    }
+
+    if is_op_name(name, "dx.op.binary") && (37..=40).contains(&opc) && args.len() == 3 {
+        let (a, b) = (args[1], args[2]);
+        if a == b {
+            return Some(a);
+        }
+        let ty = m.insts[id as usize].ty;
+        let sw = m.int_width(ty)?;
+        let (ua, ub) = (const_int_u64(m, a)?, const_int_u64(m, b)?);
+        let r = match opc {
+            37 => (sext_i64(ua, sw).max(sext_i64(ub, sw))) as u64,
+            38 => (sext_i64(ua, sw).min(sext_i64(ub, sw))) as u64,
+            39 => ua.max(ub),
+            40 => ua.min(ub),
+            _ => unreachable!(),
+        };
+        return Some(m.const_int(ty, r));
+    }
+
+    None
+}
+
+/// RPO constant folding, cast simplification, integer identities/reassociation,
+/// comparison and select simplifications.
+pub(super) fn simplify_insts(m: &mut Module) -> bool {
+    let mut repl: Vec<Option<Value>> = vec![None; m.insts.len()];
+    let mut changed = false;
+
+    for b in 0..m.blocks.len() {
+        let mut keep = Vec::with_capacity(m.blocks[b].len());
+        let old_insts = std::mem::take(&mut m.blocks[b]);
+        for id in old_insts {
+            if rewrite_op_values(&mut m.insts[id as usize].op, &repl) {
+                changed = true;
+            }
+            if matches!(m.insts[id as usize].op, Op::Phi(..)) {
+                keep.push(id);
+                continue;
+            }
+            let ty = m.insts[id as usize].ty;
+            let simplified = match &m.insts[id as usize].op {
+                Op::Bin(..) => {
+                    if let Some(w) = m.int_width(ty) {
+                        simplify_int_bin(m, id, ty, w)
+                    } else {
+                        Err(None)
+                    }
+                }
+                Op::Cast(..) => simplify_cast(m, id),
+                Op::Cmp(..) => simplify_cmp(m, id),
+                Op::Select(..) => simplify_select(m, id),
+                Op::Call(..) => match simplify_pure_dxop_call(m, id) {
+                    Some(v) => Ok(v),
+                    None => Err(None),
+                },
+                _ => Err(None),
+            };
+            match simplified {
+                Ok(v) if v != Value::Inst(id) => {
+                    repl[id as usize] = Some(v);
+                    changed = true;
+                }
+                Err(Some(new_op)) => {
+                    m.insts[id as usize].op = new_op;
+                    changed = true;
+                    keep.push(id);
+                }
+                _ => keep.push(id),
+            }
+        }
+        m.blocks[b] = keep;
+    }
+
+    if changed {
+        for b in 0..m.blocks.len() {
+            for &id in &m.blocks[b] {
+                if !matches!(m.insts[id as usize].op, Op::Phi(..)) {
+                    break;
+                }
+                rewrite_op_values(&mut m.insts[id as usize].op, &repl);
+            }
+        }
+        rewrite_md_values(m, &repl);
+    }
+
+    changed
+}
+
+// --------------------------------------------------------- Dominator CSE
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CseKey {
+    Bin(u8, Value, Value, u64),
+    Cast(u8, Value, Ty),
+    Cmp(u8, Value, Value),
+    Select(Value, Value, Value),
+    Extract(Value, u32),
+    Gep(Value, Vec<Value>),
+    Call(u32, Vec<Value>),
+}
+
+fn cse_key(m: &Module, op: &Op) -> Option<CseKey> {
+    match op {
+        Op::Bin(bin_op, a, b, flags) => {
+            let (mut x, mut y) = (*a, *b);
+            if matches!(bin_op, BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor) && x > y {
+                std::mem::swap(&mut x, &mut y);
+            }
+            Some(CseKey::Bin(*bin_op as u8, x, y, *flags))
+        }
+        Op::Cast(cop, v, ty) => Some(CseKey::Cast(*cop as u8, *v, *ty)),
+        Op::Cmp(p, a, b) => {
+            let (mut p, mut x, mut y) = (*p, *a, *b);
+            if x > y {
+                std::mem::swap(&mut x, &mut y);
+                p = swap_pred(p);
+            }
+            Some(CseKey::Cmp(p as u8, x, y))
+        }
+        Op::Select(c, t, f) => Some(CseKey::Select(*c, *t, *f)),
+        Op::Extract(a, idx) => Some(CseKey::Extract(*a, *idx)),
+        Op::Gep(p, idx) => Some(CseKey::Gep(*p, idx.clone())),
+        Op::Call(f, args) => {
+            let fd = &m.funcs[*f as usize];
+            if fd.attrs != FnAttrs::ReadNone {
+                return None;
+            }
+            // Implicit quad derivatives (`dx.op.unary` opcodes 83..=86) depend on
+            // CFG position even though declared `readnone`. Never CSE them.
+            if is_op_name(&fd.name, "dx.op.unary") {
+                let opc = args.first().and_then(|&v| const_int_u64(m, v));
+                if !matches!(opc, Some(0..=30)) {
+                    return None;
+                }
+            }
+            let mut norm_args = args.clone();
+            if is_op_name(&fd.name, "dx.op.binary")
+                && norm_args.len() == 3
+                && matches!(norm_args.first().and_then(|&v| const_int_u64(m, v)), Some(35..=40))
+                && norm_args[1] > norm_args[2]
+            {
+                norm_args.swap(1, 2);
+            }
+            Some(CseKey::Call(*f, norm_args))
+        }
+        _ => None,
+    }
+}
+
+/// Dominator-tree scoped CSE assuming blocks `0..n` are already in RPO.
+pub(super) fn cse(m: &mut Module) -> bool {
+    let n = m.blocks.len();
+    if n == 0 {
+        return false;
+    }
+
+    let idom = compute_idom(m);
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for b in 1..n {
+        if let Some(p) = idom[b] {
+            children[p].push(b);
+        }
+    }
+
+    enum DomFrame {
+        Enter(usize),
+        Exit(usize),
+    }
+
+    let mut table: HashMap<CseKey, Value> = HashMap::new();
+    let mut undo: Vec<CseKey> = Vec::new();
+    let mut repl: Vec<Option<Value>> = vec![None; m.insts.len()];
+    let mut changed = false;
+    let mut stack = vec![DomFrame::Enter(0)];
+
+    while let Some(frame) = stack.pop() {
+        match frame {
+            DomFrame::Enter(b) => {
+                let mark = undo.len();
+                stack.push(DomFrame::Exit(mark));
+
+                let old_insts = std::mem::take(&mut m.blocks[b]);
+                let mut keep = Vec::with_capacity(old_insts.len());
+                for id in old_insts {
+                    if !matches!(m.insts[id as usize].op, Op::Phi(..))
+                        && rewrite_op_values(&mut m.insts[id as usize].op, &repl)
+                    {
+                        changed = true;
+                    }
+                    if let Some(key) = cse_key(m, &m.insts[id as usize].op) {
+                        if let Some(&prev) = table.get(&key) {
+                            repl[id as usize] = Some(prev);
+                            changed = true;
+                            continue;
+                        }
+                        table.insert(key.clone(), Value::Inst(id));
+                        undo.push(key);
+                    }
+                    keep.push(id);
+                }
+                m.blocks[b] = keep;
+
+                for &c in children[b].iter().rev() {
+                    stack.push(DomFrame::Enter(c));
+                }
+            }
+            DomFrame::Exit(mark) => {
+                while undo.len() > mark {
+                    if let Some(k) = undo.pop() {
+                        table.remove(&k);
+                    }
+                }
+            }
+        }
+    }
+
+    if changed {
+        for b in 0..n {
+            for &id in &m.blocks[b] {
+                if !matches!(m.insts[id as usize].op, Op::Phi(..)) {
+                    break;
+                }
+                rewrite_op_values(&mut m.insts[id as usize].op, &repl);
+            }
+        }
+        rewrite_md_values(m, &repl);
+    }
+
+    changed
+}
+
 // ------------------------------------------------------------------- DCE
 
 fn is_pure_wave_quad(name: &str) -> bool {
@@ -1233,8 +2212,7 @@ pub(super) fn sync_features(s: &mut Shader) {
 mod tests {
     use super::*;
     use crate::gpu::dxil::container::Stage;
-    use crate::gpu::dxil::module::{CastOp, Pred};
-    use crate::gpu::dxil::ops::{BitCount, WaveOp};
+    use crate::gpu::dxil::ops::{Binary, BitCount, Deriv, WaveOp};
     use crate::gpu::dxil::shader::Shader;
     use crate::gpu::dxil::validate;
     use crate::gpu::recomp::runner;
@@ -1294,6 +2272,130 @@ mod tests {
         assert_eq!(st.blocks, 1, "loop + exit must merge into entry block");
 
         let dxil = s.finish([1, 1, 1], Some(32));
+        validate_if_supported(&dxil);
+    }
+
+    #[test]
+    fn bitcast_and_select_and_scc_idioms_simplify() {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let uav = s.raw_uav(1, 0);
+        let tid = s.flattened_thread_id_in_group();
+        let i32 = s.m.i32();
+        let f32 = s.m.f32();
+        let i64 = s.m.i64();
+
+        let zero = s.m.i32c(0);
+        let c5 = s.m.i32c(5);
+        let cmp = s.m.cmp(Pred::SLt, tid, c5);
+        // `set_scc` + `scc_bit` idiom: zext(cmp) != 0, then xor(..., true), then select swap.
+        let scc = s.m.cast(CastOp::ZExt, cmp, i32);
+        let nz = s.m.cmp(Pred::Ne, scc, zero);
+        let t1 = s.m.i1c(true);
+        let n_nz = s.m.bin(BinOp::Xor, nz, t1);
+        let f_two = s.m.f32c(2.0f32.to_bits());
+        let f_tid = s.m.cast(CastOp::UIToFP, tid, f32);
+        let sel_f = s.m.select(n_nz, f_two, f_tid);
+        let bc_i = s.m.bitcast(sel_f, i32);
+        let bc_roundtrip = s.m.bitcast(bc_i, f32);
+        let tid64 = s.m.cast(CastOp::ZExt, tid, i64);
+        let same_i = s.m.cast(CastOp::Trunc, tid64, i32);
+        let x0 = s.m.bin(BinOp::Xor, same_i, same_i);
+        let off = s.m.bin(BinOp::Add, x0, zero);
+        let out_i = s.m.bitcast(bc_roundtrip, i32);
+        let sext_i = s.m.cast(CastOp::SExt, n_nz, i32);
+        let _sext_nz = s.m.cmp(Pred::Ne, sext_i, zero);
+        s.raw_store(uav, off, &[out_i]);
+        s.m.ret();
+
+        s.optimize();
+        let has_cast = s.m.blocks.iter().flatten().any(|&id| {
+            matches!(s.m.insts[id as usize].op, Op::Cast(CastOp::ZExt | CastOp::SExt | CastOp::Trunc, ..))
+        });
+        assert!(!has_cast, "redundant zext/sext/trunc roundtrips should disappear");
+
+        let dxil = s.finish([32, 1, 1], Some(32));
+        validate_if_supported(&dxil);
+    }
+
+    #[test]
+    fn dominator_cse_deduplicates_pure_ops_and_preserves_derivatives_and_wave_ops() {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let uav = s.raw_uav(1, 0);
+        let b1 = s.m.new_block();
+        let else_b = s.m.new_block();
+
+        let c0 = s.m.i32c(0);
+        let ld = s.raw_load(uav, c0, 3);
+        let (a, b) = (ld[0], ld[1]);
+        let _add1 = s.m.bin(BinOp::Add, a, b);
+        let f32 = s.m.f32();
+        let f_a = s.m.bitcast(a, f32);
+        let dx1 = s.deriv(Deriv::CoarseX, f_a);
+        let sum1 = s.wave_active_op(a, WaveOp::Sum, false);
+        let c4 = s.m.i32c(4);
+        let c1 = s.m.cmp(Pred::UGt, a, c4);
+        s.m.cond_br(c1, b1, else_b);
+
+        s.m.set_block(else_b);
+        s.m.ret();
+
+        s.m.set_block(b1);
+        // Commutative duplicate dominated by entry -> CSE must merge into `add1`.
+        let add2 = s.m.bin(BinOp::Add, b, a);
+        // Derivatives and WaveOps must NOT be CSE'd across entry -> child!
+        let dx2 = s.deriv(Deriv::CoarseX, f_a);
+        let sum2 = s.wave_active_op(a, WaveOp::Sum, false);
+        let dx_sum = s.m.fbin(BinOp::Add, dx1, dx2, 0);
+        let i32 = s.m.i32();
+        let dx_i = s.m.bitcast(dx_sum, i32);
+        let t1 = s.m.bin(BinOp::Add, add2, sum1);
+        let t2 = s.m.bin(BinOp::Add, t1, sum2);
+        let out = s.m.bin(BinOp::Add, t2, dx_i);
+        s.raw_store(uav, c0, &[out]);
+        s.m.ret();
+
+        s.optimize();
+        let extract_add_count = s
+            .m
+            .blocks
+            .iter()
+            .flatten()
+            .filter(|&&id| match s.m.insts[id as usize].op {
+                Op::Bin(BinOp::Add, Value::Inst(x), Value::Inst(y), _) => {
+                    matches!(s.m.insts[x as usize].op, Op::Extract(..))
+                        && matches!(s.m.insts[y as usize].op, Op::Extract(..))
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(extract_add_count, 1, "commutative add across dominated blocks must CSE");
+        let deriv_count = s
+            .m
+            .blocks
+            .iter()
+            .flatten()
+            .filter(|&&id| match &s.m.insts[id as usize].op {
+                Op::Call(f, args) => {
+                    is_op_name(&s.m.funcs[*f as usize].name, "dx.op.unary")
+                        && args.first().and_then(|&v| const_int_u64(&s.m, v)) == Some(Deriv::CoarseX as u64)
+                }
+                _ => false,
+            })
+            .count();
+        let wave_count = s
+            .m
+            .blocks
+            .iter()
+            .flatten()
+            .filter(|&&id| match &s.m.insts[id as usize].op {
+                Op::Call(f, _) => is_op_name(&s.m.funcs[*f as usize].name, "dx.op.waveActiveOp"),
+                _ => false,
+            })
+            .count();
+        assert_eq!(deriv_count, 2, "implicit derivatives must never be CSE'd");
+        assert_eq!(wave_count, 2, "waveActiveOp must never be CSE'd");
+
+        let dxil = s.finish([4, 4, 1], Some(32));
         validate_if_supported(&dxil);
     }
 
@@ -1449,6 +2551,187 @@ mod tests {
 
         let dxil = s.finish([1, 1, 1], Some(32));
         validate_if_supported(&dxil);
+    }
+
+    #[test]
+    fn gpu_differential_alu_loops_and_bitops_match_unoptimized() {
+        let supported = match runner::wave32_supported() {
+            Ok(true) => true,
+            Ok(false) => {
+                runner::skip_test("no wave32");
+                false
+            }
+            Err(e) => {
+                runner::skip_test(&e);
+                false
+            }
+        };
+
+        let build = |do_opt: bool| -> (Stats, Vec<u8>) {
+            let mut s = Shader::new(Stage::Compute, (6, 6));
+            let res = s.raw_uav(1, 0);
+            let mem = s.raw_uav(2, 0);
+            let tid = s.flattened_thread_id_in_group();
+            let i32 = s.m.i32();
+            let f32 = s.m.f32();
+            let i64 = s.m.i64();
+
+            let entry = Block(0);
+            let loop_b = s.m.new_block();
+            let exit = s.m.new_block();
+
+            s.m.set_block(entry);
+            let two = s.m.i32c(2);
+            let off = s.m.bin(BinOp::Shl, tid, two);
+            let in_v = s.raw_load(mem, off, 1)[0];
+            let c0 = s.m.i32c(0);
+            let c1 = s.m.i32c(1);
+            let exec_all = s.m.i32c(0xFFFF_FFFF);
+            s.m.br(loop_b);
+
+            s.m.set_block(loop_b);
+            let p_exec = s.m.phi(i32);
+            let p_idx = s.m.phi(i32);
+            let p_acc = s.m.phi(i32);
+            let p_dead = s.m.phi(i32);
+            s.m.add_incoming(p_exec, exec_all, entry);
+            s.m.add_incoming(p_exec, p_exec, loop_b);
+            s.m.add_incoming(p_idx, c0, entry);
+            s.m.add_incoming(p_acc, c0, entry);
+            s.m.add_incoming(p_dead, c0, entry);
+
+            let exec_bit = s.m.bin(BinOp::And, p_exec, c1);
+            let act = s.m.cmp(Pred::Ne, exec_bit, c0);
+            let scc = s.m.cast(CastOp::ZExt, act, i32);
+            let act2 = s.m.cmp(Pred::Ne, scc, c0);
+            // Redundant `f32 <-> i32` bitcasts and CSE candidates.
+            let x_f = s.m.bitcast(p_acc, f32);
+            let one_f = s.m.f32c(1.0f32.to_bits());
+            let add_f = s.m.fbin(BinOp::Add, x_f, one_f, 0);
+            let add_i = s.m.bitcast(add_f, i32);
+            let mix1 = s.m.bin(BinOp::Xor, in_v, c1);
+            let mix2 = s.m.bin(BinOp::Xor, c1, in_v);
+            let zext_mix = s.m.cast(CastOp::ZExt, mix2, i64);
+            let trunc_zext = s.m.cast(CastOp::Trunc, zext_mix, i32);
+            let diff = s.m.bin(BinOp::Sub, mix1, trunc_zext);
+            let step = s.m.bin(BinOp::Add, add_i, diff);
+            let next_acc = s.m.select(act2, step, p_acc);
+            let next_idx = s.m.bin(BinOp::Add, p_idx, c1);
+            let dead_next = s.m.bin(BinOp::Add, p_dead, c1);
+            s.m.add_incoming(p_idx, next_idx, loop_b);
+            s.m.add_incoming(p_acc, next_acc, loop_b);
+            s.m.add_incoming(p_dead, dead_next, loop_b);
+
+            let c4 = s.m.i32c(4);
+            let go = s.m.cmp(Pred::ULt, next_idx, c4);
+            s.m.cond_br(go, loop_b, exit);
+
+            s.m.set_block(exit);
+            let c_fshi = s.m.i32c(0x4000_0000);
+            let const_bits = s.bit_count(BitCount::FirstbitSHi, c_fshi);
+            let c7 = s.m.i32c(7);
+            let c19 = s.m.i32c(19);
+            let cst = s.binary(Binary::UMax, c7, c19);
+            let rhs = s.m.bin(BinOp::Add, const_bits, cst);
+            let out = s.m.bin(BinOp::Add, p_acc, rhs);
+            s.raw_store(res, off, &[out]);
+            s.m.ret();
+
+            if do_opt {
+                s.optimize();
+            }
+            let st = module_stats(&s.m);
+            let dxil = s.finish([32, 1, 1], Some(32));
+            (st, dxil)
+        };
+
+        let (raw_st, raw_dxil) = build(false);
+        let (opt_st, opt_dxil) = build(true);
+        assert!(opt_st.insts < raw_st.insts);
+        assert!(opt_st.phis < raw_st.phis);
+        assert!(opt_dxil.len() < raw_dxil.len());
+        validate_if_supported(&opt_dxil);
+
+        if supported {
+            let mut mem = vec![0u32; 64];
+            for i in 0..32u32 {
+                mem[i as usize] = i.wrapping_mul(0x9e37_79b9);
+            }
+            let raw_r = runner::run(&raw_dxil, &runner::KernelState::default(), &mem).expect("raw GPU run");
+            let opt_r = runner::run(&opt_dxil, &runner::KernelState::default(), &mem).expect("opt GPU run");
+            assert_eq!(&opt_r.raw[..32], &raw_r.raw[..32]);
+        }
+    }
+
+    #[test]
+    fn gpu_differential_divergent_wave_ops_not_cse_or_hoisted() {
+        let supported = match runner::wave32_supported() {
+            Ok(true) => true,
+            Ok(false) => {
+                runner::skip_test("no wave32");
+                false
+            }
+            Err(e) => {
+                runner::skip_test(&e);
+                false
+            }
+        };
+
+        let build = |do_opt: bool| -> Vec<u8> {
+            let mut s = Shader::new(Stage::Compute, (6, 6));
+            let res = s.raw_uav(1, 0);
+            let tid = s.flattened_thread_id_in_group();
+            let two = s.m.i32c(2);
+            let off = s.m.bin(BinOp::Shl, tid, two);
+            let c1 = s.m.i32c(1);
+            let c16 = s.m.i32c(16);
+            let then_b = s.m.new_block();
+            let else_b = s.m.new_block();
+            let join = s.m.new_block();
+
+            s.m.set_block(Block(0));
+            let in_high = s.m.cmp(Pred::UGe, tid, c16);
+            let base_sum = s.wave_active_op(c1, WaveOp::Sum, false);
+            s.m.cond_br(in_high, then_b, else_b);
+
+            s.m.set_block(then_b);
+            let then_sum = s.wave_active_op(c1, WaveOp::Sum, false);
+            s.m.br(join);
+
+            s.m.set_block(else_b);
+            let else_sum = s.wave_active_op(c1, WaveOp::Sum, false);
+            s.m.br(join);
+
+            s.m.set_block(join);
+            let i32 = s.m.i32();
+            let br_sum = s.m.phi(i32);
+            s.m.add_incoming(br_sum, then_sum, then_b);
+            s.m.add_incoming(br_sum, else_sum, else_b);
+            let c8 = s.m.i32c(8);
+            let hi_bits = s.m.bin(BinOp::Shl, base_sum, c8);
+            let packed = s.m.bin(BinOp::Add, hi_bits, br_sum);
+            s.raw_store(res, off, &[packed]);
+            s.m.ret();
+
+            if do_opt {
+                s.optimize();
+            }
+            s.finish([32, 1, 1], Some(32))
+        };
+
+        let raw_dxil = build(false);
+        let opt_dxil = build(true);
+        validate_if_supported(&opt_dxil);
+
+        if supported {
+            let mem = vec![0u32; 64];
+            let raw_r = runner::run(&raw_dxil, &runner::KernelState::default(), &mem).expect("raw GPU run");
+            let opt_r = runner::run(&opt_dxil, &runner::KernelState::default(), &mem).expect("opt GPU run");
+            assert_eq!(&opt_r.raw[..32], &raw_r.raw[..32]);
+            // Verify waveActiveOp inside each branch returned 16 (not 32 from hoisted base_sum).
+            assert_eq!(opt_r.raw[0], (32 << 8) | 16);
+            assert_eq!(opt_r.raw[16], (32 << 8) | 16);
+        }
     }
 
     #[test]
