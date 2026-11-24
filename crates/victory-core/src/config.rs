@@ -135,17 +135,27 @@ fn default_dir_from(
     name: &str,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Result<PathBuf> {
-    if let Some(local) = env("LOCALAPPDATA") {
+    if let Some(local) = env("LOCALAPPDATA").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(local).join("victory").join(name));
     }
     let base = if name == "data" {
         env("XDG_DATA_HOME")
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+            .or_else(|| {
+                env("HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(|h| PathBuf::from(h).join(".local").join("share"))
+            })
     } else {
         env("XDG_CACHE_HOME")
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".cache")))
+            .or_else(|| {
+                env("HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(|h| PathBuf::from(h).join(".cache"))
+            })
     }
     .context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")?;
     Ok(base.join("victory").join(name))
@@ -163,7 +173,11 @@ mod tests {
             cache_dir: Some("cache-from-file".into()),
             ..Default::default()
         };
-        let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
+        let env = |k: &str| match k {
+            "VICTORY_GAME_DIR" => Some(OsString::from("from-env")),
+            "HOME" => Some(OsString::from("/tmp/probe-home")),
+            _ => None,
+        };
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
@@ -175,7 +189,11 @@ mod tests {
             game_dir: Some("from-file".into()),
             ..Default::default()
         };
-        let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
+        let env = |k: &str| match k {
+            "VICTORY_GAME_DIR" => Some(OsString::new()),
+            "HOME" => Some(OsString::from("/tmp/probe-home")),
+            _ => None,
+        };
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));
     }
