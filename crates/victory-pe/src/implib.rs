@@ -612,6 +612,93 @@ mod tests {
         assert_eq!(lib.other_members, 0);
     }
 
+    /// `Version` must be 0. The anonymous object headers that share the
+    /// `0, 0xFFFF` signature (version 1 and up, including `/bigobj`
+    /// objects at version 2) are other members, not imports.
+    #[test]
+    fn a_header_version_other_than_zero_is_another_member() {
+        let members: Vec<Vec<u8>> = [1u16, 2, 0xFFFF]
+            .iter()
+            .map(|&version| {
+                let mut member = short_import("a.dll", "Versioned", 0, CODE, BY_NAME);
+                member[4..6].copy_from_slice(&version.to_le_bytes());
+                member
+            })
+            .chain([short_import("a.dll", "Kept", 0, CODE, BY_NAME)])
+            .collect();
+        let lib = ImportLibrary::parse(&archive(&members)).unwrap();
+        assert_eq!(lib.imports, [name("a.dll", "Kept", LibImportKind::Code)]);
+        assert_eq!(lib.other_members, 3);
+    }
+
+    /// Only the low five bits of the type word are defined (two for the
+    /// import type, three for the name type). The reserved bits above them
+    /// change neither.
+    #[test]
+    fn reserved_bits_of_the_type_word_are_ignored() {
+        let reserved = 0xFFE0u16;
+        let cases = [
+            (CODE, BY_NAME, name("a.dll", "Plain", LibImportKind::Code)),
+            (DATA, NO_PREFIX, name("a.dll", "Plain", LibImportKind::Data)),
+            (
+                CONST,
+                BY_ORDINAL,
+                LibImport {
+                    dll: "a.dll".into(),
+                    export: ImportSymbol::Ordinal(5),
+                    kind: LibImportKind::Const,
+                },
+            ),
+        ];
+        for (ty, name_ty, expected) in cases {
+            let symbol = if name_ty == NO_PREFIX {
+                "_Plain"
+            } else {
+                "Plain"
+            };
+            let mut member = short_import("a.dll", symbol, 5, ty, name_ty);
+            let word = u16::from_le_bytes([member[18], member[19]]) | reserved;
+            member[18..20].copy_from_slice(&word.to_le_bytes());
+            let lib = ImportLibrary::parse(&archive(&[member])).unwrap();
+            assert_eq!(lib.imports, [expected], "type {ty}, name type {name_ty}");
+            assert_eq!(lib.other_members, 0);
+        }
+    }
+
+    /// `SizeOfData` bounds the strings, not the member: a DLL name that
+    /// lies in the member but past `SizeOfData` is not read, so the object
+    /// is not an import.
+    #[test]
+    fn strings_past_size_of_data_are_not_read() {
+        let mut member = short_import("a.dll", "Sym", 0, CODE, BY_NAME);
+        // Count only `Sym\0`; `a.dll\0` still follows in the member.
+        member[12..16].copy_from_slice(&4u32.to_le_bytes());
+        let lib = ImportLibrary::parse(&archive(&[member])).unwrap();
+        assert!(lib.imports.is_empty());
+        assert_eq!(lib.other_members, 1);
+    }
+
+    /// An `EXPORTAS` object imports by name even when its ordinal/hint
+    /// field is set, and an empty third string names the empty export.
+    #[test]
+    fn export_as_imports_by_name_and_may_name_the_empty_export() {
+        let mut hinted = export_as_import("a.dll", "__imp_Sym", "Real");
+        hinted[16..18].copy_from_slice(&7u16.to_le_bytes());
+        let lib = ImportLibrary::parse(&archive(&[
+            hinted,
+            export_as_import("b.dll", "__imp_Other", ""),
+        ]))
+        .unwrap();
+        assert_eq!(
+            lib.imports,
+            [
+                name("a.dll", "Real", LibImportKind::Code),
+                name("b.dll", "", LibImportKind::Code),
+            ]
+        );
+        assert_eq!(lib.other_members, 0);
+    }
+
     /// The hint of a by-name import is not kept: a library names exports,
     /// and a hint into one build's export table is no part of that name.
     #[test]
