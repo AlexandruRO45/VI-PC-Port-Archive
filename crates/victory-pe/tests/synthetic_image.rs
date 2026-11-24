@@ -1128,3 +1128,106 @@ fn a_delay_import_directory_holding_only_the_terminator_has_no_modules() {
     let info = ImageInfo::parse(&d).unwrap();
     assert!(info.delay_imports.is_empty());
 }
+
+#[test]
+fn ordinal_imports_keep_only_the_low_16_bits() {
+    // IMAGE_ORDINAL64 is the low word; bits 16..62 are not part of it.
+    let mut d = image();
+    for table in [NAME_TABLE, IAT] {
+        put64(&mut d, at(table) + 8, (1 << 63) | 0x7FFF_1234_0005);
+    }
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.imports[0].entries[1].symbol, ImportSymbol::Ordinal(5));
+}
+
+#[test]
+fn name_imports_read_the_hint_name_rva_from_the_low_32_bits() {
+    // Without the ordinal flag the thunk holds an RVA; the loader reads it as
+    // a 32-bit value, so the bits above it do not move the name.
+    let mut d = image();
+    put64(
+        &mut d,
+        at(NAME_TABLE),
+        0x1234_5678_0000_0000 | u64::from(HINT_NAME),
+    );
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(
+        info.imports[0].entries[0].symbol,
+        ImportSymbol::Name {
+            hint: 0x123,
+            name: "ExitProcess".into()
+        }
+    );
+}
+
+#[test]
+fn tls_callbacks_after_a_null_slot_are_not_read() {
+    // The loader stops at the first null pointer; what follows is not a
+    // callback even when it looks like one.
+    let mut d = image();
+    put64(&mut d, at(TLS_CALLBACKS) + 16, 0);
+    put64(&mut d, at(TLS_CALLBACKS) + 24, IMAGE_BASE + 0x1030);
+    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
+    assert_eq!(tls.callback_rvas, vec![0x1010, 0x1020]);
+
+    put64(&mut d, at(TLS_CALLBACKS), 0);
+    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
+    assert_eq!(tls.callbacks_va, IMAGE_BASE + u64::from(TLS_CALLBACKS));
+    assert!(tls.callback_rvas.is_empty());
+}
+
+#[test]
+fn rva_to_file_offset_maps_the_raw_size_when_the_virtual_size_is_zero() {
+    // Some linkers leave VirtualSize at zero; the raw size is all there is.
+    let mut info = ImageInfo::parse(&image()).unwrap();
+    info.sections[0].virtual_size = 0;
+    let last = SECTION_RVA + SECTION_SIZE - 1;
+    assert_eq!(info.rva_to_file_offset(last), Some(at(last) as u32));
+    assert_eq!(info.rva_to_file_offset(SECTION_RVA + SECTION_SIZE), None);
+}
+
+#[test]
+fn rva_to_file_offset_leaves_the_zero_filled_tail_unmapped() {
+    // A virtual size past the raw size is zero fill in memory, not file data.
+    let mut info = ImageInfo::parse(&image()).unwrap();
+    info.sections[0].virtual_size = 0x1000;
+    info.sections[0].file_size = 0x100;
+    assert_eq!(
+        info.rva_to_file_offset(SECTION_RVA + 0xFF),
+        Some(at(SECTION_RVA + 0xFF) as u32)
+    );
+    assert_eq!(info.rva_to_file_offset(SECTION_RVA + 0x100), None);
+    assert_eq!(info.rva_to_file_offset(SECTION_RVA + 0xFFF), None);
+
+    // A section with no file data maps nothing at all.
+    info.sections[0].file_size = 0;
+    assert_eq!(info.rva_to_file_offset(SECTION_RVA), None);
+}
+
+#[test]
+fn symbol_keys_pad_every_guid_field_but_not_the_age() {
+    use victory_pe::CodeViewInfo;
+    let key = |guid: [u8; 16], age: u32| {
+        CodeViewInfo {
+            pdb_path: String::new(),
+            guid,
+            age,
+        }
+        .symbol_key()
+    };
+    assert_eq!(key([0; 16], 0), format!("{}0", "0".repeat(32)));
+    assert_eq!(key([0; 16], 1), format!("{}1", "0".repeat(32)));
+    assert_eq!(key([0; 16], 0x10), format!("{}10", "0".repeat(32)));
+    assert_eq!(
+        key([0xFF; 16], u32::MAX),
+        format!("{}FFFFFFFF", "F".repeat(32))
+    );
+    // Data1 is four little-endian bytes, Data2 and Data3 two each, Data4 is
+    // eight bytes in order.
+    let mut guid = [0u8; 16];
+    guid[0] = 0x01;
+    guid[4] = 0x02;
+    guid[6] = 0x03;
+    guid[15] = 0x04;
+    assert_eq!(key(guid, 2), "000000010002000300000000000000042");
+}
