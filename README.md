@@ -1,6 +1,6 @@
-# VIctory fork (work in progress)
+# KeyWest
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
+A work-in-progress fork of [VIctory fork](https://github.com/fxceless/victory-fork), a
 compatibility layer that runs an Xbox Series title natively on Windows from
 files the user supplies. This fork follows upstream
 `main` and adds fixes aimed at one goal: getting the game's world to render
