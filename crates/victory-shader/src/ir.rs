@@ -186,12 +186,24 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             };
         }
         if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
+            let mut dedup_reads = Vec::with_capacity(reads.len());
+            for r in reads {
+                if !dedup_reads.contains(&r) {
+                    dedup_reads.push(r);
+                }
+            }
+            let mut dedup_writes = Vec::with_capacity(writes.len());
+            for w in writes {
+                if !dedup_writes.contains(&w) {
+                    dedup_writes.push(w);
+                }
+            }
             let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
             blocks[b].insts.push(Inst {
                 machine,
                 fields,
-                reads: unset(reads),
-                writes: unset(writes),
+                reads: unset(dedup_reads),
+                writes: unset(dedup_writes),
             });
         }
     }

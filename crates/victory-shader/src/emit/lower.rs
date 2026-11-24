@@ -3960,49 +3960,32 @@ impl<'a> Lower<'a> {
                     dst_val = self.s.m.select(c, is, x, dst_val);
                 }
                 // Write src_val → v[dst + dst_off] (scatter) and dst_val → v[src + src_off].
-                if sreg == dreg {
-                    for k in 0..=255u8.saturating_sub(sreg) {
-                        let Some(_) = inst.write(Reg::V(sreg + k)) else {
-                            break;
-                        };
-                        let old = match inst.read(Reg::V(sreg + k)) {
-                            Some(o) => self.i32_of(o)?,
-                            None => self.s.m.i32(0),
-                        };
-                        let kk = self.s.m.i32(u32::from(k));
-                        let is_dst = self.s.m.cmp(c, pred::EQ, dst_off, kk);
-                        let is_src = self.s.m.cmp(c, pred::EQ, src_off, kk);
-                        let x = self.s.m.select(c, is_dst, src_val, old);
-                        let x = self.s.m.select(c, is_src, dst_val, x);
-                        self.write_placed(inst, Reg::V(sreg + k), x, guard);
-                    }
-                } else {
-                    for k in 0..=255u8.saturating_sub(dreg) {
-                        let Some(_) = inst.write(Reg::V(dreg + k)) else {
-                            break;
-                        };
-                        let old = match inst.read(Reg::V(dreg + k)) {
-                            Some(o) => self.i32_of(o)?,
-                            None => self.s.m.i32(0),
-                        };
-                        let kk = self.s.m.i32(u32::from(k));
-                        let is = self.s.m.cmp(c, pred::EQ, dst_off, kk);
-                        let x = self.s.m.select(c, is, src_val, old);
-                        self.write_placed(inst, Reg::V(dreg + k), x, guard);
-                    }
-                    for k in 0..=255u8.saturating_sub(sreg) {
-                        let Some(_) = inst.write(Reg::V(sreg + k)) else {
-                            break;
-                        };
-                        let old = match inst.read(Reg::V(sreg + k)) {
-                            Some(o) => self.i32_of(o)?,
-                            None => self.s.m.i32(0),
-                        };
-                        let kk = self.s.m.i32(u32::from(k));
-                        let is = self.s.m.cmp(c, pred::EQ, src_off, kk);
-                        let x = self.s.m.select(c, is, dst_val, old);
-                        self.write_placed(inst, Reg::V(sreg + k), x, guard);
-                    }
+                // Handle the union of both register spans in a single pass so overlapping
+                // ranges (e.g. sreg <= dreg) do not overwrite each other.
+                let min_reg = sreg.min(dreg);
+                for r in min_reg..=255 {
+                    let Some(_) = inst.write(Reg::V(r)) else {
+                        break;
+                    };
+                    let old = match inst.read(Reg::V(r)) {
+                        Some(o) => self.i32_of(o)?,
+                        None => self.s.m.i32(0),
+                    };
+                    let is_dst = if r >= dreg {
+                        let k = self.s.m.i32(u32::from(r - dreg));
+                        self.s.m.cmp(c, pred::EQ, dst_off, k)
+                    } else {
+                        self.s.m.bool(false)
+                    };
+                    let is_src = if r >= sreg {
+                        let k = self.s.m.i32(u32::from(r - sreg));
+                        self.s.m.cmp(c, pred::EQ, src_off, k)
+                    } else {
+                        self.s.m.bool(false)
+                    };
+                    let x = self.s.m.select(c, is_dst, src_val, old);
+                    let x = self.s.m.select(c, is_src, dst_val, x);
+                    self.write_placed(inst, Reg::V(r), x, guard);
                 }
                 Ok(())
             }
@@ -7606,7 +7589,7 @@ mod tests {
         // v_movrelsd_2_b32 v2, v1: VGPR[2 + M0[25:16]] = VGPR[1 + M0[9:0]]
         lowers(
             &[
-                0xBE80_0380, // s_mov_b32 s0, 0  (M0 = 0)
+                0xBEFC_0380, // s_mov_b32 m0, 0
                 0x7E04_9101, // v_movrelsd_2_b32 v2, v1
                 S_ENDPGM,
             ],
@@ -7620,7 +7603,7 @@ mod tests {
         // v_swaprel_b32 v2, v4: swaps v[2 + M0[25:16]] ↔ v[4 + M0[9:0]]
         lowers(
             &[
-                0xBE80_0380, // s_mov_b32 s0, 0  (M0 = 0)
+                0xBEFC_0380, // s_mov_b32 m0, 0
                 0x7E04_D104, // v_swaprel_b32 v2, v4: swaps v[2+m0] ↔ v[4+m0]
                 S_ENDPGM,
             ],
@@ -7634,7 +7617,7 @@ mod tests {
         // s_movrelsd_2_b32 s0, s2: SGPR[0 + M0[25:16]] = SGPR[2 + M0[9:0]]
         lowers(
             &[
-                0xBE80_0380, // s_mov_b32 s0, 0  (M0 = 0)
+                0xBEFC_0380, // s_mov_b32 m0, 0
                 0xBE80_4902, // s_movrelsd_2_b32 s0, s2
                 S_ENDPGM,
             ],
@@ -7648,7 +7631,7 @@ mod tests {
         // v_movrels_b32 (src indexed) and v_movreld_b32 (dst indexed).
         lowers(
             &[
-                0xBE80_0380, // s_mov_b32 s0, 0        (M0 = 0)
+                0xBEFC_0380, // s_mov_b32 m0, 0
                 0x7E00_8704, // v_movrels_b32 v0, v4   (src-indexed read)
                 0x7E04_8501, // v_movreld_b32 v2, v1   (dst-indexed write)
                 S_ENDPGM,
