@@ -1924,6 +1924,157 @@ mod tests {
         assert_eq!(ix, [0, 7, 1, 6, 2, 5, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]);
     }
 
+    /// `bc7_pack` read back by a BC7 reader written from the public mode
+    /// table: mode prefix, partition, rotation and index-selection bits,
+    /// colour and alpha widths, per-endpoint and shared p-bits, and index
+    /// widths with one bit fewer at each anchor. Every mode, every partition,
+    /// each rotation and both index selections give back the endpoints and
+    /// indices that went in, in exactly 128 bits.
+    #[test]
+    fn bc7_blocks_follow_the_public_layout() {
+        // Subsets, partition bits, rotation bits, index-selection bits,
+        // colour bits, alpha bits, endpoint p-bits, shared p-bits, index
+        // bits, secondary index bits.
+        const MODES: [[u32; 10]; 8] = [
+            [3, 4, 0, 0, 4, 0, 1, 0, 3, 0],
+            [2, 6, 0, 0, 6, 0, 0, 1, 3, 0],
+            [3, 6, 0, 0, 5, 0, 0, 0, 2, 0],
+            [2, 6, 0, 0, 7, 0, 1, 0, 2, 0],
+            [1, 0, 2, 1, 5, 6, 0, 0, 2, 3],
+            [1, 0, 2, 0, 7, 8, 0, 0, 2, 2],
+            [1, 0, 0, 0, 7, 7, 1, 0, 4, 0],
+            [2, 6, 0, 0, 5, 5, 1, 0, 2, 0],
+        ];
+        struct Reader(u128, u32);
+        impl Reader {
+            fn take(&mut self, n: u32) -> u16 {
+                let v = (self.0 >> self.1) as u16 & ((1u32 << n) - 1) as u16;
+                self.1 += n;
+                v
+            }
+        }
+        let mut seed = 0x6a09_e667_f3bc_c908u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for mode in 0..8u16 {
+            let [ns, pb, rb, isb, cb, ab, epb, spb, ib, ib2] = MODES[usize::from(mode)];
+            let pbit = epb + spb;
+            for round in 0..64u16 {
+                let part = round & ((1 << pb) - 1);
+                let rot = if rb > 0 { round / 2 % 4 } else { 0 };
+                let sel = if isb > 0 { round % 2 } else { 0 };
+                let ctrl = mode | rot << 3 | sel << 5 | (ns as u16) << 6 | part << 8;
+                let prec = bc7_precision(ctrl);
+                let mut ep = Bc7Ep {
+                    ctrl,
+                    ..Default::default()
+                };
+                for row in ep.rows.iter_mut().take(ns as usize) {
+                    for (c, v) in row.iter_mut().enumerate() {
+                        let p = prec[c / 2];
+                        *v = if p == 0 {
+                            0
+                        } else {
+                            next() as u16 & 0xffff << (16 - p)
+                        };
+                    }
+                }
+                let anchors: Vec<usize> = match ns {
+                    2 => vec![0, usize::from(ANCHOR2[usize::from(part)])],
+                    3 => vec![
+                        0,
+                        usize::from(ANCHOR3A[usize::from(part)]),
+                        usize::from(ANCHOR3B[usize::from(part)]),
+                    ],
+                    _ => vec![0],
+                };
+                // The set written first: mode 4 leads with its 2-bit set.
+                let order = if mode == 4 { [1, 0] } else { [0, 1] };
+                let mut ix = Bc7Ix {
+                    bits: BC7_INDEX[usize::from(mode)],
+                    ..Default::default()
+                };
+                assert_eq!(
+                    [ix.bits[order[0]], ix.bits[order[1]]].map(u32::from),
+                    [ib, ib2],
+                    "mode {mode} index bits"
+                );
+                for set in 0..2 {
+                    let bits = u32::from(ix.bits[set]);
+                    if bits == 0 {
+                        continue;
+                    }
+                    for (p, v) in ix.ix[set].iter_mut().enumerate() {
+                        let first = set == order[0] && anchors.contains(&p) || p == 0;
+                        let n = bits - u32::from(first);
+                        *v = (next() & ((1 << n) - 1)) as i16;
+                    }
+                }
+                let mut out = [0u8; 16];
+                bc7_pack(&ep, &ix, prec, &mut out);
+
+                let mut r = Reader(u128::from_le_bytes(out), 0);
+                let what = format!("mode {mode} part {part} rot {rot} sel {sel}");
+                assert_eq!(r.take(u32::from(mode) + 1), 1 << mode, "{what}");
+                assert_eq!(r.take(pb), part, "{what}");
+                assert_eq!(r.take(rb), rot, "{what}");
+                assert_eq!(r.take(isb), sel, "{what}");
+                let ends = 2 * ns as usize;
+                let mut got = [[0u16; 6]; 4];
+                for (ch, g) in got.iter_mut().enumerate() {
+                    let width = if ch < 3 { cb } else { ab };
+                    for v in g.iter_mut().take(if width > 0 { ends } else { 0 }) {
+                        *v = r.take(width);
+                    }
+                }
+                let mut p = [0u16; 6];
+                for e in 0..ends {
+                    if epb > 0 {
+                        p[e] = r.take(1);
+                    } else if spb > 0 && e % 2 == 0 {
+                        p[e] = r.take(1);
+                        p[e + 1] = p[e];
+                    }
+                }
+                if pbit > 0 {
+                    for e in 0..ends {
+                        got[0][e] = got[0][e] << 1 | p[e];
+                    }
+                }
+                if rot != 0 {
+                    got.swap(3, usize::from(rot) - 1);
+                }
+                for (ch, g) in got.iter().enumerate() {
+                    let w = prec[ch];
+                    for (e, &v) in g.iter().enumerate().take(if w > 0 { ends } else { 0 }) {
+                        let mut want = ep.rows[e / 2][2 * ch + e % 2] >> (16 - w);
+                        if ch == 0 && spb > 0 {
+                            // The shared p-bit is the subset's first endpoint's.
+                            want = want & !1 | ep.rows[e / 2][0] >> (16 - w) & 1;
+                        }
+                        assert_eq!(v, want, "{what} channel {ch} endpoint {e}");
+                    }
+                }
+                for (k, set) in order.into_iter().enumerate() {
+                    let bits = u32::from(ix.bits[set]);
+                    if bits == 0 {
+                        continue;
+                    }
+                    for (q, &want) in ix.ix[set].iter().enumerate() {
+                        let anchor = if k == 0 { anchors.contains(&q) } else { q == 0 };
+                        let v = r.take(bits - u32::from(anchor));
+                        assert_eq!(v as i16, want, "{what} set {set} pixel {q}");
+                    }
+                }
+                assert_eq!(r.1, 128, "{what}");
+            }
+        }
+    }
+
     /// Compares with reference outputs made outside the repository:
     /// `VICTORY_BCPACK_CASES`, a directory of `<name>.bc<n>` packed chunks
     /// with `<name>.out` beside them. The tables are the built-in ones unless
