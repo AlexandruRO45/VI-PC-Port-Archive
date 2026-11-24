@@ -84,7 +84,14 @@ pub extern "system" fn CreateWindowExW(
     } else {
         asked
     };
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let wide = parent
+        .is_null()
+        .then(caption)
+        .flatten()
+        .map(|c| c.encode_utf16().chain([0]).collect::<Vec<u16>>());
+    let name = wide.as_ref().map_or(name, |c| c.as_ptr());
+    // SAFETY: the title's own arguments, forwarded (the size fitted, the
+    // caption replaced by `wide`, which outlives the call).
     let hwnd = unsafe {
         wm::CreateWindowExW(
             at.ex_style,
@@ -126,7 +133,10 @@ pub extern "system" fn CreateWindowExA(
     } else {
         asked
     };
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let narrow = parent.is_null().then(caption).flatten().map(|c| ansi(&c));
+    let name = narrow.as_ref().map_or(name, |c| c.as_ptr());
+    // SAFETY: the title's own arguments, forwarded (the size fitted, the
+    // caption replaced by `narrow`, which outlives the call).
     let hwnd = unsafe {
         wm::CreateWindowExA(
             at.ex_style,
@@ -145,6 +155,50 @@ pub extern "system" fn CreateWindowExA(
     };
     hook(hwnd);
     hwnd
+}
+
+/// `VICTORY_CAPTION`, which replaces the caption of the title's top-level
+/// windows as it does that of the window `victory-gpu` presents in.
+fn caption() -> Option<String> {
+    std::env::var("VICTORY_CAPTION").ok()
+}
+
+/// `text` in the ANSI code page, NUL-terminated, as `CreateWindowExA`
+/// takes it (a character the code page lacks becomes its default one).
+fn ansi(text: &str) -> Vec<u8> {
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Globalization::{CP_ACP, WideCharToMultiByte};
+    let wide: Vec<u16> = text.encode_utf16().filter(|&c| c != 0).collect();
+    let Ok(len) = i32::try_from(wide.len()) else {
+        return vec![0];
+    };
+    // SAFETY: sizing call, then a call with room for `n` bytes.
+    let mut narrow = unsafe {
+        let n = WideCharToMultiByte(
+            CP_ACP,
+            0,
+            wide.as_ptr(),
+            len,
+            null_mut(),
+            0,
+            null(),
+            null_mut(),
+        );
+        let mut narrow = vec![0u8; usize::try_from(n).unwrap_or(0)];
+        WideCharToMultiByte(
+            CP_ACP,
+            0,
+            wide.as_ptr(),
+            len,
+            narrow.as_mut_ptr(),
+            n,
+            null(),
+            null_mut(),
+        );
+        narrow
+    };
+    narrow.push(0);
+    narrow
 }
 
 /// Puts our procedure in front of the title's.
@@ -335,6 +389,20 @@ mod tests {
         UnregisterAppStateChangeNotification(a);
         let left: Vec<_> = routines().iter().map(|r| r.0).collect();
         assert_eq!(left, [b]);
+    }
+
+    #[test]
+    fn an_ansi_caption_is_in_the_code_page_and_terminated() {
+        assert_eq!(ansi("Neutral caption"), b"Neutral caption\0");
+        assert_eq!(ansi("a\0b"), b"ab\0");
+        assert_eq!(ansi(""), b"\0");
+        // Not passed on as UTF-8 bytes (unless the code page is UTF-8):
+        // one byte per character, whatever the code page makes of it.
+        use windows_sys::Win32::Globalization::{CP_UTF8, GetACP};
+        // SAFETY: a plain query.
+        if unsafe { GetACP() } != CP_UTF8 {
+            assert_eq!(ansi("caf\u{e9}").len(), 5);
+        }
     }
 
     #[test]
