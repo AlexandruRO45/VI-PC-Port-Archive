@@ -547,7 +547,17 @@ impl<'a> Lower<'a> {
                 };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            // A wave64 shader that uses lane-order-dependent operations, or
+            // shares LDS within one wave, cannot run correctly on a wave32
+            // device.  Declare the required wave size so D3D12 refuses the
+            // pipeline cleanly instead of letting the GPU execute the shader
+            // in wave32 mode, where the lane masks and cross-lane reads are
+            // wrong and the shader may loop forever (TDR / device hung).
+            //
+            // All wave64 shaders get wave_size declared: even shaders without
+            // explicit cross-lane ops may use wave-size-dependent control flow
+            // (e.g. exec mask handling) that hangs on wave32 hardware.
+            if x.native.wave64 || console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
         }
@@ -561,6 +571,12 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
+            // A wave64 mesh shader cannot run correctly on a wave32 device:
+            // declare the required wave size so D3D12 refuses the pipeline
+            // cleanly instead of hanging the GPU (TDR) on wave32 hardware.
+            if x.native.wave64 {
+                s.wave_size = Some(64);
+            }
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
