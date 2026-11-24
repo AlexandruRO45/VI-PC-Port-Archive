@@ -883,8 +883,9 @@ mod tests {
             let store_w0 = 0xF020_0008u32 | (u32::from(dmask) << 8);
             let store_w1 = 4u32 | (1 << 16) | (u32::from(d16) << 31);
             let words = [
-                0xF40C_0101u32,
-                0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], 0x0
+                0xBE81_0380u32, // s_mov_b32 s1, 0
+                0xF40C_0100,
+                0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
                 0x7E00_0280, // v_mov_b32 v0, 0
                 0x7E02_0281, // v_mov_b32 v1, 1
                 0x7E04_0282, // v_mov_b32 v2, 2
@@ -902,9 +903,9 @@ mod tests {
                 layout: vec![RootParam {
                     root: RootType::Table,
                     table_offset_dwords: 0,
-                    sgprs: 2,
+                    sgprs: 1,
                     base_register: 0,
-                    user_data: 2,
+                    user_data: 0,
                     slot: 0,
                 }],
                 used: vec![UsedResource {
@@ -914,7 +915,7 @@ mod tests {
                     lower_bound: 0,
                     stride: 0,
                     dwords: 8,
-                    user_data: 2,
+                    user_data: 0,
                     slot: 0,
                 }],
                 io: StageIo::Cs(ComputeIo {

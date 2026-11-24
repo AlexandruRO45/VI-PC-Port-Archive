@@ -30,15 +30,4 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
-        shell: bash
-        env:
-          CARGO_TERM_COLOR: never
-        run: |
-          set +e
-          set -o pipefail
-          cargo test --workspace --locked 2>&1 | tee /tmp/test.log
-          rc=$?
-          if [ "$rc" -ne 0 ]; then
-            awk '/^failures:/{flag=1} flag && NF{print "::error::" $0}' /tmp/test.log | head -n 10
-            exit "$rc"
-          fi
+        run: cargo test --workspace --locked

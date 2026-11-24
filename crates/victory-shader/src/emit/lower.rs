@@ -8344,11 +8344,13 @@ impl<'a> Lower<'a> {
                     self.x.st.masks.contains_key(&arg) || self.x.st.highs.contains_key(&arg);
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    // Register reuse puts a dead lane-mask dword on one edge of
-                    // a data join while another edge carries real data (#878).
-                    (_, false) if has_data && is_mask => self.s.m.undef(self.s.t.i32),
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+                    }
+                    // Register reuse puts a dead lane-mask dword on one edge of
+                    // a data join while another edge carries real data (#878).
+                    (Some(Val::Missing(_)), false) if has_data && is_mask => {
+                        self.s.m.undef(self.s.t.i32)
                     }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
