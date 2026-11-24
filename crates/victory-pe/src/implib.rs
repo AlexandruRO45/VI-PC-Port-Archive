@@ -122,8 +122,8 @@ impl ImportLibrary {
             if consumed[index] {
                 continue;
             }
-            if let Some((_, size, ordinal, flags)) = import_header(member) {
-                if size == 0 {
+            if let Some((_, size, ordinal, flags)) = import_header(member)
+                && size == 0 {
                     // Long-format descriptor. Its DLL and export names live
                     // in the COFF object(s) that follow the null members.
                     consumed[index] = true;
@@ -172,7 +172,6 @@ impl ImportLibrary {
                     }
                     continue;
                 }
-            }
             match ImportFile::parse(&member[..]) {
                 Ok(import) => {
                     lib.imports.push(LibImport {
