@@ -125,6 +125,7 @@ fn synthetic_presentx() {
         (original, ORIGINAL_SIZE),
         (original, ORIGINAL_SIZE),
         (resized, RESIZED_SIZE),
+        (original, ORIGINAL_SIZE),
     ]
     .into_iter()
     .enumerate()
@@ -133,8 +134,15 @@ fn synthetic_presentx() {
             assert_eq!(reset(list, allocator, null(), 0), S_OK);
         }
         crate::descriptor::create_rtv(device, target, null(), handle);
-        clear(list, handle, &[1.0, 0.0, 1.0, 1.0], 0, null());
-        if frame != 0 {
+        // A distinct color proves that returning to the original extent
+        // presents fresh content from the reused target.
+        let color = if frame == 3 {
+            [0.0, 0.0, 1.0, 1.0]
+        } else {
+            [1.0, 0.0, 1.0, 1.0]
+        };
+        clear(list, handle, &color, 0, null());
+        if matches!(frame, 1 | 2) {
             let viewport = D3D12_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
@@ -192,7 +200,7 @@ fn synthetic_presentx() {
             let presenter = guard.as_ref().expect("swap chain created");
             // SAFETY: the presenter owns the live swap chain.
             let next = unsafe { presenter.swap_chain.GetCurrentBackBufferIndex() };
-            let previous = if frame == 2 { 0 } else { frame as u32 };
+            let previous = if frame >= 2 { 0 } else { frame as u32 };
             assert_eq!(next, (previous + 1) % BUFFERS);
         }
     }
@@ -244,6 +252,7 @@ pub(super) fn check_pixels(
     let expected = match frame {
         1 => [255, 0, 255, 255],
         2 | 3 => [0, 255, 0, 255],
+        4 => [0, 0, 255, 255],
         _ => panic!("unexpected frame {frame}"),
     };
     let layout = footprint.Footprint;
