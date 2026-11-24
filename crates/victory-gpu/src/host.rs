@@ -1331,9 +1331,17 @@ fn pass_cost(runs: &[&HostList], gpu: std::time::Duration) {
     let mut worst: Vec<(&String, &(u64, u64))> = map.iter().collect();
     worst.sort_by_key(|(_, (us, _))| std::cmp::Reverse(*us));
     // Logged once a second of accounted time, which is often enough to watch
-    // and rare enough to read.
+    // and rare enough to read. A run whose frames are almost all pipeline
+    // construction charges less than that in its whole life and reports
+    // nothing at all, which reads as "not measured" on exactly the frames
+    // worth asking about: `VICTORY_PASS_COST_MIN_US` lowers the threshold
+    // (microseconds of charged submission time) so those runs still answer.
     let total: u64 = worst.iter().map(|(_, (us, _))| us).sum();
-    if total < 1_000_000 {
+    let min_us = std::env::var("VICTORY_PASS_COST_MIN_US")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000);
+    if total < min_us {
         return;
     }
     // No span yet means nothing has been measured: the first line of a run must
