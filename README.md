@@ -130,6 +130,8 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `VICTORY_LIST_SPLIT=<n>` | cut a title list into more host lists before its estimated GPU weight (a draw 1, a dispatch 2, a mesh dispatch 16) reaches `n`, replaying render targets, viewports, scissors and roots; keeps each submission under the GPU watchdog |
+| `VICTORY_MESH_BUDGET=<n>` | record at most `n` mesh dispatches per host list and drop the rest (faster and safer, but missing geometry; prefer `VICTORY_LIST_SPLIT`) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries; works in release builds too); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_SHADER_SPIN_LIMIT=<n>` | loops that only reread memory until another workgroup or queue changes it (spin waits) stop after `n` iterations per lane instead of 4096 (own shader cache entries); `1048576` restores the general limit for them |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |

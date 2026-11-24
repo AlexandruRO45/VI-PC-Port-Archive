@@ -341,6 +341,9 @@ pub(crate) struct HostList {
     /// Mesh dispatches recorded so far, for `VICTORY_MESH_BUDGET`
     /// (diagnostics).
     recorded_mesh: AtomicU32,
+    /// Recorded work by estimated GPU cost, for `VICTORY_LIST_SPLIT`
+    /// (diagnostics).
+    weight: AtomicU32,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -523,6 +526,7 @@ impl Host {
                 budget: OnceLock::new(),
                 recorded: AtomicU32::new(0),
                 recorded_mesh: AtomicU32::new(0),
+                weight: AtomicU32::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -885,6 +889,30 @@ impl HostList {
                 .unwrap_or(0)
         });
         budget == 0 || self.recorded_mesh.fetch_add(1, Ordering::Relaxed) < budget
+    }
+
+    /// Records work by estimated GPU cost, for `VICTORY_LIST_SPLIT`.
+    pub(crate) fn add_weight(&self, n: u32) {
+        self.weight.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// The work recorded so far, by estimated GPU cost.
+    pub(crate) fn weight(&self) -> u32 {
+        self.weight.load(Ordering::Relaxed)
+    }
+
+    /// Whether the list should be split before the next command, for
+    /// `VICTORY_LIST_SPLIT` (diagnostics): the recorded weight at which a
+    /// list is cut. Unset or zero means no split.
+    pub(crate) fn wants_split(&self) -> bool {
+        static BUDGET: OnceLock<u32> = OnceLock::new();
+        let budget = *BUDGET.get_or_init(|| {
+            std::env::var("VICTORY_LIST_SPLIT")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        });
+        budget != 0 && self.weight() >= budget
     }
 
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
