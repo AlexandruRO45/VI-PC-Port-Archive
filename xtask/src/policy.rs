@@ -236,6 +236,7 @@ const PATHSPEC_ENV: &[&str] = &[
 /// `GIT_DEFAULT_HASH=sha256` makes repositories that the SHA-1 object ids
 /// tests stage are refused by. `GIT_ATTR_SOURCE` reads attributes from a
 /// tree-ish that a new repository does not have, and every command fails.
+/// Nor do they look for a repository above themselves.
 pub(crate) fn git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(root);
@@ -257,6 +258,15 @@ pub(crate) fn git_command(root: &Path) -> Command {
                 // Reads `.gitattributes` from that tree-ish instead of the
                 // working tree; a fresh repository has no HEAD to read.
                 .env_remove("GIT_ATTR_SOURCE");
+            // Git looks no further up than `root` itself: a directory that is
+            // not a repository is walked, not taken for part of whatever
+            // repository encloses it (the checkout, when the temporary
+            // directory is made beside the test binary). Git stops before
+            // entering a ceiling, so the ceiling is the parent.
+            #[cfg(unix)]
+            if let Some(parent) = root.is_absolute().then(|| root.parent()).flatten() {
+                command.env("GIT_CEILING_DIRECTORIES", parent);
+            }
         }
     }
     command
@@ -1086,6 +1096,61 @@ mod tests {
         // attribute source is the checkout's own business.
         let checkout = super::git_command(&crate::workspace_root());
         assert!(checkout.get_envs().all(|(key, _)| key != "GIT_ATTR_SOURCE"));
+    }
+
+    /// A temporary directory that is not a repository is walked. Made beside
+    /// the test binary, it used to be taken for an ignored part of the
+    /// checkout: `git ls-files` there succeeded, listed nothing, and the
+    /// check passed a directory it never read.
+    #[cfg(unix)]
+    #[test]
+    fn directories_outside_any_repository_are_walked() {
+        let outer = tempdir();
+        git_str(outer.path(), &["init", "-q"]);
+        std::fs::write(outer.path().join(".gitignore"), "plain/\n").unwrap();
+        let root = outer.path().join("plain");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("src/a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(root.join("target/game.bin"), b"MZ\x90\0build output").unwrap();
+        std::fs::write(root.join("game.bin"), b"MZ\x90\0a game executable").unwrap();
+
+        // Without the ceiling, as before: git finds the enclosing repository,
+        // where the directory is ignored and lists as empty.
+        let found = super::git_command(&root)
+            .env_remove("GIT_CEILING_DIRECTORIES")
+            .args([
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ])
+            .output()
+            .unwrap();
+        assert!(found.status.success());
+        assert!(found.stdout.is_empty());
+
+        let outside = super::git_command(&root)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .unwrap();
+        assert!(!outside.status.success(), "a repository above was found");
+        // The walk skips build output and lists in no fixed order.
+        let mut walked = names(&root, false);
+        walked.sort();
+        assert_eq!(walked, ["game.bin", "src/a.rs"]);
+        assert!(super::run(&root, false).is_err());
+        std::fs::remove_file(root.join("game.bin")).unwrap();
+        super::run(&root, false).unwrap();
+
+        // The checkout keeps git's own discovery.
+        let checkout = super::git_command(&crate::workspace_root());
+        assert!(
+            checkout
+                .get_envs()
+                .all(|(key, _)| key != "GIT_CEILING_DIRECTORIES")
+        );
     }
 
     const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1\n\
