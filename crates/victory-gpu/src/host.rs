@@ -240,6 +240,9 @@ fn create() -> anyhow::Result<Host> {
             // adapter offers when none can.
             let (chosen, _) = crate::adapter::open()?;
             device = Some(chosen);
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // Whether a GPU hang ends the run or freezes the PC (#1054).
+            crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
