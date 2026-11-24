@@ -139,8 +139,10 @@ impl Config {
         let home = home_dir(env);
         let file = match config_file(explicit_config(env, home.as_deref())?)? {
             Some(path) => {
-                let text = std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading {}", path.display()))?;
+                let bytes =
+                    std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+                let text =
+                    config_text(bytes).with_context(|| format!("reading {}", path.display()))?;
                 Some((path, text))
             }
             None => None,
@@ -303,6 +305,40 @@ fn parse_file(text: &str) -> Result<FileConfig> {
         misplaced.join(", "),
         if misplaced.len() == 1 { "it" } else { "them" }
     );
+}
+
+/// The text of a config file. Windows editors and shells save text in ways
+/// `read_to_string` and the TOML parser reject with messages that do not
+/// say what to change: Notepad's "UTF-8 with BOM" puts U+FEFF before the
+/// first key, and Windows PowerShell 5's `>` / `Out-File` (or Notepad's
+/// "Unicode") writes UTF-16, reported only as "stream did not contain valid
+/// UTF-8". A UTF-8 byte order mark is dropped (it is not part of the
+/// text); UTF-16, with or without a mark, and other non-UTF-8 bytes are
+/// refused with the fix.
+fn config_text(bytes: Vec<u8>) -> Result<String> {
+    const SAVE_AS: &str = "save it as UTF-8 (in Notepad: Save As, Encoding: UTF-8; in \
+                           PowerShell: Set-Content -Encoding utf8)";
+    let utf16 = match bytes.as_slice() {
+        [0xFF, 0xFE, ..] | [0xFE, 0xFF, ..] => true,
+        // ASCII text in UTF-16 without a mark: every other byte is zero.
+        [a, 0, ..] | [0, a, ..] if a.is_ascii() && *a != 0 => true,
+        _ => false,
+    };
+    if utf16 {
+        anyhow::bail!("the file is UTF-16 text, not UTF-8: {SAVE_AS}");
+    }
+    let bytes = match bytes.strip_prefix(b"\xEF\xBB\xBF") {
+        Some(rest) => rest.to_vec(),
+        None => bytes,
+    };
+    String::from_utf8(bytes).map_err(|e| {
+        let at = e.utf8_error().valid_up_to();
+        let line = 1 + e.as_bytes()[..at].iter().filter(|&&b| b == b'\n').count();
+        anyhow::anyhow!(
+            "line {line} is not UTF-8 text (byte {at}, perhaps a path typed in another \
+             encoding): {SAVE_AS}"
+        )
+    })
 }
 
 /// `VICTORY_CONFIG`, empty counting as unset, with a leading `~` as the
@@ -1830,6 +1866,50 @@ mod tests {
                 .to_string();
             assert!(err.contains(var), "{err}");
         }
+    }
+
+    #[test]
+    fn config_text_drops_a_utf8_byte_order_mark() {
+        let text = config_text(b"\xEF\xBB\xBF[paths]\ngame_dir = 'g'\n".to_vec()).unwrap();
+        assert_eq!(text, "[paths]\ngame_dir = 'g'\n");
+        let parsed = parse_file(&text).unwrap();
+        assert_eq!(parsed.paths.game_dir, Some(PathBuf::from("g")));
+        // Only a leading mark: one later in the file is the TOML's business.
+        assert_eq!(config_text(b"a\xEF\xBB\xBF".to_vec()).unwrap(), "a\u{FEFF}");
+        assert_eq!(config_text(Vec::new()).unwrap(), "");
+        assert_eq!(config_text(b"\xEF\xBB\xBF".to_vec()).unwrap(), "");
+    }
+
+    #[test]
+    fn config_text_refuses_utf16() {
+        let encode = |le: bool, mark: bool| -> Vec<u8> {
+            let units = mark
+                .then_some(0xFEFF)
+                .into_iter()
+                .chain("[paths]\n".encode_utf16());
+            units
+                .flat_map(|u| if le { u.to_le_bytes() } else { u.to_be_bytes() })
+                .collect()
+        };
+        for le in [true, false] {
+            for mark in [true, false] {
+                let err = format!("{:#}", config_text(encode(le, mark)).unwrap_err());
+                assert!(err.contains("UTF-16"), "le={le} mark={mark}: {err}");
+                assert!(err.contains("save it as UTF-8"), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn config_text_names_the_line_that_is_not_utf8() {
+        // `é` in Latin-1, as an older editor would save a folder name.
+        let err = format!(
+            "{:#}",
+            config_text(b"[paths]\ngame_dir = '/jeux/\xE9t\xE9'\n".to_vec()).unwrap_err()
+        );
+        assert!(err.contains("line 2"), "{err}");
+        assert!(err.contains("save it as UTF-8"), "{err}");
+        assert!(!err.contains("UTF-16"), "{err}");
     }
 
     #[test]
