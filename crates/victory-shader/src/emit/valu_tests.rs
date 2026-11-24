@@ -712,15 +712,28 @@ const DS_MIN_RTN_F32: u8 = 0x32;
 const DS_MAX_RTN_F32: u8 = 0x33;
 const DS_READ_B32: u8 = 0x36;
 
-/// The ISA's `ds_max_f32` / `ds_min_f32` on a dword holding `old` with
-/// `data`: `DATA > tmp ? DATA : tmp` (min: `<`), -0 below +0.
-fn lds_min_max_ref(old: f32, data: f32, max: bool) -> f32 {
-    let key = |x: f32| {
-        let b = x.to_bits() as i32;
-        if b < 0 { i32::MIN - b - 1 } else { b }
+/// What RDNA2 writes for `ds_max_f32` / `ds_min_f32` over a dword holding
+/// `old` with `data` (bits), as measured on gfx1036 with f32 denormals kept:
+/// an sNaN, data first, then memory, is written quieted; otherwise a NaN
+/// loses to a number (two quiet NaNs give the data); numbers compare as
+/// floats with -0 below +0.
+fn lds_min_max_ref(old: u32, data: u32, max: bool) -> u32 {
+    let nan = |x: u32| x & 0x7FFF_FFFF > 0x7F80_0000;
+    let snan = |x: u32| nan(x) && x & 0x40_0000 == 0;
+    let key = |x: u32| {
+        let b = x as i32;
+        if b < 0 { b ^ 0x7FFF_FFFF } else { b }
     };
-    if data.is_nan() {
-        return old;
+    if snan(data) {
+        return data | 0x40_0000;
+    }
+    if snan(old) {
+        return old | 0x40_0000;
+    }
+    match (nan(data), nan(old)) {
+        (true, true) | (false, true) => return data,
+        (true, false) => return old,
+        (false, false) => {}
     }
     let take = if max {
         key(data) > key(old)
@@ -748,10 +761,19 @@ fn ds_min_max_f32_order_floats_and_return_the_old_value() {
         f32::MAX,
         f32::MIN,
     ];
+    // Quiet and signalling NaNs of both signs, in memory and as data.
+    let nans = [
+        0x7FC0_0000u32,
+        0xFFC0_0000,
+        0x7F80_0001,
+        0xFFA0_0000,
+        0x7FBF_FFFF,
+    ];
+    let bits: Vec<u32> = values.iter().map(|v| v.to_bits()).chain(nans).collect();
     let mut cases: Vec<[u32; 4]> = Vec::new();
-    for &old in &values {
-        for &data in values.iter().chain(&[f32::NAN, -f32::NAN]) {
-            cases.push([old.to_bits(), data.to_bits(), 0, 0]);
+    for &old in &bits {
+        for &data in &bits {
+            cases.push([old, data, 0, 0]);
         }
     }
     for (rtn, plain, max, what) in [
@@ -781,7 +803,7 @@ fn ds_min_max_f32_order_floats_and_return_the_old_value() {
                     let want = if old_result {
                         inp[0]
                     } else {
-                        lds_min_max_ref(old, data, max).to_bits()
+                        lds_min_max_ref(inp[0], inp[1], max)
                     };
                     assert_eq!(
                         got,
