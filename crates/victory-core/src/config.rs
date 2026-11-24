@@ -297,11 +297,14 @@ fn config_file(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
 /// The data folder holds what titles must keep and the cache may be deleted
 /// at any time, so data inside (or equal to) the cache would be lost with it.
 /// Easy to set up by accident, e.g. `VICTORY_CACHE_DIR=~/victory` with
-/// `VICTORY_DATA_DIR=~/victory/data`. Compared as written (no symlinks
-/// followed): the folders need not exist yet. The error says where each
-/// folder came from, so it is clear which setting caused it.
+/// `VICTORY_DATA_DIR=~/victory/data`. Compared without touching the disk
+/// (no symlinks followed; the folders need not exist yet), but with `.` and
+/// `..` folded away (see [`lexical`]): otherwise `~/.cache/victory/../data`
+/// would be refused although it is a sibling of the cache, and a cache of
+/// `~/victory/tmp/..` would not be seen to hold `~/victory/data`. The error
+/// says where each folder came from, so it is clear which setting caused it.
 fn ensure_data_outside_cache(cache_dir: &Path, data_dir: &Path, origins: &Origins) -> Result<()> {
-    if data_dir.starts_with(cache_dir) {
+    if lexical(data_dir).starts_with(lexical(cache_dir)) {
         anyhow::bail!(
             "the data folder {} (from {}) is inside the cache folder {} (from {}), which may \
              be deleted at any time; set VICTORY_DATA_DIR or [paths].data_dir to a folder \
@@ -313,6 +316,28 @@ fn ensure_data_outside_cache(cache_dir: &Path, data_dir: &Path, origins: &Origin
         );
     }
     Ok(())
+}
+
+/// `path` with `.` dropped and each `..` removing the component before it,
+/// without reading the disk. A `..` with nothing left to remove is kept
+/// (it cannot climb above the root, which [`Path::components`] already
+/// keeps first).
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Refuses a Windows drive path (`D:\games`, `D:/games`, `D:`) when the
@@ -698,6 +723,40 @@ mod tests {
             _ => None,
         };
         assert!(Config::resolve(FilePaths::default(), None, cache_in_data).is_ok());
+    }
+
+    #[test]
+    fn data_inside_the_cache_ignores_dot_dot() {
+        let with = |cache: PathBuf, data: PathBuf| {
+            move |k: &str| match k {
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let v = PathBuf::from(abs("v"));
+        // `v/cache/../data` is `v/data`, a sibling of the cache: allowed.
+        let sibling = with(v.join("cache"), v.join("cache").join("..").join("data"));
+        assert!(Config::resolve(FilePaths::default(), None, sibling).is_ok());
+        // A cache of `v/tmp/..` is `v`, which holds `v/./data`: refused.
+        let inside = with(v.join("tmp").join(".."), v.join(".").join("data"));
+        let err = Config::resolve(FilePaths::default(), None, inside)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inside the cache folder"), "{err}");
+    }
+
+    #[test]
+    fn lexical_folds_dot_and_dot_dot() {
+        let l = |p: &str| lexical(Path::new(p));
+        assert_eq!(l("a/./b/../c"), PathBuf::from("a/c"));
+        assert_eq!(l("../a/.."), PathBuf::from(".."));
+        assert_eq!(l("a/../../b"), PathBuf::from("../b"));
+        #[cfg(unix)]
+        {
+            assert_eq!(l("/../a"), PathBuf::from("/a"));
+            assert_eq!(l("/x/y/../../z"), PathBuf::from("/z"));
+        }
     }
 
     #[test]
