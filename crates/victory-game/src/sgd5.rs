@@ -41,9 +41,23 @@ pub fn is_sgd5(file: &[u8]) -> bool {
     memchr::memmem::find(file, MAGIC).is_some()
 }
 
-/// Every record in an SGD5 file, in file order.
+/// Every record in an SGD5 file, in file order. The search resumes after
+/// each record's packed bytes: a marker inside them (stored deflate blocks
+/// carry a container's bytes as they are) is part of that record.
 pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
-    memchr::memmem::find_iter(file, &MARKER).filter_map(|at| record(file, at))
+    let finder = memchr::memmem::Finder::new(&MARKER);
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        while let Some(found) = finder.find(&file[from..]) {
+            let at = from + found;
+            if let Some(r) = record(file, at) {
+                from = at + 12 + r.packed.len();
+                return Some(r);
+            }
+            from = at + 1;
+        }
+        None
+    })
 }
 
 fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
@@ -124,6 +138,28 @@ mod tests {
         assert!(is_sgd5(&archive));
         assert_eq!(records(&archive).count(), 2);
         assert!(!is_sgd5(&archive[..0x1000]));
+    }
+
+    #[test]
+    fn marker_inside_a_record_is_not_another_record() {
+        let inner = record_bytes("PS_inner", 0x32, b"inner container");
+        // Level 0: stored blocks, so the inner record's bytes appear as they are.
+        let packed = miniz_oxide::deflate::compress_to_vec(&inner, 0);
+        assert!(memchr::memmem::find(&packed, &MARKER).is_some());
+        let n = (packed.len() + 12) as u32;
+        let mut file = MAGIC.to_vec();
+        file.extend_from_slice(&[0xF4, 0x01, 0, 0, 9]);
+        file.extend_from_slice(b"PS_outer\0\x32");
+        for v in [n, 0x000D_DCE7, n, inner.len() as u32] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&packed);
+        file.extend(record_bytes("PS_after", 0x32, b"next"));
+
+        let found: Vec<_> = records(&file).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_outer"), Some("PS_after")]);
+        assert_eq!(found[0].unpack(), Some(inner));
     }
 
     #[test]
