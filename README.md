@@ -125,8 +125,6 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - **The game folder is never modified** – writes go to the overlay.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
-- `XCL_ACTIVITY=1` logs rendering, streaming and memory activity every two seconds. Under Wine,
-  the process commit figure is Wine's estimate from anonymous resident memory and swap.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
@@ -136,6 +134,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `null` if its format cannot be decoded. Intermediate render-target dumps do not update it.
   Sampling uses every fourth pixel in each direction (`XCL_FRAME_DUMP_FULL=1`: every pixel).
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
+- `XCL_ACTIVITY=1` logs rendering, streaming and memory activity every two seconds. Under Wine,
+  the process commit figure is Wine's estimate from anonymous resident memory and swap.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
