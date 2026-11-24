@@ -337,6 +337,11 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
+        if !list.allow_record() {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("list budget reached".into());
+            return false;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
@@ -497,6 +502,15 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
+            return;
+        }
+        if !list.allow_record() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::pipeline::note_drop(self.pipeline as This);
+                crate::pipeline::note_why("list budget reached".into());
+            }
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -941,6 +955,11 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
+            return false;
+        }
+        if !list.allow_record() {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("list budget reached".into());
             return false;
         }
         const DRAW: u32 = 0;

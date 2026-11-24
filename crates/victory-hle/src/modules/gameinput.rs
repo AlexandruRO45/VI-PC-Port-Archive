@@ -1201,7 +1201,7 @@ mod host {
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
+    /// 2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
@@ -1234,7 +1234,7 @@ mod host {
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+            .filter(|&&(at, _)| (at..at + Duration::from_secs(2)).contains(&now))
             .map(|&(_, vk)| vk)
             .collect()
     }

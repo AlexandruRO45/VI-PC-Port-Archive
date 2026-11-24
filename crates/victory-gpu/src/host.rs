@@ -336,6 +336,8 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Commands recorded so far, for `VICTORY_LIST_BUDGET` (diagnostics).
+    recorded: AtomicU32,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -516,6 +518,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                recorded: AtomicU32::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -851,6 +854,20 @@ impl Host {
 }
 
 impl HostList {
+    /// Whether another command may be recorded, for `VICTORY_LIST_BUDGET`
+    /// (diagnostics): a list longer than the budget is cut short so one
+    /// submission stays under the GPU watchdog. Unset or zero means no limit.
+    pub(crate) fn allow_record(&self) -> bool {
+        static BUDGET: OnceLock<u32> = OnceLock::new();
+        let budget = *BUDGET.get_or_init(|| {
+            std::env::var("VICTORY_LIST_BUDGET")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        });
+        budget == 0 || self.recorded.fetch_add(1, Ordering::Relaxed) < budget
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
