@@ -334,7 +334,9 @@ class TestFolder(unittest.TestCase):
 
             with mock.patch.object(T.os, "walk", walk), contextlib.redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(T.main([root, "--names", names, "--dry-run"]), 2)
-            self.assertIn(blocked, err.getvalue())
+            # OSError's own message prints the filename with %r, so on Windows every backslash is doubled:
+            # compare the repr, which is what the tool prints, not the raw path.
+            self.assertIn(repr(blocked), err.getvalue())
 
     def test_cli(self):
         r = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names, "--source", "story",
