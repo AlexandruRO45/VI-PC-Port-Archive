@@ -512,6 +512,13 @@ impl HostPipeline {
                 ..Default::default()
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            // A refusal that a later attempt at the same module survives is not
+            // a verdict on the module, so `VICTORY_SERIAL_PIPELINES=1` creates
+            // them one at a time: it separates a driver race from a
+            // description we build differently each attempt.
+            static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let serial = std::env::var_os("VICTORY_SERIAL_PIPELINES")
+                .map(|_| ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner()));
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -519,15 +526,35 @@ impl HostPipeline {
                 // SAFETY: as above.
                 || unsafe { host.device.CreateComputePipelineState(&desc) },
             );
+            drop(serial);
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    // What the description carried, so a refusal and a later
+                    // creation of the same module can be compared: an empty
+                    // `CS` is the refusal this call cannot distinguish from a
+                    // module the driver dislikes.
+                    tracing::warn!(
+                        error = %e,
+                        ?shaders,
+                        cs_bytes = desc.CS.BytecodeLength,
+                        root = desc.pRootSignature.is_some(),
+                        node = desc.NodeMask,
+                        flags = desc.Flags.0,
+                        "host pipeline refused"
+                    );
                     host.log_messages();
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host pipeline");
+            tracing::info!(
+                ?shaders,
+                cs_bytes = desc.CS.BytecodeLength,
+                root = desc.pRootSignature.is_some(),
+                node = desc.NodeMask,
+                flags = desc.Flags.0,
+                "host pipeline"
+            );
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
@@ -663,12 +690,32 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                // What the description carried, as the compute path logs it: a
+                // refusal and a later creation of the same pair can then be
+                // compared instead of guessed at.
+                tracing::warn!(
+                    error = %e,
+                    ?shaders,
+                    vs_bytes = desc.VS.BytecodeLength,
+                    ps_bytes = desc.PS.BytecodeLength,
+                    root = desc.pRootSignature.is_some(),
+                    node = desc.NodeMask,
+                    flags = desc.Flags.0,
+                    "host pipeline refused"
+                );
                 host.log_messages();
                 return None;
             }
         };
-        tracing::info!(?shaders, "host pipeline");
+        tracing::info!(
+            ?shaders,
+            vs_bytes = desc.VS.BytecodeLength,
+            ps_bytes = desc.PS.BytecodeLength,
+            root = desc.pRootSignature.is_some(),
+            node = desc.NodeMask,
+            flags = desc.Flags.0,
+            "host pipeline"
+        );
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -920,6 +967,30 @@ mod tests {
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
+        );
+    }
+
+    /// What the refusal log's fields are for: a compute description with no
+    /// bytecode is refused by the device, so `cs_bytes = 0` on a refusal names
+    /// an empty `CS` rather than a module the driver dislikes.
+    #[test]
+    fn a_compute_pipeline_with_no_bytecode_is_refused() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let (root, _) = root_signature(&host.device, &[], &[], true).unwrap();
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the description never releases.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            CS: D3D12_SHADER_BYTECODE::default(),
+            ..Default::default()
+        };
+        assert_eq!(desc.CS.BytecodeLength, 0, "the field the refusal log prints");
+        // SAFETY: a description over live data; the call is expected to fail.
+        let made = unsafe { host.device.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+        assert!(
+            made.is_err(),
+            "an empty CS must be refused, or cs_bytes = 0 on a refusal says nothing"
         );
     }
 }
