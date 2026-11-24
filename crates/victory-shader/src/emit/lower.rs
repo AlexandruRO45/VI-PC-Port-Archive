@@ -8866,7 +8866,7 @@ mod tests {
     }
 
     #[test]
-    fn one_dynamic_heap_slot_cannot_be_both_a_cbv_and_a_raw_srv() {
+    fn one_dynamic_heap_slot_read_as_cbv_and_raw_srv_is_read_raw() {
         let words = [
             0xBE84_0301, // s_mov_b32 s4, s1
             0xBE85_0380, // s_mov_b32 s5, 0
@@ -8904,13 +8904,8 @@ mod tests {
             user_data: 1,
             slot: 1,
         }];
-        assert!(matches!(
-            lower_with(&words, layout, used),
-            Err(crate::ShaderError::Unsupported {
-                what: "one GPU-indexed buffer needs both a CBV and a raw SRV",
-                ..
-            })
-        ));
+        // Local build: the scalar (constant) read goes through the same raw view.
+        assert!(lower_with(&words, layout, used).is_ok());
     }
 
     #[test]
