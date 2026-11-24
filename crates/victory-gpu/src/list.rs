@@ -482,8 +482,8 @@ pub(crate) struct CopyLocation {
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// buffer filled at submission; texture to buffer into the title buffer's
+/// host copy, copied back into title memory once the list has run.
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -507,8 +507,7 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            copy_texture_to_buffer(list, dst, x, y, z, src, source_box);
             return;
         };
         let mut from = src;
@@ -604,6 +603,107 @@ extern "system" fn copy_texture_region_x(
     _flags: u32,
 ) {
     copy_texture_region(this, dst, x, y, z, src, source_box);
+}
+
+#[cfg(windows)]
+fn copy_texture_to_buffer(
+    list: &crate::host::HostList,
+    dst: CopyLocation,
+    x: u32,
+    y: u32,
+    z: u32,
+    src: CopyLocation,
+    source_box: *const [u32; 6],
+) {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
+    use windows::core::Interface;
+    const FOOTPRINT: u32 = 1;
+
+    let Some(from_texture) = crate::resource::host_resource(src.resource) else {
+        return;
+    };
+    if dst.kind != FOOTPRINT {
+        tracing::warn!(kind = dst.kind, "texture to buffer copy with non-footprint destination");
+        return;
+    }
+    let Some((data, size)) = crate::resource::buffer_bytes(dst.resource) else {
+        tracing::warn!(?dst.resource, "texture to buffer copy with non-buffer destination");
+        return;
+    };
+
+    let src_desc = crate::resource::texture_memory(src.resource).map(|(_, d)| d);
+    let (footprint, bytes) = match crate::resource::compute_copy_footprint(&dst.footprint, src_desc.as_ref()) {
+        Ok(res) => res,
+        Err(e) => {
+            tracing::warn!(?e, "texture to buffer copy invalid footprint; dropping");
+            return;
+        }
+    };
+
+    let Some(title_address) = (data as u64).checked_add(footprint.offset) else {
+        return;
+    };
+    let Some(end) = footprint.offset.checked_add(bytes) else {
+        return;
+    };
+    if end > size {
+        tracing::warn!(offset = footprint.offset, bytes, size, "texture to buffer copy outside buffer bounds");
+        return;
+    }
+
+    let Some(shadow) = crate::shadow::find(title_address, bytes) else {
+        tracing::warn!(title_address = format_args!("{title_address:#x}"), bytes, "no host copy for buffer");
+        return;
+    };
+
+    let buffer_offset = shadow.offset(title_address);
+    if buffer_offset % 512 != 0 {
+        tracing::warn!(buffer_offset, "texture to buffer copy offset not 512-byte aligned; dropping");
+        return;
+    }
+
+    if crate::texture::title_written(from_texture) {
+        crate::texture::upload(list, src.resource, from_texture);
+    }
+    ensure_state(list, src.resource, COPY_SOURCE);
+
+    shadow.refresh(list, title_address, bytes);
+    shadow.gpu_writes(list, title_address, bytes);
+
+    let mut from_location = src;
+    from_location.resource = from_texture.as_raw().cast_const().cast();
+
+    let mut to_location = dst;
+    to_location.resource = shadow.buffer.as_raw().cast_const().cast();
+    to_location.kind = FOOTPRINT;
+    to_location.footprint = footprint;
+    to_location.footprint.offset = buffer_offset;
+
+    let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| {
+        format!(
+            "copy texture to buffer: dst {:?} offset {:#x} pitch {} at {x},{y},{z} from {:?} box {:?}",
+            dst.resource,
+            buffer_offset,
+            footprint.row_pitch,
+            src.resource,
+            host_box.map(|b| unsafe { *b })
+        )
+    });
+
+    const _: () = assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+    unsafe {
+        list.list.CopyTextureRegion(
+            (&raw const to_location).cast(),
+            x,
+            y,
+            z,
+            (&raw const from_location).cast(),
+            host_box,
+        )
+    };
 }
 
 extern "system" fn resolve(
