@@ -224,16 +224,16 @@ pub(crate) fn remapped(at: usize, len: usize) {
     /// Ranges kept until a pass takes them.
     const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
-    if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
+    if start >= end || end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
+    // Multiple writes to the same page and adjacent mappings all make the
+    // same slots due at the next pass. Keep their exact union in one entry.
     if let Some(last) = ranges.last_mut()
-        && last.1 == start
+        && merge_touching(last, (start, end))
     {
-        last.1 = end;
         return;
     }
     if ranges.len() >= MOST {
@@ -243,6 +243,15 @@ pub(crate) fn remapped(at: usize, len: usize) {
         ranges.clear();
     }
     ranges.push((start, end));
+}
+
+fn merge_touching(last: &mut (u64, u64), next: (u64, u64)) -> bool {
+    if next.0 >= next.1 || next.0 > last.1 || next.1 < last.0 {
+        return false;
+    }
+    last.0 = last.0.min(next.0);
+    last.1 = last.1.max(next.1);
+    true
 }
 
 /// Frames for which a slot a draw read through a table counts as a table's
@@ -2429,6 +2438,19 @@ mod tests {
 
     /// Memory the runtime maps under a slot's texture makes the slot due
     /// again from the next frame; a stale slot leaves the queue.
+    #[test]
+    fn repeated_and_reverse_page_notifications_preserve_the_exact_union() {
+        let mut range = (100, 200);
+        for next in [(100, 200), (120, 180), (90, 100), (70, 110), (190, 240), (240, 260)] {
+            assert!(super::merge_touching(&mut range, next));
+        }
+        assert_eq!(range, (70, 260));
+        for next in [(0, 69), (261, 300), (110, 110)] {
+            assert!(!super::merge_touching(&mut range, next));
+            assert_eq!(range, (70, 260));
+        }
+    }
+
     #[test]
     fn remapped_memory_makes_its_texture_slots_due() {
         let Some(heap) = HostHeap::new(false, 8) else {
