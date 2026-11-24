@@ -49,7 +49,9 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
    signatures, and hold no long hex/base64 runs. File names must be UTF-8,
    and submodules are refused. A symlink is checked as git stores it, as
    its target path. Exceptions need an entry with a reason in
-   `xtask/src/policy.rs`.
+   `xtask/src/policy.rs`, pinned to the BLAKE3 of the exempted content:
+   any other content at that path is refused, so a new version needs the
+   entry updated.
 3. At runtime, everything that writes derived data calls
    `victory_core::ensure_outside_repo`.
 4. Tests that need real files take their paths from environment variables

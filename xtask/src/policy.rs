@@ -27,9 +27,11 @@ const ALLOWED_NAMES: &[&str] = &[
     "LICENSE-APACHE",
 ];
 
-/// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
-const EXCEPTIONS: &[(&str, &str)] = &[(
+/// Paths explicitly exempted, each pinned to the BLAKE3 of the one content
+/// it is exempted for, with a reason. Keep this empty if at all possible.
+const EXCEPTIONS: &[(&str, &str, &str)] = &[(
     "crates/victory-formats/src/bcpack-tables.bin",
+    "f0f032aa310e7cfd431c075d2816decdd39d21b1927cbffc38386599c0de73c0",
     "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
 )];
 
@@ -53,9 +55,6 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
     let mut violations = Vec::new();
     for file in &files {
         let path = &file.name;
-        if EXCEPTIONS.iter().any(|(p, _)| p == path) {
-            continue;
-        }
         if !file.utf8_name {
             // Lossily decoded, so it could not be matched or read by name.
             violations.push(format!("{path}: file name is not valid UTF-8"));
@@ -68,6 +67,12 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
                 continue;
             }
         };
+        if let Some(problem) = exempt(path, &content) {
+            if let Err(problem) = problem {
+                violations.push(format!("{path}: {problem}"));
+            }
+            continue;
+        }
         for problem in check(path, &content) {
             violations.push(format!("{path}: {problem}"));
         }
@@ -341,6 +346,23 @@ fn staged_files(root: &Path) -> Result<Vec<File>> {
     Ok(files)
 }
 
+/// `None` if `path` has no exception; otherwise whether `content` is the
+/// content it was granted for. The exception covers that content only, so
+/// nothing else (an asset, an executable, a file of any size) can be
+/// committed under the exempted name.
+fn exempt(path: &str, content: &[u8]) -> Option<Result<(), String>> {
+    let (_, pinned, _) = EXCEPTIONS.iter().find(|(p, ..)| *p == path)?;
+    let actual = blake3::hash(content).to_hex();
+    Some(if actual.as_str() == *pinned {
+        Ok(())
+    } else {
+        Err(format!(
+            "exempted only with BLAKE3 {pinned}, but its content hashes to {actual}; \
+             a new version needs the owner's approval and its hash in xtask/src/policy.rs"
+        ))
+    })
+}
+
 /// All problems with one file. Pure, for testing.
 pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
@@ -502,6 +524,44 @@ mod tests {
         assert!(super::run(root, false).is_err());
         git_str(root, &["add", "dangling.rs"]);
         assert!(super::run(root, true).is_err());
+    }
+
+    /// An exception covers the content it was granted for, not whatever is
+    /// later committed under its name.
+    #[test]
+    fn exceptions_are_pinned_to_their_content() {
+        assert!(super::exempt("src/lib.rs", b"fn main() {}\n").is_none());
+        for (path, pinned, _) in super::EXCEPTIONS {
+            assert_eq!(pinned.len(), 64, "{path}: pin a full BLAKE3 hex digest");
+            let err = super::exempt(path, b"MZ\x90\0anything").unwrap();
+            assert!(err.is_err(), "{path}: other content passed");
+            assert!(super::exempt(path, b"").unwrap().is_err());
+        }
+    }
+
+    /// The full and staged checks both refuse new content at an exempted
+    /// path, which used to pass whatever it held.
+    #[cfg(unix)]
+    #[test]
+    fn exempted_paths_refuse_other_content() {
+        let (path, ..) = super::EXCEPTIONS[0];
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git_str(root, &["init", "-q"]);
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"MZ\x90\0a game executable").unwrap();
+        git_str(root, &["add", path]);
+        assert!(super::run(root, false).is_err());
+        assert!(super::run(root, true).is_err());
+
+        let real = crate::workspace_root().join(path);
+        if let Ok(content) = std::fs::read(real) {
+            std::fs::write(&file, content).unwrap();
+            git_str(root, &["add", path]);
+            super::run(root, false).unwrap();
+            super::run(root, true).unwrap();
+        }
     }
 
     /// A renamed file is checked under its new name, with its staged content.
