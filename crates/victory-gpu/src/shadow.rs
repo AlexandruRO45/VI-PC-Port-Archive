@@ -427,8 +427,16 @@ impl Shadow {
     /// Subtract pending GPU writes before planning observations so all of
     /// the readable pieces can share a fresh sample.
     pub(crate) fn update_ranges(&self, ranges: &[(usize, usize)]) -> usize {
+        let ready = self.ready(ranges);
+        self.update_ready(&ready)
+    }
+
+    /// The parts of sorted, disjoint title ranges that can be refreshed now:
+    /// cut to this copy, without the ranges shaders of the submission may
+    /// be writing.
+    pub(crate) fn ready(&self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
         let Some((&(first, _), &(_, last))) = ranges.first().zip(ranges.last()) else {
-            return 0;
+            return Vec::new();
         };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let mut pending = self
@@ -437,7 +445,7 @@ impl Shadow {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if pending.is_empty() && start <= first && first < last && last <= end {
-            return self.update_ready(ranges);
+            return ranges.to_vec();
         }
 
         pending.sort_unstable();
@@ -464,10 +472,28 @@ impl Shadow {
                 ready.push((from, to));
             }
         }
-        self.update_ready(&ready)
+        ready
     }
 
-    fn update_ready(&self, mut ranges: &[(usize, usize)]) -> usize {
+    /// Whether this copy's memory was found not write-watched.
+    pub(crate) fn not_watched(&self) -> bool {
+        self.watched.load(Ordering::Relaxed) == NOT_WATCHED
+    }
+
+    /// The oldest copy of `[from, to)` (see `watch_floor`), for a question
+    /// shared with other copies.
+    pub(crate) fn floor(&self, from: usize, to: usize) -> u64 {
+        self.watch_floor(from, to)
+    }
+
+    /// Brings `[from, to)` (ready, see [`Shadow::ready`]) up to date from an
+    /// answer for written pages asked over a span shared with other copies.
+    pub(crate) fn answered(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+        self.watched.store(WATCHED, Ordering::Relaxed);
+        self.update_watched(from, to, now, written)
+    }
+
+    pub(crate) fn update_ready(&self, mut ranges: &[(usize, usize)]) -> usize {
         let mut copied = 0;
         let mut allocation: Option<crate::watch::Allocation> = None;
         let mut failed_private_watch: Option<crate::watch::Allocation> = None;
