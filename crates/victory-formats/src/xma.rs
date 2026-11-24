@@ -488,12 +488,15 @@ impl Decoder {
     }
 
     /// Decodes one frame (`frame.data`, `frame.bits`) and appends
-    /// `FRAME_SAMPLES` interleaved samples per channel to `out`.
+    /// `FRAME_SAMPLES` interleaved samples per channel to `out`. A `bits`
+    /// past the end of `data` counts as the end of `data`.
     pub fn decode(&mut self, data: &[u8], bits: usize, out: &mut Vec<i16>) -> Result<(), Error> {
+        // Reads past `data` give zeros, and a stereo tile header of zeros
+        // never advances: only running past `end` stops it.
         let mut b = Bits {
             data,
             pos: 0,
-            end: bits,
+            end: bits.min(data.len().saturating_mul(8)),
         };
         let len = b.read(LENGTH_BITS) as usize;
         let result = self.frame(&mut b, len);
@@ -1218,6 +1221,20 @@ mod tests {
                 assert_eq!(out.len() - before, FRAME_SAMPLES * decoder.channels());
             }
             decoder.flush(&mut out);
+        }
+    }
+
+    #[test]
+    fn a_length_past_the_data_ends_at_the_data() {
+        // Zeros make a stereo tile header in which no channel takes the
+        // subframe, so it loops until the reader passes the frame's end.
+        for (data, bits) in [(&[][..], usize::MAX), (&[0u8; 16][..], 1 << 40)] {
+            for channels in [1, 2] {
+                let mut decoder = Decoder::new(channels, 48_000);
+                let mut out = Vec::new();
+                assert!(decoder.decode(data, bits, &mut out).is_err());
+                assert_eq!(out.len(), FRAME_SAMPLES * channels);
+            }
         }
     }
 
