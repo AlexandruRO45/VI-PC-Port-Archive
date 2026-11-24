@@ -1355,8 +1355,11 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 let sample = HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed) + 1;
                 if sample <= 8 || sample.is_power_of_two() {
+                    let extent = crate::descriptor::host::buffer_extent(&view);
+                    let writable = matches!(&view, View::Unordered(..) | View::Placed(true, ..));
+                    let placed = matches!(&view, View::Placed(..));
                     tracing::info!(sample, frame, index, heap = heap.start, address, len,
-                        refreshed_copy = shadow.id(),
+                        ?extent, writable, placed, refreshed_copy = shadow.id(),
                         "a heap buffer slot shows a different host resource from the one refreshed");
                 }
             }
