@@ -15,7 +15,7 @@ use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -1149,6 +1149,40 @@ impl<'a> Lower<'a> {
         Val::I32(self.s.m.extract(entry, r, index % 4))
     }
 
+    /// The ballot of a lane mask: its low and high dwords, taken in the block
+    /// that writes the mask (see [`MaskData`]). Cached, so every use of the
+    /// same mask reads one ballot.
+    fn ballot_pair(&mut self, lo: Value) -> Result<(V, V), Why> {
+        if let Some(&xy) = self.ballots.get(&lo) {
+            return Ok(xy);
+        }
+        let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        if !self.x.st.active.contains(&lo) {
+            return Err("a lane mask holding lanes elsewhere read as data");
+        }
+        let at = match self.def_block.get(&lo) {
+            // Program inputs (EXEC on entry).
+            None => self.s.entry,
+            Some(&b) if b == self.cur_ir => self.cur,
+            Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+        };
+        if !self.balloting.insert(lo) {
+            return Err("a lane mask whose lanes depend on its own value");
+        }
+        let bit = self.boolean(m, at);
+        self.balloting.remove(&lo);
+        let bit = bit?;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+        self.ballots.insert(lo, xy);
+        Ok(xy)
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
@@ -1156,37 +1190,37 @@ impl<'a> Lower<'a> {
             Some(&lo) => (lo, true),
             None => (v, false),
         };
-        let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        if !self.x.st.active.contains(&lo) {
-            return Err("a lane mask holding lanes elsewhere read as data");
-        }
-        let (x, y) = match self.ballots.get(&lo) {
-            Some(&xy) => xy,
-            None => {
-                let at = match self.def_block.get(&lo) {
-                    // Program inputs (EXEC on entry).
-                    None => self.s.entry,
-                    Some(&b) if b == self.cur_ir => self.cur,
-                    Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
-                };
-                if !self.balloting.insert(lo) {
-                    return Err("a lane mask whose lanes depend on its own value");
-                }
-                let bit = self.boolean(m, at);
-                self.balloting.remove(&lo);
-                let bit = bit?;
-                let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
-                self.ballots.insert(lo, xy);
-                xy
-            }
-        };
+        let (x, y) = self.ballot_pair(lo)?;
         Ok(if high { y } else { x })
+    }
+
+    /// Both ballot dwords of source `k` when it is a tracked lane mask.
+    fn mask_pair(&mut self, inst: &Inst, k: usize) -> Result<Option<(V, V)>, Why> {
+        // SOP1 (s_bcnt1, s_ff1) and VALU (v_mbcnt) both carry a source list.
+        let src: &[Operand] = match &inst.fields {
+            Fields::Valu(v) => &v.src,
+            Fields::Sop { src, .. } => src,
+            _ => return Ok(None),
+        };
+        let Some(&op) = src.get(k) else {
+            return Ok(None);
+        };
+        let read = match op {
+            Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)),
+            Operand::Vector { reg, .. } => inst.read(Reg::V(reg)),
+            // `exec` and `vcc` are special inline constants in the listing.
+            Operand::Const(252) => inst.read(Reg::S(EXEC)),
+            Operand::Const(251) => inst.read(Reg::S(VCC)),
+            _ => None,
+        };
+        let Some(value) = read else {
+            return Ok(None);
+        };
+        let lo = *self.x.st.highs.get(&value).unwrap_or(&value);
+        if !self.x.st.masks.contains_key(&lo) {
+            return Ok(None);
+        }
+        self.ballot_pair(lo).map(Some)
     }
 
     // ---- operands ----
@@ -1923,6 +1957,7 @@ impl<'a> Lower<'a> {
         if self.x.native.wave64 { 64 } else { 32 }
     }
 
+    /// `(1 << n) - 1`, all ones from 32 on: the lanes below `n`.
     fn lane_index(&mut self) -> V {
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
@@ -2552,11 +2587,42 @@ impl<'a> Lower<'a> {
             }
             "s_ff1_i32_b32" | "s_bcnt1_i32_b32" => {
                 // First set bit (-1 for zero, as DXIL's), or the bit count.
-                let a = src32(self, 0)?;
-                let op = if name == "s_ff1_i32_b32" { 32 } else { 31 };
-                let r = self
-                    .s
-                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
+                // A tracked mask is the whole host ballot, whatever the host's
+                // wave size, so both dwords count: on a 64-lane wave the lanes
+                // past the console's 32 are real. Any other scalar, and every
+                // console-wave mask, keeps the single dword below.
+                let pair = if self.mask_data == MaskData::Host && !self.x.native.wave64 {
+                    self.mask_pair(inst, 0)?
+                } else {
+                    None
+                };
+                let r = match pair {
+                    Some((x, y)) if name == "s_bcnt1_i32_b32" => {
+                        let i32t = self.s.t.i32;
+                        let nx = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[x]);
+                        let ny = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[y]);
+                        self.s.m.bin(c, Bin::Add, nx, ny)
+                    }
+                    Some((x, y)) => {
+                        // Lowest set bit of the pair: the low dword first, then
+                        // 32 + the high dword's, as s_ff1_i32_b64 does.
+                        let i32t = self.s.t.i32;
+                        let fx = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[x]);
+                        let fy = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[y]);
+                        let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+                        let fy32 = self.s.m.bin(c, Bin::Add, fy, k32);
+                        let yzero = self.s.m.cmp(c, pred::EQ, y, z);
+                        let fy = self.s.m.select(c, yzero, fy, fy32);
+                        let xset = self.s.m.cmp(c, pred::NE, x, z);
+                        self.s.m.select(c, xset, fx, fy)
+                    }
+                    None => {
+                        let a = src32(self, 0)?;
+                        let op = if name == "s_ff1_i32_b32" { 32 } else { 31 };
+                        self.s
+                            .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a])
+                    }
+                };
                 (r, None)
             }
             "s_bfe_u32" | "s_bfe_i32" => {
@@ -4883,6 +4949,16 @@ impl<'a> Lower<'a> {
             "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => {
                 // Bits of the mask's low (high) half below this lane, plus src1:
                 // with an all-ones mask, the lane index.
+                // A tracked mask is the whole host ballot, so the low form
+                // counts both dwords when the host may run 64 lanes.
+                let pair = if name == "v_mbcnt_lo_u32_b32"
+                    && self.mask_data == MaskData::Host
+                    && !self.x.native.wave64
+                {
+                    self.mask_pair(inst, 0)?
+                } else {
+                    None
+                };
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 // Mesh lanes are the console's by construction; pixel and
                 // vertex lanes are the host's, as their masks are.
@@ -4891,15 +4967,17 @@ impl<'a> Lower<'a> {
                     let Fields::Valu(v) = &inst.fields else {
                         unreachable!()
                     };
-                    let host = match v.src.first() {
-                        Some(&Operand::Const(193)) => true,
-                        Some(&Operand::Scalar { code, .. }) => {
-                            inst.read(Reg::S(code)).is_some_and(|m| {
-                                self.x.st.masks.contains_key(&m) || self.x.st.highs.contains_key(&m)
-                            })
-                        }
-                        _ => false,
-                    };
+                    let host = pair.is_some()
+                        || match v.src.first() {
+                            Some(&Operand::Const(193)) => true,
+                            Some(&Operand::Scalar { code, .. }) => {
+                                inst.read(Reg::S(code)).is_some_and(|m| {
+                                    self.x.st.masks.contains_key(&m)
+                                        || self.x.st.highs.contains_key(&m)
+                                })
+                            }
+                            _ => false,
+                        };
                     if !host {
                         return Err("v_mbcnt of a mask that is no ballot (console lane layout)");
                     }
@@ -4908,6 +4986,36 @@ impl<'a> Lower<'a> {
                     self.cross_lane(false)?;
                 }
                 let lane = self.lane_index();
+                if let Some((px, py)) = pair {
+                    // Lanes below this one, counted over the ballot's two
+                    // dwords: the low one below min(lane, 32), the high one
+                    // below the lanes past 31.
+                    let (k32, z) = (k(self, 32), k(self, 0));
+                    let under = self.s.m.cmp(c, pred::IULT, lane, k32);
+                    let lo_below = self.s.m.select(c, under, lane, k32);
+                    let hi_below = self.s.m.bin(c, Bin::Sub, lane, k32);
+                    let (one, ones) = (k(self, 1), k(self, u32::MAX));
+                    let below_mask = |l: &mut Self, n: V| -> V {
+                        let sh = m31(l, n);
+                        let m = l.s.m.bin(c, Bin::Shl, one, sh);
+                        let m = l.s.m.bin(c, Bin::Sub, m, one);
+                        let full = l.s.m.cmp(c, pred::IUGE, n, k32);
+                        l.s.m.select(c, full, ones, m)
+                    };
+                    let (mlo, mhi) = (below_mask(self, lo_below), below_mask(self, hi_below));
+                    let low = self.s.m.bin(c, Bin::And, px, mlo);
+                    let high = self.s.m.bin(c, Bin::And, py, mhi);
+                    let (i32t, count) = (self.s.t.i32, 31);
+                    let nl = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, count, &[low]);
+                    let nh = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, count, &[high]);
+                    let n = self.s.m.bin(c, Bin::Add, nl, nh);
+                    let _ = z;
+                    return Ok(self.s.m.bin(c, Bin::Add, n, b));
+                }
                 let below = if name == "v_mbcnt_lo_u32_b32" {
                     lane
                 } else {
