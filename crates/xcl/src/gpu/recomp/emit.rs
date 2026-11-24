@@ -3978,6 +3978,43 @@ impl Em {
                 self.write32(&dst, &t);
                 return Ok(());
             }
+            // forward permute: each active lane sends DATA0 to lane ((ADDR + offset) >> 2) mod
+            // the wave size; of several senders to one lane the highest wins, a lane nobody
+            // sends to gets 0 (no LDS memory is used). The receiver looks at every sender in
+            // lane order; split wave64: the halves first exchange their addresses and data.
+            "ds_permute_b32" => {
+                if self.opt.wave64 && self.opt.split_wave64 && matches!(self.opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
+                    // a 32-lane wave stands for a console wave whose lanes 32..63 do not exist
+                    return Err("ds_permute_b32 in a wave64 VS / PS that may run in 32-lane waves");
+                }
+                let (a, v) = (self.vreg(f("ADDR")), self.vreg(f("DATA0")));
+                let (el, eh) = (self.sreg(126), self.sreg(127));
+                let eh = if self.opt.wave64 { eh } else { "0u".into() };
+                let (n, m) = if self.opt.wave64 { (64, 63) } else { (32, 31) };
+                self.line(&format!("uint {t}_a = {a} + {off16}u;"));
+                self.line(&format!("uint {t} = 0u;"));
+                if self.x64() {
+                    self.x64_words = self.x64_words.max(64);
+                    self.line(&format!("xcl_x_put(WaveGetLaneIndex(), {t}_a); xcl_x_put(32u + WaveGetLaneIndex(), {v});"));
+                    self.line(&format!("bool {t}_ok = xcl_x_meet();"));
+                    self.line(&format!("[loop] for (uint {t}_k = 0u; {t}_k < 64u; {t}_k++) {{"));
+                    self.line(&format!("    uint {t}_kl = {t}_k & 31u; bool {t}_own = ({t}_k >> 5) == xcl_half;"));
+                    self.line(&format!("    uint {t}_sa = WaveReadLaneAt({t}_a, {t}_kl), {t}_sd = WaveReadLaneAt({v}, {t}_kl);"));
+                    self.line(&format!("    if (!{t}_own && {t}_ok) {{ {t}_sa = xcl_x_get({t}_kl); {t}_sd = xcl_x_get(32u + {t}_kl); }}"));
+                    self.line(&format!(
+                        "    if (({t}_own || {t}_ok) && lanebit_at({el}, {eh}, {t}_k) && (({t}_sa >> 2) & 63u) == lane_id) {t} = {t}_sd;"
+                    ));
+                    self.line("}");
+                } else {
+                    self.line(&format!("[loop] for (uint {t}_k = 0u; {t}_k < {n}u; {t}_k++) {{"));
+                    self.line(&format!("    uint {t}_sa = rla({t}_a, {t}_k), {t}_sd = rla({v}, {t}_k);"));
+                    self.line(&format!("    if (lanebit_at({el}, {eh}, {t}_k) && (({t}_sa >> 2) & {m}u) == lane_id) {t} = {t}_sd;"));
+                    self.line("}");
+                }
+                let dst = Dst::V(f("VDST"));
+                self.write32(&dst, &t);
+                return Ok(());
+            }
             _ => {}
         }
         if !matches!(self.opt.mode, Mode::Kernel | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Compute(_)) {
