@@ -129,9 +129,10 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, String> {
     };
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         native: &native,
         p: &p,
@@ -165,10 +166,12 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, String> {
     Ok(shader)
 }
 
-/// One GPU test at a time: with these tests on the hardware adapter and WARP
+/// One GPU test at a time. With these tests on the hardware adapter and WARP
 /// from several test threads at once, now and then none of their dispatches
-/// ever completes and the test binary hangs.
-static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// ever completes and the test binary hangs; and two GPU tests at once on
+/// WARP can end the test process with an access violation. Other GPU test
+/// modules take this lock too.
+pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
