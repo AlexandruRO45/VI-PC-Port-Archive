@@ -2413,6 +2413,45 @@ mod tests {
     }
 
     #[test]
+    fn the_unpacked_limit_holds_for_real_streams() {
+        // A stream really inflating to the largest plausible size passes the
+        // limit and is read as far as its FSSM magic.
+        let zeros = vec![0u8; MAX_UNPACKED as usize];
+        assert_eq!(refused_blob(&xbch(&zeros)), "native blob lacks FSSM magic");
+        // One byte more is implausible before a byte of it is inflated.
+        let mut over = zeros.clone();
+        over.push(0);
+        assert_eq!(refused_blob(&xbch(&over)), "implausible XBCH unpacked size");
+        // Stated as the limit, it does not inflate to its stated size: the
+        // stream is never cut to fit the limit and read as far as it goes.
+        let mut blob = xbch(&over);
+        blob[16..24].copy_from_slice(&MAX_UNPACKED.to_le_bytes());
+        assert_eq!(
+            refused_blob(&blob),
+            "XBCH stream does not inflate to its stated size"
+        );
+    }
+
+    #[test]
+    fn a_stated_stream_holding_more_than_one_zlib_stream_reads_the_first() {
+        let fssm_blob = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let expect = native_programs(&part(&[(KIND_NATIVE, &xbch(&fssm_blob))])).unwrap();
+        let with_stream = |stream: &[u8]| {
+            let mut blob = xbch(&fssm_blob);
+            blob.truncate(XBCH_HEADER);
+            blob[8..16].copy_from_slice(&(stream.len() as u64).to_le_bytes());
+            blob.extend_from_slice(stream);
+            native_programs(&part(&[(KIND_NATIVE, &blob)]))
+        };
+        let stream = miniz_oxide::deflate::compress_to_vec_zlib(&fssm_blob, 6);
+        // A second whole stream after the first, inside the stated size,
+        // adds nothing to what is inflated.
+        let mut twice = stream.clone();
+        twice.extend_from_slice(&stream);
+        assert_eq!(with_stream(&twice).unwrap(), expect);
+    }
+
+    #[test]
     fn only_native_entries_need_their_bounds_in_the_index() {
         let native = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
         // The last entry of another kind cut after its kind: its offset and
