@@ -3558,6 +3558,24 @@ mod tests {
     }
 
     #[test]
+    fn test_titles_env_splits_paths() {
+        // The empty entry between them (`first::second`) is skipped, not
+        // read as the working directory.
+        let value = std::env::join_paths(["first", "", "second"]).unwrap();
+        let file = FilePaths::default();
+        let env = |k: &str| match k {
+            "VICTORY_TEST_TITLES" => Some(value.clone()),
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        let cfg = Config::resolve(file, None, env).unwrap();
+        assert_eq!(
+            cfg.test_titles,
+            vec![PathBuf::from("first"), PathBuf::from("second")]
+        );
+    }
+
+    #[test]
     fn example_config_parses() {
         let text = include_str!("../../../victory.example.toml");
         let parsed = parse_file(text).unwrap();
