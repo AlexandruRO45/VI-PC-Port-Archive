@@ -457,6 +457,13 @@ impl Drop for Writing {
     }
 }
 
+static ON_KERNEL_WRITE: std::sync::OnceLock<fn(usize, usize)> = std::sync::OnceLock::new();
+
+/// Register the runtime's lazy-page commit callback.
+pub fn on_kernel_write(before: fn(usize, usize)) {
+    let _ = ON_KERNEL_WRITE.set(before);
+}
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler) or another write the
 /// guards do not see: opens its guarded blocks, marks them changed and
@@ -464,6 +471,9 @@ impl Drop for Writing {
 /// `kernel_will_write`) around the title's kernel reads into its own
 /// memory and DirectStorage's writes to addresses.
 pub fn writing(at: usize, len: usize) -> Writing {
+    if let Some(before) = ON_KERNEL_WRITE.get() {
+        before(at, len);
+    }
     // The length is the title's (`fread`'s size times count, saturated).
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
