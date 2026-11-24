@@ -424,8 +424,6 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
-    /// See [`Structured::complement`].
-    complement: HashMap<Value, Value>,
     /// Immediate dominator per block.
     idom: Vec<usize>,
 }
