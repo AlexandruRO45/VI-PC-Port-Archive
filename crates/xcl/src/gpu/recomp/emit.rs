@@ -3631,10 +3631,18 @@ impl Em {
         };
         let cond = match ty {
             "f32" => {
-                let (a, b) = (Self::fsrc(m, 0, &ua), Self::fsrc(m, 1, &ub));
-                match op {
-                    "class" => format!("((({ub}) >> fclass({a})) & 1u) != 0u"),
-                    _ => float_compare(op, &a, &b, "isnan").ok_or("VOPC f32")?,
+                if op == "class" {
+                    let mut u = ua.clone();
+                    if m.abs[0] {
+                        u = format!("({u} & 0x7FFFFFFFu)");
+                    }
+                    if m.neg[0] {
+                        u = format!("({u} ^ 0x80000000u)");
+                    }
+                    format!("((({ub}) >> fclass({u})) & 1u) != 0u")
+                } else {
+                    let (a, b) = (Self::fsrc(m, 0, &ua), Self::fsrc(m, 1, &ub));
+                    float_compare(op, &a, &b, "isnan").ok_or("VOPC f32")?
                 }
             }
             "i32" | "u32" => {
@@ -5866,8 +5874,8 @@ uint fclass16(uint h) {
     if (e == 0u) return m == 0u ? (n ? 5u : 6u) : (n ? 4u : 7u);
     return n ? 3u : 8u;
 }
-uint fclass(float f) {
-    uint u = asuint(f); uint e = (u >> 23) & 0xFFu; uint m = u & 0x7FFFFFu; bool n = (u >> 31) != 0u;
+uint fclass(uint u) {
+    uint e = (u >> 23) & 0xFFu; uint m = u & 0x7FFFFFu; bool n = (u >> 31) != 0u;
     if (e == 0xFFu) return m != 0u ? (((m & 0x400000u) != 0u) ? 1u : 0u) : (n ? 2u : 9u);
     if (e == 0u) return m == 0u ? (n ? 5u : 6u) : (n ? 4u : 7u);
     return n ? 3u : 8u;
