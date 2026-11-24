@@ -2132,6 +2132,79 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// A `core.excludesFile` written into `.git/config` by hand names the
+    /// file git's config parser reads out of it: unquoted, `#` and `;` open
+    /// a comment and the spaces before it are trimmed, so `{out}/plain   #
+    /// note` names `plain`, which takes `plain` and leaves `spaced`, named
+    /// by the file `plain   `, visible and refused. Quoted, the same
+    /// characters are kept, so `"{out}/kept # note"` names `kept # note`,
+    /// which takes `quoted`, while `unquoted`, named only by `kept`, is
+    /// refused, left empty.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_ignored_by_an_excludes_file_as_git_config_reads_it() {
+        let repo = tempdir();
+        let outside = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        let out = outside.path().to_str().unwrap();
+        assert!(!out.contains(['"', '\\', '#', ';', ' ']));
+        for (file, rule) in [
+            ("plain", "/plain/\n"),
+            ("plain   ", "/spaced/\n"),
+            ("kept # note", "/quoted/\n"),
+            ("kept", "/unquoted/\n"),
+        ] {
+            std::fs::write(outside.path().join(file), rule).unwrap();
+        }
+        let base = std::fs::read_to_string(root.join(".git/config")).unwrap();
+        let set = |value: &str| {
+            std::fs::write(
+                root.join(".git/config"),
+                format!("{base}[core]\n\texcludesFile = {value}\n"),
+            )
+            .unwrap();
+        };
+        let dir = |name: &str| root.join(name);
+        for name in ["plain", "spaced", "quoted", "unquoted"] {
+            std::fs::create_dir(dir(name)).unwrap();
+        }
+        let taken = |first: &[&str], last: &str| {
+            let tmp = tempdir_in_first(root, first.iter().map(|name| dir(name)).chain([dir(last)]));
+            assert_eq!(tmp.path().parent(), Some(dir(last).as_path()));
+            for name in first {
+                assert_eq!(std::fs::read_dir(dir(name)).unwrap().count(), 0);
+            }
+            std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+            tmp
+        };
+
+        set(&format!("{out}/plain   # note"));
+        let tmp = taken(&["spaced", "quoted", "unquoted"], "plain");
+        std::fs::write(dir("spaced").join("a.rs"), b"fn a() {}\n").unwrap();
+        assert_eq!(names(root, false), ["spaced/a.rs"]);
+        super::run(root, false).unwrap();
+        drop(tmp);
+        std::fs::remove_file(dir("spaced").join("a.rs")).unwrap();
+
+        set(&format!("{out}/plain\t; note"));
+        drop(taken(&["spaced", "quoted", "unquoted"], "plain"));
+
+        set(&format!("\"{out}/kept # note\""));
+        let tmp = taken(&["plain", "spaced", "unquoted"], "quoted");
+        std::fs::write(dir("unquoted").join("b.rs"), b"fn b() {}\n").unwrap();
+        assert_eq!(names(root, false), ["unquoted/b.rs"]);
+        super::run(root, false).unwrap();
+        drop(tmp);
+
+        // Git agrees: it reads the quoted value whole.
+        let value = super::git_command(root)
+            .args(["config", "core.excludesFile"])
+            .output()
+            .unwrap();
+        assert_eq!(value.stdout, format!("{out}/kept # note\n").as_bytes());
+    }
+
     /// A relative `core.excludesFile` is read from the top of the checkout,
     /// wherever it is set and wherever git is run from: set in a file that
     /// `.git/config` includes (`include.path`, itself relative to `.git`),
