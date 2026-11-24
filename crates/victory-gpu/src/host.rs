@@ -2080,7 +2080,11 @@ mod tests {
             assert_eq!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
         }
     }
+}
 
+#[cfg(test)]
+mod batch {   // Batch::texture_due lives here; `mod tests` is already taken above
+    use super::Batch;
     use std::sync::Arc;
 
     #[test]
