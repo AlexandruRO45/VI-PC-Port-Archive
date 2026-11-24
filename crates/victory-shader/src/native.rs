@@ -287,13 +287,15 @@ impl StageIo {
     }
 }
 
-/// SGPRs the hardware initializes for a pixel shader from
-/// `SPI_SHADER_PGM_RSRC2_PS`: user SGPRs (bits 1-5, plus bit 28 as MSB),
-/// `prim_mask` (always present), `wave_cnt` (bit 7), POPS collision wave id
-/// (bit 25), intrawave collisions (bit 26), and the scratch wave offset
-/// (bit 0).
+/// SGPRs the hardware initializes for a pixel shader from GFX10.3
+/// `SPI_SHADER_PGM_RSRC2_PS`: user SGPRs (bits 1-5, plus `USER_SGPR_MSB` at
+/// bit 27; bits 28-31 are `SHARED_VGPR_CNT`), `prim_mask` (always present),
+/// `wave_cnt` (bit 7), POPS collision wave id (bit 25), intrawave collisions
+/// (bit 26), and the scratch wave offset (bit 0). Counting the POPS SGPRs keeps
+/// reads of them refused as hardware SGPR inputs rather than silently zeroing
+/// them (zero means "no overlap", which would skip ROV ordering waits).
 pub fn ps_initialized_sgprs(rsrc2: u32) -> u8 {
-    let user = ((rsrc2 >> 1) & 0x1F) | (((rsrc2 >> 28) & 1) << 5);
+    let user = ((rsrc2 >> 1) & 0x1F) | (((rsrc2 >> 27) & 1) << 5);
     let scratch = rsrc2 & 1;
     let wave_cnt = (rsrc2 >> 7) & 1;
     let pops_collision = (rsrc2 >> 25) & 1;
@@ -1020,8 +1022,8 @@ mod tests {
         assert_eq!(ps_initialized_sgprs(10 << 1), 11);
         // 17 user SGPRs (s0..=s16) + prim_mask (s17): 18.
         assert_eq!(ps_initialized_sgprs(17 << 1), 18);
-        // USER_SGPR_MSB (bit 28) extends user SGPRs to 32 + prim_mask: 33.
-        assert_eq!(ps_initialized_sgprs(1 << 28), 33);
+        // USER_SGPR_MSB (GFX10.3 bit 27) extends user SGPRs to 32 + prim_mask: 33.
+        assert_eq!(ps_initialized_sgprs(1 << 27), 33);
         // Scratch (bit 0), wave_cnt (bit 7), POPS collision wave id (bit 25),
         // and intrawave collisions (bit 26) each add one SGPR.
         assert_eq!(ps_initialized_sgprs((10 << 1) | 1), 12);
@@ -1030,10 +1032,10 @@ mod tests {
             ps_initialized_sgprs((10 << 1) | 1 | (1 << 7) | (1 << 25) | (1 << 26)),
             15
         );
-        // TRAP_PRESENT (bit 6), EXTRA_LDS_SIZE (8..=15), and EXCP_EN (16..=24)
-        // do not allocate general SGPRs.
+        // TRAP_PRESENT (bit 6), EXTRA_LDS_SIZE (8..=15), EXCP_EN (16..=24), and
+        // SHARED_VGPR_CNT (28..=31) do not allocate general SGPRs.
         assert_eq!(
-            ps_initialized_sgprs((10 << 1) | (1 << 6) | (0xFF << 8) | (0x1FF << 16)),
+            ps_initialized_sgprs((10 << 1) | (1 << 6) | (0xFF << 8) | (0x1FF << 16) | (0xF << 28)),
             11
         );
         let ps = StageIo::Ps {
