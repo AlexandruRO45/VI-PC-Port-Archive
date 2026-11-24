@@ -223,10 +223,11 @@ mod tests {
             return;
         };
         const RECORDS: usize = 256;
-        // Each record asks for 2^26 vertices (half the 2^27 budget): 256
-        // records total 2^34 vertices, wrapping u32 four times under naive
-        // InterlockedAdd, whereas saturating CAS allows at most 2 records.
-        let mut buf: Vec<[u32; 4]> = vec![[0x0400_0000, 1, 0, 0]; RECORDS];
+        // Each record asks for 2^24 vertices * 4 instances = 2^26 vertex
+        // instances (half the 2^27 budget): 256 records total 2^34, wrapping
+        // u32 four times under naive InterlockedAdd, whereas saturating CAS
+        // admits exactly 2 records and zeroes the remaining 254.
+        let mut buf: Vec<[u32; 4]> = vec![[1 << 24, 4, 0, 0]; RECORDS];
         let addr = buf.as_mut_ptr() as u64;
         let byte_len = std::mem::size_of_val(buf.as_slice()) as u64;
         let token = addr as usize;
