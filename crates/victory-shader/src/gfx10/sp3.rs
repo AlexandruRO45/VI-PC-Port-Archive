@@ -1336,4 +1336,99 @@ mod tests {
             "global_store_dword v1, v2, s[4:5]"
         );
     }
+
+    /// Branch and call targets count signed dwords from the next
+    /// instruction: a back branch can land on itself, a forward one skips
+    /// what it passes, and `s_call_b64` names its return pair first.
+    #[test]
+    fn branch_and_call_targets_count_signed_dwords_from_the_next_instruction() {
+        // SOPP: 0xBF80_0000 | op << 16 | simm16; s_cbranch_scc0 0x04, scc1 0x05.
+        let sopp = |op: u32, imm: u16| 0xBF80_0000 | op << 16 | u32::from(imm);
+        let v_nop = 0x7E00_0000;
+        assert_eq!(
+            texts(&[sopp(4, 0xFFFF), sopp(5, 1), v_nop], true),
+            [
+                "s_cbranch_scc0 label_0000",
+                "s_cbranch_scc1 label_000C",
+                "v_nop"
+            ]
+        );
+        // SOPK s_call_b64 (0x16) to s[30:31]: two dwords back, and to the
+        // instruction right after it.
+        let call = |imm: u32| 0xB000_0000 | 0x16 << 23 | 30 << 16 | imm;
+        assert_eq!(
+            texts(&[v_nop, call(0xFFFE)], true)[1],
+            "s_call_b64 s[30:31], label_0000"
+        );
+        assert_eq!(one(&[call(0)], true), "s_call_b64 s[30:31], label_0004");
+    }
+
+    /// A scalar load writes its offset alone against `null`, its SGPR alone
+    /// for a zero offset, and both otherwise; the offset is the 21-bit signed
+    /// field, so a negative one is printed in its 21 bits.
+    #[test]
+    fn scalar_memory_offsets_name_only_the_parts_that_are_set() {
+        // s_load_dword s4, s[2:3]: op 0, sdata 4, sbase 1; word 1 is soffset << 25 | offset.
+        let load = |w1: u32| one(&[0xF400_0101, w1], true);
+        assert_eq!(load(0x7D << 25), "s_load_dword s4, s[2:3], null");
+        assert_eq!(load(0x7D << 25 | 0x10), "s_load_dword s4, s[2:3], 0x000010");
+        assert_eq!(load(6 << 25), "s_load_dword s4, s[2:3], s6");
+        assert_eq!(
+            load(6 << 25 | 0x10),
+            "s_load_dword s4, s[2:3], s6 offset:0x000010"
+        );
+        assert_eq!(
+            load(0x7D << 25 | 0x0F_FFFF),
+            "s_load_dword s4, s[2:3], 0x0fffff"
+        );
+        assert_eq!(
+            load(0x7D << 25 | 0x1F_FFFC),
+            "s_load_dword s4, s[2:3], 0x1ffffc"
+        );
+        // Bits 21-24 between offset and soffset are not part of either.
+        assert_eq!(
+            load(6 << 25 | 0x01E0_0010),
+            "s_load_dword s4, s[2:3], s6 offset:0x000010"
+        );
+        // glc and dlc follow the operands, glc first.
+        assert_eq!(
+            one(&[0xF401_4101, 6 << 25], true),
+            "s_load_dword s4, s[2:3], s6 glc dlc"
+        );
+    }
+
+    /// Every image dimension is named and sizes the address by its
+    /// coordinates; images write `dlc` before `glc slc`, where buffers write
+    /// it last.
+    #[test]
+    fn image_dimensions_size_the_address_and_dlc_leads_the_cache_flags() {
+        // image_load v8, v[0:n], s[16:23]: op 0, dmask 1, srsrc 4, vdata 8.
+        let load = |dim: u32, w0: u32| one(&[0xF000_0100 | dim << 3 | w0, 0x0004_0800], true);
+        let dims = [
+            ("v0", "1D"),
+            ("v[0:1]", "2D"),
+            ("v[0:2]", "3D"),
+            ("v[0:2]", "CUBE"),
+            ("v[0:1]", "1D_ARRAY"),
+            ("v[0:2]", "2D_ARRAY"),
+            ("v[0:2]", "2D_MSAA"),
+            ("v[0:3]", "2D_MSAA_ARRAY"),
+        ];
+        for (dim, (addr, name)) in (0..).zip(dims) {
+            assert_eq!(
+                load(dim, 0),
+                format!("image_load v8, {addr}, s[16:23] dim:SQ_RSRC_IMG_{name}")
+            );
+        }
+        // dlc (bit 7), glc (bit 13) and slc (bit 25) together.
+        assert_eq!(
+            load(0, 1 << 7 | 1 << 13 | 1 << 25),
+            "image_load v8, v0, s[16:23] dim:SQ_RSRC_IMG_1D dlc glc slc"
+        );
+        // A buffer with the same three writes dlc last.
+        assert_eq!(
+            one(&[0xE030_C000, 0x0042_0400], true),
+            "buffer_load_dword v4, v0, s[8:11], s0 glc slc dlc"
+        );
+    }
 }
