@@ -2929,6 +2929,82 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn a_folder_setting_at_under_or_linked_to_a_named_pipe_is_refused() {
+        // A scratch folder under the system temp folder, never the
+        // repository; removed at the end. The pipe is only looked at, never
+        // opened: opening a pipe with no writer would hang the check.
+        let scratch = std::env::temp_dir().join(format!("vc-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fifo = scratch.join("p");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            // No `mkfifo` on this host; nothing to check.
+            std::fs::remove_dir_all(&scratch).unwrap();
+            return;
+        }
+        let link = scratch.join("to-pipe");
+        std::os::unix::fs::symlink("p", &link).unwrap();
+        let env = |k: &'static str, v: PathBuf| {
+            let cache = scratch.join("cache");
+            let data = scratch.join("data");
+            move |key: &str| match key {
+                _ if key == k => Some(v.clone().into_os_string()),
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let refused = |k: &'static str, v: PathBuf| {
+            Config::resolve(FilePaths::default(), None, env(k, v))
+                .unwrap_err()
+                .to_string()
+        };
+
+        // The pipe itself, named plainly, with a trailing slash, or through a
+        // link to it, is neither a folder nor a file: the plain "not a
+        // directory" error, without the "is a file" hint.
+        for (k, v) in [
+            ("VICTORY_GAME_DIR", fifo.clone()),
+            ("VICTORY_CACHE_DIR", scratch.join("p/")),
+            ("VICTORY_DATA_DIR", link.clone()),
+        ] {
+            let err = refused(k, v.clone());
+            assert!(
+                err.contains(&format!("{} (from {k}) is not a directory", v.display())),
+                "{err}"
+            );
+            assert!(
+                !err.contains("is a file") && !err.contains("leads nowhere"),
+                "{err}"
+            );
+        }
+
+        // A folder still to create below the pipe, or below the link to it,
+        // names the path as written as the blocker, and nothing is created.
+        for blocker in [&fifo, &link] {
+            let below = blocker.join("victory");
+            let err = refused("VICTORY_CACHE_DIR", below.clone());
+            assert!(
+                err.contains(&format!(
+                    "the cache folder {} (from VICTORY_CACHE_DIR) cannot be a folder because \
+                     {} is not a directory",
+                    below.display(),
+                    blocker.display()
+                )),
+                "{err}"
+            );
+        }
+        assert!(!scratch.join("cache").exists());
+
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn a_folder_setting_through_a_link_that_leads_nowhere_is_refused() {
         // A scratch folder under the system temp folder, never the
         // repository; removed at the end.
