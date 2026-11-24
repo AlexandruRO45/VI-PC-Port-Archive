@@ -97,11 +97,22 @@ mod tests {
 
     /// A `!<arch>` archive of `members`, each under a short GNU-style name.
     fn archive(members: &[Vec<u8>]) -> Vec<u8> {
+        let names: Vec<String> = (0..members.len()).map(|i| format!("m{i}.obj/")).collect();
+        let named: Vec<(&str, &[u8])> = names
+            .iter()
+            .zip(members)
+            .map(|(name, data)| (name.as_str(), data.as_slice()))
+            .collect();
+        archive_named(&named)
+    }
+
+    /// A `!<arch>` archive whose members carry the raw header names given.
+    fn archive_named(members: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = b"!<arch>\n".to_vec();
-        for (i, data) in members.iter().enumerate() {
+        for (name, data) in members {
             let header = format!(
                 "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
-                format!("m{i}.obj/"),
+                name,
                 0,
                 0,
                 0,
@@ -176,5 +187,80 @@ mod tests {
                 .imports
                 .is_empty()
         );
+    }
+
+    /// The layout `lib.exe` writes: a first and a second linker member
+    /// (both named `/`), a `//` long-names member, then the import objects
+    /// under `/<offset>` names. The bookkeeping members are not imports and
+    /// not "other" members either.
+    #[test]
+    fn reads_msvc_layout_with_linker_and_long_name_members() {
+        // First linker member: big-endian symbol count, no symbols.
+        let first_linker = 0u32.to_be_bytes();
+        // Second linker member: member count and symbol count, both 0.
+        let second_linker = [0u8; 8];
+        let long_names =
+            b"a_member_name_too_long_for_the_header.obj\0another_long_member_name.obj\0";
+        let first = short_import(
+            "xboxkrnl.exe",
+            "KeQueryPerformanceCounter",
+            1,
+            CODE,
+            BY_NAME,
+        );
+        let second = short_import("kernelx.dll", "GetTickCount64", 2, CODE, BY_NAME);
+
+        let lib = ImportLibrary::parse(&archive_named(&[
+            ("/", &first_linker),
+            ("/", &second_linker),
+            ("//", long_names),
+            ("/0", &first),
+            ("/42", &second),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            lib.imports,
+            [
+                name("kernelx.dll", "GetTickCount64", LibImportKind::Code),
+                name(
+                    "xboxkrnl.exe",
+                    "KeQueryPerformanceCounter",
+                    LibImportKind::Code
+                ),
+            ]
+        );
+        assert_eq!(lib.other_members, 0);
+    }
+
+    /// A damaged archive is an error, never a panic; a damaged member inside
+    /// an intact archive is counted, not read as an import.
+    #[test]
+    fn damaged_archives_and_members_do_not_panic() {
+        let good = short_import("a.dll", "Plain", 0, CODE, BY_NAME);
+        let whole = archive(std::slice::from_ref(&good));
+
+        // Every truncation of the archive either parses or errors.
+        for len in 0..whole.len() {
+            let _ = ImportLibrary::parse(&whole[..len]);
+        }
+        // A member header that claims more bytes than the file holds.
+        let mut oversized = whole.clone();
+        let size_field = 8 + 48;
+        oversized[size_field..size_field + 10].copy_from_slice(b"999999    ");
+        assert!(ImportLibrary::parse(&oversized).is_err());
+        // A long name that points past the names table.
+        assert!(
+            ImportLibrary::parse(&archive_named(&[("//", b"x.obj\0"), ("/99", &good)])).is_err()
+        );
+
+        // An import object whose SizeOfData runs past the member, and one cut
+        // short inside its fixed header: neither is an import.
+        let mut overlong = good.clone();
+        overlong[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        let lib =
+            ImportLibrary::parse(&archive(&[overlong, good[..10].to_vec(), good.clone()])).unwrap();
+        assert_eq!(lib.imports, [name("a.dll", "Plain", LibImportKind::Code)]);
+        assert_eq!(lib.other_members, 2);
     }
 }
