@@ -162,14 +162,34 @@ s36, v13`, then `v_fmac_f32`), and the same `attr2` is interpolated off those
 registers again at 0x377c/0x3790. An agreement walk over those arms returns
 `Err`, correctly: they do not name the same value.
 
+The clobber is on **one arm only**, which rules out "we have the wrong idea
+about what that register holds": four branches jump past it straight into the
+second interpolation —
+
+```
+000ea4: s_cbranch_execz label_35BC
+000ee0: s_cbranch_execz label_35B8
+0016c4: s_cbranch_execz label_35A0
+001a74: s_cbranch_execz label_35A0
+```
+
+and 0x35a0-0x35bc falls into 0x377c/0x3790. So one path reaches
+`v_interp_p2_f32 v28, v1, attr2.z` with `v1` still the PerspectiveCenter and
+another reaches it after `v1` was overwritten. The same attribute is
+interpolated twice, once off the barycentric pair and once off a computed
+value, and only the first is an interpolation at all.
+
 So one attribute is interpolated two ways and one of them uses weights the
 shader built itself, which `SV_Barycentrics` as an interp mode cannot express.
-Two consequences. Cheaply separable: programs whose `v0`/`v1` are never written
-are the ones a phi walk fixes, and a scan for writes to `v0`/`v1` that feed a
-`v_interp_p*` operand counts them across the archive. Not cheap: the rest need
-the pull model — read the attribute's values and interpolate by hand — which
-the console data already distinguishes (`Barycentric::PerspectivePullModel`,
-for which `interp()` returns `None`) and which the emitter does not implement.
+
+**How many of the 167 are the cheap shape: none.** Every one of the 167 writes
+`v0` or `v1` with an ordinary instruction (`v_mul_legacy_f32`, `v_fma_f32`,
+`v_mov_b32`, `v_cndmask_b32`, `v_cvt_pkrtz_f16_f32` and friends — scanned over
+the whole set from the disassembly), so no agreement walk resolves any of them
+and the family is entirely the pull-model case: read the attribute's values and
+interpolate by hand, which the console data already distinguishes
+(`Barycentric::PerspectivePullModel`, for which `interp()` returns `None`) and
+which the emitter does not implement. Nothing here is a phi that was missed.
 
 **The rest** are single programs each (`s_getpc_b64`, `v_cvt_f32_f64`, an LDS
 operation, `v_permlanex16_b32`, a whole-wave section step); each is a small,
