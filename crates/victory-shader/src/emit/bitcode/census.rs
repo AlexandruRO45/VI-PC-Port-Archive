@@ -42,6 +42,10 @@ pub const KINDS: [&str; 26] = [
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Census {
     pub counts: [u32; KINDS.len()],
+    /// Calls by the callee's name (`dx.op.waveReadLaneAt`, ...), sorted: the
+    /// fine form of `counts`, for telling one module's constructs from
+    /// another's.
+    pub ops: Vec<(String, u32)>,
 }
 
 thread_local! {
@@ -133,6 +137,7 @@ impl Module {
             }
         }
         let mut c = Census::default();
+        let mut by_name: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         for (b, blk) in self.blocks.iter().enumerate() {
             if !seen[b] {
                 continue;
@@ -160,6 +165,9 @@ impl Module {
                     Op::Call(f, _) => call_kind[*f as usize],
                 };
                 c.counts[at] += 1;
+                if let Op::Call(f, _) = &self.insts[i as usize].op {
+                    *by_name.entry(self.funcs[*f as usize].name.clone()).or_default() += 1;
+                }
                 match self.tags.get(&i) {
                     Some(Tag::Guard) => c.counts[k("guard_select")] += 1,
                     Some(Tag::Clamp) => c.counts[k("clamp")] += 1,
@@ -169,6 +177,8 @@ impl Module {
                 let _ = V::Inst(i);
             }
         }
+        c.ops = by_name.into_iter().collect();
+        c.ops.sort();
         c
     }
 }

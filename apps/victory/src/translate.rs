@@ -529,6 +529,29 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     }
     line.push('\n');
     let _ = lock(out).write_all(line.as_bytes());
+    ops_line(label, &census.ops);
+}
+
+/// `VICTORY_SHADER_CENSUS_OPS=<file>`: one line per emitted program, appended:
+/// its label and every `dx.op` its host module calls, by the callee's name.
+/// The fine form of the `KINDS` counts, for telling the constructs of one
+/// module from another's.
+fn ops_line(label: &str, ops: &[(String, u32)]) {
+    use std::io::Write;
+    static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let Some(out) = OUT.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_SHADER_CENSUS_OPS")?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some(Mutex::new(file))
+    }) else {
+        return;
+    };
+    let mut line = label.to_owned();
+    for (name, n) in ops {
+        line.push_str(&format!("\t{name}={n}"));
+    }
+    line.push('\n');
+    let _ = lock(out).write_all(line.as_bytes());
 }
 
 /// Validates an emitted shader if asked to.

@@ -57,6 +57,37 @@ pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST;
 
+/// `VICTORY_REUSE_SKIP`'s value: further callees [`REUSE`] leaves alone, by
+/// `dx.op` name, on top of [`NEVER_COMMON`]. Empty when unset. Read once.
+fn reuse_skips() -> &'static [String] {
+    static SKIPS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    SKIPS.get_or_init(|| {
+        std::env::var("VICTORY_REUSE_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+}
+
+/// The callees [`REUSE`] never commons. A resource handle is an identity,
+/// not a value: the `annotateHandle` that follows it gives it its resource
+/// type, so two creates with the same arguments are two handles that may be
+/// annotated as two different resources. Commoning the creates leaves the
+/// annotations of several handles on one, and commoning the annotations
+/// leaves handles with another's type — and AMD's compiler (`amdxc64.dll`)
+/// faults on such a module, `0xc0000005` at `amdxc64+0x85fd0f`, `rcx = 0`,
+/// in the compute-pipeline create. Both halves have to stay apart: skipping
+/// either one alone happens to compile (`22319.dxbc`, the reproduction),
+/// skipping both is what the pairing means.
+const NEVER_COMMON: [&str; 4] = [
+    "dx.op.createHandle",
+    "dx.op.createHandleFromBinding",
+    "dx.op.createHandleFromHeap",
+    "dx.op.annotateHandle",
+];
+
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -604,6 +635,19 @@ impl Module {
         }
     }
 
+    /// Whether [`REUSE`] may give `i` an earlier instruction's value. A call
+    /// to a callee in [`NEVER_COMMON`] or named in `VICTORY_REUSE_SKIP` (a
+    /// comma-separated list of `dx.op` names) keeps its own value: two calls
+    /// with the same arguments are not always one, for the ops that give a
+    /// value an identity.
+    fn commonable(&self, i: u32) -> bool {
+        let Op::Call(f, _) = &self.insts[i as usize].op else {
+            return true;
+        };
+        let name = &self.funcs[*f as usize].name;
+        !NEVER_COMMON.contains(&name.as_str()) && !reuse_skips().contains(name)
+    }
+
     /// What kind of instruction `i` is for merging.
     fn class(&self, effects: &[Effect], i: u32) -> Effect {
         match &self.insts[i as usize].op {
@@ -807,6 +851,7 @@ impl Module {
                 let class = self.class(&effects, i);
                 if passes & REUSE != 0
                     && class == Effect::Pure
+                    && self.commonable(i)
                     && let Some(key) = self.key(i)
                 {
                     if let Some(&first) = known.get(&key) {
@@ -1372,6 +1417,41 @@ mod tests {
             other,
             join,
         }
+    }
+
+    #[test]
+    fn a_handle_and_its_annotation_are_never_reused() {
+        let Kit { mut m, b, pure, writes, .. } = kit();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        let heap = m.function("dx.op.createHandleFromHeap", fty, Some(Attr::ReadNone), false);
+        let annotate = m.function("dx.op.annotateHandle", fty, Some(Attr::ReadNone), false);
+        let (index, flag) = (m.i32(7), m.i32(0));
+        // The same arguments: the same descriptor, but a handle is an
+        // identity, and AMD's compiler faults on the module where the two
+        // creations are one value (`amdxc64+0x85fd0f`).
+        let first = m.call(b, heap, vec![index, flag]);
+        let second = m.call(b, heap, vec![index, flag]);
+        let props = m.i32(13);
+        let one = m.call(b, annotate, vec![first, props]);
+        let other = m.call(b, annotate, vec![second, props]);
+        m.call(b, writes, vec![one, other]);
+        // Any other pure call keeps being one value for the same arguments.
+        let x = m.call(b, pure, vec![index, flag]);
+        let y = m.call(b, pure, vec![index, flag]);
+        m.call(b, writes, vec![x, y]);
+        m.terminate(b, Term::Ret);
+        m.optimise(REUSE);
+        let mut calls: HashMap<&str, usize> = HashMap::new();
+        for &i in &m.blocks[b].body {
+            if let Op::Call(f, _) = &m.insts[i as usize].op {
+                *calls.entry(m.funcs[*f as usize].name.as_str()).or_default() += 1;
+            }
+        }
+        assert_eq!(calls.get("dx.op.createHandleFromHeap"), Some(&2), "two handles stay two");
+        assert_eq!(calls.get("dx.op.annotateHandle"), Some(&2), "two annotations stay two");
+        assert_eq!(calls.get("dx.op.binary.i32"), Some(&1), "a folded value is one");
+        m.write();
     }
 
     #[test]
