@@ -28,6 +28,7 @@ env:
   CARGO_INCREMENTAL: 0
   # A failing test or build script prints where it panicked.
   RUST_BACKTRACE: 1
+  # Folded package lists are read into Bash arrays of Cargo arguments.
   # Crates (plus xtask) that build, test and are clippy-clean on Linux today.
   LINUX_CRATES: >-
     -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
@@ -80,12 +81,10 @@ jobs:
       - name: Asset policy
         run: cargo xtask policy
 
-      # Lints this workflow: expression and context typos, unknown keys, and
+      # Lints all workflows: expression and context typos, unknown keys, and
       # (via the runner's preinstalled shellcheck) the `run:` scripts, which
       # YAML parsing alone never checks. The release is pinned and its
-      # checksum verified, like the actions above. SC2086 (unquoted variable)
-      # is ignored because the *_CRATES lists are split into arguments on
-      # purpose.
+      # checksum verified, like the actions above.
       - name: actionlint
         env:
           ACTIONLINT_VERSION: 1.7.7
@@ -97,7 +96,7 @@ jobs:
           echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
           tar xzf "$tarball" actionlint
           cd "$GITHUB_WORKSPACE"
-          "$RUNNER_TEMP/actionlint" -color -ignore 'SC2086:'
+          "$RUNNER_TEMP/actionlint" -color
 
       # Security audit of the workflows, which actionlint does not do:
       # template injection in `run:` scripts, credentials persisted by
@@ -124,17 +123,22 @@ jobs:
       # checked by itself, since the rest of victory-loader is not clean yet.
       - name: rustfmt (clean packages)
         run: |
-          cargo fmt --check $RUSTFMT_CRATES
+          read -r -a crates <<< "$RUSTFMT_CRATES"
+          cargo fmt --check "${crates[@]}"
           rustfmt --check --edition 2024 crates/victory-loader/tests/load_probe.rs
 
       - name: clippy (all targets)
-        run: cargo clippy --all-targets --locked $LINUX_CRATES -- -D warnings
+        run: |
+          read -r -a crates <<< "$LINUX_CRATES"
+          cargo clippy --all-targets --locked "${crates[@]}" -- -D warnings
 
       # The steps above build default features only, so code behind the
       # `diagnostics` (and victory-shader's `host`) features is never compiled.
       # Lint it too. Both builds stay: some code is cfg(not(feature = ...)).
       - name: clippy (all features)
-        run: cargo clippy --all-targets --all-features --locked $LINUX_CRATES -- -D warnings
+        run: |
+          read -r -a crates <<< "$LINUX_CRATES"
+          cargo clippy --all-targets --all-features --locked "${crates[@]}" -- -D warnings
 
       # Doc tests run under `cargo test` below, but rustdoc's own lints (a
       # renamed item leaving a dangling [`link`], a public doc linking to a
@@ -147,24 +151,25 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          cargo doc --no-deps --locked --document-private-items $RUSTDOC_CRATES
-          cargo doc --no-deps --locked --document-private-items --all-features $RUSTDOC_CRATES
+          read -r -a crates <<< "$RUSTDOC_CRATES"
+          cargo doc --no-deps --locked --document-private-items "${crates[@]}"
+          cargo doc --no-deps --locked --document-private-items --all-features "${crates[@]}"
 
       # The skipped tests parse the test executable itself as a PE image, which
       # is an ELF on Linux. They still run on Windows. Once the workspace's
       # Linux gates land they are cfg(windows) and these --skip flags are no-ops.
       # --no-fail-fast: report failures from every test binary, not the first.
       - name: cargo test
-        run: >
-          cargo test --locked --no-fail-fast $LINUX_CRATES
-          -- --exact
-          --skip image::tests::parses_own_test_binary
-          --skip image::tests::rva_to_file_offset_maps_entry_point
-          --skip image::tests::rva_to_file_offset_rejects_offsets_past_4_gib
-          --skip image::tests::rejects_iat_outside_image
-          --skip prepare::tests::patches_own_test_binary
-          --skip prepare::tests::keeps_iat_slots_when_import_size_excludes_the_terminator
-          --skip prepare::tests::file_name_is_stable_per_build
+        run: |
+          read -r -a crates <<< "$LINUX_CRATES"
+          cargo test --locked --no-fail-fast "${crates[@]}" -- --exact \
+            --skip image::tests::parses_own_test_binary \
+            --skip image::tests::rva_to_file_offset_maps_entry_point \
+            --skip image::tests::rva_to_file_offset_rejects_offsets_past_4_gib \
+            --skip image::tests::rejects_iat_outside_image \
+            --skip prepare::tests::patches_own_test_binary \
+            --skip prepare::tests::keeps_iat_slots_when_import_size_excludes_the_terminator \
+            --skip prepare::tests::file_name_is_stable_per_build
 
   # Type-checks the Windows build from Linux: no MSVC, no linking, nothing runs.
   # Catches compile errors in cfg(windows) code (most of victory-gpu,
@@ -202,9 +207,9 @@ jobs:
         run: cargo check --locked --workspace --all-targets --target x86_64-pc-windows-msvc
 
       - name: clippy (Windows target, clean crates)
-        run: >
-          cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc
-          $WINDOWS_CLIPPY_CRATES -- -D warnings
+        run: |
+          read -r -a crates <<< "$WINDOWS_CLIPPY_CRATES"
+          cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc "${crates[@]}" -- -D warnings
 
       # victory-hle and apps/victory are clippy-clean for Windows but for one
       # field_reassign_with_default in victory-hle's xmem.rs (fixed in open
@@ -223,8 +228,9 @@ jobs:
       # code is cfg(not(feature = "diagnostics")).
       - name: cargo check + clippy (Windows target, all features)
         run: |
+          read -r -a crates <<< "$WINDOWS_CLIPPY_CRATES"
           cargo check --locked --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
-          cargo clippy --locked --all-targets --all-features --target x86_64-pc-windows-msvc $WINDOWS_CLIPPY_CRATES -- -D warnings
+          cargo clippy --locked --all-targets --all-features --target x86_64-pc-windows-msvc "${crates[@]}" -- -D warnings
 
       # The hle-probe fixture is outside the workspace (load_probe builds it on
       # demand on Windows), so the steps above never compile it. It is
@@ -244,8 +250,9 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          cargo doc --no-deps --locked --document-private-items --target x86_64-pc-windows-msvc $WINDOWS_RUSTDOC_CRATES
-          cargo doc --no-deps --locked --document-private-items --all-features --target x86_64-pc-windows-msvc $WINDOWS_RUSTDOC_CRATES
+          read -r -a crates <<< "$WINDOWS_RUSTDOC_CRATES"
+          cargo doc --no-deps --locked --document-private-items --target x86_64-pc-windows-msvc "${crates[@]}"
+          cargo doc --no-deps --locked --document-private-items --all-features --target x86_64-pc-windows-msvc "${crates[@]}"
           cargo doc --no-deps --locked --document-private-items --target x86_64-pc-windows-msvc --manifest-path tests/fixtures/hle-probe/Cargo.toml
 
       # The fixture is outside the workspace, so `cargo fmt --all` never reaches
