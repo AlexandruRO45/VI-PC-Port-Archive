@@ -110,9 +110,9 @@ fn shader_with(
         });
     }
     let p = ir::build(&native.code, native.wave64, native.vgprs)?;
-    let res = resource::track(&p, &native.layout, native.stage)?;
-    let io = io::raise(&p, &native)?;
     let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
     let empty = super::container::build(&[]);
     emit(&Container::parse(&empty)?, &native, &p, &st, &io, &res)
 }
