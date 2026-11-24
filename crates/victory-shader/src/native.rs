@@ -2968,6 +2968,96 @@ mod tests {
     }
 
     #[test]
+    fn a_compute_group_inside_each_component_limit_is_still_capped_by_its_product() {
+        let cs = fssm(&[(HwStage::Cs, &VS_CODE)]);
+        let e = stage_data_at(&cs, HwStage::Cs);
+        let group = |threads: [u32; 3]| {
+            let mut blob = cs.clone();
+            for (k, n) in threads.into_iter().enumerate() {
+                blob[e + CS_THREADS + 4 * k..][..4].copy_from_slice(&n.to_le_bytes());
+            }
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        // Exactly 1024 lanes over all three components fits, as does one
+        // lane short of it.
+        for fits in [[4, 4, 64], [8, 8, 16], [16, 1, 64], [31, 33, 1], [1, 1, 64]] {
+            let p = group(fits).unwrap();
+            assert!(
+                matches!(p[0].io, StageIo::Cs(ComputeIo { threads, .. }) if threads == fits),
+                "{fits:?}"
+            );
+        }
+        // Every component below is within its own limit (1024, 1024, 64);
+        // only the product, one lane or more past 1024, is refused.
+        for bad in [
+            [5, 5, 41],
+            [3, 7, 49],
+            [2, 513, 1],
+            [1025 / 5 + 1, 5, 1],
+            [1024, 1024, 64],
+        ] {
+            assert!(
+                matches!(group(bad), Err(Malformed("implausible thread-group size"))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_lds_is_read_from_rsrc2_bits_15_to_23_alone() {
+        let cs = fssm(&[(HwStage::Cs, &VS_CODE)]);
+        let e = stage_data_at(&cs, HwStage::Cs);
+        let lds_field = 0x1FFu32 << 15;
+        let with_rsrc2 = |rsrc2: u32| {
+            let mut blob = cs.clone();
+            blob[e + CS_RSRC2..][..4].copy_from_slice(&rsrc2.to_le_bytes());
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        // Every bit outside the field set (three thread ids fit the 28
+        // VGPRs, and with no root parameters the system SGPRs clash with
+        // nothing): the LDS is still the field's granules alone.
+        for (granules, bytes) in [(0, 0), (1, 512), (128, MAX_LDS_BYTES)] {
+            let rsrc2 = !lds_field | granules << 15;
+            let p = with_rsrc2(rsrc2).unwrap();
+            assert!(
+                matches!(p[0].io, StageIo::Cs(c) if c.rsrc2 == rsrc2 && c.lds_bytes() == bytes),
+                "{granules} granules"
+            );
+        }
+        // A granule past 64 KiB is refused whatever the other bits hold.
+        for others in [0, !lds_field] {
+            assert!(
+                matches!(
+                    with_rsrc2(others | 129 << 15),
+                    Err(Malformed("implausible LDS size"))
+                ),
+                "{others:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_mesh_info_user_sgpr_byte_never_refuses_a_mesh() {
+        let ms = fssm(&[(HwStage::Ms, &VS_CODE)]);
+        let e = stage_data_at(&ms, HwStage::Ms);
+        // One lane, one vertex and primitive, lines; byte 6 is the user
+        // SGPR count, which the limits and topology checks never read.
+        for user_sgprs in [0u8, 13, 0x80, 0xff] {
+            let mut blob = ms.clone();
+            blob[e + MS_INFO..][..8].copy_from_slice(&[1, 0, 1, 0, 1, 0, user_sgprs, 1]);
+            let p = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap();
+            assert!(
+                matches!(
+                    &p[0].io,
+                    StageIo::Ms(m) if (m.threads, m.max_vertices, m.max_primitives, m.topology)
+                        == (1, 1, 1, 1)
+                ),
+                "{user_sgprs}"
+            );
+        }
+    }
+
+    #[test]
     fn mesh_info_breaking_several_rules_is_named_for_the_first_checked() {
         let ms = fssm(&[(HwStage::Ms, &VS_CODE)]);
         let e = stage_data_at(&ms, HwStage::Ms);
