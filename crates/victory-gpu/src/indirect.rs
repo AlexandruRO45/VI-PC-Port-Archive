@@ -69,10 +69,54 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-/// Compiles a compute shader with DXC (`dxcompiler.dll` from the DLL search path).
+/// Where `dxcompiler.dll` is looked for: `VICTORY_DXC` (the DLL or its
+/// folder), beside the `dxil.dll` shader validation uses (the SDK ships them
+/// together), then the executable's folder and System32.
+fn dxc_library() -> windows::core::Result<windows::Win32::Foundation::HMODULE> {
+    use windows::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    };
+    use windows::core::{HSTRING, w};
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(p) = std::env::var_os("VICTORY_DXC").map(std::path::PathBuf::from) {
+        paths.push(if p.is_dir() {
+            p.join("dxcompiler.dll")
+        } else {
+            p
+        });
+    }
+    if let Some(dir) = victory_shader::emit::validator::Validator::default_path()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        paths.push(dir.join("dxcompiler.dll"));
+    }
+    for path in paths.iter().filter(|p| p.is_file()) {
+        // SAFETY: a NUL-terminated path; its folder (dxil.dll) is searched first.
+        if let Ok(m) = unsafe {
+            LoadLibraryExW(
+                &HSTRING::from(path.as_path()),
+                None,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            )
+        } {
+            return Ok(m);
+        }
+    }
+    // SAFETY: a bare name, searched only in the executable's folder and System32.
+    unsafe {
+        LoadLibraryExW(
+            w!("dxcompiler.dll"),
+            None,
+            LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    }
+}
+
+/// Compiles a compute shader with DXC (see [`dxc_library`]).
 fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
     use windows::Win32::Graphics::Direct3D::Dxc::*;
-    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::Win32::System::LibraryLoader::GetProcAddress;
     use windows::core::{Interface, w};
     type Create = unsafe extern "system" fn(
         *const windows::core::GUID,
@@ -82,7 +126,7 @@ fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
     // SAFETY: loading the compiler and calling its documented entry point with
     // out pointers of ours; the buffer and arguments outlive the calls.
     unsafe {
-        let library = LoadLibraryW(w!("dxcompiler.dll"))?;
+        let library = dxc_library()?;
         let create: Create = std::mem::transmute(
             GetProcAddress(library, s!("DxcCreateInstance"))
                 .ok_or_else(windows::core::Error::from_thread)?,
@@ -97,7 +141,19 @@ fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
         };
         let arguments = [w!("-T"), w!("cs_6_0"), w!("-E"), w!("main"), w!("-O3")];
         let result: IDxcResult = compiler.Compile(&buffer, Some(&arguments), None)?;
-        result.GetStatus()?.ok()?;
+        if let Err(e) = result.GetStatus()?.ok() {
+            if let Ok(errors) = result.GetErrorBuffer() {
+                let text = std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                );
+                tracing::warn!(
+                    "argument clamp: DXC: {}",
+                    String::from_utf8_lossy(text).trim()
+                );
+            }
+            return Err(e);
+        }
         let blob = result.GetResult()?;
         Ok(
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
@@ -150,7 +206,7 @@ fn make() -> windows::core::Result<Clamp> {
         )
     };
     // Wine's d3dcompiler_47 (vkd3d-shader) rejects RWByteAddressBuffer loads:
-    // then DXC (dxcompiler.dll, as shader translation already needs) compiles
+    // then DXC (dxcompiler.dll; see `dxc_library` for where it is looked for) compiles
     // the same source as cs_6_0, root signature inside.
     let fallback;
     if let Err(e) = &compiled {
