@@ -2522,6 +2522,67 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// An exclude file git must read but cannot (`.git/info/exclude`, or a
+    /// `core.excludesFile`, that is a directory) is fatal to every git
+    /// command that weighs ignore rules, unlike a `.gitignore` of that
+    /// shape: `ls-files` fails, and the full check walks the checkout as it
+    /// walks a tree outside any repository, skipping only `target` and
+    /// `.git`. A TMPDIR is judged as that walk sees it: `ignored`, which
+    /// the `.gitignore` names, is refused and left empty, and `target` is
+    /// taken. Once the exclude file is a file again, `ignored` is taken.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_judged_by_the_walk_when_git_cannot_read_excludes() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "/ignored/\n").unwrap();
+        let ignored = root.join("ignored");
+        let target = root.join("target");
+        let elsewhere = root.join(".git/excludes.d");
+        for dir in [&ignored, &target, &elsewhere] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let exclude = root.join(".git/info/exclude");
+        let _ = std::fs::remove_file(&exclude);
+        std::fs::create_dir_all(&exclude).unwrap();
+
+        let fails = |args: &[&str]| {
+            let out = super::git_command(root).args(args).output().unwrap();
+            assert_eq!(out.status.code(), Some(128), "{args:?}");
+        };
+        let judge = || {
+            fails(&["check-ignore", "-q", "--", "ignored"]);
+            fails(&["ls-files", "-z", "--others", "--exclude-standard"]);
+            let tmp = tempdir_in_first(root, [ignored.clone(), target.clone()]);
+            assert_eq!(tmp.path().parent(), Some(target.as_path()));
+            assert_eq!(std::fs::read_dir(&ignored).unwrap().count(), 0);
+            std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+            let mut walked = names(root, false);
+            walked.sort();
+            assert_eq!(walked, [".gitignore"]);
+            tmp
+        };
+        let tmp = judge();
+
+        std::fs::remove_dir(&exclude).unwrap();
+        git_str(
+            root,
+            &["config", "core.excludesFile", elsewhere.to_str().unwrap()],
+        );
+        let tmp_config = judge();
+
+        // `target` is no build directory here, and git lists what is in it.
+        drop((tmp, tmp_config));
+        git_str(root, &["config", "--unset", "core.excludesFile"]);
+        std::fs::write(&exclude, "").unwrap();
+        let tmp_ignored = tempdir_in_first(root, [ignored.clone(), target.clone()]);
+        assert_eq!(tmp_ignored.path().parent(), Some(ignored.as_path()));
+        std::fs::write(tmp_ignored.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        assert_eq!(names(root, false), [".gitignore"]);
+        super::run(root, false).unwrap();
+    }
+
     /// A tracked `.gitignore` is read from disk, not from `HEAD` or the
     /// index: rewritten there and left unstaged, its rule for `fresh` holds
     /// and `fresh` is taken, while `stale`, named only in the commit, and
