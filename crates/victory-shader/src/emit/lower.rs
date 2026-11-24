@@ -399,6 +399,7 @@ impl<'a> Lower<'a> {
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
+            let wave = wave.min(super::wave_size_max());
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -1476,9 +1477,17 @@ impl<'a> Lower<'a> {
         let t = self.binary(36, hi, third);
         let median = self.binary(35, lo, t);
         let least = self.binary(36, lo, third);
-        let ab = self.s.m.cmp(c, pred::UNO, a, b);
-        let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
-        let nan = self.s.m.bin(c, Bin::Or, ab, nan3);
+        let (ai, bi, ti) = (self.as_int(a), self.as_int(b), self.as_int(third));
+        let mask = self.s.m.i32(0x7FFF_FFFF);
+        let inf = self.s.m.i32(0x7F80_0000);
+        let a_abs = self.s.m.bin(c, Bin::And, ai, mask);
+        let b_abs = self.s.m.bin(c, Bin::And, bi, mask);
+        let t_abs = self.s.m.bin(c, Bin::And, ti, mask);
+        let a_nan = self.s.m.cmp(c, pred::IUGT, a_abs, inf);
+        let b_nan = self.s.m.cmp(c, pred::IUGT, b_abs, inf);
+        let t_nan = self.s.m.cmp(c, pred::IUGT, t_abs, inf);
+        let ab = self.s.m.bin(c, Bin::Or, a_nan, b_nan);
+        let nan = self.s.m.bin(c, Bin::Or, ab, t_nan);
         self.s.m.select(c, nan, least, median)
     }
 
