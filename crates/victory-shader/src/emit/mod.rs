@@ -188,6 +188,11 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_traced(container).map_err(|r| r.error)
+}
+
+/// [`translate`], naming where a refusal's missing value was made.
+pub fn translate_traced(container: &[u8]) -> Result<HostShader, Refusal> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -211,7 +216,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_traced(&c, &native, &p, &st, &io, &res)
 }
 
 /// The instruction that made a value the emitter has no DXIL form for.
@@ -238,6 +243,18 @@ pub struct Refusal {
 impl From<ShaderError> for Refusal {
     fn from(error: ShaderError) -> Self {
         Self { error, from: None }
+    }
+}
+
+/// The error, then where its missing value was made:
+/// `... is not supported (made by v_writelane_b32 at 0x52c)`.
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)?;
+        match self.from {
+            Some(o) => write!(f, " (made by {} at {:#x})", o.name, o.offset),
+            None => Ok(()),
+        }
     }
 }
 
@@ -558,6 +575,58 @@ mod tests {
         if let Err(e) = emit(&c, &native, &p, &st, &io, &res) {
             assert!(e.to_string().contains("its own value"), "{e}");
         }
+    }
+
+    /// What the runtime logs for a shader that does not translate says
+    /// where the missing value it needed was made.
+    #[test]
+    fn a_refusal_says_where_its_missing_value_was_made() {
+        let words = [
+            0xF490_0180u32,
+            0,           // s_memtime s[6:7]
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1: the refusal
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let bytes = crate::dxbc::build(&[]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        // Timestamps lower: nothing is missing here any more.
+        let Err(r) = emit_traced(&c, &native, &p, &st, &io, &res) else {
+            return;
+        };
+        let made = Origin {
+            offset: 0,
+            name: "s_memtime",
+        };
+        assert_eq!(r.from, Some(made));
+        assert!(matches!(
+            r.error,
+            ShaderError::Unsupported { offset: 0xC, .. }
+        ));
+        assert_eq!(
+            r.to_string(),
+            format!("{} (made by s_memtime at 0x0)", r.error)
+        );
+        // Without an origin the text is the error's own.
+        let plain = Refusal::from(r.error);
+        assert_eq!(plain.to_string(), plain.error.to_string());
     }
 
     /// A pixel shader writing a constant colour.

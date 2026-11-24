@@ -100,4 +100,5 @@ lists what they cannot handle yet. A value with no DXIL form only stops a
 program where something with an effect needs it, often far from where it
 was made, so an emit refusal also names the instruction that made the
 value (`from <instruction> at <offset>` with `--list`, and `made by` under
-each reason).
+each reason; `made by <instruction> at <offset>` in the runtime's "shader
+does not translate" warning).
