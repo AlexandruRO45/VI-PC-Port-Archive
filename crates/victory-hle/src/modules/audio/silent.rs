@@ -5,7 +5,7 @@
 //! endpoint and activates an `ISpatialAudioClient` on it. With no active
 //! endpoint its output setup never allocates buffers and returns holding a
 //! lock, so the audio thread never drains the title's command streams and
-//! the title asserts (`title+0x4dcbc9d`). A console always has an output.
+//! the title's audio-thread assert fires. A console always has an output.
 //!
 //! `CoCreateInstance` is ours. Everything but the device enumerator goes to
 //! the host unchanged, and so does an enumerator that reports an active
