@@ -421,11 +421,35 @@ fn is_drive_path(path: &Path) -> bool {
     }
 }
 
+/// `<root>/<sub>`, created. `sub` must be a plain relative path (names
+/// only: no `..`, `.`, root or drive): [`Path::join`] with an absolute `sub`
+/// would replace `root` outright, and a `..` would climb out of it, so a
+/// title id or other computed part that came out wrong would write outside
+/// the cache or data folder, possibly into the dump, without an error.
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
+    ensure_plain_subdir(sub)?;
     let dir = root.join(sub);
     ensure_outside_repo(&dir)?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
+}
+
+/// Refuses a `sub` for [`subdir`] that is empty or is not made only of
+/// ordinary names.
+fn ensure_plain_subdir(sub: &str) -> Result<()> {
+    let path = Path::new(sub);
+    let plain = !sub.is_empty()
+        && !is_drive_path(path)
+        && path.components().all(|c| matches!(c, Component::Normal(_)))
+        // `Path::components` drops interior `.`; refuse it all the same.
+        && !sub.split(['/', '\\']).any(|part| part == "." || part == "..");
+    if !plain {
+        anyhow::bail!(
+            "internal error: subfolder {sub:?} is not a plain relative path; it would \
+             leave the cache or data folder"
+        );
+    }
+    Ok(())
 }
 
 /// The user's home directory: `HOME`, else `USERPROFILE` (Windows), when
@@ -1042,6 +1066,36 @@ mod tests {
         // A correct file still parses.
         let parsed = parse_file("[paths]\ngame_dir = '/games/gta'\n").expect("parses");
         assert_eq!(parsed.paths.game_dir, Some(PathBuf::from("/games/gta")));
+    }
+
+    #[test]
+    fn subfolders_must_stay_inside_their_root() {
+        for ok in ["images", "0000ABCD/storage", "a/b/c"] {
+            assert!(ensure_plain_subdir(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "/etc",
+            "../escape",
+            "a/../../b",
+            "a/./b",
+            ".",
+            "..",
+            "C:\\x",
+            "C:/x",
+            "a\\..\\b",
+        ] {
+            let err = ensure_plain_subdir(bad).unwrap_err().to_string();
+            assert!(err.contains("not a plain relative path"), "{bad}: {err}");
+        }
+        // Refused before anything is created: the root need not exist.
+        let cfg = Config {
+            cache_dir: PathBuf::from("/nonexistent-victory-test-root"),
+            data_dir: PathBuf::from("/nonexistent-victory-test-data"),
+            ..Default::default()
+        };
+        assert!(cfg.cache_subdir("/tmp").is_err());
+        assert!(cfg.data_subdir("../x").is_err());
     }
 
     #[test]
