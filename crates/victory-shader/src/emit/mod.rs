@@ -154,8 +154,11 @@ pub struct HostShader {
     /// `b<index>` in [`ROOT_CBV_SPACE`].
     pub root_cbvs: Vec<u8>,
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
-    /// [`ROOT_CBV_SPACE`].
-    pub root_srvs: Vec<u8>,
+    /// [`ROOT_CBV_SPACE`], by register. A register below 256 is a root
+    /// descriptor's parameter index; above, the qword at
+    /// `(reg >> 8) - 1` of that parameter's root constants (a pointer the
+    /// program loaded; the host binds a root view at its value).
+    pub root_srvs: Vec<u16>,
 }
 
 impl HostShader {
@@ -404,7 +407,6 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
-    use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
 
@@ -419,7 +421,6 @@ mod tests {
         }
     }
     use super::container::SigElement;
-    use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
 
