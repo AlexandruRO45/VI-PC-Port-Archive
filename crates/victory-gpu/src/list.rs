@@ -1718,6 +1718,17 @@ extern "system" fn execute_indirect(
         return;
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    {
+        let bucket = match args {
+            [[0, ..]] => 0,
+            [[1, ..]] => 1,
+            [[2 | 105, ..]] => 2,
+            [[10, ..]] => 3,
+            _ => 4,
+        };
+        INDIRECT_BY_KIND[bucket].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {
@@ -1738,6 +1749,14 @@ pub(crate) fn take_indirect() -> u64 {
     INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static INDIRECT_BY_KIND: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_indirect_by_kind() -> [u64; 5] {
+    INDIRECT_BY_KIND.each_ref().map(|v| v.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }

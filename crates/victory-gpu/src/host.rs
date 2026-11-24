@@ -5673,6 +5673,14 @@ impl Meter {
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        #[cfg(feature = "diagnostics")]
+        {
+            let counts = crate::list::take_indirect_by_kind();
+            if counts.iter().any(|&n| n != 0) {
+                let [draw, indexed, compute, mesh, other] = counts.map(|n| n as f64 / frames);
+                tracing::info!("indirect executions dropped per frame: draw {draw:.1}, indexed {indexed:.1}, compute {compute:.1}, mesh {mesh:.1}, other {other:.1}");
+            }
+        }
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
