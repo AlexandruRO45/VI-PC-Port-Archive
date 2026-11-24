@@ -82,12 +82,36 @@ the emitter set `wave_size = Some(64)` for each of them, so **every emitted
 mesh shader failed `--validate`** — 8,383 programs — and the container's
 `PSV0` lane counts disagreed with the module even after the attribute was
 dropped (`DXIL container mismatch for 'PSVRuntimeInfo'`). Neither is now
-emitted for a mesh stage, and `chunks/d010` and `chunks/d011` validate
-448 of 450 and 427 of 427 mesh programs. `a_mesh_shader_declares_no_wave_size`
-holds the container to it.
+emitted for a mesh stage.
+
+Measured with `victory translate <slice> --validate`: chunk `d010` emits 448 of
+450 mesh programs and **every emitted one validates** (0 did before); `d011`
+emits 427 of 427 and all validate; the vertex and pixel programs alongside are
+50 of 50 and 73 of 73. The two programs in `d010` that never emit are refused
+before emission by the resource layer — `05276.dxbc@0x0 Ms at 0x5ee4` and
+`05278.dxbc@0x0 Ms at 0x60e8`, both `a descriptor read only as data`, the
+family this table counts 63 of — so neither is a validation failure.
+`translate --validate --pipelines` on a mesh program reports **1 validated,
+1 pipelines**: host mesh pipelines still create without the claim.
+`a_mesh_shader_declares_no_wave_size` holds `PSV0` to "any".
 
 The consequence is stated where it belongs: a mesh program cannot ask the
 runtime for the console's wave, so its lanes are the device's.
+
+Removing a declared wave size would be alarming if any lowering depended on the
+host wave, so here is why none does — checked, not assumed.
+
+- `lane_index` (`emit/lower.rs:2407`) computes a mesh lane as
+  `flat & (wave - 1)` from the group thread index, so it is the **console's**
+  lane whatever the host wave is; a mesh program never asks the host for it.
+- `cross_lane` (`:2276`) refuses every cross-lane operation in a mesh program,
+  so no ballot, lane read or DPP is emitted for one.
+- `v_mbcnt` (`:6601`) takes its non-Host branch for mesh without needing
+  cross-lane: it derives the count from that console lane index and the
+  console's mask.
+- Compute keeps its declaration — `:562` is the only remaining
+  `wave_size = Some(wave)` — and the entry-point property is filtered on
+  `mesh.is_none()` (`emit/shader.rs`).
 
 ## Open, with what would settle each
 
@@ -111,24 +135,41 @@ needed.
 
 **A packed input half no element holds (174 pixel programs).** A 16-bit pixel
 input is packed two per dword and the host's inputs are 32-bit floats, so
-`lower` rebuilds each half from the input elements (`packed_half`). It returns
-`None` when the signature element for that half does not exist, which happens
-for an interpolation of a channel the input signature does not describe. What
-would settle it: the ISG1 element list of one failing program against its
-interpolation's `attr`/`chan` (e.g. `chunks/c005/11190.dxbc@0x0`), to see
-whether the element is missing from the signature or merely from the
-`halves` pairing.
+`lower` rebuilds each half from the input elements (`packed_half`), which
+returns `None` when no element names that half.
 
-**An interpolation with computed barycentrics (167 pixel programs).** The
-interpolation's barycentric operand is not an input VGPR but a value joined
-by control flow: `chunks/c005/10550.dxbc@0x0` at 0x3790 reads a phi whose
-incoming values are `v1` (`PerspectiveCenter`, index 1) and a value the io
-pass cannot name, which is neither an input nor an instruction result. If the
-arms name the same barycentric, resolving the phi is enough; if they name
-different ones, one attribute is interpolated two ways and `io`'s
-one-interp-per-attribute model needs a select over two interpolations. What
-would settle it: the two arms of that phi from a disassembly of the block
-before 0x3790.
+Diagnosed on `chunks/c005/11190.dxbc@0x0`. The console's input record for
+attribute 1 says `row 3, pack2, row2 == row`, and the program interpolates that
+attribute at channels x, y and z, each in both halves (`v_interp_p1ll_f16` and
+`v_interp_p2_f16 … high`) — six halves. Our element for row 3 declares
+`cols 4` halves, so half 4 has no element and the refusal fires. The console
+reads halves the row carries and we do not name: this is a **declaration**
+bug, not a source we lack. For a packed 16-bit element the console's column
+count is in dwords (4 dwords = 8 halves) and `packed_half`'s `extent` treats it
+as a half count. What the fix must keep: a pixel input never silently reads
+zero, and a width that decodes a neighbour's dword is the black-scene class
+rather than a clean refusal.
+
+**An interpolation with computed barycentrics (167 pixel programs).**
+Diagnosed, and it is not a phi the io pass merely failed to follow. On
+`chunks/c005/10550.dxbc@0x0` the barycentric phi chain resolves
+(`11035 → 10942 → 10846`, every arm `v1` as `PerspectiveCenter` index 1) down
+to a leaf that is `v_mul_legacy_f32 at 0x3580` reading `V(1)`: the console
+**computes** its own interpolation weight. The disassembly agrees — `v0`/`v1`
+are the PerspectiveCenter pair at 0x10a0 and 0x1eac, arithmetic overwrites
+them at 0x1ebc/0x1edc (`v_mul_legacy_f32 v0, s18, v8`, `v_mul_legacy_f32 v1,
+s36, v13`, then `v_fmac_f32`), and the same `attr2` is interpolated off those
+registers again at 0x377c/0x3790. An agreement walk over those arms returns
+`Err`, correctly: they do not name the same value.
+
+So one attribute is interpolated two ways and one of them uses weights the
+shader built itself, which `SV_Barycentrics` as an interp mode cannot express.
+Two consequences. Cheaply separable: programs whose `v0`/`v1` are never written
+are the ones a phi walk fixes, and a scan for writes to `v0`/`v1` that feed a
+`v_interp_p*` operand counts them across the archive. Not cheap: the rest need
+the pull model — read the attribute's values and interpolate by hand — which
+the console data already distinguishes (`Barycentric::PerspectivePullModel`,
+for which `interp()` returns `None`) and which the emitter does not implement.
 
 **The rest** are single programs each (`s_getpc_b64`, `v_cvt_f32_f64`, an LDS
 operation, `v_permlanex16_b32`, a whole-wave section step); each is a small,

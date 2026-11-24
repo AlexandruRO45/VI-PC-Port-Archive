@@ -8797,7 +8797,7 @@ mod tests {
     }
 
     /// Lowers a synthetic pixel program.
-    fn lowers_pixel(words: &[u32]) -> Result<(), crate::ShaderError> {
+    fn lower_pixel(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Ps,
@@ -8828,7 +8828,10 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
+    }
+
+    fn lowers_pixel(words: &[u32]) -> Result<(), crate::ShaderError> {
+        lower_pixel(words).map(|_| ())
     }
 
     #[test]
@@ -8837,17 +8840,30 @@ mod tests {
         // (`pixel-ee41ebc3eb3fbbdc` does this to feed a descriptor offset):
         // the lane write and the constant-lane read back are one scalar, in
         // a pixel program too, with no wave read at all.
-        let read_at_a_lane = [
-            0xBE8E_0385, // s_mov_b32 s14, 5
-            0xD761_009E,
-            0x0001_000E, // v_writelane_b32 v158, s14, lane 0
-            0xD760_0000,
-            0x0001_019E, // v_readlane_b32 s0, v158, lane 0
-            0xBF07_8000, // s_cmp_lg_u32 s0, 0
-            0xBF85_0000, // s_cbranch_scc1 -> s_endpgm
-            S_ENDPGM,
-        ];
-        lowers_pixel(&read_at_a_lane).unwrap();
+        let read_at = |write_lane: u32, read_lane: u32, constant: u32| {
+            let lane = |k: u32| (128 + k) << 9;
+            [
+                0xBE8E_0300 | constant, // s_mov_b32 s14, constant
+                0xD761_009E,
+                lane(write_lane) | 0x0E, // v_writelane_b32 v158, s14, write_lane
+                0xD760_0000,
+                lane(read_lane) | 0x019E, // v_readlane_b32 s0, v158, read_lane
+                0xBF07_8000,              // s_cmp_lg_u32 s0, 0
+                0xBF85_0000,              // s_cbranch_scc1 -> s_endpgm
+                S_ENDPGM,
+            ]
+        };
+        // The lane the write set resolves ...
+        assert!(lowers_pixel(&read_at(0, 0, 0x85)).is_ok());
+        // ... a lane no lane write reached does not, rather than another
+        // lane's scalar.
+        assert!(lowers_pixel(&read_at(0, 1, 0x85)).is_err());
+        // And the scalar reaches the code: a different constant is a
+        // different module, so the read back is not resolving to something
+        // else.
+        let five = lower_pixel(&read_at(0, 0, 0x85)).unwrap();
+        let nine = lower_pixel(&read_at(0, 0, 0x89)).unwrap();
+        assert_ne!(five.dxil, nine.dxil);
     }
 
     fn perm_features(selector: u32) -> u64 {
