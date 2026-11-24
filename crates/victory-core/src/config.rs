@@ -267,6 +267,7 @@ impl Config {
             ensure_own_folder(name, dir, home.as_deref(), origin, setting)?;
         }
         ensure_data_outside_cache(&cache_dir, &data_dir, &origins)?;
+        ensure_data_outside_user_cache(&data_dir, origins.data_dir, &env)?;
         if let Some(game) = &game_dir {
             ensure_game_apart(game, &cache_dir, &data_dir, &origins)?;
         }
@@ -591,6 +592,48 @@ fn ensure_data_outside_cache(cache_dir: &Path, data_dir: &Path, origins: &Origin
         );
     }
     Ok(())
+}
+
+/// [`ensure_data_outside_cache`] for the user's whole cache, not only
+/// Victory's: `$XDG_CACHE_HOME` (else `~/.cache`) is what desktop cleaners
+/// and users empty, so data under it is lost with it even when it is not
+/// inside Victory's cache folder. The easy slips are
+/// `VICTORY_DATA_DIR=~/.cache/victory-saves`, and `XDG_DATA_HOME` set
+/// under `XDG_CACHE_HOME` (`~/.cache/share`), which moves the default data
+/// folder there although the cache folder is a sibling. Skipped when that
+/// base is the home folder or holds it (`XDG_CACHE_HOME=$HOME`): then it is
+/// not a folder anyone clears. Compared lexically, without the disk.
+fn ensure_data_outside_user_cache(
+    data_dir: &Path,
+    origin: Origin,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<()> {
+    let absolute = |k: &str| env(k).map(PathBuf::from).filter(|p| p.is_absolute());
+    let home = absolute("HOME");
+    let (base, named) = match absolute("XDG_CACHE_HOME") {
+        Some(base) => (base, "XDG_CACHE_HOME"),
+        None => match &home {
+            Some(home) => (home.join(".cache"), "~/.cache"),
+            None => return Ok(()),
+        },
+    };
+    if !is_within(data_dir, &base, FOLD_CASE)
+        || home.is_some_and(|h| is_within(&h, &base, FOLD_CASE))
+    {
+        return Ok(());
+    }
+    if origin == Origin::Default {
+        anyhow::bail!(
+            "the default data folder {} is inside your cache folder {} ({named}), which              may be deleted at any time, because XDG_DATA_HOME is inside it; point              XDG_DATA_HOME elsewhere, or set VICTORY_DATA_DIR or [paths].data_dir to a              folder outside the cache",
+            data_dir.display(),
+            base.display()
+        );
+    }
+    anyhow::bail!(
+        "the data folder {} (from {origin}) is inside your cache folder {} ({named}), which          may be deleted at any time; set VICTORY_DATA_DIR or [paths].data_dir to a folder          outside it, such as one under ~/.local/share",
+        data_dir.display(),
+        base.display()
+    );
 }
 
 /// The game folder is the user's own dump: Victory reads it and never
@@ -2211,6 +2254,84 @@ mod tests {
             _ => None,
         };
         assert!(Config::resolve(FilePaths::default(), None, cache_in_data).is_ok());
+    }
+
+    #[test]
+    fn data_inside_the_user_cache_is_refused() {
+        let home = PathBuf::from(abs("home"));
+        let run = |vars: Vec<(&'static str, OsString)>| {
+            let env = move |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+            Config::resolve(FilePaths::default(), None, env)
+        };
+        // An explicit data folder under ~/.cache, apart from Victory's cache.
+        let err = run(vec![
+            ("HOME", home.clone().into()),
+            ("VICTORY_CACHE_DIR", abs("c")),
+            ("VICTORY_DATA_DIR", home.join(".cache").join("saves").into()),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("inside your cache folder"), "{err}");
+        assert!(err.contains("(from VICTORY_DATA_DIR)"), "{err}");
+        assert!(err.contains("~/.cache"), "{err}");
+
+        // XDG_CACHE_HOME wins over ~/.cache, through `..` too.
+        let err = run(vec![
+            ("HOME", home.clone().into()),
+            ("XDG_CACHE_HOME", abs("xc")),
+            (
+                "VICTORY_DATA_DIR",
+                PathBuf::from(abs("v"))
+                    .join("..")
+                    .join("xc")
+                    .join("d")
+                    .into(),
+            ),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("(XDG_CACHE_HOME)"), "{err}");
+        // ...and then ~/.cache is not the user cache.
+        assert!(
+            run(vec![
+                ("HOME", home.clone().into()),
+                ("XDG_CACHE_HOME", abs("xc")),
+                ("VICTORY_DATA_DIR", home.join(".cache").join("d").into()),
+            ])
+            .is_ok()
+        );
+
+        // XDG_DATA_HOME under XDG_CACHE_HOME moves the default data there.
+        let err = run(vec![
+            ("XDG_CACHE_HOME", abs("xc")),
+            (
+                "XDG_DATA_HOME",
+                PathBuf::from(abs("xc")).join("share").into(),
+            ),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("the default data folder"), "{err}");
+        assert!(err.contains("XDG_DATA_HOME is inside it"), "{err}");
+
+        // A sibling such as ~/.cache-old, the usual defaults, and an
+        // XDG_CACHE_HOME that is the home folder itself are all fine.
+        assert!(
+            run(vec![
+                ("HOME", home.clone().into()),
+                ("VICTORY_DATA_DIR", home.join(".cache-old").into()),
+            ])
+            .is_ok()
+        );
+        assert!(run(vec![("HOME", home.clone().into())]).is_ok());
+        assert!(
+            run(vec![
+                ("HOME", home.clone().into()),
+                ("XDG_CACHE_HOME", home.clone().into()),
+                ("VICTORY_CACHE_DIR", abs("c")),
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
