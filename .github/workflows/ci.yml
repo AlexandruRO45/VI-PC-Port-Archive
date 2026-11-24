@@ -25,9 +25,36 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        shell: bash
+        run: |
+          set +e
+          CARGO_TERM_COLOR=never cargo clippy --workspace --all-targets --locked --message-format=short -- -D warnings > /tmp/clippy.log 2>&1
+          code=$?
+          cat /tmp/clippy.log
+          if [ $code -ne 0 ]; then
+            grep -E '(error|warning)' /tmp/clippy.log | head -n 40 | while IFS= read -r line; do echo "::error::$line"; done
+            exit $code
+          fi
       - name: Clippy, diagnostics build
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        shell: bash
+        run: |
+          set +e
+          CARGO_TERM_COLOR=never cargo clippy --workspace --all-targets --all-features --locked --message-format=short -- -D warnings > /tmp/clippy_diag.log 2>&1
+          code=$?
+          cat /tmp/clippy_diag.log
+          if [ $code -ne 0 ]; then
+            grep -E '(error|warning)' /tmp/clippy_diag.log | head -n 40 | while IFS= read -r line; do echo "::error::$line"; done
+            exit $code
+          fi
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
-        run: cargo test --workspace --locked
+        shell: bash
+        run: |
+          set +e
+          CARGO_TERM_COLOR=never cargo test --workspace --locked > /tmp/test.log 2>&1
+          code=$?
+          cat /tmp/test.log
+          if [ $code -ne 0 ]; then
+            grep -E '(FAILED|panicked|assertion|error\[|thread .+ panicked)' /tmp/test.log | head -n 40 | while IFS= read -r line; do echo "::error::$line"; done
+            exit $code
+          fi
