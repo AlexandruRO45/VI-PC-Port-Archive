@@ -1115,8 +1115,9 @@ fn ensure_titles_distinct(
 /// For the cache or data folder `create_dir_all` would fail on first use
 /// with "File exists", naming neither the setting nor the fix; the same goes
 /// for a link (the folder or one above it) whose target was moved or deleted,
-/// or that loops, so it is refused too, as is a folder under a folder without
-/// search permission, with a name longer than the file system allows or
+/// or that loops, so it is refused too (a link into a file, or under a folder
+/// without search permission, is named as such rather than as gone), as is
+/// a folder under a folder without search permission, with a name longer than the file system allows or
 /// longer as a whole than the system takes for one path. A path that
 /// does not exist yet is fine: the cache and data folders are created when
 /// needed. `what` is the folder ("game folder", "cache folder", "data
@@ -1157,13 +1158,13 @@ fn ensure_directory_path(what: &str, dir: &Path, origin: Origin, setting: &str) 
             too_long |= e.kind() == std::io::ErrorKind::InvalidFilename;
             std::fs::symlink_metadata(p)
                 .is_ok_and(|m| m.file_type().is_symlink())
-                .then_some(Err(p))
+                .then_some(Err((p, e.kind())))
         }
     });
     let (path, metadata) = match existing {
         None => return Ok(()),
         Some(Ok(found)) => found,
-        Some(Err(link)) => {
+        Some(Err((link, kind))) => {
             let target = std::fs::read_link(link)
                 .map(|t| format!(" to {}", t.display()))
                 .unwrap_or_default();
@@ -1172,10 +1173,29 @@ fn ensure_directory_path(what: &str, dir: &Path, origin: Origin, setting: &str) 
             } else {
                 format!(" cannot be a folder because {}", link.display())
             };
+            // A link that is there but cannot be followed is not always one
+            // whose target is gone: one to `default.xex/` or `default.xex/sub`
+            // goes through a file ("Not a directory"), and one into a folder
+            // without search permission cannot be followed by this user
+            // ("Permission denied"). Calling those moved, deleted or looping
+            // sends the user looking for the wrong fix.
+            let why = match kind {
+                std::io::ErrorKind::NotADirectory => {
+                    "that goes through something that is not a folder (a file, named pipe, \
+                     socket or device) as if it were one; point the link at a folder"
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    "that leads under a folder without search permission for this user, so \
+                     where it leads cannot be checked; give that folder search permission"
+                }
+                _ => {
+                    "that leads nowhere (its target was moved or deleted, or the link loops); \
+                     fix or remove the link"
+                }
+            };
             anyhow::bail!(
-                "the {what} {} (from {origin}){place} is a link{target} that leads nowhere \
-                 (its target was moved or deleted, or the link loops); \
-                 fix or remove the link, or set {setting} elsewhere",
+                "the {what} {} (from {origin}){place} is a link{target} {why}, \
+                 or set {setting} elsewhere",
                 dir.display()
             );
         }
@@ -4346,6 +4366,117 @@ mod tests {
                 .join("n".repeat(100))
                 .exists()
         );
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_folder_setting_link_into_a_file_or_a_locked_folder_is_not_called_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        // A scratch folder under the system temp folder, never the
+        // repository; removed at the end.
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-link-unfollowable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(scratch.join("gta")).unwrap();
+        std::fs::create_dir_all(scratch.join("locked").join("inner")).unwrap();
+        let exe = scratch.join("gta").join("default.xex");
+        std::fs::write(&exe, b"").unwrap();
+        let resolve = |cache: PathBuf, data: PathBuf| {
+            Config::resolve(FilePaths::default(), None, move |key: &str| match key {
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            })
+        };
+
+        // A link whose target goes through the file as if it were a folder
+        // (`default.xex/`, `default.xex/.`, `default.xex/saves`, written as
+        // is or relative to the link's folder): "Not a directory", which
+        // is named as such, not as a target moved, deleted or looping.
+        let targets = [
+            format!("{}/", exe.display()),
+            format!("{}/.", exe.display()),
+            exe.join("saves").display().to_string(),
+            "gta/default.xex/".to_owned(),
+        ];
+        for (i, target) in targets.iter().enumerate() {
+            let link = scratch.join(format!("into-file-{i}"));
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            // As the folder itself, and as a folder still to create under it.
+            for (cache, place) in [
+                (link.clone(), String::new()),
+                (
+                    link.join("cache"),
+                    format!(" cannot be a folder because {}", link.display()),
+                ),
+            ] {
+                let err = resolve(cache.clone(), scratch.join("data"))
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(
+                    err,
+                    format!(
+                        "the cache folder {} (from VICTORY_CACHE_DIR){place} is a link to \
+                         {target} that goes through something that is not a folder (a file, \
+                         named pipe, socket or device) as if it were one; point the link at a \
+                         folder, or set VICTORY_CACHE_DIR or [paths].cache_dir elsewhere",
+                        cache.display()
+                    )
+                );
+            }
+        }
+
+        // A link into a folder without search permission: "Permission
+        // denied", named as such.
+        let locked = scratch.join("locked");
+        let to_locked = scratch.join("to-locked");
+        std::os::unix::fs::symlink(locked.join("inner"), &to_locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root (or a CAP_DAC_OVERRIDE container) searches through the mode
+        // bits, leaving nothing to check.
+        if std::fs::metadata(locked.join("inner")).is_err() {
+            for data in [to_locked.clone(), to_locked.join("data")] {
+                let err = resolve(scratch.join("cache"), data.clone())
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.starts_with(&format!(
+                        "the data folder {} (from VICTORY_DATA_DIR)",
+                        data.display()
+                    )) && err.contains(&format!(
+                        "is a link to {} that leads under a folder without search \
+                             permission for this user, so where it leads cannot be checked; \
+                             give that folder search permission, or set VICTORY_DATA_DIR or \
+                             [paths].data_dir elsewhere",
+                        locked.join("inner").display()
+                    )),
+                    "{err}"
+                );
+                assert!(!err.contains("leads nowhere"), "{err}");
+            }
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Search permission back: the link is followed to the folder, and
+        // a folder still to create under it is fine; nothing is made.
+        let cfg = resolve(scratch.join("cache"), to_locked.join("data")).unwrap();
+        assert_eq!(cfg.data_dir, to_locked.join("data"));
+        assert!(!locked.join("inner").join("data").exists());
+        // A link whose target is gone is still called that.
+        let gone = scratch.join("gone");
+        std::os::unix::fs::symlink(scratch.join("moved-away"), &gone).unwrap();
+        let err = resolve(gone.clone(), scratch.join("data"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("that leads nowhere (its target was moved"),
+            "{err}"
+        );
+        // Nothing was created or replaced.
+        assert!(exe.is_file());
+        assert!(!scratch.join("cache").exists() && !scratch.join("data").exists());
         std::fs::remove_dir_all(&scratch).unwrap();
     }
 
