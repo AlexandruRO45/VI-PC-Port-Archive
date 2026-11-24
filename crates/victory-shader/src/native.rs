@@ -540,7 +540,20 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 user_data: e[17],
                 slot: e[18],
             })
-            .collect();
+            .collect::<Vec<UsedResource>>();
+        // The host binds a table read by its root slot (`draw::tables`),
+        // while lowering finds what a read is by the table address's SGPR
+        // (`used_kind`). A read naming no table parameter with both would be
+        // classified from one table and its descriptors bound from another,
+        // or from none.
+        if used.iter().any(|u| {
+            u.root == RootType::Table
+                && !layout.iter().any(|p| {
+                    p.root == RootType::Table && p.slot == u.slot && p.user_data == u.user_data
+                })
+        }) {
+            return Err(Malformed("used descriptor names no root table"));
+        }
         // The record is in bounds, so its end is too.
         let stage_data = &payload[(start + RECORD_SIZE) as usize..];
         let io = match stage {
@@ -1113,6 +1126,8 @@ mod tests {
         for sgprs in [0u32, 1, 2] {
             let mut desc = blob.clone();
             desc[entry..entry + 4].copy_from_slice(&1u32.to_le_bytes());
+            // The SRV read through it is then a root descriptor's.
+            desc[entry + ENTRY_SIZE as usize + 1] = 1;
             desc[entry + 8..entry + 12].copy_from_slice(&sgprs.to_le_bytes());
             desc[entry + 16] = 104;
             assert_eq!(
@@ -1130,6 +1145,30 @@ mod tests {
                 assert!(layout(&desc).is_ok());
             }
         }
+
+        // The SRV is read through the table in s9, root slot 1: a read
+        // naming another slot or SGPR names no table the layout has.
+        let used = entry + ENTRY_SIZE as usize;
+        for (at, byte) in [(17, 8u8), (17, 10), (18, 0), (18, 2)] {
+            let mut stray = blob.clone();
+            stray[used + at] = byte;
+            assert_eq!(
+                refused_blob(&xbch(&stray)),
+                "used descriptor names no root table",
+                "byte {at} = {byte}"
+            );
+        }
+        // Nor may it name a parameter of another kind there.
+        let mut constants = blob.clone();
+        constants[entry..entry + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            refused_blob(&xbch(&constants)),
+            "used descriptor names no root table"
+        );
+        // A read of another kind of root is not a table read.
+        let mut desc = constants.clone();
+        desc[used + 1] = 0;
+        assert!(layout(&desc).is_ok());
 
         blob[record + RECORD_COUNTS] = 9;
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_err());
