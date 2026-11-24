@@ -63,6 +63,10 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Diagnostics: the console resources its native programs use, parsed
+    /// on first ask (see [`native_used`]).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    native: OnceLock<Vec<victory_shader::UsedResource>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -88,6 +92,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(all(windows, feature = "diagnostics"))]
+                native: OnceLock::new(),
             })
         })
         .clone()
@@ -185,25 +191,31 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 
 /// Diagnostics: the console resources each stage of pipeline `this` uses
 /// (stage, shader hash, resources), whether or not its shaders translate.
+/// Each container is parsed once, on the first ask for any pipeline that
+/// shares it; later asks borrow that.
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn native_used(this: This) -> Vec<(&'static str, String, Vec<victory_shader::UsedResource>)> {
+pub(crate) fn native_used<'a>(
+    this: This,
+) -> impl Iterator<Item = (&'static str, &'a str, &'a [victory_shader::UsedResource])> {
     use victory_shader::{Container, FourCC};
-    if this.is_null() {
-        return Vec::new();
-    }
-    pipeline(this)
-        .shaders
-        .iter()
-        .map(|s| {
-            let used = Container::parse(&s.container)
+    let shaders: &'a [Arc<Shader>] = if this.is_null() {
+        &[]
+    } else {
+        &pipeline(this).shaders
+    };
+    shaders.iter().map(|s| {
+        let used = s.native.get_or_init(|| {
+            Container::parse(&s.container)
                 .ok()
-                .and_then(|c| c.part(FourCC::DXIL).map(|p| p.data.to_vec()))
-                .and_then(|d| victory_shader::native_programs(&d).ok())
+                .and_then(|c| {
+                    let part = c.part(FourCC::DXIL)?;
+                    victory_shader::native_programs(part.data).ok()
+                })
                 .map(|programs| programs.into_iter().flat_map(|p| p.used).collect())
-                .unwrap_or_default();
-            (s.stage, s.hash.clone(), used)
-        })
-        .collect()
+                .unwrap_or_default()
+        });
+        (s.stage, s.hash.as_str(), used.as_slice())
+    })
 }
 
 #[repr(C)]
