@@ -8,6 +8,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 const EXEC_LO: u32 = 126;
+#[cfg(windows)]
 const EXEC_HI: u32 = 127;
 const VCC: u32 = 106;
 const NULL_OP: u32 = 125;
@@ -56,6 +57,7 @@ fn ds_op(op: u32, off0: u8, off1: u8, addr: u32, data0: u32, vdst: u32) -> [u32;
         addr | (data0 << 8) | (vdst << 24),
     ]
 }
+#[cfg(windows)]
 fn dpp_row_shr(
     vop2_op: u32,
     dst: u32,
@@ -73,18 +75,21 @@ fn dpp_row_shr(
 fn s_mov_b32(dst: u32, src0: u32) -> u32 {
     sop1(dst, 0x03, src0)
 }
+#[cfg(windows)]
 fn s_mov_b64(dst: u32, src0: u32) -> u32 {
     sop1(dst, 0x04, src0)
 }
 fn s_bcnt1_i32_b64(dst: u32, src0: u32) -> u32 {
     sop1(dst, 0x10, src0)
 }
+#[cfg(windows)]
 fn s_ff1_i32_b64(dst: u32, src0: u32) -> u32 {
     sop1(dst, 0x14, src0)
 }
 fn s_and_saveexec_b64(dst: u32, src0: u32) -> u32 {
     sop1(dst, 0x24, src0)
 }
+#[cfg(windows)]
 fn s_or_saveexec_b64(dst: u32, src0: u32) -> u32 {
     sop1(dst, 0x25, src0)
 }
@@ -113,33 +118,39 @@ fn v_readfirstlane_b32(sdst: u32, vsrc: u32) -> u32 {
 fn v_lshlrev_b32(dst: u32, shift: u32, vsrc1: u32) -> u32 {
     vop2(0x1A, dst, shift, vsrc1)
 }
+#[cfg(windows)]
 fn v_and_b32(dst: u32, src0: u32, vsrc1: u32) -> u32 {
     vop2(0x1B, dst, src0, vsrc1)
 }
+#[cfg(windows)]
 fn v_or_b32(dst: u32, src0: u32, vsrc1: u32) -> u32 {
     vop2(0x1C, dst, src0, vsrc1)
 }
 fn v_add_nc_u32(dst: u32, src0: u32, vsrc1: u32) -> u32 {
     vop2(0x25, dst, src0, vsrc1)
 }
+#[cfg(windows)]
 fn v_sub_nc_u32(dst: u32, src0: u32, vsrc1: u32) -> u32 {
     vop2(0x26, dst, src0, vsrc1)
 }
 fn v_cmp_lt_u32(src0: u32, vsrc1: u32) -> u32 {
     vopc(0xC1, src0, vsrc1)
 }
+#[cfg(windows)]
 fn v_cmp_eq_u32(src0: u32, vsrc1: u32) -> u32 {
     vopc(0xC2, src0, vsrc1)
 }
 fn v_cmp_gt_u32(src0: u32, vsrc1: u32) -> u32 {
     vopc(0xC4, src0, vsrc1)
 }
+#[cfg(windows)]
 fn v_cndmask_b32(dst: u32, src0: u32, src1: u32, mask_s: u32) -> [u32; 2] {
     vop3(0x101, dst, src0, src1, mask_s)
 }
 fn v_readlane_b32(sdst: u32, vsrc: u32, lane_op: u32) -> [u32; 2] {
     vop3(0x360, sdst, vgpr(vsrc), lane_op, 0)
 }
+#[cfg(windows)]
 fn v_writelane_b32(vdst: u32, src: u32, lane_op: u32) -> [u32; 2] {
     vop3(0x361, vdst, src, lane_op, 0)
 }
@@ -513,11 +524,14 @@ fn lds_regions_fence_at_uniform_joins_and_exits() {
             );
         }
         for mode in [Wave64Mode::Wave32, Wave64Mode::Emulate] {
-            let mut shader = emit_cs(&prog, mode).unwrap();
+            let shader = emit_cs(&prog, mode).unwrap();
+            #[cfg(not(windows))]
+            drop(shader);
             #[cfg(windows)]
             if let Ok(mut validator) = super::validator::Validator::load(
                 super::validator::Validator::default_path().as_deref(),
             ) {
+                let mut shader = shader;
                 validator.validate(&mut shader.dxil).unwrap();
             }
         }
