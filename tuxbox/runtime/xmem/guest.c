@@ -135,7 +135,7 @@ static int virtual_query(void)
     BYTE *base = VirtualAlloc(NULL, 2 * system.dwPageSize, MEM_RESERVE, PAGE_NOACCESS);
     REQUIRE(base);
     HMODULE module = GetModuleHandleW(L"xmem.dll");
-    REQUIRE(GetProcAddress(module, "XMemVirtualQuery") == GetProcAddress(module, MAKEINTRESOURCEA(32)));
+    REQUIRE(GetProcAddress(module, "XMemVirtualQuery") == GetProcAddress(module, MAKEINTRESOURCEA(36)));
     REQUIRE(VirtualAlloc(base + system.dwPageSize, system.dwPageSize, MEM_COMMIT, PAGE_READONLY));
     BYTE sentinel[sizeof out]; memset(sentinel, 0xa5, sizeof sentinel);
     for (int i = 0; i < 2; ++i) {
@@ -234,7 +234,7 @@ static int virtual_cpu_profiles(void)
 static int write_watch(void)
 {
     HMODULE module = GetModuleHandleW(L"xmem.dll");
-    REQUIRE(GetProcAddress(module, "XMemGetWriteWatch") == GetProcAddress(module, MAKEINTRESOURCEA(17)));
+    REQUIRE(GetProcAddress(module, "XMemGetWriteWatch") == GetProcAddress(module, MAKEINTRESOURCEA(18)));
     SYSTEM_INFO info;
     GetSystemInfo(&info);
     SIZE_T page = info.dwPageSize;
@@ -266,8 +266,8 @@ static int write_watch(void)
     DWORD guest_error = XMemGetWriteWatch(0x80000000u, (void *)base, 4 * page,
                                           output.pages, &count, &granularity);
     REQUIRE(host_error != 0 && guest_error == host_error && count == expected_count);
-    REQUIRE(GetProcAddress(module, "XMemSetOption") == GetProcAddress(module, MAKEINTRESOURCEA(27)));
-    REQUIRE(GetProcAddress(module, "XMemResumeWriteWatch") == GetProcAddress(module, MAKEINTRESOURCEA(24)));
+    REQUIRE(GetProcAddress(module, "XMemSetOption") == GetProcAddress(module, MAKEINTRESOURCEA(30)));
+    REQUIRE(GetProcAddress(module, "XMemResumeWriteWatch") == GetProcAddress(module, MAKEINTRESOURCEA(27)));
     REQUIRE(XMemResumeWriteWatch());
     XMEM_OPTION setting = {0x10000, 0, 1};
     XMemSetOption(&setting);
@@ -328,7 +328,7 @@ static int write_watch(void)
 static int allocation_tags(void)
 {
     HMODULE module = GetModuleHandleW(L"xmem.dll");
-    REQUIRE(GetProcAddress(module, "XMemMakeTag") == GetProcAddress(module, MAKEINTRESOURCEA(20)));
+    REQUIRE(GetProcAddress(module, "XMemMakeTag") == GetProcAddress(module, MAKEINTRESOURCEA(21)));
     REQUIRE(XMemMakeTag(0) == 0);
     REQUIRE(XMemMakeTag(0x41414141u) == 0x69a69a0000000000ULL);
     UINT64 hash = 14695981039346656037ULL;
@@ -383,7 +383,7 @@ static void *WINAPI reentrant_alloc_hook(SIZE_T bytes, UINT64 attributes)
 static int allocation_hooks(void)
 {
     HMODULE module = GetModuleHandleW(L"xmem.dll");
-    REQUIRE(GetProcAddress(module, "XMemSetAllocationHooks") == GetProcAddress(module, MAKEINTRESOURCEA(25)));
+    REQUIRE(GetProcAddress(module, "XMemSetAllocationHooks") == GetProcAddress(module, MAKEINTRESOURCEA(28)));
     REQUIRE(GetProcAddress(module, "XMemAlloc") != GetProcAddress(module, "XMemAllocDefault"));
     REQUIRE(GetProcAddress(module, "XMemFree") != GetProcAddress(module, "XMemFreeDefault"));
     XMemSetAllocationHooks(guest_alloc_hook, guest_free_hook);
@@ -510,7 +510,7 @@ static int heap_diagnostics(void)
     }
     HMODULE module = GetModuleHandleW(L"xmem.dll");
     const UINT64 *volatile *history = (const UINT64 *volatile *)GetProcAddress(module, "XMemHistoryData");
-    REQUIRE(history && (FARPROC)history == GetProcAddress(module, MAKEINTRESOURCEA(18)) && *history);
+    REQUIRE(history && (FARPROC)history == GetProcAddress(module, MAKEINTRESOURCEA(19)) && *history);
     MEMORY_BASIC_INFORMATION view;
     REQUIRE(VirtualQuery(*history, &view, sizeof view) == sizeof view && view.Protect == PAGE_READONLY);
     for (int retry = 0; retry < 30 && !((const volatile UINT64 *)*history)[15]; ++retry) Sleep(100);
@@ -686,7 +686,7 @@ static int physical_pages(void)
     SIZE_T count = 2;
     HMODULE dll = GetModuleHandleW(L"xmem.dll");
     REQUIRE(GetProcAddress(dll, "XMemAllocatePhysicalPages") == GetProcAddress(dll, MAKEINTRESOURCEA(3)));
-    REQUIRE(GetProcAddress(dll, "XMemMapPhysicalPages") == GetProcAddress(dll, MAKEINTRESOURCEA(21)));
+    REQUIRE(GetProcAddress(dll, "XMemMapPhysicalPages") == GetProcAddress(dll, MAKEINTRESOURCEA(22)));
     REQUIRE(GetProcAddress(dll, "XMemFreePhysicalPages") == GetProcAddress(dll, MAKEINTRESOURCEA(8)));
     if (!XMemAllocatePhysicalPages(flags, &count, tokens)) {
         DWORD error = GetLastError();
@@ -736,7 +736,7 @@ static int scattered_pages(void)
 {
     const SIZE_T page = 65536;
     HMODULE module = GetModuleHandleW(L"xmem.dll");
-    REQUIRE(GetProcAddress(module, "XMemMapPhysicalPagesScatter") == GetProcAddress(module, MAKEINTRESOURCEA(22)));
+    REQUIRE(GetProcAddress(module, "XMemMapPhysicalPagesScatter") == GetProcAddress(module, MAKEINTRESOURCEA(23)));
     BYTE *base = VirtualAlloc(NULL, 8 * page, MEM_RESERVE, PAGE_NOACCESS);
     REQUIRE(base);
     SIZE_T count = 3;

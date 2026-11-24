@@ -41,6 +41,7 @@ XCL works only on unpacked game files you already own. It does not download, dec
 | **kernelx** | ✅ | title memory (budget from MicrosoftGame.Config, physical pages), threads on the PC's processors, modules, OS / console info | unit + end-to-end tests |
 | **Memory** | ✅ | title graphics memory shared by CPU and GPU without copies, up to 16 GB (4 GiB windows) | GPU tests: loads, stores and atomics across windows |
 | **File system** | ✅ | console paths (`GAME:`, `G:`, `D:` …) → the game folder; writes go to an overlay, the game folder is never modified; the console's drives: `S:\` (persistent local storage) and `T:\` (temp) in the title's data folder; free disk space answered for console paths | end-to-end: the test title's folder stays byte-identical; PLS and free space through the real call path |
+| **DirectStorage** | ✅ | the console's DirectStorage queues: file and memory sources, zlib, and BCPack – the console's texture compression – for BC1, BC3, BC4, BC5, BC6H and BC7 (BC2 and the hardware swizzle are refused) | unit tests on synthetic streams; retail BCPack chunks of all six modes byte-identical with a reference decoder (`XCL_SAMPLE_BCPACK`) |
 
 ### System services
 
@@ -113,6 +114,9 @@ xcl inspect D:\Game\game.exe               # the game's imports and what XCL has
 xcl run D:\Game [-- game arguments]        # run
 xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console containers too)
 xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
+xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build compute pipelines and save driver blobs for the next run
+xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
+xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
@@ -124,6 +128,22 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - **The game folder is never modified** – writes go to the overlay.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
+  background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
+  at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
+  they cannot occupy the ordinary huge-pipeline slot; one of them can therefore run next to the
+  ordinary ones, and each gated compile starts only with 3 GB of commit free. Smaller pipelines
+  and those a game thread waits for never wait. `xcl.log` shows each huge one as a numbered
+  `driver compile start #K` / `driver compile finish #K: … PSO, N B DXIL, M ms` pair (compute
+  ones with `record HASH`, the console record's hash that `--measure-pso` and
+  `--export-hlsl --record-hash` take), with whether it was gated and how long it waited;
+  `XCL_PSO_TRACE=1` logs every driver compile.
+- With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
+  XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
+  those on which the GPU completed at least one operation.
+- `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
+  requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
+  (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
@@ -151,7 +171,7 @@ the adapter (no GPU / DXC / wave64 / mesh shaders) passes too, but prints `SKIPP
 those skips fail. Tests on real game data are opt-in through
 environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pack),
 `XCL_SAMPLE_DLLS` (the game's console DLLs), `XCL_SAMPLE_TTPF` (texture archive),
-`XCL_SAMPLE_BK2` (a movie), `XCL_SAMPLE_BVH4`, `XCL_SAMPLE_AWC` (a sound) – described in `HANDOFF.md`; without them those
+`XCL_SAMPLE_BCPACK` (a folder of BCPack streams `<name>.bc<mode>` with a reference decoder's blocks of each, `<name>.vic<mode>`), `XCL_SAMPLE_BK2` (a movie), `XCL_SAMPLE_BVH4`, `XCL_SAMPLE_AWC` (a sound) – described in `HANDOFF.md`; without them those
 tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
 part of the repository.
 

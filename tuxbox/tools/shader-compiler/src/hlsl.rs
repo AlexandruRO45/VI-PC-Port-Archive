@@ -26,12 +26,18 @@ mod compare;
 mod uniform_texel;
 mod pixel_quad;
 mod mubuf_offsets;
+mod code_offset;
+mod scalar_bits;
 #[cfg(test)]
 mod raw_width;
+#[cfg(test)]
+mod raw_idxen;
 #[cfg(test)]
 mod wide_atomic_test;
 #[cfg(test)]
 mod heap_resinfo;
+#[cfg(test)]
+mod compute_swizzle;
 mod fssm_bindings;
 mod micropoly;
 mod mesh;
@@ -68,6 +74,7 @@ mod ray_resolve;
 mod fspx_wave;
 mod singleton_wave;
 mod wave_sum;
+mod raw_index;
 mod reflection_compact;
 pub(crate) mod radiance_probe;
 mod screen_gather;
@@ -398,6 +405,21 @@ fn ff1_b64_expr(lo: &str, hi: &str) -> String {
     )
 }
 
+/// HLSL expression for `s_flbit_i32_b64`: first set bit from MSB to LSB over a 64-bit value.
+fn flbit_b64_expr(lo: &str, hi: &str) -> String {
+    format!("({hi} != 0u ? 31u - firstbithigh({hi}) : {lo} != 0u ? 63u - firstbithigh({lo}) : ~0u)")
+}
+
+/// HLSL expression for `s_ff0_i32_b32`: first zero bit from LSB to MSB over a 32-bit value.
+fn ff0_b32_expr(val: &str) -> String {
+    format!("firstbitlow(~{val})")
+}
+
+/// HLSL expression for `s_ff0_i32_b64`: first zero bit from LSB to MSB over a 64-bit value.
+fn ff0_b64_expr(lo: &str, hi: &str) -> String {
+    format!("(~{lo} != 0u ? uint(firstbitlow(~{lo})) : ~{hi} != 0u ? 32u + uint(firstbitlow(~{hi})) : 0xffffffffu)")
+}
+
 struct Emitter<'a> {
     lds_tile: Option<lds_tile::LdsTile>,
     packed: Option<PackedRoot>,
@@ -406,6 +428,8 @@ struct Emitter<'a> {
     res: HashMap<usize, Vec<Res>>, // per-instruction resolved resources
     cb_size: BTreeMap<u32, u32>,   // slot -> dwords
     zero_buffer_offsets: std::cell::OnceCell<BTreeSet<(usize, u8)>>,
+    ordinary_bit_sites: std::cell::OnceCell<BTreeSet<usize>>,
+    smem_constants: std::cell::OnceCell<BTreeMap<(usize, u8), u32>>,
     tex: BTreeMap<u32, u32>,       // slot -> dim
     samp: BTreeSet<u32>,
     samp_cmp: BTreeSet<u32>,
@@ -415,6 +439,8 @@ struct Emitter<'a> {
     /// PersistentClusterCull's validated buffer layout and cross-group UAV queue.
     persistent_queue: bool,
     raw: BTreeSet<(bool, u32)>,
+    // Native sites with a proven byte-stride-one linear descriptor.
+    raw_byte_index: BTreeSet<usize>,
     tbuf: BTreeSet<(bool, u32)>,      // typed buffers (is_uav, slot)
     tbuf_uint: BTreeSet<u32>,         // typed UAV slots whose element must be uint (atomics)
     /// Inferred integer element type of typed buffers: (is_uav, slot) -> 1 uint, 2 sint.
@@ -653,7 +679,8 @@ fn lower_wave_reductions(insns: &mut [Insn]) -> Result<Option<u32>, String> {
             continue;
         }
         let saved_extrema = matches!(red.as_str(), "v_min_f32" | "v_max_f32")
-            && first.checked_sub(3).is_some_and(|p| matches!(insns[p].mnemonic.as_str(), "s_or_saveexec_b32" | "s_or_saveexec_b64"));
+            && (first.checked_sub(3).is_some_and(|p| matches!(insns[p].mnemonic.as_str(), "s_or_saveexec_b32" | "s_or_saveexec_b64"))
+                || wave_sum::masked_floating(insns, first));
         if matches!(red.as_str(), "v_add_nc_u32" | "v_min_u32" | "v_max_u32" | "v_add_f32" | "v_and_b32" | "v_or_b32") || saved_extrema {
             let (required, next) = wave_sum::lower(insns, first).map_err(bad)?;
             if width.replace(required).is_some_and(|w| w != required) {
@@ -1017,10 +1044,15 @@ fn verify_lane_election(insns: &mut [Insn], ff1: usize) -> Result<(), String> {
         return Err(bad("branch enters the election"));
     }
     let c = &insns[cmp];
-    if !matches!(c.mnemonic.as_str(), "v_cmp_eq_i32" | "v_cmp_eq_u32") || c.src.get(0) != Some(&Opnd::Sgpr(lane)) {
+    if !matches!(c.mnemonic.as_str(), "v_cmp_eq_i32" | "v_cmp_eq_u32") {
         return Err(bad("lane is not compared for equality"));
     }
-    let Some(&Opnd::Vgpr(index)) = c.src.get(1) else { return Err(bad("lane is not compared with a VGPR")) };
+    // Equality is symmetric. The VOP3 encoding permits the elected scalar
+    // on either side; preserve all existing full-lane-index proof checks.
+    let index = match c.src.get(..2) {
+        Some([Opnd::Sgpr(reg), Opnd::Vgpr(v)]) | Some([Opnd::Vgpr(v), Opnd::Sgpr(reg)]) if *reg == lane => *v,
+        _ => return Err(bad("lane is not compared for equality with a VGPR")),
+    };
     let bits = if insns[ff1].mnemonic.ends_with("_b32") { "b32" } else { "b64" };
     let full_low = |l: &Insn| l.mnemonic == "v_mbcnt_lo_u32_b32" && l.aux.mask == 0
         && l.src.get(..2) == Some(&[Opnd::ConstInt(-1), Opnd::ConstInt(0)][..]);
@@ -1741,6 +1773,8 @@ impl<'a> Emitter<'a> {
             res: HashMap::new(),
             cb_size: BTreeMap::new(),
             zero_buffer_offsets: Default::default(),
+            ordinary_bit_sites: Default::default(),
+            smem_constants: Default::default(),
             tex: BTreeMap::new(),
             samp: BTreeSet::new(),
             samp_cmp: BTreeSet::new(),
@@ -1749,6 +1783,7 @@ impl<'a> Emitter<'a> {
             reflected_strides: BTreeSet::new(),
             persistent_queue: false,
             raw: BTreeSet::new(),
+            raw_byte_index: BTreeSet::new(),
             tbuf: BTreeSet::new(),
             tbuf_uint: BTreeSet::new(),
             tbuf_ty: BTreeMap::new(),
@@ -2234,6 +2269,7 @@ impl<'a> Emitter<'a> {
         self.bsel.clear();
         self.dsel_loads.clear();
         self.dsel_moves.clear();
+        self.raw_byte_index.clear();
         // Recording pass with the converged entry states.
         for (b, r) in ranges.iter().enumerate() {
             if let Some((mut sym, mut written)) = states[b].clone() {
@@ -3036,7 +3072,8 @@ impl<'a> Emitter<'a> {
                     // Read from an embedded constant table.
                     let n = 1u32 << ins.op;
                     let d = ins.dst.first().and_then(sg).ok_or("s_load: bad dst")?;
-                    if (ins.raw.get(1).copied().unwrap_or(0) >> 25) != 0x7d {
+                    if self.static_smem_offset(ins).is_none()
+                        && self.dynamic_code_offset(idx).is_none() {
                         return Err(format!("s_load at {:#x}: code-table read with dynamic soffset unsupported", ins.offset));
                     }
                     self.uses_code = true;
@@ -3067,7 +3104,9 @@ impl<'a> Emitter<'a> {
                         // SOFFSET is a heap fetch, however the byte offset was computed.
                         let heap_offset = sym.get(&soff) == Some(&Sym::HeapOffset)
                             || (self.compute_heap && soff < 106 && written.contains(&soff));
-                        if self.resource_heap_base == Some(table) && matches!(n, 4 | 8) && ins.aux.imm == 0 && heap_offset {
+                        if self.resource_heap_base == Some(table) && matches!(n, 4 | 8)
+                            && (ins.aux.imm == 0 || (ins.aux.imm >= 0 && ins.aux.imm % 32 == 0 && sym.get(&soff) == Some(&Sym::HeapOffset)))
+                            && heap_offset {
                             for k in 0..n as u16 {
                                 sym.remove(&(d + k));
                                 written.insert(d + k);
@@ -3103,16 +3142,19 @@ impl<'a> Emitter<'a> {
                                 continue;
                             }
                         }
-                        return Err(format!("s_load at {:#x}: dynamic soffset unsupported", ins.offset));
+                        // Preserve heap-specific lowering above. Only fold an ordinary
+                        // descriptor-table offset when every reaching path proves its value.
                     }
+                    let off = self.static_smem_offset(ins)
+                        .ok_or_else(|| format!("s_load at {:#x}: dynamic soffset unsupported", ins.offset))?;
                     if self.mesh_bindings.as_ref().is_some_and(|mesh| {
-                        n != 4 || !mesh.tables.contains_key(&(table, ins.aux.imm as u32))
+                        n != 4 || !mesh.tables.contains_key(&(table, off))
                     }) {
                         return Err(format!("unverified mesh descriptor load at {:#x}", ins.offset));
                     }
                     for k in 0..n {
-                        sym.insert(d + k as u16, Sym::Desc { table, off: ins.aux.imm as u32, k });
-                        self.dsel_loads.insert(idx, (d, ((table as u32) << 24) | ins.aux.imm as u32));
+                        sym.insert(d + k as u16, Sym::Desc { table, off, k });
+                        self.dsel_loads.insert(idx, (d, ((table as u32) << 24) | off));
                         written.insert(d + k as u16);
                     }
                 }
@@ -3210,11 +3252,17 @@ impl<'a> Emitter<'a> {
                 Enc::Mubuf if ins.op == 0x71 || ins.op == 0x72 => {}
                 Enc::Mubuf => {
                     let rs = ins.src.get(1).and_then(sg).ok_or("mubuf: bad srsrc")?;
+                    // Never retain a provisional proof from another CFG visit.
+                    self.raw_byte_index.remove(&ins.offset);
                     if let Some(raw) = self.mesh_raw_descriptor(sym, rs)? {
+                        self.raw_byte_index.insert(ins.offset);
                         self.res.insert(idx, vec![raw]);
                         continue;
                     }
                     if let Some(Sym::DirectRaw(slot)) = sym.get(&rs) {
+                        if raw_index::local_byte_descriptor(&insns[block_start..idx], rs) {
+                            self.raw_byte_index.insert(ins.offset);
+                        }
                         self.res.insert(idx, vec![Res::Raw(*slot, false)]);
                         continue;
                     }
@@ -3434,7 +3482,7 @@ impl<'a> Emitter<'a> {
             }
             // Packed FMAC accumulates in its destination. A subword FMA also
             // reads that register to preserve the half outside its write mask.
-            let old_dst = matches!(ins.mnemonic.as_str(), "v_pk_fmac_f16" | "v_fma_f16" | "v_rcp_f16")
+            let old_dst = (matches!(ins.mnemonic.as_str(), "v_pk_fmac_f16" | "v_fma_f16" | "v_rcp_f16") || int16::new_half(ins))
                 .then(|| ins.dst.first()).flatten();
             for o in ins.src.iter().chain(old_dst) {
                 if let Opnd::Sgpr(n) | Opnd::Vgpr(n) = o {
@@ -4319,6 +4367,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 return Ok(());
             }
         }
+        if scalar_bits::emit(self, idx, ins)? { return Ok(()); }
         match ins.enc {
             Enc::Sopp if matches!(ins.op, 0x24 | 0x25) => {
                 // MODE[7:0] exposes the guest round and denorm settings to S_GETREG.
@@ -4765,7 +4814,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                         self.regs.insert(value.clone());
                         let dst = d.ok_or("missing direct descriptor destination")?;
                         self.touch(&dst);
-                        self.ws(&dst, &format!("tb_heap_index({value} >> 5)"))?;
+                        let byte_offset = if ins.aux.imm == 0 { value }
+                            else { format!("({value} + {:#x}u)", ins.aux.imm as u32) };
+                        self.ws(&dst, &format!("tb_heap_index({byte_offset} >> 5)"))?;
                         return Ok(());
                     }
                     if let Some(Res::HeapSamplerLoad(offset)) = self.res.get(&idx).and_then(|v| v.first()).copied() {
@@ -4786,9 +4837,19 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                         let ndw = ((self.ex.isa_data.len().saturating_sub(self.ex.isa.len())) / 4).max(1);
                         let t = self.tmp;
                         self.tmp += 1;
-                        self.line(&format!("uint t{t} = ({} + {:#x}u) >> 2;", r(&s[0])?, ins.aux.imm as u32));
-                        for k in 0..n {
-                            self.line(&format!("uint t{t}_{k} = tb_code[(t{t} + {k}u - {}u) % {ndw}u];", self.ex.isa.len() / 4));
+                        if let Some(offset) = self.static_smem_offset(ins) {
+                            self.line(&format!("uint t{t} = ({} + {offset:#x}u) >> 2;", r(&s[0])?));
+                            for k in 0..n {
+                                self.line(&format!("uint t{t}_{k} = tb_code[(t{t} + {k}u - {}u) % {ndw}u];", self.ex.isa.len() / 4));
+                            }
+                        } else {
+                            let reg = self.dynamic_code_offset(idx).ok_or("unverified dynamic code-table offset")?;
+                            let offset = Opnd::Sgpr(reg);
+                            self.touch(&offset);
+                            self.line(&format!("uint t{t} = ({} + {} + {:#x}u - {}u) >> 2;", r(&s[0])?, r(&offset)?, ins.aux.imm, self.ex.isa.len()));
+                            for k in 0..n {
+                                self.line(&format!("uint t{t}_{k} = tb_code[t{t} + {k}u];"));
+                            }
                         }
                         for k in 0..n {
                             let dst = sreg_opnd(base + k as u8);
@@ -5315,7 +5376,11 @@ uint tb_fmac_half(uint a, uint b, uint c) {
     }
 
     fn emit_compute_swizzle(&mut self, idx: usize, ins: &Insn, active: &[usize]) -> Result<(), String> {
-        if ins.raw[0] & 0x3_8000 != 0 {
+        let mode = ins.aux.imm as u32;
+        // RDNA2 ISA DS_SWIZZLE_B32: offset[15] selects QDMode, which permutes
+        // within each quad by offset[7:0]. Other high offset bits and GDS stay refused.
+        let quad = mode & 0x8000 != 0;
+        if ins.raw[0] & 0x3_0000 != 0 || (quad && mode & 0xff00 != 0x8000) {
             return Err("unsupported compute DS swizzle encoding".into());
         }
         // Skipped and EXEC-masked lanes contribute zero. Rendezvous before
@@ -5325,14 +5390,93 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         let value = r(&ins.src[0])?;
         self.line(&format!("tb_swizzle[tb_lane] = ({predicate}) ? {value} : 0u;"));
         self.line("GroupMemoryBarrierWithGroupSync();");
-        let mode = ins.aux.imm as u32;
-        self.line(&format!("uint swizzle{idx} = tb_swizzle[(tb_lane & ~31u) | (((tb_lane & {}u) | {}u) ^ {}u)];",
-            mode & 31, (mode >> 5) & 31, (mode >> 10) & 31));
+        if quad {
+            self.line(&format!("uint swizzle{idx} = tb_swizzle[(tb_lane & ~3u) | (({:#x}u >> (2u * (tb_lane & 3u))) & 3u)];",
+                mode & 255));
+        } else {
+            self.line(&format!("uint swizzle{idx} = tb_swizzle[(tb_lane & ~31u) | (((tb_lane & {}u) | {}u) ^ {}u)];",
+                mode & 31, (mode >> 5) & 31, (mode >> 10) & 31));
+        }
         self.line("GroupMemoryBarrierWithGroupSync();");
         Ok(())
     }
 
 
+
+    /// Decode the packed SRC0 attribute descriptor of a Vop3 f16-interpolation
+    /// instruction: (attr, channel, high).
+    fn f16_interp_descriptor(second: u32) -> (usize, usize, bool) {
+        ((second & 0x3f) as usize, ((second >> 6) & 3) as usize, (second >> 8) & 1 != 0)
+    }
+
+    /// Emit a Vop3-encoded f16-interpolation instruction.
+    ///
+    /// SRC0 in the second word packs the attribute descriptor: attr (6 bits),
+    /// channel (2 bits), and the `high` bit (1 bit). SRC1 is the barycentric
+    /// weight; for p2_f16, SRC2 is the p1ll's f32 partial register. An attribute
+    /// packed in a 32-bit word holds two 16-bit halves, so each vertex's raw
+    /// word is decoded per vertex and the halves are interpolated (mirroring
+    /// the pulled-attribute path), which is also what Mesa ACO does.
+    fn emit_f16_interp(&mut self, ins: &Insn) -> Result<(), String> {
+        if self.ex.stage != Stage::Pixel {
+            return Err("v_interp outside a pixel shader".into());
+        }
+        if ins.enc != Enc::Vop3 || ins.raw.len() < 2 {
+            return Err("invalid f16 interpolation encoding".into());
+        }
+        let m = ins.mnemonic.as_str();
+        let is_p2 = m == "v_interp_p2_f16";
+        let (attr, chan, high) = Self::f16_interp_descriptor(ins.raw[1]);
+        let clamp = (ins.raw[0] >> 15) & 1 != 0;
+        let reg = *self.ps_attrs.get(attr).ok_or_else(|| format!("PS attr{attr} has no signature register"))?;
+        let (ei, k) = sig_lookup(&self.ex.input_sig, reg, chan)
+            .ok_or_else(|| format!("PS attr{attr} has no signature register"))?;
+        if matches!(self.ex.input_sig[ei].comp_type, 1 | 2) {
+            return Err("v_interp f16 with a typed signature element unsupported".into());
+        }
+        let (_, n) = sig_type(&self.ex.input_sig[ei]);
+        let field = if n == 1 { format!("i.i{ei}") } else { format!("i.i{ei}.{}", XYZW[k]) };
+        let raw = |index: usize| -> String {
+            format!("asuint(GetAttributeAtVertex({field}, {index}))")
+        };
+        let half = |index: usize| -> String {
+            let h = raw(index);
+            if high { format!("(({h} >> 16u) & 0xffffu)") } else { format!("({h} & 0xffffu)") }
+        };
+        let p0 = format!("f16tof32({})", half(0));
+        let p1 = format!("f16tof32({})", half(1));
+        let p2v = format!("f16tof32({})", half(2));
+        let dst = ins.dst.first().cloned().ok_or("no dst")?;
+        let name_d = name(&dst)?;
+        // SM5 fallback: the raw smooth read (best-effort; the per-vertex path is SM6+).
+        let fallback = format!("asuint({field})");
+        if !is_p2 {
+            // p1ll/p1lv: the f32 partial P0 + I*(P1-P0), consumed by p2_f16.
+            let i = f(&ins.src[1])?;
+            let expr = format!("{p0} + {i} * ({p1} - {p0})");
+            self.line("#if __SHADER_TARGET_MAJOR >= 6");
+            self.wv(&dst, &format!("asuint({expr})"))?;
+            self.line("#else");
+            self.wv(&dst, &fallback)?;
+            self.line("#endif");
+            Ok(())
+        } else {
+            if ins.src.len() < 3 {
+                return Err("missing p2_f16 partial register".into());
+            }
+            let j = f(&ins.src[1])?;
+            let partial = r(&ins.src[2])?;
+            let full = format!("(asfloat({partial}) + {j} * ({p2v} - {p0}))");
+            let full = if clamp { format!("saturate({full})") } else { full };
+            let bits = format!("tb_f16_rne({full})");
+            self.line("#if __SHADER_TARGET_MAJOR >= 6");
+            self.wv(&dst, &format!("(({name_d} & 0xffff0000u) | {bits})"))?;
+            self.line("#else");
+            self.wv(&dst, &fallback)?;
+            self.line("#endif");
+            Ok(())
+        }
+    }
 
     fn emit_vec(&mut self, ins: &Insn) -> Result<(), String> {
         let mut m = ins.mnemonic.clone();
@@ -5346,6 +5490,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         }
         if m == "v_nop" {
             return Ok(());
+        }
+        if matches!(m.as_str(), "v_interp_p1ll_f16" | "v_interp_p1lv_f16" | "v_interp_p2_f16") {
+            return self.emit_f16_interp(ins);
         }
         if ins.enc == Enc::Vop2 && ins.op == wave_sum::DPP_REDUCE {
             // Read the partner before the EXEC-guarded write, including when VDST aliases VSRC.
@@ -5565,6 +5712,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 format!("tb_dot4_i8({lhs}, {rhs}, {acc})")
             };
             return self.wv(&d, &value);
+        }
+        if int16::new_half(ins) && self.ex.stage != Stage::Compute {
+            return Err("unverified ordinary 16-bit integer shader stage".into());
         }
         if let Some(result) = int16::expression(ins)? {
             return self.wv(&d, &result);
@@ -6255,13 +6405,27 @@ uint tb_fmac_half(uint a, uint b, uint c) {
     }
 
     /// Resolve a raw buffer's byte address before any overlapping VGPR is overwritten.
-    /// OFFEN and SOFFSET are byte offsets. IDXEN uses the runtime descriptor stride,
-    /// which the PSV raw declaration does not encode.
+    ///
+    /// OFFEN and SOFFSET are byte offsets. A raw descriptor's stride is one byte,
+    /// the same stride a shader writes when it builds that descriptor and the size
+    /// recorded for a raw binding, so IDXEN is a byte offset too. With both enables
+    /// the first address VGPR is the index and the next is the byte offset.
     fn raw_address(&mut self, ins: &Insn) -> Result<String, String> {
-        if ins.aux.mask & 2 != 0 {
-            return Err("raw buffer IDXEN needs the console descriptor stride".into());
-        }
-        let vector = if ins.aux.mask & 1 != 0 { r(&ins.src[0])? } else { "0u".to_string() };
+        let (indexed, offset) = (ins.aux.mask & 2 != 0, ins.aux.mask & 1 != 0);
+        let vector = if indexed {
+            if !self.raw_byte_index.contains(&ins.offset)
+                || !ins.mnemonic.starts_with("buffer_load_dword")
+            {
+                return Err("raw buffer IDXEN needs the console descriptor stride".into());
+            }
+            let index = r(&ins.src[0])?;
+            if offset {
+                let Opnd::Vgpr(v) = ins.src[0] else { return Err("invalid indexed raw address".into()) };
+                let byte_offset = Opnd::Vgpr(v.checked_add(1).ok_or("raw address register overflow")?);
+                self.touch(&byte_offset);
+                format!("({index} + {})", r(&byte_offset)?)
+            } else { index }
+        } else if offset { r(&ins.src[0])? } else { "0u".to_string() };
         let address = format!("raw_addr{}", self.tmp);
         self.tmp += 1;
         self.line(&format!("uint {address} = {vector} + {} + {}u;", r(&ins.src[2])?, ins.aux.imm));
@@ -6422,7 +6586,11 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             let offset = format!("{address} + {}u", 4 * k);
             let reg = Opnd::Vgpr(base.checked_add(k).ok_or("raw buffer register overflow")?);
             if load {
-                self.line(&format!("uint t{t}_{k} = {buffer}.Load({offset});"));
+                if ins.aux.mask & 2 != 0 {
+                    self.line(&format!("uint t{t}_{k} = 0u; if (exec_lo & 1u) t{t}_{k} = {buffer}.Load({offset});"));
+                } else {
+                    self.line(&format!("uint t{t}_{k} = {buffer}.Load({offset});"));
+                }
             } else {
                 self.touch(&reg);
                 self.line(&format!("if (exec_lo & 1u) {buffer}.Store({offset}, {});", r(&reg)?));
@@ -6434,6 +6602,35 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             }
         }
         Ok(())
+    }
+
+    fn dynamic_code_offset(&self, idx: usize) -> Option<u8> {
+        if self.ex.stage != Stage::Compute || self.packed.is_some() || self.mesh_bindings.is_some() {
+            return None;
+        }
+        code_offset::prove(&self.insns, idx, self.ex.isa.len(), self.ex.isa_data.len())
+    }
+
+    fn static_smem_offset(&self, ins: &Insn) -> Option<u32> {
+        let imm = u32::try_from(ins.aux.imm).ok()?;
+        if ins.raw.get(1).copied()? >> 25 == 0x7d { return Some(imm); }
+        if self.proven_zero_smem_offset(ins) { return Some(imm); }
+        let reg = ins.raw.get(1).copied()? >> 25;
+        if reg > 105 { return None; }
+        let offset = *self.smem_constants
+            .get_or_init(|| mubuf_offsets::proven_smem_constants(&disassemble(&self.ex.isa)))
+            .get(&(ins.offset, reg as u8))?;
+        let combined = imm.checked_add(offset)?;
+        // Static table selectors encode the table in the upper byte.
+        // Do not turn unaligned or out-of-range addresses into descriptors.
+        (combined <= 0x00ff_ffff && combined % 4 == 0).then_some(combined)
+    }
+
+    fn proven_zero_smem_offset(&self, ins: &Insn) -> bool {
+        let reg = ins.raw.get(1).copied().unwrap_or(u32::MAX) >> 25;
+        reg <= 105 && self.zero_buffer_offsets
+            .get_or_init(|| mubuf_offsets::proven_zero(&disassemble(&self.ex.isa)))
+            .contains(&(ins.offset, reg as u8))
     }
 
     fn zero_buffer_offset(&self, ins: &Insn) -> bool {
@@ -8473,6 +8670,16 @@ mod tests {
     }
 
     #[test]
+    fn f16_interp_descriptor_decodes_attr_channel_and_high() {
+        // attr=1, chan=0, high=1 (0b00000001 01_00 00_01)
+        assert_eq!(Emitter::f16_interp_descriptor(0x00020101), (1, 0, true));
+        // attr=1, chan=1, high=0
+        assert_eq!(Emitter::f16_interp_descriptor(0x00020041), (1, 1, false));
+        // attr=1, chan=0, high=0
+        assert_eq!(Emitter::f16_interp_descriptor(0x00020001), (1, 0, false));
+    }
+
+    #[test]
     fn typed_buffer_16_16_16_16_uint_channels_read_16_bit_words_from_two_dwords() {
         // 8-byte element: [lo: ch0, ch1] [hi: ch2, ch3].
         assert_eq!(tbuf_16_16_16_16_uint_channel(0, "packed", "packed1"), "((packed >> 0u) & 65535u)");
@@ -8490,6 +8697,14 @@ mod tests {
     }
 
     #[test]
+    fn flbit_b64_checks_high_word_before_low_word() {
+        assert_eq!(
+            flbit_b64_expr("s2", "s3"),
+            "(s3 != 0u ? 31u - firstbithigh(s3) : s2 != 0u ? 63u - firstbithigh(s2) : ~0u)"
+        );
+    }
+
+    #[test]
     fn typed_buffer_extraction_masks_to_16_bits() {
         // Each channel is masked with 0xffff: no channel may leak into a wider one.
         for channel in 0..4u32 {
@@ -8497,4 +8712,187 @@ mod tests {
             assert!(expr.contains("& 65535u"), "channel {channel}: {expr}");
         }
     }
+
+    #[test]
+    fn ff0_b32_inverts_operand_for_firstbitlow() {
+        assert_eq!(ff0_b32_expr("s2"), "firstbitlow(~s2)");
+    }
+
+    #[test]
+    fn ff0_b64_checks_low_word_before_high_word() {
+        assert_eq!(
+            ff0_b64_expr("s2", "s3"),
+            "(~s2 != 0u ? uint(firstbitlow(~s2)) : ~s3 != 0u ? 32u + uint(firstbitlow(~s3)) : 0xffffffffu)"
+        );
+    }
+
+    // --- Masked prologue decode paths (int and floating) -------------------
+
+    fn masked_insn(mnemonic: &str, enc: Enc, dst: Vec<Opnd>, src: Vec<Opnd>) -> Insn {
+        Insn {
+            offset: 0x100,
+            dwords: 1,
+            enc,
+            op: 0,
+            raw: vec![0],
+            mnemonic: mnemonic.to_string(),
+            dst,
+            src,
+            aux: Default::default(),
+        }
+    }
+
+    fn masked_shuffle(mnemonic: &str, selector: u32, acc: u8, ctrl: u32) -> Insn {
+        let mut ins = masked_insn(mnemonic, Enc::Vop2, vec![Opnd::Vgpr(acc)], vec![Opnd::Raw(selector as u16), Opnd::Vgpr(acc)]);
+        ins.raw = vec![0x4a0606e9, ctrl << 8 | u32::from(acc)];
+        ins
+    }
+
+    fn masked_readlane(acc: u8, lane: u32, dst: u8) -> Insn {
+        let mut ins = masked_insn(
+            "v_readlane_b32",
+            Enc::Vop3,
+            vec![Opnd::Vgpr(dst)],
+            vec![Opnd::Vgpr(acc), Opnd::ConstInt(lane as i64), Opnd::Sgpr(0)],
+        );
+        ins.raw = vec![0xd760_0000 | u32::from(dst), ((128 + lane) << 9) | 256 | u32::from(acc)];
+        ins
+    }
+
+    fn masked_cross_row(mnemonic: &str, acc: u8, tmp: u8) -> Insn {
+        masked_insn(mnemonic, Enc::Vop2, vec![Opnd::Vgpr(acc)], vec![Opnd::Vgpr(tmp), Opnd::Vgpr(acc)])
+    }
+
+    fn masked_perm(acc: u8, tmp: u8) -> Insn {
+        masked_insn("v_permlanex16_b32", Enc::Vop3, vec![Opnd::Vgpr(tmp)], vec![Opnd::Vgpr(acc), Opnd::ConstInt(0), Opnd::ConstInt(0)])
+    }
+
+    fn masked_reduction_insns(
+        width: u32,
+        op: &str,
+        data_reg: u8,
+        float_bits: Option<u32>,
+        ident_reg: u8,
+    ) -> Vec<Insn> {
+        let is_float = float_bits.is_some();
+        let acc = 1u8;
+        let ctrl = [0xde54c1u32, 0x936012, 0x000924, 0xff0940];
+        let selector = [233u32, 233, 233, 250];
+        let mut insns = Vec::new();
+        // Prologue: saveexec + (literal identity move | AND) + CNDMASK.
+        if width == 32 {
+            insns.push(masked_insn("s_or_saveexec_b32", Enc::Sop1, vec![Opnd::Sgpr(0)], vec![Opnd::ConstInt(-1)]));
+        } else {
+            insns.push(masked_insn("s_or_saveexec_b64", Enc::Sop1, vec![Opnd::Sgpr(0)], vec![Opnd::ConstInt(-1)]));
+        }
+        if let Some(bits) = float_bits {
+            insns.push(masked_insn("v_mov_b32", Enc::Vop1, vec![Opnd::Vgpr(ident_reg)], vec![Opnd::Literal(bits)]));
+        }
+        if width == 32 {
+            insns.push(masked_insn("s_and_b32", Enc::Sopc, vec![Opnd::Sgpr(2)], vec![Opnd::Sgpr(26), Opnd::Sgpr(0)]));
+        } else {
+            insns.push(masked_insn("s_and_b64", Enc::Sopc, vec![Opnd::Sgpr(2)], vec![Opnd::Sgpr(80), Opnd::Sgpr(0)]));
+        }
+        let cndmask_src = if is_float {
+            vec![Opnd::Vgpr(ident_reg), Opnd::Vgpr(data_reg), Opnd::Sgpr(2)]
+        } else {
+            vec![Opnd::ConstInt(0), Opnd::Vgpr(data_reg), Opnd::Sgpr(2)]
+        };
+        insns.push(masked_insn("v_cndmask_b32", Enc::Vop2, vec![Opnd::Vgpr(acc)], cndmask_src));
+        for (i, (&c, &s)) in ctrl.iter().zip(selector.iter()).enumerate() {
+            let _ = i;
+            insns.push(masked_shuffle(op, s, acc, c));
+        }
+        insns.push(masked_perm(acc, ident_reg + 4));
+        insns.push(masked_cross_row(op, acc, ident_reg + 4));
+        if width == 64 {
+            insns.push(masked_readlane(acc, 32, ident_reg + 3));
+            insns.push(masked_insn(op, Enc::Vop2, vec![Opnd::Vgpr(acc)], vec![Opnd::Sgpr(ident_reg + 3), Opnd::Vgpr(acc)]));
+        }
+        insns.push(masked_readlane(acc, 0, ident_reg + 2));
+        if width == 32 {
+            insns.push(masked_insn("s_mov_b32", Enc::Sop1, vec![Opnd::ExecLo], vec![Opnd::Sgpr(0)]));
+        } else {
+            insns.push(masked_insn("s_mov_b64", Enc::Sop1, vec![Opnd::ExecLo], vec![Opnd::Sgpr(0)]));
+        }
+        insns
+    }
+
+    #[test]
+    fn int_masked_add_prologue_lowers_full_block() {
+        let mut insns = masked_reduction_insns(32, "v_add_nc_u32", 3, None, 1);
+        lower_wave_reductions(&mut insns).expect("int masked prologue lowered");
+        for ins in insns.iter().skip(3).take(4) {
+            assert_eq!(ins.op, wave_sum::DPP_REDUCE, "shuffled instruction {ins:?}");
+        }
+        assert_eq!(insns[9].op, wave_sum::READ_LANE);
+        assert_eq!(insns[9].mnemonic, "v_readlane_b32");
+        assert_eq!(insns[9].dst, vec![Opnd::Sgpr(3)]);
+    }
+
+    #[test]
+    fn floating_min_masked_prologue_with_register_identity_lowers() {
+        // +inf held in a VGPR materialized by a literal move.
+        let mut insns = masked_reduction_insns(64, "v_min_f32", 4, Some(f32::INFINITY.to_bits()), 2);
+        lower_wave_reductions(&mut insns).expect("floating masked prologue lowered");
+        assert_eq!(insns[4].op, wave_sum::DPP_REDUCE);
+        // Both readlanes became READ_LANE and returned scalars.
+        assert_eq!(insns[10].op, wave_sum::READ_LANE);
+        assert_eq!(insns[10].dst, vec![Opnd::Sgpr(5)]);
+        assert_eq!(insns[12].op, wave_sum::READ_LANE);
+        assert_eq!(insns[12].dst, vec![Opnd::Sgpr(4)]);
+    }
+
+    #[test]
+    fn floating_max_masked_prologue_with_register_identity_lowers() {
+        // -inf held in a VGPR materialized by a literal move.
+        let mut insns = masked_reduction_insns(32, "v_max_f32", 4, Some(f32::NEG_INFINITY.to_bits()), 2);
+        lower_wave_reductions(&mut insns).expect("floating masked prologue lowered");
+        assert_eq!(insns[4].op, wave_sum::DPP_REDUCE);
+        assert_eq!(insns[10].op, wave_sum::READ_LANE);
+        assert_eq!(insns[10].dst, vec![Opnd::Sgpr(4)]);
+    }
+
+    #[test]
+    fn floating_masked_prologue_rejects_unrelated_identity_register() {
+        // The identity move lives in a different register than the CNDMASK
+        // operand: must refuse, not guess.
+        let mut insns = masked_reduction_insns(32, "v_min_f32", 4, Some(f32::INFINITY.to_bits()), 2);
+        insns[1].dst = vec![Opnd::Vgpr(9)]; // identity materialized in the wrong register
+        assert!(lower_wave_reductions(&mut insns).is_err());
+    }
+
+    #[test]
+    fn floating_max_masked_prologue_rejects_immediate_select_identity() {
+        // A select with an immediate identity does not match the register-held
+        // floating shape.
+        let mut insns = masked_reduction_insns(32, "v_max_f32", 4, Some(f32::NEG_INFINITY.to_bits()), 2);
+        insns[3].src[0] = Opnd::ConstInt(f32::NEG_INFINITY.to_bits() as i64);
+        assert!(lower_wave_reductions(&mut insns).is_err());
+    }
 }
+
+#[cfg(test)]
+mod election_order_regression {
+    use super::*;
+    fn op(name: &str, enc: Enc, dst: Vec<Opnd>, src: Vec<Opnd>, offset: usize) -> Insn {
+        Insn { offset, dwords: 1, enc, op: 0, raw: vec![0], mnemonic: name.into(), dst, src, aux: Default::default() }
+    }
+    #[test]
+    fn symmetric_equality_still_requires_full_lane_count() {
+        let mut ops = vec![
+            op("v_mbcnt_lo_u32_b32", Enc::Vop3, vec![Opnd::Vgpr(2)], vec![Opnd::ConstInt(-1), Opnd::ConstInt(0)], 0),
+            op("s_ff1_i32_b32", Enc::Sop1, vec![Opnd::Sgpr(7)], vec![Opnd::ExecLo], 4),
+            op("v_cmp_eq_u32", Enc::Vop3, vec![Opnd::VccLo], vec![Opnd::Vgpr(2), Opnd::Sgpr(7)], 8),
+        ];
+        assert!(verify_lane_election(&mut ops, 1).is_ok());
+        ops[2].src.swap(0, 1);
+        assert!(verify_lane_election(&mut ops, 1).is_ok());
+        ops[2].mnemonic = "v_cmp_ne_u32".into();
+        assert!(verify_lane_election(&mut ops, 1).is_err());
+        ops[2].mnemonic = "v_cmp_eq_u32".into();
+        ops[0].src[0] = Opnd::ConstInt(0);
+        assert!(verify_lane_election(&mut ops, 1).is_err());
+    }
+}
+

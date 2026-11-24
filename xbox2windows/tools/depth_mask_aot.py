@@ -22,8 +22,8 @@ BINARY_F32 = {
 
 
 # One-source binary32 e32 forms with a VGPR, constant or scalar word source. round is round-half-even, like
-# v_rndne_f32. The result of rcp, rsq and sqrt is whatever the host computes: a caller may only rely on inputs
-# whose exact result is an integer, and a zero or negative operand is not claimed. Source modifiers, clamp,
+# v_rndne_f32. The result of rcp, rsq, sqrt, exp and log is whatever the host computes: a caller may only rely on inputs
+# whose exact result is an integer, and a zero or negative operand (or an overflow) is not claimed. Source modifiers, clamp,
 # output modifiers and a second source stay rejected; the e64 spelling is accepted only without modifiers (see plain).
 UNARY_F32 = {
     "v_rcp_f32_e32": "(1.0f / {x})",
@@ -32,6 +32,9 @@ UNARY_F32 = {
     "v_floor_f32_e32": "floor({x})",
     "v_trunc_f32_e32": "trunc({x})",
     "v_rndne_f32_e32": "round({x})",
+    "v_ceil_f32_e32": "ceil({x})",
+    "v_exp_f32_e32": "exp2({x})",
+    "v_log_f32_e32": "log2({x})",
 }
 
 

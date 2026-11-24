@@ -5,7 +5,7 @@ use core::ffi::c_void;
 use crate::commands::page_mapping::{GPU_APERTURE, ImportPin};
 use std::sync::Arc;
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER};
-use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Direct3D12::{ID3D12Pageable, *};
 use windows::core::{GUID, HRESULT, Interface};
 
 const IMPORTED_HEAP: GUID = GUID::from_u128(0xc2a3c751_1d00_470c_8efd_5da145efd165);
@@ -32,11 +32,39 @@ unsafe extern "system" fn get_desc(heap: &Heap, out: *mut D3D12_HEAP_DESC) -> *m
     unsafe { out.write(heap.state) };
     out
 }
-static HEAP: Slots<9> = {
-    let mut table = child_slots::<ID3D12Heap, D3D12_HEAP_DESC, 9>();
+// GetDesc is slot 8. A protected-session query and a GPU address follow it.
+// A shorter table would read off the end, so those calls fail closed.
+static HEAP: Slots<11> = {
+    let mut table = child_slots::<ID3D12Heap, D3D12_HEAP_DESC, 11>();
     table[8] = crate::slot!(get_desc);
     table
 };
+
+pub(super) unsafe fn memory_heap<'a>(
+    object: *mut c_void,
+    owner: *mut c_void,
+) -> Option<&'a ID3D12Heap> {
+    // SAFETY: unwrap checks the heap vtable and the owning device.
+    unsafe { unwrap::<ID3D12Heap, D3D12_HEAP_DESC>(object, owner, &HEAP).map(|heap| &heap.native) }
+}
+
+pub(super) unsafe fn pageable(object: *mut c_void, owner: *mut c_void) -> Option<ID3D12Pageable> {
+    // SAFETY: each unwrap checks the vtable and the owning device. These four
+    // objects are pageable, and the cast keeps a reference for the caller.
+    unsafe {
+        if let Some(resource) = super::resource(object, owner) {
+            resource.cast().ok()
+        } else if let Some(heap) = unwrap::<ID3D12Heap, D3D12_HEAP_DESC>(object, owner, &HEAP) {
+            heap.native.cast().ok()
+        } else if let Some(heap) = super::descriptor_heap(object, owner) {
+            heap.native.cast().ok()
+        } else if let Some(heap) = super::queries::native(object, owner) {
+            heap.cast().ok()
+        } else {
+            None
+        }
+    }
+}
 
 pub(super) unsafe extern "system" fn create(
     device: &Device,
@@ -307,7 +335,64 @@ pub(super) fn import_buffer_with_heap(
     Ok((resource, heap))
 }
 
+fn commit_guest_pages(start: u64, bytes: u64) -> bool {
+    use windows::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
+    if bytes == 0 || bytes > 1 << 30 || start.checked_add(bytes).is_none() {
+        return false;
+    }
+    // Commit only this view. The surrounding reservation stays a reservation.
+    !unsafe { VirtualAlloc(Some(start as _), bytes as usize, MEM_COMMIT, PAGE_READWRITE) }.is_null()
+}
+
+fn device_buffer(device: &Device, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES)
+    -> windows::core::Result<ID3D12Resource> {
+    let host = D3D12_RESOURCE_DESC {
+        Flags: D3D12_RESOURCE_FLAGS(desc.Flags.0 & !0x2_0000),
+        ..*desc
+    };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        CreationNodeMask: 1,
+        VisibleNodeMask: 1,
+        ..Default::default()
+    };
+    let mut native = None;
+    unsafe { device.native.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &host, state, None, &mut native)? };
+    native.ok_or(E_POINTER.into())
+}
+
+fn import_or_back(device: &Device, address: u64, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES)
+    -> windows::core::Result<ID3D12Resource> {
+    match import_buffer(device, address, desc, state) {
+        Ok(native) => Ok(native),
+        Err(error) => {
+            let info = unsafe { device.native.GetResourceAllocationInfo(0, std::slice::from_ref(desc)) };
+            let bytes = if info.SizeInBytes == u64::MAX { desc.Width } else { info.SizeInBytes };
+            let base = address & !0xffff;
+            let end = address.saturating_add(bytes).saturating_add(0xffff) & !0xffff;
+            if commit_guest_pages(base, end.saturating_sub(base))
+                && let Ok(native) = import_buffer(device, address, desc, state) {
+                static COMMITTED: std::sync::Once = std::sync::Once::new();
+                crate::diagnostics::log_once(&COMMITTED, || format!(
+                    "placed buffer at {address:#x} bytes={} committed reserved guest pages", desc.Width));
+                return Ok(native);
+            }
+            let native = device_buffer(device, desc, state)?;
+            static DEVICE: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&DEVICE, || format!(
+                "placed buffer at {address:#x} bytes={} is not importable guest memory ({:?}); using a device buffer",
+                desc.Width, error.code()));
+            Ok(native)
+        }
+    }
+}
+
 impl ImportedHeap {
+    /// False once a page remap replaced the pages this heap was imported from.
+    pub(super) fn is_live(&self) -> bool {
+        self._pin.is_live()
+    }
+
     pub(super) fn buffer_alias(self: &Arc<Self>, device: &ID3D12Device, offset: u64,
         width: u64, stride: u32, flags: D3D12_RESOURCE_FLAGS,
     ) -> windows::core::Result<(ID3D12Resource, u64)> {
@@ -360,7 +445,7 @@ pub(super) unsafe extern "system" fn place_virtual(
     if let Err(error) = GPU_APERTURE.wait(address, 1) { return error.code(); }
     let state = super::host_state(initial, desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER);
     if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && clear.is_null() {
-        let native = import_buffer(device, address, desc, state);
+        let native = import_or_back(device, address, desc, state);
         return unsafe {
             wrap_pageable(native, &RESOURCE, device,
                 super::ResourceState::from(super::Backing::ConsoleLayout(desc.Layout, desc.Flags)), out)
@@ -470,10 +555,18 @@ pub(super) unsafe extern "system" fn place_virtual_layout(
     let (native, heap) = match import_buffer_with_heap(device, base, &host, D3D12_RESOURCE_STATE_COMMON) {
         Ok(resource) => resource,
         Err(error) => {
-            crate::diagnostics::recording_error(format_args!(
-                "placed buffer import at {address:#x} bytes={} native offset={delta:#x}: {:?}", desc.Width, error.code()
-            ));
-            return error.code();
+            let native = match import_or_back(device, address, desc, D3D12_RESOURCE_STATE_COMMON) {
+                Ok(native) => native,
+                Err(fallback) => {
+                    crate::diagnostics::log(&format!(
+                        "placed buffer at {address:#x} bytes={} native offset={delta:#x}: import {:?} stand-in {:?}",
+                        desc.Width, error.code(), fallback.code()));
+                    return fallback.code();
+                }
+            };
+            let buffer = super::views::TextureAddress::at(device, &native, 0, false, None);
+            return unsafe { wrap_pageable(Ok(native), &RESOURCE, device,
+                super::ResourceState::from(super::Backing::Addressed(buffer, *desc)), out) };
         }
     };
     let buffer = super::views::TextureAddress::with_heap(
@@ -612,7 +705,17 @@ unsafe fn place_gpu_target(
         step = "guest memory";
         crate::diagnostics::watch("device-memory image", address, allocation.SizeInBytes, || format!(
             "{}x{}x{} format={} flags={:#x}", desc.Width, desc.Height, desc.DepthOrArraySize, desc.Format.0, desc.Flags.0));
-        validate_shared_range(address, address.checked_add(allocation.SizeInBytes).ok_or(E_INVALIDARG)?)?;
+        let footprint = address.checked_add(allocation.SizeInBytes).ok_or(E_INVALIDARG)?;
+        if validate_shared_range(address, footprint).is_err() {
+            let base = address & !0xffff;
+            let end = footprint.saturating_add(0xffff) & !0xffff;
+            if !commit_guest_pages(base, end.saturating_sub(base))
+                || validate_shared_range(address, footprint).is_err() {
+                static RESERVED: std::sync::Once = std::sync::Once::new();
+                crate::diagnostics::log_once(&RESERVED, || format!(
+                    "placed GPU image at {address:#x} is not committed guest memory; keeping a device image"));
+            }
+        }
         // A heap opened from guest memory holds only buffers. Driver-tiled
         // images live in device memory; the guest reaches their texels through
         // GPU copies and views, not through its CPU mapping of this range.
@@ -758,6 +861,10 @@ pub(super) extern "system" fn unregister_pages(device: &Device, token: usize) {
     device.state.page_pools.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&token);
 }
 
+#[path = "heap_page_cache.rs"]
+mod heap_page_cache;
+use heap_page_cache::PageCache;
+
 // Registration returns an opaque cookie. Import the actual slices when a
 // resource uses them, so a large title arena doesn't pin untouched pages.
 #[derive(Default)]
@@ -766,12 +873,12 @@ pub(super) struct PagePools(std::sync::Mutex<std::collections::HashMap<usize, Bo
 struct PagePool {
     start: u64,
     end: u64,
-    last_page: Option<(u64, std::sync::Weak<ImportedHeap>)>,
+    pages: PageCache<ImportedHeap>,
 }
 
 impl PagePools {
     fn register(&self, start: u64, end: u64) -> usize {
-        let pool = Box::new(PagePool { start, end, last_page: None });
+        let pool = Box::new(PagePool { start, end, pages: PageCache::default() });
         let token = core::ptr::from_ref(pool.as_ref()).addr();
         self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(token, pool);
         token
@@ -785,14 +892,9 @@ impl PagePools {
         if size == u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
             let mut pools = self.0.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(pool) = pools.values_mut().find(|pool| pool.start <= base && base + size <= pool.end) {
-                // Nearby suballocations often share one page. The resources
-                // keep their own heap references after this cache advances.
-                if let Some((cached, heap)) = &pool.last_page && *cached == base && let Some(heap) = heap.upgrade() {
-                    return Ok(heap);
-                }
-                let heap = open()?;
-                pool.last_page = Some((base, Arc::downgrade(&heap)));
-                return Ok(heap);
+                // Interleaved allocations can revisit a page whose heap is
+                // still owned by a resource. Reuse only that exact live import.
+                return pool.pages.get_or_open(base, ImportedHeap::is_live, open);
             }
         }
         open()

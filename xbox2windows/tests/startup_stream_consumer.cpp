@@ -98,7 +98,8 @@ int main(int argc, char** argv)
                static_cast<UINT>(std::strtoul(argv[8], nullptr, 10)),
                std::strcmp(argv[9], "tiled") == 0};
         if ((bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69)) return 2;
-        if (!bc7.tiled && std::strcmp(argv[9], "linear") != 0) return 2;
+        if (std::strncmp(argv[9], "packed:", 7) == 0) bc7.packed = argv[9] + 7;
+        else if (!bc7.tiled && std::strcmp(argv[9], "linear") != 0) return 2;
     }
     ComPtr<IDXGIAdapter> adapter;
     void* device = nullptr;
@@ -128,6 +129,14 @@ int main(int argc, char** argv)
         if (format != DXGI_FORMAT_R32_UINT && format != DXGI_FORMAT_R32_SINT &&
             format != DXGI_FORMAT_R32G32B32A32_FLOAT) return 2;
         if (argc == 8) export_word = static_cast<UINT>(std::strtoul(argv[7], nullptr, 0));
+    }
+    wchar_t manifest[MAX_PATH];
+    const DWORD length = GetEnvironmentVariableW(L"X2W_TEST_PUBLISH_MANIFEST", manifest, MAX_PATH);
+    if (length && length < MAX_PATH) {
+        const std::string first = std::string(argv[5]) + ".first";
+        if (const int rc = check_stream_draw(adapter.Get(), device, pso, first.c_str(), nullptr, format)) return rc;
+        if (!MoveFileW((std::wstring(manifest) + L".pending").c_str(), manifest)) return 61;
+        Sleep(1100);
     }
     if (GetEnvironmentVariableW(L"X2W_TEST_PLACED_VERTEX", nullptr, 0)) {
         extern void release_placed_vertices(bool);

@@ -1,4 +1,5 @@
 """Reader for capture.bin written by the frame capture (startup tools; see docs/startup-runtime.md)."""
+import itertools
 import struct
 import sys
 from collections import defaultdict, Counter
@@ -166,7 +167,7 @@ def describe(cap, out=sys.stdout):
         w('%4d f%d L%03x %-30s %s | %s\n' % (c['seq'], c['frame'], c['list'] & 0xfff, LIST_SLOTS.get(c['slot'], 'slot%d' % c['slot']),
                                              ', '.join(args), ' '.join('0x%x' % a for a in c['args'][3:5])))
         for t in cap.tables.get(c['seq'], ()):
-            used = [(i, s, k) for i, (s, k) in enumerate(zip(t['shadow'], t['tokens'])) if s or k]
+            used = [(i, s, k) for i, (s, k) in enumerate(itertools.zip_longest(t['shadow'], t['tokens'], fillvalue=0)) if s or k]
             w('       table param %d heap index %d: %d of %d entries known\n' % (t['parameter'] if t['parameter'] != 0xffffffff else -1,
                                                                              t['index'], len(used), t['entries']))
             for i, s, k in used[:64]:

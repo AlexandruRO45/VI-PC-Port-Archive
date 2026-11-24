@@ -165,7 +165,8 @@ std::string run(const wchar_t* requested, bool) {
     auto options = query<16>(guest.Get(), D3D12_FEATURE_D3D12_OPTIONS);
     require(options[0] == UINT(native.DoublePrecisionFloatShaderOps != 0) &&
             options[4] == UINT(native.ResourceBindingTier) && options[15] == UINT(native.ResourceHeapTier) &&
-            options[3] == 0 && options[7] == 0 && options[14] == 0, "64-byte Xbox OPTIONS layout");
+            options[3] == UINT(native.TiledResourcesTier) && options[7] == 0 && options[14] == 0,
+            "64-byte Xbox OPTIONS layout");
     D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT addresses{};
     host_query(host.Get(), D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, addresses);
     auto bits = query<2>(guest.Get(), D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT);
@@ -184,7 +185,7 @@ std::string run(const wchar_t* requested, bool) {
     D3D12_FEATURE_DATA_FORMAT_SUPPORT flags{format, {}, {}};
     host_query(host.Get(), D3D12_FEATURE_FORMAT_SUPPORT, flags);
     auto support = query<3>(guest.Get(), D3D12_FEATURE_FORMAT_SUPPORT, {format});
-    constexpr UINT unavailable = UINT(D3D12_FORMAT_SUPPORT2_TILED) | UINT(D3D12_FORMAT_SUPPORT2_SAMPLER_FEEDBACK);
+    constexpr UINT unavailable = UINT(D3D12_FORMAT_SUPPORT2_SAMPLER_FEEDBACK);
     require(support[0] == format && support[1] == UINT(flags.Support1) &&
             support[2] == (UINT(flags.Support2) & ~unavailable),
             "same-adapter format flags");

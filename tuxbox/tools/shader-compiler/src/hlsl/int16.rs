@@ -25,6 +25,11 @@ pub(super) fn half(src: &Opnd, select: u32) -> Result<String, String> {
     })
 }
 
+pub(super) fn new_half(ins: &Insn) -> bool {
+    ins.enc == Enc::Vop3 && matches!(ins.mnemonic.as_str(),
+        "v_mul_lo_u16" | "v_max_u16" | "v_min_u16")
+}
+
 pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
     if ins.enc != Enc::Vop3 {
         return Ok(None);
@@ -32,10 +37,10 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
     let op = match ins.mnemonic.as_str() {
         "v_add_nc_u16" | "v_pk_add_u16" | "v_pk_add_i16" => Operation::Add,
         "v_sub_nc_u16" | "v_pk_sub_i16" | "v_pk_sub_u16" => Operation::Subtract,
-        "v_pk_mul_lo_u16" => Operation::Multiply,
+        "v_mul_lo_u16" | "v_pk_mul_lo_u16" => Operation::Multiply,
         "v_pk_mad_i16" | "v_pk_mad_u16" => Operation::MultiplyAdd,
-        "v_pk_max_u16" => Operation::UnsignedMax,
-        "v_pk_min_u16" => Operation::UnsignedMin,
+        "v_max_u16" | "v_pk_max_u16" => Operation::UnsignedMax,
+        "v_min_u16" | "v_pk_min_u16" => Operation::UnsignedMin,
         "v_lshlrev_b16" | "v_pk_lshlrev_b16" => Operation::ShiftLeft,
         "v_lshrrev_b16" | "v_pk_lshrrev_b16" => Operation::ShiftRight,
         "v_ashrrev_i16" | "v_pk_ashrrev_i16" => Operation::ArithmeticShiftRight,
@@ -54,6 +59,9 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
     // do not interpret an EXEC/VCC selector as packed integer data.
     if new_packed && (!packed || !ins.src[..arity].iter().all(|s| matches!(s, Opnd::Vgpr(_)))) {
         return Err("unsupported packed integer source or encoding".into());
+    }
+    if new_half(ins) && (packed || !ins.src[..arity].iter().all(|s| matches!(s, Opnd::Vgpr(_)))) {
+        return Err("unsupported ordinary 16-bit integer source or encoding".into());
     }
     let (w0, w1) = (ins.raw[0], ins.raw[1]);
     // RDNA2 ISA sections 6.5 and 12.10: clamp arithmetic to the
@@ -143,6 +151,29 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
 mod tests {
     use super::*;
     use crate::rdna2::disassemble;
+
+    #[test]
+    fn ordinary_half_forms_preserve_the_other_half() {
+        for (first, mnemonic) in [
+            (0xd705_4804u32, "v_mul_lo_u16"),
+            (0xd709_4804u32, "v_max_u16"),
+            (0xd70b_4804u32, "v_min_u16"),
+        ] {
+            let decode = |a: u32, b: u32| {
+                let bytes: Vec<u8> = [a,b].iter().flat_map(|v| v.to_le_bytes()).collect();
+                disassemble(&bytes).remove(0)
+            };
+            let ins=decode(first,0x0202_0b04);
+            assert_eq!(ins.mnemonic,mnemonic);
+            assert!(new_half(&ins));
+            let expr=expression(&ins).unwrap().unwrap();
+            assert!(expr.contains("v4 & 0xffffu"));
+            let expr=expression(&decode(first & !0x4000,0x0202_0b04)).unwrap().unwrap();
+            assert!(expr.contains("v4 & 0xffff0000u"));
+            assert!(expression(&decode(first | 0x8000,0x0202_0b04)).is_err());
+            assert!(expression(&decode(first,0x0202_0a04)).is_err());
+        }
+    }
 
     #[test]
     fn new_packed_integer_forms_accept_ordinary_sources_only() {

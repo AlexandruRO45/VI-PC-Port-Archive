@@ -42,9 +42,18 @@ impl MeshLayout {
     pub fn read(program: &[u8], resources: &[[u32; 4]], root: &RootSig) -> Option<Self> {
         let used = records(program)?;
         let user: BTreeSet<_> = user_data_records(program)?.collect();
-        if used.len() != resources.len() || used.len() > 128 {
+        if used.len() > 128 || resources.len() > 128 {
             return None;
         }
+        let mut expanded = BTreeSet::new();
+        for &[ty, space, lower, upper] in resources {
+            let count = upper.checked_sub(lower)?.checked_add(1)?;
+            if count > 128 || expanded.len() + count as usize > 128 { return None; }
+            for register in lower..=upper {
+                if !expanded.insert((ty, space, register)) { return None; }
+            }
+        }
+        if used.len() != expanded.len() { return None; }
         let mut result = Self {
             tables: BTreeMap::new(),
             raw: BTreeMap::new(),
@@ -83,10 +92,8 @@ impl MeshLayout {
                 }
                 _ => return None,
             };
-            let mut matching = resources
-                .iter()
-                .filter(|r| (r[0], r[2], r[3]) == (ty, register, register));
-            let space = matching.next()?[1];
+            let mut matching = expanded.iter().filter(|&&(t, _, reg)| t == ty && reg == register);
+            let space = matching.next()?.1;
             let binding_class = if ty == 2 { 2 } else { 0 };
             if matching.next().is_some()
                 || !used_resources.insert((binding_class, space, register))
@@ -270,6 +277,37 @@ pub fn shader_resources(bytes: &[u8]) -> Option<Vec<[u32; 4]>> {
 mod tests {
     use super::*;
     use crate::rootsig::RootParam;
+
+    #[test]
+    fn bounded_psv_range_requires_every_physical_binding() {
+        let mut program = vec![0; 0x100];
+        program[..8].copy_from_slice(b"FSSM\x01\x01\0\0");
+        for (field, count, rows) in [
+            (0xe8, 0xf8, [[3, 0, 1, 7, 0x009u32], [3, 8, 1, 8, 0x009]]),
+            (0xf0, 0xfc, [[0x300, 0, 7, 64, 0x00904], [0x300, 8, 8, 64, 0x00904]]),
+        ] {
+            let offset = (program.len() - 16) as u64;
+            program[field..field + 8].copy_from_slice(&offset.to_le_bytes());
+            program[count..count + 4].copy_from_slice(&2u32.to_le_bytes());
+            program.extend(rows.into_iter().flatten().flat_map(u32::to_le_bytes));
+        }
+        let size = (program.len() - 16) as u32;
+        program[8..12].copy_from_slice(&size.to_le_bytes());
+        let root = RootSig { version: 2, flags: 0,
+            params: vec![RootParam { visibility: 7,
+                kind: RootParamKind::Table(vec![RootRange { range_type: 0, num: 2,
+                    base_register: 7, space: 1, offset_in_table: 0 }]) }],
+            num_static_samplers: 0, static_samplers: Vec::new() };
+        let layout = MeshLayout::read(&program, &[[5, 1, 7, 8]], &root).unwrap();
+        assert_eq!(layout.tables[&(17, 0)].register, 7);
+        assert_eq!(layout.tables[&(17, 32)].register, 8);
+        assert!(layout.replacements.is_empty());
+        assert!(MeshLayout::read(&program, &[[5, 1, 7, 9]], &root).is_none());
+        assert!(MeshLayout::read(&program, &[[5, 1, 7, u32::MAX]], &root).is_none());
+        assert!(MeshLayout::read(&program, &[[5, 1, 7, 8], [5, 1, 8, 8]], &root).is_none());
+        program[0x114..0x118].copy_from_slice(&4u32.to_le_bytes());
+        assert!(MeshLayout::read(&program, &[[5, 1, 7, 8]], &root).is_none());
+    }
 
     #[test]
     fn remaps_mesh_slots_only_if_both_fssm_tables_agree() {

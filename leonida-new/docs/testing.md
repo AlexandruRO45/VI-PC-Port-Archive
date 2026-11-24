@@ -2,13 +2,14 @@
 
 The GPU tests are small hand-written RDNA2 programs in `runtime/test/shaders`. They are translated to SPIR-V and run
 on your GPU, and the results are compared with what the RDNA2 hardware gives. They need no game files, and every
-result helps: post it in [#166](https://github.com/ItsNotRexed/Leonida/issues/166), one comment per GPU and driver.
+result helps: submit a pull request adding a record under [`gpu-test-results/`](../gpu-test-results), following
+the existing files there and [CONTRIBUTING.md](../CONTRIBUTING.md).
 If your GPU is already covered there, testing an open pull request from the review queue in the [coordination
 issue][claims] helps more.
 
 This page collects the setup steps and the problems testers have run into so far.
 
-[claims]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+[claims]: https://github.com/ubiquitarianism/leonida/issues/14
 
 ## What you need
 
@@ -143,7 +144,7 @@ Write-Output "Test exit code: $LASTEXITCODE"
 ```
 
 Report the executable name, the workflow run and its commit, your GPU and driver,
-the exit code, and the test summary in [#166](https://github.com/ItsNotRexed/Leonida/issues/166).
+the exit code, and the test summary in your `gpu-test-results/` record.
 Label it as a single-test run so the result is easy to distinguish from a full suite run.
 
 ## Run them
@@ -168,16 +169,6 @@ The two-step form, which `CONTRIBUTING.md` describes:
 ```sh
 python -I runtime/test/shaders/build.py <out dir>
 python -I runtime/test/shaders/check.py <out dir> <folder with the test programs>
-```
-
-For the standalone `v_mullit_f32` readback, build the full-screen triangle and the
-hand-written semantic fixture, then run 120 draws with runtime SGPR inputs.
-The driver checks every pixel against an integer product rounded to 24 bits.
-It reports the input words, pixel and channel on the first mismatch.
-
-```sh
-python -I runtime/test/shaders/build.py <out-dir> vs_ids ps_mullit
-python -I runtime/test/shaders/mullit_readback.py <out-dir> <harness-directory>
 ```
 
 For D3D12/runtime tests, `LEONIDA_VK_VALIDATION=1` enables `VK_LAYER_KHRONOS_validation`. When running with validation, set `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` if MSI Afterburner (RivaTuner) or OBS is installed: their overlay layers can add unsupported swapchain usage, and in an elevated (administrator) terminal the loader ignores `VK_LOADER_LAYERS_DISABLE=~implicit~` (see "Known problems").
@@ -344,6 +335,17 @@ subgroups in another order print `not available`, a skip. Measured
 on an Apple M3 Max (MoltenVK 1.4.2 and 1.4.3): 17 workgroup shapes from 1 to 1024 invocations, partial last
 subgroups, with and without full subgroups and register pressure, all 32 lanes in order. A device whose default
 isn't the requested size still prints `not available`, and those tests skip.
+
+`cs_w32_shift64` checks `v_lshlrev_b64`, `v_lshrrev_b64` and `v_ashrrev_i64` with 64 memory-fed cases:
+eight boundary values crossed with counts 0, 1, 31, 32, 33, 63, 64 and 65. The expected values come from Python
+integers using the low six count bits, as specified by the [RDNA2 ISA, VOP3 opcodes 767–769](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content).
+It also overlaps the destination with the count, one source word or the entire source pair. Both GPU runners
+compare all 640 heap words (384 results and 256 unchanged input words); the operands are loaded at runtime so
+the driver cannot replace the tested operations with constant-folded answers. Run it alone with
+`python -I scripts/run_gpu_tests.py --build runtime/build --filter cs_w32_shift64 --require-pass`.
+It needs shader Int64 support; a device that lacks it reports a skip. This is a wave32 test of 64-bit values,
+independent of wave64 emulation. On RTX 3080 Ti (616.92, Windows 11), all 640 words matched; replacing the count
+mask with 31 or the arithmetic shift with a logical shift made the test fail at words 66 and 251 respectively.
 
 ## Wave64 pixel, vertex and geometry shaders (`w64_graphics.py`)
 
@@ -708,9 +710,14 @@ CS, 10,974 PS).
 
 ## Posting your result
 
-Use the template at the top of [#166](https://github.com/ItsNotRexed/Leonida/issues/166): GPU, driver, subgroup
-range, OS, the commit you built, the tool versions and the counts each script printed. Post counts and pass/fail
-lines only, never shaders or logs from the game. A failure that isn't in the table above gets its own issue, linked
-from your entry.
+Submit a pull request adding a file under [`gpu-test-results/`](../gpu-test-results), using the existing files
+there as format examples. Follow [CONTRIBUTING.md](../CONTRIBUTING.md) and claim the work in the
+[coordination issue][claims] before opening the pull request.
 
-Use your system's detected CPU, GPU, VRAM and RAM model names in the #166 entry, not benchmark scores. For a rough browser-based check against reference profiles, you can use [Can I Run Leonida](https://assttro.github.io/can-i-run-leonida/).
+Include your GPU, driver, subgroup range, OS, the commit you built, the tool versions, and the pass, skip and fail
+counts each script printed. Label a single-test run clearly instead of presenting it as a full suite run.
+Post counts and pass/fail lines only, never shaders or logs from the game. A failure that is not in the table
+above gets its own issue, linked from your record.
+
+Use your system's detected CPU, GPU, VRAM and RAM model names in your result record, not benchmark scores.
+For a rough browser-based check against reference profiles, you can use [Can I Run Leonida](https://assttro.github.io/can-i-run-leonida/).

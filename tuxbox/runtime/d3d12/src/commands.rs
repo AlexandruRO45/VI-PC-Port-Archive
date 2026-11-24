@@ -32,6 +32,7 @@ mod raytracing;
 pub(crate) mod serialized_blas;
 mod standard;
 mod stencil;
+mod tiles;
 
 enum ListState {
     Fresh(ID3D12CommandAllocator, Option<ID3D12PipelineState>),
@@ -51,7 +52,6 @@ struct Recording {
     display_bound: bool,
     trace_target: Option<ID3D12Resource>,
     trace_samples: Vec<(String, crate::present::sampler::Sample)>,
-    null_pipeline: bool,
     media: Option<media::Recording>,
     placed_reads: Vec<Arc<Texture>>,
     placed_writes: Vec<Arc<Texture>>,
@@ -100,6 +100,13 @@ impl Recording {
     }
 
     fn compute_dispatch(&mut self, list: &List, dispatch: impl FnOnce()) {
+        let null_usage = self.bindings.null_usage.clone();
+        let dispatch = move || {
+            dispatch();
+            if let Some(tag) = &null_usage {
+                crate::diagnostics::display::record_null(tag, false);
+            }
+        };
         if let Some(table) = self.bindings.reflected_table::<true>() {
             if let Err(error) = self.bindings.with_reflected_table::<true>(
                 table, list, self.descriptor_arena.as_deref(), self.resource_heap.as_ref(),
@@ -110,6 +117,10 @@ impl Recording {
             return;
         }
         if self.descriptor_arena.is_some() && !self.bindings.supports_paged_draw::<true>() {
+            static FIRST: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&FIRST, || {
+                "compute dispatch dropped: descriptor heap is bound and this pipeline has no paged layout".to_string()
+            });
             self.error = E_NOTIMPL;
             return;
         }
@@ -155,9 +166,17 @@ impl Recording {
     }
 
     fn draw(&mut self, list: &List, rasterizes: bool, draw: impl FnOnce()) {
-        if rasterizes {
-            crate::diagnostics::display::draw(self.display_bound, self.null_pipeline);
-        }
+        let null_usage = self.bindings.null_usage.clone();
+        let display_bound = self.display_bound;
+        let draw = move || {
+            draw();
+            if rasterizes {
+                crate::diagnostics::display::draw(display_bound, null_usage.is_some());
+                if let Some(tag) = &null_usage {
+                    crate::diagnostics::display::record_null(tag, display_bound);
+                }
+            }
+        };
         if rasterizes {
             for target in &self.bound_placed_targets {
                 if let Err(error) = Self::track_texture(&mut self.placed_writes, target) {
@@ -1032,6 +1051,13 @@ unsafe extern "system" fn copy_resource(
     });
 }
 
+// DriverHintX (Scarlett slot 101, GDK d3d12_xs.h). The desktop driver manages
+// its own hardware policy, so console tuning hints have no effect. The title
+// calls it with feature 2 and value 1 (RVA 0x50a6651) and ignores the result.
+unsafe extern "system" fn driver_hint(_list: &List, _feature: u64, _value: u64) -> u64 {
+    0
+}
+
 // Frosty's RHIDispatchIndirectComputeShader calls slot 59 (RVA 0x57876df).
 unsafe extern "system" fn execute_indirect(
     list: &List,
@@ -1205,6 +1231,12 @@ unsafe extern "system" fn reset_extended(list: &List, allocator: *mut c_void, in
 // base graphics-list IID. The List6-only cache barriers remain separate.
 static DEVICE11_LIST_SLOTS: Slots<149> = {
     let mut slots = LIST_SLOTS;
+    // Scarlett's list adds InsertGpuMarker and InsertTimingMarker after
+    // EndEvent (GDK d3d12_xs.h), so ExecuteIndirect moves from slot 59 to 61
+    // and CopyMemoryToMemoryX (slot 62) follows it. ProjectScarlett calls it
+    // from title RVA 0x248cbc1 with a one-command signature.
+    slots[61] = crate::slot!(execute_indirect);
+    slots[101] = crate::slot!(driver_hint);
     slots[70] = crate::slot!(graphics::depth_bounds);
     slots[75] = crate::slot!(graphics::force_shader_depth_order);
     slots[142] = crate::slot!(graphics::sample_mask);
@@ -1275,8 +1307,8 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
         return;
     }
     let guest = unsafe { slice::from_raw_parts(lists, count as usize) };
-    // Mirrors exist only when a constant-buffer import failed. The count is
-    // zero for every boot that has not hit that path.
+    // Mirrors exist only when a constant-buffer or address-SRV import failed.
+    // The count is zero for every boot that has not hit that path.
     crate::device::snapshot_cbv_mirrors();
     let mut list_index = 0;
     let trace_samples = std::cell::RefCell::new(Vec::new());
@@ -1567,6 +1599,9 @@ unsafe fn present_planes(
 
 static QUEUE_SLOTS: Slots<64> = {
     let mut slots = child_slots::<ID3D12CommandQueue, QueueState, 64>();
+    // Tile mapping sits before the marker methods, so both queue generations share it.
+    slots[8] = crate::slot!(tiles::update);
+    slots[9] = crate::slot!(tiles::copy);
     slots[10] = crate::slot!(execute);
     slots[14] = crate::slot!(queue_fence::<false>);
     slots[15] = crate::slot!(queue_fence::<true>);
@@ -1579,6 +1614,8 @@ static QUEUE_SLOTS: Slots<64> = {
 
 static DEVICE11_QUEUE_SLOTS: Slots<64> = {
     let mut slots = child_slots::<ID3D12CommandQueue, QueueState, 64>();
+    slots[8] = crate::slot!(tiles::update);
+    slots[9] = crate::slot!(tiles::copy);
     slots[10] = crate::slot!(execute);
     slots[16] = crate::slot!(queue_fence::<false>);
     slots[17] = crate::slot!(queue_fence::<true>);
@@ -1634,7 +1671,6 @@ pub(crate) unsafe fn wrap_command_list(
             display_bound: false,
             trace_target: None,
             trace_samples: Vec::new(),
-            null_pipeline: false,
             placed_reads: Vec::new(),
             placed_writes: Vec::new(),
             uploads: Vec::new(),

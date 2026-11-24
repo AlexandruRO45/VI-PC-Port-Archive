@@ -10,10 +10,11 @@
 // upload ring / a private descriptor heap.
 
 struct Translation {
-    struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
+    struct Srv { int kind, source, a, b; };  // kind 0 buffer, 1 2D texture, 2 2D array, 3 3D texture, 4 1D texture; source 0 table(param a, byte b), 1 vertex stream a, 2 root parameter a
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
+    ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
     std::vector<Srv> srvs;
     std::vector<Ud> uds;
     x2w_startup::TranslatedSamplers samplers;
@@ -30,6 +31,9 @@ struct BoundPipeline {
     Translation* translation = nullptr;
     bool has_blend = false;
     D3D12_BLEND_DESC blend{};
+    bool has_depth_stencil = false;
+    D3D12_DEPTH_STENCIL_DESC depth_stencil{};
+    DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
 };
 
@@ -122,12 +126,18 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     std::string manifest;
     if (!cache_path(path, L"", tr.key, L".txt")) return;
     if (!read_text(path, manifest)) {
-        InterlockedIncrement(&translation_missing);
-        static LONG missing;
-        if (rtv_request.empty() && first_calls(missing, 12))
-            log("x2w-draw no translation for pipeline %016llx", tr.key);
+        if (!tr.retry_manifest_at) {
+            InterlockedIncrement(&translation_missing);
+            static LONG missing;
+            if (rtv_request.empty() && first_calls(missing, 12))
+                log("x2w-draw no translation for pipeline %016llx", tr.key);
+        }
+        tr.retry_manifest_at = GetTickCount64() + 1000;
         return;
     }
+    // The writer publishes this marker last. A malformed published result stays rejected.
+    const bool previously_missing = tr.retry_manifest_at != 0;
+    tr.retry_manifest_at = 0;
     bool matched_rtv = false;
     for (std::size_t at = 0; at < manifest.size();) {
         std::size_t end = manifest.find('\n', at);
@@ -154,7 +164,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
             if (static_cast<std::size_t>(i) == tr.uds.size() && ud.kind >= 0) tr.uds.push_back(ud);
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
             const int texture_kind = !std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex2da") ? 2 :
-                                     !std::strcmp(kind, "tex3d") ? 3 : 0;
+                                     !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0;
             Translation::Srv srv{texture_kind, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
         } else if (!tr.samplers.read_manifest_line(line.c_str())) {
@@ -176,6 +186,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         return;
     }
     tr.state = 1;
+    if (previously_missing) InterlockedDecrement(&translation_missing);
     InterlockedIncrement(&translation_ready);
     log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu static samplers, sampler_heap=%u",
         tr.key, tr.uds.size(), tr.srvs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
@@ -183,28 +194,67 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
 
 // draw_lock held. Both pipeline forms use the same request writer and shader cache.
 Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
-                                const std::vector<unsigned char>& root_blob)
+                                const std::vector<unsigned char>& root_blob, const std::string& layout = {})
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
     // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
-    constexpr char revision[] = "x2w-startup-shader-3";
+    constexpr char revision[] = "x2w-startup-shader-5";
     const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
-    const u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
+    u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
+    // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
+    if (!layout.empty()) key = fnv_bytes(layout.data(), layout.size(), key);
     auto& entry = translation_by_key()[key];
     if (!entry) {
         entry = new Translation;
         entry->key = key;
         // A legacy cache hit still needs source blobs for late RTV specialization.
         if (publish_shader_request(key, L".b", b, b_bytes) &&
-            publish_shader_request(key, L".root", root_blob.data(), root_blob.size()))
+            publish_shader_request(key, L".root", root_blob.data(), root_blob.size()) &&
+            (layout.empty() || publish_shader_request(key, L".ia", layout.data(), layout.size())))
             publish_shader_request(key, L".a", a, a_bytes);
         load_translation(*entry);
     }
     return entry;
 }
 
+// The INPUT_LAYOUT subobject as the request text tools/startup/gfx2hlsl.py reads: "ia1 <count>", then one
+// "<semantic> <index> <format> <slot> <offset> <class> <step>" line per element. False when it cannot be read.
+bool stream_input_layout(const unsigned char* subobject, std::string& text)
+{
+    D3D12_INPUT_LAYOUT_DESC layout;
+    std::memcpy(&layout, subobject + 8, sizeof(layout));
+    if (!layout.NumElements) return true;
+    if (layout.NumElements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT ||
+        !x2w_local::readable(layout.pInputElementDescs, sizeof(D3D12_INPUT_ELEMENT_DESC) * layout.NumElements)) return false;
+    text = "ia1 " + std::to_string(layout.NumElements) + "\n";
+    std::string shown;
+    for (UINT i = 0; i < layout.NumElements; ++i) {
+        const D3D12_INPUT_ELEMENT_DESC& e = layout.pInputElementDescs[i];
+        std::size_t length = 0;
+        while (length < 64 && x2w_local::readable(e.SemanticName + length, 1) && e.SemanticName[length]) {
+            const char c = e.SemanticName[length];
+            if (!(std::isalpha(static_cast<unsigned char>(c)) || c == '_' || (length && std::isdigit(static_cast<unsigned char>(c))))) return false;
+            ++length;
+        }
+        if (!length || length == 64) return false;
+        char line[160];
+        std::snprintf(line, sizeof(line), "%.*s %u %u %u %u %u %u\n", static_cast<int>(length), e.SemanticName, e.SemanticIndex,
+                      static_cast<unsigned>(e.Format), e.InputSlot, e.AlignedByteOffset, static_cast<unsigned>(e.InputSlotClass),
+                      e.InstanceDataStepRate);
+        text += line;
+        std::snprintf(line, sizeof(line), "%s%u/%u/%u/%u", i ? " " : "", static_cast<unsigned>(e.Format), e.InputSlot,
+                      e.AlignedByteOffset, static_cast<unsigned>(e.InputSlotClass));
+        shown += line;
+    }
+    static LONG logged;
+    if (first_calls(logged, 24))
+        log("x2w-draw stream input layout: %u elements (format/slot/offset/class) %s", layout.NumElements, shown.c_str());
+    return true;
+}
+
 // Resolve the shader pointers and wrapped root while the caller still owns the stream.
-Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3D12_BLEND_DESC& blend, bool& has_blend)
+Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3D12_BLEND_DESC& blend, bool& has_blend,
+                                D3D12_DEPTH_STENCIL_DESC& depth_stencil, bool& has_depth_stencil, DXGI_FORMAT& dsv_format)
 {
     const auto* stream = static_cast<const unsigned char*>(desc.pPipelineStateSubobjectStream);
     if (!desc.SizeInBytes || desc.SizeInBytes > 0x2000 || desc.SizeInBytes % 8 ||
@@ -212,6 +262,7 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
 
     const Wrapper* root = nullptr;
     D3D12_SHADER_BYTECODE stages[2]{};
+    std::string layout;
     unsigned seen = 0;
     for (std::size_t at = 0; at < desc.SizeInBytes;) {
         unsigned type;
@@ -233,6 +284,24 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND) {
             std::memcpy(&blend, stream + at + sizeof(type), sizeof(blend));
             has_blend = true;
+        } else if (type == 11 || type == 21) {  // DEPTH_STENCIL (56B) / DEPTH_STENCIL1 (64B)
+            std::memcpy(&depth_stencil, stream + at + sizeof(type), sizeof(depth_stencil));
+            has_depth_stencil = true;
+            if (type == 21) {  // DEPTH_STENCIL1 appends DepthBoundsTestEnable; it has no translated equivalent
+                BOOL bounds = FALSE;
+                std::memcpy(&bounds, stream + at + sizeof(type) + sizeof(depth_stencil), sizeof(bounds));
+                if (bounds) return nullptr;
+            }
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
+            // Unreadable: translate without it; gfx2hlsl refuses a vertex shader that needs it.
+            if (!stream_input_layout(stream + at, layout)) {
+                layout.clear();
+                log("x2w-draw stream input layout unreadable; requesting the translation without it");
+            }
+        } else if (type == 16) {  // DEPTH_STENCIL_FORMAT (8B)
+            DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+            std::memcpy(&fmt, stream + at + sizeof(type), sizeof(fmt));
+            dsv_format = desktop_format(fmt);
         }
         at += stream_sizes[type];
     }
@@ -245,7 +314,7 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
     if (root_blob.empty()) return nullptr;
     AcquireSRWLockExclusive(&draw_lock);
     auto* result = cached_translation(stages[0].pShaderBytecode, stages[0].BytecodeLength,
-                                      stages[1].pShaderBytecode, stages[1].BytecodeLength, root_blob);
+                                      stages[1].pShaderBytecode, stages[1].BytecodeLength, root_blob, layout);
     ReleaseSRWLockExclusive(&draw_lock);
     return result;
 }
@@ -306,7 +375,14 @@ BoundPipeline* translation_for(Wrapper* pipeline)
             }
         }
     }
-    if (info && info->path == 86) result = info->stream_translation;
+    if (info && info->path == 86) {
+        result = info->stream_translation;
+        if (info->has_stream_depth_stencil) {
+            bound->depth_stencil = info->stream_depth_stencil;
+            bound->has_depth_stencil = true;
+        }
+        bound->dsv_format = info->stream_dsv_format;
+    }
     if (info && info->path == 57 && info->desc.size() >= 0x60) {
         u64 words[12];
         std::memcpy(words, info->desc.data(), sizeof(words));
@@ -354,8 +430,12 @@ bool needs_rtv_variant(DXGI_FORMAT format)
 
 Translation* translation_for_targets(Translation* base, const Pass& pass)
 {
-    if (!base || std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant))
+    if (!base) return nullptr;
+    if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
+        if (base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at)
+            load_translation(*base);
         return base;
+    }
     std::string request = "rtv1 " + std::to_string(base->key);
     for (UINT i = 0; i < pass.target_count; ++i)
         request += " " + std::to_string(static_cast<unsigned>(pass.target_formats[i]));
@@ -369,26 +449,32 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
             publish_shader_request(key, L".rtv", request.data(), request.size());
             log("x2w-draw no RTV translation for %016llx (%s)", key, request.c_str());
         }
+    } else if (entry->retry_manifest_at && GetTickCount64() >= entry->retry_manifest_at) {
+        load_translation(*entry, request);
     }
     return entry;
 }
 
 ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass)
 {
+    const DXGI_FORMAT dsv_format = pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
     u64 key = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
+    key = fnv_bytes(&dsv_format, sizeof(dsv_format), key);
+    if (bound.has_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root;
     desc.VS = {tr.vs->GetBufferPointer(), tr.vs->GetBufferSize()};
     desc.PS = {tr.ps->GetBufferPointer(), tr.ps->GetBufferSize()};
-    // Blend state as found in the pipeline's state block, else opaque. Raster and depth state are
-    // not decoded yet: no culling, no depth (enough for the 2D start-up screens).
+    // Blend state as found in the pipeline's state block, else opaque. Depth-stencil state and
+    // DSVFormat come from the stream PSO (or bound DSV), else disabled. Raster state: no culling.
     for (auto& target : desc.BlendState.RenderTarget)
         target = {FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
                   D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
     if (bound.has_blend) desc.BlendState = bound.blend;
+    if (bound.has_depth_stencil) desc.DepthStencilState = bound.depth_stencil;
     desc.SampleMask = ~0u;
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -396,11 +482,13 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) desc.RTVFormats[i] = pass.target_formats[i];
+    desc.DSVFormat = dsv_format;
     desc.SampleDesc.Count = 1;
     ID3D12PipelineState* pipeline = nullptr;
     const HRESULT hr = device_of(the_device)->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
-    log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx", tr.key, pass.target_count,
-        pass.target_count ? pass.target_formats[0] : 0, static_cast<unsigned long>(hr));
+    log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d)", tr.key,
+        pass.target_count, pass.target_count ? pass.target_formats[0] : 0, static_cast<unsigned long>(hr),
+        static_cast<int>(dsv_format), desc.DepthStencilState.DepthEnable ? 1 : 0);
     check_device("translated CreateGraphicsPipelineState", 0);
     bound.pipelines[key] = pipeline;
     return pipeline;
@@ -436,14 +524,16 @@ struct SubmittedDrawSamplerHeaps {
 };
 std::vector<SubmittedDrawSamplerHeaps> submitted_draw_sampler_heaps;
 
-void discard_draw_sampler_heaps(Wrapper* self)
+void discard_draw_sampler_heaps(ID3D12CommandList* list)
 {
     AcquireSRWLockExclusive(&draw_lock);
-    recorded_draw_sampler_heaps.erase(static_cast<ID3D12GraphicsCommandList*>(self->own().real));
+    recorded_draw_sampler_heaps.erase(list);
     ReleaseSRWLockExclusive(&draw_lock);
 }
 
-// draw_lock held. The lists have already been executed on this queue.
+// draw_lock held. The lists have already been executed on this queue. A closed list can be
+// submitted again until its Reset, so each submit takes its own references and the recording
+// keeps its own until discard_draw_sampler_heaps.
 void retire_draw_sampler_heaps(ID3D12CommandQueue* queue, const std::vector<ID3D12CommandList*>& lists)
 {
     submitted_draw_sampler_heaps.erase(std::remove_if(submitted_draw_sampler_heaps.begin(),
@@ -454,8 +544,7 @@ void retire_draw_sampler_heaps(ID3D12CommandQueue* queue, const std::vector<ID3D
     for (auto* list : lists) {
         auto it = recorded_draw_sampler_heaps.find(list);
         if (it == recorded_draw_sampler_heaps.end()) continue;
-        for (auto& heap : it->second) batch.heaps.push_back(std::move(heap));
-        recorded_draw_sampler_heaps.erase(it);
+        for (const auto& heap : it->second) batch.heaps.push_back(heap);
     }
     if (batch.heaps.empty()) return;
     x2w_startup::ComPtr<ID3D12Device> device;
@@ -510,10 +599,19 @@ bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool
     return true;
 }
 
-// Copies of title memory made for the current frame: (address, bytes) -> ring offset.
-std::unordered_map<u64, u64>& frame_copies() { static std::unordered_map<u64, u64> m; return m; }
+// Copies of title memory made for the current frame, found by (address, bytes). A title may rewrite the same
+// address between two draws of one frame (a dynamic constant buffer, a reused vertex or index range), so an
+// entry keeps the bytes it was made from and is reused only while the title's memory still matches them. The
+// upload ring is write-combined memory that is slow to read, so the comparison is against this copy, not the ring.
+struct FrameCopy {
+    u64 address = 0;
+    u64 offset = 0;
+    std::vector<unsigned char> content;
+};
+std::unordered_map<u64, FrameCopy>& frame_copies() { static std::unordered_map<u64, FrameCopy> m; return m; }
 LONG frame_copies_frame = -1;
 
+// Callers have just probed that [address, address + bytes) is readable (readable_window), and draw_lock is held.
 bool frame_copy(u64 address, std::size_t bytes, u64* offset)
 {
     if (frame_copies_frame != frame_number) {
@@ -521,13 +619,33 @@ bool frame_copy(u64 address, std::size_t bytes, u64* offset)
         frame_copies_frame = frame_number;
     }
     const u64 key = address * 1099511628211ull ^ bytes;
+    const auto* title = reinterpret_cast<const unsigned char*>(address);
     const auto found = frame_copies().find(key);
-    if (found != frame_copies().end()) {
-        *offset = found->second;
+    const bool known = found != frame_copies().end() && found->second.address == address && found->second.content.size() == bytes;
+    if (known && std::memcmp(found->second.content.data(), title, bytes) == 0) {
+        *offset = found->second.offset;
         return true;
     }
-    if (!ring_copy(address, bytes, offset)) return false;
-    frame_copies()[key] = *offset;
+    u64 fresh = 0;
+    auto* ring = reserve_upload_ring(bytes, &fresh);
+    if (!ring) return false;
+    // Cache insertion and snapshot allocation are optional. Fill the ring directly if they fail.
+    const unsigned char* source = title;
+    try {
+        std::vector<unsigned char> content(title, title + bytes);
+        // Use the stored snapshot to fill the ring so the GPU bytes and subsequent comparisons agree.
+        auto entry = frame_copies().insert_or_assign(key, FrameCopy{address, fresh, std::move(content)});
+        source = entry.first->second.content.data();
+    } catch (const std::bad_alloc&) {
+        // The ring slice is already reserved. The draw can proceed without another CPU allocation.
+    }
+    std::memcpy(ring, source, bytes);
+    if (known) {
+        static LONG refreshed;
+        if (first_calls(refreshed, 4))
+            log("x2w-draw frame copy of 0x%llx (%zu bytes) refreshed: the title changed it since an earlier draw of this frame", address, bytes);
+    }
+    *offset = fresh;
     return true;
 }
 
@@ -547,7 +665,7 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, ID3D12Resource* buffer, u64 o
 // surface must be detiled into the footprint first. A texture is uploaded on its first bind and
 // again when its memory changed: XG copies announce themselves (x2w_d3d12_texture_written), and
 // CPU-backed textures up to 32 MiB are also re-hashed for writes the title makes on its own.
-// Recheck single-mip R8 planes on their first bind each frame and other textures every 15 frames.
+// Recheck single-mip R8 and A8 planes on their first bind each frame and other textures every 15 frames.
 // Targets and UAVs are GPU-written and never uploaded.
 struct TextureUpload {
     u64 hash = 0, generation = ~0ull;
@@ -570,9 +688,11 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     auto* const memory = static_cast<const unsigned char*>(resource->own().title_memory);
     auto* list = recording(self);
     const D3D12_RESOURCE_DESC desc = texture->GetDesc();
+    const bool uploadable = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc.DepthOrArraySize == 1 && desc.Height == 1);
     {
         static LONG reasons;
-        if ((!memory || (desc.Flags & 0x7) || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) && !texture_uploads().count(texture) &&
+        if ((!memory || (desc.Flags & 0x7) || !uploadable) && !texture_uploads().count(texture) &&
             first_calls(reasons, 12)) {
             texture_uploads()[texture].done = true;
             log("x2w-draw texture not uploaded %p: %llux%u format %d flags 0x%x dim %d title memory %p", static_cast<void*>(texture),
@@ -581,7 +701,7 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     }
     if (!memory || !list) return;
     if (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return;
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return;
+    if (!uploadable) return;
     const UINT mips = desc.MipLevels ? desc.MipLevels : 1;
     const UINT slices = desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
     if (mips > 15) return;
@@ -832,9 +952,10 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         const bool entry_ok = entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32);
         if (entry_ok) std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
         bool buffer_token_known = false;
-        if (srv.kind >= 1 && srv.kind <= 3) {
+        if (srv.kind >= 1 && srv.kind <= 4) {
             const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
-                                   srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE3D;
+                                   srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
+                                   srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
             // A texture: the title's descriptor memory carries the id of the view it created there.
             ViewRecord record{};
             bool known = false;
@@ -849,22 +970,43 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             desc.ViewDimension = dimension;
             desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            desc.Texture2D.MipLevels = 1;  // shared mip fields in all three views
+            desc.Texture2D.MipLevels = 1;  // shared MostDetailedMip and MipLevels in all supported texture views
             if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
             ID3D12Resource* texture = sampled_address_texture(resource);
             if (texture && record.desc_bytes >= 40) {
                 std::memcpy(&desc, record.desc, 40);
                 desc.Format = desktop_format(desc.Format);
             }
+            if (texture && x2w_startup::packed_target_format(desc.Format)) {
+                // The view recorded from the title names a packed format: follow a stand-in texture,
+                // and bind nothing for a texture the view does not fit (packed_target_format.h).
+                const auto verdict = x2w_startup::packed_view(desc.Format, texture->GetDesc().Format, x2w_startup::packed_stand_in_of(texture));
+                if (verdict == x2w_startup::PackedView::stand_in) desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                if (verdict == x2w_startup::PackedView::refused) {
+                    static LONG refused;
+                    if (first_calls(refused, 6))
+                        log("x2w-draw   %016llx srv %u: packed format %d on a texture of format %d that does not stand in for it; binding null",
+                            tr->key, i, desc.Format, texture->GetDesc().Format);
+                    texture = nullptr;
+                    desc = {};
+                    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    desc.ViewDimension = dimension;
+                    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    desc.Texture2D.MipLevels = 1;
+                    if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
+                }
+            }
             if (texture) upload_texture(self, resource, texture);
-            if (texture) require_state(self, texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            if (texture) require_state(self, texture, sampled_state(self, texture));
             const bool had_texture = texture != nullptr;
             bool mismatched = false;
             static LONG shown;
             if (first_calls(shown, 6))
                 log("x2w-draw   %016llx srv %u texture: table entry 0x%llx words %08x %08x -> view %s, resource %p, desc %u bytes format %d",
                     tr->key, i, entry, words[0], words[1], known ? "known" : "UNKNOWN", static_cast<void*>(texture), record.desc_bytes, desc.Format);
-            if (texture && desc.ViewDimension != dimension && record.desc_bytes >= 40) {
+            const bool wrong_1d_resource = texture && srv.kind == 4 &&
+                (texture->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D || texture->GetDesc().DepthOrArraySize != 1);
+            if (texture && ((record.desc_bytes >= 40 && desc.ViewDimension != dimension) || wrong_1d_resource)) {
                 static LONG mismatch;
                 if (first_calls(mismatch, 6)) log("x2w-draw   %016llx srv %u: view dimension %d does not match the shader; binding null", tr->key, i, desc.ViewDimension);
                 texture = nullptr;
@@ -904,10 +1046,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 std::memcpy(&view, record.desc, 40);
                 Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
                 if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && resource && resource->own().title_memory) {
-                    const UINT element = view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride : 4;
+                    const bool typed_view = !view.Buffer.StructureByteStride && view.Format != DXGI_FORMAT_R32_TYPELESS;
+                    const UINT element = view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride
+                                         : typed_view ? x2w_startup::typed_buffer_format_bytes(view.Format) : 4;
                     address = reinterpret_cast<u64>(resource->own().title_memory) + view.Buffer.FirstElement * element;
                     bytes = std::size_t{view.Buffer.NumElements} * element;
-                    strides[i] = view.Buffer.StructureByteStride;
+                    strides[i] = typed_view ? element : view.Buffer.StructureByteStride;
                 }
             }
         }
@@ -983,6 +1127,23 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             : ud.kind == Translation::start_instance ? start_instance
             : ud.kind == Translation::root_constant ? ((ud.a >= 0 && ud.a < 16 && ud.b >= 0 && ud.b < 8) ? pass.constants[ud.a][ud.b] : 0)
             : ud.kind == Translation::stride && ud.a >= 0 && ud.a < 32 ? strides[ud.a] : 0;
+    }
+    // A desktop list with no viewport or scissor draws nothing: cover the first render target unless the title set its own.
+    if (pass.target0 && (!pass.viewport_set || !pass.scissor_set)) {
+        const D3D12_RESOURCE_DESC target = pass.target0->GetDesc();
+        // Only the title's own calls set the flags; an automatic default is regenerated when render target 0 changes size.
+        if (!pass.viewport_set && (pass.default_viewport_w != target.Width || pass.default_viewport_h != target.Height)) {
+            const D3D12_VIEWPORT full{0.0f, 0.0f, static_cast<float>(target.Width), static_cast<float>(target.Height), 0.0f, 1.0f};
+            list->RSSetViewports(1, &full);
+            pass.default_viewport_w = target.Width;
+            pass.default_viewport_h = target.Height;
+        }
+        if (!pass.scissor_set && (pass.default_scissor_w != target.Width || pass.default_scissor_h != target.Height)) {
+            const D3D12_RECT full{0, 0, static_cast<LONG>(target.Width), static_cast<LONG>(target.Height)};
+            list->RSSetScissorRects(1, &full);
+            pass.default_scissor_w = target.Width;
+            pass.default_scissor_h = target.Height;
+        }
     }
     list->SetPipelineState(pipeline);
     list->SetGraphicsRootSignature(tr->root);
@@ -1075,6 +1236,10 @@ void __stdcall list_table(Wrapper* self, UINT parameter, u64 gpu_handle)
 // List slot 40 (desktop 36 + 4), SetGraphicsRoot32BitConstants(parameter, count, data, offset).
 void __stdcall list_root_constants(Wrapper* self, UINT parameter, UINT count, const std::uint32_t* data, UINT offset)
 {
+    static LONG dropped;
+    if (count && (parameter >= 16 || offset >= 8 || count > 8 - offset) && first_calls(dropped, 4))
+        log("x2w-render root constants %s: parameter %u, offset %u, count %u (16 parameters of 8 words are kept)",
+            parameter >= 16 || offset >= 8 ? "dropped" : "truncated", parameter, offset, count);
     if (parameter >= 16 || offset >= 8 || !count || !x2w_local::readable(data, std::size_t{count} * 4)) return;
     for (UINT i = 0; i < count && offset + i < 8; ++i) pass_of(self).constants[parameter][offset + i] = data[i];
 }

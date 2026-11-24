@@ -117,3 +117,13 @@ fn other_resinfo_shapes_stay_refused() {
         "{a16}"
     );
 }
+
+#[test]
+fn aligned_immediate_is_added_to_verified_dynamic_heap_offset() {
+    let mut words = resinfo_words(0xf038_1308, 0x0002_0113);
+    words[2] |= 32;
+    let hlsl = lower(&words).unwrap();
+    assert!(hlsl.contains("tb_heap_index((s4 + 0x20u) >> 5)"), "{hlsl}");
+    words[2] = 0x0800_0004;
+    assert!(lower(&words).is_err());
+}

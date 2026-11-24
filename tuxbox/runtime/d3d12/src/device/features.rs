@@ -27,13 +27,13 @@ fn options(device: &Device) -> Result<[u32; 16], HRESULT> {
         D3D12_FEATURE_DATA_D3D12_OPTIONS::default(),
     )?;
     // The Xbox driver writes the address width at +36 and heap tier at +60.
-    // Keep the unverified flags between them disabled. Tiled resource mappings
-    // and ROVs are also unavailable through this guest device.
+    // Flags between those two stay off. The tiled-resource tier is the field
+    // at +12, and this device now creates reserved resources. ROVs stay off.
     Ok([
         u32::from(host.DoublePrecisionFloatShaderOps.as_bool()),
         u32::from(host.OutputMergerLogicOp.as_bool()),
         0,
-        0,
+        host.TiledResourcesTier.0.clamp(0, 4) as u32,
         host.ResourceBindingTier.0.clamp(0, 3) as u32,
         u32::from(host.PSSpecifiedStencilRefSupported.as_bool()),
         u32::from(host.TypedUAVLoadAdditionalFormats.as_bool()),
@@ -88,7 +88,7 @@ unsafe fn translate(
             words.cast::<[u32; 16]>().write_unaligned(options(device)?)
         },
         D3D12_FEATURE_D3D12_OPTIONS5 => {
-            // TuxBox has no guest tiled SRV, render-pass, or DXR command interface.
+            // No shader-resource-only tiled tier, render pass, or DXR tier is advertised.
             unsafe { words.cast::<[u32; 3]>().write_unaligned([0; 3]) };
         }
         D3D12_FEATURE_D3D12_OPTIONS7 => {
@@ -138,8 +138,8 @@ unsafe fn translate(
                     ..Default::default()
                 };
                 let result = host_query(device, feature, record)?;
-                let unavailable =
-                    D3D12_FORMAT_SUPPORT2_TILED | D3D12_FORMAT_SUPPORT2_SAMPLER_FEEDBACK;
+                // Sampler-feedback views are not created here. Tiled resources are.
+                let unavailable = D3D12_FORMAT_SUPPORT2_SAMPLER_FEEDBACK;
                 [
                     result.Support1.0 as u32,
                     (result.Support2.0 & !unavailable.0) as u32,
@@ -177,9 +177,12 @@ unsafe fn translate(
             };
             let result = host_query(device, feature, record)?;
             // The packaged driver offers one quality level for supported counts
-            // through 8x, subject to its tiled-resource flag. Tile mapping is absent here.
+            // through 8x. The tiled-resource flag is the only extra bit accepted.
+            let tiled = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE.0 as u32;
             let levels = u32::from(
-                matches!(count, 1 | 2 | 4 | 8) && flags == 0 && result.NumQualityLevels != 0,
+                matches!(count, 1 | 2 | 4 | 8)
+                    && (flags == 0 || flags == tiled)
+                    && result.NumQualityLevels != 0,
             );
             unsafe { words.add(3).write_unaligned(levels) };
         }

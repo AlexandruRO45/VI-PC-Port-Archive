@@ -8,18 +8,46 @@ pub(super) const READ_LANE: u32 = 0x7ff2;
 // Reductions may have a completed vector load and a second predicate.
 // The scalar AND intersects that predicate with the saved EXEC before the
 // CNDMASK sets excluded lanes to the reduction's identity.
-fn masked_prologue(insns: &[Insn], first: usize, identity: i64) -> Option<(usize, Opnd)> {
+enum NeutralIdentity {
+    // Immediate neutral: v_or_b32 / v_max_u32 (0), v_and_b32 / v_min_u32 (-1),
+    // v_add_nc_u32 (0) and v_add_f32 (0.0 == 0x00000000). Accept ConstInt or
+    // Literal encodings of the same bits.
+    Immediate(i64),
+    // Neutral held in a VGPR: floating extrema materialize +/-inf with a
+    // literal move (v_mov_b32) before the AND and CNDMASK.
+    LiteralBits(u32),
+}
+
+fn masked_prologue(insns: &[Insn], first: usize, identity: NeutralIdentity) -> Option<(usize, Opnd, Opnd)> {
     let select = insns.get(first.checked_sub(1)?)?;
-    let [Opnd::ConstInt(value), Opnd::Vgpr(_), mask @ Opnd::Sgpr(_)] = select.src[..] else {
+    let [ident, _, mask @ Opnd::Sgpr(_)] = select.src[..] else {
         return None;
     };
-    if value != identity {
-        return None;
-    }
+    let (expected, want_reg, want_literal) = match (identity, ident) {
+        (NeutralIdentity::Immediate(v), Opnd::ConstInt(k)) if k == v => {
+            (Opnd::ConstInt(v), None, None)
+        }
+        (NeutralIdentity::Immediate(v), Opnd::Literal(k)) if k == v as u32 => {
+            (Opnd::Literal(k), None, None)
+        }
+        (NeutralIdentity::LiteralBits(bits), Opnd::Vgpr(reg)) => {
+            (Opnd::Vgpr(reg), Some(reg), Some(bits))
+        }
+        _ => return None,
+    };
     let mut mask_sources = None;
+    let mut ident_reg_found = want_reg.is_none();
     for (index, op) in insns[..first - 1].iter().enumerate().rev() {
         match op.mnemonic.as_str() {
             "s_waitcnt" | "v_nop" => (),
+            "v_mov_b32" if want_reg.is_some() => {
+                let [Opnd::Vgpr(reg)] = op.dst[..] else { return None };
+                let [Opnd::Literal(bits)] = op.src[..] else { return None };
+                if reg != want_reg.unwrap() || bits != want_literal.unwrap() {
+                    return None;
+                }
+                ident_reg_found = true;
+            }
             "s_and_b32" | "s_and_b64" if mask_sources.is_none() && op.dst == [mask] => {
                 mask_sources = Some((op.mnemonic.as_str(), &op.src));
             }
@@ -33,7 +61,10 @@ fn masked_prologue(insns: &[Insn], first: usize, identity: i64) -> Option<(usize
                     }
                     None => saved == mask,
                 };
-                return matches.then_some((index, mask));
+                if matches && ident_reg_found {
+                    return Some((index, mask, expected));
+                }
+                return None;
             }
             _ => return None,
         }
@@ -41,12 +72,27 @@ fn masked_prologue(insns: &[Insn], first: usize, identity: i64) -> Option<(usize
     None
 }
 
-fn masked_identity(operation: &str) -> Option<i64> {
+fn masked_identity(operation: &str) -> Option<NeutralIdentity> {
     match operation {
-        "v_or_b32" | "v_max_u32" => Some(0),
-        "v_and_b32" | "v_min_u32" => Some(-1),
+        "v_or_b32" | "v_max_u32" => Some(NeutralIdentity::Immediate(0)),
+        "v_and_b32" | "v_min_u32" => Some(NeutralIdentity::Immediate(-1)),
+        "v_add_nc_u32" => Some(NeutralIdentity::Immediate(0)),
+        "v_add_f32" => Some(NeutralIdentity::Immediate(0)),
+        "v_min_f32" => Some(NeutralIdentity::LiteralBits(f32::INFINITY.to_bits())),
+        "v_max_f32" => Some(NeutralIdentity::LiteralBits(f32::NEG_INFINITY.to_bits())),
         _ => None,
     }
+}
+
+// Whether the floating-extrema shape is the masked form (saveexec + identity
+// move + scalar AND + CNDMASK) rather than the nand form. The caller routes
+// floating extrema here; the nand form keeps its own lowering.
+pub(super) fn masked_floating(insns: &[Insn], first: usize) -> bool {
+    let Some(insn) = insns.get(first) else { return false };
+    let Some(id) = masked_identity(&insn.mnemonic) else {
+        return false;
+    };
+    masked_prologue(insns, first, id).is_some()
 }
 
 pub(super) fn lower(insns: &mut [Insn], first: usize) -> Result<(u32, usize), &'static str> {
@@ -55,19 +101,31 @@ pub(super) fn lower(insns: &mut [Insn], first: usize) -> Result<(u32, usize), &'
     let operation = &insns[first].mnemonic;
     let floating = matches!(operation.as_str(), "v_min_f32" | "v_max_f32");
     // The floating form inserts the neutral value between SAVEEXEC and CNDMASK.
-    let identity = masked_identity(operation);
-    let masked = identity
-        .map(|neutral| {
-            masked_prologue(insns, first, neutral).ok_or("unrecognized masked DPP prologue")
-        })
+    let masked = masked_identity(operation)
+        .map(|id| masked_prologue(insns, first, id).ok_or("unrecognized masked DPP prologue"))
         .transpose()?;
-    let save = if let Some((index, _)) = masked {
-        &insns[index]
+    let (save, neutral, expected_mask): (&Insn, Opnd, Opnd) = if let Some((index, mask, neutral)) = masked {
+        (&insns[index], neutral, mask)
     } else if floating {
         let prologue = start.checked_sub(1).ok_or("missing extrema prologue")?;
-        &insns[prologue]
+        let identity_bits = if operation == "v_min_f32" {
+            f32::INFINITY.to_bits()
+        } else {
+            f32::NEG_INFINITY.to_bits()
+        };
+        if tail[0].mnemonic != "v_mov_b32" || tail[0].src != [Opnd::Literal(identity_bits)] {
+            return Err("unexpected extrema identity");
+        }
+        let [reg @ Opnd::Vgpr(_)] = tail[0].dst[..] else {
+            return Err("invalid identity register");
+        };
+        (&insns[prologue], reg, Opnd::Sgpr(0)) // mask patched after saved is bound
     } else {
-        &tail[0]
+        let int = match masked_identity(operation) {
+            Some(NeutralIdentity::Immediate(v)) => v,
+            _ => return Err("unexpected identity encoding"),
+        };
+        (&tail[0], Opnd::ConstInt(int), Opnd::Sgpr(0)) // mask patched after saved is bound
     };
     let width = match save.mnemonic.as_str() {
         "s_or_saveexec_b32" => 32,
@@ -84,25 +142,17 @@ pub(super) fn lower(insns: &mut [Insn], first: usize) -> Result<(u32, usize), &'
     let [Opnd::Vgpr(acc)] = block[1].dst[..] else {
         return Err("invalid accumulator");
     };
-    let neutral = if floating {
-        let identity = if operation == "v_min_f32" {
-            f32::INFINITY
-        } else {
-            f32::NEG_INFINITY
-        };
-        if tail[0].mnemonic != "v_mov_b32" || tail[0].src != [Opnd::Literal(identity.to_bits())] {
-            return Err("unexpected extrema identity");
-        }
-        let [reg @ Opnd::Vgpr(_)] = tail[0].dst[..] else {
-            return Err("invalid identity register");
-        };
-        reg
+    let expected_mask = if masked.is_some() {
+        expected_mask
     } else {
-        Opnd::ConstInt(identity.unwrap_or(0))
+        Opnd::Sgpr(saved)
     };
     if save.src != [Opnd::ConstInt(-1)]
         || block[1].mnemonic != "v_cndmask_b32"
-        || !matches!(block[1].src[..], [identity, Opnd::Vgpr(_), mask] if mask == masked.map_or(Opnd::Sgpr(saved), |(_, mask)| mask) && identity == neutral)
+        || block[1].src.len() != 3
+        || block[1].src[0] != neutral
+        || !matches!(block[1].src[1], Opnd::Vgpr(_))
+        || block[1].src[2] != expected_mask
     {
         return Err("invalid masked reduction input");
     }
@@ -190,6 +240,39 @@ pub(super) fn lower(insns: &mut [Insn], first: usize) -> Result<(u32, usize), &'
     Ok((width, start + last_read + 2))
 }
 
+// Restrict the proof to a small straight-line scalar slice. No lane reads,
+// EXEC/VCC values, memory operations or unrecognized definitions are admitted.
+// The caller checks all control-flow edges crossing this entire slice.
+fn uniform_scalar_chain(insns: &[Insn], end: usize, operand: Opnd) -> Option<usize> {
+    use std::collections::BTreeSet;
+    let Opnd::Sgpr(reg @ 0..=105) = operand else { return None };
+    let mut needed = BTreeSet::from([reg]);
+    for index in (end.saturating_sub(32)..end).rev() {
+        let ins = &insns[index];
+        if matches!(ins.mnemonic.as_str(), "s_nop" | "s_waitcnt") { continue; }
+        let [Opnd::Sgpr(dst @ 0..=105)] = ins.dst.as_slice() else { return None };
+        let ordinary = match (ins.enc, ins.mnemonic.as_str(), ins.src.len()) {
+            (Enc::Sop1, "s_mov_b32", 1) => true,
+            (Enc::Sop2, "s_add_u32" | "s_add_i32" | "s_sub_u32" | "s_sub_i32"
+                | "s_and_b32" | "s_or_b32" | "s_xor_b32"
+                | "s_lshl_b32" | "s_lshr_b32", 2) => true,
+            _ => false,
+        };
+        if !ordinary { return None; }
+        if needed.remove(dst) {
+            for source in &ins.src {
+                match source {
+                    Opnd::Sgpr(r @ 0..=105) => { needed.insert(*r); }
+                    Opnd::ConstInt(_) | Opnd::Literal(_) => (),
+                    _ => return None,
+                }
+            }
+        }
+        if needed.is_empty() { return Some(index); }
+    }
+    None
+}
+
 /// A forward SCC branch can skip a whole reduction without divergence when
 /// its comparison uses only immediates or the immediately preceding verified
 /// reduction's scalar result. Require the entire proof window to be free of
@@ -204,8 +287,25 @@ fn uniform_forward_guard(
     let branch = &insns[branch_index];
     let pc = branch.offset as i64;
     let target = pc + 4 + 4 * branch.aux.imm;
-    if !matches!(branch.op, 4 | 5) || target <= reduction_end as i64 {
+    if !matches!(branch.op, 2 | 4 | 5) || target <= reduction_end as i64 {
         return false;
+    }
+    if branch.op == 2 {
+        // Every invocation reaching an unconditional branch takes it. Prove
+        // that there is no bypass of the branch and no entry into the skipped
+        // interval, including a backward edge or an indirect branch.
+        return insns.iter().enumerate().all(|(i, op)| {
+            if i == branch_index { return true; }
+            if matches!(op.mnemonic.as_str(), "s_setpc_b64" | "s_swappc_b64" | "s_call_b64" | "s_rfe_b64" | "s_trap") {
+                return false;
+            }
+            if op.enc == Enc::Sopp && Emitter::branch_cond(op.op).is_some() {
+                let from = op.offset as i64;
+                let to = from + 4 + 4 * op.aux.imm;
+                return !(from.min(to) < target && from.max(to) > pc);
+            }
+            !(op.enc == Enc::Sopp && op.op == 1 && (op.offset as i64) < target)
+        });
     }
     let Some(compare_index) = branch_index.checked_sub(1) else { return false };
     let compare = &insns[compare_index];
@@ -236,11 +336,15 @@ fn uniform_forward_guard(
         match src {
             Opnd::ConstInt(_) | Opnd::Literal(_) => (),
             Opnd::Sgpr(_) => {
-                let Some(read) = previous_read else { return false };
-                if insns[read].dst.as_slice() != [*src] {
-                    return false;
+                if let Some(read) = previous_read.filter(|&read| insns[read].dst.as_slice() == [*src]) {
+                    proof_start = proof_start.min(insns[read].offset as i64);
+                } else {
+                    // A contiguous straight-line chain of ordinary scalar moves
+                    // and integer operations is uniform if all of its dependencies
+                    // are literals or previously established uniform definitions.
+                    let Some(first) = uniform_scalar_chain(insns, compare_index, *src) else { return false };
+                    proof_start = proof_start.min(insns[first].offset as i64);
                 }
-                proof_start = insns[read].offset as i64;
             }
             _ => return false,
         }
@@ -285,8 +389,8 @@ pub(super) fn check_control_flow(insns: &[Insn], width: u32) -> Result<(), Strin
         };
         let start = if let Some(neutral) = masked_identity(&ins.mnemonic) {
             masked_prologue(insns, first, neutral)
-                .ok_or("unrecognized masked DPP prologue")?
-                .0
+                .map(|(index, _, _)| index)
+                .unwrap_or(first - prologue_len)
         } else {
             first - prologue_len
         };
@@ -303,7 +407,8 @@ pub(super) fn check_control_flow(insns: &[Insn], width: u32) -> Result<(), Strin
             }
             if Emitter::branch_cond(branch.op).is_some() {
                 let target = pc + 4 + 4 * branch.aux.imm;
-                if ((pc < start && target > start) || (pc > end && target <= end))
+                if ((pc < start && target > start) || (pc > end && target <= end)
+                    || (pc >= start && pc <= end))
                     && !(pc < start && uniform_forward_guard(insns, branch_index, end as usize, &verified_reads))
                 {
                     return Err(format!(
@@ -515,6 +620,25 @@ mod tests {
     }
 
     #[test]
+    fn native_literal_scalar_guard_translates_and_unknown_source_refuses() {
+        for width in [32, 64] {
+            let (mut ex, mut words, cmp) = fixture::shader(width);
+            // s_mov_b32 s7, 1; the following comparison and branch are unchanged.
+            words.insert(cmp, 0xbe87_0381);
+            ex.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            ex.isa_data = ex.isa.clone();
+            let translated = super::super::translate(&ex).unwrap();
+            assert!(translated.hlsl.contains("s7 = 1u;") || translated.hlsl.contains("s7 = 0x1u;") || translated.hlsl.contains("s7 = 0x00000001u;"), "{}", translated.hlsl);
+            // s_mov_b32 s7, s8 (unknown input) must still be rejected.
+            words[cmp] = 0xbe87_0308;
+            ex.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            ex.isa_data = ex.isa.clone();
+            let reason = super::super::translate(&ex).err().unwrap();
+            assert!(reason.contains("divergent control flow"), "{reason}");
+        }
+    }
+
+    #[test]
     fn portable_wave64_requires_a_single_group_and_no_other_wave_operations() {
         let (mut ex, _, _) = fixture::shader(64);
         let mut insns = crate::rdna2::disassemble(&ex.isa);
@@ -558,6 +682,66 @@ mod tests {
             edge(&mut ops, 1, after - 1, 4);
             assert!(check_control_flow(&ops, width).is_err());
             edge(&mut ops, 1, after, 8); // EXEC is a per-invocation mask
+            assert!(check_control_flow(&ops, width).is_err());
+        }
+    }
+
+    #[test]
+    fn literal_scalar_definition_proves_forward_guard_only_without_bypass() {
+        for width in [32, 64] {
+            let mut ops = vec![nop(), insn("s_mov_b32", Enc::Sop1, 0,
+                vec![Opnd::Sgpr(9)], vec![Opnd::ConstInt(1)]),
+                compare(vec![Opnd::Sgpr(9), Opnd::ConstInt(0)]), branch(4)];
+            ops.extend(reduction(width, 7));
+            let after = ops.len();
+            ops.push(nop());
+            edge(&mut ops, 3, after, 4);
+            assert!(check_control_flow(&ops, width).is_ok());
+            edge(&mut ops, 0, 2, 8);
+            assert!(check_control_flow(&ops, width).is_err());
+            ops[0] = nop();
+            offsets(&mut ops);
+            ops[1].src[0] = Opnd::Sgpr(10);
+            assert!(check_control_flow(&ops, width).is_err());
+        }
+    }
+
+    #[test]
+    fn scalar_chain_guards_require_all_dependencies_and_no_bypass() {
+        for width in [32, 64] {
+            let mut ops = vec![nop(),
+                insn("s_mov_b32", Enc::Sop1, 0, vec![Opnd::Sgpr(9)], vec![Opnd::ConstInt(2)]),
+                insn("s_add_u32", Enc::Sop2, 0, vec![Opnd::Sgpr(10)], vec![Opnd::Sgpr(9), Opnd::ConstInt(1)]),
+                insn("s_mov_b32", Enc::Sop1, 0, vec![Opnd::Sgpr(11)], vec![Opnd::Sgpr(10)]),
+                compare(vec![Opnd::Sgpr(11), Opnd::Sgpr(9)]), branch(4)];
+            ops.extend(reduction(width, 7));
+            let after = ops.len();
+            ops.push(nop());
+            edge(&mut ops, 5, after, 4);
+            assert!(check_control_flow(&ops, width).is_ok());
+            edge(&mut ops, 0, 2, 8);
+            assert!(check_control_flow(&ops, width).is_err());
+            ops[0] = nop();
+            offsets(&mut ops);
+            ops[2].src[1] = Opnd::Sgpr(12);
+            assert!(check_control_flow(&ops, width).is_err());
+        }
+    }
+
+    #[test]
+    fn unconditional_bypass_must_skip_whole_collective_and_have_no_other_entry() {
+        for width in [32, 64] {
+            let mut ops = vec![nop(), branch(2)];
+            ops.extend(reduction(width, 7));
+            let after = ops.len();
+            ops.push(nop());
+            edge(&mut ops, 1, after, 2);
+            assert!(check_control_flow(&ops, width).is_ok());
+            edge(&mut ops, 0, 3, 8);
+            assert!(check_control_flow(&ops, width).is_err());
+            ops[0] = nop();
+            offsets(&mut ops);
+            edge(&mut ops, 1, after - 1, 2);
             assert!(check_control_flow(&ops, width).is_err());
         }
     }

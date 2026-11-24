@@ -7,10 +7,11 @@
 //! inside the compiler and died (ProjectScarlett stayed on a black screen).
 //!
 //! A cold NVIDIA disk cache then spends minutes inside that same call, turning
-//! DXIL into a GPU binary. Compute creation waits a bounded time and, if the
-//! driver is still compiling, returns so the title can boot. The compile keeps
-//! the device, root signature, and shader bytes and runs to completion, which
-//! is what writes the driver cache for the next launch.
+//! DXIL into a GPU binary. An untranslated compute shader waits a bounded time
+//! and, if the driver is still compiling, returns so the title can substitute
+//! a null pipeline. A translated shader waits for the real pipeline: a null
+//! stand-in has no descriptor-heap layout, and the title's dispatch is then
+//! dropped. The compile keeps the device, root signature, and shader bytes.
 
 /// Reserved, not committed: untouched pages cost only address space.
 const STACK_BYTES: usize = 64 << 20;

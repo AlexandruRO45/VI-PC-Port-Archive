@@ -37,9 +37,6 @@ pub(super) unsafe extern "system" fn clear_state(list: &List, pipeline: *mut c_v
     // or the next draw puts the old tables back.
     state.bindings = super::compute_bindings::Bindings::new(pipeline);
     state.stencil_slot = pipeline.and_then(|pipeline| pipeline.state.stencil_slot);
-    state.null_pipeline = pipeline.is_some_and(|pipeline| {
-        crate::diagnostics::display::is_null_pipeline(pipeline.native.as_raw())
-    });
     if let Some(targets) = &mut state.stencil_targets {
         targets.unbind();
     }

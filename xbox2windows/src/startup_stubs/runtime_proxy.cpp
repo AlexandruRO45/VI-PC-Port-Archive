@@ -6,17 +6,23 @@
 // so that the lookup of "QueryApiImpl" returns a wrapper. The wrapper hands out proxy objects whose
 // methods log their first calls ("x2w-runtime") and forward to the real object.
 //
-// X2W_FAKE_USER=1 additionally answers the user API for one local user (see fake_user below).
+// X2W_FAKE_USER=1 additionally answers the user API for one local user (see fake_user below)
+// and, while the proxy is on, XStoreCreateContext for that user (see area_call).
 #include "startup_stubs/api_trace.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/save_blob_pack.h"
 #include "startup_stubs/save_store.h"
+#include "startup_stubs/storage_root.h"
+#include "startup_stubs/storage_root_utf8.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <intrin.h>
+#include <new>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 using u64 = std::uint64_t;
@@ -44,6 +50,9 @@ QueryApi real_query;
 constexpr unsigned long user_provider_data1 = 0x01acd177;
 constexpr u64 local_user_handle = 0x58325755'00000001ull;  // not a pointer the runtime knows
 constexpr u64 local_user_id = 0x0009000012345678ull;
+// XStoreImpl. Method 3 is XStoreCreateContext; the handle below is the offline context it writes.
+constexpr GUID store_provider_id{0x0dd112ac, 0x7c24, 0x448c, {0xb9, 0x2b, 0x39, 0x60, 0xfb, 0x5b, 0xd3, 0x0c}};
+constexpr u64 store_context_handle = 0x58325753'00000001ull;  // not a pointer the runtime knows
 bool fake_user() noexcept { return x2w_local::env_on("X2W_FAKE_USER"); }
 int user_provider = -1, save_provider = -1;
 // The user provider also hands out a second interface (iid cef4fac0...) whose slot 3 is
@@ -65,7 +74,7 @@ bool tracked(u64 value)
 }
 bool user_call(int slot, u64* args, u64* result);
 bool save_call(int slot, u64* args, u64* result);
-bool area_call(unsigned long provider, int slot, u64* args, u64* result);
+bool area_call(const GUID& provider_id, int slot, u64* args, u64* result);
 u64 complete_async(u64 async_block);
 void* storage_object();
 const char* storage_path();
@@ -142,7 +151,17 @@ __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s
         }
     }
     if (!handled && self->provider == save_provider && N >= 3 && fake_user()) handled = save_call(N, args, &result);
-    if (!handled && N >= 3 && fake_user()) handled = area_call(provider_ids[self->provider].Data1, N, args, &result);
+    if (!handled && N >= 3 && fake_user()) handled = area_call(provider_ids[self->provider], N, args, &result);
+    if (!handled && N >= 3 && fake_user()) {
+        // The offline context is our token, never a desktop runtime object. Unimplemented
+        // methods must fail here rather than let the real runtime dereference it.
+        for (int i = 0; i < 4 && !handled; ++i) {
+            if (args[i] == store_context_handle) {
+                handled = true;
+                result = 0x80004005;
+            }
+        }
+    }
     if (!handled && self->provider != user_provider && N >= 3 && fake_user()) {
         // Other API families cannot resolve the local user's handle: fail the call instead of passing it on.
         for (int i = 0; i < 4 && !handled; ++i) {
@@ -360,11 +379,11 @@ bool user_call(int slot, u64* args, u64* result)
 // ---- local game saves -----------------------------------------------------------------------
 // Slot numbers follow the order of the public XGameSave.h (hypothesis, checked against the logged
 // argument shapes). Containers and blob writes are kept on disk (save_store.h, below
-// storage_path()/x2w-gamesave); enumerations and reads still report nothing and the calls whose
-// argument layout is not known are accepted and dropped. Asynchronous calls are completed by starting the real
-// "add default user silently" operation on the caller's async block: it fails quickly inside the
-// runtime and runs the caller's completion callback on its task queue; the matching Result call is
-// then answered here.
+// storage_path()/x2w-gamesave). Enumerations still report nothing, and the synchronous read (20)
+// still reports no blob. Slots 21 and 22 read through the system XAsync service (see async_read).
+// The other asynchronous calls are completed by starting the real "add default user silently"
+// operation on the caller's async block: it fails quickly inside the runtime and runs the caller's
+// completion callback on its task queue; the matching Result call is then answered here.
 constexpr u64 save_provider_handle = 0x58325753'00000001ull, save_container_handle = 0x58325743'00000001ull,
               save_update_handle = 0x58325755'50000001ull;
 // Container and update handles keep their fixed base; the low bits count from 1 and index these tables.
@@ -471,6 +490,187 @@ u64 async_submit(int slot, u64 update, u64 block)
     reinterpret_cast<Complete>(methods[10])(service, async, status, 0);
     return S_OK;
 }
+
+// XGameSaveReadBlobDataAsync / Result. Same XAsync service as submit, different identity, so a
+// read block is not a submit block. Begin is attempted before any read: a rejection leaves the
+// store untouched. The snapshot is packed only after acceptance. Complete can run the caller's
+// callback before it returns, so no save lock is held across it. A failed read completes with no
+// payload (the runtime then drops the context); the bytes are copied into the caller's buffer only
+// when slot 22 asks, and only if that buffer is large enough.
+constexpr char read_identity[] = "local XGameSaveReadBlobData";
+constexpr u64 small_buffer = 0x80830007;
+struct AsyncProviderData {
+    void* async;
+    std::size_t buffer_size;
+    void* buffer;
+    void* context;
+};
+static_assert(sizeof(AsyncProviderData) == 32 && offsetof(AsyncProviderData, context) == 24, "XAsyncProviderData");
+struct ReadAsync {
+    void* block = nullptr;
+    std::uint32_t count = 0;
+    std::size_t bytes = 0;
+    std::vector<x2w_save_pack::Piece> pieces;
+};
+struct ReadRecord { void* block; std::uint32_t count; std::size_t bytes; };
+std::vector<ReadRecord> read_records;  // accepted reads whose payload is still outstanding
+SRWLOCK read_records_lock = SRWLOCK_INIT;
+void remember_read(const ReadAsync& state)
+{
+    AcquireSRWLockExclusive(&read_records_lock);
+    struct Unlock { ~Unlock() { ReleaseSRWLockExclusive(&read_records_lock); } } unlock;
+    read_records.push_back({state.block, state.count, state.bytes});
+}
+void forget_read(void* block)
+{
+    AcquireSRWLockExclusive(&read_records_lock);
+    struct Unlock { ~Unlock() { ReleaseSRWLockExclusive(&read_records_lock); } } unlock;
+    for (std::size_t i = 0; i < read_records.size(); ++i)
+        if (read_records[i].block == block) {
+            read_records.erase(read_records.begin() + static_cast<std::ptrdiff_t>(i));
+            break;
+        }
+}
+bool pending_read(void* block, std::uint32_t& count, std::size_t& bytes)
+{
+    AcquireSRWLockShared(&read_records_lock);
+    struct Unlock { ~Unlock() { ReleaseSRWLockShared(&read_records_lock); } } unlock;
+    for (const ReadRecord& record : read_records)
+        if (record.block == block) {
+            count = record.count;
+            bytes = record.bytes;
+            return true;
+        }
+    return false;
+}
+HRESULT WINAPI read_provider(unsigned op, const void* raw)
+{
+    if (op == 0) return S_OK;  // Begin: the read runs after XAsyncBegin accepts the block
+    if (!raw) return S_OK;
+    const auto* data = static_cast<const AsyncProviderData*>(raw);
+    auto* state = static_cast<ReadAsync*>(data->context);
+    if (op == 2 && state && data->buffer && state->bytes <= data->buffer_size)
+        x2w_save_pack::write(state->pieces, data->buffer);  // GetResult
+    if (op == 4 && state) {  // Cleanup, including the runtime's cleanup of a failed read
+        forget_read(state->block);
+        delete state;
+    }
+    return S_OK;
+}
+// Names and bytes of one accepted read. The save lock is not held on return.
+u64 snapshot_read(ReadAsync& state, u64 container, u64 names_pointer, std::uint32_t count)
+{
+    std::string container_name;
+    {
+        AcquireSRWLockShared(&save_lock);
+        struct Unlock { ~Unlock() { ReleaseSRWLockShared(&save_lock); } } unlock;
+        if (container >= save_container_handle && container - save_container_handle < max_save_handles)
+            container_name = save_table.container_name(static_cast<std::size_t>(container - save_container_handle));
+    }
+    if (container_name.empty()) return e_invalidarg;
+    if (count > SIZE_MAX / sizeof(const char*)) return e_invalidarg;
+    if (count && x2w_local::probe_readable(static_cast<std::uintptr_t>(names_pointer), sizeof(const char*) * count) != sizeof(const char*) * count)
+        return e_invalidarg;
+    const auto* names = reinterpret_cast<const char* const*>(names_pointer);
+    std::vector<std::string> wanted;
+    wanted.reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        std::string name;
+        if (!names[i] || !read_save_name(reinterpret_cast<u64>(names[i]), name) || !x2w_save::valid_name(name))
+            return e_invalidarg;
+        wanted.push_back(std::move(name));
+    }
+    std::vector<std::vector<unsigned char>> data;
+    const x2w_save::Status status = save_store().read_blobs(container_name, wanted, data);
+    if (status != x2w_save::Status::ok) return save_status(status);
+    if (data.size() != wanted.size() || data.size() > 0xffffffffu) return e_fail;
+    state.pieces.resize(data.size());
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        state.pieces[i].name = std::move(wanted[i]);
+        state.pieces[i].bytes = std::move(data[i]);
+    }
+    state.count = static_cast<std::uint32_t>(state.pieces.size());
+    if (!x2w_save_pack::bytes_needed(state.pieces, state.bytes)) return e_fail;
+    return 0;
+}
+u64 async_read(int slot, u64 container, u64 names, u64 count_or_size, u64 block_or_buffer, u64 count_pointer)
+{
+    if (!real_query) return e_fail;
+    void* service = nullptr;
+    const auto query = real_query(&submit_async_family, &submit_async_family, &service);
+    if (FAILED(query)) return static_cast<unsigned>(query);
+    if (!service) return e_fail;
+    auto** methods = *static_cast<void***>(service);
+    struct ApiRef {
+        void* object;
+        ULONG (WINAPI* release)(void*);
+        ~ApiRef() { release(object); }
+    } api{service, reinterpret_cast<ULONG (WINAPI*)(void*)>(methods[2])};
+    if (slot == 22) {
+        auto* async = reinterpret_cast<void*>(container);  // XGameSaveReadBlobDataResult(async, size, data, &count)
+        if (!async) return e_fail;
+        const auto out = [](u64 pointer, std::size_t bytes) {
+            return pointer && x2w_local::writable(reinterpret_cast<void*>(pointer), bytes);
+        };
+        std::uint32_t count = 0;
+        std::size_t bytes = 0;
+        if (pending_read(async, count, bytes)) {
+            // A short or unusable buffer must not consume the result or change the caller's memory.
+            if (count_or_size < bytes) return small_buffer;
+            if (!out(count_pointer, sizeof(std::uint32_t)) || !out(block_or_buffer, bytes) ||
+                block_or_buffer % alignof(x2w_save_pack::Blob)) return e_invalidarg;
+            using Result = HRESULT(WINAPI*)(void*, void*, const void*, size_t, void*, size_t*);
+            const auto hr = reinterpret_cast<Result>(methods[11])(
+                service, async, read_identity, static_cast<std::size_t>(count_or_size),
+                reinterpret_cast<void*>(block_or_buffer), nullptr);
+            if (FAILED(hr)) return static_cast<unsigned>(hr);
+            *reinterpret_cast<std::uint32_t*>(count_pointer) = count;
+            return 0;
+        }
+        // No payload was kept: a missing blob or other failure, or a read of no blobs. The caller's
+        // buffer is not passed through, so a failure cannot change it. A success with no blobs
+        // reports a count of zero.
+        using Result = HRESULT(WINAPI*)(void*, void*, const void*, size_t, void*, size_t*);
+        const auto hr = reinterpret_cast<Result>(methods[11])(service, async, read_identity, 0, nullptr, nullptr);
+        if (FAILED(hr)) return static_cast<unsigned>(hr);
+        if (!out(count_pointer, sizeof(std::uint32_t))) return e_invalidarg;
+        *reinterpret_cast<std::uint32_t*>(count_pointer) = 0;
+        return 0;
+    }
+    auto* async = reinterpret_cast<void*>(block_or_buffer);
+    if (!async) return e_fail;
+    ReadAsync* state;
+    try {
+        state = new ReadAsync;
+    } catch (const std::bad_alloc&) {
+        return e_outofmemory;
+    }
+    using Begin = HRESULT(WINAPI*)(void*, void*, void*, const void*, const char*, decltype(&read_provider));
+    const auto begun = reinterpret_cast<Begin>(methods[7])(service, async, state, read_identity, read_identity, read_provider);
+    if (FAILED(begun)) {
+        delete state;  // rejection: the runtime has not taken the context, and nothing was read
+        return static_cast<unsigned>(begun);
+    }
+    using Complete = void(WINAPI*)(void*, void*, HRESULT, size_t);
+    const auto complete = reinterpret_cast<Complete>(methods[10]);
+    try {
+        state->block = async;
+        const u64 status = snapshot_read(*state, container, names, static_cast<std::uint32_t>(count_or_size));
+        if (status) {
+            complete(service, async, static_cast<HRESULT>(status), 0);  // no payload; context is released by Cleanup
+            return S_OK;
+        }
+        if (state->bytes) remember_read(*state);
+        complete(service, async, S_OK, state->bytes);
+        return S_OK;
+    } catch (const std::bad_alloc&) {
+        complete(service, async, static_cast<HRESULT>(e_outofmemory), 0);
+        return S_OK;
+    } catch (const std::filesystem::filesystem_error&) {
+        complete(service, async, static_cast<HRESULT>(e_fail), 0);
+        return S_OK;
+    }
+}
 u64 complete_async(u64 async_block)
 {
     Proxy* user = user_provider >= 0 ? proxies[user_provider] : nullptr;
@@ -540,10 +740,10 @@ bool save_call(int slot, u64* args, u64* result)
         *result = blob_not_found;
         return true;
     case 21:  // XGameSaveReadBlobDataAsync(container, names, count, async)
-        *result = complete_async(args[3]);
+        *result = async_read(slot, args[0], args[1], args[2], args[3], 0);
         return true;
     case 22:  // XGameSaveReadBlobDataResult(async, size, data, &count)
-        *result = blob_not_found;
+        *result = async_read(slot, args[0], 0, args[1], args[2], args[3]);
         return true;
     case 23: {  // XGameSaveCreateUpdate(container, display name, &update)
         u64 handle = 0;
@@ -610,8 +810,9 @@ unsigned env_number(const char* name, unsigned fallback, int base)
     char text[32]{};
     return GetEnvironmentVariableA(name, text, sizeof(text)) ? static_cast<unsigned>(std::strtoul(text, nullptr, base)) : fallback;
 }
-bool area_call(unsigned long provider, int slot, u64* args, u64* result)
+bool area_call(const GUID& provider_id, int slot, u64* args, u64* result)
 {
+    const unsigned long provider = provider_id.Data1;
     const auto out = [](u64 pointer, std::size_t bytes) { return pointer && x2w_local::writable(reinterpret_cast<void*>(pointer), bytes); };
     if (provider == 0x973a344e && slot == 3) {  // title id (a 32-bit value from the title's manifest: X2W_TITLE_ID, hex)
         const unsigned id = env_number("X2W_TITLE_ID", 0, 16);
@@ -697,16 +898,103 @@ bool area_call(unsigned long provider, int slot, u64* args, u64* result)
         *result = 0;
         return true;
     }
+    if (slot == 3 && IsEqualGUID(provider_id, store_provider_id)) {
+        // XStoreCreateContext(user, &context). Vtable slot 3 of XStoreImpl
+        // (0dd112ac-7c24-448c-b92b-3960fb5bd30c): QueryInterface, AddRef, Release, then this.
+        // The public GDK takes the console user and writes an XStoreContextHandle. The VIctory
+        // runtime notes (github.com/Marvisak/VIctory, facts only) answer it offline by writing one
+        // context and returning success; catalog, licence and purchase methods stay unanswered.
+        // Only the local user is answered. A different user is refused and the output is left
+        // unchanged. A buffer that cannot be written is E_INVALIDARG.
+        if (args[0] != local_user_handle) {
+            *result = 0x80004005;
+            return true;
+        }
+        if (!out(args[1], 8)) {
+            *result = 0x80070057;
+            return true;
+        }
+        *reinterpret_cast<u64*>(args[1]) = store_context_handle;
+        *result = 0;
+        return true;
+    }
     return false;
+}
+
+// Source-built check (tests/startup_stub_consumer.cpp). Both switches are required, as they are
+// for a title: the proxy is installed only for X2W_RUNTIME_PROXY, and this answer only for the
+// fake user. Returns 0 when the local user receives the context, a mutated provider still
+// fails with E_FAIL without writing, and a non-local user is refused the same way.
+int store_method3_check()
+{
+    if (!x2w_local::env_on("X2W_RUNTIME_PROXY") || !fake_user()) return 2;
+    if (provider_count >= max_providers) return 3;
+    const int index = provider_count++;
+    provider_ids[index] = store_provider_id;
+    Proxy proxy{nullptr, nullptr, index};
+
+    u64 context = 0;
+    const u64 answered = forward<3>(&proxy, local_user_handle, reinterpret_cast<u64>(&context), 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    if (answered != 0 || context != store_context_handle) return 4;
+
+    u64 untouched = 0x1111111111111111ull;
+    provider_ids[index].Data4[7] ^= 1;  // same first word, different provider
+    const u64 refused = forward<3>(&proxy, local_user_handle, reinterpret_cast<u64>(&untouched), 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    if (refused != 0x80004005 || untouched != 0x1111111111111111ull) return 5;
+    provider_ids[index] = store_provider_id;
+
+    u64 foreign_out = 0x1111111111111111ull;
+    const u64 foreign_user = local_user_handle ^ 1ull;
+    const u64 foreign = forward<3>(&proxy, foreign_user, reinterpret_cast<u64>(&foreign_out), 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    if (foreign != 0x80004005 || foreign_out != 0x1111111111111111ull) return 7;
+
+    const u64 missing = forward<3>(&proxy, local_user_handle, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    if (missing != 0x80070057) return 6;
+
+    const auto desktop = +[](void*, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 {
+        return 0x1234;
+    };
+    void* methods[5] = {};
+    methods[4] = reinterpret_cast<void*>(desktop);
+    void** real = methods;
+    proxy.real = &real;
+    for (int position = 0; position < 4; ++position) {
+        u64 arguments[4] = {};
+        arguments[position] = context;
+        const u64 blocked = forward<4>(&proxy, arguments[0], arguments[1], arguments[2], arguments[3], 0, 0, 0, 0, 0, 0, 0);
+        if (blocked != 0x80004005) return 8;
+    }
+    // A foreign value still reaches the desktop implementation: the guard is token-specific.
+    if (forward<4>(&proxy, context ^ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) != 0x1234) return 9;
+
+    std::printf("store context %016llx\n", static_cast<unsigned long long>(context));
+    std::printf("store refused %08llx\n", static_cast<unsigned long long>(refused & 0xffffffffu));
+    std::printf("store user refused %08llx\n", static_cast<unsigned long long>(foreign & 0xffffffffu));
+    return 0;
 }
 
 // Persistent local storage: the root of a drive (X2W_STORAGE_PATH, e.g. "S:\\", mapped by the run
 // script onto a folder outside the game) with the quota from the manifest (X2W_STORAGE_MB).
 struct StorageObject { void* const* vtable; };
+// The value is read once. It gets a trailing separator when it has none (storage_root.h). A value
+// that does not fit is refused with a log line and the default is used: handing the executable a
+// cut-off or empty root would send its files somewhere else without a word.
 const char* storage_path()
 {
-    static char path[64];
-    if (!path[0] && !GetEnvironmentVariableA("X2W_STORAGE_PATH", path, sizeof(path))) std::strcpy(path, "S:\\");
+    static char path[x2w_startup::storage_root_capacity];
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
+        wchar_t value[x2w_startup::storage_root_capacity + 1];
+        const DWORD capacity = static_cast<DWORD>(sizeof(value) / sizeof(*value));
+        const DWORD length = GetEnvironmentVariableW(L"X2W_STORAGE_PATH", value, capacity);
+        if (length >= capacity)
+            x2w_local::logf("x2w-runtime X2W_STORAGE_PATH has %lu characters, more than the %zu supported: using S:\\",
+                            static_cast<unsigned long>(length - 1), x2w_startup::storage_root_capacity - 2);
+        else if (length && !x2w_startup::storage_root_utf8(value, path))
+            x2w_local::logf("x2w-runtime X2W_STORAGE_PATH is invalid UTF-16 or does not fit as UTF-8 with its trailing separator: using S:\\");
+        if (!path[0]) std::strcpy(path, "S:\\");
+        return TRUE;
+    }, nullptr, nullptr);
     return path;
 }
 HRESULT __stdcall storage_query(StorageObject* self, const GUID*, void** out) { if (out) *out = self; return S_OK; }
@@ -749,6 +1037,8 @@ void* storage_object()
     return &object;
 }
 }  // namespace
+
+int x2w_store_method3_check() { return store_method3_check(); }
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void*)
 {

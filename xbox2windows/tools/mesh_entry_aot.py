@@ -641,8 +641,41 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
     return "\n".join(lines) + "\n"
 
 
+STAGE_NAMES = {
+    0: "pixel",
+    1: "vertex",
+    2: "geometry",
+    3: "hull",
+    4: "domain",
+    5: "compute",
+    6: "library",
+    13: "mesh",
+    14: "amplification",
+}
+
+
+def require_mesh_stage(chunks):
+    """Reject any other stage by name before the mesh profile checks."""
+    psv = chunks[b"PSV0"]
+    program = chunks[b"DXIL"]
+    kind = struct.unpack_from("<H", program, 2)[0] if len(program) >= 4 else None
+    for stage in (psv[28] if len(psv) > 28 else None, kind):
+        if stage == 13:
+            continue
+        if stage == 14:
+            raise ValueError(
+                "Unsupported amplification stage: only the bounded mesh stage is translated"
+            )
+        if stage is not None:
+            name = STAGE_NAMES.get(stage, f"stage {stage}")
+            raise ValueError(
+                f"Unsupported {name} stage: only the bounded mesh stage is translated"
+            )
+
+
 def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
     chunks = parts(blob)
+    require_mesh_stage(chunks)
     p = chunks[b"PSV0"]
     if (
         len(p) < 52

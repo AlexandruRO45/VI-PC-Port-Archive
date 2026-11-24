@@ -287,6 +287,8 @@ pub(crate) fn watch(kind: &str, start: u64, len: u64, detail: impl FnOnce() -> S
 
 /// With `TUXBOX_TRACE_PRESENT`, count GPU writes aimed at display resources
 /// (created with ALLOW_DISPLAY) so a black presented image can be attributed.
+pub(crate) mod null_usage;
+
 pub(crate) mod display {
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -366,7 +368,7 @@ pub(crate) mod display {
 
     static RESOURCES: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(Default::default);
     static RTVS: LazyLock<Mutex<HashMap<usize, bool>>> = LazyLock::new(Default::default);
-    static NULL_PIPELINES: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(Default::default);
+    static NULL_USAGE: LazyLock<Mutex<super::null_usage::Usage>> = LazyLock::new(Default::default);
     // draws, null-pipeline draws, clears, copies, all draws, RTV binds
     static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
@@ -388,27 +390,40 @@ pub(crate) mod display {
         if any { COUNTS[5].fetch_add(1, Ordering::Relaxed); }
         any
     }
-    pub(crate) fn mark_null_pipeline(native: *mut core::ffi::c_void) {
-        if enabled() { NULL_PIPELINES.lock().unwrap_or_else(|e| e.into_inner()).insert(native as usize); }
-    }
-    static NULL_COMPUTE: LazyLock<Mutex<HashMap<usize, String>>> = LazyLock::new(Default::default);
-    static NULL_DISPATCHES: LazyLock<Mutex<HashSet<(usize, [u32; 3])>>> = LazyLock::new(Default::default);
-    /// Remember which untranslated compute shader a null pipeline stands in for.
-    pub(crate) fn mark_null_compute(native: *mut core::ffi::c_void, digest: String) {
+    pub(crate) fn record_null(tag: &std::sync::Arc<super::null_usage::Tag>, display: bool) {
         if !enabled() { return; }
-        NULL_COMPUTE.lock().unwrap_or_else(|e| e.into_inner()).insert(native as usize, digest);
-    }
-    /// Report each distinct (null compute shader, group count) dispatch once.
-    pub(crate) fn null_dispatch(native: *mut core::ffi::c_void, groups: [u32; 3]) {
-        if !enabled() { return; }
-        let Some(digest) = NULL_COMPUTE.lock().unwrap_or_else(|e| e.into_inner()).get(&(native as usize)).cloned() else { return };
-        let mut seen = NULL_DISPATCHES.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.len() < 120 && seen.insert((native as usize, groups)) {
-            super::log_once(&std::sync::Once::new(), || format!("null compute dispatch CS={digest} groups=({},{},{})", groups[0], groups[1], groups[2]));
+        let rows = {
+            let mut usage = NULL_USAGE.lock().unwrap_or_else(|e| e.into_inner());
+            usage.record(tag, display).then(|| usage.drain())
+        };
+        if let Some(rows) = rows {
+            log_null_usage(rows, "recording_checkpoint");
         }
     }
-    pub(crate) fn is_null_pipeline(native: *mut core::ffi::c_void) -> bool {
-        enabled() && NULL_PIPELINES.lock().unwrap_or_else(|e| e.into_inner()).contains(&(native as usize))
+    // Retain the previous direct-dispatch shape samples, but deduplicate
+    // by shader identity instead of a potentially recycled native pointer.
+    pub(crate) fn sample_null_dispatch(tag: &std::sync::Arc<super::null_usage::Tag>, groups: [u32; 3]) {
+        if !enabled() || tag.kind != "compute" { return; }
+        type Sample = (std::sync::Arc<super::null_usage::Tag>, [u32; 3]);
+        static SEEN: LazyLock<Mutex<HashSet<Sample>>> = LazyLock::new(Default::default);
+        let report = {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            seen.len() < 120 && seen.insert((tag.clone(), groups))
+        };
+        if report {
+            super::log_once(&std::sync::Once::new(), || format!(
+                "null compute dispatch {} groups=({},{},{})", tag.stages, groups[0], groups[1], groups[2]));
+        }
+    }
+    pub(crate) fn report_null_usage() {
+        if !enabled() { return; }
+        let rows = NULL_USAGE.lock().unwrap_or_else(|e| e.into_inner()).drain();
+        log_null_usage(rows, "present_sample");
+    }
+    fn log_null_usage(rows: Vec<String>, trigger: &'static str) {
+        for row in rows {
+            super::log_once(&std::sync::Once::new(), || format!("{row} trigger={trigger}"));
+        }
     }
     pub(crate) fn draw(display_bound: bool, null_pipeline: bool) {
         if !enabled() { return; }

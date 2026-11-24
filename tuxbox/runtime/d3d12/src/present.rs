@@ -412,6 +412,7 @@ pub(crate) mod sampler {
             if name == "present" {
                 let summary = crate::diagnostics::display::summary();
                 crate::diagnostics::log_once(&std::sync::Once::new(), || summary);
+                crate::diagnostics::display::report_null_usage();
             }
         }
     }

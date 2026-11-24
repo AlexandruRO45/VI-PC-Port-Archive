@@ -26,6 +26,7 @@ pub(crate) mod descriptor_paging;
 mod dxgi;
 mod features;
 pub(crate) mod format;
+mod reserved;
 pub(crate) mod frame_events;
 mod fence;
 mod graphics;
@@ -385,6 +386,13 @@ pub(crate) unsafe fn resource_proxy<'a>(
     device: *mut c_void,
 ) -> Option<&'a Resource> {
     unsafe { unwrap(object, device, &RESOURCE) }
+}
+
+pub(crate) unsafe fn memory_heap<'a>(
+    object: *mut c_void,
+    device: *mut c_void,
+) -> Option<&'a ID3D12Heap> {
+    unsafe { heap::memory_heap(object, device) }
 }
 
 /// Borrows a native fence under the same ownership contract as [`resource`].
@@ -923,10 +931,14 @@ static DEVICE: Slots<160> = {
     slots[27] = crate::slot!(traced::committed::<false>);
     slots[28] = crate::slot!(heap::create);
     slots[29] = crate::slot!(traced::place);
+    slots[30] = crate::slot!(traced::reserved);
+    slots[34] = crate::slot!(reserved::make_resident);
+    slots[35] = crate::slot!(reserved::evict);
     slots[36] = crate::slot!(create_fence);
     slots[38] = crate::slot!(allocation::footprints);
     slots[39] = crate::slot!(queries::create_heap);
     slots[41] = crate::slot!(indirect::create_signature);
+    slots[42] = crate::slot!(reserved::tiling);
     slots[43] = crate::slot!(adapter_luid);
     slots[44] = crate::slot!(traced::place_virtual);
     slots[48] = crate::slot!(create_queue_x);
@@ -1054,6 +1066,13 @@ mod traced {
         initial: D3D12_RESOURCE_STATES, clear: *const D3D12_CLEAR_VALUE, iid: *const GUID, out: Out,
     ) -> HRESULT {
         report(29, unsafe { heap::place(device, heap, offset, desc, initial, clear, iid, out) }, initial.0, desc)
+    }
+
+    pub(super) unsafe extern "system" fn reserved(
+        device: &Device, desc: *const D3D12_RESOURCE_DESC, initial: D3D12_RESOURCE_STATES,
+        clear: *const D3D12_CLEAR_VALUE, iid: *const GUID, out: Out,
+    ) -> HRESULT {
+        report(30, unsafe { super::reserved::create(device, desc, initial, clear, iid, out) }, initial.0, desc)
     }
 
     pub(super) unsafe extern "system" fn place_virtual(

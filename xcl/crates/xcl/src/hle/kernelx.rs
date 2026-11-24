@@ -69,6 +69,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         UnregisterAppConstrainedChangeNotification,
         // threads / system
         SetUnhandledExceptionFilter,
+        Sleep,
         SetThreadName,
         GetThreadName,
         SetThreadpoolAffinityMask,
@@ -925,16 +926,18 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
 
 /// A page's data went from `home` to another address: a home in a sparse window is
 /// decommitted at the end of the call or every 256 MB (`give_back_homes`; its GPU tiles go too: the GPU does
-/// not see the page while it is away).
-unsafe fn move_home_away(away: &mut Away, home: usize) {
+/// not see the page while it is away). True if homes were given back now.
+unsafe fn move_home_away(away: &mut Away, home: usize) -> bool {
     if lazy_home(home) {
         away.gone.push(home);
         // (256 MB at a time: a call that maps gigabytes would otherwise hold them twice until
         // it ends)
         if away.gone.len() >= 4096 {
             give_back_homes(away);
+            return true;
         }
     }
+    false
 }
 
 /// The homes `move_home_away` collected, decommitted in runs of neighbouring pages.
@@ -1007,6 +1010,25 @@ fn committed_range(a: usize, len: usize) -> bool {
 }
 
 fn committed_page(a: usize) -> bool {
+    committed_page_in(a, &mut StateRun::default())
+}
+
+/// The run of pages around an address that one VirtualQuery found in one state. `map_pages`
+/// asks about the pages of a range one after the other and nothing it does in between (a page
+/// left lazy) changes that state: a run answers them without asking again (VirtualQuery walks
+/// the run to its end, and under Wine 98,304 fresh pages took 13 s).
+#[derive(Default)]
+struct StateRun {
+    start: usize,
+    end: usize,
+    committed: bool,
+}
+
+/// `committed_page`, remembering in `run` the state of the pages around `a`.
+fn committed_page_in(a: usize, run: &mut StateRun) -> bool {
+    if (run.start..run.end).contains(&a) {
+        return run.committed;
+    }
     // A page in the working set is committed: asking for that is one entry, where VirtualQuery
     // walks the page table to the end of the committed range the page is in (gigabytes of
     // homes: 0.25 ms a page, and a scatter of pages from their homes grew with its square).
@@ -1016,18 +1038,32 @@ fn committed_page(a: usize) -> bool {
     {
         return true;
     }
+    #[cfg(test)]
+    VIRTUAL_QUERIES.with(|n| n.set(n.get() + 1));
     let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    unsafe { mem::VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 && m.State == mem::MEM_COMMIT }
+    if unsafe { mem::VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+        return false;
+    }
+    let start = m.BaseAddress as usize;
+    *run = StateRun { start, end: start + m.RegionSize, committed: m.State == mem::MEM_COMMIT };
+    run.committed
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The VirtualQuery calls `committed_page_in` made on this thread.
+    static VIRTUAL_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Copy what is mapped at `at` back home and unmap it (Windows memory is decommitted); the homes
-/// in `committed` the caller has committed.
-unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usize>) {
+/// in `committed` the caller has committed. True if memory was committed or decommitted (a page
+/// never used, or none mapped at `at`, leaves it as it was).
+unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usize>) -> bool {
     if let Some(page) = away.at.remove(&at) {
         away.page.remove(&page);
         // never used where it was mapped: its home still holds the page (zeros)
         if lazy::unmark(at) {
-            return;
+            return false;
         }
         // (a home this call has not given back yet is still committed)
         let own = page_home(page);
@@ -1043,6 +1079,9 @@ unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usi
         if !committed.contains(&at) {
             release_at(at);
         }
+        true
+    } else {
+        false
     }
 }
 
@@ -1208,15 +1247,29 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         return std::ptr::null_mut();
     }
     let in_uma = |a: usize| crate::gpu::uma::get().is_some_and(|u| u.is_committed(a));
+    // the state of the addresses and homes asked about: dropped when `unmap_away` commits or
+    // decommits and when `move_home_away` gives homes back. The rest of a step changes only an
+    // address, or a home not asked about again (the addresses rise; a page mapped twice is
+    // unmapped first) – bar an address that is another page's home (a home in plain memory):
+    // that answer was wrong before the runs too.
+    let (mut at_run, mut home_run) = (StateRun::default(), StateRun::default());
     for (i, &p) in pages.iter().enumerate() {
         let at = base + i * PHYS_PAGE;
-        unmap_away(away, at, &(0..0));
+        if unmap_away(away, at, &(0..0)) {
+            (at_run, home_run) = Default::default();
+        }
         if p == 0 {
             continue;
         }
         if let Some(&old) = away.page.get(&p) {
+            // (a move commits `at` and decommits `old`, which may lie in a run already answered:
+            // both runs go – #556)
             match move_away(away, old, at, p, in_uma(at)) {
-                Ok(true) => continue,
+                Ok(true) => {
+                    (at_run, home_run) = Default::default();
+                    continue;
+                }
+                // a lazy page is only unmarked: memory is as it was, the runs stay
                 Ok(false) => {}
                 Err(()) => {
                     fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
@@ -1224,12 +1277,12 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
                 }
             }
         }
-        let fresh = !in_uma(at) && !committed_page(at);
+        let fresh = !in_uma(at) && !committed_page_in(at, &mut at_run);
         let home = page_home(p).unwrap();
         // a page never used (its home not committed) at the title's own reserved address space:
         // committed on first use (`lazy`) – GPU-owned targets placed there are never touched
         let plain = crate::gpu::uma::get().is_none_or(|u| !u.contains(at));
-        if fresh && plain && !committed_page(home) {
+        if fresh && plain && !committed_page_in(home, &mut home_run) {
             lazy::mark(at);
             away.at.insert(at, p);
             away.page.insert(p, at);
@@ -1241,7 +1294,9 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         }
         if committed_page(home) {
             std::ptr::copy_nonoverlapping(home as *const u8, at as *mut u8, PHYS_PAGE);
-            move_home_away(away, home);
+            if move_home_away(away, home) {
+                (at_run, home_run) = Default::default();
+            }
         } else if !fresh {
             std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE); // a page never used: zeros
         }
@@ -1323,6 +1378,56 @@ fn hresult_to_win32(hr: i32) -> u32 {
         hr as u32 & 0xFFFF
     } else {
         fnd::ERROR_INVALID_PARAMETER
+    }
+}
+
+/// a sleep is taken in steps of at most this, so that time held from then on is not counted
+const SLEEP_STEP_MS: u32 = 20;
+/// how often a sleep looks whether the title is still held
+const SLEEP_HELD_POLL_MS: u32 = 5;
+/// the shortest sleep that is a wait for time: a shorter one is a poll and is passed on as it is
+const SLEEP_HOLD_MIN_MS: u32 = 100;
+
+/// Sleep(ms): `ms` of the title's time. The time XCL holds one of the title's threads in a bind
+/// for a pipeline still being built (`pso_async::title_held`) is not the title's: a console
+/// title never waits there. A retail title's own stall check – a thread that ticks once a second
+/// with Sleep and ends the process after 30 ticks without a sign of its main thread – ended it
+/// while the driver built the pipelines of its world (#505, #232). Only a sleep of
+/// `SLEEP_HOLD_MIN_MS` or more is taken so: a thread that polls with short sleeps (streaming,
+/// sound) goes on while a bind waits. `XCL_SLEEP_HOLD=<ms>` sets that length, `0`: the PC's
+/// Sleep as it is.
+pub unsafe extern "system" fn Sleep(ms: u32) {
+    static MIN: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let Some(min) = *MIN.get_or_init(|| sleep_hold_min(std::env::var("XCL_SLEEP_HOLD").ok().as_deref())) else {
+        return thr::Sleep(ms);
+    };
+    title_sleep(ms, min, |ms| thr::Sleep(ms), crate::hle::d3d12x::pso_async::title_held)
+}
+
+/// `XCL_SLEEP_HOLD`: the shortest sleep whose held time is not counted (`None`: no sleep).
+fn sleep_hold_min(v: Option<&str>) -> Option<u32> {
+    match v.map(str::trim) {
+        None => Some(SLEEP_HOLD_MIN_MS),
+        Some("0") => None,
+        Some(v) => Some(v.parse().unwrap_or(SLEEP_HOLD_MIN_MS)),
+    }
+}
+
+/// `ms` of time in which the title was not `held`, slept through `sleep` (a yield, an endless
+/// sleep and one shorter than `min` as they are).
+fn title_sleep(ms: u32, min: u32, sleep: impl Fn(u32), held: impl Fn() -> bool) {
+    if ms == 0 || ms == thr::INFINITE || ms < min {
+        return sleep(ms);
+    }
+    let mut left = std::time::Duration::from_millis(ms as u64);
+    while !left.is_zero() {
+        if held() {
+            sleep(SLEEP_HELD_POLL_MS);
+            continue;
+        }
+        let t = std::time::Instant::now();
+        sleep((left.as_millis() as u32).clamp(1, SLEEP_STEP_MS));
+        left = left.saturating_sub(t.elapsed());
     }
 }
 
@@ -1845,6 +1950,88 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 mod tests {
     use super::*;
 
+    fn real_sleep(ms: u32) {
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    }
+
+    /// A title's Sleep does not count the time the title is held (a bind waiting for a pipeline
+    /// still being built): it returns once that is over and its own time has gone by after it.
+    #[test]
+    fn a_sleep_does_not_count_the_time_the_title_is_held() {
+        use std::sync::atomic::AtomicBool;
+        let held = AtomicBool::new(true);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                real_sleep(300);
+                held.store(false, Ordering::Release);
+            });
+            title_sleep(60, 60, real_sleep, || held.load(Ordering::Acquire));
+        });
+        let took = start.elapsed();
+        assert!(took >= std::time::Duration::from_millis(355), "back after {took:?}: the 300 ms held were counted");
+    }
+
+    /// Time held from the middle of a sleep on is not counted either (but for the step under way).
+    #[test]
+    fn a_sleep_stops_counting_when_the_title_gets_held() {
+        use std::sync::atomic::AtomicBool;
+        let held = AtomicBool::new(false);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                real_sleep(50);
+                held.store(true, Ordering::Release);
+                real_sleep(300);
+                held.store(false, Ordering::Release);
+            });
+            title_sleep(200, SLEEP_HOLD_MIN_MS, real_sleep, || held.load(Ordering::Acquire));
+        });
+        let took = start.elapsed();
+        // 200 ms of its own, less at most one step counted while held, and the 300 ms held
+        assert!(took >= std::time::Duration::from_millis(200 + 300 - SLEEP_STEP_MS as u64 - 15), "back after {took:?}");
+    }
+
+    /// With the title not held a sleep takes its time, in steps; a yield and an endless sleep
+    /// are passed on as they are.
+    #[test]
+    fn a_sleep_of_a_title_not_held_takes_its_time() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let sleep = |ms: u32| {
+            calls.borrow_mut().push(ms);
+            if ms != 0 && ms != thr::INFINITE {
+                real_sleep(ms);
+            }
+        };
+        title_sleep(0, 1, sleep, || false);
+        title_sleep(thr::INFINITE, 1, sleep, || false);
+        assert_eq!(*calls.borrow(), [0, thr::INFINITE]);
+        calls.borrow_mut().clear();
+        let t = std::time::Instant::now();
+        title_sleep(50, 1, sleep, || false);
+        let took = t.elapsed();
+        assert!(took >= std::time::Duration::from_millis(50) && took < std::time::Duration::from_millis(400), "took {took:?}");
+        assert!(calls.borrow().iter().all(|&ms| (1..=SLEEP_STEP_MS).contains(&ms)), "{:?}", calls.borrow());
+        // a sleep shorter than a step is one sleep, as before
+        calls.borrow_mut().clear();
+        title_sleep(1, 1, sleep, || false);
+        assert_eq!(*calls.borrow(), [1]);
+    }
+
+    /// A sleep shorter than the shortest one held is a poll: it is passed on as it is, also
+    /// while the title is held. `XCL_SLEEP_HOLD` sets that length, `0` takes no sleep.
+    #[test]
+    fn a_short_sleep_is_passed_on_while_the_title_is_held() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let sleep = |ms: u32| calls.borrow_mut().push(ms);
+        title_sleep(SLEEP_HOLD_MIN_MS - 1, SLEEP_HOLD_MIN_MS, sleep, || true);
+        assert_eq!(*calls.borrow(), [SLEEP_HOLD_MIN_MS - 1]);
+        assert_eq!(sleep_hold_min(None), Some(SLEEP_HOLD_MIN_MS));
+        assert_eq!(sleep_hold_min(Some("0")), None);
+        assert_eq!(sleep_hold_min(Some(" 250 ")), Some(250));
+        assert_eq!(sleep_hold_min(Some("on")), Some(SLEEP_HOLD_MIN_MS));
+    }
+
     #[test]
     fn fine_timer_makes_short_sleeps_short() {
         // Windows' Sleep (std::thread::sleep has its own high-resolution timer)
@@ -2096,6 +2283,118 @@ mod tests {
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
             mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
             mem::VirtualFree(r0 as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// Fresh pages mapped into a reservation in one call are left lazy with a few VirtualQuery
+    /// calls, not two per page (13 s under Wine for a title's 98,304 pages); a committed page
+    /// among them is still told from the reserved ones.
+    #[test]
+    fn mapping_fresh_pages_does_not_query_each_page() {
+        const N: usize = 64;
+        unsafe {
+            let Some(u) = crate::gpu::uma::get() else { return };
+            let mut n = N;
+            let mut pages = [0usize; N];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let home = page_home(pages[0]).unwrap();
+            if !u.is_sparse(home) {
+                FreeTitlePhysicalPages(std::ptr::null_mut(), N, pages.as_mut_ptr());
+                return;
+            }
+            let r = mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            let used = r + 3 * PHYS_PAGE;
+            assert!(!mem::VirtualAlloc(used as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+            *(used as *mut u32) = 0xABAB_ABAB;
+            let before = VIRTUAL_QUERIES.with(|q| q.get());
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, N, 0, 4, pages.as_mut_ptr()) as usize, r);
+            let queries = VIRTUAL_QUERIES.with(|q| q.get()) - before;
+            assert!(queries <= 8, "{queries} VirtualQuery calls for {N} pages");
+            assert_eq!(*(used as *const u32), 0, "a committed page is told from the reserved ones: it is not left lazy");
+            assert!(!committed_page(r + 2 * PHYS_PAGE) && !committed_page(r + 4 * PHYS_PAGE), "the others are left lazy");
+            assert!(!committed_page(page_home(pages[N - 1]).unwrap()), "and their homes stay reserved");
+            assert_eq!(*((r + 4 * PHYS_PAGE) as *const u32), 0);
+            // back home: the pages left lazy are unmarked (a freed one stays marked, and the address
+            // is another test's later)
+            assert!(!MapTitlePhysicalPages(std::ptr::null_mut(), N, 0, 4, pages.as_mut_ptr()).is_null());
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), N, pages.as_mut_ptr()), 1);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// `n` pages with a sparse home (None, with nothing allocated: not on this adapter).
+    unsafe fn sparse_pages(n: usize) -> Option<Vec<usize>> {
+        let u = crate::gpu::uma::get()?;
+        let (mut num, mut pages) = (n, vec![0usize; n]);
+        assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut num, pages.as_mut_ptr()), 1);
+        if u.is_sparse(page_home(pages[0]).unwrap()) {
+            return Some(pages);
+        }
+        FreeTitlePhysicalPages(std::ptr::null_mut(), n, pages.as_mut_ptr());
+        None
+    }
+
+    /// Pages mapped, half of them written, then all mapped again in one call – at another
+    /// address or the same one: the written ones keep their contents. The first pages of the
+    /// call are never-used (nothing to move), the ones after them are moved: what a run of
+    /// the pages asked about before says is no longer true (the home they moved to is committed
+    /// by now, the address they left decommitted).
+    unsafe fn remap_keeps_what_was_written(same_address: bool) {
+        const N: usize = 8;
+        let Some(mut pages) = sparse_pages(N) else { return };
+        let r1 = mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+        let r2 = if same_address { r1 } else { mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize };
+        assert_eq!(MapTitlePhysicalPages(r1 as *mut c_void, N, 0, 4, pages.as_mut_ptr()) as usize, r1);
+        for i in N / 2..N {
+            *((r1 + i * PHYS_PAGE) as *mut u32) = 0x100 + i as u32;
+        }
+        assert_eq!(MapTitlePhysicalPages(r2 as *mut c_void, N, 0, 4, pages.as_mut_ptr()) as usize, r2);
+        for i in 0..N {
+            let want = if i >= N / 2 { 0x100 + i as u32 } else { 0 };
+            assert_eq!(*((r2 + i * PHYS_PAGE) as *const u32), want, "page {i} (same address: {same_address})");
+        }
+        // back home: the pages left lazy are unmarked (a freed one stays marked, and the address
+        // is another test's later)
+        assert!(!MapTitlePhysicalPages(std::ptr::null_mut(), N, 0, 4, pages.as_mut_ptr()).is_null());
+        assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), N, pages.as_mut_ptr()), 1);
+        mem::VirtualFree(r1 as *mut c_void, 0, mem::MEM_RELEASE);
+        if !same_address {
+            mem::VirtualFree(r2 as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn pages_mapped_again_at_another_address_keep_what_was_written() {
+        unsafe { remap_keeps_what_was_written(false) }
+    }
+
+    #[test]
+    fn pages_mapped_again_at_the_same_address_keep_what_was_written() {
+        unsafe { remap_keeps_what_was_written(true) }
+    }
+
+    /// Pages never used, mapped again (they are only unmarked: memory is as it was) cost no
+    /// more queries than the first time.
+    #[test]
+    fn mapping_lazy_pages_again_does_not_query_each_page() {
+        const N: usize = 64;
+        unsafe {
+            let Some(mut pages) = sparse_pages(N) else { return };
+            let r1 = mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            let r2 = mem::VirtualAlloc(std::ptr::null(), N * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_eq!(MapTitlePhysicalPages(r1 as *mut c_void, N, 0, 4, pages.as_mut_ptr()) as usize, r1);
+            for to in [r1, r2] {
+                let before = VIRTUAL_QUERIES.with(|q| q.get());
+                assert_eq!(MapTitlePhysicalPages(to as *mut c_void, N, 0, 4, pages.as_mut_ptr()) as usize, to);
+                let queries = VIRTUAL_QUERIES.with(|q| q.get()) - before;
+                assert!(queries <= 8, "{queries} VirtualQuery calls for {N} pages mapped again");
+            }
+            // back home: the pages left lazy are unmarked (a freed one stays marked, and the address
+            // is another test's later)
+            assert!(!MapTitlePhysicalPages(std::ptr::null_mut(), N, 0, 4, pages.as_mut_ptr()).is_null());
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), N, pages.as_mut_ptr()), 1);
+            mem::VirtualFree(r1 as *mut c_void, 0, mem::MEM_RELEASE);
+            mem::VirtualFree(r2 as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }
 

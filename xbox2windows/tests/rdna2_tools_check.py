@@ -811,6 +811,72 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual([(r["length"], r["assembly"]) for r in records],
                          [(8, "s_movrels_b32 s1, 0x12345678"), (4, "s_endpgm")])
 
+    def test_vop1_rounding_frexp_and_no_operand_opcodes(self):
+        # Words from `llvm-mc -arch=amdgcn -mcpu=gfx1013 -show-encoding`; the texts are llvm-mc's disassembly of them.
+        vectors = (
+            ("022f087e", 4, "v_trunc_f64_e32 v[4:5], v[2:3]"),
+            ("0230007e", 4, "v_ceil_f64_e32 v[0:1], s[2:3]"),
+            ("0233fc7f", 4, "v_rndne_f64_e32 v[254:255], v[2:3]"),
+            ("f234087e", 4, "v_floor_f64_e32 v[4:5], 1.0"),
+            ("0036007e", 4, "v_pipeflush"),
+            ("0279087e", 4, "v_frexp_exp_i32_f64_e32 v4, v[2:3]"),
+            ("027b087e", 4, "v_frexp_mant_f64_e32 v[4:5], v[2:3]"),
+            ("ff7c087e78563412", 8, "v_fract_f64_e32 v[4:5], 0x12345678"),
+            ("027f087e", 4, "v_frexp_exp_i32_f32_e32 v4, v2"),
+            ("0280087e", 4, "v_frexp_mant_f32_e32 v4, s2"),
+            ("0082007e", 4, "v_clrexcp"),
+            ("040097d502010122", 8, "v_trunc_f64_e64 v[4:5], -v[2:3]"),
+            ("04819ad502010102", 8, "v_floor_f64_e64 v[4:5], |v[2:3]| clamp"),
+            ("0400bcd502010102", 8, "v_frexp_exp_i32_f64_e64 v4, v[2:3]"),
+            ("0400c0d50201012a", 8, "v_frexp_mant_f32_e64 v4, -v2 mul:2"),
+            ("0401bfd502010102", 8, "v_frexp_exp_i32_f32_e64 v4, |v2|"),
+            ("00009bd580000102", 8, "v_pipeflush"),
+            ("0000c1d580000102", 8, "v_clrexcp"),
+            ("f980027e02060600", 8,
+             "v_frexp_mant_f32_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"),
+            ("f97e027e02050200", 8,
+             "v_frexp_exp_i32_f32_sdwa v1, v2 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_2"),
+            ("fa80027e02e400ff", 8, "v_frexp_mant_f32_dpp v1, v2 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf"),
+            ("fa7e027e020101ff", 8, "v_frexp_exp_i32_f32_dpp v1, v2 row_shl:1 row_mask:0xf bank_mask:0xf"),
+        )
+        for raw, length, assembly in vectors:
+            with self.subTest(assembly=assembly):
+                self.assertEqual(decode_instruction(bytes.fromhex(raw), 0)[::2], (length, assembly))
+                self.assertTrue(is_opcode_recognized(assembly.split()[0]))
+        # LLVM takes no literal for the operand-free forms: the next dword is a separate instruction (as in llvm-mc).
+        records = disasm_rdna2(bytes.fromhex("ff36007e78563412000081bf"))
+        self.assertEqual([(r["length"], r["assembly"]) for r in records],
+                         [(4, "v_pipeflush"), (4, "v_mul_i32_i24_e32 v26, ttmp12, v43"), (4, "s_endpgm")])
+        # LLVM has no SDWA or DPP form of the binary64 ops or of the operand-free ones: eight-byte refusals.
+        for raw, name in (("f92e007e02060600", "v_trunc_f64_e32"), ("fa30007e02e400ff", "v_ceil_f64_e32"),
+                          ("f936007e02060600", "v_pipeflush"), ("fa82007e02e400ff", "v_clrexcp")):
+            with self.subTest(refused=name):
+                length, _, assembly, _ = decode_instruction(bytes.fromhex(raw), 0)
+                self.assertEqual((length, assembly.startswith(name + " <unsupported ")), (8, True))
+        # The neighbouring opcodes stay as they were: 0x1c is not defined and 0x42 is v_movreld_b32.
+        self.assertEqual(decode_instruction(bytes.fromhex("0038007e"), 0)[:2], (4, "v_vop1_1c"))
+        self.assertEqual(decode_instruction(bytes.fromhex("0284007e"), 0)[1], "v_movreld_b32_e32")
+
+    def test_vop1_f64_source_conversions_have_one_register_result(self):
+        # Words from `llvm-mc -arch=amdgcn -mcpu=gfx1013 -show-encoding`. A 32-bit result from a binary64 source
+        # names one VGPR; a binary64 result (or a binary64-to-binary64 op) names a pair, as before.
+        vectors = (
+            ("0207087e", 4, "v_cvt_i32_f64_e32 v4, v[2:3]"),
+            ("042b027e", 4, "v_cvt_u32_f64_e32 v1, v[4:5]"),
+            ("021ffe7f", 4, "v_cvt_f32_f64_e32 v255, v[2:3]"),
+            ("0206007e", 4, "v_cvt_i32_f64_e32 v0, s[2:3]"),
+            ("f22a0e7e", 4, "v_cvt_u32_f64_e32 v7, 1.0"),
+            ("ff1e067e78563412", 8, "v_cvt_f32_f64_e32 v3, 0x12345678"),
+            # Controls that keep the pair: binary64 results.
+            ("0209087e", 4, "v_cvt_f64_i32_e32 v[4:5], v2"),
+            ("0221fc7f", 4, "v_cvt_f64_f32_e32 v[254:255], v2"),
+            ("025f087e", 4, "v_rcp_f64_e32 v[4:5], v[2:3]"),
+        )
+        for raw, length, assembly in vectors:
+            with self.subTest(assembly=assembly):
+                self.assertEqual(decode_instruction(bytes.fromhex(raw), 0)[::2], (length, assembly))
+                self.assertTrue(is_opcode_recognized(assembly.split()[0]))
+
     def test_hwreg_operands_use_llvm_spelling(self):
         """Issue #938: hwreg operands and s_setreg_imm32_b32 literals print as LLVM 15 prints them for gfx1013.
 
@@ -2067,13 +2133,13 @@ class TestRdna2Disasm(unittest.TestCase):
             if expected_name == "v_readlane_b32":
                 expected_dst = "s1"
             else:
-                expected_dst = "v[1:2]" if dst_width == 2 else "v1"
+                expected_dst = f"v[1:{dst_width}]" if dst_width > 1 else "v1"
             expected_srcs = []
             raw_regs = [2, 3, 4]
             for i in range(arity):
                 w = src_widths[i]
                 r = raw_regs[i]
-                expected_srcs.append(f"v[{r}:{r+1}]" if w == 2 else f"v{r}")
+                expected_srcs.append(f"v[{r}:{r + w - 1}]" if w > 1 else f"v{r}")
             srcs_str = ", ".join(expected_srcs)
             if is_vop3b:
                 self.assertEqual(insns[0]["assembly"], f"{expected_name} {expected_dst}, s0, {srcs_str}")
@@ -2138,7 +2204,7 @@ class TestRdna2Disasm(unittest.TestCase):
             "0000afd502091a04"  # v_rcp_f64_e64 v[0:1], v[2:3]
             "000040d502091a04"  # v_mad_legacy_f32 v0, v2, v4, v6
             "000050d502091a04"  # v_mullit_f32 v0, v2, v4, v6
-            "000075d502091a04"  # v_vop3_175 (undecoded special form consumes 8 bytes)
+            "000079d502091a04"  # v_vop3_179 (undecoded special form consumes 8 bytes)
             "05004bd501ff09040000803f"  # v_fma_f32 v5, v1, 0x3f800000, v2 (12-byte literal)
             "000081bf"          # s_endpgm
         )
@@ -2159,7 +2225,7 @@ class TestRdna2Disasm(unittest.TestCase):
                 ("v_rcp_f64_e64", 8, "v_rcp_f64_e64 v[0:1], v[2:3]"),
                 ("v_mad_legacy_f32", 8, "v_mad_legacy_f32 v0, v2, v4, v6"),
                 ("v_mullit_f32", 8, "v_mullit_f32 v0, v2, v4, v6"),
-                ("v_vop3_175", 8, "v_vop3_175 v0, v2, v4, v6"),
+                ("v_vop3_179", 8, "v_vop3_179 v0, v2, v4, v6"),
                 ("v_fma_f32", 12, "v_fma_f32 v5, v1, 0x3f800000, v2"),
                 ("s_endpgm", 4, "s_endpgm"),
             ],
@@ -2503,6 +2569,28 @@ class TestRdna2Disasm(unittest.TestCase):
         decoded = disasm_rdna2(stream)
         self.assertEqual([(r["opcode"], r["length"]) for r in decoded], [("buffer_mubuf_10", 8), ("s_endpgm", 4)])
 
+    # v_mqsad_u32_u8 (VOP3 0x175): a four-register destination and accumulator around a register-pair src0.
+    # Encoded and printed by llvm-mc 19.1.7 for gfx1013; no destination overlaps a source, so the same text also
+    # assembles where the assembler treats the destination as early-clobber (LLVM 15 does for the SAD family).
+    # llvm-mc 19 assembles only a VGPR quad for src2 and clamp, and rejects abs, neg and omod.
+    VOP3_MQSAD_U32_U8_VECTORS = (
+        ("000075d5040d2204", "v_mqsad_u32_u8 v[0:3], v[4:5], v6, v[8:11]"),
+        ("0c8075d56a082204", "v_mqsad_u32_u8 v[12:15], vcc, v4, v[8:11] clamp"),
+        ("0c0075d5020e4104", "v_mqsad_u32_u8 v[12:15], s[2:3], 7, v[16:19]"),
+        ("0c0075d57ef84004", "v_mqsad_u32_u8 v[12:15], exec, m0, v[16:19]"),
+        ("0c0075d502ff210478563412", "v_mqsad_u32_u8 v[12:15], v[2:3], 0x12345678, v[8:11]"),
+        ("fc8075d5f8ffd307", "v_mqsad_u32_u8 v[252:255], v[248:249], v255, v[244:247] clamp"),
+        ("000075d5fafff307", "v_mqsad_u32_u8 v[0:3], v[250:251], v255, v[252:255]"),
+        ("0c0075d5f2082204", "v_mqsad_u32_u8 v[12:15], 1.0, v4, v[8:11]"),
+        ("0c0075d57d822104", "v_mqsad_u32_u8 v[12:15], null, -1, v[8:11]"),
+        ("0c8075d56ed22004", "v_mqsad_u32_u8 v[12:15], ttmp[2:3], s105, v[8:11] clamp"),
+    )
+
+    # The vectors that LLVM 15's assembler also accepts (it needs no clamp, literal, null or trap-temporary operand here):
+    # the rest are checked against the golden strings only.
+    VOP3_MQSAD_U32_U8_ROUND_TRIP_VECTORS = (VOP3_MQSAD_U32_U8_VECTORS[0], VOP3_MQSAD_U32_U8_VECTORS[2],
+                                                VOP3_MQSAD_U32_U8_VECTORS[3], VOP3_MQSAD_U32_U8_VECTORS[6])
+
     VOP3_MUL_QSAD_INTERP_VECTORS = (
         # Encoded and printed by llvm-mc 15.0.6 and 19.1.7 for gfx1013 (v_qsad and v_mqsad need a destination that
         # does not overlap a source on LLVM 15).
@@ -2521,7 +2609,7 @@ class TestRdna2Disasm(unittest.TestCase):
         ("c88002d6e0020000", "v_interp_mov_f32_e64 v200, p20, attr32.w clamp"),
         ("030002d685040008", "v_interp_mov_f32_e64 v3, p0, attr5.z mul:2"),
         ("058002d6c1020010", "v_interp_mov_f32_e64 v5, p20, attr1.w clamp mul:4"),
-    )
+    ) + VOP3_MQSAD_U32_U8_VECTORS
     # llvm-mc 15 and 19 both print this word; llvm-mc 19 refuses to assemble attr62, so it is a decode-only vector.
     VINTRP_MOV_ATTR62_VECTOR = ("040002d67e000018", "v_interp_mov_f32_e64 v4, p10, attr62.y div:2")
 
@@ -2599,8 +2687,10 @@ class TestRdna2Disasm(unittest.TestCase):
         objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
         if not assembler or not objcopy:
             self.fail(f"VOP3 round trip requires llvm-mc and llvm-objcopy (assembler={assembler}, objcopy={objcopy})")
-        source = [assembly for _, assembly in self.VOP3_MUL_QSAD_INTERP_VECTORS]
-        expected = bytes.fromhex("".join(encoding for encoding, _ in self.VOP3_MUL_QSAD_INTERP_VECTORS))
+        vectors = tuple(vector for vector in self.VOP3_MUL_QSAD_INTERP_VECTORS
+                        if vector not in self.VOP3_MQSAD_U32_U8_VECTORS) + self.VOP3_MQSAD_U32_U8_ROUND_TRIP_VECTORS
+        source = [assembly for _, assembly in vectors]
+        expected = bytes.fromhex("".join(encoding for encoding, _ in vectors))
         emitted = assemble_with_llvm_mc(source, assembler, objcopy)
         self.assertEqual(emitted, expected)
         decoded = [record["assembly"] for record in disasm_rdna2(emitted)]
@@ -2624,13 +2714,18 @@ class TestRdna2Disasm(unittest.TestCase):
                     self.assertNotEqual(record["assembly"], assembly)
         # The three neighbouring opcodes keep their own names; the new ones are not aliases of them.
         names = {
-            op: disasm_rdna2(self._vop3_word(op))[0]["opcode"]
-            for op in (0x169, 0x16a, 0x16b, 0x16c, 0x171, 0x172, 0x173, 0x174)
+            op: disasm_rdna2(self._vop3_word(op, **({"src2": 0x104} if op == 0x175 else {})))[0]["opcode"]
+            for op in (0x169, 0x16a, 0x16b, 0x16c, 0x171, 0x172, 0x173, 0x174, 0x175, 0x176)
         }
         self.assertEqual(names, {
             0x169: "v_mul_lo_u32", 0x16a: "v_mul_hi_u32", 0x16b: "v_mul_lo_i32", 0x16c: "v_mul_hi_i32",
             0x171: "v_msad_u8", 0x172: "v_qsad_pk_u16_u8", 0x173: "v_mqsad_pk_u16_u8", 0x174: "v_trig_preop_f64",
+            0x175: "v_mqsad_u32_u8", 0x176: "v_mad_u64_u32",
         })
+        # Same sources, different operand widths: the u32 form writes and accumulates four registers, the pk form two.
+        words = {op: self._vop3_word(op, vdst=0, src0=0x102, src1=0x103, src2=0x104) for op in (0x173, 0x175)}
+        self.assertEqual(disasm_rdna2(words[0x173])[0]["assembly"], "v_mqsad_pk_u16_u8 v[0:1], v[2:3], v3, v[4:5]")
+        self.assertEqual(disasm_rdna2(words[0x175])[0]["assembly"], "v_mqsad_u32_u8 v[0:3], v[2:3], v3, v[4:7]")
 
     def test_vop3_mul_lo_i32_qsad_and_interp_mov_refuse_forms_llvm_rejects(self):
         """Issue #938: abs, neg, clamp, omod and src2 bits the assembler rejects become eight-byte refused records."""
@@ -2643,6 +2738,11 @@ class TestRdna2Disasm(unittest.TestCase):
             "abs on qsad": self._vop3_word(0x172, src0=0x102, src1=0x103, src2=0x104, abs_bits=4),
             "neg on mqsad": self._vop3_word(0x173, src0=0x102, src1=0x103, src2=0x104, neg=4),
             "omod on qsad": self._vop3_word(0x172, src0=0x102, src1=0x103, src2=0x104, omod=2),
+            "abs on mqsad_u32_u8": self._vop3_word(0x175, src0=0x102, src1=0x103, src2=0x104, abs_bits=2),
+            "neg on mqsad_u32_u8": self._vop3_word(0x175, src0=0x102, src1=0x103, src2=0x104, neg=1),
+            "omod on mqsad_u32_u8": self._vop3_word(0x175, src0=0x102, src1=0x103, src2=0x104, omod=3),
+            "SGPR accumulator on mqsad_u32_u8": self._vop3_word(0x175, src0=0x102, src1=0x103, src2=0x04),
+            "inline constant accumulator on mqsad_u32_u8": self._vop3_word(0x175, src0=0x102, src1=0x103, src2=0x81),
             "abs on interp_mov": self._vop3_word(0x202, src0=0x85, src1=0, abs_bits=1),
             "neg on interp_mov": self._vop3_word(0x202, src0=0x85, src1=0, neg=1),
             "src2 on interp_mov": self._vop3_word(0x202, src0=0x85, src1=0, src2=1),
@@ -2658,10 +2758,22 @@ class TestRdna2Disasm(unittest.TestCase):
                 self.assertIn("<unsupported VOP3A encoding>", records[0]["assembly"])
                 self.assertEqual(records[1]["opcode"], "s_endpgm")
         # The op_sel bits do not exist for these ops: LLVM neither prints them nor refuses the word.
-        for op, kwargs in ((0x16b, {}), (0x172, {"src2": 0x104}), (0x173, {"src2": 0x104}), (0x202, {"src0": 0x85, "src1": 0})):
+        for op, kwargs in ((0x16b, {}), (0x172, {"src2": 0x104}), (0x173, {"src2": 0x104}),
+                           (0x175, {"src2": 0x104}), (0x202, {"src0": 0x85, "src1": 0})):
             with self.subTest(op=hex(op), field="op_sel"):
                 plain = disasm_rdna2(self._vop3_word(op, **kwargs))[0]["assembly"]
                 self.assertEqual(disasm_rdna2(self._vop3_word(op, op_sel=0xf, **kwargs))[0]["assembly"], plain)
+
+    def test_vop3_mqsad_u32_u8_register_quads_stop_at_v255(self):
+        """A destination or accumulator quad that would run past v255 is flagged, not printed as a register."""
+        last_quad = disasm_rdna2(self._vop3_word(0x175, vdst=252, src2=0x100 + 252))[0]["assembly"]
+        self.assertEqual(last_quad, "v_mqsad_u32_u8 v[252:255], v[2:3], v3, v[252:255]")
+        for label, kwargs in (("destination", {"vdst": 253, "src2": 0x104}), ("accumulator", {"src2": 0x100 + 253})):
+            with self.subTest(quad=label):
+                record, = disasm_rdna2(self._vop3_word(0x175, **kwargs))
+                self.assertEqual(record["length"], 8)
+                self.assertIn("<invalid VGPR quad>", record["assembly"])
+                self.assertNotIn("v[253:256]", record["assembly"])
 
     # Issue #1298: v_permlane16_b32 (VOP3 0x377) and v_permlanex16_b32 (0x378), assembled with llvm-mc 15.0.7
     # for gfx1013. They cover both opcodes, the special SGPRs, inline constants and both op_sel flags.
@@ -2807,7 +2919,7 @@ class TestRdna2Disasm(unittest.TestCase):
             self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
         resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
         three_sources = {"src0": 0x102, "src1": 0x103, "src2": 0x104}
-        sources = {0x16b: {}, 0x172: three_sources, 0x173: three_sources, 0x202: {"src0": 0x85, "src1": 1}}
+        sources = {0x16b: {}, 0x172: three_sources, 0x173: three_sources, 0x175: three_sources, 0x202: {"src0": 0x85, "src1": 1}}
         accepted = 0
         for op, base in sources.items():
             for abs_bits in range(8):
@@ -3018,6 +3130,7 @@ class TestRdna2Disasm(unittest.TestCase):
             "01006bd502070200"      # v_mul_lo_i32
             "0a0072d502091a04"      # v_qsad_pk_u16_u8
             "0a0073d5020ef501"      # v_mqsad_pk_u16_u8
+            "000075d5040d2204"      # v_mqsad_u32_u8
             "010002d600000000"      # v_interp_mov_f32_e64
             "000098e000010100"      # buffer_load_format_d16_hi_x
             "00009ce000010100"      # buffer_store_format_d16_hi_x
@@ -3031,7 +3144,7 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(result["unsupported_opcodes"], {})
         self.assertEqual(
             [d["raw"].split()[0] for d in result["unsupported_details"]],
-            ["v_mul_lo_i32", "v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8", "v_interp_mov_f32_e64",
+            ["v_mul_lo_i32", "v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8", "v_mqsad_u32_u8", "v_interp_mov_f32_e64",
              "buffer_load_format_d16_hi_x", "buffer_store_format_d16_hi_x"],
         )
         # A word with an abs bit is refused by the decoder: the scan keeps it on the translator-rejected list.
@@ -3043,6 +3156,36 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertFalse(refused_result["translator_accepted"])
         self.assertEqual([d["raw"] for d in refused_result["unsupported_details"]],
                          ["v_mul_lo_i32 <unsupported VOP3A encoding>"])
+
+    def test_binary_scan_recognizes_vop1_rounding_frexp_and_no_operand_opcodes(self):
+        """The scan report names the eleven VOP1 forms instead of listing v_vop1_NN as unknown opcodes."""
+        shader = bytes.fromhex(
+            "022f087e"              # v_trunc_f64
+            "0230007e"              # v_ceil_f64
+            "0233fc7f"              # v_rndne_f64
+            "f234087e"              # v_floor_f64
+            "0036007e"              # v_pipeflush
+            "0279087e"              # v_frexp_exp_i32_f64
+            "027b087e"              # v_frexp_mant_f64
+            "ff7c087e78563412"      # v_fract_f64 with a literal
+            "027f087e"              # v_frexp_exp_i32_f32
+            "0280087e"              # v_frexp_mant_f32
+            "0082007e"              # v_clrexcp
+            "000081bf"              # s_endpgm
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "ps_vop1_forms.bin").write_bytes(shader)
+            result = {r["shader_name"]: r for r in scan_directory_or_files([tmp_path])}["ps_vop1_forms.bin"]
+        self.assertTrue(result["opcodes_recognized"])
+        self.assertEqual(result["unsupported_opcodes"], {})
+        # v_frexp_mant_f32 is lowered by pixel_aot, so it is not listed as untranslated; the other ten are.
+        self.assertEqual(
+            [d["raw"].split()[0] for d in result["unsupported_details"]],
+            ["v_trunc_f64_e32", "v_ceil_f64_e32", "v_rndne_f64_e32", "v_floor_f64_e32", "v_pipeflush",
+             "v_frexp_exp_i32_f64_e32", "v_frexp_mant_f64_e32", "v_fract_f64_e32", "v_frexp_exp_i32_f32_e32",
+             "v_clrexcp"],
+        )
 
     def test_mtbuf_opcode_table_synthetic_forms(self):
         """Every GFX1013 MTBUF opcode and format identifier must decode accurately and stay aligned."""
@@ -4657,22 +4800,28 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertFalse(is_instruction_supported(line), line)
 
     def test_float_to_word_conversions_e32_and_e64(self):
-        """v_cvt_u32_f32 and v_cvt_i32_f32 accept plain e32 and e64 with optional source abs/neg;
-        v_cvt_flr_i32_f32 and v_cvt_rpi_i32_f32 stay out of generic scanner support until arbitrary runtime
-        exceptional inputs are backed by a native RDNA reference."""
+        """v_cvt_u32_f32, v_cvt_i32_f32, v_cvt_flr_i32_f32 and v_cvt_rpi_i32_f32 accept plain e32 and e64 with
+        optional source abs/neg, on runtime registers too: pixel_aot defines NaN, infinities and overflow for
+        flr and rpi (issue #1772)."""
         for line in ("v_cvt_u32_f32_e32 v12, v13", "v_cvt_i32_f32_e32 v12, s44",
                      "v_cvt_u32_f32_e32 v12, 0x40400000", "v_cvt_u32_f32_e64 v12, v13",
                      "v_cvt_i32_f32_e64 v12, s44", "v_cvt_u32_f32_e64 v12, |s44|",
                      "v_cvt_i32_f32_e64 v12, -s44", "v_cvt_i32_f32_e64 v12, -|v13|",
                      "v_cvt_u32_f32_e64 v12, abs(v13)", "v_cvt_i32_f32_e64 v12, neg(0x40400000)",
-                     "v_cvt_u32_f32_e64 v12, |0xc0300000|"):
+                     "v_cvt_u32_f32_e64 v12, |0xc0300000|",
+                     "v_cvt_flr_i32_f32_e32 v12, v13", "v_cvt_rpi_i32_f32_e32 v12, s44",
+                     "v_cvt_flr_i32_f32_e32 v12, 0x7fc00000", "v_cvt_rpi_i32_f32_e64 v12, -v13",
+                     "v_cvt_flr_i32_f32_e64 v12, -|s44|", "v_cvt_rpi_i32_f32_e64 v12, neg(0x4f000000)"):
             self.assertTrue(is_instruction_supported(line), line)
         for line in ("v_cvt_u32_f32_e64 v12, s44 clamp", "v_cvt_i32_f32_e64 v12, s44 omod:2",
                      "v_cvt_i32_f32_e32 v12, 1", "v_cvt_u32_f32_e32 v12, 0.5",
                      "v_cvt_u32_f32_e64 v12, 0.5", "v_cvt_i32_f32_e64 v12, -1",
                      "v_cvt_i32_f32_e64 v12, -0x40400000", "v_cvt_u32_f32_e64 v12, |-s44|",
                      "v_cvt_u32_f32_e32  v12, v13", "v_cvt_u32_f32_e64  v12, v13",
-                     "v_cvt_flr_i32_f32_e32 v12, v13", "v_cvt_rpi_i32_f32_e64 v12, -v13"):
+                     "v_cvt_flr_i32_f32_e64 v12, s44 clamp", "v_cvt_rpi_i32_f32_e64 v12, s44 omod:2",
+                     "v_cvt_flr_i32_f32_e32 v12, 0.5", "v_cvt_rpi_i32_f32_e64 v12, |-s44|",
+                     "v_cvt_flr_i32_f32_dpp v12, v13 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+                     "v_cvt_rpi_i32_f32_sdwa v12, v13 dst_sel:DWORD src0_sel:DWORD"):
             self.assertFalse(is_instruction_supported(line), line)
 
     def test_disasm_cvt_flr_and_rpi_e32_and_e64(self):
@@ -4707,6 +4856,46 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual(res["unsupported_count"], 1)
         self.assertEqual(res["support_percentage"], 50.0)
         self.assertEqual(res["unsupported_details"][0]["raw"], "v_imaginary_opcode_xyz v0, v1")
+
+    def test_vop1_cvt_off_sat_pack_and_swap_opcodes(self):
+        # Words from `llvm-mc -arch=amdgcn -mcpu=gfx1013 -show-encoding`; the texts are llvm-mc's disassembly of them.
+        vectors = (
+            ("021d087e", 4, "v_cvt_off_f32_i4_e32 v4, v2"),
+            ("021c087e", 4, "v_cvt_off_f32_i4_e32 v4, s2"),
+            ("831c087e", 4, "v_cvt_off_f32_i4_e32 v4, 3"),
+            ("ff1c087e78563412", 8, "v_cvt_off_f32_i4_e32 v4, 0x12345678"),
+            ("02c5087e", 4, "v_sat_pk_u8_i16_e32 v4, v2"),
+            ("ffc4087e78563412", 8, "v_sat_pk_u8_i16_e32 v4, 0x12345678"),
+            ("02cb087e", 4, "v_swap_b32 v4, v2"),
+            ("02d1087e", 4, "v_swaprel_b32 v4, v2"),
+            ("04008ed502010102", 8, "v_cvt_off_f32_i4_e64 v4, v2"),
+            ("04808ed502010102", 8, "v_cvt_off_f32_i4_e64 v4, v2 clamp"),
+            ("04008ed50201010a", 8, "v_cvt_off_f32_i4_e64 v4, v2 mul:2"),
+            ("0400e2d502010102", 8, "v_sat_pk_u8_i16_e64 v4, v2"),
+            ("0400e2d585000102", 8, "v_sat_pk_u8_i16_e64 v4, 5"),
+            ("f91c027e02060100", 8,
+             "v_cvt_off_f32_i4_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1"),
+            ("f9c4027e02060500", 8,
+             "v_sat_pk_u8_i16_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1"),
+            ("fa1c027e02e400ff", 8, "v_cvt_off_f32_i4_dpp v1, v2 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf"),
+            ("fac4027e020101ff", 8, "v_sat_pk_u8_i16_dpp v1, v2 row_shl:1 row_mask:0xf bank_mask:0xf"),
+        )
+        for raw, length, assembly in vectors:
+            with self.subTest(assembly=assembly):
+                self.assertEqual(decode_instruction(bytes.fromhex(raw), 0)[::2], (length, assembly))
+                self.assertTrue(is_opcode_recognized(assembly.split()[0]))
+        # llvm-mc has no VOP3A, SDWA or DPP form of the two swaps: eight-byte refusals that keep the next offset.
+        for raw, name, form in (("0400e5d502010102", "v_swap_b32", "VOP3A encoding"),
+                                ("0400e8d502010102", "v_swaprel_b32", "VOP3A encoding"),
+                                ("f9ca027e02060600", "v_swap_b32", "SDWA"),
+                                ("fad0027e020101ff", "v_swaprel_b32", "DPP16")):
+            with self.subTest(refused=name, form=form):
+                records = disasm_rdna2(bytes.fromhex(raw + "000081bf"))
+                self.assertEqual([(r["offset"], r["length"], r["assembly"]) for r in records],
+                                 [(0, 8, f"{name} <unsupported {form}>"), (8, 4, "s_endpgm")])
+        # The neighbouring opcodes 0x66 and 0x67 are not defined and stay unknown records.
+        for raw, name in (("00cc007e", "v_vop1_66"), ("00ce007e", "v_vop1_67")):
+            self.assertEqual(decode_instruction(bytes.fromhex(raw), 0)[:2], (4, name))
 
     def test_cli_scanner(self):
         """Invoke scanner via its actual CLI entry point on synthetic assembly file."""
@@ -4763,6 +4952,24 @@ class TestRdna2Scanner(unittest.TestCase):
                 stream.write(".long 0\n")
             result = scan()
             self.assertIn("Full Shaders Accepted by Translator:       0", result.stdout)
+
+    def test_binary_scan_recognizes_vop1_cvt_off_sat_pack_and_swap_opcodes(self):
+        """The scan report names the four VOP1 forms instead of listing v_vop1_NN as unknown opcodes."""
+        shader = bytes.fromhex(
+            "021d087e"              # v_cvt_off_f32_i4
+            "02c5087e"              # v_sat_pk_u8_i16
+            "02cb087e"              # v_swap_b32
+            "02d1087e"              # v_swaprel_b32
+            "000081bf"              # s_endpgm
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "ps_vop1_swap.bin").write_bytes(shader)
+            result = {r["shader_name"]: r for r in scan_directory_or_files([tmp_path])}["ps_vop1_swap.bin"]
+        self.assertTrue(result["opcodes_recognized"])
+        self.assertEqual(result["unsupported_opcodes"], {})
+        # The scanner's static tables still list v_swaprel_b32 as untranslated; pixel_aot lowers it since #1795.
+        self.assertEqual([d["raw"].split()[0] for d in result["unsupported_details"]], ["v_swaprel_b32"])
 
     def test_binary_scan_recognizes_vop2_carry_and_image_atomics(self):
         """Issue #938 step 3: binary scan accepts decoded VOP2 carry ops and keeps image_atomic_* recognized-only."""
@@ -4952,6 +5159,27 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual(detect_shader_stage("cs_dispatch.bin"), "compute")
         self.assertEqual(detect_shader_stage("shaders/vertex/vs_main.s"), "vertex")
         self.assertEqual(detect_shader_stage("unknown_kernel.bin"), "other")
+
+    def test_detect_shader_stage_whole_tokens_only(self):
+        """A stage tag must be a whole path component or a `_`/`.`/`-` delimited token."""
+        # Tags that sit inside another word used to match as substrings.
+        self.assertEqual(detect_shader_stage("loops_cs.s"), "compute")
+        self.assertEqual(detect_shader_stage("shaders/bumps_vs.txt"), "vertex")
+        self.assertEqual(detect_shader_stage("tex_cs_ps5.s"), "compute")  # `ps5` is not the tag `ps`
+        self.assertEqual(detect_shader_stage("cs/copy.s"), "compute")  # relative directory, no leading slash
+        self.assertEqual(detect_shader_stage("maps_a.s"), "other")
+        self.assertEqual(detect_shader_stage("blur_cs.s"), "compute")
+        # Controls for each stage and name shape.
+        self.assertEqual(detect_shader_stage("blur_ps.s"), "pixel")
+        self.assertEqual(detect_shader_stage("blur-vs.s"), "vertex")
+        self.assertEqual(detect_shader_stage("blur.ps.s"), "pixel")
+        self.assertEqual(detect_shader_stage("PS_Upper.bin"), "pixel")
+        self.assertEqual(detect_shader_stage("shaders\\vertex\\main.s"), "vertex")
+        self.assertEqual(detect_shader_stage("compute/main.s"), "compute")
+        self.assertEqual(detect_shader_stage("pixel/main.s"), "pixel")
+        # Two different whole tags: pixel, then compute, then vertex wins.
+        self.assertEqual(detect_shader_stage("ps_cs_x.s"), "pixel")
+        self.assertEqual(detect_shader_stage("cs_vs_x.s"), "compute")
 
     def test_binary_scan_recognizes_decoded_interp_f16(self):
         """Issue #938 step 2: a scanned binary's binary16 interpolation forms reach the scanner by name.
@@ -5226,6 +5454,15 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertIn("overall", json_content)
             self.assertIn("stages", json_content)
             self.assertIn("missing_opcodes_ranked", json_content)
+
+    def test_timing_hint_instructions(self):
+        """The scanner accepts the timing, trace and cache hints pixel_aot lowers like s_nop 0."""
+        for line in ("s_incperflevel 15", "s_decperflevel 0x2", "s_ttracedata_imm 0xffff", "s_ttracedata_imm 5",
+                     "s_icache_inv", "s_ttracedata", "s_wakeup"):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in ("s_incperflevel 16", "s_decperflevel 0x10", "s_ttracedata_imm 0x10000",
+                     "s_waitcnt_depctr 0xffe3", "s_wait_idle", "s_code_end"):
+            self.assertFalse(is_instruction_supported(line), line)
 
     def test_supported_shader_instructions(self):
         """Verify scanner patterns recognize subrev, mov_b32, waitcnt_expcnt as supported."""
@@ -5503,7 +5740,9 @@ class TestRdna2Scanner(unittest.TestCase):
         for opcode in ("v_cvt_pk_u16_u32", "v_cvt_pk_i16_i32"):
             self.assertTrue(is_opcode_recognized(opcode), opcode)
         for line in (
+            "v_sad_u8 v1, v2, v3, v4",
             "v_sad_hi_u8 v1, v2, v3, v4",
+            "v_sad_u16 v1, s2, v3, 64",
             "v_sad_u32 v1, s2, v3, 64",
             "v_sad_u32_e64 v1, v2, v3, v4",
             "v_msad_u8 v1, v2, 0x7f00ff01, s4",
@@ -5514,12 +5753,15 @@ class TestRdna2Scanner(unittest.TestCase):
             "v_sad_u32 v1, v2, v3",
             "v_msad_u8 v1, v2, v3, v4, v5",
             "v_msad_u8 v1, v2, v3, v4 clamp",
-            "v_sad_u8 v1, v2, v3, v4",
-            "v_sad_u16 v1, v2, v3, v4",
+            "v_sad_u8_e32 v1, v2, v3, v4",
+            "v_sad_u8 v1, v2, v3, v4 clamp",
+            "v_sad_u16 v1, v2, v3",
+            "v_sad_u16 v1, v2, v3, v4 clamp",
             "v_mqsad_pk_u16_u8 v[1:2], v[3:4], v5, v[6:7]",
+            "v_mqsad_u32_u8 v[1:4], v[5:6], v7, v[8:11]",
         ):
             self.assertFalse(is_instruction_supported(line), line)
-        for opcode in ("v_sad_hi_u8", "v_sad_u32", "v_msad_u8"):
+        for opcode in ("v_sad_u8", "v_sad_hi_u8", "v_sad_u16", "v_sad_u32", "v_msad_u8"):
             self.assertTrue(is_opcode_recognized(opcode), opcode)
         for line in (
             "v_add3_u32 v1, v2, v3, v4",
@@ -5918,6 +6160,52 @@ class TestRdna2Scanner(unittest.TestCase):
         # Negative control: v_div_scale_f32 must be rejected
         with self.assertRaises(ValueError):
             lower(["v_div_scale_f32 v12, vcc_lo, v19, v19, v20", *div_shader], 20, 24, [1, 2, 3, 4])
+
+
+class TestDisasmSop1BitsetWidths(unittest.TestCase):
+    """Verify operand widths for SOP1 64-bit bitset ops."""
+
+    def test_sop1_bitset_b64_src0_is_32bit(self):
+        cases = [
+            # SOP1 64-bit bitset takes a 32-bit scalar bit-index src0 (must not emit s[4:5] or vcc)
+            (0xbe800000 | (2 << 16) | (0x1c << 8) | 4, "s_bitset0_b64 s[2:3], s4"),
+            (0xbe800000 | (2 << 16) | (0x1c << 8) | 106, "s_bitset0_b64 s[2:3], vcc_lo"),
+            (0xbe800000 | (2 << 16) | (0x1e << 8) | 4, "s_bitset1_b64 s[2:3], s4"),
+            # Positive controls: s_not_b64 (64-bit dst & src0) and s_bitreplicate_b64_b32 (64-bit dst, 32-bit src0)
+            (0xbe800000 | (2 << 16) | (0x08 << 8) | 4, "s_not_b64 s[2:3], s[4:5]"),
+            (0xbe800000 | (2 << 16) | (0x3b << 8) | 4, "s_bitreplicate_b64_b32 s[2:3], s4"),
+        ]
+        for w0, expected in cases:
+            rec = disasm_rdna2(struct.pack("<I", w0))[0]
+            self.assertEqual(rec["assembly"], expected)
+
+        llvm_mc = resolve_tool("LLVM_MC", ["llvm-mc-19", "llvm-mc-15", "llvm-mc"])
+        if llvm_mc:
+            for w0, expected in cases:
+                res = subprocess.run(
+                    [llvm_mc, "-triple=amdgcn--", "-mcpu=gfx1013", "-show-encoding"],
+                    input=expected + "\n",
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(res.returncode, 0, f"{expected}: {res.stderr}")
+                enc_match = re.search(r"encoding:\s*\[([^\]]+)\]", res.stdout)
+                self.assertIsNotNone(enc_match, f"Missing encoding for {expected}: {res.stdout}")
+                encoded = bytes(int(tok.strip(), 16) for tok in enc_match.group(1).split(","))
+                self.assertEqual(encoded, struct.pack("<I", w0), f"Encoding mismatch for {expected}")
+            # Negative controls: wide src0 is rejected by llvm-mc for SOP1 64-bit bitset ops
+            for bad in (
+                "s_bitset0_b64 s[2:3], s[4:5]",
+                "s_bitset0_b64 s[2:3], vcc",
+                "s_bitset1_b64 s[2:3], s[4:5]",
+            ):
+                res = subprocess.run(
+                    [llvm_mc, "-triple=amdgcn--", "-mcpu=gfx1013", "-show-encoding"],
+                    input=bad + "\n",
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertNotEqual(res.returncode, 0, f"Expected failure for {bad}")
 
 
 if __name__ == "__main__":

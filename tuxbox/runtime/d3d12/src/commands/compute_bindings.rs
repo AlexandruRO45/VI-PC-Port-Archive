@@ -11,6 +11,7 @@ use windows::core::{IUnknown, Result};
 pub(super) struct Bindings {
     pub(super) pipeline: Option<Pipeline>,
     pub(super) draw_trace: Option<Arc<crate::diagnostics::RasterDraw>>,
+    pub(super) null_usage: Option<Arc<crate::diagnostics::null_usage::Tag>>,
     heaps: Vec<Option<ID3D12DescriptorHeap>>,
     compute: Option<ID3D12RootSignature>,
     layout: Option<RootSource>,
@@ -117,6 +118,7 @@ impl Bindings {
         Self {
             pipeline: initial.map(Pipeline::from),
             draw_trace: initial.and_then(|p| p.state.draw_trace.clone()),
+            null_usage: initial.and_then(|p| p.state.null_usage.clone()),
             ..Default::default()
         }
     }

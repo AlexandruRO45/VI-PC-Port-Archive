@@ -2,12 +2,12 @@
   "schema": 1,
   "date_utc": "2026-11-24",
   "executable_sha256": "e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993",
-  "compiler_sha256": "e3cf4748bd75991c06ea48b06f82bf6cedf5ada3998d26bf1b1333d2fa106e6d",
-  "log_sha256": "6223d74b5cc74e40dbe0dfb11c0a96db6daaafe608e548f177bbccbc8e6721f5",
+  "compiler_sha256": "a6e8ec309bd27b45ac04eb293bb290cf1f30c9e47a37e55885a85c682244efec",
+  "log_sha256": "ebc7c88979521c201bb78b349fc695e475b063c0ea40885d68cea7d0b35d0e63",
   "requests": {
-    "total": 11429,
-    "compiled": 2755,
-    "unsupported": 8674,
+    "total": 16025,
+    "compiled": 6487,
+    "unsupported": 9538,
     "failed": 0
   },
   "mesh_pipelines": {

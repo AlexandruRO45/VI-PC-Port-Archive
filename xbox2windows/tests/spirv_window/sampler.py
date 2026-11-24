@@ -217,6 +217,27 @@ def check_sampler_tables(source, folder, assembler, validator, cross):
     assert split_sampler_views(not_samplers) == not_samplers
 
 
+def check_query_lod(source, folder, assembler, validator, cross):
+    """A level-of-detail query is an ordinary use: the table keeps a SamplerState for it."""
+    sample = "%raw = OpImageSampleImplicitLod %vec4 %si %uv"
+    query = "%lodv = OpImageQueryLod %vec2 %si %uv\n%raw = OpVectorShuffle %vec4 %lodv %lodv 0 1 0 1"
+    module = source.replace(sample, query).replace("OpCapability Shader", "OpCapability Shader\nOpCapability ImageQuery")
+    assert module != source and "OpImageSample" not in module.replace("OpImageSampleDref", "")
+    lines = split_sampler_views(module).splitlines()
+    assert "%bridge_cmp = OpVariable %_ptr_UC_rt_smp UniformConstant" in lines, lines
+    assert "%lodv = OpImageQueryLod %vec2 %si %uv" in lines
+    # A query whose sampled image is not a direct OpSampledImage may reach any table, as for a sample.
+    copied = module.replace("%lodv = OpImageQueryLod %vec2 %si %uv",
+                            "%sc = OpCopyObject %pair %si\n%lodv = OpImageQueryLod %vec2 %sc %uv")
+    assert any(line.startswith("%bridge_cmp = ") for line in split_sampler_views(copied).splitlines())
+    hlsl = emit_checked(split_sampler_views(module), folder, assembler, validator, cross)
+    call = re.search(r"CalculateLevelOfDetail\w*\(\s*(\w+)\[", hlsl)
+    assert call, hlsl
+    assert re.search(rf"SamplerState {call.group(1)}\[", hlsl), hlsl
+    assert re.search(r"SamplerComparisonState \w+\[2\] : register\(s1, space3\)", hlsl), hlsl
+    return folder / "query.hlsl", hlsl
+
+
 def emit(folder, assembler, validator, cross, pixel=False, variant=None):
     original = Path(__file__).with_name("sampler.spvasm")
     if pixel:
@@ -269,11 +290,16 @@ if __name__ == "__main__":
             pixel = emit(folder, *sys.argv[1:4], pixel=True, variant=variant)
             if len(sys.argv) > 4:
                 subprocess.run([sys.argv[4], "-T", "ps_6_0", "-E", "main", "-Fo", pixel.with_suffix(".dxil"), pixel], check=True)
+            if variant is None:
+                query, text = check_query_lod((folder / "pixel.spvasm").read_text(), folder, *sys.argv[1:4])
+                if len(sys.argv) > 4:
+                    query.write_text(text)
+                    subprocess.run([sys.argv[4], "-T", "ps_6_0", "-E", "main", "-Fo", query.with_suffix(".dxil"), query], check=True)
             hlsl = emit(folder, *sys.argv[1:4], variant=variant)
             if len(sys.argv) > 4:
                 dxil = hlsl.with_suffix(".dxil")
                 subprocess.run([sys.argv[4], "-T", "cs_6_0", "-E", "main", "-Fo", dxil, hlsl], check=True)
                 # The renamed table is read back exactly as the original is: same slots, same expected words.
                 status |= subprocess.run([sys.argv[5], sys.argv[6], "--spirv-sampler-views", dxil]).returncode
-    print("sampler views: plain and renamed tables validated; controls passed")
+    print("sampler views: plain and renamed tables and a level-of-detail query validated; controls passed")
     sys.exit(status)

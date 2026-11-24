@@ -26,6 +26,23 @@ using Microsoft::WRL::ComPtr;
 namespace {
 constexpr UINT entry_constants = 4;  // ud0..ud3 of the fixture's manifest
 constexpr UINT side = 2;
+// The mip fixture: a 4x4 array of two slices with three mip levels (4x4, 2x2, 1x1).
+constexpr UINT mip_base = 4;
+constexpr UINT max_levels = 3;
+
+// The value at texel (x, y) of slice s and mip level m. One level keeps the 2x2x2 fixture's values. With
+// several levels every (slice, mip, x, y) cell is distinct: the red channel is a dyadic fraction and
+// alpha is s + 2m, so exchanging slice and mip, or reading another level, changes the colour.
+void texel_value(UINT x, UINT y, UINT s, UINT m, UINT levels, float out[4])
+{
+    if (levels == 1) {
+        const float one[4] = {(1.0f + x + 2.0f * y + 4.0f * s) / 8.0f, float(x), float(y), float(s)};
+        std::memcpy(out, one, sizeof(one));
+        return;
+    }
+    const float many[4] = {(1.0f + x + 4.0f * y + 16.0f * s + 32.0f * m) / 128.0f, float(x), float(y), float(s + 2 * m)};
+    std::memcpy(out, many, sizeof(many));
+}
 
 std::vector<char> read_blob(const char* path)
 {
@@ -36,11 +53,8 @@ std::vector<char> read_blob(const char* path)
     return bytes;
 }
 
-ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const char* sampler_line)
+ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const x2w_startup::TranslatedSamplers& samplers)
 {
-    x2w_startup::TranslatedSamplers samplers;
-    if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1)
-        throw std::runtime_error("Expected one inline sampler in the image 3D draw");
     ComPtr<ID3D12RootSignature> root;
     check(x2w_startup::create_translated_root(device, entry_constants, 1, samplers, &root),
           "Create translated image 3D root signature");
@@ -48,12 +62,23 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const char* sample
 }
 }  // namespace
 
+// array: the same eight texels as two slices of a 2D array (dim:SQ_RSRC_IMG_2D_ARRAY); the default
+// view of a two-slice texture is a Texture2DArray over both. levels (array only, 1 or 3): the array is
+// 4x4 with that many mip levels, and the default view spans all of them. When sampler_line is a
+// comparison sampler (smpc), the texture uses DXGI_FORMAT_R32_FLOAT holding the red channel as depth.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
-                            float color[4], const char* sampler_line)
+                            float color[4], const char* sampler_line, bool array, UINT levels, bool one_dimensional)
 {
+    if (levels < 1 || levels > max_levels || (levels > 1 && !array))
+        throw std::runtime_error("Unsupported image mip level count");
+    const UINT base = levels > 1 ? mip_base : side;
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
-    const auto root = create_root(device, sampler_line);
+    x2w_startup::TranslatedSamplers samplers;
+    if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1)
+        throw std::runtime_error("Expected one inline sampler in the image 3D draw");
+    const bool comparison = !samplers.comparison.empty() && samplers.comparison[0];
+    const auto root = create_root(device, samplers);
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = root.Get();
@@ -72,30 +97,41 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)), "Create image 3D PSO");
 
     D3D12_RESOURCE_DESC td{};
-    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-    td.Width = side;
-    td.Height = side;
-    td.DepthOrArraySize = side;
-    td.MipLevels = 1;
-    td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    td.Dimension = one_dimensional ? D3D12_RESOURCE_DIMENSION_TEXTURE1D : array ? D3D12_RESOURCE_DIMENSION_TEXTURE2D : D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    td.Width = base;
+    td.Height = one_dimensional ? 1 : base;
+    td.DepthOrArraySize = one_dimensional ? 1 : side;
+    td.MipLevels = levels;
+    td.Format = comparison ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
     td.SampleDesc.Count = 1;
     const auto texture = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    // A volume is one subresource of two slices; an array is two subresources of one slice each.
+    // The subresource of slice s and mip m is m + s * levels.
+    const UINT subresources = array ? side * levels : 1;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[side * max_levels]{};
     UINT64 upload_size = 0;
-    device->GetCopyableFootprints(&td, 0, 1, 0, &footprint, nullptr, nullptr, &upload_size);
+    device->GetCopyableFootprints(&td, 0, subresources, 0, footprints, nullptr, nullptr, &upload_size);
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint = footprints[0];
     const auto upload = make_buffer(device, upload_size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     void* mapped = nullptr;
     const D3D12_RANGE none{0, 0};
     check(upload->Map(0, &none, &mapped), "Map image 3D texels");
-    auto* base = static_cast<std::uint8_t*>(mapped) + footprint.Offset;
+    auto* const start = static_cast<std::uint8_t*>(mapped);
     const UINT slice_pitch = footprint.Footprint.RowPitch * footprint.Footprint.Height;
-    for (UINT tz = 0; tz < side; ++tz)
-        for (UINT ty = 0; ty < side; ++ty)
-            for (UINT tx = 0; tx < side; ++tx) {
-                const float texel[4] = {(1.0f + tx + 2.0f * ty + 4.0f * tz) / 8.0f, float(tx), float(ty), float(tz)};
-                std::memcpy(base + tz * slice_pitch + ty * footprint.Footprint.RowPitch + tx * sizeof(texel), texel,
-                            sizeof(texel));
-            }
+    for (UINT tz = 0; tz < td.DepthOrArraySize; ++tz)
+        for (UINT level = 0; level < levels; ++level) {
+            const UINT extent = base >> level;
+            const auto& place = array ? footprints[level + tz * levels] : footprint;
+            for (UINT ty = 0; ty < (one_dimensional ? 1u : extent); ++ty)
+                for (UINT tx = 0; tx < extent; ++tx) {
+                    float texel[4];
+                    texel_value(tx, ty, tz, level, levels, texel);
+                    if (one_dimensional) texel[3] = tx ? 0.75f : 0.5f;
+                    auto* const slice = array ? start + place.Offset : start + place.Offset + tz * slice_pitch;
+                    const UINT texel_bytes = comparison ? sizeof(float) : sizeof(texel);
+                    std::memcpy(slice + ty * place.Footprint.RowPitch + tx * texel_bytes, texel, texel_bytes);
+                }
+        }
     upload->Unmap(0, nullptr);
 
     D3D12_RESOURCE_DESC rd{};
@@ -125,10 +161,13 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
 
     ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     auto* list = commands.list.Get();
-    D3D12_TEXTURE_COPY_LOCATION to{texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-    D3D12_TEXTURE_COPY_LOCATION from{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    from.PlacedFootprint = footprint;
-    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    for (UINT i = 0; i < subresources; ++i) {
+        D3D12_TEXTURE_COPY_LOCATION to{texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        to.SubresourceIndex = i;
+        D3D12_TEXTURE_COPY_LOCATION from{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        from.PlacedFootprint = footprints[i];
+        list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    }
     transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
     list->SetGraphicsRootSignature(root.Get());
@@ -158,5 +197,5 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     check(readback->Map(0, &read, &mapped), "Map image 3D readback");
     std::memcpy(color, static_cast<std::uint8_t*>(mapped) + target_footprint.Offset, 4 * sizeof(float));
     readback->Unmap(0, &none);
-    std::printf("startup_image_3d z=%g color=(%g, %g, %g, %g)\n", z, color[0], color[1], color[2], color[3]);
+    std::printf("startup_image_%s z=%g color=(%g, %g, %g, %g)\n", array ? "2d_array" : "3d", z, color[0], color[1], color[2], color[3]);
 }

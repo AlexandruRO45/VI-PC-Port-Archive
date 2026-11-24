@@ -32,9 +32,13 @@ SAMPLE_CALLS = {
     "image_sample_lz": "SampleLevel(samp,uv,0)",
 }
 # The explicit-level form takes the level as a third address register after the
-# two coordinates. Only a register copied from a buffered float is modeled, so
-# the level is a GPU resource like the other comparison inputs.
+# two coordinates. The biased form takes the bias as the first address register,
+# before them (bias, s, t). Only a register copied from a buffered float is
+# modeled for either, so the value is a GPU resource like the other comparison
+# inputs.
 LEVEL_SAMPLE = "image_sample_l"
+BIAS_SAMPLE = "image_sample_b"
+EXTRA_SAMPLES = {LEVEL_SAMPLE: "SampleLevel", BIAS_SAMPLE: "SampleBias"}
 
 
 def plain(bank, *tokens):
@@ -249,27 +253,29 @@ def lower(decoded, bindings):
             ):
                 raise ValueError("Unresolved move source")
             vector[args[0]] = ("level", source[1])
-        elif op in SAMPLE_CALLS or op == LEVEL_SAMPLE:
+        elif op in SAMPLE_CALLS or op in EXTRA_SAMPLES:
             match = re.fullmatch(
                 r"(v\d+), (v\[\d+:\d+\]), (s\[\d+:\d+\]), (s\[\d+:\d+\]) dmask:0x([1248]) dim:SQ_RSRC_IMG_2D",
                 operands,
             )
             if not match or mask != "quad" or samples:
                 raise ValueError("Unsupported sample")
-            explicit = op == LEVEL_SAMPLE
+            explicit = op in EXTRA_SAMPLES
             coords = regs(match[2], "v", 3 if explicit else 2)
-            if [vector.get(v) for v in coords[:2]] != ["uv.x", "uv.y"]:
+            extra = coords[0] if op == BIAS_SAMPLE else coords[-1]
+            uv_regs = coords[1:] if op == BIAS_SAMPLE else coords[:2]
+            if [vector.get(v) for v in uv_regs] != ["uv.x", "uv.y"]:
                 raise ValueError("Unresolved sample coordinates")
             call = SAMPLE_CALLS.get(op)
             if explicit:
-                level = vector.get(coords[2])
+                level = vector.get(extra)
                 if (
-                    coords[2] in pending_sample
+                    extra in pending_sample
                     or not isinstance(level, tuple)
                     or level[0] != "level"
                 ):
                     raise ValueError("Unresolved sample level")
-                call = f"SampleLevel(samp,uv,{level[1]})"
+                call = f"{EXTRA_SAMPLES[op]}(samp,uv,{level[1]})"
             texture = list(map(read, regs(match[3], "s", 8)))
             descriptor, _ = texture[0]
             if (

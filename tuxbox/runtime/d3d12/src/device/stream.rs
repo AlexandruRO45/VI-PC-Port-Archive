@@ -428,14 +428,21 @@ unsafe fn create(
             let (producer_code, Some(i)) = original[producer]? else {
                 return None;
             };
-            let (pixel_code, Some(j)) = original[1]? else {
+            let (pixel_code, _) = original[1]?;
+            let bound = pixel_bytecode();
+            if bound.pShaderBytecode.is_null() || bound.BytecodeLength == 0
+                || bound.BytecodeLength > 64 * 1024 * 1024 {
                 return None;
-            };
+            }
+            // All original and prepared stages (including a redirected stencil
+            // variant) remain live for the entire synchronous stream call.
+            // Hash and check the actual consumer, not the pre-redirection variant.
+            let consumer = unsafe { slice::from_raw_parts(bound.pShaderBytecode.cast::<u8>(), bound.BytecodeLength) };
             shader_cache::link_on_demand(
                 (source, producer_code),
                 (pixel, pixel_code),
                 &stages[i],
-                &stages[j],
+                consumer,
             )
         })
     {
@@ -470,10 +477,10 @@ unsafe fn create(
             Err(error) => crate::diagnostics::pipeline_stages(&hashes, error.code().0, true),
         }
         if retry.is_ok() { return retry; }
-        return unsafe { null_pipeline(host, &native_desc, &fields, stream_output, geometry_record) }.unwrap_or(retry);
+        return unsafe { null_pipeline(host, &native_desc, &fields, stream_output, geometry_record, pipeline, &hashes) }.unwrap_or(retry);
     }
     crate::diagnostics::pipeline_stages(&hashes, status.0, false);
-    unsafe { null_pipeline(host, &native_desc, &fields, stream_output, geometry_record) }.unwrap_or(initial)
+    unsafe { null_pipeline(host, &native_desc, &fields, stream_output, geometry_record, pipeline, &hashes) }.unwrap_or(initial)
 }
 
 /// Retry a rejected stream with resource-free shaders (see `fallback`). Mesh
@@ -484,6 +491,8 @@ unsafe fn null_pipeline(
     fields: &[Option<*mut D3D12_SHADER_BYTECODE>; 8],
     stream_output: bool,
     geometry: *mut D3D12_SHADER_BYTECODE,
+    state: &mut compute::PipelineData,
+    hashes: &[Option<(String, bool)>; 8],
 ) -> Option<windows::core::Result<ID3D12PipelineState>> {
     use super::fallback::{Stage, bytecode, enabled, shader, substituted};
     if !enabled() || stream_output || fields[6].is_some() || fields[7].is_some() {
@@ -510,8 +519,16 @@ unsafe fn null_pipeline(
         unsafe { geometry.write(D3D12_SHADER_BYTECODE::default()) };
     }
     let result = unsafe { host.CreatePipelineState::<ID3D12PipelineState>(desc) };
-    if let Ok(pipeline) = &result {
-        crate::diagnostics::display::mark_null_pipeline(pipeline.as_raw());
+    if result.is_ok() {
+        if crate::diagnostics::display::enabled() {
+            let stages = ["VS", "PS", "DS", "HS", "GS", "CS", "AS", "MS"].iter().enumerate()
+                .filter(|(i, _)| fields[*i].is_some())
+                .map(|(i, name)| format!("{name}={}", hashes[i].as_ref().map(|(digest, _)| digest.as_str()).unwrap_or("unknown")))
+                .collect::<Vec<_>>().join(" ");
+            state.null_usage = Some(std::sync::Arc::new(crate::diagnostics::null_usage::Tag {
+                kind: if compute { "compute" } else { "raster" }, stages,
+            }));
+        }
         substituted(if compute { "compute stream" } else { "raster stream" });
     }
     Some(result)

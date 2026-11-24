@@ -4,7 +4,7 @@ use super::{Queue, reject};
 use core::{ptr, slice};
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak, mpsc};
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, HANDLE, S_OK};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -114,7 +114,32 @@ impl Mappings {
         })
     }
 
-    fn apply(&self, imports: &HashMap<usize, Range<u64>>) -> Result<()> {
+    /// Record which imported GPU range a remap collided with, so the lifetime
+    /// of imports and remaps can be compared. Bounded; only active with
+    /// `TUXBOX_LOG`, and uses no platform-specific calls.
+    fn report_pinned_overlap(&self, import: &Range<u64>, verdict: HRESULT) {
+        static REPORTED: AtomicUsize = AtomicUsize::new(0);
+        if REPORTED.fetch_add(1, Ordering::Relaxed) >= 24 {
+            return;
+        }
+        let hits: Vec<String> = self
+            .spans
+            .iter()
+            .filter(|r| r.start < import.end && import.start < r.end)
+            .take(3)
+            .map(|r| format!("{:#x}..{:#x}", r.start, r.end))
+            .collect();
+        crate::diagnostics::log(&format!(
+            "page remap replaced imported range {:#x}..{:#x} ({:#x} bytes) retired stale GPU import verdict={verdict:?} batches={} remap spans [{}]",
+            import.start,
+            import.end,
+            import.end - import.start,
+            self.batches.len(),
+            hits.join(", ")
+        ));
+    }
+
+    fn apply(&self, imports: &mut HashMap<usize, Range<u64>>) -> Result<()> {
         let mut batches = Vec::new();
         batches
             .try_reserve_exact(self.batches.len())
@@ -130,17 +155,21 @@ impl Mappings {
                 },
             });
         }
-        let mut overlaps = imports
-            .values()
-            .filter(|import| {
+        let overlapping: Vec<(usize, Range<u64>)> = imports
+            .iter()
+            .filter(|(_, import)| {
                 self.spans
                     .iter()
                     .any(|r| r.start < import.end && import.start < r.end)
             })
-            .peekable();
-        if overlaps.peek().is_some() {
-            // Once Vulkan has imported a page, changing the CPU view cannot
-            // retarget that existing GPU allocation. Identical mappings are safe.
+            .map(|(key, import)| (*key, import.clone()))
+            .collect();
+        // Imports whose backing pages this batch really replaces. A GPU import
+        // keeps the physical pages it was created from, so it cannot follow the
+        // remap. It is retired below; the title's next use of the address
+        // imports the new pages.
+        let mut retired = Vec::new();
+        if !overlapping.is_empty() {
             let module = unsafe { GetModuleHandleW(w!("xmem.dll"))? };
             let validate: ValidatePinned = unsafe {
                 std::mem::transmute(
@@ -148,8 +177,8 @@ impl Mappings {
                         .ok_or(E_NOTIMPL)?,
                 )
             };
-            for import in overlaps {
-                unsafe {
+            for (key, import) in &overlapping {
+                let verdict = unsafe {
                     validate(
                         batches.len() as u32,
                         batches.as_ptr(),
@@ -158,8 +187,15 @@ impl Mappings {
                         import.start,
                         import.end,
                     )
+                };
+                if verdict == E_NOTIMPL {
+                    // E_NOTIMPL means "replaces a pinned page"; identical
+                    // mappings and real errors keep their previous meaning.
+                    self.report_pinned_overlap(import, verdict);
+                    retired.push(*key);
+                } else {
+                    verdict.ok()?;
                 }
-                .ok()?;
             }
         }
         unsafe {
@@ -170,7 +206,11 @@ impl Mappings {
                 self.pages,
             )
         }
-        .ok()
+        .ok()?;
+        for key in retired {
+            imports.remove(&key);
+        }
+        Ok(())
     }
 }
 
@@ -194,6 +234,18 @@ pub(crate) static GPU_APERTURE: LazyLock<Registry> = LazyLock::new(Registry::def
 
 pub(crate) struct ImportPin {
     key: usize,
+}
+impl ImportPin {
+    /// False once a page remap has replaced the pages this import was created
+    /// from. A retired import must not be reused for the address.
+    pub(crate) fn is_live(&self) -> bool {
+        GPU_APERTURE
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .imports
+            .contains_key(&self.key)
+    }
 }
 impl Drop for ImportPin {
     fn drop(&mut self) {
@@ -259,8 +311,8 @@ impl Registry {
         state.pending.push(Arc::downgrade(mapping));
     }
     fn apply(&self, mappings: &Mappings) -> Result<()> {
-        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        mappings.apply(&state.imports)
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        mappings.apply(&mut state.imports)
     }
 }
 

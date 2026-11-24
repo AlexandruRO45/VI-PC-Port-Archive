@@ -61,6 +61,18 @@ fn plan(guest_offset: u64, guest_bytes: u64, total: u64, regions: &[Region]) -> 
     if whole {
         return Some(Plan::Whole);
     }
+    // A single-subresource texture can arrive with its rows padded to an
+    // aligned height (a 128x4 RGBA16 target uploads 0x2000 bytes for a 0x1000
+    // footprint). Only the footprint is read, so accept a tail of at most one
+    // footprint. Larger buffers stay rejected.
+    if let [region] = regions
+        && guest_offset == 0
+        && region.offset == 0
+        && guest_bytes >= region.span
+        && guest_bytes - region.span <= region.span
+    {
+        return Some(Plan::One(region.index));
+    }
     regions
         .iter()
         .find(|region| {
@@ -490,6 +502,13 @@ mod tests {
             plan(2048, 1024, 3072, &regions),
             Some(Plan::One(1))
         ));
+    }
+
+    #[test]
+    fn height_padded_single_subresource_uploads_its_footprint() {
+        let regions = [region(0, 0, 0x1000, 1024)];
+        assert!(matches!(plan(0, 0x2000, 0x1000, &regions), Some(Plan::One(0))));
+        assert!(plan(0, 0x2001, 0x1000, &regions).is_none());
     }
 
     #[test]

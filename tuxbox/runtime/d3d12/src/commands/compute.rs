@@ -113,12 +113,13 @@ pub(super) unsafe extern "system" fn dispatch(list: &List, x: u32, y: u32, z: u3
         state.error = E_INVALIDARG;
         return;
     }
-    if let Some(super::compute_bindings::Pipeline::Regular(pso, ..)) = &state.bindings.pipeline {
-        crate::diagnostics::display::null_dispatch(windows::core::Interface::as_raw(pso), [x, y, z]);
-    }
+    let null_usage = state.bindings.null_usage.clone();
     // SAFETY: the native list remains open under its recording lock.
     state.compute_dispatch(list, || unsafe {
         list.native.Dispatch(x, y, z);
+        if let Some(tag) = &null_usage {
+            crate::diagnostics::display::sample_null_dispatch(tag, [x, y, z]);
+        }
         static FIRST: std::sync::Once = std::sync::Once::new();
         crate::diagnostics::log_once(&FIRST, || format!("recorded Dispatch list={list:p} groups=({x},{y},{z})"));
     });
