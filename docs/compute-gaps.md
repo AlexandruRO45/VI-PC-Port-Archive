@@ -1,5 +1,28 @@
 # What still stops compute shaders
 
+> **The project moved to the adopted base (`fxceless/victory-gta6`, merged at
+> `eb6d3a3`).** The same corpus on that tree, measured the same way
+> (`victory.exe translate D:ictory-scratch\lane-b\containers --list`):
+>
+> | tree | vertex and pixel | compute | mesh | refusal lines |
+> |---|---:|---:|---:|---:|
+> | `e3dac6e`, before PR #5 | 13,022 of 14,031 | 2,452 of 2,611 | 8,381 of 8,713 | 2,034 |
+> | `cap/compute-permute`, with PR #5 | 13,022 of 14,031 | 2,457 of 2,611 | 8,381 of 8,713 | 2,029 |
+> | `eb6d3a3`, the adopted base | **14,140 of 14,247** | **2,663 of 2,682** | **8,762 of 8,765** | **324** |
+>
+> The denominators differ because the adopted translator raises I/O for programs ours
+> refuses earlier; the rates are 99.3 % and 99.97 % there against 92.8 %, 94.1 % and
+> 96.2 % here. What is left there, in corpus order: `an address in an SGPR that is no
+> root parameter` **195** (all geometry), `a descriptor chosen by control flow` 40,
+> `a descriptor read only as data` 40, `an opaque lane mask` 13, `a hardware SGPR input`
+> 10, `the first half of an interpolation` 8, and single digits below that. The 195
+> geometry programs are the largest emitter gap on the adopted base and they are the
+> same family this document counts as 195 — the ranking carries over even though the
+> numbers do not.
+>
+> Everything below is the measurement of **our** tree and is kept for what it says about
+> each refusal's mechanism, not as a to-do list against the adopted base.
+
 Measured on branch `cap/compute-permute` (rebased onto `fork/main` `61ca6fe`) from its
 own worktree, over lane B's container corpus:
 
