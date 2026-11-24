@@ -15,11 +15,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 const HELP: &str = "\
-xcl pipelines <game folder | title data folder | pipelines.bin> [--watch] [--threads N] [--limit N]
+xcl pipelines <game folder | title data folder | pipelines.bin> [--watch] [--threads N] [--limit N] [--shard k/n]
   Compiles the pipelines a run of the title asked for (<data>\\cache\\pipelines.bin) outside
   the title: the DXIL cache and the driver's cache. --watch: also while the title runs,
   following what it adds (stop with Ctrl+C). --threads: pipelines at once (default: half the
-  cores, at below-normal priority; XCL_PIPELINE_THREADS caps the driver compiles, default 4, 2 with --watch).";
+  cores, at below-normal priority; XCL_PIPELINE_THREADS caps the driver compiles, default 4, 2 with --watch).
+  --shard k/n: this process takes the k-th of n shares of the journal, with its own .done and
+  .trying; run n processes (1/n .. n/n) so the driver's compiles are not serialized in one.";
 
 /// The journal of `target`: the file itself, a data folder with one, or a game folder.
 fn journal_of(target: &Path) -> Result<PathBuf, String> {
@@ -105,9 +107,16 @@ struct Queue {
     buf: Vec<u8>,
     parsed: usize,
     closed: bool,
+    /// `--shard k/n`: only the pipelines whose hash % n is k - 1 (as (k - 1, n))
+    shard: Option<(u64, u64)>,
 }
 
 impl Queue {
+    /// In this process's share (`--shard`), or no shards.
+    fn mine(&self, h: u64) -> bool {
+        self.shard.is_none_or(|(k, n)| h % n == k)
+    }
+
     /// Read what was added to the journal; the new work.
     fn ingest(&mut self, file: &mut std::fs::File) -> usize {
         // a torn last frame may be cut and written over by the next run: read it again
@@ -169,7 +178,7 @@ impl Queue {
 
     fn next(&mut self) -> Option<(u64, Option<Replay>)> {
         while let Some(h) = self.used.pop_front().or_else(|| self.rest.pop_front()) {
-            if !self.taken.insert(h) {
+            if !self.mine(h) || !self.taken.insert(h) {
                 continue;
             }
             let (tag, payload) = self.pipes.get(&h)?.clone();
@@ -180,7 +189,10 @@ impl Queue {
     }
 
     fn left(&self) -> usize {
-        self.used.len() + self.rest.len()
+        if self.shard.is_none() {
+            return self.used.len() + self.rest.len();
+        }
+        self.used.iter().chain(self.rest.iter()).filter(|&&h| self.mine(h)).count()
     }
 }
 
@@ -192,6 +204,18 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok());
     let watch = args.iter().any(|a| a == "--watch");
     let limit = opt("--limit").unwrap_or(usize::MAX);
+    // `--shard k/n`: one of n processes on the journal, with its own `.done` / `.trying` (NVIDIA's
+    // driver builds about one pipeline at a time per process, however many threads ask)
+    let shard = match args.iter().position(|a| a == "--shard").map(|i| args.get(i + 1)) {
+        None => None,
+        Some(v) => match v.and_then(|v| v.split_once('/')).and_then(|(k, n)| Some((k.trim().parse::<u64>().ok()?, n.trim().parse::<u64>().ok()?))) {
+            Some((k, n)) if n >= 1 && (1..=n).contains(&k) => Some((k - 1, n)),
+            _ => {
+                eprintln!("xcl pipelines: --shard takes k/n with 1 <= k <= n, e.g. --shard 1/4");
+                return 2;
+            }
+        },
+    };
     let journal = match journal_of(target) {
         Ok(j) => j,
         Err(e) => {
@@ -229,9 +253,14 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    let q = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
+    let q = Arc::new((Mutex::new(Queue { shard, ..Default::default() }), Condvar::new()));
+    // a shard keeps its own `.done` / `.trying` (`pipelines.shard2of4.done`)
+    let ext = |e: &str| match shard {
+        Some((k, n)) => format!("shard{}of{n}.{e}", k + 1),
+        None => e.to_string(),
+    };
     // what an earlier run of this binary finished
-    let done_path = journal.with_extension("done");
+    let done_path = journal.with_extension(ext("done"));
     let key = binary_key(gpu_key);
     let mut done_file = match open_done(&done_path, key) {
         Ok((f, done)) => {
@@ -245,7 +274,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     };
     // what a run that crashed (in the driver or DXC) was making: left to the title, so the same
     // pipeline does not end every run (a run the user stopped removes the file)
-    let trying_path = journal.with_extension("trying");
+    let trying_path = journal.with_extension(ext("trying"));
     let crashed: Vec<u64> = {
         let t = std::fs::read(&trying_path).unwrap_or_default();
         let mut g = q.0.lock().unwrap();
@@ -286,6 +315,9 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             if g.windows & 0x80 != 0 { " (from the descriptor heap)" } else { "" },
             if watch { "; following the journal (Ctrl+C stops)" } else { "" }
         );
+        if let Some((k, n)) = shard {
+            println!("shard {}/{n}: {} of them are this process's", k + 1, g.left());
+        }
     }
 
     let t0 = std::time::Instant::now();
@@ -577,5 +609,23 @@ mod tests {
         assert!(q.next().is_none(), "each pipeline once");
         drop(f);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn shards_split_the_pipelines_without_overlap() {
+        let hashes: Vec<u64> = (0..1000u64).map(|k| k.wrapping_mul(0x9e37_79b9_7f4a_7c15)).collect();
+        let mut seen = HashSet::new();
+        for k in 0..4 {
+            let q = Queue { shard: Some((k, 4)), rest: hashes.iter().copied().collect(), ..Default::default() };
+            let mine: Vec<u64> = hashes.iter().copied().filter(|&h| q.mine(h)).collect();
+            assert_eq!(q.left(), mine.len());
+            assert!(mine.len() > 150, "shard {k} gets a fair share ({})", mine.len());
+            for h in mine {
+                assert!(seen.insert(h), "a pipeline in two shards");
+            }
+        }
+        assert_eq!(seen.len(), hashes.len(), "every pipeline in a shard");
+        let all = Queue { rest: hashes.iter().copied().collect(), ..Default::default() };
+        assert_eq!(all.left(), hashes.len());
     }
 }
