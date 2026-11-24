@@ -459,14 +459,14 @@ pub(crate) fn cache_stats() -> (usize, u64, usize, u64) {
     let (registered_count, registered_bytes) = buffers()
         .values()
         .filter_map(|entry| entry.shadow.as_ref())
-        .fold((0, 0), |(count, bytes), shadow| {
+        .fold((0usize, 0u64), |(count, bytes), shadow| {
             (count + 1, bytes.saturating_add(shadow.len))
         });
     let (loose_count, loose_bytes) = LOOSE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values()
-        .fold((0, 0), |(count, bytes), shadow| {
+        .fold((0usize, 0u64), |(count, bytes), shadow| {
             (count + 1, bytes.saturating_add(shadow.len))
         });
     (registered_count, registered_bytes, loose_count, loose_bytes)
