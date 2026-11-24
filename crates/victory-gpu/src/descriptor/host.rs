@@ -1096,7 +1096,10 @@ fn buffer_srv(
     {
         // SAFETY: a buffer view's union member.
         let b = unsafe { &mut desc.Anonymous.Buffer };
-        if b.StructureByteStride > 0 && b.StructureByteStride.is_multiple_of(4) && b.Flags == D3D12_BUFFER_SRV_FLAG_NONE {
+        // Only where the view's first byte is 16-byte aligned (a raw view's rule); otherwise the
+        // structured view stays (raw reads through it address bytes on AMD hardware).
+        let start = address.wrapping_add(b.FirstElement.wrapping_mul(u64::from(b.StructureByteStride)));
+        if b.StructureByteStride > 0 && b.StructureByteStride.is_multiple_of(4) && b.Flags == D3D12_BUFFER_SRV_FLAG_NONE && start.is_multiple_of(16) {
             let stride = u64::from(b.StructureByteStride);
             b.FirstElement = b.FirstElement * stride / 4;
             b.NumElements = (u64::from(b.NumElements) * stride / 4) as u32;
@@ -1158,7 +1161,8 @@ fn buffer_uav(
     {
         // SAFETY: a buffer view's union member.
         let b = unsafe { &mut desc.Anonymous.Buffer };
-        if b.StructureByteStride > 0 && b.StructureByteStride.is_multiple_of(4) && b.Flags == D3D12_BUFFER_UAV_FLAG_NONE && b.CounterOffsetInBytes == 0 {
+        let start = address.wrapping_add(b.FirstElement.wrapping_mul(u64::from(b.StructureByteStride)));
+        if b.StructureByteStride > 0 && b.StructureByteStride.is_multiple_of(4) && b.Flags == D3D12_BUFFER_UAV_FLAG_NONE && b.CounterOffsetInBytes == 0 && start.is_multiple_of(16) {
             let stride = u64::from(b.StructureByteStride);
             b.FirstElement = b.FirstElement * stride / 4;
             b.NumElements = (u64::from(b.NumElements) * stride / 4) as u32;
