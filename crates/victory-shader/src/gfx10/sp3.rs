@@ -1202,4 +1202,138 @@ mod tests {
         assert_eq!(pk(0, 3, 1, 1), "v_pk_add_f16 v1, -v2, v3");
         assert_eq!(pk(1, 3, 2, 2), "v_pk_add_f16 v1, sel_hi(v2), -v3");
     }
+
+    /// Export targets by range: render targets 0-7, depth, null, positions
+    /// 0-3, the primitive and parameters 0-31 are named; the gaps between
+    /// them (10-11, 16-19, 21-31) keep their number. A disabled channel is
+    /// `off`, and an export without `done` writes no flag.
+    #[test]
+    fn export_targets_name_each_range_at_its_bounds() {
+        // EXP: 0xF800_0000 | vm << 12 | done << 11 | target << 4 | en.
+        let target = |t: u32| {
+            one(&[0xF800_0801 | t << 4, 0x0000_0002], true)
+                .strip_prefix("exp ")
+                .and_then(|t| t.strip_suffix(", v2, off, off, off done"))
+                .unwrap()
+                .to_owned()
+        };
+        let names: Vec<String> = [0, 7, 8, 9, 10, 11, 12, 15, 16, 19, 20, 21, 31, 32, 63]
+            .into_iter()
+            .map(target)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "mrt0",
+                "mrt7",
+                "mrtz",
+                "null",
+                "<target 10>",
+                "<target 11>",
+                "pos0",
+                "pos3",
+                "<target 16>",
+                "<target 19>",
+                "prim",
+                "<target 21>",
+                "<target 31>",
+                "param0",
+                "param31",
+            ]
+        );
+        // Channels 0 and 2 enabled, each reading its own byte of dword 1.
+        assert_eq!(
+            one(&[0xF800_0005, 0x0403_0201], true),
+            "exp mrt0, v1, off, v3, off"
+        );
+    }
+
+    /// A single-address LDS access joins both offset bytes into one 16-bit
+    /// offset; a paired access (`read2`, `write2`) names each byte on its own
+    /// and only when nonzero. `gds` follows the offsets either way.
+    #[test]
+    fn ds_offsets_join_for_one_address_and_split_for_a_pair() {
+        // DS: 0xD800_0000 | op << 18 | gds << 17 | offset1 << 8 | offset0.
+        let ds = |op: u32, o0: u32, o1: u32, gds: u32, w1: u32| {
+            one(
+                &[0xD800_0000 | op << 18 | gds << 17 | o1 << 8 | o0, w1],
+                true,
+            )
+        };
+        // ds_read_b32 (0x36): v6 from the address in v1.
+        assert_eq!(
+            ds(0x36, 0x02, 0x03, 0, 0x0600_0001),
+            "ds_read_b32 v6, v1 offset:770"
+        );
+        assert_eq!(
+            ds(0x36, 0x00, 0xFF, 0, 0x0600_0001),
+            "ds_read_b32 v6, v1 offset:65280"
+        );
+        assert_eq!(
+            ds(0x36, 0xFF, 0xFF, 0, 0x0600_0001),
+            "ds_read_b32 v6, v1 offset:65535"
+        );
+        assert_eq!(
+            ds(0x36, 0x00, 0x00, 1, 0x0600_0001),
+            "ds_read_b32 v6, v1 gds"
+        );
+        // ds_write_b32 (0x0D): address v1, data v2.
+        assert_eq!(
+            ds(0x0D, 0x04, 0x00, 0, 0x0000_0201),
+            "ds_write_b32 v1, v2 offset:4"
+        );
+        // ds_write2_b32 (0x0E): address v1, data v2 and v3.
+        assert_eq!(
+            ds(0x0E, 0x00, 0xFF, 0, 0x0003_0201),
+            "ds_write2_b32 v1, v2, v3 offset1:255"
+        );
+        assert_eq!(
+            ds(0x0E, 0x01, 0x00, 1, 0x0003_0201),
+            "ds_write2_b32 v1, v2, v3 offset0:1 gds"
+        );
+        assert_eq!(
+            ds(0x0E, 0x00, 0x00, 0, 0x0003_0201),
+            "ds_write2_b32 v1, v2, v3"
+        );
+    }
+
+    /// FLAT's instruction offset is 11 unsigned bits (bit 11 is not part of
+    /// it); global and scratch take 12 signed bits, so 0x800 is -2048. A
+    /// global access with an SGPR base takes a 32-bit VGPR offset, and a
+    /// scratch access with one takes no VGPR at all: its address is `off`.
+    #[test]
+    fn flat_offsets_and_addresses_follow_the_segment() {
+        // FLAT: 0xDC00_0000 | op << 18 | seg << 14 | offset.
+        let fl = |op: u32, seg: u32, off: u32, w1: u32| {
+            one(&[0xDC00_0000 | op << 18 | seg << 14 | off, w1], true)
+        };
+        // *_load_dword (12) into v3 from v1, SGPR base s4.
+        assert_eq!(fl(12, 0, 0, 0x0300_0001), "flat_load_dword v3, v[1:2]");
+        assert_eq!(
+            fl(12, 0, 0xFFF, 0x0300_0001),
+            "flat_load_dword v3, v[1:2] inst_offset:2047"
+        );
+        assert_eq!(
+            fl(12, 2, 0x7FF, 0x0304_0001),
+            "global_load_dword v3, v1, s[4:5] inst_offset:2047"
+        );
+        assert_eq!(
+            fl(12, 2, 0x800, 0x0304_0001),
+            "global_load_dword v3, v1, s[4:5] inst_offset:-2048"
+        );
+        assert_eq!(
+            fl(12, 2, 0xFFF, 0x0304_0001),
+            "global_load_dword v3, v1, s[4:5] inst_offset:-1"
+        );
+        assert_eq!(
+            fl(12, 1, 8, 0x0304_0001),
+            "scratch_load_dword v3, off, s4 inst_offset:8"
+        );
+        // *_store_dword (28) of v2.
+        assert_eq!(fl(28, 1, 0, 0x0004_0201), "scratch_store_dword off, v2, s4");
+        assert_eq!(
+            fl(28, 2, 0, 0x0004_0201),
+            "global_store_dword v1, v2, s[4:5]"
+        );
+    }
 }
