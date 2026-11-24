@@ -5710,7 +5710,7 @@ def check_int16_vop3_controls():
     for line in ("v_add_nc_u16 v24, v18, v19 op_sel:[0,0,1]", "v_add_nc_u16 v24, v18, v19 clamp",
                  "v_add_nc_u16_dpp v24, v18, v19 quad_perm:[0,1,2,3]",
                  "v_add_nc_u16_sdwa v24, v18, v19 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0",
-                 "v_min_f16_e64 v24, v18, v19"):
+                 "v_min_f64_e64 v24, v18, v19"):
         refuse(line, "Unsupported instruction")
     refuse("v_add_nc_u16 v24, v18, -v19", "Unsupported 16-bit integer operand")
     refuse("v_add_nc_u16 v24, v18, 1.0", "Unsupported 16-bit integer operand")
@@ -10593,8 +10593,8 @@ def check_f16_arith_controls():
     for line in ("v_add_f16_e64 v24, v18, v19 clamp", "v_mul_f16_e64 v24, v18, v19 mul:2", "v_mul_f16_e64 v24, v18, v19 div:2",
                  "v_add_f16_e64 v24, v18, v19 op_sel:[0,1]", "v_add_f16_dpp v24, v18, v19 quad_perm:[0,1,2,3]",
                  "v_add_f16_sdwa v24, v18, v19 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0",
-                 "v_add_f16 v24, v18, v19, v19", "v_add_f16 v24, v18", "v_min_f16_e64 v24, v18, v19",
-                 "v_max_f16_e32 v24, v18, v19"):
+                 "v_add_f16 v24, v18, v19, v19", "v_add_f16 v24, v18", "v_min_f64_e64 v24, v18, v19",
+                 "v_max_f64_e32 v24, v18, v19"):
         refuse(line, "Unsupported instruction")
 
     # Scheduling around the load and the samples: a pending SGPR, an outstanding sample, a non-entry mask.
@@ -11423,8 +11423,8 @@ def check_f16_round_controls():
                  "v_floor_f16_e64 v24, -v18 clamp", "v_floor_f16_e32 v24, v18 clamp",
                  "v_floor_f16_dpp v24, v18 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
                  "v_floor_f16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
-                 "v_floor_f16 v24, v18, v19", "v_floor_f16 v24", "v_fract_f16_e32 v24, v18", "v_rcp_f16_e32 v24, v18",
-                 "v_sqrt_f16_e64 v24, v18", "v_fract_f16_e64 v24, v18"):
+                 "v_floor_f16 v24, v18, v19", "v_floor_f16 v24", "v_fract_f64 v24, v18", "v_rcp_f16_e32 v24, v18",
+                 "v_sqrt_f16_e64 v24, v18", "v_cos_f64 v24, v18"):
         refuse(line, "Unsupported instruction")
 
     # Scheduling around the load and the samples: a pending SGPR, an outstanding sample, a non-entry mask.
@@ -12284,6 +12284,78 @@ def check_f16_to_int_controls():
         expect_value_error(translate_f16, export, "Unsupported export")
 
 
+def check_f16_algebraic_controls():
+    """Lowering, spelling, modifiers, clamp, half16 destination tracking and reader refusals of binary16 fract, min, max."""
+    prefix = ["v_mov_b32_e32 v16, 0x3e00", "v_mov_b32_e32 v18, 0x3c00"]
+
+    def program(*lines):
+        return uncompressed_export([*prefix, *lines])
+
+    def refuse(line, message, translator=translate_f16):
+        expect_value_error(translator, program(line), message)
+
+    # Positive translations:
+    spelled_fract = [translate_f16(program(f"v_fract_f16{s} v24, v16")) for s in ("", "_e32", "_e64")]
+    assert spelled_fract[0] == spelled_fract[1] == spelled_fract[2]
+    body = spelled_fract[0].split("uint4 main", 1)[1]
+    assert "fract16(" in body and "narrow16(" in body and "precise float hs" in body
+
+    # VOP3 clamp and modifiers
+    fract_clamp = translate_f16(program("v_fract_f16_e64 v24, -|v16| clamp"))
+    assert "saturate(fract16((-abs(widen16(asuint(" in fract_clamp
+
+    spelled_min = [translate_f16(program(f"v_min_f16{s} v24, v16, v18")) for s in ("", "_e32", "_e64")]
+    assert spelled_min[0] == spelled_min[1] == spelled_min[2]
+    assert "min16_num(" in spelled_min[0]
+
+    min_clamp = translate_f16(program("v_min_f16_e64 v24, -v16, |v18| clamp"))
+    assert "saturate(min16_num((-widen16(asuint(" in min_clamp
+
+    spelled_max = [translate_f16(program(f"v_max_f16{s} v24, v16, v18")) for s in ("", "_e32", "_e64")]
+    assert spelled_max[0] == spelled_max[1] == spelled_max[2]
+    assert "max16_num(" in spelled_max[0]
+
+    # Subsequent readers:
+    # half16 can be read via SDWA WORD_0 into a numeric register:
+    sdwa_read = translate_f16(program("v_fract_f16 v24, v16", "v_cvt_f32_f16_sdwa v0, v24 dst_sel:DWORD dst_unused:UNUSED_PRESERVE src0_sel:WORD_0"))
+    assert "widen16(" in sdwa_read and "asuint(alu" in sdwa_read
+
+    # half16 read directly by unaudited readers without SDWA extraction is refused:
+    expect_value_error(translate_f16, program("v_fract_f16 v24, v16", "v_cmp_lt_f16_e32 vcc_lo, v24, v18"),
+                       "Expected a numeric register")
+    expect_value_error(translate_f16, program("v_fract_f16 v24, v16", "v_min_f16 v24, v24, v18"),
+                       "Expected a numeric register")
+
+    # Negative controls:
+    # R0Y00's exact negative control: WORD_1 SDWA read of unwritten high half after half16
+    expect_value_error(translate_f16, program("v_fract_f16 v24, v16", "v_cvt_f32_f16_sdwa v0, v24 dst_sel:DWORD dst_unused:UNUSED_PRESERVE src0_sel:WORD_1"),
+                       "Reads the undefined high half of a 16-bit result")
+    expect_value_error(translate_f16, program("v_min_f16 v24, v16, v18", "v_cvt_f32_f16_sdwa v0, v24 dst_sel:DWORD dst_unused:UNUSED_PRESERVE src0_sel:WORD_1"),
+                       "Reads the undefined high half of a 16-bit result")
+    expect_value_error(translate_f16, program("v_fract_f16 v24, v16", "v_mov_b32_sdwa v0, v24 dst_sel:DWORD dst_unused:UNUSED_PRESERVE src0_sel:WORD_1"),
+                       "Reads the undefined high half of a 16-bit result")
+
+    # Clamp requires VOP3 encoding:
+    refuse("v_fract_f16_e32 v24, v16 clamp", "Clamp requires VOP3 encoding")
+    refuse("v_min_f16_e32 v24, v16, v18 clamp", "Clamp requires VOP3 encoding")
+    refuse("v_max_f16_e32 v24, v16, v18 clamp", "Clamp requires VOP3 encoding")
+
+    # Modifiers require VOP3 encoding:
+    refuse("v_fract_f16_e32 v24, -v16", "Input modifiers require VOP3 encoding")
+    refuse("v_fract_f16_e32 v24, |v16|", "Input modifiers require VOP3 encoding")
+    refuse("v_min_f16_e32 v24, -v16, v18", "Input modifiers require VOP3 encoding")
+    refuse("v_min_f16_e32 v24, v16, -v18", "Binary16 e32 src1 must be a VGPR")
+    refuse("v_min_f16_e32 v24, v16, s45", "Binary16 e32 src1 must be a VGPR")
+
+    # Register out of range:
+    refuse("v_fract_f16 v256, v16", "Register out of range")
+    refuse("v_min_f16 v256, v16, v18", "Register out of range")
+
+    # Unsupported instructions:
+    refuse("v_fract_f64 v24, v16", "Unsupported instruction")
+    refuse("v_min_f64 v24, v16, v18", "Unsupported instruction")
+
+
 def check_controls(directory):
     check_dpp_cvt_refusals()
     check_dpp_f16_contract_controls()
@@ -12299,6 +12371,7 @@ def check_controls(directory):
     check_title_load_controls()
     check_ds_swizzle_controls()
     check_ds_nop_controls()
+    check_f16_algebraic_controls()
     for mask in (0x3, 0xC, 0xF):
         program = compressed_export(mask)
         modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
@@ -12986,7 +13059,7 @@ def check_controls(directory):
     for expected in ("= ceil(alu", "= round(alu", "= round(params[1].x);", "= ceil((-params[1].y));"):
         assert expected in source, expected
     # Neighbouring forms: other widths, output modifiers, a second source and the IEEE-flag reciprocal.
-    for old, new in (("v_ceil_f32_e32 v12, v18", "v_fract_f16_e32 v12, v18"),
+    for old, new in (("v_ceil_f32_e32 v12, v18", "v_floor_f64_e32 v[12:13], v[18:19]"),
                      ("v_ceil_f32_e32 v12, v18", "v_ceil_f64_e32 v[12:13], v[18:19]"),
                      ("v_rndne_f32_e32 v13, v19", "v_rcp_f16_e32 v13, v19"),
                      ("v_rndne_f32_e32 v13, v19", "v_rndne_f32_e32 v13, v19, v18"),
@@ -18074,6 +18147,236 @@ def f16_compares_reference(words: tuple[int, int, int, int]) -> tuple[int, int, 
     return (w0, w1, w2, w3)
 
 
+F16_ALGEBRAIC_SETS = (
+    # (s44, s45, s46, s47)
+    # 0: tiny negative (-5.96e-08 -> 0x3bff clamp bound), 1.5
+    (0x8001, 0x3e00, 0, 0),
+    # 1: negative integer (-2.0 -> 0x0000), quiet NaN on right (0x7e00)
+    (0xc000, 0x7e00, 0, 0),
+    # 2: quiet NaN on left (0x7e00), 2.0 (0x4000)
+    (0x7e00, 0x4000, 0, 0),
+    # 3: signed zeros +0.0 (0x0000) vs -0.0 (0x8000), equality, reversed order
+    (0x0000, 0x8000, 0, 0),
+)
+
+
+def f16_algebraic() -> list[str]:
+    """Build a shader exercising all 6 binary16 fract, min, and max forms across e32, e64, and half16 reader chains."""
+    body = [
+        "v_mov_b32_e32 v12, 0",
+        "v_mov_b32_e32 v13, 0",
+        "v_mov_b32_e32 v14, 0",
+        "v_mov_b32_e32 v15, 0",
+        "v_mov_b32_e32 v16, s44",
+        "v_mov_b32_e32 v18, s45",
+    ]
+
+    def emit(acc: str, insn: str) -> None:
+        body.append(insn)
+        body.append("v_mov_b32_sdwa v25, v24 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0")
+        body.append(f"v_xor_b32_e32 {acc}, {acc}, v25")
+        body.append(f"v_lshlrev_b32_e32 {acc}, 1, {acc}")
+
+    # v12: fract forms (e32 flat, e32 explicit, e64 neg, e64 abs)
+    v12_ops = [
+        "v_fract_f16 v24, v16",
+        "v_fract_f16_e32 v24, v18",
+        "v_fract_f16_e64 v24, -v16",
+        "v_fract_f16_e64 v24, |v16|",
+    ]
+    for insn in v12_ops:
+        emit("v12", insn)
+
+    # v13: min forms (e32 flat, e32 reversed, e64 neg src0, e64 neg src1, e64 abs)
+    v13_ops = [
+        "v_min_f16 v24, v16, v18",
+        "v_min_f16_e32 v24, v18, v16",
+        "v_min_f16_e64 v24, -v16, v18",
+        "v_min_f16_e64 v24, v16, -v18",
+        "v_min_f16_e64 v24, |v16|, |v18|",
+    ]
+    for insn in v13_ops:
+        emit("v13", insn)
+
+    # v14: max forms (e32 flat, e32 reversed, e64 neg src0, e64 neg src1, e64 abs)
+    v14_ops = [
+        "v_max_f16 v24, v16, v18",
+        "v_max_f16_e32 v24, v18, v16",
+        "v_max_f16_e64 v24, -v16, v18",
+        "v_max_f16_e64 v24, v16, -v18",
+        "v_max_f16_e64 v24, |v16|, |v18|",
+    ]
+    for insn in v14_ops:
+        emit("v14", insn)
+
+    # v15: chained half16 reads across fract, min, max, and clamp
+    body.append("v_fract_f16 v24, v16")
+    body.append("v_mov_b32_sdwa v25, v24 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0")
+    body.append("v_xor_b32_e32 v15, v15, v25")
+    body.append("v_lshlrev_b32_e32 v15, 1, v15")
+
+    body.append("v_min_f16 v24, v25, v18")
+    body.append("v_mov_b32_sdwa v25, v24 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0")
+    body.append("v_xor_b32_e32 v15, v15, v25")
+    body.append("v_lshlrev_b32_e32 v15, 1, v15")
+
+    body.append("v_max_f16 v24, v16, v25")
+    body.append("v_mov_b32_sdwa v25, v24 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0")
+    body.append("v_xor_b32_e32 v15, v15, v25")
+    body.append("v_lshlrev_b32_e32 v15, 1, v15")
+
+    body.append("v_fract_f16_e64 v24, -|v25| clamp")
+    body.append("v_mov_b32_sdwa v25, v24 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_0")
+    body.append("v_xor_b32_e32 v15, v15, v25")
+    body.append("v_lshlrev_b32_e32 v15, 1, v15")
+
+    return body
+
+
+def f16_algebraic_reference(words: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """Compute the exact 4 uint hash values expected from f16_algebraic()."""
+    def half_float(bits: int) -> float:
+        return struct.unpack("<e", struct.pack("<H", bits & 0xffff))[0]
+
+    def float_half(val: float) -> int:
+        return struct.unpack("<H", struct.pack("<e", val))[0]
+
+    def is_nan16(bits: int) -> bool:
+        return (bits & 0x7fff) > 0x7c00
+
+    def frac16_eval(b: int) -> int:
+        if is_nan16(b):
+            return b | 0x0200
+        v = half_float(b)
+        f = v - math.floor(v)
+        if f >= 0.99951171875:
+            return 0x3bff
+        return float_half(f)
+
+    def min16_eval(a: int, b: int) -> int:
+        na = not is_nan16(a)
+        nb = not is_nan16(b)
+        if not na:
+            return b
+        if not nb:
+            return a
+        if (a | b) == 0x8000:
+            return 0x8000
+        fa, fb = half_float(a), half_float(b)
+        return a if fa < fb else b
+
+    def max16_eval(a: int, b: int) -> int:
+        na = not is_nan16(a)
+        nb = not is_nan16(b)
+        if not na:
+            return b
+        if not nb:
+            return a
+        if (a & b) == 0x8000:
+            return 0x8000
+        if (a | b) == 0x8000:
+            return 0x0000
+        fa, fb = half_float(a), half_float(b)
+        return a if fa > fb else b
+
+    def neg16(b: int) -> int:
+        return b ^ 0x8000
+
+    def abs16(b: int) -> int:
+        return b & 0x7fff
+
+    def sat16(b: int) -> int:
+        if is_nan16(b):
+            return b
+        v = half_float(b)
+        return float_half(max(0.0, min(1.0, v)))
+
+    w16 = words[0] & 0xffff
+    w18 = words[1] & 0xffff
+
+    acc12 = 0
+    for val in [
+        frac16_eval(w16),
+        frac16_eval(w18),
+        frac16_eval(neg16(w16)),
+        frac16_eval(abs16(w16)),
+    ]:
+        acc12 = ((acc12 ^ val) << 1) & 0xffffffff
+
+    acc13 = 0
+    for val in [
+        min16_eval(w16, w18),
+        min16_eval(w18, w16),
+        min16_eval(neg16(w16), w18),
+        min16_eval(w16, neg16(w18)),
+        min16_eval(abs16(w16), abs16(w18)),
+    ]:
+        acc13 = ((acc13 ^ val) << 1) & 0xffffffff
+
+    acc14 = 0
+    for val in [
+        max16_eval(w16, w18),
+        max16_eval(w18, w16),
+        max16_eval(neg16(w16), w18),
+        max16_eval(w16, neg16(w18)),
+        max16_eval(abs16(w16), abs16(w18)),
+    ]:
+        acc14 = ((acc14 ^ val) << 1) & 0xffffffff
+
+    acc15 = 0
+    c = frac16_eval(w16)
+    acc15 = ((acc15 ^ c) << 1) & 0xffffffff
+    c = min16_eval(c, w18)
+    acc15 = ((acc15 ^ c) << 1) & 0xffffffff
+    c = max16_eval(w16, c)
+    acc15 = ((acc15 ^ c) << 1) & 0xffffffff
+    c = sat16(frac16_eval(neg16(abs16(c))))
+    acc15 = ((acc15 ^ c) << 1) & 0xffffffff
+
+    return (acc12, acc13, acc14, acc15)
+
+
+def check_f16_algebraic_draws(directory, compiler, renderer, backend):
+    source = directory / "f16-algebraic.hlsl"
+    shader = directory / "f16-algebraic.cso"
+    program = uncompressed_export(f16_algebraic())
+    source.write_text(translate_f16(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+    for index, words in enumerate(F16_ALGEBRAIC_SETS):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        expected = tuple(as_float(w) for w in f16_algebraic_reference(words))
+        path = write_case(directory / f"f16-alg-{index}.case", constants, expected, integer_rt=True)
+        cases.append((path, "pass"))
+        if index < 4:
+            wrong_words = list(f16_algebraic_reference(words))
+            wrong_words[index] ^= 1 << index
+            wrong_path = write_case(
+                directory / f"f16-alg-bad-{index}.case",
+                constants,
+                tuple(as_float(w) for w in wrong_words),
+                integer_rt=True,
+            )
+            cases.append((wrong_path, "mismatch"))
+    run_pixel_batch(renderer, backend, shader, cases)
+
+    mutated_shader = directory / "f16-algebraic-mutated.cso"
+    for label, old, new, case_index in (
+        ("f16 e32 fract to min", "v_fract_f16 v24, v16", "v_min_f16 v24, v16, v18", 0),
+        ("f16 e64 neg modifier", "v_fract_f16_e64 v24, -v16", "v_fract_f16_e64 v24, v16", 0),
+        ("f16 min to max", "v_min_f16 v24, v16, v18", "v_max_f16 v24, v16, v18", 0),
+    ):
+        mutated = [new if line == old else line for line in program]
+        assert mutated != program
+        source.write_text(translate_f16(mutated), encoding="ascii")
+        compile_shader(compiler, source, mutated_shader)
+        draw = [renderer, backend, "--check-pixel-case", mutated_shader, directory / f"f16-alg-{case_index}.case"]
+        result = subprocess.run(draw, capture_output=True, text=True)
+        if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+            raise AssertionError(f"Mutating {label} escaped detection")
+
+
 def check_f16_compare_draws(directory, compiler, renderer, backend):
     source = directory / "f16-compare.hlsl"
     shader = directory / "f16-compare.cso"
@@ -18445,6 +18748,7 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
 def check_comparison_draws(directory, compiler, renderer, backend):
     """The comparison and class draws, split from draw-predicate-rounding so each CTest entry stays under its
     timeout on adapters where every renderer launch pays for device creation with the debug layer (issue #448)."""
+    check_f16_algebraic_draws(directory, compiler, renderer, backend)
     check_f16_compare_draws(directory, compiler, renderer, backend)
     check_f32_compare_draws(directory, compiler, renderer, backend)
     check_class_draw(directory, compiler, renderer, backend)

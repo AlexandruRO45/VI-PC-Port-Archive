@@ -3549,6 +3549,29 @@ class TestRdna2Scanner(unittest.TestCase):
         # The nonexistent VOP3 form of the packed fused multiply-accumulate stays unrecognized.
         self.assertFalse(is_opcode_recognized("v_pk_fmac_f16_unsupported"))
 
+    def test_f16_fract_and_minmax_recognition(self):
+        """Binary16 fract, min, and max opcodes must be recognized across e32 and e64."""
+        base = "v_fract_f16"
+        self.assertTrue(is_opcode_recognized(base), f"Base opcode not recognized: {base}")
+        self.assertTrue(is_opcode_recognized(f"{base}_e32"), f"e32 not recognized: {base}_e32")
+        self.assertTrue(is_opcode_recognized(f"{base}_e64"), f"e64 not recognized: {base}_e64")
+        self.assertEqual(classify_isa_category(base), "VOP / VALU (Vector ALU - VOP1/VOP2/VOP3)")
+        self.assertTrue(is_instruction_supported(f"{base} v0, v1"))
+        self.assertTrue(is_instruction_supported(f"{base}_e32 v0, s0"))
+        self.assertTrue(is_instruction_supported(f"{base}_e64 v0, -|s0| clamp"))
+        self.assertFalse(is_instruction_supported(f"{base}_sdwa v0, v1 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0"))
+
+        for op in ("min", "max"):
+            base = f"v_{op}_f16"
+            self.assertTrue(is_opcode_recognized(base), f"Base opcode not recognized: {base}")
+            self.assertTrue(is_opcode_recognized(f"{base}_e32"), f"e32 not recognized: {base}_e32")
+            self.assertTrue(is_opcode_recognized(f"{base}_e64"), f"e64 not recognized: {base}_e64")
+            self.assertEqual(classify_isa_category(base), "VOP / VALU (Vector ALU - VOP1/VOP2/VOP3)")
+            self.assertTrue(is_instruction_supported(f"{base} v0, s0, v1"))
+            self.assertTrue(is_instruction_supported(f"{base}_e32 v0, 1.0, v1"))
+            self.assertTrue(is_instruction_supported(f"{base}_e64 v0, -|s0|, |v1| clamp"))
+            self.assertFalse(is_instruction_supported(f"{base}_sdwa v0, v1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_1"))
+
     def test_decoded_scalar_memory_forms_are_recognized(self):
         """Every mnemonic the decoder prints for SMEM is recognized by the scanner, decoding only."""
         missing = sorted(name for name in SMEM_OPS.values() if not is_opcode_recognized(name))
@@ -5039,7 +5062,7 @@ class TestRdna2Scanner(unittest.TestCase):
             "v_fmac_f16_e32 v24, 3, v19",
             "v_floor_f16_e32 v24, -v18",
             "v_floor_f16_e32 v24, v18 clamp",
-            "v_fract_f16_e32 v24, v18",
+            "v_rcp_f16_e32 v24, v18",
             "v_cvt_f16_i16_e32 v24, 65",
             "v_cvt_f16_u16_e32 v24, 0x10000",
             "v_cvt_f16_i16_e32 v24, 1.0",
@@ -5083,7 +5106,7 @@ class TestRdna2Scanner(unittest.TestCase):
             "v_add_f16_e64 v24, 3, v19", "v_add_f16_e64 v24, v18, 3", "v_add_f16_e64 v24, 3.0, v19",
             "v_add_f16_e64 v24, 0x10000, v19", "v_add_f16_e64 v24, v256, v19", "v_add_f16_e64 v256, v18, v19",
             "v_add_f16_e64 v24, s106, v19", "v_add_f16_e64 v24, v18", "v_add_f16_e64 v24, v18, v19, v19",
-            "v_fma_f16_e64 v24, v18, v19, v19", "v_fract_f16_e64 v24, v18", "v_mul_f16_e64 v24, v18, v19 clamp",
+            "v_fma_f16_e64 v24, v18, v19, v19", "v_rcp_f16_e64 v24, v18", "v_mul_f16_e64 v24, v18, v19 clamp",
             "v_floor_f16_e64 v24, -v18", "v_floor_f16_e64 v24, |v18|", "v_floor_f16_e64 v24, v18 clamp",
             "v_floor_f16_e64 v24, v18 mul:2", "v_floor_f16_e64 v24, 3", "v_floor_f16_e64 v24, 0x10000",
             "v_floor_f16_e64 v24, v256", "v_floor_f16_e64 v24, v18, v19", "v_rndne_f16_e64 v24",

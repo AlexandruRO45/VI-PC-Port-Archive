@@ -232,6 +232,18 @@ if pixel_aot is not None:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cvt_f16_(?:i16|u16)_e32\s+{INT16_VGPR},\s+{INT16_SOURCE}"
     )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_fract_f16(?:_e32)?\s+{INT16_VGPR},\s+{F16_PLAIN}"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_fract_f16_e64\s+{INT16_VGPR},\s+{F16_MOD}(?:\s+clamp)?"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:min|max)_f16(?:_e32)?\s+{INT16_VGPR},\s+{F16_PLAIN},\s+{INT16_VGPR}"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:min|max)_f16_e64\s+{INT16_VGPR},\s+{F16_MOD},\s+{F16_MOD}(?:\s+clamp)?"
+    )
 if PIXEL_VOP3P_F16:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_pk_(?:{'|'.join(map(re.escape, PIXEL_VOP3P_F16))})_f16\s+v\d+,\s+.+"

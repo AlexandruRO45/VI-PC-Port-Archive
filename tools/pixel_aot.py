@@ -320,6 +320,11 @@ float fract32(float value) {
     float f = frac(value);
     return f >= 1.0f ? asfloat(0x3f7fffffu) : f;
 }
+// v_fract_f16: x - floor(x) clamped to 0x3bff (0.99951171875), so a tiny negative input cannot round up to 1.0 (0x3c00).
+float fract16(float value) {
+    float f = frac(value);
+    return f >= asfloat(0x3f7fe000u) ? asfloat(0x3f7fe000u) : f;
+}
 // v_mad_f32 and v_mac_f32 round the product before the add and do not support binary32 denormals.
 // Flush each operand, the product and the sum to signed zero; NaN fails the comparison and propagates.
 float ftz32(float value) {
@@ -993,12 +998,27 @@ uint mul_hi_i32(uint a, uint b) {
     ),
     "min16_num": (
         "float min16_num(float a, float b) {\n"
-        "    return isnan(a) ? b : (isnan(b) ? a : min(a, b));\n"
+        "    uint ua = narrow16(a);\n"
+        "    uint ub = narrow16(b);\n"
+        "    bool na = num16(ua);\n"
+        "    bool nb = num16(ub);\n"
+        "    if (!na) return b;\n"
+        "    if (!nb) return a;\n"
+        "    if ((ua | ub) == 0x8000u) return asfloat(0x80000000u);\n"
+        "    return a < b ? a : b;\n"
         "}"
     ),
     "max16_num": (
         "float max16_num(float a, float b) {\n"
-        "    return isnan(a) ? b : (isnan(b) ? a : max(a, b));\n"
+        "    uint ua = narrow16(a);\n"
+        "    uint ub = narrow16(b);\n"
+        "    bool na = num16(ua);\n"
+        "    bool nb = num16(ub);\n"
+        "    if (!na) return b;\n"
+        "    if (!nb) return a;\n"
+        "    if ((ua & ub) == 0x8000u) return asfloat(0x80000000u);\n"
+        "    if ((ua | ub) == 0x8000u) return 0.0f;\n"
+        "    return a > b ? a : b;\n"
         "}"
     ),
     "dot_u64_add": (
@@ -5104,6 +5124,52 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(r"v_fract_f16(_e32|_e64)? (v\d+), ([^,]+?)( clamp)?"):
+            # Plain binary16 fractional part: low half only, clamped to 0x3bff so tiny negative
+            # inputs cannot round up to 1.0 (0x3c00). Output is tagged ("half16", alu).
+            enc, dst, src, clamp = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid fract operation")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if clamp and enc != "_e64":
+                raise ValueError("Clamp requires VOP3 encoding")
+            operand = f16_cmp_operand(src, scalar, vector, pending, sample_dest, allow_mods=enc == "_e64", as_bits=False)
+            expression = f"fract16({operand})"
+            if clamp:
+                expression = f"saturate({expression})"
+            lines.append(f"    precise float hs{i} = {expression};")
+            lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
+            vector[dst] = ("half16", f"alu{i}")
+        elif m := match(r"v_(min|max)_f16(_e32|_e64)? (v\d+), ([^,\s]+), ([^,]+?)( clamp)?"):
+            # Plain binary16 min/max: IEEE 754-2008 minNum/maxNum semantics with encoding-based num16
+            # validation and signed zero ordering. Output is tagged ("half16", alu).
+            op, enc, dst, src0, src1, clamp = m.groups()
+            if mask != "entry":
+                raise ValueError(f"Invalid {op} operation")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if enc != "_e64":
+                if clamp:
+                    raise ValueError("Clamp requires VOP3 encoding")
+                if not re.fullmatch(r"v\d+", src1):
+                    raise ValueError("Binary16 e32 src1 must be a VGPR")
+                allow_mods = False
+            else:
+                allow_mods = True
+            val0 = f16_cmp_operand(src0, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=False)
+            val1 = f16_cmp_operand(src1, scalar, vector, pending, sample_dest, allow_mods=allow_mods, as_bits=False)
+            helpers.add(f"{op}16_num")
+            expression = f"{op}16_num({val0}, {val1})"
+            if clamp:
+                expression = f"saturate({expression})"
+            lines.append(f"    precise float hs{i} = {expression};")
+            lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
+            vector[dst] = ("half16", f"alu{i}")
         elif m := match(r"v_cvt_f16_f32(?:_e32|_e64)? (v\d+), ([^,\s]+)"):
             # GFX10 16-bit results replace only the low half; the high half of the destination is kept
             # (LLVM GCNSubtarget::zeroesHigh16BitsOfDest). A destination with no tracked value contributes zero.

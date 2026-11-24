@@ -7938,3 +7938,16 @@ checked against LLVM 19.1.7 only, and that check skips itself when the LLVM in u
 Scope: decoding and scanner recognition only. None of these forms is lowered by a translator, and no
 measurement on hardware or in a Windows run backs the descriptions. `v_interp_p1_f32_e64` and `v_interp_p2_f32_e64`
 (0x200 and 0x201 on gfx1013) are not decoded by this change.
+
+## Binary16 low-half algebraic fract, min and max lowering
+
+The offline pixel shader translator lowers 6 distinct RDNA 2 low-half binary16 (`f16`) forms:
+- `v_fract_f16`: low-half fractional part `x - floor(x)` clamped to `0x3bff` (`0.99951171875`), preventing tiny negative inputs from rounding up to `1.0` (`0x3c00`);
+- `v_min_f16`: low-half minimum selection (`min16_num`) following IEEE 754-2008 minNum semantics via encoding-based `num16` validation and signed zero ordering (`min16_num(+0, -0) -> -0`);
+- `v_max_f16`: low-half maximum selection (`max16_num`) following IEEE 754-2008 maxNum semantics via encoding-based `num16` validation and signed zero ordering (`max16_num(+0, -0) -> +0`).
+
+Each operation is supported across plain VOP1/VOP2 (`_e32` or suffix-less) and VOP3 (`_e64`) forms. In `_e32`, inputs are unmodified registers or inline constants and `src1` must be a VGPR. In `_e64`, inputs accept negation and absolute value modifiers (`-|x|`, `-x`, `|x|`), and the output accepts saturation clamping (`clamp` to `[0.0, 1.0]`).
+
+Destination registers are marked as half-defined (`("half16", alu)`), defining only bits 15:0 while bits 31:16 remain unspecified. Any subsequent SDWA read of the unwritten high half (`src0_sel:WORD_1` or sub-dword `BYTE` selections) is refused with `"Reads the undefined high half of a 16-bit result"`.
+
+Synthetic test fixtures in `tests/pixel_aot_check.py` (`check_f16_algebraic_controls` and `check_f16_algebraic_draws`) exercise all 6 forms across tiny negative subnormals (`-5.96e-08`), negative integers (`-2.0`), quiet NaNs (`0x7e00`), and signed zeros (`+0.0` vs `-0.0`), checking bit-accurate readbacks against an exact Python reference oracle. Negative controls verify refusal of upper-half SDWA reads (`WORD_1`) after `v_fract_f16` and `v_min_f16`, `_e32` clamp, `_e32` input modifiers, `_e32` non-VGPR `src1`, register indices out of range, and unsupported widths.

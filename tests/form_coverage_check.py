@@ -705,6 +705,48 @@ def check_f16_to_int16_forms():
         pixel.ACCEPTED.update(saved)
 
 
+def check_f16_algebraic_forms():
+    """The six low-half binary16 algebraic forms (v_fract_f16, v_min_f16, v_max_f16 across e32 and e64) count
+    as covered once the translator accepts their fixtures; SDWA, DPP, and transcendental forms stay uncovered."""
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        pixel.translate_f16(pixel.uncompressed_export(pixel.f16_algebraic()))
+        forms = {
+            ("VOP1", "v_fract_f16"),
+            ("VOP2", "v_min_f16"),
+            ("VOP2", "v_max_f16"),
+            ("VOP3", "v_fract_f16_e64"),
+            ("VOP3", "v_min_f16_e64"),
+            ("VOP3", "v_max_f16_e64"),
+        }
+        neighbours = {
+            ("SDWA", "v_fract_f16_sdwa"),
+            ("SDWA", "v_min_f16_sdwa"),
+            ("SDWA", "v_max_f16_sdwa"),
+            ("DPP16", "v_fract_f16_dpp"),
+            ("DPP16", "v_min_f16_dpp"),
+            ("DPP16", "v_max_f16_dpp"),
+            ("VOP1", "v_rcp_f16"),
+            ("VOP1", "v_sqrt_f16"),
+            ("VOP1", "v_sin_f16"),
+            ("VOP1", "v_cos_f16"),
+            ("VOP3", "v_rcp_f16_e64"),
+            ("VOP3", "v_sqrt_f16_e64"),
+        }
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, forms - reference)
+            assert neighbours <= reference, (name, neighbours - reference)
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, forms - covered)
+            assert not (neighbours & covered), (name, neighbours & covered)
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
 def check_int16_ternary_forms():
     """The 8 three-operand 16-bit integer VOP3 forms count as covered once the translator accepts their fixtures; the
     nearby VOP3 forms that stay rejected (v_mad_u32_u16, v_mad_i32_i16, v_sad_u16, f16 ops) stay uncovered."""
@@ -1254,6 +1296,7 @@ if __name__ == "__main__":
     check_f16_fmac_ldexp_forms()
     check_f16_cvt_int16_forms()
     check_f16_to_int16_forms()
+    check_f16_algebraic_forms()
     check_swap_coverage()
     check_pk_fmac_coverage()
     check_sopk_wait_forms()
