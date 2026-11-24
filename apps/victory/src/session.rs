@@ -35,6 +35,10 @@ pub(crate) const INHERITED: &str = "VICTORY_SESSION_INHERITED";
 pub(crate) struct Session {
     #[cfg(windows)]
     handle: windows_sys::Win32::Foundation::HANDLE,
+    /// The mapping that publishes this session's pid, kept for as long as the
+    /// session is held.
+    #[cfg(windows)]
+    owner: windows_sys::Win32::Foundation::HANDLE,
 }
 
 /// Takes the session, or fails saying who has it. Called once, before the
@@ -46,6 +50,8 @@ pub(crate) fn take() -> Result<Session> {
         return Ok(Session {
             #[cfg(windows)]
             handle: std::ptr::null_mut(),
+            #[cfg(windows)]
+            owner: std::ptr::null_mut(),
         });
     }
     imp::take()
@@ -54,51 +60,37 @@ pub(crate) fn take() -> Result<Session> {
 impl Drop for Session {
     fn drop(&mut self) {
         #[cfg(windows)]
-        if !self.handle.is_null() {
-            // SAFETY: our own handle, closed once.
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+        for handle in [self.handle, self.owner] {
+            if !handle.is_null() {
+                // SAFETY: our own handles, closed once.
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            }
         }
     }
 }
 
-/// A session someone else holds: its pid, image, and whether it looks alive or
-/// left over (its parent is gone, which is what a crash or a restart leaves).
-struct Other {
-    pid: u32,
-    name: String,
-    alive: bool,
-}
+/// Set by whoever holds the session, in a mapping beside it, so the refusal
+/// can name a pid instead of guessing one from a process list. Session-local:
+/// a global mapping needs `SeCreateGlobalPrivilege`, which a global *mutex* may
+/// be made without, and every process of a session can open this one.
+const OWNER: &str = "Local\\VIctory-title-owner";
 
-/// The refusal a second session prints, with the sessions to act on: the
-/// object itself names no process. Pure, so the wording is testable without a
-/// second process.
+/// The refusal a second session prints. Pure, so the wording is testable
+/// without a second process.
 ///
-/// An alive session and a corpse need opposite reactions — wait for the first,
-/// end the second — so the line says which each looks like.
-fn refusal(others: &[Other]) -> String {
-    let mut running = Vec::new();
-    let mut corpses = Vec::new();
-    for other in others {
-        let entry = format!("{} (pid {})", other.name, other.pid);
-        if other.alive {
-            running.push(entry);
-        } else {
-            corpses.push(entry);
-        }
-    }
-    let mut who = String::new();
-    if !running.is_empty() {
-        who.push_str(&format!(" Running title sessions: {}.", running.join(", ")));
-    }
-    if !corpses.is_empty() {
-        who.push_str(&format!(
-            " Left over with no parent, which is what a crash or a restart leaves: {}. Ending one \
-             is safe, it is not running a title.",
-            corpses.join(", ")
-        ));
-    }
+/// Only a `run` takes this object — translating a corpus, inspecting an
+/// executable and every other subcommand are offline and never touch it — so
+/// the holder is a title session by construction. It also cannot be a corpse:
+/// the system releases a named object when the last handle to it closes, which
+/// is the whole reason the guard is a mutex rather than a lock file.
+fn refusal(owner: Option<u32>) -> String {
+    let who = match owner {
+        Some(pid) => format!(" It is held by victory.exe (pid {pid})."),
+        // A holder that did not publish its pid, which an older build does not.
+        None => String::new(),
+    };
     format!(
-        "another title session is running, so this one stops here without touching the GPU: two sessions share one GPU, one save folder and one shader cache.{who}"
+        "another title session is running, so this one stops here without touching the GPU: two sessions share one GPU, one save folder and one shader cache. Wait for it to end, or end it and try again.{who}"
     )
 }
 
@@ -116,13 +108,9 @@ mod imp {
         CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-        TH32CS_SNAPPROCESS,
-    };
     use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
 
-    use super::{INHERITED, NAME, Session, refusal, unavailable};
+    use super::{INHERITED, NAME, OWNER, Session, refusal, unavailable};
 
     /// `ERROR_ACCESS_DENIED`: the global scope needs a privilege this process
     /// does not have.
@@ -135,14 +123,15 @@ mod imp {
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
             // SAFETY: the handle is ours, and is not the one we keep.
             unsafe { CloseHandle(handle) };
-            anyhow::bail!(refusal(&others()));
+            anyhow::bail!(refusal(owner()));
         }
         // Every child from here on inherits the exclusion. Set before any
         // thread of ours exists, and only once, so nothing reads it while it
         // is being written.
         // SAFETY: single-threaded here (main, before the title starts).
         unsafe { std::env::set_var(INHERITED, &name) };
-        Ok(Session { handle })
+        let owner = publish();
+        Ok(Session { handle, owner })
     }
 
     /// The inheritable object, in the widest scope this process may use.
@@ -175,50 +164,76 @@ mod imp {
         Ok((name, handle))
     }
 
-    /// Other processes whose executable looks like ours, without this one, each
-    /// with whether its parent is still alive.
-    fn others() -> Vec<super::Other> {
-        // SAFETY: a plain query of our own pid.
-        let me = unsafe { GetCurrentProcessId() };
-        let mut found = Vec::new();
-        // SAFETY: a snapshot of the process list, closed below.
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
-            return found;
+    /// Publishes this session's pid beside the object, for the refusal's
+    /// message, and keeps the mapping alive with the session.
+    fn publish() -> HANDLE {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE,
+        };
+        let name = OWNER.to_owned();
+        let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        // SAFETY: a null-terminated name and a page-file backed mapping of one
+        // pid; every handle created here is inheritable, as the object's is.
+        let mapping = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                size_of::<u32>() as u32,
+                wide.as_ptr(),
+            )
+        };
+        if mapping.is_null() || mapping == INVALID_HANDLE_VALUE {
+            // Not fatal: the mutex alone is the exclusion, this only names the
+            // holder in the refusal.
+            eprintln!(
+                "session: the owner pid could not be published ({})",
+                std::io::Error::last_os_error()
+            );
+            return std::ptr::null_mut();
         }
-        // Everything alive in one pass, to tell a session that is running from
-        // one whose parent is gone.
-        let mut live = std::collections::HashSet::new();
-        let mut ours = Vec::new();
-        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
-        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
-        // SAFETY: a live snapshot and a structure of the size it was told.
-        let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
-        while more {
-            let len = entry
-                .szExeFile
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(entry.szExeFile.len());
-            let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-            live.insert(entry.th32ProcessID);
-            // Our own image only: a session may start renamed children (the
-            // shader workers) that are not sessions themselves.
-            if entry.th32ProcessID != me && name.eq_ignore_ascii_case("victory.exe") {
-                ours.push((entry.th32ProcessID, entry.th32ParentProcessID, name));
+        // SAFETY: our mapping, and a view of its whole size.
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, size_of::<u32>()) };
+        if view.Value.is_null() {
+            eprintln!(
+                "session: the owner pid could not be published ({})",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            // SAFETY: a writable view of one pid.
+            unsafe { view.Value.cast::<u32>().write(GetCurrentProcessId()) };
+        }
+        mapping
+    }
+
+    /// The pid the holder published, if one did.
+    fn owner() -> Option<u32> {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MapViewOfFile, OpenFileMappingW};
+        let name = OWNER.to_owned();
+        let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        // SAFETY: a null-terminated name; the mapping is opened read-only.
+        let mapping = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, wide.as_ptr()) };
+        if mapping.is_null() {
+            return None;
+        }
+        // SAFETY: the mapping is live and holds a pid.
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, size_of::<u32>()) };
+        let pid = if view.Value.is_null() {
+            None
+        } else {
+            // SAFETY: a readable view of one pid, copied before the unmap.
+            let pid = unsafe { view.Value.cast::<u32>().read() };
+            Some(pid)
+        };
+        // SAFETY: the view and the mapping we opened.
+        unsafe {
+            if !view.Value.is_null() {
+                windows_sys::Win32::System::Memory::UnmapViewOfFile(view);
             }
-            // SAFETY: as above.
-            more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+            CloseHandle(mapping);
         }
-        // SAFETY: our snapshot.
-        unsafe { CloseHandle(snapshot) };
-        for (pid, parent, name) in ours {
-            // A launcher that is still running means a session someone drives;
-            // a parent that is gone is what a crash or a restart leaves behind.
-            let alive = parent != 0 && live.contains(&parent);
-            found.push(super::Other { pid, name, alive });
-        }
-        found
+        pid.filter(|&pid| pid != 0)
     }
 }
 
@@ -236,50 +251,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_refusal_tells_a_running_session_from_a_corpse() {
-        let running = [Other {
-            pid: 4312,
-            name: "victory.exe".to_owned(),
-            alive: true,
-        }];
-        let text = refusal(&running);
-        assert!(
-            text.contains("Running title sessions: victory.exe (pid 4312)"),
-            "{text}"
-        );
+    fn the_refusal_names_the_holder_and_why_it_cannot_be_a_corpse() {
+        let text = refusal(Some(4312));
+        assert!(text.contains("victory.exe (pid 4312)"), "{text}");
         assert!(text.contains("without touching the GPU"), "{text}");
-        assert!(!text.contains("No parent"), "{text}");
-
-        // A corpse says it is safe to end, which is the reaction it needs.
-        let text = refusal(&[Other {
-            pid: 77,
-            name: "victory.exe".to_owned(),
-            alive: false,
-        }]);
-        assert!(text.contains("no parent"), "{text}");
-        assert!(text.contains("Ending one is safe"), "{text}");
-        assert!(!text.contains("Running title sessions"), "{text}");
-
-        // Both at once, each named for what it is.
-        let text = refusal(&[
-            Other {
-                pid: 1,
-                name: "victory.exe".to_owned(),
-                alive: true,
-            },
-            Other {
-                pid: 2,
-                name: "victory.exe".to_owned(),
-                alive: false,
-            },
-        ]);
-        assert!(text.contains("Running title sessions: victory.exe (pid 1)"), "{text}");
-        assert!(text.contains("victory.exe (pid 2)"), "{text}");
-
-        // Without a visible holder it still says the session is taken.
-        let text = refusal(&[]);
+        // A holder that published no pid still refuses, without inventing one.
+        let text = refusal(None);
         assert!(text.contains("another title session is running"), "{text}");
-        assert!(!text.contains("Running title sessions"), "{text}");
+        assert!(!text.contains("pid"), "{text}");
     }
 
     #[test]
