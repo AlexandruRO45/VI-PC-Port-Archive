@@ -16,7 +16,7 @@
 //! program's VGPR count, all read (and all written, for a destination).
 
 use crate::ShaderError;
-use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
+use crate::gfx10::{self, Fields, Flow, Instruction, NULL, Operand};
 
 /// One register dword. Scalar codes as in [`Operand::Scalar`]: 0-105 SGPRs,
 /// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC.
@@ -262,6 +262,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
         }
     }
     remove_trivial_phis(&mut blocks, values);
+    forward_spills(&mut blocks, values);
     Ok(Program {
         wave64,
         vgprs,
@@ -633,6 +634,170 @@ fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
                 *v = find(&replaced, *v);
             }
         }
+    }
+}
+
+/// SGPRs the compiler spills to VGPR lanes: a `v_readlane_b32` at a
+/// constant lane gives the value `v_writelane_b32` stored in that lane on
+/// every path, and the spill writes and joins nothing else reads go. Later
+/// passes see the SGPR's own value through the spill, a lane mask's too.
+fn forward_spills(blocks: &mut [Block], values: u32) {
+    let n = values as usize;
+    let (mut def, mut phi) = (vec![None; n], vec![None; n]);
+    for (b, block) in blocks.iter().enumerate() {
+        for (i, p) in block.phis.iter().enumerate() {
+            phi[p.value.0 as usize] = Some((b, i));
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, w) in &inst.writes {
+                def[w.0 as usize] = Some((b, i));
+            }
+        }
+    }
+    let mut replaced: Vec<Value> = (0..values).map(Value).collect();
+    let mut gone = vec![Vec::new(); blocks.len()];
+    for (b, block) in blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            let Fields::Valu(v) = &inst.fields else {
+                continue;
+            };
+            let ("v_readlane_b32", [Operand::Vector { reg, .. }, at]) = (inst.name(), &v.src[..])
+            else {
+                continue;
+            };
+            let (Some(k), Some(src), Some(&(_, out))) =
+                (lane_of(*at), inst.read(Reg::V(*reg)), inst.writes.first())
+            else {
+                continue;
+            };
+            if let Ok(Some(x)) = stored(blocks, &def, &phi, src, k, &mut Vec::new()) {
+                replaced[out.0 as usize] = x;
+                gone[b].push(i);
+            }
+        }
+    }
+    if gone.iter().all(Vec::is_empty) {
+        return;
+    }
+    let find = |mut v: Value| {
+        while replaced[v.0 as usize] != v {
+            v = replaced[v.0 as usize];
+        }
+        v
+    };
+    for block in blocks.iter_mut() {
+        for phi in &mut block.phis {
+            for a in &mut phi.args {
+                *a = find(*a);
+            }
+        }
+        for inst in &mut block.insts {
+            for (_, v) in &mut inst.reads {
+                *v = find(*v);
+            }
+        }
+    }
+    // Spill writes and VGPR joins whose values only other such writes and
+    // joins read, once the reads above are gone.
+    let mut spill = vec![false; n];
+    for block in blocks.iter() {
+        for p in &block.phis {
+            spill[p.value.0 as usize] = matches!(p.reg, Reg::V(_));
+        }
+        for inst in &block.insts {
+            if inst.name() == "v_writelane_b32" {
+                for &(_, w) in &inst.writes {
+                    spill[w.0 as usize] = true;
+                }
+            }
+        }
+    }
+    let dropped = |spill: &[bool], b: usize, i: usize, inst: &Inst| {
+        gone[b].contains(&i)
+            || (inst.name() == "v_writelane_b32"
+                && inst.writes.iter().all(|w| spill[w.1.0 as usize]))
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut live = Vec::new();
+        for (b, block) in blocks.iter().enumerate() {
+            for p in block.phis.iter().filter(|p| !spill[p.value.0 as usize]) {
+                live.extend(p.args.iter().copied());
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                if !dropped(&spill, b, i, inst) {
+                    live.extend(inst.reads.iter().map(|r| r.1));
+                }
+            }
+        }
+        for v in live {
+            changed |= std::mem::replace(&mut spill[v.0 as usize], false);
+        }
+    }
+    for (b, block) in blocks.iter_mut().enumerate() {
+        block.phis.retain(|p| !spill[p.value.0 as usize]);
+        let mut i = 0;
+        block.insts.retain(|inst| {
+            i += 1;
+            !dropped(&spill, b, i - 1, inst)
+        });
+    }
+    remove_trivial_phis(blocks, values);
+}
+
+/// The SGPR value lane `k` of VGPR value `v` holds, following its
+/// `v_writelane_b32` writes: `Ok(None)` for a join in `seen` (already being
+/// followed), `Err` if some path stores no SGPR there.
+fn stored(
+    blocks: &[Block],
+    def: &[Option<(usize, usize)>],
+    phi: &[Option<(usize, usize)>],
+    v: Value,
+    k: u32,
+    seen: &mut Vec<Value>,
+) -> Result<Option<Value>, ()> {
+    if let Some((b, i)) = phi[v.0 as usize] {
+        if seen.contains(&v) {
+            return Ok(None);
+        }
+        seen.push(v);
+        let mut found = None;
+        for &a in &blocks[b].phis[i].args {
+            if let Some(x) = stored(blocks, def, phi, a, k, seen)? {
+                if found.is_some_and(|f| f != x) {
+                    return Err(());
+                }
+                found = Some(x);
+            }
+        }
+        return Ok(found);
+    }
+    let (b, i) = def[v.0 as usize].ok_or(())?;
+    let inst = &blocks[b].insts[i];
+    let Fields::Valu(w) = &inst.fields else {
+        return Err(());
+    };
+    let ("v_writelane_b32", Some(Operand::Vector { reg, .. }), [Operand::Scalar { code, .. }, at]) =
+        (inst.name(), w.dst, &w.src[..])
+    else {
+        return Err(());
+    };
+    if *code == NULL {
+        return Err(());
+    }
+    if lane_of(*at).ok_or(())? != k {
+        return stored(blocks, def, phi, inst.read(Reg::V(reg)).ok_or(())?, k, seen);
+    }
+    inst.read(Reg::S(*code)).map(Some).ok_or(())
+}
+
+/// A lane select given as a constant.
+fn lane_of(op: Operand) -> Option<u32> {
+    match op {
+        Operand::Const(c @ 128..=191) => Some(u32::from(c - 128)),
+        Operand::Literal(x) => Some(x),
+        _ => None,
     }
 }
 
@@ -1041,6 +1206,61 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    #[test]
+    fn a_spilled_sgpr_is_read_back_as_itself() {
+        let spill = [
+            0xBF06_0100, // s_cmp_eq_u32 s0, s1
+            0xBF85_0003, // s_cbranch_scc1 -> 20
+            0xD761_0000,
+            0x0001_0609, // v_writelane_b32 v0, s9, 3
+            0xBF82_0002, // s_branch -> 28
+            0xD761_0000,
+            0x0001_0609, // 20: v_writelane_b32 v0, s9, 3
+            0xD760_0002,
+            0x0001_0700, // 28: v_readlane_b32 s2, v0, 3
+            0x7E02_0202, // v_mov_b32 v1, s2
+        ];
+        let names = |p: &Program| -> Vec<&str> {
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .map(Inst::name)
+                .collect()
+        };
+        let mov = |p: &Program, name| {
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find(|i| i.name() == name)
+                .cloned()
+                .unwrap()
+        };
+        let p = build_words(&[&spill[..], &[S_ENDPGM]].concat(), false);
+        assert_eq!(
+            mov(&p, "v_mov_b32").read(Reg::S(2)),
+            Some(input(&p, Reg::S(9)))
+        );
+        assert!(
+            !names(&p).iter().any(|n| n.contains("lane")),
+            "{:?}",
+            names(&p)
+        );
+        assert!(
+            p.blocks
+                .iter()
+                .all(|b| b.phis.iter().all(|q| q.reg != Reg::V(0)))
+        );
+        // Another reader of the VGPR keeps the lane writes.
+        let p = build_words(&[&spill[..], &[0x7E04_0300, S_ENDPGM]].concat(), false); // v_mov_b32 v2, v0
+        assert_eq!(
+            mov(&p, "v_mov_b32").read(Reg::S(2)),
+            Some(input(&p, Reg::S(9)))
+        );
+        let names = names(&p);
+        assert_eq!(names.iter().filter(|n| **n == "v_writelane_b32").count(), 2);
+        assert!(!names.contains(&"v_readlane_b32"));
     }
 
     #[test]

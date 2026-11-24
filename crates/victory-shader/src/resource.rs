@@ -1924,7 +1924,8 @@ pub(crate) mod tests {
             &[param(Table, 9, 1)],
             HwStage::Ps,
         );
-        assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
+        // The IR reads s9 itself at the load: the spill is gone.
+        assert_eq!(r.scalar, [((0, 1), at(0, 0x20))]);
     }
 
     #[test]

@@ -616,6 +616,59 @@ mod gpu {
         }
     }
 
+    /// Runs `w` (4 user SGPRs, s[2:3] the output address) on one wave of
+    /// 32 lanes; the dword each lane stores at 4 * lane.
+    fn run32(w: &[u32]) -> Vec<(&'static str, Vec<u32>)> {
+        let shader = build_with(w, 4);
+        let map = address_map::encode(&[address_map::Range {
+            start: OUT,
+            len: 32 * 4,
+            view: 0,
+            view_offset: 0,
+        }]);
+        let consts = [0, 0, OUT as u32, (OUT >> 32) as u32];
+        let _one = super::super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut runs = Vec::new();
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = consts[u.dword as usize];
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: map.clone(),
+                                },
+                            ),
+                        ],
+                        views: &[View::RawUav(32)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            runs.push((label, out[0].clone()));
+        }
+        runs
+    }
+
     /// A traversal's loop over lanes: the mask of lanes still walking (8
     /// at first) is carried around the loop, each pass drops its lowest
     /// lane as a number (`s_ff1`, `s_bitset0`), and each lane tests its
@@ -667,52 +720,55 @@ mod gpu {
                 "s_endpgm",
             ],
         );
-        let shader = build_with(&w, 4);
-        let map = address_map::encode(&[address_map::Range {
-            start: OUT,
-            len: 32 * 4,
-            view: 0,
-            view_offset: 0,
-        }]);
-        let consts = [0, 0, OUT as u32, (OUT >> 32) as u32];
-        let _one = super::super::valu_tests::ONE_AT_A_TIME
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for (label, warp) in [("hardware", false), ("warp", true)] {
-            let Ok(host) = Host::new(warp) else {
-                eprintln!("no SM 6.6 {label} device; skipped");
-                continue;
-            };
-            let (root, pso) = host
-                .compute_pipeline(&shader)
-                .unwrap_or_else(|e| panic!("{label}: {e}"));
-            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-            for u in &shader.user_data {
-                ud[u.index as usize] = consts[u.dword as usize];
-            }
-            let out = host
-                .dispatch(
-                    &root,
-                    &pso,
-                    &Dispatch {
-                        roots: vec![
-                            (0, Root::Constants(ud)),
-                            (
-                                1,
-                                Root::View {
-                                    srv: true,
-                                    data: map.clone(),
-                                },
-                            ),
-                        ],
-                        views: &[View::RawUav(32)],
-                        samplers: &[],
-                        groups: [1, 1, 1],
-                    },
-                )
-                .unwrap_or_else(|e| panic!("{label}: {e}"));
-            let want: Vec<u32> = (0..32).map(|n| if n < 8 { n + 1 } else { 0 }).collect();
-            assert_eq!(out[0], want, "{label}");
+        let want: Vec<u32> = (0..32).map(|n| if n < 8 { n + 1 } else { 0 }).collect();
+        for (label, out) in run32(&w) {
+            assert_eq!(out, want, "{label}");
+        }
+    }
+
+    /// The EXEC an `if` saves, copied inside the `if` (where it holds lanes
+    /// that do not run), is spilled to a VGPR lane (`v_writelane_b32`) and
+    /// read back at the join (`v_readlane_b32`) to restore it: lanes 0-7
+    /// run the `if`, all lanes store after it.
+    #[test]
+    fn an_exec_mask_spilled_to_a_lane_is_restored() {
+        let w = [
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7D88_0088, // v_cmp_gt_u32 vcc_lo, 8, v0
+            0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc_lo
+            0xBE8A_0306, // s_mov_b32 s10, s6
+            0xD761_0008, // v_writelane_b32 v8, s10, 1
+            0x0001_020A,
+            0xBF88_0001, // s_cbranch_execz join
+            0x7E0A_0281, // v_mov_b32 v5, 1
+            0xD760_0009, // join: v_readlane_b32 s9, v8, 1
+            0x0001_0308,
+            0x887E_097E, // s_or_b32 exec_lo, exec_lo, s9
+            0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+            0xDC70_8000, // global_store_dword v7, v5, s[2:3]
+            0x0002_0507,
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_names(
+            &w,
+            &[
+                "v_mov_b32",
+                "v_cmp_gt_u32",
+                "s_and_saveexec_b32",
+                "s_mov_b32",
+                "v_writelane_b32",
+                "s_cbranch_execz",
+                "v_mov_b32",
+                "v_readlane_b32",
+                "s_or_b32",
+                "v_lshlrev_b32",
+                "global_store_dword",
+                "s_endpgm",
+            ],
+        );
+        let want: Vec<u32> = (0..32).map(|n| u32::from(n < 8)).collect();
+        for (label, out) in run32(&w) {
+            assert_eq!(out, want, "{label}");
         }
     }
 }
