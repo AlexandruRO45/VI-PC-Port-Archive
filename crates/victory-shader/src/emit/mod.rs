@@ -504,6 +504,17 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
                 "two signature elements with one semantic",
             ));
         }
+        // A system value other than a target, clip or cull distance is one
+        // value of the stage: there is one position, one depth, one front
+        // face. The kind comes from the row's raw system value, not its
+        // name, so a second row (under another name) passed the semantic
+        // check above, and DXC's validator refuses a signature listing one
+        // twice (`Meta.DuplicateSysValue`).
+        if !matches!(kind, 0 | 6 | 7 | 16) && out.iter().any(|e| e.kind == kind) {
+            return Err(ShaderError::Malformed(
+                "a system value listed twice in a signature",
+            ));
+        }
         out.push(container::SigElement {
             name,
             index,
@@ -725,6 +736,57 @@ mod tests {
             );
         }
         assert_eq!(signature(&part(0, 8)).unwrap()[0].row, Some(8));
+    }
+
+    /// A system value other than a target, clip or cull distance names one
+    /// value of the stage, so a second row with it is refused even under
+    /// another name. Targets, clip and cull distances and arbitrary
+    /// elements may each appear more than once.
+    #[test]
+    fn a_system_value_listed_twice_is_refused() {
+        let part = |rows: &[(u32, &[u8])]| {
+            let mut p = Vec::new();
+            p.extend_from_slice(&u32::to_le_bytes(rows.len() as u32));
+            p.extend_from_slice(&u32::to_le_bytes(8));
+            let names = 8 + 32 * rows.len() as u32;
+            for (i, (sv, _)) in rows.iter().enumerate() {
+                let i = i as u32;
+                for w in [0, names + 32 * i, i, *sv, 3, i, 0x0F, 0] {
+                    p.extend_from_slice(&u32::to_le_bytes(w));
+                }
+            }
+            for (_, name) in rows {
+                let mut n = name.to_vec();
+                n.resize(32, 0);
+                p.extend_from_slice(&n);
+            }
+            p
+        };
+        for rows in [
+            &[(64, &b"SV_Target"[..]), (64, b"SV_Target")][..],
+            &[(2, b"SV_ClipDistance"), (2, b"SV_ClipDistance")],
+            &[(3, b"SV_CullDistance"), (3, b"SV_CullDistance")],
+            &[(0, b"TEXCOORD"), (0, b"COLOR")],
+            &[(1, b"SV_Position"), (0, b"TEXCOORD")],
+        ] {
+            let read = signature(&part(rows)).expect("a signature D3D12 takes");
+            assert_eq!(read.len(), 2);
+        }
+        let refused = ShaderError::Malformed("a system value listed twice in a signature");
+        for (sv, a, b) in [
+            (1, &b"SV_Position"[..], &b"POS"[..]),
+            (1, b"SV_Position", b"SV_Position"),
+            (6, b"SV_RenderTargetArrayIndex", b"LAYER"),
+            (9, b"SV_IsFrontFace", b"FACE"),
+        ] {
+            assert_eq!(
+                signature(&part(&[(sv, a), (sv, b)]))
+                    .unwrap_err()
+                    .to_string(),
+                refused.to_string(),
+                "system value {sv}"
+            );
+        }
     }
 
     /// A signature mask is a raw byte of the title's part. One with bits
