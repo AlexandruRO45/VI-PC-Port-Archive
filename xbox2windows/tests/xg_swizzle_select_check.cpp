@@ -52,6 +52,7 @@ int main()
 #include <vector>
 
 #include "addrinterface.h"
+#include "../src/startup_stubs/bc64_chain.h"
 
 namespace {
 // Mesa ac_fake_hw_db.h "navi21": family_id AMDGPU_FAMILY_NV, chip_external_rev 0x28, gb_addr_config 0x40 with
@@ -457,6 +458,46 @@ int run_factory(bool mutate)
     return ok ? 0 : 1;
 }
 
+bool block_addresses_match(ADDR_HANDLE lib, const ADDR2_COMPUTE_SURFACE_INFO_INPUT& surface)
+{
+    D3D12_RESOURCE_DESC desc{};
+    desc.Height = surface.height;
+    desc.MipLevels = static_cast<UINT16>(surface.numMipLevels);
+    desc.DepthOrArraySize = static_cast<UINT16>(surface.numSlices);
+    const x2w_startup::bc64::Chain chain(desc);
+    ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_INPUT in{};
+    in.size = sizeof(in);
+    in.flags = surface.flags;
+    in.resourceType = surface.resourceType;
+    in.swizzleMode = surface.swizzleMode;
+    in.bpp = 128;
+    in.unalignedWidth = surface.width / 4;
+    in.unalignedHeight = surface.height / 4;
+    in.numMipLevels = surface.numMipLevels;
+    in.numSlices = surface.numSlices;
+    in.numSamples = in.numFrags = 1;
+    ADDR2_COMPUTE_SURFACE_ADDRFROMCOORD_OUTPUT out{};
+    out.size = sizeof(out);
+    for (in.slice = 0; in.slice < in.numSlices; ++in.slice) {
+        for (in.mipId = 0; in.mipId < in.numMipLevels; ++in.mipId) {
+            const unsigned columns = ((surface.width >> in.mipId) + 3) / 4;
+            const unsigned rows = ((surface.height >> in.mipId) + 3) / 4;
+            for (in.y = 0; in.y < rows; ++in.y) {
+                for (in.x = 0; in.x < columns; ++in.x) {
+                    const auto expected = chain.address(in.mipId, in.x, in.y, in.slice);
+                    if (Addr2ComputeSurfaceAddrFromCoord(lib, &in, &out) != ADDR_OK ||
+                        out.bitPosition != 0 || out.addr != expected) {
+                        std::printf("BC block mismatch at slice %u mip %u (%u,%u): AddrLib %llu, XG %u\n",
+                                    in.slice, in.mipId, in.x, in.y, static_cast<unsigned long long>(out.addr), expected);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
 int bc64_tiling_reference()
 {
     ADDR_HANDLE lib = create_navi21();
@@ -493,6 +534,7 @@ int bc64_tiling_reference()
                             static_cast<unsigned>(format), height, slices,
                             static_cast<unsigned long long>(out.sliceSize), out.firstMipIdInTail);
                 expect(matches, "64 KiB standard block starts, packed tile and complete array size");
+                expect(block_addresses_match(lib, in), "all visible BC blocks match AddrLib");
             }
         }
     }

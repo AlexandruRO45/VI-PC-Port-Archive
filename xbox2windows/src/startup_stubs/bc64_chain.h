@@ -1,61 +1,63 @@
 #pragma once
 
 #include <d3d12.h>
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
 
-// Fixed non-XOR 64 KiB standard layout, 1024x1024, six BC mips and one slice.
-// The optional AMD surface-info and coordinate fixture checks every visible block.
 namespace x2w_startup::bc64 {
-constexpr UINT bytes = 0x160000, levels = 6, first_tail = 3;
-constexpr std::array<UINT, levels> offsets{0x60000, 0x20000, 0x10000, 0x8000, 0x4000, 0x2000};
-
-inline bool standard_bc(const D3D12_RESOURCE_DESC& d)
-{
-    return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Alignment == 0 && d.Width == 1024 &&
-           d.SampleDesc.Count == 1 && d.SampleDesc.Quality == 0 && static_cast<UINT>(d.Layout) == 0x109 &&
-           d.Flags == D3D12_RESOURCE_FLAG_NONE &&
-           (d.Format == DXGI_FORMAT_BC5_UNORM || d.Format == DXGI_FORMAT_BC7_UNORM);
-}
+constexpr UINT first_tail = 3, tile_bytes = 65536, tile_side = 256;
 
 inline bool supports(const D3D12_RESOURCE_DESC& d)
 {
-    return standard_bc(d) && d.Height == 1024 && d.DepthOrArraySize == 1 && d.MipLevels == levels;
+    const bool six = d.MipLevels == 6 && d.Height == 1024 && d.DepthOrArraySize == 1;
+    const bool nine = d.MipLevels == 9 && (d.Height == 512 || d.Height == 1024) &&
+                      (d.DepthOrArraySize == 1 || d.DepthOrArraySize == 2);
+    return (six || nine) && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Alignment == 0 &&
+           d.Width == 1024 && d.SampleDesc.Count == 1 && d.SampleDesc.Quality == 0 &&
+           static_cast<UINT>(d.Layout) == 0x109 && d.Flags == D3D12_RESOURCE_FLAG_NONE &&
+           (d.Format == DXGI_FORMAT_BC5_UNORM || d.Format == DXGI_FORMAT_BC7_UNORM);
 }
 
-inline bool supports_nine_mip_tiling(const D3D12_RESOURCE_DESC& d)
-{
-    return standard_bc(d) && (d.Height == 512 || d.Height == 1024) && d.MipLevels == 9 &&
-           (d.DepthOrArraySize == 1 || d.DepthOrArraySize == 2);
-}
+// Explicit non-XOR 64 KiB standard layout for the shapes accepted above.
+// Measurements are in 4x4 BC blocks except for offsets and slice sizes.
+struct Chain {
+    UINT height, levels, slices;
+    explicit Chain(const D3D12_RESOURCE_DESC& d) : height(d.Height), levels(d.MipLevels), slices(d.DepthOrArraySize) {}
+    UINT columns(UINT mip) const { return ((1024u >> mip) + 3) / 4; }
+    UINT rows(UINT mip) const { return ((height >> mip) + 3) / 4; }
+    UINT tiles_wide(UINT mip) const { return (columns(mip) + 63) / 64; }
+    UINT tiles_high(UINT mip) const { return (rows(mip) + 63) / 64; }
 
-constexpr UINT side(UINT mip) { return 256 >> mip; }
-
-// Coordinates are 4x4 BC blocks. Each macro tile contains 64x64 blocks.
-// Address bits 4..7 select (y0,y1,x0,x1); higher pairs interleave y and x.
-constexpr UINT offset(UINT mip, UINT x, UINT y)
-{
-    const UINT tiles_per_row = (side(mip) + 63) / 64;
-    const UINT tile = (y / 64) * tiles_per_row + x / 64;
-    UINT within = ((y & 3) << 4) | ((x & 3) << 6);
-    for (UINT bit = 2; bit < 6; ++bit) {
-        within |= ((y >> bit) & 1) << (4 + bit * 2);
-        within |= ((x >> bit) & 1) << (5 + bit * 2);
+    UINT start(UINT mip) const {
+        constexpr std::array<UINT, 6> tail{0x8000, 0x4000, 0x2000, 0x1000, 0x800, 0x600};
+        if (mip >= first_tail) return tail[mip - first_tail];
+        UINT tiles = 1;
+        for (UINT i = mip + 1; i < first_tail; ++i) tiles += tiles_wide(i) * tiles_high(i);
+        return tiles * tile_bytes;
     }
-    return offsets[mip] + tile * 65536 + within;
-}
+    UINT slice_bytes() const { return start(0) + tiles_wide(0) * tiles_high(0) * tile_bytes; }
+    UINT bytes() const { return slice_bytes() * slices; }
 
-inline void untile(UINT mip, const unsigned char* guest, unsigned char* linear, UINT pitch)
-{
-    for (UINT y = 0; y < side(mip); ++y)
-        for (UINT x = 0; x < side(mip); ++x)
-            std::memcpy(linear + static_cast<std::size_t>(y) * pitch + 16 * x, guest + offset(mip, x, y), 16);
-}
-inline void tile(UINT mip, unsigned char* guest, const unsigned char* linear, UINT pitch)
-{
-    for (UINT y = 0; y < side(mip); ++y)
-        for (UINT x = 0; x < side(mip); ++x)
-            std::memcpy(guest + offset(mip, x, y), linear + static_cast<std::size_t>(y) * pitch + 16 * x, 16);
-}
+    UINT address(UINT mip, UINT x, UINT y, UINT slice) const {
+        const UINT tile = (y / 64) * tiles_wide(mip) + x / 64;
+        UINT within = ((y & 3) << 4) | ((x & 3) << 6);
+        for (UINT bit = 2; bit < 6; ++bit) {
+            within |= ((y >> bit) & 1) << (4 + bit * 2);
+            within |= ((x >> bit) & 1) << (5 + bit * 2);
+        }
+        return slice * slice_bytes() + start(mip) + tile * tile_bytes + within;
+    }
+
+    template<bool into> void copy(UINT mip, UINT slice, unsigned char* dst, const unsigned char* src, UINT pitch) const {
+        for (UINT y = 0; y < rows(mip); ++y)
+            for (UINT x = 0; x < columns(mip); ++x) {
+                const UINT tiled = address(mip, x, y, slice);
+                const std::size_t linear = static_cast<std::size_t>(y) * pitch + 16 * x;
+                if constexpr (into) std::memcpy(dst + tiled, src + linear, 16);
+                else std::memcpy(dst + linear, src + tiled, 16);
+            }
+    }
+};
 } // namespace x2w_startup::bc64

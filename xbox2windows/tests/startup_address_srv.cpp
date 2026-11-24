@@ -122,12 +122,18 @@ int draw_bc_chain(void* guest, void* list)
     wchar_t path[MAX_PATH]{};
     const DWORD size = GetEnvironmentVariableW(L"X2W_TEST_BC_CHAIN", path, MAX_PATH);
     if (!size || size >= MAX_PATH) return 43;
-    static std::array<char, 0x160000 + 0xffff> storage{};
+    const bool array = GetEnvironmentVariableW(L"X2W_TEST_BC_ARRAY", nullptr, 0) != 0;
+    const bool rectangular = GetEnvironmentVariableW(L"X2W_TEST_BC_RECT", nullptr, 0) != 0;
+    const UINT height = rectangular ? 512 : 1024;
+    const UINT16 slices = array ? 2 : 1;
+    const UINT16 mips = array ? 9 : 6;
+    const UINT bytes = slices * (rectangular ? 0xc0000 : 0x160000);
+    static std::array<char, 2 * 0x160000 + 0xffff> storage{};
     char* backing = reinterpret_cast<char*>((ptr(storage.data()) + 0xffff) & ~Word{0xffff});
     std::ifstream input(path, std::ios::binary);
-    if (!input.read(backing, 0x160000) || input.peek() != std::char_traits<char>::eof()) return 43;
+    if (!input.read(backing, bytes) || input.peek() != std::char_traits<char>::eof()) return 43;
     const bool bc5 = GetEnvironmentVariableW(L"X2W_TEST_BC5", nullptr, 0) != 0;
-    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1024, 1024, 1, 6,
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1024, height, slices, mips,
         bc5 ? DXGI_FORMAT_BC5_UNORM : DXGI_FORMAT_BC7_UNORM, {1, 0}, static_cast<D3D12_TEXTURE_LAYOUT>(0x109),
         D3D12_RESOURCE_FLAG_NONE};
     Word cpu = 0;
@@ -135,9 +141,15 @@ int draw_bc_chain(void* guest, void* list)
     ViewAt v{};
     v.address = ptr(backing);
     v.view.Format = desc.Format;
-    v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     v.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    v.view.Texture2D.MipLevels = desc.MipLevels;
+    if (array) {
+        v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        v.view.Texture2DArray.ArraySize = slices;
+        v.view.Texture2DArray.MipLevels = mips;
+    } else {
+        v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        v.view.Texture2D.MipLevels = mips;
+    }
     invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
     invoke(list, 12, 3, 1);
     return 0;

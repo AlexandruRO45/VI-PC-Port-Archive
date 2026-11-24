@@ -8,7 +8,7 @@ import tempfile
 from startup_stream_draw_check import gfx2hlsl, pixel, vertex
 
 
-def draw_texture(directory, consumer, backend, hlsl, modes):
+def draw_texture(directory, consumer, backend, hlsl, modes, view_kind="tex2d"):
     cache = directory / "cache"
     cache.mkdir()
     vs, ps, root, output = (directory / name for name in ("vs", "ps", "root", "pixels"))
@@ -21,7 +21,7 @@ def draw_texture(directory, consumer, backend, hlsl, modes):
     subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
     manifest, = cache.glob("*.txt")
     with manifest.open("a", encoding="ascii") as file:
-        file.write("\nsrv 0 tex2d table 0 0\n")
+        file.write(f"\nsrv 0 {view_kind} table 0 0\n")
     source = manifest.with_suffix(".ps.hlsl")
     source.write_text(hlsl)
     subprocess.run([env["X2W_FXC"], "/nologo", "/T", "ps_5_0", "/E", "main", "/Fo",

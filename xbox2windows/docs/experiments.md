@@ -8625,3 +8625,12 @@ XG texture-computer slot 10 reports a 64 KiB standard tile layout for 1024×512 
 cmake --build --preset release --target startup_stub_xg_xs xg_swizzle_select_check
 ctest --preset release --no-tests=error --output-on-failure -R '^(startup_xg_bc_tiling|xg_bc64_tiling_reference)$'
 ```
+
+For the same nine-mip textures, slot 2 returns the byte offset of each mip within its slice. Slots 8 and 9 copy subresource `mip + slice * 9`. In the packed tile, the individual mips begin at `0x8000, 0x4000, 0x2000, 0x1000, 0x800, 0x600`. Slot 10 identifies the enclosing tile at zero. The optional AddrLib comparison checks the address of every visible 16-byte block in both formats and sizes with one and two slices.
+
+`startup_xg_bc_array_{warp,hardware}` writes a distinct pattern for each mip and slice through slot 8, reads it through slot 9, and checks guards, padding, and an invalid subresource. It passes the actual tiled bytes to the D3D12 address SRV and draws with a source-built `Texture2DArray.Load` shader. Each adapter compares 12,288 pixels per draw across four combinations of size and format, then repeats each draw with the array slice reversed and checks those pixels against the reversed reference. The fixture supplies the array shader and its typed SRV manifest directly.
+
+```powershell
+cmake --build --preset release --target startup_stream_consumer startup_stub_xg_xs xg_swizzle_select_check
+ctest --preset release --no-tests=error --output-on-failure -R '^(startup_xg_bc_(array|chain)_(hardware|warp)|startup_xg_bc_tiling|xg_bc64_tiling_reference|startup_xg_bc7_layout)$'
+```
