@@ -1112,7 +1112,7 @@ fn dpp16_and_dpp8_honor_fi_and_source_lane_exec() {
                 if fi || src_active {
                     (0x1000 + src) + l
                 } else {
-                    old // DPP8 0xE9 disables write when source lane is inactive
+                    l // DPP8 0xE9 substitutes 0 for inactive source lanes (0 + l)
                 }
             })
             .collect()
