@@ -2984,12 +2984,12 @@ impl Em {
             "v_sub_f16" => fr(format!("{} - {}", fh(0), fh(1))),
             "v_subrev_f16" => fr(format!("{} - {}", fh(1), fh(0))),
             "v_mul_f16" => fr(format!("{} * {}", fh(0), fh(1))),
-            "v_min_f16" => fr(format!("min({}, {})", fh(0), fh(1))),
-            "v_max_f16" => fr(format!("max({}, {})", fh(0), fh(1))),
+            "v_min_f16" => format!("min16z2({}, {}, {})", hb(0), hb(1), fr(format!("fmin_ieee({}, {})", fh(0), fh(1)))),
+            "v_max_f16" => format!("max16z2({}, {}, {})", hb(0), hb(1), fr(format!("fmax_ieee({}, {})", fh(0), fh(1)))),
             "v_fma_f16" => fr(format!("mad({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_med3_f16" => fr(format!("med3f({}, {}, {})", fh(0), fh(1), fh(2))),
-            "v_min3_f16" => fr(format!("min(min({}, {}), {})", fh(0), fh(1), fh(2))),
-            "v_max3_f16" => fr(format!("max(max({}, {}), {})", fh(0), fh(1), fh(2))),
+            "v_min3_f16" => format!("min16z3({}, {}, {}, {})", hb(0), hb(1), hb(2), fr(format!("fmin_ieee(fmin_ieee({}, {}), {})", fh(0), fh(1), fh(2)))),
+            "v_max3_f16" => format!("max16z3({}, {}, {}, {})", hb(0), hb(1), hb(2), fr(format!("fmax_ieee(fmax_ieee({}, {}), {})", fh(0), fh(1), fh(2)))),
             "v_med3_u16" => format!("med3u({a}, {b}, {c})"),
             "v_min3_u16" => format!("min(min({a}, {b}), {c})"),
             "v_max3_u16" => format!("max(max({a}, {b}), {c})"),
@@ -3359,8 +3359,8 @@ impl Em {
             "v_subrev_f32" => fr(format!("{} - {}", fs(1), fs(0))),
             "v_mul_f32" => fr(format!("{} * {}", fs(0), fs(1))),
             "v_mul_legacy_f32" => fr(format!("mul_legacy({}, {})", fs(0), fs(1))),
-            "v_min_f32" => fr(format!("min({}, {})", fs(0), fs(1))),
-            "v_max_f32" => fr(format!("max({}, {})", fs(0), fs(1))),
+            "v_min_f32" => fr(format!("fmin_ieee({}, {})", fs(0), fs(1))),
+            "v_max_f32" => fr(format!("fmax_ieee({}, {})", fs(0), fs(1))),
             "v_fmac_f32" => fr(format!("mad({}, {}, asfloat({cur}))", fs(0), fs(1))),
             "v_mac_f32" => fr(format!("mad_nf({}, {}, asfloat({cur}))", fs(0), fs(1))),
             "v_fmac_legacy_f32" => fr(format!("fma_legacy({}, {}, asfloat({cur}))", fs(0), fs(1))),
@@ -3371,8 +3371,8 @@ impl Em {
             "v_fmaak_f32" => fr(format!("mad({}, {}, asfloat({c}))", fs(0), fs(1))),
             "v_madmk_f32" => fr(format!("mad_nf({}, asfloat({b}), {})", fs(0), fs(2))),
             "v_madak_f32" => fr(format!("mad_nf({}, {}, asfloat({c}))", fs(0), fs(1))),
-            "v_min3_f32" => fr(format!("min(min({}, {}), {})", fs(0), fs(1), fs(2))),
-            "v_max3_f32" => fr(format!("max(max({}, {}), {})", fs(0), fs(1), fs(2))),
+            "v_min3_f32" => fr(format!("fmin_ieee(fmin_ieee({}, {}), {})", fs(0), fs(1), fs(2))),
+            "v_max3_f32" => fr(format!("fmax_ieee(fmax_ieee({}, {}), {})", fs(0), fs(1), fs(2))),
             "v_med3_f32" => fr(format!("med3f({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_cubeid_f32" => fr(format!("cube_id({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_cubesc_f32" => fr(format!("cube_sc({}, {}, {})", fs(0), fs(1), fs(2))),
@@ -5613,6 +5613,35 @@ uint lanemask_lt_lo() { return lane_id >= 32u ? 0xFFFFFFFFu : (lane_id == 0u ? 0
 uint lanemask_lt_hi() { return lane_id <= 32u ? 0u : (0xFFFFFFFFu >> (64u - lane_id)); }
 uint wqm(uint m) { uint q = m | (m >> 1); q = q | (q >> 2); q &= 0x11111111u; return q * 15u; }
 float mul_legacy(float a, float b) { return select(or(a == 0.0f, b == 0.0f), 0.0f, a * b); }
+// RDNA2 IEEE min/max order -0.0 < +0.0; HLSL min/max may return either zero, so
+// settle the both-zero case on the sign bits (min: OR keeps -0, max: AND keeps +0)
+float fmin_ieee(float a, float b) { return (a == 0.0f && b == 0.0f) ? asfloat(asuint(a) | asuint(b)) : min(a, b); }
+float fmax_ieee(float a, float b) { return (a == 0.0f && b == 0.0f) ? asfloat(asuint(a) & asuint(b)) : max(a, b); }
+bool f16_nan(uint h) { return (h & 0x7FFFu) > 0x7C00u; }
+bool f16_zero(uint h) { return (h & 0x7FFFu) == 0u; }
+bool f16_negz(uint h) { return h == 0x8000u; }
+bool f16_posz(uint h) { return h == 0u; }
+bool f16_negv(uint h) { return (h & 0x8000u) != 0u && !f16_zero(h) && !f16_nan(h); }
+bool f16_posv(uint h) { return (h & 0x8000u) == 0u && !f16_zero(h) && !f16_nan(h); }
+// f16 -> f32 -> f16 loses the sign of zero, so the zero results are settled on the raw
+// halves instead: min is -0 when a -0 is present and no operand is negative, +0 when the
+// zeros present are all +0; max mirrors it (+0 wins over -0, negatives do not block it)
+uint min16z2(uint a, uint b, uint fb) {
+    if (!f16_negv(a) && !f16_negv(b) && (f16_zero(a) || f16_zero(b))) return (f16_negz(a) || f16_negz(b)) ? 0x8000u : 0u;
+    return fb;
+}
+uint min16z3(uint a, uint b, uint c, uint fb) {
+    if (!f16_negv(a) && !f16_negv(b) && !f16_negv(c) && (f16_zero(a) || f16_zero(b) || f16_zero(c))) return (f16_negz(a) || f16_negz(b) || f16_negz(c)) ? 0x8000u : 0u;
+    return fb;
+}
+uint max16z2(uint a, uint b, uint fb) {
+    if (!f16_posv(a) && !f16_posv(b) && (f16_zero(a) || f16_zero(b))) return (f16_posz(a) || f16_posz(b)) ? 0u : 0x8000u;
+    return fb;
+}
+uint max16z3(uint a, uint b, uint c, uint fb) {
+    if (!f16_posv(a) && !f16_posv(b) && !f16_posv(c) && (f16_zero(a) || f16_zero(b) || f16_zero(c))) return (f16_posz(a) || f16_posz(b) || f16_posz(c)) ? 0u : 0x8000u;
+    return fb;
+}
 uint absd8(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFu; uint y = (b >> k) & 0xFFu; return max(x, y) - min(x, y); }
 uint absd16(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFFFu; uint y = (b >> k) & 0xFFFFu; return max(x, y) - min(x, y); }
 uint sad_u8(uint a, uint b) { return absd8(a, b, 0u) + absd8(a, b, 8u) + absd8(a, b, 16u) + absd8(a, b, 24u); }

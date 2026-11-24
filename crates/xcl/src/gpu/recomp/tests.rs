@@ -2727,6 +2727,42 @@ fn gpu_valu_16_and_64_bit() {
 }
 
 #[test]
+fn gpu_min_max_f32_f16_order_negative_zero() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            ("V_MIN_F32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 0), ("SRC1", V + 1)], None), // min(+0, -0)
+            ("V_MIN_F32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 1), ("SRC1", V + 0)], None), // min(-0, +0)
+            ("V_MAX_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 0), ("SRC1", V + 1)], None), // max(+0, -0)
+            ("V_MAX_F32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 1), ("SRC1", V + 0)], None), // max(-0, +0)
+            ("V_MIN3_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None), // min3(+0, -0, +1)
+            ("V_MAX3_F32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 1), ("SRC1", V + 0), ("SRC2", V + 3)], None), // max3(-0, +0, -1)
+            ("V_MIN_F16", "ENC_VOP2", &[("VDST", 8), ("SRC0", V + 20), ("VSRC1", 21)], None), // low halves: min(-0h, +0h)
+            ("V_MAX_F16", "ENC_VOP2", &[("VDST", 9), ("SRC0", V + 20), ("VSRC1", 21)], None), // low halves: max(-0h, +0h)
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[0] = 0x0000_0000; // +0.0f
+            r[1] = 0x8000_0000; // -0.0f
+            r[2] = 0x3F80_0000; // +1.0f
+            r[3] = 0xBF80_0000; // -1.0f
+            r[20] = 0x0000_8000; // low -0.0h, high +0.0h
+            r[21] = 0x0000_0000; // low +0.0h, high +0.0h
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(v[2], 0x8000_0000, "wave{lanes} lane {l} min(+0,-0) = -0");
+            assert_eq!(v[3], 0x8000_0000, "wave{lanes} lane {l} min(-0,+0) = -0");
+            assert_eq!(v[4], 0x0000_0000, "wave{lanes} lane {l} max(+0,-0) = +0");
+            assert_eq!(v[5], 0x0000_0000, "wave{lanes} lane {l} max(-0,+0) = +0");
+            assert_eq!(v[6], 0x8000_0000, "wave{lanes} lane {l} min3(+0,-0,+1) = -0");
+            assert_eq!(v[7], 0x0000_0000, "wave{lanes} lane {l} max3(-0,+0,-1) = +0");
+            assert_eq!(v[8] & 0xFFFF, 0x8000, "wave{lanes} lane {l} min(-0h,+0h) = -0h");
+            assert_eq!(v[9] & 0xFFFF, 0x0000, "wave{lanes} lane {l} max(-0h,+0h) = +0h");
+        }
+    }
+}
+
+#[test]
 fn gpu_packed_math_dots_movrel() {
     if !gpu_ready() {
         return;
@@ -7589,3 +7625,5 @@ fn jumps_to_outer_loop_heads_are_structured() {
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
 }
+
+
