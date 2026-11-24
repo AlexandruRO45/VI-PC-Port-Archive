@@ -103,13 +103,14 @@ pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     let mut floor = memchr::memmem::find(file, MAGIC).map_or(file.len(), |m| m + MAGIC.len());
     // A marker needs its name's NUL, the kind and `n` (6 bytes) before it.
     let mut from = floor + 6;
+    let mut streams = Streams::default();
     std::iter::from_fn(move || {
         while let Some(found) = finder.find(file.get(from..)?) {
             let at = from + found;
             match record(&file[floor..], at - floor) {
                 Found::Record(r) => {
                     let r = Record { offset: at, ..r };
-                    if covers_a_record(file, &r) && !r.is_stream() {
+                    if covers_a_record(file, &r, &mut streams) && !r.is_stream() {
                         // Bytes that only look like a marker, laid over a
                         // real record: the real one wins.
                         from = at + 1;
@@ -182,13 +183,53 @@ fn record(file: &[u8], at: usize) -> Found<'_> {
 /// a real one is that record's (stored deflate blocks); but if `r`'s own
 /// bytes are no deflate stream, `r` is bytes that look like a marker (in a
 /// container stored between records, say) and the record it covers is real.
-fn covers_a_record(file: &[u8], r: &Record<'_>) -> bool {
+fn covers_a_record(file: &[u8], r: &Record<'_>, streams: &mut Streams) -> bool {
     let span = r.span();
-    let lo = r.offset + 1;
-    // A marker from `span.end + 6` on has its header after the span.
+    // Its header must be after `r`'s marker, and a marker from
+    // `span.end + 6` on has its header after the span.
     let hi = file.len().min(span.end + 6 + MARKER.len() - 1);
-    memchr::memmem::find_iter(file.get(lo..hi).unwrap_or_default(), &MARKER)
-        .any(|m| matches!(record(&file[lo..], m), Found::Record(inner) if inner.is_stream()))
+    streams.any_in(file, r.offset + 7, hi)
+}
+
+/// Which markers start a record whose packed bytes are a deflate stream, as
+/// far as [`records`] has asked. Its questions move forward through the
+/// file, and markers in bytes that only look like records may each cover
+/// all the rest of it: asking each of them anew rescans and reinflates the
+/// same bytes, so a crafted file of `n` such markers takes `n²` work and
+/// more. Each marker is looked at once instead.
+#[derive(Default)]
+struct Streams {
+    /// No marker at an offset in `from..to` starts such a record.
+    from: usize,
+    to: usize,
+    /// The marker at `to` does (and was the first found from `from` on).
+    hit: bool,
+}
+
+impl Streams {
+    /// Whether a marker that lies wholly in `lo..hi` starts such a record
+    /// (its header read from `lo` on).
+    fn any_in(&mut self, file: &[u8], lo: usize, hi: usize) -> bool {
+        if lo < self.from || lo > self.to {
+            *self = Self {
+                from: lo,
+                to: lo,
+                hit: false,
+            };
+        }
+        if !self.hit {
+            let window = file.get(self.to..hi).unwrap_or_default();
+            match memchr::memmem::find_iter(window, &MARKER)
+                .map(|m| self.to + m)
+                .find(|&at| matches!(record(&file[at - 6..], 6), Found::Record(inner) if inner.is_stream()))
+            {
+                Some(at) => (self.to, self.hit) = (at, true),
+                // Markers at offsets up to `hi - 4` have been looked at.
+                None => self.to = self.to.max(hi.saturating_sub(MARKER.len() - 1)),
+            }
+        }
+        self.hit && self.to + MARKER.len() <= hi
+    }
 }
 
 /// Whether `bytes` are the start of a deflate stream of `unpacked` bytes:
@@ -738,6 +779,35 @@ mod tests {
         assert_eq!(names, [Some("CS_x"), Some("PS_after")]);
         assert_eq!(found[0].unpack(), None);
         assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+    }
+
+    #[test]
+    fn nested_markers_without_streams_take_linear_work() {
+        // Bytes that each read as a marker whose span runs to the end of the
+        // file and covers every one after it, then a real record: each is
+        // skipped in favour of the record it covers. Before, every one of
+        // them rescanned (and reinflated) the rest of the file: these 8000
+        // (150 KB) took 43 s in a test build, and now take milliseconds.
+        let real = record_bytes("PS_real", 0x32, b"real");
+        let count = 8000;
+        let end = MAGIC.len() + count * 19 + real.len();
+        let mut file = MAGIC.to_vec();
+        for _ in 0..count {
+            let n = (end - (file.len() + 6)) as u32;
+            file.extend_from_slice(&[0, 0x32]);
+            for v in [n, 0x000D_DCE7, n, 1 << 20] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            file.push(0x07); // reserved block type: no deflate stream
+        }
+        file.extend(&real);
+        assert_eq!(file.len(), end);
+        let started = std::time::Instant::now();
+        let found: Vec<_> = records(&file).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_real")]);
+        assert_eq!(found[0].unpack().as_deref(), Some(&b"real"[..]));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
