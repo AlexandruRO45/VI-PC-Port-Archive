@@ -23,4 +23,6 @@ jobs:
       - name: Check the asset policy
         run: cargo xtask policy
       - name: Run workspace tests
+        env:
+          VICTORY_WARP: '1'
         run: cargo test --workspace --locked -- --test-threads=1
