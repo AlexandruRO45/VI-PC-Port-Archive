@@ -1097,6 +1097,10 @@ mod tests {
     /// `GIT_CEILING_DIRECTORIES` there, with no way to escape it, so the
     /// ceiling `git_command` sets would not hold and git would look for a
     /// repository above the temporary one.
+    ///
+    /// Nor under a path that is not UTF-8: the hook and filter scripts the
+    /// tests write, and the arguments some of them pass to git, are built
+    /// from the path as text, so every such test panicked in `to_str`.
     fn tempdir() -> tempfile::TempDir {
         let candidates = [
             Some(std::env::temp_dir()),
@@ -1116,7 +1120,9 @@ mod tests {
             let Ok(dir) = dir.canonicalize() else {
                 continue;
             };
-            if cfg!(unix) && dir.as_os_str().as_encoded_bytes().contains(&b':') {
+            if dir.to_str().is_none()
+                || cfg!(unix) && dir.as_os_str().as_encoded_bytes().contains(&b':')
+            {
                 continue;
             }
             if let Ok(tmp) = tempfile::tempdir_in(dir)
@@ -1127,7 +1133,8 @@ mod tests {
         }
         panic!(
             "could not create a temporary directory outside {} or ignored by it: \
-             set TMPDIR to a writable directory outside the checkout without `:`",
+             set TMPDIR to a writable directory outside the checkout, named in UTF-8 \
+             without `:`",
             checkout.display()
         );
     }
@@ -2209,6 +2216,38 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         assert_eq!(out.stdout, tricky.as_os_str().as_encoded_bytes());
+    }
+
+    /// Under a TMPDIR whose path is not UTF-8, the tests that write hook
+    /// or filter scripts, or pass a path inside it to git as text, panicked
+    /// in `to_str`. Such a directory is passed over like one holding `:`.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_skip_a_tmpdir_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let outer = tempdir();
+        let bad = outer
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"not-utf8-\xff"));
+        let plain = outer.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        if std::fs::create_dir(&bad).is_err() {
+            // Some filesystems (APFS) refuse names that are not UTF-8.
+            return;
+        }
+        assert!(
+            tempfile::tempdir_in(&bad)
+                .unwrap()
+                .path()
+                .to_str()
+                .is_none()
+        );
+
+        let tmp = tempdir_in_first(&crate::workspace_root(), [bad.clone(), plain.clone()]);
+        assert!(tmp.path().starts_with(plain.canonicalize().unwrap()));
+        assert!(tmp.path().to_str().is_some());
+        sh_quote(tmp.path());
+        assert_eq!(std::fs::read_dir(&bad).unwrap().count(), 0);
     }
 
     const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1\n\
