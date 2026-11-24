@@ -205,6 +205,17 @@ The first launch after a build translates every shader and builds about
 - This fork's changes were developed with
   [Claude Code](https://claude.com/claude-code) and Gemini (Antigravity).
 
+### Running on Linux
+
+The workspace compiles, tests and runs its file-side commands (`config`,
+`inspect`, `census`, `shader-info`) natively on Linux. The game itself needs
+a Windows environment, which Proton supplies: build `victory.exe` with
+`cargo win` and run it through `proton/run.sh`. Packages, commands, prefix
+layout and known Wine gaps are in [docs/proton.md](docs/proton.md).
+
+Everything below this line is upstream VIctory's own README, unchanged; its
+status section describes upstream, not this fork.
+
 ---
 
 ## From upstream's README
