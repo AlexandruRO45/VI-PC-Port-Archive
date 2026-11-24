@@ -1,0 +1,196 @@
+"""Interpréteur de référence RDNA 2 (wave32) : première brique du recompilateur de shaders.
+
+Il exécute un programme RDNA 2 sur 32 lignes : registres scalaires (SGPR, VCC, EXEC, M0),
+registres vectoriels (VGPR), SCC et branchements. Le futur recompilateur RDNA 2 → DXIL
+sera validé contre lui. La sémantique suit la documentation publique d'AMD (« RDNA 2
+Instruction Set Architecture ») ; les instructions non encore décrites lèvent une erreur
+qui les nomme, ce qui mesure ce qui reste à traduire.
+"""
+import struct
+
+from emu import rdna2, rdna2_exec_ext, rdna2_exec_graphics, rdna2_exec_image, rdna2_exec_memory, rdna2_exec_vop3
+from emu.rdna2_exec_ops import SCALAR, VECTOR, VECTOR_COMPARE, BRANCHES, float_bits
+
+LANES = 32
+FULL = (1 << LANES) - 1
+MASK32 = 0xFFFF_FFFF
+SCALAR_REGISTERS = 128              # s0-s105, vcc, ttmp, m0, null, exec
+VCC_LO, M0, NULL, EXEC_LO = 106, 124, 125, 126
+VGPR_FIRST, LITERAL = 256, 255
+INLINE_FLOATS = {240: 0.5, 241: -0.5, 242: 1.0, 243: -1.0, 244: 2.0, 245: -2.0, 246: 4.0, 247: -4.0,
+                 248: 0.15915494309189535}
+MAX_STEPS = 1_000_000
+DECODED_FAMILIES = frozenset({"SOP1", "SOP2", "SOPC", "SOPK", "SOPP", "VOP1", "VOP2", "VOPC"})
+MEMORY_FAMILIES = frozenset({"SMEM", "DS", "MUBUF", "FLAT", "GLOBAL", "SCRATCH"})
+
+
+class Untranslated(NotImplementedError):
+    """Instruction que l'interpréteur ne sait pas encore exécuter."""
+
+
+class Wave:
+    """État d'un wave32. `v[n][ligne]` : VGPR ; `s[n]` : registres scalaires 32 bits."""
+
+    def __init__(self, memory=None):
+        self.memory = memory if memory is not None else rdna2_exec_memory.Memory()
+        self.lds = bytearray(rdna2_exec_memory.LDS_SIZE)
+        self.steps = 0
+        self.s = [0] * SCALAR_REGISTERS
+        self.v = [[0] * LANES for _ in range(VGPR_FIRST)]
+        self.s[EXEC_LO] = FULL
+        self.v[0] = list(range(LANES))     # v0 : numéro de ligne, comme un shader de calcul
+        self.scc = False
+        self.pc = 0
+
+    @property
+    def exec(self):
+        return self.s[EXEC_LO]
+
+    @property
+    def vcc(self):
+        return self.s[VCC_LO]
+
+    def active(self):
+        return [lane for lane in range(LANES) if self.exec >> lane & 1]
+
+    def read_scalar(self, code, literal, width=1):
+        if code == LITERAL:
+            return literal
+        if code < SCALAR_REGISTERS:
+            low = 0 if code == NULL else self.s[code]
+            return low | (self.s[code + 1] << 32 if width == 2 and code + 1 < SCALAR_REGISTERS else 0)
+        if 128 <= code <= 192:
+            return code - 128
+        if 193 <= code <= 208:
+            return (192 - code) & (MASK32 if width == 1 else (1 << 64) - 1)
+        if code in INLINE_FLOATS:
+            return float_bits(INLINE_FLOATS[code])
+        raise Untranslated(f"opérande scalaire {code} non pris en charge")
+
+    def write_scalar(self, code, value, width=1):
+        if code == NULL:
+            return
+        self.s[code] = value & MASK32
+        if width == 2:
+            self.s[code + 1] = (value >> 32) & MASK32
+
+    def read_lane(self, code, lane, literal):
+        """Source 9 bits d'une instruction vectorielle, pour une ligne."""
+        if code >= VGPR_FIRST:
+            return self.v[code - VGPR_FIRST][lane]
+        return self.read_scalar(code, literal)
+
+
+def _fields(family, word):
+    from emu.rdna2_operands import FIELDS
+
+    return {name: (word >> shift) & mask for name, (shift, mask, _) in FIELDS[family].items()}
+
+
+def _signed16(value):
+    return value - 0x10000 if value & 0x8000 else value
+
+
+def step(wave, data):
+    """Exécute l'instruction à wave.pc. Renvoie False après s_endpgm."""
+    family, opcode, size = rdna2.classify(data, wave.pc)
+    name = rdna2.mnemonic(family, opcode) or f"{family}#{opcode}"
+    if name == "s_endpgm":
+        return False
+    if not executable(family, name):
+        raise Untranslated(f"instruction non traduite : {name} ({family}, opcode 0x{opcode:X})")
+    wave.steps += 1
+    if family in rdna2_exec_graphics.FAMILIES:
+        word = int.from_bytes(data[wave.pc:wave.pc + 2 * rdna2.DWORD].ljust(8, b"\0"), "little")
+        rdna2_exec_graphics.execute(wave, family, name, word)
+        wave.pc += size * rdna2.DWORD
+        return True
+    if family in rdna2_exec_image.FAMILIES:
+        rdna2_exec_image.execute(wave, name, int.from_bytes(data[wave.pc:wave.pc + size * rdna2.DWORD], "little"))
+        wave.pc += size * rdna2.DWORD
+        return True
+    if family in MEMORY_FAMILIES:
+        word = int.from_bytes(data[wave.pc:wave.pc + 2 * rdna2.DWORD], "little")
+        rdna2_exec_memory.execute(wave, family, name, word)
+        wave.pc += size * rdna2.DWORD
+        return True
+    if family == "VOP3":
+        word = int.from_bytes(data[wave.pc:wave.pc + 2 * rdna2.DWORD], "little")
+        literal = struct.unpack_from("<I", data, wave.pc + 2 * rdna2.DWORD)[0] if size > 2 else None
+        rdna2_exec_vop3.execute(wave, name, opcode, word, literal)
+        wave.pc += size * rdna2.DWORD
+        return True
+    word = struct.unpack_from("<I", data, wave.pc)[0]
+    literal = struct.unpack_from("<I", data, wave.pc + rdna2.DWORD)[0] if size > 1 else None
+    fields = _fields(family, word)
+    next_pc = wave.pc + size * rdna2.DWORD
+    if name in BRANCHES:
+        if BRANCHES[name](wave):
+            next_pc = wave.pc + rdna2.DWORD + _signed16(fields["simm16"]) * rdna2.DWORD
+    elif name in SCALAR:
+        SCALAR[name](wave, fields, literal)
+    elif rdna2_exec_ext.is_ext(family, fields.get("src0")):
+        rdna2_exec_ext.execute(wave, family, name, fields, literal or 0)
+    elif name in VECTOR:
+        _vector(wave, name, fields, literal)
+    elif name in VECTOR_COMPARE:
+        _compare(wave, name, fields, literal)
+    else:
+        raise Untranslated(f"instruction non traduite : {name} ({family}, opcode 0x{opcode:X})")
+    wave.pc = next_pc
+    return True
+
+
+def _vector(wave, name, fields, literal):
+    operation = VECTOR[name]
+    if name == "v_readfirstlane_b32":
+        lanes = wave.active() or [0]
+        wave.write_scalar(fields["sdst"], wave.read_lane(fields["src0"], lanes[0], literal))
+        return
+    destination = wave.v[fields["vdst"]]
+    for lane in wave.active():
+        a = wave.read_lane(fields["src0"], lane, literal)
+        b = wave.v[fields["vsrc1"]][lane] if "vsrc1" in fields else 0
+        destination[lane] = operation(a, b, destination[lane], literal, wave.vcc >> lane & 1) & MASK32
+
+
+def _compare(wave, name, fields, literal):
+    test, writes_exec = VECTOR_COMPARE[name]
+    mask = 0
+    for lane in wave.active():
+        if test(wave.read_lane(fields["src0"], lane, literal), wave.v[fields["vsrc1"]][lane]):
+            mask |= 1 << lane
+    wave.s[EXEC_LO if writes_exec else VCC_LO] = mask
+
+
+def run(data, wave=None, max_steps=MAX_STEPS):
+    """Exécute un programme jusqu'à s_endpgm et renvoie l'état final du wave."""
+    wave = wave or Wave()
+    for _ in range(max_steps):
+        if wave.pc + rdna2.DWORD > len(data) or not step(wave, data):
+            return wave
+    raise RuntimeError(f"programme interrompu après {max_steps} instructions (boucle infinie ?)")
+
+
+EXECUTABLE = frozenset({"s_endpgm", *SCALAR, *VECTOR, *VECTOR_COMPARE, *BRANCHES})
+
+
+def executable(family, name):
+    """Vrai si l'interpréteur exécute cette instruction dans cet encodage."""
+    if family == "VOP3":
+        return name in rdna2_exec_vop3.EXECUTABLE
+    if family in rdna2_exec_graphics.FAMILIES:
+        return rdna2_exec_graphics.supports(family, name)
+    if family in rdna2_exec_image.FAMILIES:
+        return rdna2_exec_image.supports(family, name)
+    if family in MEMORY_FAMILIES:
+        return rdna2_exec_memory.supports(name)
+    return family in DECODED_FAMILIES and name in EXECUTABLE
+
+
+def coverage():
+    """(encodages exécutables, encodages RDNA 2 connus), un par (famille, opcode)."""
+    from emu.rdna2_ops import MNEMONICS
+
+    done = sum(executable(family, name) for (family, _), name in MNEMONICS.items())
+    return done, len(MNEMONICS)

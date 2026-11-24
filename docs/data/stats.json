@@ -3,7 +3,7 @@
   "issues": 29,
   "prs": 542,
   "comments": 3708,
-  "updated": 1795555642
+  "updated": 1795506056
  },
  "leonida-old": {
   "issues": 371,
@@ -15,30 +15,36 @@
   "issues": 352,
   "prs": 658,
   "comments": 7087,
-  "updated": 1795558043
+  "updated": 1795504328
  },
  "victory": {
   "issues": 470,
   "prs": 612,
   "comments": 6275,
-  "updated": 1795556183
+  "updated": 1795506755
  },
  "xbox2windows": {
   "issues": 239,
   "prs": 1137,
   "comments": 3883,
-  "updated": 1795559012
+  "updated": 1795506551
  },
  "tuxbox": {
   "issues": 11,
   "prs": 68,
   "comments": 47,
-  "updated": 1795559413
+  "updated": 1795541444
  },
  "victory-fork": {
   "issues": 63,
   "prs": 15,
   "comments": 315,
-  "updated": 1795557618
+  "updated": 1795552504
+ },
+ "anyxboxx": {
+  "issues": 41,
+  "prs": 138,
+  "comments": 176,
+  "updated": 1795556730
  }
 }

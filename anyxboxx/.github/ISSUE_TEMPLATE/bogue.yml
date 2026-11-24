@@ -1,0 +1,26 @@
+name: Bogue
+description: Signaler un comportement incorrect de l'émulateur
+labels: [bogue]
+body:
+  - type: textarea
+    id: etapes
+    attributes:
+      label: Étapes pour reproduire
+      description: Commande lancée ou bouton utilisé.
+    validations:
+      required: true
+  - type: textarea
+    id: attendu
+    attributes:
+      label: Résultat attendu et résultat obtenu
+    validations:
+      required: true
+  - type: textarea
+    id: journal
+    attributes:
+      label: Journal ou rapport de compatibilité
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version de Windows et de Python

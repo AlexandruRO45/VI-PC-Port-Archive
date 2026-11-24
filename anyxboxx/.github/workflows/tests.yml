@@ -1,0 +1,64 @@
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Lecture seule : la CI ne pousse rien et n'écrit pas dans le dépôt.
+permissions:
+  contents: read
+
+# Un nouveau push sur une PR annule le passage précédent, devenu inutile.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ruff pytest
+      - name: ruff (même règles que les mainteneurs)
+        run: python -m ruff check --select W605,F,E9 PrototypeScarlett tests tools
+      - name: README dans les 9 langues
+        run: python -m pytest tests/test_readme_sync.py -q
+
+  pytest:
+    # Garder « pytest » : c'est le nom du check exigé par la protection de main.
+    name: pytest
+    needs: lint
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      ANYXBOXX_REQUIRE_RUNTIME: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Runtime C++
+        run: |
+          cmake -S runtime -B runtime/build -A x64
+          cmake --build runtime/build --config Release
+      - name: Rust (passerelle vers TomBox)
+        run: |
+          cargo build --release --manifest-path rust/Cargo.toml
+          cargo test --release --manifest-path rust/Cargo.toml
+      - name: DLL console de TomBox (runtime/build/tombox, lues par défaut)
+        run: python tools/build_tombox.py
+      - run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: pytest (suite complète, nombre de tests comparé aux README)
+        run: python -m pytest

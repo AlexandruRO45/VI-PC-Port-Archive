@@ -1,7 +1,7 @@
 :root {
   color-scheme: light;
   --bg:#f7f6f3; --panel:#ffffff; --soft:#efede8; --ink:#111110; --ink2:#52514e; --muted:#6f6d67; --line:#e2e0da;
-  --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --s5:#8a8780; --s6:#d6457a; --s7:#7c5cf0;
+  --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --s5:#8a8780; --s6:#d6457a; --s7:#7c5cf0; --s8:#0e8fa8;
   --open:#15803d; --closed:#6b7280; --merged:#6250d6;
   --mono:"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --display:"Space Grotesk", Inter, system-ui, sans-serif;
@@ -9,13 +9,13 @@
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
   color-scheme: dark;
   --bg:#0e0e0d; --panel:#171716; --soft:#1f1f1d; --ink:#f0efec; --ink2:#c3c2b7; --muted:#8f8e86; --line:#2a2a28;
-  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#77756e; --s6:#e0588c; --s7:#9479ff;
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#77756e; --s6:#e0588c; --s7:#9479ff; --s8:#26b0c9;
   --open:#4ade80; --closed:#9ca3af; --merged:#9085e9;
 } }
 :root[data-theme="dark"] {
   color-scheme: dark;
   --bg:#0e0e0d; --panel:#171716; --soft:#1f1f1d; --ink:#f0efec; --ink2:#c3c2b7; --muted:#8f8e86; --line:#2a2a28;
-  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#77756e; --s6:#e0588c; --s7:#9479ff;
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#77756e; --s6:#e0588c; --s7:#9479ff; --s8:#26b0c9;
   --open:#4ade80; --closed:#9ca3af; --merged:#9085e9;
 }
 * { box-sizing:border-box; }
@@ -61,7 +61,7 @@ h1, h2, h3 { font-family:var(--display); letter-spacing:-.025em; margin:0; }
 
 .chip { display:inline-flex; align-items:center; gap:6px; font-family:var(--mono); font-size:11.5px; color:var(--ink2); border:1px solid var(--line); border-radius:99px; padding:2px 9px; white-space:nowrap; }
 .dot { width:9px; height:9px; border-radius:2px; flex:none; display:inline-block; }
-.p-leonida-new { --pc:var(--s1); } .p-leonida-old { --pc:var(--s5); } .p-xcl { --pc:var(--s2); } .p-victory { --pc:var(--s3); } .p-xbox2windows { --pc:var(--s4); } .p-tuxbox { --pc:var(--s6); } .p-victory-fork { --pc:var(--s7); }
+.p-leonida-new { --pc:var(--s1); } .p-leonida-old { --pc:var(--s5); } .p-xcl { --pc:var(--s2); } .p-victory { --pc:var(--s3); } .p-xbox2windows { --pc:var(--s4); } .p-tuxbox { --pc:var(--s6); } .p-victory-fork { --pc:var(--s7); } .p-anyxboxx { --pc:var(--s8); }
 .dot { background:var(--pc); }
 
 footer { margin-top:72px; border-top:1px solid var(--line); padding:28px 0 48px; color:var(--muted); font-size:13px; }

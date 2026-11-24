@@ -1,0 +1,14 @@
+/PrototypeScarlett/runtime/
+/Scarlett - prototype.exe
+/.venv/
+__pycache__/
+*.pyc
+.coverage
+.pytest_cache/
+/runtime/build/
+
+# Rust
+rust/target/
+
+# Paramètres Claude Code personnels
+.claude/settings.local.json

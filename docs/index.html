@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GTA6 PC Port Archive</title>
-<meta name="description" content="Archive of the open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory, victory-fork, Xbox2Windows and TuxBox. Code, branches, pull requests, issues and comments, synced hourly. Projects removed from GitHub stay here.">
+<meta name="description" content="Archive of the open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory, victory-fork, AnyXboxX, Xbox2Windows and TuxBox. Code, branches, pull requests, issues and comments, synced hourly. Projects removed from GitHub stay here.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <script>
   // old links pointed issues at index.html#project/number; they live on browse.html now ("leonida" is now "leonida-old")
-  if (/^#(leonida|leonida-old|leonida-new|xcl|victory|xbox2windows|tuxbox|victory-fork|victory-gta6)(\/\d+)?$/.test(location.hash))
+  if (/^#(leonida|leonida-old|leonida-new|xcl|victory|xbox2windows|tuxbox|victory-fork|anyxboxx|victory-gta6)(\/\d+)?$/.test(location.hash))
     location.replace("browse.html" + location.hash.replace(/^#leonida(?=\/|$)/, "#leonida-old").replace(/^#victory-gta6/, "#victory-fork"));
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -101,6 +101,9 @@
 .cmdline { display:flex; gap:8px; align-items:stretch; }
 .cmdline pre { flex:1; min-width:0; margin:0; font-family:var(--mono); font-size:13px; background:var(--soft); border-radius:8px; padding:11px 12px; white-space:pre-wrap; overflow-wrap:anywhere; }
 .one .btn[aria-pressed="true"] { border-color:var(--ink); background:var(--soft); box-shadow:inset 0 0 0 1px var(--ink); }
+.filter { margin:-6px 0 18px; }
+.filter .btn[aria-pressed="true"] { background:var(--ink); color:var(--bg); border-color:var(--ink); }
+.gta-only [data-gta="0"] { display:none; }
 .one { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:14px; font-size:14px; color:var(--ink2); }
 
 /* important links */
@@ -137,6 +140,7 @@
 
   <section class="sec" id="archive" aria-labelledby="arc-h">
     <div class="sec-head"><h2 id="arc-h">Archive</h2><p>Still on GitHub. Every hour the sync checks each one for new code, pull requests and comments.</p></div>
+    <div class="filter"><button type="button" class="btn sm" id="gta" aria-pressed="false">Only GTA VI projects</button></div>
     <div class="alive" id="alive"></div>
   </section>
 </div>
@@ -166,7 +170,7 @@
 </main>
 
 <footer><div class="wrap">
-  <span>Licenses: Leonida (old and new) GPL-3.0 · xcl GPL-2.0 · VIctory GPL-3.0 · Xbox2Windows MIT · TuxBox Apache-2.0 · victory-fork GPL-3.0</span>
+  <span>Licenses: Leonida (old and new) GPL-3.0 · xcl GPL-2.0 · VIctory GPL-3.0 · Xbox2Windows MIT · TuxBox Apache-2.0 · victory-fork GPL-3.0 · AnyXboxX GPL-3.0</span>
   <a href="https://github.com/Guernica4u/GTA6-PC-Port-Archive">GitHub repository</a>
 </div></footer>
 
@@ -175,17 +179,18 @@ const REPO = "https://github.com/Guernica4u/GTA6-PC-Port-Archive";
 const STEPS = ["Starts", "Menus", "Loads the world", "World on screen", "Playable"];
 // reached = how many STEPS work, from each project's README (24 Nov 2026); branch = its branch prefix in this repo;
 // gone = date it was removed from GitHub (listed in the graveyard); born and commits come from its archived history
+// gta = made only for GTA VI (the others run Xbox Series games in general); the "Only GTA VI projects" button keeps these
 const PROJECTS = {
-  "leonida-new": { repo: "ubiquitarianism/leonida", saved: "24 Nov 2026", name: "Leonida", tag: "new", lic: "GPL-3.0", branch: "leonida-new", up: "https://github.com/ubiquitarianism/leonida",
+  "leonida-new": { repo: "ubiquitarianism/leonida", saved: "24 Nov 2026", name: "Leonida", tag: "new", gta: true, lic: "GPL-3.0", branch: "leonida-new", up: "https://github.com/ubiquitarianism/leonida",
     desc: "Leonida Continued: picks up the original Leonida with its full history.", reached: 0,
     note: "The game doesn't start yet. Its tools already unpack the game's shaders, models, textures and audio.", src: "https://github.com/ubiquitarianism/leonida#project-status" },
-  "leonida-old": { repo: "ItsNotRexed/Leonida", saved: "23 Nov 2026", gone: "23 Nov 2026", born: "20 Nov 2026", commits: 11487, name: "Leonida", tag: "old", lic: "GPL-3.0", branch: "leonida", up: null, frozen: "Final copy, 23 Nov 2026",
+  "leonida-old": { repo: "ItsNotRexed/Leonida", saved: "23 Nov 2026", gone: "23 Nov 2026", born: "20 Nov 2026", commits: 11487, name: "Leonida", tag: "old", gta: true, lic: "GPL-3.0", branch: "leonida", up: null, frozen: "Final copy, 23 Nov 2026",
     desc: "The original Leonida. Development continues in Leonida (new).", reached: 0,
     note: "Stopped before the game starts. The new Leonida carries on from here.", src: `${REPO}/tree/main/leonida-old#project-status` },
   xcl: { repo: "ivall/xcl", saved: "23 Nov 2026", name: "xcl", lic: "GPL-2.0", branch: "xcl", up: "https://github.com/ivall/xcl",
     desc: "Runs Xbox Series games on Windows. Minecraft Preview and Unicorn Overlord are already fully playable.", reached: 2,
     note: "Starts in about 4 seconds and shows the menus at 30 fps. Gameplay not reached yet. (Its README calls it “a newer retail game”.)", src: "https://github.com/ivall/xcl#games" },
-  victory: { repo: "Marvisak/VIctory", saved: "23 Nov 2026", name: "VIctory", lic: "GPL-3.0", branch: "victory", up: "https://github.com/Marvisak/VIctory",
+  victory: { repo: "Marvisak/VIctory", saved: "23 Nov 2026", name: "VIctory", gta: true, lic: "GPL-3.0", branch: "victory", up: "https://github.com/Marvisak/VIctory",
     desc: "Runs GTA VI's Xbox code natively on Windows.", reached: 3,
     note: "Starts, plays the intro, shows the menus and loads into the world. The world itself is still a dark screen.", src: "https://github.com/Marvisak/VIctory#status-2026-11-23" },
   xbox2windows: { repo: "R0Y00/Xbox2Windows", saved: "23 Nov 2026", name: "Xbox2Windows", lic: "MIT", branch: "xbox2windows", up: "https://github.com/R0Y00/Xbox2Windows",
@@ -194,9 +199,12 @@ const PROJECTS = {
   tuxbox: { repo: "brcly/TuxBox", saved: "24 Nov 2026", name: "TuxBox", lic: "Apache-2.0", branch: "tuxbox", up: "https://github.com/brcly/TuxBox",
     desc: "Runs Xbox Series games on Linux (through Proton) and Windows.", reached: 2,
     note: "On Linux it starts and shows the player selection screen in 4K. What comes after that isn't checked yet.", src: "https://github.com/brcly/TuxBox/blob/main/docs/PROGRESS.md#games" },
-  "victory-fork": { repo: "fxceless/victory-fork", saved: "24 Nov 2026", name: "victory-fork", lic: "GPL-3.0", branch: "victory-fork", up: "https://github.com/fxceless/victory-fork",
+  "victory-fork": { repo: "fxceless/victory-fork", saved: "24 Nov 2026", name: "victory-fork", gta: true, lic: "GPL-3.0", branch: "victory-fork", up: "https://github.com/fxceless/victory-fork",
     desc: "A fork of VIctory focused on getting GTA VI's world to render and run on a Windows PC.", reached: 4,
     note: "Plays the opening cutscene and renders the first gameplay scene with working input, but at 2-4 fps and with everything in shadow black.", src: "https://github.com/fxceless/victory-fork#status-of-this-fork-2026-11-25" },
+  anyxboxx: { repo: "LooperSalty/AnyXboxX", saved: "24 Nov 2026", name: "AnyXboxX", gta: true, lic: "GPL-3.0", branch: "anyxboxx", up: "https://github.com/LooperSalty/AnyXboxX",
+    desc: "An Xbox Series X emulator prototype aimed only at GTA VI for now, running it through victory-fork.", reached: 4,
+    note: "Shows the world with the character under your control, at about 5.4 fps. Not playable yet: graphics problems remain and there is no ray tracing.", src: "https://github.com/LooperSalty/AnyXboxX#readme" },
 };
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
@@ -216,7 +224,7 @@ function projects(st) {
   $("n-alive").textContent = ALIVE.length; $("n-dead").textContent = DEAD.length;
   $("alive").innerHTML = ALIVE.map(k => {
     const P = PROJECTS[k], s = st[k] || {};
-    return `<article class="life p-${k}" aria-labelledby="h-${k}">
+    return `<article class="life p-${k}" data-gta="${+!!P.gta}" aria-labelledby="h-${k}">
       <div class="hd"><h3 id="h-${k}">${label(P)}</h3><span class="beat">${pulse}Alive</span></div>
       <p>${esc(P.desc)}</p>
       <div class="facts">${s.updated ? `Last code change ${ago(s.updated)}<br>` : ""}${fmt(s.prs)} PRs · ${fmt(s.issues)} issues · ${fmt(s.comments)} comments<br>Saved since ${P.saved} · ${P.lic}<br>Status: ${esc(reach(P))} (<a href="${P.src}" target="_blank" rel="noopener">source</a>)</div>
@@ -229,7 +237,7 @@ function projects(st) {
   }).join("");
   $("yard").innerHTML = DEAD.map(k => {
     const P = PROJECTS[k], s = st[k] || {};
-    return `<article class="grave" aria-labelledby="h-${k}">
+    return `<article class="grave" data-gta="${+!!P.gta}" aria-labelledby="h-${k}">
       <div><h3 id="h-${k}">${label(P)}</h3>
         <span class="gone">Removed from GitHub · ${P.gone}</span>
         <div class="was">Was at github.com/${P.repo}<br>Active ${P.born || "?"} – ${P.gone}</div>
@@ -243,7 +251,7 @@ function projects(st) {
 function downloads() {
   $("dl").innerHTML = Object.keys(PROJECTS).map(k => {
     const P = PROJECTS[k];
-    return `<div class="dlc p-${k}">
+    return `<div class="dlc p-${k}" data-gta="${+!!P.gta}">
       <h3><i class="dot"></i>${label(P)}</h3>
       <p>${P.frozen || "Latest code, synced every hour"}</p>
       <div class="actions">
@@ -278,6 +286,15 @@ function cmds() {
   });
 }
 
+// "Only GTA VI projects": hides the general Xbox Series projects everywhere on the page
+function gtaFilter() {
+  $("gta").addEventListener("click", e => {
+    const on = e.currentTarget.getAttribute("aria-pressed") !== "true";
+    e.currentTarget.setAttribute("aria-pressed", String(on));
+    document.body.classList.toggle("gta-only", on);
+  });
+}
+
 // highlight the nav item of the section on screen
 function spy() {
   const links = new Map([...document.querySelectorAll('.nav a[href^="#"]')].map(a => [a.hash.slice(1), a]));
@@ -293,6 +310,7 @@ function spy() {
   projects(null);
   downloads();
   cmds();
+  gtaFilter();
   spy();
   try { const r = await fetch("data/stats.json"); if (r.ok) projects(await r.json()); } catch {}
 })();

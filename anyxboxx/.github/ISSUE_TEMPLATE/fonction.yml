@@ -1,0 +1,21 @@
+name: Fonction à émuler
+description: Demander l'émulation d'une fonction système Xbox ou Windows
+labels: [hle]
+body:
+  - type: input
+    id: nom
+    attributes:
+      label: Fonction
+      placeholder: xgameruntime.dll!XUserAddAsync
+    validations:
+      required: true
+  - type: input
+    id: doc
+    attributes:
+      label: Lien vers la documentation publique
+  - type: textarea
+    id: contexte
+    attributes:
+      label: Programme qui l'appelle et comportement attendu
+    validations:
+      required: true

@@ -1,0 +1,262 @@
+"""Instructions mémoire RDNA 2 pour l'interpréteur de référence : SMEM, DS (LDS), FLAT/GLOBAL et MUBUF.
+
+La mémoire globale est un espace d'adresses 64 bits éparse ; la LDS est un tableau de 64 Kio
+propre au wave. Les buffers MUBUF et s_buffer_load passent par un descripteur V# de quatre
+SGPR (adresse de base 48 bits, pas, nombre d'éléments) ; un accès hors limites lit 0 et
+n'écrit rien, comme sur le GPU. Formats d'encodage et sémantique d'après la documentation
+publique d'AMD (« RDNA 2 Instruction Set Architecture »).
+"""
+import re
+import struct
+
+from emu.rdna2_exec_ops import MASK32, signed
+
+PAGE = 4096
+LDS_SIZE = 64 * 1024
+NULL, OFF = 125, 0x7D
+DWORD = 4
+WIDTHS = {"dword": 4, "dwordx2": 8, "dwordx3": 12, "dwordx4": 16, "dwordx8": 32, "dwordx16": 64,
+          "b32": 4, "b64": 8, "b96": 12, "b128": 16, "ubyte": 1, "sbyte": 1, "byte": 1, "u8": 1, "i8": 1,
+          "b8": 1, "ushort": 2, "sshort": 2, "short": 2, "u16": 2, "i16": 2, "b16": 2}
+SIGNED_TYPES = ("sbyte", "sshort", "i8", "i16")
+ATOMICS = {
+    "add": lambda old, value: old + value, "sub": lambda old, value: old - value,
+    "swap": lambda old, value: value, "and": lambda old, value: old & value,
+    "or": lambda old, value: old | value, "xor": lambda old, value: old ^ value,
+    "umin": min, "umax": max, "min_u32": min, "max_u32": max,
+    "smin": lambda old, value: min(signed(old), signed(value)),
+    "smax": lambda old, value: max(signed(old), signed(value)),
+    "min_i32": lambda old, value: min(signed(old), signed(value)),
+    "max_i32": lambda old, value: max(signed(old), signed(value)),
+}
+LDS_SIMPLE_ATOMICS = ("add", "sub", "and", "or", "xor")
+VECTOR_PATTERN = re.compile(r"^(global|flat|scratch|buffer)_(load|store)_([a-z0-9]+)$")
+VECTOR_ATOMIC = re.compile(r"^(global|flat|buffer)_atomic_(add|sub|swap|and|or|xor|umin|umax|smin|smax)$")
+SCALAR_PATTERN = re.compile(r"^s_(buffer_)?load_(dword|dwordx2|dwordx4|dwordx8|dwordx16)$")
+LDS_PATTERN = re.compile(r"^ds_(read|write)(2?)_(b32|b64|b96|b128|u8|i8|u16|i16|b8|b16)$")
+LDS_ATOMIC = re.compile(r"^ds_(add|sub|and|or|xor|min|max)(_rtn)?_(u32|i32|b32)$")
+# Formes _d16 : la valeur est une moitié (16 bits) du VGPR. {nom: (sens, type, moitié haute)}.
+LDS_HALVES = {
+    **{f"ds_read_{kind}_d16{suffix}": ("read", kind, bool(suffix))
+       for kind in ("u8", "i8", "u16") for suffix in ("", "_hi")},
+    **{f"ds_write_{kind}_d16_hi": ("write", kind, True) for kind in ("b8", "b16")},
+}
+HALF_BITS, HALF_MASK = 16, 0xFFFF
+CACHE_CONTROL = frozenset({"s_dcache_inv", "s_gl1_inv", "s_dcache_wb", "buffer_gl0_inv", "buffer_gl1_inv",
+                           "ds_nop"})
+OTHER = frozenset({"s_memtime", "s_memrealtime", "ds_bpermute_b32"})
+
+
+class Memory:
+    """Mémoire globale éparse (pages de 4 Kio créées à la première écriture)."""
+
+    def __init__(self):
+        self.pages = {}
+
+    def read(self, address, size):
+        out = bytearray()
+        while size:
+            page, offset = divmod(address, PAGE)
+            count = min(size, PAGE - offset)
+            out += self.pages.get(page, bytes(PAGE))[offset:offset + count]
+            address, size = address + count, size - count
+        return bytes(out)
+
+    def write(self, address, data):
+        while data:
+            page, offset = divmod(address, PAGE)
+            count = min(len(data), PAGE - offset)
+            self.pages.setdefault(page, bytearray(PAGE))[offset:offset + count] = data[:count]
+            address, data = address + count, data[count:]
+
+    def write_words(self, address, words):
+        self.write(address, struct.pack(f"<{len(words)}I", *(w & MASK32 for w in words)))
+
+    def read_words(self, address, count):
+        return list(struct.unpack(f"<{count}I", self.read(address, count * DWORD)))
+
+
+def supports(name):
+    """Vrai si l'interpréteur exécute cette instruction mémoire."""
+    vector = VECTOR_PATTERN.match(name)
+    return bool(name in CACHE_CONTROL or name in OTHER or vector and vector.group(3) in WIDTHS
+                or VECTOR_ATOMIC.match(name) or SCALAR_PATTERN.match(name)
+                or LDS_PATTERN.match(name) or LDS_ATOMIC.match(name) or name in LDS_HALVES)
+
+
+def _to_words(data):
+    padded = data + bytes(-len(data) % DWORD)
+    return list(struct.unpack(f"<{len(padded) // DWORD}I", padded))
+
+
+def _extend(data, kind):
+    value = int.from_bytes(data, "little")
+    return signed(value, len(data) * 8) & MASK32 if kind in SIGNED_TYPES else value
+
+
+def _store_bytes(wave, register, lane, size):
+    words = [wave.v[register + i][lane] for i in range((size + DWORD - 1) // DWORD)]
+    return struct.pack(f"<{len(words)}I", *words)[:size]
+
+
+def _load_into(wave, register, lane, data, kind):
+    if len(data) < DWORD:
+        wave.v[register][lane] = _extend(data, kind)
+        return
+    for index, word in enumerate(_to_words(data)):
+        wave.v[register + index][lane] = word
+
+
+def execute(wave, family, name, word):
+    """Exécute une instruction mémoire dont `supports(name)` est vrai ; `word` : 64 bits."""
+    if name in CACHE_CONTROL:
+        return
+    if family == "SMEM":
+        _scalar(wave, name, word)
+    elif family == "DS":
+        _lds(wave, name, word)
+    elif family == "MUBUF":
+        _buffer(wave, name, word)
+    else:
+        _flat(wave, family, name, word)
+
+
+# --- SMEM : chargements scalaires --------------------------------------------------------
+
+def descriptor(wave, first):
+    """Descripteur de buffer V# : (adresse de base 48 bits, pas en octets, nombre d'éléments)."""
+    base = wave.s[first] | (wave.s[first + 1] & 0xFFFF) << 32
+    stride = (wave.s[first + 1] >> 16) & 0x3FFF
+    return base, stride, wave.s[first + 2]
+
+
+def _scalar(wave, name, word):
+    sdata = (word >> 6) & 0x7F
+    if name in ("s_memtime", "s_memrealtime"):
+        wave.write_scalar(sdata, wave.steps, 2)
+        return
+    sbase = (word & 0x3F) * 2
+    offset = signed((word >> 32) & 0x1FFFFF, 21)
+    soffset = (word >> 57) & 0x7F
+    if soffset != NULL:
+        offset += wave.s[soffset]
+    found = SCALAR_PATTERN.match(name)
+    size = WIDTHS[found.group(2)]
+    if found.group(1):
+        base, _, records = descriptor(wave, sbase)
+        inside = 0 <= offset and offset + size <= records
+        data = wave.memory.read(base + offset, size) if inside else bytes(size)
+    else:
+        data = wave.memory.read((wave.s[sbase] | wave.s[sbase + 1] << 32) + offset, size)
+    for index, value in enumerate(_to_words(data)):
+        wave.s[sdata + index] = value
+
+
+# --- DS : mémoire partagée LDS ------------------------------------------------------------
+
+def _lds(wave, name, word):
+    offset0, offset1 = word & 0xFF, (word >> 8) & 0xFF
+    addr, data0, data1, vdst = ((word >> shift) & 0xFF for shift in (32, 40, 48, 56))
+    if name == "ds_bpermute_b32":
+        values = list(wave.v[data0])
+        for lane in wave.active():
+            wave.v[vdst][lane] = values[((wave.v[addr][lane] + (offset1 << 8 | offset0)) // DWORD) % 32]
+        return
+    atomic = LDS_ATOMIC.match(name)
+    found = LDS_PATTERN.match(name)
+    for lane in wave.active():
+        base = wave.v[addr][lane]
+        if name in LDS_HALVES:
+            _lds_half(wave, name, base + (offset1 << 8 | offset0), data0, vdst, lane)
+            continue
+        if atomic:
+            _lds_atomic(wave, atomic, base + (offset1 << 8 | offset0), data0, vdst, lane)
+            continue
+        size = WIDTHS[found.group(3)]
+        if found.group(2):          # read2/write2 : deux accès, décalages en éléments
+            places = [(base + offset0 * size, data0, vdst), (base + offset1 * size, data1, vdst + size // DWORD)]
+        else:
+            places = [(base + (offset1 << 8 | offset0), data0, vdst)]
+        for address, source, target in places:
+            address %= LDS_SIZE
+            if found.group(1) == "write":
+                wave.lds[address:address + size] = _store_bytes(wave, source, lane, size)
+            else:
+                _load_into(wave, target, lane, bytes(wave.lds[address:address + size]), found.group(3))
+
+
+def _lds_half(wave, name, address, data0, vdst, lane):
+    """Accès _d16 : une lecture remplit une moitié du VGPR (étendue à 16 bits) et garde l'autre ;
+    une écriture _d16_hi prend l'octet ou le demi-mot dans la moitié haute de la donnée.
+
+    Source : DSInstructions.td de LLVM (sortie liée à l'entrée, prédicat D16PreservesUnusedBits).
+    """
+    direction, kind, high = LDS_HALVES[name]
+    size, shift = WIDTHS[kind], HALF_BITS if high else 0
+    address %= LDS_SIZE
+    if direction == "write":
+        value = (wave.v[data0][lane] >> shift) & ((1 << 8 * size) - 1)
+        wave.lds[address:address + size] = value.to_bytes(size, "little")
+        return
+    half = _extend(bytes(wave.lds[address:address + size]), kind) & HALF_MASK
+    kept = wave.v[vdst][lane] & ~(HALF_MASK << shift) & MASK32
+    wave.v[vdst][lane] = kept | half << shift
+
+
+def _lds_atomic(wave, found, address, data0, vdst, lane):
+    address %= LDS_SIZE
+    old = int.from_bytes(wave.lds[address:address + DWORD], "little")
+    operation = found.group(1)
+    key = operation if operation in LDS_SIMPLE_ATOMICS else f"{operation}_{found.group(3)}"
+    new = ATOMICS[key](old, wave.v[data0][lane]) & MASK32
+    wave.lds[address:address + DWORD] = new.to_bytes(DWORD, "little")
+    if found.group(2):
+        wave.v[vdst][lane] = old
+
+
+# --- FLAT / GLOBAL et MUBUF : mémoire vectorielle ------------------------------------------
+
+def _flat(wave, family, name, word):
+    offset = signed(word & 0xFFF, 12)
+    addr, data, saddr, vdst = (word >> 32) & 0xFF, (word >> 40) & 0xFF, (word >> 48) & 0x7F, (word >> 56) & 0xFF
+    for lane in wave.active():
+        if family == "GLOBAL" and saddr != OFF:
+            address = (wave.s[saddr] | wave.s[saddr + 1] << 32) + wave.v[addr][lane]
+        else:
+            address = wave.v[addr][lane] | wave.v[addr + 1][lane] << 32
+        _access(wave, name, address + offset, data, vdst, lane, returns=(word >> 16) & 1)
+
+
+def _buffer(wave, name, word):
+    offset, offen, idxen = word & 0xFFF, (word >> 12) & 1, (word >> 13) & 1
+    vaddr, vdata = (word >> 32) & 0xFF, (word >> 40) & 0xFF
+    base, stride, records = descriptor(wave, ((word >> 48) & 0x1F) * 4)
+    soffset_code = (word >> 56) & 0xFF
+    soffset = 0 if soffset_code == NULL else wave.read_scalar(soffset_code, None)
+    plain = VECTOR_PATTERN.match(name)
+    size = WIDTHS[plain.group(3)] if plain else DWORD
+    for lane in wave.active():
+        index = wave.v[vaddr][lane] if idxen else 0
+        byte_offset = offset + (wave.v[vaddr + idxen][lane] if offen else 0)
+        inside = index < records if stride else byte_offset + size <= records
+        _access(wave, name, base + soffset + index * stride + byte_offset, vdata, vdata, lane, inside,
+                returns=(word >> 14) & 1)
+
+
+def _access(wave, name, address, data, vdst, lane, inside=True, returns=False):
+    atomic = VECTOR_ATOMIC.match(name)
+    if atomic:
+        if inside:
+            old = wave.memory.read_words(address, 1)[0]
+            wave.memory.write_words(address, [ATOMICS[atomic.group(2)](old, wave.v[data][lane])])
+            if returns:                             # glc : la valeur d'avant est renvoyée
+                wave.v[vdst][lane] = old
+        return
+    found = VECTOR_PATTERN.match(name)
+    size = WIDTHS[found.group(3)]
+    if found.group(2) == "store":
+        if inside:
+            wave.memory.write(address, _store_bytes(wave, data, lane, size))
+    else:
+        loaded = wave.memory.read(address, size) if inside else bytes(size)
+        _load_into(wave, vdst, lane, loaded, found.group(3))
