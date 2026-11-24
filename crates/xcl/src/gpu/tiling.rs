@@ -282,24 +282,25 @@ impl Chain {
         let size = |i: usize| (((width >> i).max(1)).div_ceil(side) as usize, ((height >> i).max(1)).div_ceil(side) as usize);
         // what a level is padded from: mip 0's elements halved rounding up (addrlib ShiftCeil;
         // the console's layout library agrees), which only differs for odd sizes
-        let (w0, h0) = (width.div_ceil(side) as usize, height.div_ceil(side) as usize);
-        let padded = |i: usize| (w0.div_ceil(1 << i), h0.div_ceil(1 << i));
+        let (w0, h0, d0) = (width.div_ceil(side) as usize, height.div_ceil(side) as usize, depth.max(1) as usize);
+        let padded = |i: usize| (w0.div_ceil(1 << i), h0.div_ceil(1 << i), d0.div_ceil(1 << i));
         let depth_of = |i: usize| (depth >> i).max(1) as usize;
         // the largest level the tail holds (GetMipTailDim: a thick block halves h, w or d by
         // log2(block) % 3) and at most this many levels in it (GetMaxNumMipsInTail)
-        let (tw, th) = if !thick {
+        let (tw, th, td) = if !thick {
             // Z (depth) modes of 1- and 2-byte elements: 64 × 128 elements, as for 4-byte ones
             // (seen on the console's layout library)
             if layout.mode != 0 && layout.mode.is_multiple_of(4) && layout.elem_log2 <= 1 {
-                (bw / 4, bh >> (1 - layout.elem_log2))
+                (bw / 4, bh >> (1 - layout.elem_log2), usize::MAX)
             } else {
-                (bw / 2, bh)
+                (bw / 2, bh, usize::MAX)
             }
         } else {
+            let bd = layout.block_d;
             match blk % 3 {
-                0 => (bw, bh / 2),
-                1 => (bw / 2, bh),
-                _ => (bw, bh),
+                0 => (bw, bh / 2, bd),
+                1 => (bw / 2, bh, bd),
+                _ => (bw, bh, (bd / 2).max(1)),
             }
         };
         let eff = if thick { blk - (blk - 8) / 3 } else { blk };
@@ -311,8 +312,8 @@ impl Chain {
         let first_tail = if mips > 1 && max_tail > 0 {
             (0..mips)
                 .find(|&i| {
-                    let (w, h) = padded(i);
-                    w <= tw && h <= th && mips - i <= max_tail
+                    let (w, h, d) = padded(i);
+                    w <= tw && h <= th && (!thick || d <= td) && mips - i <= max_tail
                 })
                 .unwrap_or(mips)
         } else {
@@ -322,7 +323,7 @@ impl Chain {
         let mut offset = if first_tail < mips { layout.block_bytes } else { 0 };
         for i in (0..first_tail).rev() {
             let (w, h) = size(i);
-            let (pw, ph) = padded(i);
+            let (pw, ph, _) = padded(i);
             levels[i] = MipLevel { width: w, height: h, depth: depth_of(i), offset, pitch: pw.div_ceil(bw) * bw, origin: (0, 0), tail: None };
             offset += layout.size(pw, ph);
         }
@@ -810,6 +811,41 @@ mod tests {
                 })
                 .collect();
             assert_eq!(got, want, "mode {mode}, {} B elements", 1 << e);
+        }
+    }
+
+    #[test]
+    fn thick_3d_mip_tail_respects_block_depth() {
+        let cfg = PipeConfig { pipes_log2: 0, pkrs_log2: 0 };
+        // 64 KiB thick (mode 9, e=2 → block 32×32×16): 16×16×64 fits tw×th at mip 0,
+        // but depth > 16 until mip 2.
+        let c64 = Chain::new_3d(Layout::new_3d(9, 2, cfg).unwrap(), 16, 16, 64, 1, 4);
+        assert!(c64.levels[0].tail.is_none() && c64.levels[1].tail.is_none(), "mips with depth > block_d must stay out of mip tail");
+        assert!(c64.levels[2].tail.is_some() && c64.levels[3].tail.is_some());
+
+        // 4 KiB thick (mode 5, e=2 → block 8×16×8): 8×8×32 fits tw×th at mip 0,
+        // but depth > 8 until mip 2.
+        let c4 = Chain::new_3d(Layout::new_3d(5, 2, cfg).unwrap(), 8, 8, 32, 1, 4);
+        assert!(c4.levels[0].tail.is_none() && c4.levels[1].tail.is_none());
+        assert!(c4.levels[2].tail.is_some() && c4.levels[3].tail.is_some());
+
+        for (e, c) in [(2u32, c64), (2u32, c4)] {
+            let mut mem = vec![0u8; c.slice_bytes * c.layers()];
+            let mut want = Vec::new();
+            let mut n = 19u32;
+            for (i, l) in c.levels.iter().enumerate() {
+                let lin: Vec<u8> = (0..(l.width * l.height * l.depth) << e)
+                    .map(|_| {
+                        n = n.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                        (n >> 16) as u8 | 1
+                    })
+                    .collect();
+                c.tile_volume(&mut mem, i, &lin);
+                want.push(lin);
+            }
+            for (i, lin) in want.iter().enumerate() {
+                assert_eq!(&c.detile_volume(&mem, i), lin, "level {i} overwritten");
+            }
         }
     }
 }
