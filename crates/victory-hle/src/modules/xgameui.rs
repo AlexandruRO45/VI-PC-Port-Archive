@@ -62,6 +62,7 @@ extern "system" fn text_entry_async(
 ) -> HRESULT {
     let [title, description, default] = [title, description, default].map(|t| text(t).unwrap_or_default());
     tracing::info!(title, description, max_length, "text entry");
+    let max_length = max_text_length(max_length);
     xasync::pending_with(block, (&raw const TEXT).cast(), move || {
         match ask(&title, &description, &default, max_length) {
             Some(typed) => {
@@ -102,12 +103,22 @@ extern "system" fn text_entry_result(
     put(used, written as u32)
 }
 
-/// At most `max` characters (0: no limit).
-fn limit(typed: &str, max: u32) -> String {
+/// The limit when the title passes 0, as the GDK documents
+/// `XGameUiShowTextEntryAsync`'s `maxTextLength`.
+const DEFAULT_MAX_TEXT_LENGTH: u32 = 1024;
+
+/// The limit the dialog and the result both use: the title's own, or the
+/// default for 0.
+fn max_text_length(max: u32) -> u32 {
     match max {
-        0 => typed.to_owned(),
-        max => typed.chars().take(max as usize).collect(),
+        0 => DEFAULT_MAX_TEXT_LENGTH,
+        max => max,
     }
+}
+
+/// At most `max` characters.
+fn limit(typed: &str, max: u32) -> String {
+    typed.chars().take(max as usize).collect()
 }
 
 /// Asks the user in a modal host dialog; `None` if dismissed.
@@ -317,5 +328,39 @@ mod tests {
         assert_eq!(result(this, &mut b, 7, out.as_mut_ptr(), &mut used), S_OK);
         assert_eq!((text(out.as_ptr()).as_deref(), used), (Some("abctyp"), 7));
         assert_eq!(limit("\u{e9}t\u{e9}s", 3), "\u{e9}t\u{e9}");
+    }
+
+    /// A limit of 0 is the documented 1024 characters, not unlimited; a
+    /// positive limit is kept as given.
+    #[test]
+    fn zero_length_limit_is_1024_characters() {
+        assert_eq!(max_text_length(0), 1024);
+        assert_eq!(max_text_length(6), 6);
+        assert_eq!(max_text_length(4096), 4096);
+
+        type Entry = extern "system" fn(
+            This,
+            *mut AsyncBlock,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            u32,
+            u32,
+        ) -> HRESULT;
+        type Size = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
+        let this: This = &OBJECT;
+        let entry = method::<Entry>(&OBJECT, 0x88);
+        let size_of = method::<Size>(&OBJECT, 0x90);
+        // The test dialog answers the default text plus "typed": 1025 + 5
+        // characters, cut to 1024 (and its NUL).
+        let default = std::ffi::CString::new("a".repeat(1025)).unwrap();
+        let null = std::ptr::null();
+        let mut b = block();
+        let typed = c"Type".as_ptr();
+        assert_eq!(entry(this, &mut b, typed, null, default.as_ptr(), 0, 0), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        let mut size = 0;
+        assert_eq!(size_of(this, &mut b, &mut size), S_OK);
+        assert_eq!(size, 1025);
     }
 }
