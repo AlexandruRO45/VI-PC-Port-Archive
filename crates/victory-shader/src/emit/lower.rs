@@ -2805,7 +2805,7 @@ impl<'a> Lower<'a> {
     // shortcut: the base level reads 0 (the host view starts at its own
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
-    // stops the program. A cube reads as its six faces (not a cube array).
+    // stops the program. A cube gives its size and type, but not its depth.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
@@ -2899,8 +2899,8 @@ impl<'a> Lower<'a> {
                     1 => (one, one),
                     2 => (field(self, 1), one),
                     6 => (one, field(self, 1)),
-                    // A cube is six faces (DXIL's dimensions have no depth).
-                    5 => (field(self, 1), self.s.m.i32(6)),
+                    // A cube's depth dword is never exposed (see below).
+                    5 => (field(self, 1), one),
                     _ => (field(self, 1), field(self, 2)),
                 };
                 let levels = if uav { one } else { field(self, 3) };
@@ -2928,7 +2928,13 @@ impl<'a> Lower<'a> {
                 let base = k(self, 0xFAC | ty << 28);
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth)]
+                let mut words = vec![(1, d1), (2, d2), (3, d3)];
+                // How a guest cube encodes DEPTH (six faces, or the last layer
+                // equal to the first) is not established: it stays unreadable.
+                if kind != 5 {
+                    words.push((4, depth));
+                }
+                words
             }
             None => vec![(2, field(self, 0))],
         };
@@ -6567,8 +6573,9 @@ mod tests {
     #[test]
     fn cube_descriptor_dwords_read_as_data() {
         // A cube image's descriptor (a table range at s0) is loaded, sized
-        // with image_get_resinfo, and its depth dword (4: the six faces, so
-        // 5) is read as a number and branched on.
+        // with image_get_resinfo, and its type dword (3) is read as a number
+        // and branched on. Its depth dword (4) is not known, so reading it
+        // still stops the program.
         let table = RootParam {
             root: RootType::Table,
             table_offset_dwords: 0,
@@ -6584,12 +6591,15 @@ mod tests {
             0x7E04_0480, // v_mov_b32 v2, 0
             0xF038_0318,
             0x0001_0402, // image_get_resinfo v[4:5], v2, s[4:11] dim:SQ_RSRC_IMG_CUBE
-            0xBF06_8508, // s_cmp_eq_u32 s8, 5
+            0xBF06_8507, // s_cmp_eq_u32 s7, 5
             0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
             0xBE84_0380, // s_mov_b32 s4, 0
             S_ENDPGM,
         ];
         lowers(&words, vec![table]).unwrap();
+        let mut depth = words;
+        depth[6] = 0xBF06_8508; // s_cmp_eq_u32 s8, 5
+        assert!(lowers(&depth, vec![table]).is_err());
         // The same with a 2D image (dim 1) also lowers.
         let mut flat = words;
         flat[4] = 0xF038_0308;
