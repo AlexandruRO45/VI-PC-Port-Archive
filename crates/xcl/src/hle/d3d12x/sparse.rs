@@ -16,7 +16,7 @@
 //! Buffers the title places there get reserved resources over the same tiles, so PC-side
 //! copies, views and barriers see the same memory.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -84,7 +84,6 @@ impl Hasher for FxHasher {
 }
 
 type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
-type FxHashSet<K> = HashSet<K, BuildHasherDefault<FxHasher>>;
 
 struct TileEntry {
     pool: (u32, u32),
@@ -227,8 +226,8 @@ struct State {
     /// decommits and commits again thousands of tiles a second, and each `UpdateTileMappings`
     /// took ~0.15 ms.)
     parked: FxHashMap<usize, (u32, u32)>,
-    /// placed buffers → the pool tiles they use
-    buffers: FxHashMap<usize, Vec<(u32, u32)>>,
+    /// placed buffers → `(registration id, the pool tiles they use)`
+    buffers: FxHashMap<usize, (u64, Vec<(u32, u32)>)>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
     to_zero: Vec<(usize, usize)>,
     /// ring-buffered upload staging heap (`STAGING` bytes, persistently mapped)
@@ -408,10 +407,26 @@ static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 
 /// Packed `(live_pools << 32) | free_tiles` so `pool_bytes` never locks `STATE`.
 static POOL_STATS: AtomicU64 = AtomicU64::new(0);
-/// Placed buffer pointers currently in `State::buffers`, checked before locking `STATE` in `forget_buffer`.
-static PLACED_BUFFERS: Mutex<Option<FxHashSet<usize>>> = Mutex::new(None);
-/// Placed buffer releases that arrived while `STATE` was locked; drained under `STATE`.
-static DEFERRED_FORGET: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+struct ForgetState {
+    placed: Option<FxHashMap<usize, u64>>,
+    deferred: Vec<(usize, u64)>,
+    next_id: u64,
+}
+
+impl ForgetState {
+    fn alloc_placed(&mut self, res: usize) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.placed.get_or_insert_with(Default::default).insert(res, id);
+        id
+    }
+}
+
+/// Bookkeeping shared between `place_buffer` and `forget_buffer`.
+/// Always acquired after `STATE` when both are held; `forget_buffer` only pairs it with
+/// non-blocking `STATE.try_lock()` so transitioning `placed -> deferred` is atomic under `FORGET`.
+static FORGET: Mutex<ForgetState> = Mutex::new(ForgetState { placed: None, deferred: Vec::new(), next_id: 1 });
 
 fn pack_pool_stats(live_pools: usize, free_tiles: usize) -> u64 {
     ((live_pools as u64) << 32) | (free_tiles as u64 & 0xFFFF_FFFF)
@@ -594,8 +609,11 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             let old_queue = QUEUE.lock().unwrap().replace(s.queue.clone());
             let old = {
                 let mut g = STATE.lock().unwrap();
-                PLACED_BUFFERS.lock().unwrap().take();
-                DEFERRED_FORGET.lock().unwrap().clear();
+                {
+                    let mut f = FORGET.lock().unwrap();
+                    f.placed = None;
+                    f.deferred.clear();
+                }
                 let old = g.replace(s);
                 publish_pool_stats(g.as_ref());
                 old
@@ -1469,19 +1487,23 @@ pub unsafe fn decommitted(a: usize, n: usize) {
 
 impl State {
     fn drain_forgotten(&mut self) {
-        let mut q = DEFERRED_FORGET.lock().unwrap();
-        if q.is_empty() {
-            return;
-        }
-        let batch = std::mem::take(&mut *q);
-        drop(q);
-        for res in batch {
-            self.forget_buffer_inner(res);
+        let batch = {
+            let mut f = FORGET.lock().unwrap();
+            if f.deferred.is_empty() {
+                return;
+            }
+            std::mem::take(&mut f.deferred)
+        };
+        self.drain_forget_batch(batch);
+    }
+
+    fn drain_forget_batch(&mut self, batch: Vec<(usize, u64)>) {
+        for (res, id) in batch {
+            self.forget_buffer_inner(res, id);
         }
     }
 
-    fn forget_buffer_inner(&mut self, res: usize) {
-        let Some(tiles) = self.buffers.remove(&res) else { return };
+    fn unpin_tiles(&mut self, tiles: Vec<(u32, u32)>) {
         for tile in tiles {
             if let Some(c) = self.pinned.get_mut(&tile) {
                 *c -= 1;
@@ -1490,6 +1512,15 @@ impl State {
                     self.release_if_unused(tile);
                 }
             }
+        }
+    }
+
+    fn forget_buffer_inner(&mut self, res: usize, id: u64) {
+        if self.buffers.get(&res).is_none_or(|&(cur_id, _)| cur_id != id) {
+            return;
+        }
+        if let Some((_, tiles)) = self.buffers.remove(&res) {
+            self.unpin_tiles(tiles);
         }
     }
 
@@ -1754,8 +1785,10 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
-    PLACED_BUFFERS.lock().unwrap().get_or_insert_with(Default::default).insert(raw as usize);
-    s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
+    let id = FORGET.lock().unwrap().alloc_placed(raw as usize);
+    if let Some((_, old_tiles)) = s.buffers.insert(raw as usize, (id, tiles.iter().map(|x| x.1).collect())) {
+        s.unpin_tiles(old_tiles);
+    }
     s.signal();
     publish_pool_stats(Some(s));
     Some((hr, delta))
@@ -1763,22 +1796,23 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
 
 /// A placed buffer is gone: its tiles are not pinned by it any more.
 /// Never blocks on `STATE` so resource releases inside D3D12/worker threads cannot deadlock
-/// against a holder of `STATE`.
+/// against a holder of `STATE`. Holds `FORGET` across `remove` -> `STATE.try_lock()` ->
+/// `deferred.push` so a deferred release cannot overtake a concurrent reuse at `res`.
 pub fn forget_buffer(res: usize) {
-    let was_placed = PLACED_BUFFERS.lock().unwrap().as_mut().is_some_and(|set| set.remove(&res));
-    if !was_placed {
-        return;
-    }
+    let mut f = FORGET.lock().unwrap();
+    let Some(id) = f.placed.as_mut().and_then(|map| map.remove(&res)) else { return };
     match STATE.try_lock() {
         Ok(mut g) => {
+            let batch = std::mem::take(&mut f.deferred);
+            drop(f);
             if let Some(s) = g.as_mut() {
-                s.drain_forgotten();
-                s.forget_buffer_inner(res);
+                s.drain_forget_batch(batch);
+                s.forget_buffer_inner(res, id);
                 publish_pool_stats(Some(s));
             }
         }
         Err(std::sync::TryLockError::WouldBlock) => {
-            DEFERRED_FORGET.lock().unwrap().push(res);
+            f.deferred.push((res, id));
         }
         Err(std::sync::TryLockError::Poisoned(p)) => {
             panic!("sparse::STATE poisoned: {p}");
@@ -1828,7 +1862,7 @@ mod tests {
     fn forget_buffer_does_not_block_while_the_state_is_locked() {
         let sentinel = 0xDEAD_BEEF_0000usize;
         let held = STATE.lock().unwrap();
-        PLACED_BUFFERS.lock().unwrap().get_or_insert_with(Default::default).insert(sentinel);
+        let id = FORGET.lock().unwrap().alloc_placed(sentinel);
         let (tx, rx) = std::sync::mpsc::channel();
         let released = std::thread::spawn(move || {
             forget_buffer(0x1234_5678);
@@ -1836,11 +1870,91 @@ mod tests {
             let _ = tx.send(());
         });
         let answered = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
-        let deferred = std::mem::take(&mut *DEFERRED_FORGET.lock().unwrap());
+        let (still_placed, deferred) = {
+            let mut f = FORGET.lock().unwrap();
+            let still_placed = f.placed.as_ref().is_some_and(|m| m.contains_key(&sentinel));
+            let deferred = std::mem::take(&mut f.deferred);
+            (still_placed, deferred)
+        };
         drop(held);
         released.join().unwrap();
         assert!(answered, "forget_buffer() waited for the sparse state's lock");
-        assert!(deferred.contains(&sentinel), "placed buffer release should be deferred when STATE is locked");
+        assert!(!still_placed, "placed buffer entry should be removed atomically before deferring");
+        assert!(deferred.contains(&(sentinel, id)), "placed buffer release should be deferred when STATE is locked");
+    }
+
+    #[test]
+    fn deferred_forget_does_not_drop_reused_buffer_pointer() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
+            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
+            rb_list.Close().expect("rb_list close");
+            let mut s = State {
+                dev,
+                queue,
+                fence,
+                value: 0,
+                event,
+                rb_fence,
+                rb_value: 0,
+                windows: Vec::new(),
+                pools: Vec::new(),
+                free: Vec::new(),
+                retired: Vec::new(),
+                parked: FxHashMap::default(),
+                mapped: FxHashMap::default(),
+                pinned: FxHashMap::default(),
+                buffers: FxHashMap::default(),
+                to_zero: Vec::new(),
+                staging: None,
+                ring_write: 0,
+                ring_submitted: 0,
+                ring_free: 0,
+                inflight: VecDeque::new(),
+                zero_buf: None,
+                slots: Vec::new(),
+                next_slot: 0,
+                readback: None,
+                rb_alloc,
+                rb_list,
+                rb_last_fence: 0,
+                waited: FxHashMap::default(),
+                runs: None,
+                scratch_runs: Vec::new(),
+            };
+
+            let ptr = 0xDEAD_1000usize;
+            let tile_a = (0, 0);
+            let tile_b = (0, 1);
+            *s.pinned.entry(tile_b).or_default() += 1;
+            s.buffers.insert(ptr, (2, vec![tile_b]));
+            // Stale deferred forget for an older generation `1` at the same pointer must not
+            // remove the reused registration `2` or unpin `tile_b`.
+            s.drain_forget_batch(vec![(ptr, 1)]);
+            assert_eq!(s.buffers.get(&ptr).map(|e| e.0), Some(2));
+            assert!(s.pinned.contains_key(&tile_b));
+
+            // Matching generation `2` removes the buffer and frees `tile_b`.
+            s.drain_forget_batch(vec![(ptr, 2)]);
+            assert!(!s.buffers.contains_key(&ptr));
+            assert!(!s.pinned.contains_key(&tile_b));
+            assert!(s.free.contains(&tile_b));
+            assert!(!s.free.contains(&tile_a));
+        }
     }
 
     #[test]
