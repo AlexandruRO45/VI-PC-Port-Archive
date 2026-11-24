@@ -338,6 +338,9 @@ pub(crate) struct HostList {
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// Commands recorded so far, for `VICTORY_LIST_BUDGET` (diagnostics).
     recorded: AtomicU32,
+    /// Mesh dispatches recorded so far, for `VICTORY_MESH_BUDGET`
+    /// (diagnostics).
+    recorded_mesh: AtomicU32,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -519,6 +522,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 recorded: AtomicU32::new(0),
+                recorded_mesh: AtomicU32::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -866,6 +870,21 @@ impl HostList {
                 .unwrap_or(0)
         });
         budget == 0 || self.recorded.fetch_add(1, Ordering::Relaxed) < budget
+    }
+
+    /// Whether another mesh dispatch may be recorded, for
+    /// `VICTORY_MESH_BUDGET` (diagnostics): an emulated mesh dispatch costs
+    /// 0.1–0.3 s, so a list with many of them trips the GPU watchdog.
+    /// Unset or zero means no limit.
+    pub(crate) fn allow_mesh(&self) -> bool {
+        static BUDGET: OnceLock<u32> = OnceLock::new();
+        let budget = *BUDGET.get_or_init(|| {
+            std::env::var("VICTORY_MESH_BUDGET")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        });
+        budget == 0 || self.recorded_mesh.fetch_add(1, Ordering::Relaxed) < budget
     }
 
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).

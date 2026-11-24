@@ -337,11 +337,6 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        if !list.allow_record() {
-            #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_why("list budget reached".into());
-            return false;
-        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
@@ -504,15 +499,6 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
-        if !list.allow_record() {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            {
-                crate::pipeline::note_drop(self.pipeline as This);
-                crate::pipeline::note_why("list budget reached".into());
-            }
-            return;
-        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -525,6 +511,15 @@ impl State {
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            return;
+        }
+        if !list.allow_record() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::pipeline::note_drop(self.pipeline as This);
+                crate::pipeline::note_why("list budget reached".into());
+            }
             return;
         }
         self.bind(list, p, true);
@@ -577,6 +572,15 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        if !list.allow_mesh() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::pipeline::note_drop(self.pipeline as This);
+                crate::pipeline::note_why("mesh budget reached".into());
+            }
+            return;
+        }
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
