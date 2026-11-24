@@ -454,21 +454,31 @@ pub fn mesh_shaders_supported() -> Result<bool, String> {
 /// "no wave64", "no mesh shaders": `SKIPPED <test>: <reason>` written to stderr itself, so the
 /// line shows without `--nocapture` (libtest captures only `print!` / `eprint!`), and
 /// `scripts/test.ps1` counts them. `XCL_REQUIRE_GPU=wave64` or `=mesh` (or both, comma-separated)
-/// turns a skip that leaves that coverage out into a failure.
+/// turns a skip that leaves that coverage out into a failure; "no heap windows" (an opt-in left off)
+/// never is.
 pub fn skip_test(reason: &str) {
     use std::io::Write;
     let thread = std::thread::current();
     let test = thread.name().unwrap_or("?");
     let required = std::env::var("XCL_REQUIRE_GPU").unwrap_or_default();
-    let fails = required.split(',').map(str::trim).any(|r| match r {
-        "wave64" => reason != "no mesh shaders",
-        "mesh" => reason != "no wave64",
-        _ => false,
-    });
-    if fails {
+    if skip_fails(&required, reason) {
         panic!("{test}: {reason}, but XCL_REQUIRE_GPU={required}");
     }
     let _ = writeln!(std::io::stderr(), "SKIPPED {test}: {reason}");
+}
+
+/// Skip reasons that name an opt-in feature left off (`XCL_HEAP_WINDOWS` unset), not something
+/// the adapter lacks: `XCL_REQUIRE_GPU` does not turn them into failures.
+const OPT_IN_SKIPS: &[&str] = &["no heap windows"];
+
+/// Whether `XCL_REQUIRE_GPU=<required>` turns a skip for `reason` into a failure.
+fn skip_fails(required: &str, reason: &str) -> bool {
+    !OPT_IN_SKIPS.contains(&reason)
+        && required.split(',').map(str::trim).any(|r| match r {
+            "wave64" => reason != "no mesh shaders",
+            "mesh" => reason != "no wave64",
+            _ => false,
+        })
 }
 
 /// Run a compiled kernel (DXIL) with `state` and flat memory `mem`.
@@ -1591,5 +1601,24 @@ fn dispatch_with(
             stamps_buf.Unmap(0, None);
         }
         Ok((out, ms))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::skip_fails;
+
+    /// An opt-in feature left off is no missing GPU coverage: `XCL_REQUIRE_GPU` fails the skips
+    /// for missing hardware, not the heap-window test's skip without `XCL_HEAP_WINDOWS=1` (#1651).
+    #[test]
+    fn required_gpu_fails_missing_hardware_not_opt_in_features() {
+        for required in ["mesh", "wave64", "wave64,mesh"] {
+            assert!(!skip_fails(required, "no heap windows"), "XCL_REQUIRE_GPU={required}");
+            assert!(skip_fails(required, "no GPU"), "XCL_REQUIRE_GPU={required}");
+        }
+        assert!(!skip_fails("mesh", "no wave64"));
+        assert!(!skip_fails("wave64", "no mesh shaders"));
+        assert!(skip_fails("wave64,mesh", "no wave64"));
+        assert!(!skip_fails("", "no GPU"));
     }
 }
