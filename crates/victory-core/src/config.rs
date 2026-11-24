@@ -168,11 +168,15 @@ impl Config {
                     // Checked before splitting: on this host `:` would cut
                     // `D:\a` in two.
                     check_setting("VICTORY_TEST_TITLES", Path::new(&v))?;
+                    let titles: Vec<PathBuf> = std::env::split_paths(&v)
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .collect();
+                    // `/a: /b` passes the check above as a whole.
+                    for title in &titles {
+                        ensure_trimmed("VICTORY_TEST_TITLES", title)?;
+                    }
                     (
-                        std::env::split_paths(&v)
-                            .filter(|p| !p.as_os_str().is_empty())
-                            .map(expand)
-                            .collect(),
+                        titles.into_iter().map(expand).collect(),
                         Origin::Env("VICTORY_TEST_TITLES"),
                     )
                 }
@@ -440,12 +444,41 @@ fn lexical(path: &Path) -> PathBuf {
 
 /// The checks every configured path goes through before it is used: no
 /// control characters ([`ensure_no_control`]), no surrounding quotes
-/// ([`ensure_unquoted`]) and no Windows drive path off Windows
-/// ([`ensure_native`]). `what` names the setting for the error.
+/// ([`ensure_unquoted`]), no surrounding whitespace ([`ensure_trimmed`])
+/// and no Windows drive path off Windows ([`ensure_native`]). `what` names
+/// the setting for the error.
 fn check_setting(what: &str, path: &Path) -> Result<()> {
     ensure_no_control(what, path)?;
     ensure_unquoted(what, path)?;
+    ensure_trimmed(what, path)?;
     ensure_native(what, path, cfg!(windows))
+}
+
+/// Refuses a path that starts or ends with whitespace (a space, or a
+/// no-break space pasted from a web page). An env file or launcher keeps
+/// what a shell would split off: `VICTORY_GAME_DIR= /games/gta` or a value
+/// with a trailing space. A leading space makes the path relative, so it
+/// would be taken as a folder named ` ` under the config file's folder or
+/// the working directory (often the repository); a trailing one is reported
+/// later only as "does not exist", which looks right on screen. Windows
+/// strips trailing spaces from folder names, and no real dump or cache
+/// folder starts or ends with one; spaces inside the name are left alone.
+/// The error quotes the value so the space shows.
+fn ensure_trimmed(what: &str, path: &Path) -> Result<()> {
+    let text = path.to_string_lossy();
+    let (start, end) = match (text.chars().next(), text.chars().next_back()) {
+        (Some(s), Some(e)) => (s.is_whitespace(), e.is_whitespace()),
+        _ => return Ok(()),
+    };
+    if !start && !end {
+        return Ok(());
+    }
+    let place = match (start, end) {
+        (true, true) => "starts and ends",
+        (true, false) => "starts",
+        _ => "ends",
+    };
+    anyhow::bail!("{what} is {text:?}, which {place} with whitespace; remove it");
 }
 
 /// Refuses a path wrapped in a matching pair of quotes (`"/games/gta"` or
@@ -943,6 +976,75 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("[paths].game_dir"), "{err}");
+    }
+
+    #[test]
+    fn surrounding_whitespace_in_paths_is_refused() {
+        let err = ensure_trimmed("VICTORY_GAME_DIR", Path::new(" /games/gta"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VICTORY_GAME_DIR"), "{err}");
+        assert!(err.contains("\" /games/gta\""), "{err}");
+        assert!(err.contains("starts with whitespace"), "{err}");
+        let err = ensure_trimmed("x", Path::new("/games/gta "))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ends with whitespace"), "{err}");
+        let err = ensure_trimmed("x", Path::new(" a "))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("starts and ends"), "{err}");
+        // A no-break space pasted from a web page.
+        assert!(ensure_trimmed("x", Path::new("/games/gta\u{a0}")).is_err());
+        for ok in [
+            "/games/gta",
+            "games with spaces",
+            "/Program Files/x",
+            "~/é",
+            "",
+        ] {
+            assert!(ensure_trimmed("x", Path::new(ok)).is_ok(), "{ok}");
+        }
+
+        // Every way in: each path variable, VICTORY_CONFIG and the file.
+        for var in [
+            "VICTORY_GAME_DIR",
+            "VICTORY_CACHE_DIR",
+            "VICTORY_DATA_DIR",
+            "VICTORY_TEST_TITLES",
+        ] {
+            let env = |k: &str| match k {
+                k if k == var => Some(OsString::from(" /victory/x")),
+                "HOME" => Some(abs("home")),
+                _ => None,
+            };
+            let err = Config::resolve(FilePaths::default(), None, env)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(var), "{err}");
+            assert!(err.contains("whitespace"), "{err}");
+        }
+        // The second of several test titles, after the separator.
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let titles = OsString::from(format!("/victory/a{sep} /victory/b"));
+        let env = |k: &str| match k {
+            "VICTORY_TEST_TITLES" => Some(titles.clone()),
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        let err = Config::resolve(FilePaths::default(), None, env)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\" /victory/b\""), "{err}");
+        let env = |k: &str| (k == "VICTORY_CONFIG").then(|| OsString::from("victory.toml "));
+        let err = explicit_config(env, None).unwrap_err().to_string();
+        assert!(err.contains("VICTORY_CONFIG"), "{err}");
+        let parsed: FileConfig = toml::from_str("[paths]\ndata_dir = ' data'\n").unwrap();
+        let err = parsed
+            .anchored_at(Path::new("/configs"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[paths].data_dir"), "{err}");
     }
 
     #[test]
