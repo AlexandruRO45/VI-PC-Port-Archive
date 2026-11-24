@@ -188,6 +188,12 @@ struct Lower<'a> {
     ballot_stride: u32,
     /// Base dword index of the per-lane LDS exchange region (`64 * virtual_waves`).
     exchange_base: u32,
+    /// Multi-wave mesh: synchronize each virtual wave's emulated exchange
+    /// through its own LDS counter instead of a group barrier (another
+    /// console wave can be on a different scalar branch or loop iteration).
+    wave_barriers: bool,
+    /// Base dword of the per-virtual-wave barrier counters.
+    wave_barrier_base: u32,
     /// Emulation scratch pushed total LDS past D3D12's 32 KiB (8192 dword) limit.
     lds_overflow: bool,
     /// Barrier-less `<= 64`-thread Wave64 compute shader sharing LDS across host waves.
@@ -759,6 +765,8 @@ impl<'a> Lower<'a> {
         let mut ballot_base = 0u32;
         let mut ballot_stride = 0u32;
         let mut exchange_base = 0u32;
+        let mut wave_barriers = false;
+        let mut wave_barrier_base = 0u32;
         let mut lds_overflow = false;
         let mut need_lds_barriers = false;
         let mut spills = HashMap::new();
@@ -1029,7 +1037,14 @@ impl<'a> Lower<'a> {
                     };
                     ballot_base = title_lds_dwords;
                     exchange_base = title_lds_dwords + ballot_dwords;
-                    let emu_dwords = ballot_dwords + exchange_dwords;
+                    wave_barrier_base = exchange_base + exchange_dwords;
+                    let barrier_dwords = if total_threads > 64 {
+                        wave_barriers = true;
+                        virtual_waves
+                    } else {
+                        0
+                    };
+                    let emu_dwords = ballot_dwords + exchange_dwords + barrier_dwords;
                     s.lds_dwords = title_lds_dwords.saturating_add(emu_dwords);
                     lds_overflow = emu_dwords > 0 && s.lds_dwords > 8192;
                     cross_block_masks = collect_cross_block_masks(p, x.st, &def_block);
@@ -1120,6 +1135,8 @@ impl<'a> Lower<'a> {
             ballot_base,
             ballot_stride,
             exchange_base,
+            wave_barriers,
+            wave_barrier_base,
             lds_overflow,
             need_lds_barriers,
             spills,
@@ -1319,6 +1336,71 @@ impl<'a> Lower<'a> {
             .op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
+    /// A barrier inside the emulation: a group barrier normally, or a
+    /// per-virtual-wave rendezvous in a multi-wave mesh group, where another
+    /// console wave may never reach this point (a scalar branch or loop
+    /// iteration that differs per wave).
+    fn emu_barrier(&mut self) {
+        if self.wave_barriers {
+            self.wave_barrier();
+        } else {
+            self.lds_barrier(self.cur);
+        }
+    }
+
+    /// Initializes the per-wave counters in the entry block and orders the
+    /// stores with one group barrier (every thread runs it).
+    fn init_wave_barriers(&mut self) {
+        let c = self.cur;
+        let (_, _, vwave) = self.ensure_wave_ids();
+        let base = self.wave_barrier_base;
+        let zero = self.s.m.i32(0);
+        let p = self.scratch_ptr(c, base, 1, vwave, 0);
+        self.s.m.store(c, p, zero);
+        self.lds_barrier(c);
+    }
+
+    /// Synchronizes the lanes of this virtual wave (64, or the remainder in
+    /// a partial last wave) through its own monotonic LDS counter. Each
+    /// invocation adds `n`; a lane's `before` is in `[k*n, k*n+n)`, so
+    /// `before - before % n + n` is the same target for every lane. No
+    /// reset or generation is needed, so a wave can pass this point any
+    /// number of times while another wave is elsewhere.
+    fn wave_barrier(&mut self) {
+        const SPIN_LIMIT: u32 = 1 << 20;
+        debug_assert_eq!(self.guard_depth, 0);
+        let c = self.cur;
+        let base = self.wave_barrier_base;
+        let (_, _, vwave) = self.ensure_wave_ids();
+        let counter = self.scratch_ptr(c, base, 1, vwave, 0);
+        let (zero, one, k64) = (self.s.m.i32(0), self.s.m.i32(1), self.s.m.i32(64));
+        let total = self.s.m.i32(self.total_threads);
+        let wave_start = self.s.m.bin(c, Bin::Mul, vwave, k64);
+        let remaining = self.s.m.bin(c, Bin::Sub, total, wave_start);
+        let short = self.s.m.cmp(c, pred::IULT, remaining, k64);
+        let n = self.s.m.select(c, short, remaining, k64);
+        let before = self.s.m.atomic(c, super::bitcode::Rmw::Add, counter, one);
+        let rem = self.s.m.bin(c, Bin::URem, before, n);
+        let base_count = self.s.m.bin(c, Bin::Sub, before, rem);
+        let target = self.s.m.bin(c, Bin::Add, base_count, n);
+
+        let pre = self.cur;
+        let spin = self.s.m.new_block();
+        let join = self.s.m.new_block();
+        self.s.m.terminate(pre, Term::Br(spin));
+        self.cur = spin;
+        let iter = self.s.m.phi(spin, self.s.t.i32);
+        let now = self.s.m.atomic(spin, super::bitcode::Rmw::Add, counter, zero);
+        let reached = self.s.m.cmp(spin, pred::IUGE, now, target);
+        let limit = self.s.m.i32(SPIN_LIMIT);
+        let timed_out = self.s.m.cmp(spin, pred::IUGE, iter, limit);
+        let exit = self.s.m.bin(spin, Bin::Or, reached, timed_out);
+        let next = self.s.m.bin(spin, Bin::Add, iter, one);
+        self.s.m.terminate(spin, Term::CondBr(exit, join, spin));
+        self.s.m.set_phi(iter, vec![(zero, pre), (next, spin)]);
+        self.cur = join;
+    }
+
     /// Ensures `(flat_tid, console_lane, vwave)` exist in `self.s.entry` and returns them.
     fn ensure_wave_ids(&mut self) -> (V, V, V) {
         if let Some(ids) = self.wave_ids {
@@ -1442,7 +1524,7 @@ impl<'a> Lower<'a> {
         let (_, console_lane, vwave) = self.ensure_wave_ids();
         let stride = self.ballot_stride;
         let base = self.ballot_base;
-        self.lds_barrier(self.cur);
+        self.emu_barrier();
         let k0 = self.s.m.i32(0);
         let k32 = self.s.m.i32(32);
         let is_h0 = self.s.m.cmp(self.cur, pred::EQ, console_lane, k0);
@@ -1466,7 +1548,7 @@ impl<'a> Lower<'a> {
         self.s.m.store(self.cur, p1, val);
         self.end_guarded(at1, &[]);
 
-        self.lds_barrier(self.cur);
+        self.emu_barrier();
         let c = self.cur;
         let r0_ptr = self.scratch_ptr(c, base, stride, vwave, 0);
         let r1_ptr = self.scratch_ptr(c, base, stride, vwave, 1);
@@ -1480,10 +1562,10 @@ impl<'a> Lower<'a> {
             return Err("a cross-lane read in divergent control flow");
         }
         let (_, console_lane, vwave) = self.ensure_wave_ids();
-        self.lds_barrier(self.cur);
+        self.emu_barrier();
         let wptr = self.exchange_ptr(self.cur, vwave, console_lane);
         self.s.m.store(self.cur, wptr, val);
-        self.lds_barrier(self.cur);
+        self.emu_barrier();
         let k63 = self.s.m.i32(63);
         let idx = self.s.m.bin(self.cur, Bin::And, lane, k63);
         let rptr = self.exchange_ptr(self.cur, vwave, idx);
@@ -1516,7 +1598,7 @@ impl<'a> Lower<'a> {
             let safe_idx = self.s.m.select(c, any, bit, k0);
             let picked = self.read_lane(val, safe_idx);
 
-            self.lds_barrier(self.cur);
+            self.emu_barrier();
             let k0 = self.s.m.i32(0);
             let k32 = self.s.m.i32(32);
             let is_h0 = self.s.m.cmp(self.cur, pred::EQ, console_lane, k0);
@@ -1544,7 +1626,7 @@ impl<'a> Lower<'a> {
             self.s.m.store(self.cur, pv1, picked);
             self.end_guarded(at1, &[]);
 
-            self.lds_barrier(self.cur);
+            self.emu_barrier();
             let c = self.cur;
             let pm0 = self.scratch_ptr(c, base, stride, vwave, 0);
             let pv0 = self.scratch_ptr(c, base, stride, vwave, 1);
@@ -1561,18 +1643,18 @@ impl<'a> Lower<'a> {
         // that lane publishes its value into slot 0 and every lane reads it,
         // which takes two barriers and no atomics.
         if self.s.mesh.is_some() && guard.is_none() {
-            self.lds_barrier(self.cur);
+            self.emu_barrier();
             let zero = self.s.m.i32(0);
             let is0 = self.s.m.cmp(self.cur, pred::EQ, console_lane, zero);
             let at = self.begin_guarded(Some(is0));
             let wptr = self.exchange_ptr(self.cur, vwave, zero);
             self.s.m.store(self.cur, wptr, val);
             self.end_guarded(at, &[]);
-            self.lds_barrier(self.cur);
+            self.emu_barrier();
             let rptr = self.exchange_ptr(self.cur, vwave, zero);
             return Ok(self.s.m.load(self.cur, rptr));
         }
-        self.lds_barrier(self.cur);
+        self.emu_barrier();
         let k0 = self.s.m.i32(0);
         let kmax = self.s.m.i32(u32::MAX);
         let is_init = self.s.m.cmp(self.cur, pred::EQ, console_lane, k0);
@@ -1583,7 +1665,7 @@ impl<'a> Lower<'a> {
         self.s.m.store(self.cur, pv, k0);
         self.end_guarded(at0, &[]);
 
-        self.lds_barrier(self.cur);
+        self.emu_barrier();
         let at_act = self.begin_guarded(guard);
         let pw = self.scratch_ptr(self.cur, base, stride, vwave, 0);
         let _ = self
@@ -1592,7 +1674,7 @@ impl<'a> Lower<'a> {
             .atomic(self.cur, super::bitcode::Rmw::UMin, pw, console_lane);
         self.end_guarded(at_act, &[]);
 
-        self.lds_barrier(self.cur);
+        self.emu_barrier();
         let pw = self.scratch_ptr(self.cur, base, stride, vwave, 0);
         let winner = self.s.m.load(self.cur, pw);
         let is_win = self.s.m.cmp(self.cur, pred::EQ, winner, console_lane);
@@ -1601,7 +1683,7 @@ impl<'a> Lower<'a> {
         self.s.m.store(self.cur, pv, val);
         self.end_guarded(at_win, &[]);
 
-        self.lds_barrier(self.cur);
+        self.emu_barrier();
         let pv = self.scratch_ptr(self.cur, base, stride, vwave, 1);
         Ok(self.s.m.load(self.cur, pv))
     }
@@ -1678,7 +1760,7 @@ impl<'a> Lower<'a> {
             let (_, console_lane, vwave) = self.ensure_wave_ids();
             let base = self.ballot_base;
             let stride = self.ballot_stride;
-            self.lds_barrier(self.cur);
+            self.emu_barrier();
             let k0 = self.s.m.i32(0);
             let is0 = self.s.m.cmp(self.cur, pred::EQ, console_lane, k0);
             let at0 = self.begin_guarded(Some(is0));
@@ -1688,7 +1770,7 @@ impl<'a> Lower<'a> {
             self.s.m.store(self.cur, p1, k0);
             self.end_guarded(at0, &[]);
 
-            self.lds_barrier(self.cur);
+            self.emu_barrier();
             let at_bit = self.begin_guarded(Some(bit));
             let bcur = self.cur;
             let k32 = self.s.m.i32(32);
@@ -1711,7 +1793,7 @@ impl<'a> Lower<'a> {
                 .atomic(bcur, super::bitcode::Rmw::Or, ptr, mask_bit);
             self.end_guarded(at_bit, &[]);
 
-            self.lds_barrier(self.cur);
+            self.emu_barrier();
             let c = self.cur;
             let p0 = self.scratch_ptr(c, base, stride, vwave, 0);
             let p1 = self.scratch_ptr(c, base, stride, vwave, 1);
@@ -1808,10 +1890,10 @@ impl<'a> Lower<'a> {
                     if stride >= max_in_vwave {
                         break;
                     }
-                    self.lds_barrier(self.cur);
+                    self.emu_barrier();
                     let wp = self.exchange_ptr(self.cur, vwave, console_lane);
                     self.s.m.store(self.cur, wp, cur_val);
-                    self.lds_barrier(self.cur);
+                    self.emu_barrier();
                     let ks = self.s.m.i32(stride);
                     let active = self.s.m.cmp(self.cur, pred::IUGE, console_lane, ks);
                     let at = self.begin_guarded(Some(active));
@@ -1822,10 +1904,10 @@ impl<'a> Lower<'a> {
                     cur_val = self.end_guarded(at, &[(sum, cur_val)])[0];
                 }
                 if !inclusive {
-                    self.lds_barrier(self.cur);
+                    self.emu_barrier();
                     let wp = self.exchange_ptr(self.cur, vwave, console_lane);
                     self.s.m.store(self.cur, wp, cur_val);
-                    self.lds_barrier(self.cur);
+                    self.emu_barrier();
                     let k0 = self.s.m.i32(0);
                     let k1 = self.s.m.i32(1);
                     let not0 = self.s.m.cmp(self.cur, pred::NE, console_lane, k0);
@@ -1837,7 +1919,7 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(cur_val);
             } else {
-                self.lds_barrier(self.cur);
+                self.emu_barrier();
                 let wp = self.exchange_ptr(self.cur, vwave, console_lane);
                 self.s.m.store(self.cur, wp, x);
                 let partial = !self.total_threads.is_multiple_of(64);
@@ -1848,7 +1930,7 @@ impl<'a> Lower<'a> {
                     if stride >= max_in_vwave {
                         continue;
                     }
-                    self.lds_barrier(self.cur);
+                    self.emu_barrier();
                     let b = self.cur;
                     let ks = self.s.m.i32(stride);
                     let mut active = self.s.m.cmp(b, pred::IULT, console_lane, ks);
@@ -1869,7 +1951,7 @@ impl<'a> Lower<'a> {
                     self.s.m.store(cb, pw, comb);
                     self.end_guarded(at, &[]);
                 }
-                self.lds_barrier(self.cur);
+                self.emu_barrier();
                 let k0 = self.s.m.i32(0);
                 let rp = self.exchange_ptr(self.cur, vwave, k0);
                 return Ok(self.s.m.load(self.cur, rp));
@@ -1910,14 +1992,14 @@ impl<'a> Lower<'a> {
                     let (_, console_lane, vwave) = self.ensure_wave_ids();
                     let stride = self.ballot_stride;
                     let base = self.ballot_base;
-                    self.lds_barrier(self.cur);
+                    self.emu_barrier();
                     let k31 = self.s.m.i32(31);
                     let is31 = self.s.m.cmp(self.cur, pred::EQ, console_lane, k31);
                     let at = self.begin_guarded(Some(is31));
                     let ptr = self.scratch_ptr(self.cur, base, stride, vwave, 0);
                     self.s.m.store(self.cur, ptr, half_total_bits);
                     self.end_guarded(at, &[]);
-                    self.lds_barrier(self.cur);
+                    self.emu_barrier();
                     let ptr = self.scratch_ptr(self.cur, base, stride, vwave, 0);
                     let h0_bits = self.s.m.load(self.cur, ptr);
                     let combined = self.apply_wave_op(op, h0_bits, local_bits);
@@ -2003,6 +2085,9 @@ impl<'a> Lower<'a> {
         self.inputs()?;
         if self.emulating_wave64() {
             self.ensure_wave_ids();
+            if self.wave_barriers {
+                self.init_wave_barriers();
+            }
             self.preemit_masks(None);
         }
         if let Some(mesh) = self.s.mesh {

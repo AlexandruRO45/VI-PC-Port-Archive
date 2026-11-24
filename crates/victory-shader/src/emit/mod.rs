@@ -80,9 +80,10 @@
 //!   compute program's are without `WaveSize`. A program whose only need is
 //!   its own lane number (`v_mbcnt`, quad-local swizzles and DPPs, constant
 //!   lane masks) uses `SV_GroupIndex & 63` directly, with no group-shared
-//!   memory or barriers. A cross-lane read only some lanes reach is refused
-//!   (it would need a barrier those lanes cannot all reach), never run with
-//!   host lanes.
+//!   memory or barriers. Exchanges synchronize only their own virtual wave
+//!   through an LDS counter, so another console wave on a different scalar
+//!   branch or loop iteration never blocks it. A cross-lane read only some
+//!   lanes of a wave reach is still refused, never run with host lanes.
 
 mod bitcode;
 mod container;
