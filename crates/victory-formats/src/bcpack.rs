@@ -2075,6 +2075,201 @@ mod tests {
         }
     }
 
+    /// BC6H blocks read back by a reader written from the public header
+    /// table (Microsoft's "BC6H format" page): mode bits, then each mode's
+    /// endpoint fields in their listed order, the 5-bit partition for the two
+    /// region modes, and 3- or 4-bit indices with one bit fewer at pixel 0
+    /// and the second region's anchor. Every mode and partition gives back
+    /// the endpoint fields and indices put in a record, in exactly 128 bits,
+    /// each field bit written once; a following record that references the
+    /// first with zero residuals packs the same block.
+    #[test]
+    fn bc6_blocks_follow_the_public_layout() {
+        // Mode bits, then R G B widths of endpoints w, x, y, z as the page's
+        // mode table lists them (y and z are unused by modes 11-14).
+        const MODES: [(u16, u32, [[u32; 4]; 3]); 14] = [
+            (0b00, 2, [[10, 5, 5, 5]; 3]),
+            (0b01, 2, [[7, 6, 6, 6]; 3]),
+            (0b00010, 5, [[11, 5, 5, 5], [11, 4, 4, 4], [11, 4, 4, 4]]),
+            (0b00110, 5, [[11, 4, 4, 4], [11, 5, 5, 5], [11, 4, 4, 4]]),
+            (0b01010, 5, [[11, 4, 4, 4], [11, 4, 4, 4], [11, 5, 5, 5]]),
+            (0b01110, 5, [[9, 5, 5, 5]; 3]),
+            (0b10010, 5, [[8, 6, 6, 6], [8, 5, 5, 5], [8, 5, 5, 5]]),
+            (0b10110, 5, [[8, 5, 5, 5], [8, 6, 6, 6], [8, 5, 5, 5]]),
+            (0b11010, 5, [[8, 5, 5, 5], [8, 5, 5, 5], [8, 6, 6, 6]]),
+            (0b11110, 5, [[6, 6, 6, 6]; 3]),
+            (0b00011, 5, [[10, 10, 0, 0]; 3]),
+            (0b00111, 5, [[11, 9, 0, 0]; 3]),
+            (0b01011, 5, [[12, 8, 0, 0]; 3]),
+            (0b01111, 5, [[16, 4, 0, 0]; 3]),
+        ];
+        // The header after the mode bits; `hi:lo` fills bits lo..=hi from
+        // the lowest stream bit up. The page spells the base's high bits of
+        // modes 13 and 14 as [10:11] and [10:15]; the console writes them
+        // ascending, as here.
+        const HEADERS: [&str; 14] = [
+            "gy4 by4 bz4 rw9:0 gw9:0 bw9:0 rx4:0 gz4 gy3:0 gx4:0 bz0 gz3:0 bx4:0 bz1 by3:0 \
+             ry4:0 bz2 rz4:0 bz3 d4:0",
+            "gy5 gz4 gz5 rw6:0 bz0 bz1 by4 gw6:0 by5 bz2 gy4 bw6:0 bz3 bz5 bz4 rx5:0 gy3:0 \
+             gx5:0 gz3:0 bx5:0 by3:0 ry5:0 rz5:0 d4:0",
+            "rw9:0 gw9:0 bw9:0 rx4:0 rw10 gy3:0 gx3:0 gw10 bz0 gz3:0 bx3:0 bw10 bz1 by3:0 \
+             ry4:0 bz2 rz4:0 bz3 d4:0",
+            "rw9:0 gw9:0 bw9:0 rx3:0 rw10 gz4 gy3:0 gx4:0 gw10 gz3:0 bx3:0 bw10 bz1 by3:0 \
+             ry3:0 bz0 bz2 rz3:0 gy4 bz3 d4:0",
+            "rw9:0 gw9:0 bw9:0 rx3:0 rw10 by4 gy3:0 gx3:0 gw10 bz0 gz3:0 bx4:0 bw10 by3:0 \
+             ry3:0 bz1 bz2 rz3:0 bz4 bz3 d4:0",
+            "rw8:0 by4 gw8:0 gy4 bw8:0 bz4 rx4:0 gz4 gy3:0 gx4:0 bz0 gz3:0 bx4:0 bz1 by3:0 \
+             ry4:0 bz2 rz4:0 bz3 d4:0",
+            "rw7:0 gz4 by4 gw7:0 bz2 gy4 bw7:0 bz3 bz4 rx5:0 gy3:0 gx4:0 bz0 gz3:0 bx4:0 bz1 \
+             by3:0 ry5:0 rz5:0 d4:0",
+            "rw7:0 bz0 by4 gw7:0 gy5 gy4 bw7:0 gz5 bz4 rx4:0 gz4 gy3:0 gx5:0 gz3:0 bx4:0 bz1 \
+             by3:0 ry4:0 bz2 rz4:0 bz3 d4:0",
+            "rw7:0 bz1 by4 gw7:0 by5 gy4 bw7:0 bz5 bz4 rx4:0 gz4 gy3:0 gx4:0 bz0 gz3:0 bx5:0 \
+             by3:0 ry4:0 bz2 rz4:0 bz3 d4:0",
+            "rw5:0 gz4 bz0 bz1 by4 gw5:0 gy5 by5 bz2 gy4 bw5:0 gz5 bz3 bz5 bz4 rx5:0 gy3:0 \
+             gx5:0 gz3:0 bx5:0 by3:0 ry5:0 rz5:0 d4:0",
+            "rw9:0 gw9:0 bw9:0 rx9:0 gx9:0 bx9:0",
+            "rw9:0 gw9:0 bw9:0 rx8:0 rw10 gx8:0 gw10 bx8:0 bw10",
+            "rw9:0 gw9:0 bw9:0 rx7:0 rw11:10 gx7:0 gw11:10 bx7:0 bw11:10",
+            "rw9:0 gw9:0 bw9:0 rx3:0 rw15:10 gx3:0 gw15:10 bx3:0 bw15:10",
+        ];
+        let mut seed = 0xbb67_ae85_84ca_a73bu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Zigzag (0, -1, 1, ...) of a signed value, and a 16-bit value split
+        // into the even and odd bits `bc6` interleaves back.
+        let zig = |v: i16| ((v << 1) ^ (v >> 15)) as u16;
+        let unweave = |v: u16| {
+            let half = |v: u16| (0..8).fold(0u8, |acc, k| acc | ((v >> (2 * k) & 1) as u8) << k);
+            [half(v), half(v >> 1)]
+        };
+        let spread = |v: u16| (0..4).fold(0u8, |acc, k| acc | ((v >> k & 1) as u8) << (2 * k));
+        for (m, &(code, code_bits, widths)) in MODES.iter().enumerate() {
+            let mode = m + 1;
+            let two = mode < 11;
+            let bits = if two { 3 } else { 4 };
+            let ends = if two { 4 } else { 2 };
+            let endpoint_bits: u32 = widths.iter().flat_map(|w| &w[..ends]).sum();
+            assert_eq!(
+                endpoint_bits,
+                if two {
+                    75 - 3 * u32::from(mode > 2)
+                } else {
+                    60
+                }
+            );
+            for part in 0..if two { 32u8 } else { 4 } {
+                let what = format!("mode {mode} part {part}");
+                let anchor = if two {
+                    usize::from(ANCHOR2[usize::from(part)])
+                } else {
+                    0
+                };
+                let mut s = [0u8; 32];
+                s[30] = m as u8;
+                s[31] = part | (next() as u8 & 0xe0);
+                // Field values, then the residuals against the zero reference
+                // that give them: the stored field is the endpoint with its
+                // top bit flipped.
+                let mut fields = [[0u16; 3]; 4];
+                for (e, row) in fields.iter_mut().enumerate().take(ends) {
+                    for (c, f) in row.iter_mut().enumerate() {
+                        let w = widths[c][e];
+                        *f = (next() & ((1 << w) - 1)) as u16;
+                        let res = u32::from(*f) ^ 1 << (w - 1);
+                        let signed = ((res << (32 - w)) as i32 >> (32 - w)) as i16;
+                        let z = zig(signed);
+                        if e < 2 {
+                            let [a, b] = unweave(z);
+                            s[4 + 6 * e + 2 * c] = a;
+                            s[5 + 6 * e + 2 * c] = b;
+                        } else {
+                            s[16 + 2 * c + (e - 2)] = u8::try_from(z).unwrap();
+                        }
+                    }
+                }
+                let mut want_ix = [0u16; 16];
+                let mut sym = [0u16; 16];
+                for (p, (w, z)) in want_ix.iter_mut().zip(&mut sym).enumerate() {
+                    let n = bits - u32::from(p == 0 || p == anchor);
+                    *w = (next() & ((1 << n) - 1)) as u16;
+                    *z = zig(*w as i16 - (1 << (bits - 1)));
+                }
+                for k in 0..8 {
+                    let (first, second) = (sym[2 * k], sym[2 * k + 1]);
+                    let (even, odd) = if k < 6 {
+                        (second, first)
+                    } else {
+                        (first, second)
+                    };
+                    s[22 + k] = spread(even) | spread(odd) << 1;
+                }
+                // A second record: the first as reference, zero residuals.
+                let mut again = [0u8; 32];
+                again[2] = 1;
+                again[30] = s[30];
+                again[31] = s[31];
+                let mut out = [[0u8; 16]; 2];
+                bc6(
+                    [&s[..], &again[..]].into_iter(),
+                    out.iter_mut().map(|o| &mut o[..]),
+                    &[],
+                )
+                .unwrap();
+                assert_eq!(out[1], out[0], "{what} referenced again");
+
+                let v = u128::from_le_bytes(out[0]);
+                let mut at = 0;
+                let mut take = |n: u32| {
+                    let r = (v >> at) as u16 & ((1u32 << n) - 1) as u16;
+                    at += n;
+                    r
+                };
+                assert_eq!(take(code_bits), code, "{what}");
+                let mut got = [[0u16; 3]; 4];
+                let mut seen = [[0u16; 3]; 4];
+                let mut got_part = None;
+                for f in HEADERS[m].split_whitespace() {
+                    let (name, range) = f.split_at(if f.starts_with('d') { 1 } else { 2 });
+                    let (hi, lo) = match range.split_once(':') {
+                        Some((hi, lo)) => (hi.parse::<u32>().unwrap(), lo.parse::<u32>().unwrap()),
+                        None => (range.parse().unwrap(), range.parse().unwrap()),
+                    };
+                    let value = take(hi - lo + 1);
+                    if name == "d" {
+                        assert_eq!((hi, lo, got_part), (4, 0, None), "{what}");
+                        got_part = Some(value);
+                        continue;
+                    }
+                    let c = "rgb".find(&name[..1]).unwrap();
+                    let e = "wxyz".find(&name[1..]).unwrap();
+                    let mask = (((1u32 << (hi - lo + 1)) - 1) << lo) as u16;
+                    assert_eq!(seen[e][c] & mask, 0, "{what} {f} written twice");
+                    seen[e][c] |= mask;
+                    got[e][c] |= value << lo;
+                }
+                for e in 0..4 {
+                    for c in 0..3 {
+                        let w = if e < ends { widths[c][e] } else { 0 };
+                        let full = ((1u32 << w) - 1) as u16;
+                        assert_eq!(seen[e][c], full, "{what} endpoint {e} channel {c} bits");
+                    }
+                }
+                assert_eq!(got, fields, "{what} endpoints");
+                assert_eq!(got_part, two.then_some(u16::from(part)), "{what}");
+                for (p, &w) in want_ix.iter().enumerate() {
+                    let n = bits - u32::from(p == 0 || p == anchor);
+                    assert_eq!(take(n), w, "{what} pixel {p}");
+                }
+                assert_eq!(at, 128, "{what}");
+            }
+        }
+    }
+
     /// Compares with reference outputs made outside the repository:
     /// `VICTORY_BCPACK_CASES`, a directory of `<name>.bc<n>` packed chunks
     /// with `<name>.out` beside them. The tables are the built-in ones unless
