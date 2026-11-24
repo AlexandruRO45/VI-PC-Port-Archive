@@ -374,7 +374,12 @@ fn hwreg(imm: u16) -> String {
     }
 }
 
+/// `s_waitcnt` operand: only the counters that wait. Bit 7 belongs to no
+/// counter, so an operand with it set stays raw hex rather than lose it.
 fn waitcnt(imm: u16) -> String {
+    if imm & 0x80 != 0 {
+        return format!("0x{imm:04x}");
+    }
     let vm = imm & 0xF | (imm >> 14) << 4;
     let exp = imm >> 4 & 7;
     let lgkm = imm >> 8 & 0x3F;
@@ -882,6 +887,60 @@ mod tests {
         assert_eq!(halt(0x0009), "s_sendmsghalt sendmsg(MSG_GS_ALLOC_REQ)");
         assert_eq!(halt(0x0122), "s_sendmsghalt sendmsg(MSG_GS, GS_OP_EMIT, 1)");
         assert_eq!(halt(0x8009), "s_sendmsghalt 0x8009");
+    }
+
+    #[test]
+    fn waitcnt_names_the_counters_that_wait() {
+        // s_waitcnt is SOPP opcode 0x0C: 0xBF8C_xxxx.
+        let wait = |imm: u32| one(&[0xBF8C_0000 | imm], true).replacen("s_waitcnt ", "", 1);
+        // vmcnt's high bits live at 15:14, above lgkmcnt.
+        assert_eq!(wait(0x7F7F), "vmcnt(31)");
+        assert_eq!(wait(0x7F70), "vmcnt(16)");
+        assert_eq!(wait(0xFF0F), "expcnt(0)");
+        assert_eq!(wait(0xC57F), "lgkmcnt(5)");
+        assert_eq!(wait(0x3F23), "vmcnt(3) & expcnt(2)");
+        assert_eq!(wait(0xBF3F), "vmcnt(47) & expcnt(3)");
+        // Nothing waits, or everything does: raw hex.
+        assert_eq!(wait(0xFF7F), "0xff7f");
+        assert_eq!(wait(0x0000), "0x0000");
+        // Bit 7 is no counter's; the operand stays raw rather than drop it.
+        assert_eq!(wait(0x00F0), "0x00f0");
+        assert_eq!(wait(0xC0FF), "0xc0ff");
+        assert_eq!(wait(0xFFFF), "0xffff");
+    }
+
+    #[test]
+    fn hwreg_spells_whole_registers_by_name_and_slices_by_range() {
+        // SOPK: 0xB000_0000 | op << 23 | sdst << 16 | simm16.
+        let sopk = |op: u32, sdst: u32, imm: u32| 0xB000_0000 | op << 23 | sdst << 16 | imm;
+        let hw = |id: u32, offset: u32, size: u32| id | offset << 6 | (size - 1) << 11;
+        assert_eq!(
+            one(&[sopk(0x12, 3, hw(1, 0, 32))], true),
+            "s_getreg_b32 s3, hwreg(HW_REG_MODE)"
+        );
+        assert_eq!(
+            one(&[sopk(0x12, 3, hw(1, 4, 4))], true),
+            "s_getreg_b32 s3, hwreg(HW_REG_MODE, 4, 4)"
+        );
+        // A full-width read from a nonzero offset is still a slice.
+        assert_eq!(
+            one(&[sopk(0x12, 0, hw(20, 1, 32))], true),
+            "s_getreg_b32 s0, hwreg(HW_REG_SHADER_FLAT_SCRATCH_LO, 1, 32)"
+        );
+        // Unnamed registers keep their number, up to the field's top.
+        assert_eq!(
+            one(&[sopk(0x12, 0, hw(63, 31, 1))], true),
+            "s_getreg_b32 s0, hwreg(63, 31, 1)"
+        );
+        // The register leads for a write, both from an SGPR and a literal.
+        assert_eq!(
+            one(&[sopk(0x13, 7, hw(21, 0, 32))], true),
+            "s_setreg_b32 hwreg(HW_REG_SHADER_FLAT_SCRATCH_HI), s7"
+        );
+        assert_eq!(
+            one(&[sopk(0x15, 0, hw(25, 0, 3)), 0x0000_0005], true),
+            "s_setreg_imm32_b32 hwreg(HW_REG_POPS_PACKER, 0, 3), lit(0x00000005)"
+        );
     }
 
     #[test]
