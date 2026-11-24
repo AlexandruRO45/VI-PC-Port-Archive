@@ -329,6 +329,17 @@ pub struct UserData {
     pub dword: u32,
 }
 
+const SFI_BARYCENTRICS: u64 = 0x2_0000;
+
+/// Whether emitted DXIL requests native barycentrics (also for cache hits).
+pub fn requires_barycentrics(dxil: &[u8]) -> bool {
+    Container::parse(dxil)
+        .ok()
+        .and_then(|c| c.part(FourCC::SFI0).map(|p| p.data))
+        .and_then(|data| <[u8; 8]>::try_from(data).ok())
+        .is_some_and(|bits| u64::from_le_bytes(bits) & SFI_BARYCENTRICS != 0)
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -422,27 +433,43 @@ pub fn emit(
         }
         _ => 0,
     };
-    let parts = |st, res| lower::Parts {
-        native,
-        p,
-        st,
-        io,
-        res,
-        inputs: inputs.clone(),
-        outputs: outputs.clone(),
-        prims: prims.clone(),
-        mesh_stride,
+    let run = |st: &structure::Structured, res: &resource::Resources, native_barycentrics| {
+        lower::lower_with_barycentrics(
+            &lower::Parts {
+                native,
+                p,
+                st,
+                io,
+                res,
+                inputs: inputs.clone(),
+                outputs: outputs.clone(),
+                prims: prims.clone(),
+                mesh_stride,
+            },
+            native_barycentrics,
+        )
     };
-    let l = match lower::lower(&parts(st, res)) {
-        // Discarded lanes kept on as helpers can read what no surviving
-        // lane does (a register only killed lanes skipped writing); such a
-        // program kills them as the console does (`structure::killing`).
-        Err(_) if !st.discards.is_empty() => {
-            let st = structure::killing(p)?;
-            let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+    let attempt = |native_barycentrics| {
+        match run(st, res, native_barycentrics) {
+            // Discarded lanes kept on as helpers can read what no surviving
+            // lane does (a register only killed lanes skipped writing); such a
+            // program kills them as the console does (`structure::killing`).
+            Err(_) if !st.discards.is_empty() => {
+                let st = structure::killing(p)?;
+                let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+                run(&st, &res, native_barycentrics)
+            }
+            result => result,
         }
-        l => l?,
+    };
+    let l = match attempt(false) {
+        // Do not introduce a device feature into a shader that already
+        // lowers without it, including the conservative kill-lanes retry.
+        Err(ShaderError::Unsupported {
+            what: lower::DIRECT_BARYCENTRICS,
+            ..
+        }) if pixel => attempt(true)?,
+        result => result?,
     };
     Ok(HostShader {
         stage: native.stage,
@@ -519,6 +546,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             68 => 18,
             69 => 20,
             70 => 15,
+            23 => 28, // barycentrics
             25 => 30, // cull primitive
             _ => {
                 return Err(ShaderError::Unsupported {
@@ -583,6 +611,130 @@ mod tests {
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
+
+    #[test]
+    fn raw_barycentric_inputs_declare_the_native_feature_only_when_used() {
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 2,
+            usage: 3,
+            half: false,
+        };
+        let osg1 = container::signature(&[target], false);
+        let c = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&c).unwrap();
+        for (regs, needs) in [(0x100, true), (0x302, false)] {
+            // v2/v3 are not barycentric inputs; the unused I/J must not add a feature.
+            let words = [0xf800_1803u32, regs, 0xbf81_0000];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 1 << 1,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+            };
+            let (p, st) = crate::range::build(&native.code, false, native.vgprs).unwrap();
+            let st = st.unwrap();
+            let res = resource::track(&p, &[], HwStage::Ps, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let mut dxil = emit(&c, &native, &p, &st, &io, &res).unwrap().dxil;
+            assert_eq!(requires_barycentrics(&dxil), needs);
+            let c = Container::parse(&dxil).unwrap();
+            let sig = signature(c.part(FourCC::ISG1).unwrap().data).unwrap();
+            assert_eq!(sig.iter().any(|e| e.kind == 28), needs);
+            #[cfg(windows)]
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut dxil).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_loop_elides_only_overwritten_barycentrics() {
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+        };
+        let osg1 = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        for (end, early_read, needs) in [(4, false, false), (1, false, true), (2, true, true)] {
+            let mut words = Vec::new();
+            if early_read {
+                words.push(0x7e06_0301u32);
+            } // v3 = original v1, before overwrite
+            let latch = words.len() as i32 + 3;
+            words.extend([
+                0xbe80_0380u32, // s0 = 0
+                0x7e04_0281,    // v2 = 1
+                0xbf82_0001,    // jump to header
+                0xbe80_0302,    // latch: s0 = s2
+                0xbefc_0300,    // header: m0 = s0
+                0x8102_8100,    // s2 = s0 + 1
+            ]);
+            words.extend([0x7e00_8502, 0xbf06_8002 | (end << 8)]); // write v[m0]; compare s2
+            let back = (latch - (words.len() as i32 + 1)) as u16;
+            words.extend([
+                0xbf84_0000 | u32::from(back),
+                0xf800_1801,
+                if early_read { 3 } else { 1 },
+                0xbf81_0000,
+            ]);
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 1 << 1,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+            };
+            let (p, st) = crate::range::build(&native.code, false, native.vgprs).unwrap();
+            let st = st.unwrap();
+            let res = resource::track(&p, &[], HwStage::Ps, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let mut dxil = emit(&c, &native, &p, &st, &io, &res).unwrap().dxil;
+            assert_eq!(
+                requires_barycentrics(&dxil),
+                needs,
+                "end={end}; early_read={early_read}"
+            );
+            #[cfg(windows)]
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut dxil).unwrap();
+            }
+        }
+    }
 
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose

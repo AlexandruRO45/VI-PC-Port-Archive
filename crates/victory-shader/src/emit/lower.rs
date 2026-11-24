@@ -80,10 +80,22 @@ enum Stop {
     Fail(ShaderError),
 }
 
+pub(crate) const DIRECT_BARYCENTRICS: &str = "barycentrics read directly";
+
+#[cfg(any(test, all(windows, feature = "host")))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_barycentrics(parts, false)
+}
+
+pub(crate) fn lower_with_barycentrics(
+    parts: &Parts,
+    native_barycentrics: bool,
+) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        let mut l = Lower::new(parts, &bad);
+        l.native_barycentrics = native_barycentrics;
+        match l.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -165,6 +177,7 @@ fn half_shift(width: u32) -> u32 {
 
 struct Lower<'a> {
     s: Shader,
+    native_barycentrics: bool,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
@@ -573,6 +586,7 @@ impl<'a> Lower<'a> {
         }
         Lower {
             s,
+            native_barycentrics: false,
             x,
             bad,
             lane_fail: HashMap::new(),
@@ -1370,6 +1384,14 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
+                // Ordinary v_interp lowering does not consume raw I/J. Load
+                // the system value only for numeric uses (including live phis).
+                Reg::V(_)
+                    if self.native_barycentrics
+                        && matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) =>
+                {
+                    continue;
+                }
                 Reg::V(_) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
@@ -1393,7 +1415,10 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            Input::Barycentric { kind, index } if self.native_barycentrics => {
+                return self.barycentric(kind, index);
+            }
+            Input::Barycentric { .. } => return Val::Missing(DIRECT_BARYCENTRICS),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -1536,8 +1561,76 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn barycentric(&mut self, kind: Barycentric, index: u8) -> Val {
+        let interp = match kind {
+            Barycentric::PerspectiveCenter => 2,
+            Barycentric::PerspectiveCentroid => 3,
+            Barycentric::PerspectiveSample => 6,
+            Barycentric::LinearCenter => 4,
+            Barycentric::LinearCentroid => 5,
+            Barycentric::LinearSample => 7,
+            Barycentric::PerspectivePullModel => return Val::Missing("pull-model barycentrics"),
+        };
+        if !self.s.pixel || index > 1 {
+            return Val::Missing("unsupported barycentric input");
+        }
+        let id = self
+            .s
+            .inputs
+            .iter()
+            .position(|e| e.kind == 28 && e.interp == interp)
+            .or_else(|| {
+                self.s
+                    .inputs
+                    .iter()
+                    .position(|e| e.kind == 28 && e.usage == 0)
+            });
+        let id = match id {
+            Some(id) => id,
+            None => {
+                let count = self.s.inputs.iter().filter(|e| e.kind == 28).count() as u32;
+                if count >= 2 {
+                    return Val::Missing("barycentrics of a third interpolation mode");
+                }
+                self.s.inputs.push(SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index: count,
+                    kind: 28,
+                    comp: 9,
+                    interp,
+                    row: None,
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        let e = &mut self.s.inputs[id];
+        if e.col != 0 || e.cols != 3 || e.comp != 9 || e.half {
+            return Val::Missing("a malformed barycentric signature element");
+        }
+        e.row = None;
+        e.interp = interp;
+        self.s.flags |= flags::BARYCENTRICS;
+        // Console I/J are the weights of the second and third vertices.
+        self.load_any_input(id, index + 1)
+    }
+
+    fn load_barycentric(&mut self, value: Value) {
+        if self.native_barycentrics && !self.vals.contains_key(&value)
+            && let Some((_, Input::Barycentric { kind, index })) =
+                self.x.io.inputs.iter().find(|(v, _)| *v == value)
+        {
+            let input = self.barycentric(*kind, *index);
+            self.vals.insert(value, input);
+        }
+    }
+
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
+        self.load_barycentric(v);
         if self.phi_at.contains_key(&v) {
             self.read_phis.insert(v);
         }
@@ -9413,6 +9506,156 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// Prove a counted, unconditional v_movreld overwrites a VGPR before
+    /// its incoming value can be observed. Only accept an ordinary loop
+    /// with a single entry, back edge and normal exit.
+    fn overwritten_indexed_input(&self, b: usize, edge: usize, phi: &crate::ir::Phi) -> bool {
+        (|| {
+            let Reg::V(reg) = phi.reg else { return None };
+            let (p, st) = (self.x.p, self.x.st);
+            let block = &p.blocks[b];
+            let LaneExit::Branch {
+                when,
+                taken: latch,
+                not_taken: exit,
+            } = st.exits[b]
+            else {
+                return None;
+            };
+            let back = block.preds.iter().position(|&q| q == latch)?;
+            let entry = block.preds[edge];
+            if block.preds.len() != 2
+                || back == edge
+                || self.rpo[entry] >= self.rpo[b]
+                || self.rpo[b] >= self.rpo[latch]
+                || st.exits[latch] != LaneExit::Jump(b)
+                || p.blocks[latch].preds != [b]
+                || p.blocks[exit].preds != [b]
+                || st.exits[exit] != LaneExit::End
+                || exit == b
+                || exit == latch
+                || [b, entry, latch]
+                    .iter()
+                    .any(|q| self.sections.contains_key(q))
+            {
+                return None;
+            }
+            let uses = |value| {
+                p.blocks.iter().enumerate().flat_map(move |(bb, block)| {
+                    block.insts.iter().enumerate().filter_map(move |(i, inst)| {
+                        inst.reads
+                            .iter()
+                            .any(|r| r.1 == value)
+                            .then_some((bb, i, inst))
+                    })
+                })
+            };
+            let mut reads = uses(phi.value);
+            let (bb, i, mov) = reads.next()?;
+            if reads.next().is_some()
+                || bb != b
+                || st.guards[b][i].is_some()
+                || mov.name() != "v_movreld_b32"
+                || mov.read(phi.reg) != Some(phi.value)
+                || p.blocks
+                    .iter()
+                    .flat_map(|q| &q.phis)
+                    .any(|q| q.args.contains(&phi.value))
+            {
+                return None;
+            }
+            let Fields::Valu(f) = &mov.fields else {
+                return None;
+            };
+            let (
+                Some(Operand::Vector {
+                    reg: base,
+                    dwords: 1,
+                }),
+                [
+                    Operand::Vector {
+                        reg: src,
+                        dwords: 1,
+                    },
+                ],
+            ) = (f.dst, f.src.as_slice())
+            else {
+                return None;
+            };
+            if f.sdwa.is_some() || f.dpp.is_some() || mov.read(Reg::V(*src))? == phi.value {
+                return None;
+            }
+            let result = mov.write(phi.reg)?;
+            if phi.args[back] != result
+                || uses(result).any(|(bb, _, _)| bb != exit)
+                || p.blocks.iter().flat_map(|q| &q.phis).any(|q| {
+                    q.args
+                        .iter()
+                        .enumerate()
+                        .any(|(n, &arg)| arg == result && (q.value != phi.value || n != back))
+                })
+            {
+                return None;
+            }
+            let slot = u32::from(reg.checked_sub(base)?);
+            let scalar = |inst: &Inst, op: &Operand| match *op {
+                Operand::Scalar { code, dwords: 1 } => inst.read(Reg::S(code)),
+                _ => None,
+            };
+            let constant = |op: &Operand| match *op {
+                Operand::Const(c) => crate::resource::inline(c),
+                Operand::Literal(c) => Some(c),
+                _ => None,
+            };
+            let sop = |value, at, name| {
+                let inst = self.def_inst(value)?;
+                let Fields::Sop { src, .. } = &inst.fields else {
+                    return None;
+                };
+                (*self.def_block.get(&value)? == at && inst.name() == name)
+                    .then_some((inst, src.as_slice()))
+            };
+            let (m0, [idx]) = sop(mov.read(Reg::S(crate::ir::M0))?, b, "s_mov_b32")? else {
+                return None;
+            };
+            let idx = scalar(m0, idx)?;
+            let index = block.phis.iter().find(|p| p.value == idx)?;
+            let (_, [start]) = sop(index.args[edge], entry, "s_mov_b32")? else {
+                return None;
+            };
+            let (copy, [next]) = sop(index.args[back], latch, "s_mov_b32")? else {
+                return None;
+            };
+            let next = scalar(copy, next)?;
+            let (add, [old, step]) = sop(next, b, "s_add_i32")? else {
+                return None;
+            };
+            if scalar(add, old)? != idx || constant(step)? != 1 {
+                return None;
+            }
+            let (Atom::Uniform(scc), Bool::TRUE, Bool::FALSE) = st.bools.node(when)? else {
+                return None;
+            };
+            let branch = block.insts.last()?;
+            if branch.name() != "s_cbranch_scc0" || branch.read(Reg::Scc) != Some(scc) {
+                return None;
+            }
+            let (cmp, [tested, limit]) = sop(scc, b, "s_cmp_eq_u32")? else {
+                return None;
+            };
+            let (start, limit) = (constant(start)?, constant(limit)?);
+            // No wrap, exactly [start, limit) on normal exit. The watchdog
+            // may stop a long run, so don't prove coverage beyond its cap.
+            (scalar(cmp, tested)? == next
+                && start <= slot
+                && slot < limit
+                && limit <= 256
+                && limit - start <= super::loop_limit())
+            .then_some(())
+        })()
+        .is_some()
+    }
+
     /// The incoming edges (phi, predecessor index) over which a value can
     /// reach a read. A phi that only another read phi consumes is live too
     /// (else a value with no DXIL form reaching a read through two joins
@@ -9486,13 +9729,22 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 let read = live.contains(&(phi.value, n));
+                let missing = !matches!(self.vals.get(&arg), Some(Val::I32(_) | Val::Bit(_)));
+                let dead = read
+                    && missing
+                    && (self.never_taken(q, b)
+                        || self.dead_on_edge(b, n, phi.reg)
+                        || (self.x.io.inputs.iter().any(|&(v, input)| {
+                            v == arg && matches!(input, Input::Barycentric { .. })
+                        }) && self.overwritten_indexed_input(b, n, phi)));
+                if read && !dead {
+                    self.load_barycentric(arg);
+                }
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     // No lane from this edge reads it, or no lane comes
                     // along it at all: any value will do.
-                    _ if read
-                        && (self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg)) =>
-                    {
+                    _ if dead => {
                         if bit {
                             self.s.m.bool(false)
                         } else {
