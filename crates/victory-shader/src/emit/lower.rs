@@ -22,6 +22,18 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
 
+fn interpolation_mode(kind: Barycentric) -> Result<u8, Why> {
+    Ok(match kind {
+        Barycentric::PerspectiveCenter => 2,
+        Barycentric::PerspectiveCentroid => 3,
+        Barycentric::PerspectiveSample => 6,
+        Barycentric::LinearCenter => 4,
+        Barycentric::LinearCentroid => 5,
+        Barycentric::LinearSample => 7,
+        Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -167,6 +179,7 @@ struct Lower<'a> {
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
+    barycentrics: HashMap<Value, (Barycentric, u8)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
@@ -469,6 +482,7 @@ impl<'a> Lower<'a> {
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
+            barycentrics: HashMap::new(),
             user_data: None,
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
@@ -1055,6 +1069,12 @@ impl<'a> Lower<'a> {
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
+                    Some(&Input::Barycentric { kind, index }) => {
+                        // Normal attribute interpolation already raises its
+                        // barycentrics. Only direct reads need this input.
+                        self.barycentrics.insert(v, (kind, index));
+                        continue;
+                    }
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
                     // refuses reads of undef).
@@ -1220,6 +1240,48 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn barycentric_input(&mut self, kind: Barycentric, index: u8) -> Result<Val, Why> {
+        let mode = interpolation_mode(kind)?;
+        if index >= 2 {
+            return Err("a barycentric component");
+        }
+        let id = if let Some(id) = self
+            .s
+            .inputs
+            .iter()
+            .position(|e| e.kind == 28 && e.interp == mode)
+        {
+            id
+        } else {
+            let perspective = |mode| matches!(mode, 2 | 3 | 6);
+            let mut count = 0;
+            for e in self.s.inputs.iter().filter(|e| e.kind == 28) {
+                if perspective(e.interp) == perspective(mode) {
+                    return Err("two direct barycentric inputs of the same interpolation type");
+                }
+                count += 1;
+            }
+            let id = self.s.inputs.len();
+            self.s.inputs.push(SigElement {
+                name: "SV_Barycentrics".into(),
+                index: count,
+                kind: 28,
+                comp: 9,
+                interp: mode,
+                row: None,
+                col: 0,
+                cols: 3,
+                usage: 0,
+                half: false,
+            });
+            id
+        };
+        self.s.flags |= flags::BARYCENTRICS;
+        // Native I and J weight vertices 1 and 2. DXIL's x weights
+        // the provoking vertex, so I and J are its y and z.
+        Ok(self.load_any_input(id, index + 1))
+    }
+
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
         if self.phi_at.contains_key(&v) {
@@ -1233,6 +1295,11 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
             None => {}
+        }
+        if let Some(&(kind, index)) = self.barycentrics.get(&v) {
+            let val = self.barycentric_input(kind, index)?;
+            self.vals.insert(v, val);
+            return Ok(val);
         }
         if let Some(&(param, dword)) = self.params.get(&v) {
             let val = self.user(param, dword);
@@ -5871,18 +5938,7 @@ impl<'a> Lower<'a> {
                 attribute,
                 barycentric,
                 ..
-            } => (
-                attribute,
-                match barycentric {
-                    Barycentric::PerspectiveCenter => 2,
-                    Barycentric::PerspectiveCentroid => 3,
-                    Barycentric::PerspectiveSample => 6,
-                    Barycentric::LinearCenter => 4,
-                    Barycentric::LinearCentroid => 5,
-                    Barycentric::LinearSample => 7,
-                    Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
-                },
-            ),
+            } => (attribute, interpolation_mode(*barycentric)?),
             // P0, the provoking vertex: a flat (nointerpolation) input.
             Interp::Vertex {
                 attribute,
@@ -7530,6 +7586,14 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                if self.read_phis.contains(&phi.value)
+                    && !self.vals.contains_key(&arg)
+                    && (self.params.contains_key(&arg) || self.barycentrics.contains_key(&arg))
+                {
+                    // A live incoming value can be an input that neither
+                    // predecessor needed to read. Its load goes in the entry.
+                    self.get(arg).map_err(|why| Stop::Retry(phi.value, why))?;
+                }
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {

@@ -12,6 +12,7 @@ use victory_shader::emit::{
     DESCRIPTOR_DATA_SLOT, ROOT_CBV_SPACE, SAMPLER_SPACE, TITLE_MEMORY_SLOT, TITLE_MEMORY_SPACE,
     TITLE_MEMORY_VIEWS, USER_DATA_SPACE,
 };
+use victory_shader::{Container, FourCC};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -272,6 +273,8 @@ pub(crate) struct HostPipeline {
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
+    /// Resource and sampler heaps indexed directly by at least one stage.
+    pub(crate) indexed_heaps: [bool; 2],
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
     /// The vertex buffer slots it reads (bit per slot).
@@ -336,8 +339,15 @@ impl HostPipeline {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
+        let mut indexed_heaps = [false; 2];
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
+            let Some(heaps) = shader_heap_indexing(&t.dxil) else {
+                return refuse("translated shader has no feature information", shaders);
+            };
+            for (indexed, used) in indexed_heaps.iter_mut().zip(heaps) {
+                *indexed |= used;
+            }
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
@@ -447,7 +457,16 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+        if root_cost(&params) > u64::from(D3D12_MAX_ROOT_COST) {
+            return refuse("root signature exceeds the D3D12 DWORD limit", shaders);
+        }
+        let (root, root_blob) = match root_signature(
+            &host.device,
+            &params,
+            &samplers,
+            compute.is_some(),
+            indexed_heaps,
+        ) {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
@@ -493,6 +512,7 @@ impl HostPipeline {
                 mesh: false,
                 pso,
                 root,
+                indexed_heaps,
                 stages: bound,
                 name: format!("{shaders:?}"),
                 slots: 0,
@@ -525,6 +545,7 @@ impl HostPipeline {
                 mesh: true,
                 pso,
                 root,
+                indexed_heaps,
                 stages: bound,
                 name: format!("{shaders:?}"),
                 slots: 0,
@@ -595,6 +616,7 @@ impl HostPipeline {
             mesh: false,
             pso,
             root,
+            indexed_heaps,
             stages: bound,
             name: format!("{shaders:?}"),
             slots: g.slots(),
@@ -665,17 +687,65 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
+fn shader_heap_indexing(dxil: &[u8]) -> Option<[bool; 2]> {
+    let container = Container::parse(dxil).ok()?;
+    let data = container.part(FourCC::SFI0)?.data.get(..8)?;
+    let flags = u64::from_le_bytes(data.try_into().ok()?);
+    Some([flags & 0x0200_0000 != 0, flags & 0x0400_0000 != 0])
+}
+
+#[cfg(test)]
+#[test]
+fn root_only_shader_does_not_require_bound_heaps() {
+    let container = |flags: u64| {
+        let mut data = [0; 52];
+        data[..4].copy_from_slice(b"DXBC");
+        data[20..24].copy_from_slice(&1u32.to_le_bytes());
+        data[24..28].copy_from_slice(&52u32.to_le_bytes());
+        data[28..32].copy_from_slice(&1u32.to_le_bytes());
+        data[32..36].copy_from_slice(&36u32.to_le_bytes());
+        data[36..40].copy_from_slice(b"SFI0");
+        data[40..44].copy_from_slice(&8u32.to_le_bytes());
+        data[44..].copy_from_slice(&flags.to_le_bytes());
+        data
+    };
+    assert_eq!(shader_heap_indexing(&container(0x8000)), Some([false, false]));
+    assert_eq!(shader_heap_indexing(&container(0x0200_0000)), Some([true, false]));
+    assert_eq!(shader_heap_indexing(&container(0x0400_0000)), Some([false, true]));
+}
+
+fn root_cost(params: &[D3D12_ROOT_PARAMETER1]) -> u64 {
+    params
+        .iter()
+        .map(|p| match p.ParameterType {
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => 1,
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => {
+                // SAFETY: the parameter type selects the Constants member.
+                u64::from(unsafe { p.Anonymous.Constants.Num32BitValues })
+            }
+            _ => 2,
+        })
+        .sum()
+}
+
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
+    indexed_heaps: [bool; 2],
 ) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
-    let input = if compute {
+    let mut flags = if compute {
         D3D12_ROOT_SIGNATURE_FLAG_NONE
     } else {
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
     };
+    if indexed_heaps[0] {
+        flags |= D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+    }
+    if indexed_heaps[1] {
+        flags |= D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+    }
     let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
         Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
@@ -684,9 +754,7 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                Flags: flags,
             },
         },
     };
