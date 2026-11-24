@@ -349,6 +349,13 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     Some(all)
 }
 
+/// Whether row permutations (`v_permlane16_b32` / `v_permlanex16_b32`) are
+/// lowered (`VICTORY_PERMLANE`, on by default; `=0` refuses them as before).
+fn permlane_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PERMLANE").is_none_or(|v| v != "0"))
+}
+
 /// Blocks reached by every host lane for a fetch-inactive permutation,
 /// including the lane-local returns inserted at the loop iteration limit.
 fn permlane_all_lane_blocks(p: &Program, st: &Structured) -> Option<Vec<bool>> {
@@ -7300,6 +7307,9 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_permlane16_b32" | "v_permlanex16_b32" => {
+                if !permlane_enabled() {
+                    return Err("v_permlanex16_b32 is not supported");
+                }
                 // RDNA2 ISA 12.12: each nibble of {src2, src1} selects a lane
                 // in this row of 16, or the other row of the same 32-lane half.
                 // OP_SEL[0:1] are fetch-inactive and bound-control, not half selects.

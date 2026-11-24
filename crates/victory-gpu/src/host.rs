@@ -1557,11 +1557,63 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 }
 "#;
 
-/// Dispatch [`CARD_COMPARE`] for `pieces` pieces (one thread group per piece),
-/// chunking at D3D12's 65,535-group per-dimension limit if ever exceeded.
+/// The original one-thread-per-piece compare (`VICTORY_CARD_COMPARE_PARALLEL=0`),
+/// kept so the parallel group reduction can be A/B tested against it.
+pub(crate) const CARD_COMPARE_SERIAL: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;
+    uint skew;
+    uint size;
+    uint pieces;
+    uint out_at;
+    uint compare;
+};
+ByteAddressBuffer now : register(t0);
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= pieces) return;
+    uint piece = first + id.x;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    [loop]
+    for (uint at = lo; at < hi; at += 16u) {
+        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    if (compare != 0u) {
+        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        if (compare == 2u) hashes.Store4(piece * 16u, h);
+    } else {
+        hashes.Store4(piece * 16u, h);
+    }
+}
+"#;
+
+/// Whether the card compare uses the parallel 64-thread-group-per-piece
+/// reduction (`VICTORY_CARD_COMPARE_PARALLEL`, on by default; `=0` uses the
+/// original one-thread-per-piece [`CARD_COMPARE_SERIAL`]).
+fn card_compare_parallel() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_CARD_COMPARE_PARALLEL").is_none_or(|v| v != "0")
+    })
+}
+
+/// Dispatch the card compare for `pieces` pieces, chunking at D3D12's
+/// 65,535-group per-dimension limit if ever exceeded. One thread group per
+/// piece for the parallel shader; one thread per piece (64 to a group) for
+/// the serial one.
 ///
 /// # Safety
-/// The caller must have bound [`CARD_COMPARE`]'s root signature, pipeline,
+/// The caller must have bound the card compare's root signature, pipeline,
 /// SRV, and UAVs on `list`, and `list` must be open for recording.
 unsafe fn dispatch_card_compare(
     list: &ID3D12GraphicsCommandList,
@@ -1573,14 +1625,16 @@ unsafe fn dispatch_card_compare(
     compare: u32,
 ) {
     const MAX_GROUPS: u32 = 65_535;
+    let parallel = card_compare_parallel();
     let mut done = 0u32;
     while done < pieces {
         let chunk = (pieces - done).min(MAX_GROUPS);
         let constants = [first + done, skew, size, chunk, out_at_bytes + done * 4, compare];
-        // SAFETY: caller guarantees `list` is open with CARD_COMPARE bound.
+        let groups = if parallel { chunk } else { chunk.div_ceil(64) };
+        // SAFETY: caller guarantees `list` is open with the card compare bound.
         unsafe {
             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-            list.Dispatch(chunk, 1, 1);
+            list.Dispatch(groups, 1, 1);
         }
         done += chunk;
     }
@@ -3013,9 +3067,14 @@ impl Host {
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
+            let source = if card_compare_parallel() {
+                CARD_COMPARE
+            } else {
+                CARD_COMPARE_SERIAL
+            };
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
