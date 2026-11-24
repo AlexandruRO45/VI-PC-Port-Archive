@@ -5125,6 +5125,33 @@ ctest --preset release --no-tests=error -R '^cpu_native_gameinput$' -V
 
 ### DirectStorage factory and queue adapter
 
+#### Windows file-to-memory RFC 1950 requests
+
+The optional desktop fixture submits a local file slice through a DirectStorage
+file queue. Its custom format zero carries one RFC 1950 stream. A CPU worker
+dequeues the job and returns its result using the same request ID. The queue
+event and status become complete after that result. The fixture verifies
+output bytes and guards, compressed bytes consumed, uncompressed bytes
+produced and the status HRESULT.
+
+With DirectStorage 1.3.0 and zlib 1.3.1, the generated 116-byte stream
+produced 768 bytes. Truncation, bad checksum, trailing bytes and mismatched
+destination sizes in both directions returned `0x8007000d` and preserved the
+destination. All six cases passed on Windows build 26200.
+
+Extract the [DirectStorage NuGet package](https://www.nuget.org/packages/Microsoft.Direct3D.DirectStorage/1.3.0)
+under `out/dstorage-sdk` and install a static x64 build of
+[zlib 1.3.1](https://github.com/madler/zlib/releases/tag/v1.3.1) under
+`out/zlib-install`. From the x64 developer environment run
+
+```powershell
+cmake --preset release "-DDSTORAGE_SDK_ROOT=$PWD/out/dstorage-sdk" "-DZLIB_ROOT=$PWD/out/zlib-install" "-DZLIB_LIBRARY_RELEASE=$PWD/out/zlib-install/lib/zlibstatic.lib"
+cmake --build --preset release --target dstorage_rfc1950_check
+ctest --preset release --no-tests=error -R '^dstorage_rfc1950_' -V
+```
+
+#### Factory and staging controls
+
 This fixture exercises the DirectStorage initialization sequence and submission controls. The source-built caller ([`dstorage_caller.asm`](../tests/cpu/dstorage_caller.asm)) imports `DStorageGetFactory` by name from `xcrdapi.dll` and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled adapter provider ([`dstorage_provider.cpp`](../tests/cpu/dstorage_provider.cpp)), it verifies factory acquisition, staging buffer configuration, queue creation, delayed submission, and exact readback:
 
 - **Public sources**:

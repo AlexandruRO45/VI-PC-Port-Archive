@@ -2,6 +2,24 @@ cmake_minimum_required(VERSION 3.21)
 project(Xbox2Windows LANGUAGES CXX)
 
 enable_testing()
+
+set(DSTORAGE_SDK_ROOT "" CACHE PATH "Extracted Microsoft.Direct3D.DirectStorage NuGet package")
+if(DSTORAGE_SDK_ROOT)
+    find_package(ZLIB 1.2.9 REQUIRED)
+    set(dstorage_native "${DSTORAGE_SDK_ROOT}/native")
+    add_executable(dstorage_rfc1950_check tests/dstorage_rfc1950_check.cpp src/dstorage_rfc1950.cpp)
+    target_compile_features(dstorage_rfc1950_check PRIVATE cxx_std_17)
+    target_include_directories(dstorage_rfc1950_check PRIVATE src "${dstorage_native}/include")
+    target_link_libraries(dstorage_rfc1950_check PRIVATE "${dstorage_native}/lib/x64/dstorage.lib" ZLIB::ZLIB)
+    add_custom_command(TARGET dstorage_rfc1950_check POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${dstorage_native}/bin/x64/dstorage.dll"
+            "${dstorage_native}/bin/x64/dstoragecore.dll" "$<TARGET_FILE_DIR:dstorage_rfc1950_check>"
+        VERBATIM)
+    foreach(scenario IN ITEMS success truncated checksum trailing oversize undersize)
+        add_test(NAME dstorage_rfc1950_${scenario} COMMAND dstorage_rfc1950_check ${scenario})
+        set_tests_properties(dstorage_rfc1950_${scenario} PROPERTIES TIMEOUT 30)
+    endforeach()
+endif()
 add_executable(guest_content_root_check tests/guest_content_root_check.cpp)
 target_compile_features(guest_content_root_check PRIVATE cxx_std_17)
 add_test(NAME startup_content_root COMMAND guest_content_root_check "${CMAKE_CURRENT_BINARY_DIR}")
