@@ -430,7 +430,7 @@ pub fn sgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         if f == "LITERAL" || o.implicit {
             continue;
         }
-        if !["SREG", "SSRC", "SDST", "OPR_SRC"].iter().any(|k| o.ty.contains(k)) {
+        if o.ty != "OPR_SMEM_OFFSET" && !["SREG", "SSRC", "SDST", "OPR_SRC"].iter().any(|k| o.ty.contains(k)) {
             continue;
         }
         if f == "SRC0" && d.variant != Variant::Plain {
@@ -693,6 +693,17 @@ mod tests {
         // SBASE counts SGPR pairs, SRSRC SGPR quads (seen in retail code)
         assert_eq!(dis(&[0x08, 0x02, 0x08, 0xf4, 0x20, 0x09, 0x00, 0xfa]), "s_load_dwordx4 s[8:11], s[16:17], 0x920");
         assert_eq!(dis(&[0x04, 0x02, 0x28, 0xf4, 0x40, 0x00, 0x00, 0xfa]), "s_buffer_load_dwordx4 s[8:11], s[8:11], 0x40");
+    }
+
+    #[test]
+    fn scalar_memory_register_offset_is_a_read() {
+        for offset in [4, 7, 125] {
+            let bytes = encode("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 0), ("SOFFSET", offset)], None).unwrap();
+            let d = decode(&bytes, 0).unwrap();
+            let (reads, writes) = sgpr_uses(&d);
+            assert_eq!(reads, if offset == 125 { vec![0, 1] } else { vec![0, 1, offset] }, "SOFFSET {offset}");
+            assert_eq!(writes, vec![16]);
+        }
     }
 
     #[test]
