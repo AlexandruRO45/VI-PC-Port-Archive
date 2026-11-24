@@ -4227,13 +4227,16 @@ impl<'a> Lower<'a> {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                // Only the console's lanes wrap at its wave; a host lane is
+                // already in range and may exceed it (a 64-lane host wave).
+                let lane = if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
                     self.s.flags |= flags::WAVE_OPS;
+                    lane
                 } else {
                     self.cross_lane(false)?;
-                }
-                let mask = self.s.m.i32(self.wave() - 1);
-                let lane = self.s.m.bin(c, Bin::And, lane, mask);
+                    let mask = self.s.m.i32(self.wave() - 1);
+                    self.s.m.bin(c, Bin::And, lane, mask)
+                };
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
@@ -7529,5 +7532,66 @@ mod tests {
         let (a, b) = l.module.cmp_eq(cond).expect("lane == 3 compare");
         assert!(l.module.is_lane_index(a));
         assert_eq!(l.module.eval_i32(b), Some(3));
+    }
+
+    #[test]
+    fn a_computed_host_lane_in_a_pixel_program_is_not_masked() {
+        // A computed lane in a pixel program is a host lane, which a 64-lane
+        // host wave runs past the console's 32: lane 35 must stay 35.
+        let words = [
+            0x8000_80A3, // s_add_u32 s0, 35, 0
+            0x7E00_02F2, // v_mov_b32 v0, 1.0
+            0xD760_0001,
+            0x0000_0100, // v_readlane_b32 s1, v0, s0
+            0x7E02_0201, // v_mov_b32 v1, s1
+            0xF800_180F,
+            0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let target = super::super::container::SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let l = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![target],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+        let reads = l.module.calls("waveReadLaneAt");
+        assert_eq!(reads.len(), 1);
+        assert_eq!(l.module.eval_i32(reads[0][2]), Some(35));
     }
 }
