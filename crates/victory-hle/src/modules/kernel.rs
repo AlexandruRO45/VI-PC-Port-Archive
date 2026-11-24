@@ -17,7 +17,7 @@ pub extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&wide(name), false).unwrap_or_else(|| host::get_module_handle_w(name))
+    find_module(&wide(name), Lookup::Query).unwrap_or_else(|| host::get_module_handle_w(name))
 }
 
 /// See [`GetModuleHandleW`].
@@ -25,7 +25,7 @@ pub extern "system" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&narrow(name), false).unwrap_or_else(|| host::get_module_handle_a(name))
+    find_module(&narrow(name), Lookup::Query).unwrap_or_else(|| host::get_module_handle_a(name))
 }
 
 /// A NUL-terminated string from the title.
@@ -116,7 +116,7 @@ pub extern "system" fn LoadLibraryExA(
     flags: u32,
 ) -> *mut c_void {
     if !name.is_null()
-        && let Some(handle) = find_module(&narrow(name), runs_code(flags))
+        && let Some(handle) = find_module(&narrow(name), load_lookup(flags))
     {
         return handle;
     }
@@ -130,16 +130,28 @@ pub extern "system" fn LoadLibraryExW(
     flags: u32,
 ) -> *mut c_void {
     if !name.is_null()
-        && let Some(handle) = find_module(&wide(name), runs_code(flags))
+        && let Some(handle) = find_module(&wide(name), load_lookup(flags))
     {
         return handle;
     }
     host::load_library_ex_w(name, file, flags)
 }
 
+fn load_lookup(flags: u32) -> Lookup {
+    if runs_code(flags) {
+        Lookup::Code
+    } else if flags & 0x1 != 0 {
+        // `DONT_RESOLVE_DLL_REFERENCES` maps an executable image whose exports
+        // `GetProcAddress` can resolve, so it must stay gated by `HostPolicy`.
+        Lookup::NoInit
+    } else {
+        Lookup::Data
+    }
+}
+
 /// False for loads as data or resources (`DONT_RESOLVE_DLL_REFERENCES`,
 /// `LOAD_LIBRARY_AS_DATAFILE(_EXCLUSIVE)`, `AS_IMAGE_RESOURCE`): those run
-/// no code, so a title DLL we have not mapped can go to the host.
+/// no code, so a title DLL we have not mapped is not initialised now.
 fn runs_code(flags: u32) -> bool {
     flags & (0x1 | 0x2 | 0x20 | 0x40) == 0
 }
@@ -299,11 +311,19 @@ fn handle(m: &HleModule) -> *mut c_void {
     m as *const HleModule as *mut c_void
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lookup {
+    Query,
+    Code,
+    NoInit,
+    Data,
+}
+
 /// The title's images and our console modules by name; `None` leaves the
-/// name to the host, which only DLLs `HostPolicy` passes through get (as at
-/// import binding); others fail. With `load`, a title DLL not mapped yet is
-/// mapped now.
-fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
+/// name to the host, which DLLs `HostPolicy` passes through and passive
+/// data/resource loads get; others fail. With [`Lookup::Code`], a title DLL
+/// not mapped yet is mapped now.
+fn find_module(path: &str, lookup: Lookup) -> Option<*mut c_void> {
     let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
     // As the Windows loader does, a name without extension means a DLL.
     let file = if file.contains('.') {
@@ -313,7 +333,7 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     };
     // Loads go through the title DLL loader first: it waits for a DLL that
     // another thread is still initialising, as the Windows loader lock does.
-    if load {
+    if lookup == Lookup::Code {
         match runtime::load_title_dll(&file) {
             Ok(Some(base)) => return Some(base as *mut c_void),
             Ok(None) => {}
@@ -331,12 +351,12 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     // DLLs the host has too are real host modules, whatever `--strict` says.
     let host_dll = HostPolicy::default().allows(&file);
     if !host_dll && let Some(m) = registry().iter().find(|m| m.serves(&file)) {
-        if load {
+        if lookup != Lookup::Query {
             tracing::info!(dll = file, "loaded as a pseudo module");
         }
         return Some(handle(m));
     }
-    if host_dll {
+    if host_dll || lookup == Lookup::Data {
         return None;
     }
     // Any other host DLL (wininet, urlmon, ...) is beyond what we guard, and
@@ -754,5 +774,60 @@ mod tests {
             let last = unsafe { windows_sys::Win32::Foundation::GetLastError() };
             assert_eq!(last, ERROR_INSUFFICIENT_BUFFER);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn datafile_loads_outside_host_policy_reach_the_host() {
+        assert!(!HostPolicy::default().allows("comctl32.dll"));
+
+        // Code loads and handle queries outside `HostPolicy` stay refused.
+        assert!(LoadLibraryW(w("comctl32.dll").as_ptr()).is_null());
+        assert_eq!(
+            // SAFETY: reads this thread's last error.
+            unsafe { windows_sys::Win32::Foundation::GetLastError() },
+            ERROR_MOD_NOT_FOUND
+        );
+        assert!(LoadLibraryExA(c"comctl32.dll".as_ptr().cast(), std::ptr::null_mut(), 0).is_null());
+        assert!(GetModuleHandleW(w("comctl32.dll").as_ptr()).is_null());
+
+        // `DONT_RESOLVE_DLL_REFERENCES` (0x1) maps an executable image whose
+        // exports `GetProcAddress` can resolve, so it stays refused outside
+        // `HostPolicy`.
+        assert!(LoadLibraryExW(w("comctl32.dll").as_ptr(), std::ptr::null_mut(), 0x1).is_null());
+        assert_eq!(
+            // SAFETY: reads this thread's last error.
+            unsafe { windows_sys::Win32::Foundation::GetLastError() },
+            ERROR_MOD_NOT_FOUND
+        );
+        assert!(
+            LoadLibraryExA(c"comctl32.dll".as_ptr().cast(), std::ptr::null_mut(), 0x1).is_null()
+        );
+
+        // Passive data and resource mappings run no code and cannot resolve
+        // exports, so the host maps them.
+        for flags in [0x2, 0x20, 0x40, 0x22] {
+            let module = LoadLibraryExW(w("comctl32.dll").as_ptr(), std::ptr::null_mut(), flags);
+            assert!(!module.is_null(), "flags {flags:#x} failed");
+            assert!(
+                GetProcAddress(module, c"InitCommonControlsEx".as_ptr().cast()).is_null(),
+                "flags {flags:#x} should not resolve exports"
+            );
+            // Even while mapped, queries and code loads outside `HostPolicy` fail.
+            assert!(GetModuleHandleW(w("comctl32.dll").as_ptr()).is_null());
+            assert_eq!(
+                // SAFETY: reads this thread's last error.
+                unsafe { windows_sys::Win32::Foundation::GetLastError() },
+                ERROR_MOD_NOT_FOUND
+            );
+            assert!(LoadLibraryW(w("comctl32.dll").as_ptr()).is_null());
+            assert_ne!(FreeLibrary(module), 0);
+        }
+
+        let narrow_data =
+            LoadLibraryExA(c"comctl32.dll".as_ptr().cast(), std::ptr::null_mut(), 0x2);
+        assert!(!narrow_data.is_null());
+        assert!(GetProcAddress(narrow_data, c"InitCommonControlsEx".as_ptr().cast()).is_null());
+        assert_ne!(FreeLibrary(narrow_data), 0);
     }
 }
