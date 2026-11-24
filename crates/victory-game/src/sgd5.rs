@@ -3795,4 +3795,70 @@ mod tests {
             assert_eq!(found[1].span().end, file.len(), "{what}");
         }
     }
+
+    /// The fixed literal/length code of `sym` and its length in bits.
+    fn fixed_code(sym: u32) -> (u32, u32) {
+        match sym {
+            0..=143 => (0x30 + sym, 8),
+            144..=255 => (0x190 + sym - 144, 9),
+            256..=279 => (sym - 256, 7),
+            280..=287 => (0xC0 + sym - 280, 8),
+            _ => unreachable!("no such symbol"),
+        }
+    }
+
+    #[test]
+    fn symbols_at_every_edge_of_the_fixed_code_ranges_are_a_stream() {
+        // The fixed literal/length code is four ranges of code lengths:
+        // 0-143 in 8 bits, 144-255 in 9, 256-279 in 7 and 280-287 in 8.
+        // A block sending the symbols on both sides of each edge (literals
+        // 0, 143, 144 and 255; copies coded 279, 280 and 285; the end of
+        // the block, 256) is a stream: it unpacks, it is a stream of
+        // exactly its size and of no size one off, and the record covers
+        // no other, so the record after it is found.
+        let mut bits = Bits::default();
+        bits.put(1, 1); // BFINAL
+        bits.put(1, 2); // fixed codes
+        let mut want = Vec::new();
+        for lit in [0u8, 143, 144, 255] {
+            let (code, len) = fixed_code(lit.into());
+            bits.code(code, len);
+            want.push(lit);
+        }
+        // (length symbol, extra bits' value, their count, length, distance)
+        for (sym, extra, count, length, distance) in [
+            (279, 0, 4, 99, 1),
+            (280, 15, 4, 130, 4),
+            (285, 0, 0, 258, 2),
+        ] {
+            let (code, len) = fixed_code(sym);
+            bits.code(code, len);
+            bits.put(extra, count);
+            bits.code(distance - 1, 5); // distance codes 0-3: 1-4, no extra bits
+            for _ in 0..length {
+                want.push(want[want.len() - distance as usize]);
+            }
+        }
+        let (code, len) = fixed_code(256);
+        bits.code(code, len);
+        let packed = bits.out;
+        assert_eq!(want.len(), 4 + 99 + 130 + 258);
+
+        assert_eq!(
+            miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+            Some(want.clone())
+        );
+        assert!(starts_stream(&packed, want.len()));
+        assert!(!starts_stream(&packed, want.len() - 1));
+        assert!(!starts_stream(&packed, want.len() + 1));
+
+        let (file, marker) = outer_then_after(&packed, want.len());
+        let found: Vec<_> = records(&file).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_outer"), Some("PS_after")]);
+        assert_eq!(found[0].span(), marker..marker + 12 + packed.len());
+        assert_eq!(found[0].unpack(), Some(want));
+        assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+        assert_eq!(found[1].span().end, file.len());
+    }
 }
