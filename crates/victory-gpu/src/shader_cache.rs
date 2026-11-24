@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{
-    BufferAddress, DescriptorBinding, GroupOffset, HostShader, StaticSampler, UserData,
+    Affine, BufferAddress, DescriptorBinding, GroupOffset, HostShader, RootUavExtent,
+    StaticSampler, USER_TERMS, UserData,
 };
 use victory_shader::{HwStage, RootType};
 
@@ -234,6 +235,19 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, o.index);
         word(&mut out, u32::from(o.component));
     }
+    word(&mut out, s.root_uav_extents.len() as u32);
+    for e in &s.root_uav_extents {
+        word(&mut out, u32::from(e.slot));
+        for a in [e.end, e.peak] {
+            for x in [a.c, a.g[0], a.g[1], a.g[2]] {
+                out.extend(x.to_le_bytes());
+            }
+            for (dword, k) in a.u {
+                word(&mut out, u32::from(dword));
+                out.extend(k.to_le_bytes());
+            }
+        }
+    }
     out
 }
 
@@ -247,6 +261,18 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         }
         fn word(&mut self) -> Option<u32> {
             Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+        }
+        fn u64(&mut self) -> Option<u64> {
+            Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+        }
+        fn affine(&mut self) -> Option<Affine> {
+            let c = self.u64()?;
+            let g = [self.u64()?, self.u64()?, self.u64()?];
+            let mut u = [(0, 0); USER_TERMS];
+            for t in &mut u {
+                *t = (u8::try_from(self.word()?).ok()?, self.u64()?);
+            }
+            Some(Affine { c, g, u })
         }
         fn list(&mut self) -> Option<Vec<u8>> {
             let n = self.word()? as usize;
@@ -334,6 +360,16 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             });
         }
     }
+    let mut root_uav_extents = Vec::new();
+    if !r.0.is_empty() {
+        for _ in 0..r.word()? {
+            root_uav_extents.push(RootUavExtent {
+                slot: u8::try_from(r.word()?).ok()?,
+                end: r.affine()?,
+                peak: r.affine()?,
+            });
+        }
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -346,6 +382,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         descriptor_bindings,
         buffer_addresses,
         group_offsets,
+        root_uav_extents,
     })
 }
 
@@ -387,6 +424,15 @@ mod tests {
             group_offsets: vec![GroupOffset {
                 index: 10,
                 component: 2,
+            }],
+            root_uav_extents: vec![RootUavExtent {
+                slot: 4,
+                end: Affine {
+                    c: 16,
+                    g: [64, 0, 3],
+                    u: [(9, 4), (0, 0), (0, 0), (0, 0)],
+                },
+                peak: Affine::constant(12),
             }],
         }
     }

@@ -69,6 +69,9 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// Root UAV slots of emitted shaders: bounded by a constant, by the
+    /// dispatch size, and unbounded.
+    root_uavs: [usize; 3],
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -130,6 +133,9 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        for (a, b) in self.root_uavs.iter_mut().zip(other.root_uavs) {
+            *a += b;
+        }
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -272,6 +278,10 @@ pub fn run(
     println!(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
+    );
+    println!(
+        "root UAVs    {} slots bounded by a constant, {} by the dispatch size or user data, {} unbounded",
+        t.root_uavs[0], t.root_uavs[1], t.root_uavs[2]
     );
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
@@ -962,6 +972,18 @@ fn check(
 ) {
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
+    }
+    for slot in &shader.root_uavs {
+        let k = match shader.root_uav_extents.iter().find(|e| e.slot == *slot) {
+            Some(e) if e.end.is_constant() && e.peak.is_constant() => 0,
+            Some(_) => 1,
+            None => 2,
+        };
+        t.root_uavs[k] += 1;
+        if t.list {
+            let e = shader.root_uav_extents.iter().find(|e| e.slot == *slot);
+            t.lines.push(format!("{}  root UAV {slot}: {e:?}", label()));
+        }
     }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list

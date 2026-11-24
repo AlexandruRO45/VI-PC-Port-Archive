@@ -152,6 +152,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         descriptor_bindings: lowered.descriptor_bindings,
         buffer_addresses: lowered.buffer_addresses,
         group_offsets: lowered.group_offsets,
+        root_uav_extents: lowered.root_uav_extents,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

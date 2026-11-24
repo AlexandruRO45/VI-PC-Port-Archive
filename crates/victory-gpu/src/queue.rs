@@ -301,6 +301,25 @@ extern "system" fn present(
             "frame presented (since the last line: draws and dispatches, and those run on the host)"
         );
         #[cfg(windows)]
+        {
+            static LAST: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+            let now = crate::draw::root_uav_counts();
+            let d: Vec<u64> = now
+                .iter()
+                .zip(&LAST)
+                .map(|(&n, last)| n - last.swap(n, Ordering::Relaxed))
+                .collect();
+            if d[0] + d[1] > 0 {
+                tracing::info!(
+                    bounded = d[0],
+                    unbounded = d[1],
+                    bounded_bytes = d[2],
+                    unbounded_bytes = d[3],
+                    "root UAVs since the last line: bound by the shader's extent, or to the end of their copy"
+                );
+            }
+        }
+        #[cfg(windows)]
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");

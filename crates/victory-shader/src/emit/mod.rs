@@ -80,6 +80,7 @@ mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
+mod extent;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
@@ -92,6 +93,8 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
+
+pub use extent::{Affine, USER_TERMS};
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -182,6 +185,34 @@ pub struct HostShader {
     /// (D3D12 caps a dimension at 65535 groups). The shader adds each to its
     /// workgroup id; the host writes 0 unless it splits the dispatch.
     pub group_offsets: Vec<GroupOffset>,
+    /// How far the shader reaches past the address of each root UAV (see
+    /// [`RootUavExtent`]); a root UAV missing here may reach anywhere.
+    pub root_uav_extents: Vec<RootUavExtent>,
+}
+
+/// The bytes past its root address a shader can read or write through a
+/// root UAV: at most `end` evaluated for the dispatch's group counts and
+/// user data, as long as `peak` (every intermediate offset) stays below 2^32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootUavExtent {
+    pub slot: u8,
+    pub end: Affine,
+    pub peak: Affine,
+}
+
+impl RootUavExtent {
+    /// Its length for a dispatch of `groups` (`None` for a draw or an
+    /// indirect dispatch) with user-data dwords `user` (by
+    /// [`UserData::index`]): `None` if that cannot be bounded.
+    pub fn len(
+        &self,
+        groups: Option<[u32; 3]>,
+        user: impl Fn(u8) -> Option<u32> + Copy,
+    ) -> Option<u64> {
+        let peak = self.peak.eval(groups, user)?;
+        (peak <= u64::from(u32::MAX)).then_some(())?;
+        self.end.eval(groups, user)
+    }
 }
 
 /// One dword of user data added to a workgroup id component.
@@ -365,6 +396,7 @@ pub fn emit(
         descriptor_bindings: l.descriptor_bindings,
         buffer_addresses: l.buffer_addresses,
         group_offsets: l.group_offsets,
+        root_uav_extents: l.root_uav_extents,
     })
 }
 
@@ -763,6 +795,7 @@ mod tests {
             descriptor_bindings: Vec::new(),
             buffer_addresses: Vec::new(),
             group_offsets: Vec::new(),
+            root_uav_extents: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -777,6 +810,7 @@ mod tests {
                 descriptor_bindings: Vec::new(),
                 buffer_addresses: Vec::new(),
                 group_offsets: Vec::new(),
+                root_uav_extents: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

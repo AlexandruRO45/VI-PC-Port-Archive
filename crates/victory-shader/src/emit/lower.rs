@@ -51,6 +51,7 @@ pub(crate) struct Lowered {
     pub descriptor_bindings: Vec<DescriptorBinding>,
     pub buffer_addresses: Vec<BufferAddress>,
     pub group_offsets: Vec<GroupOffset>,
+    pub root_uav_extents: Vec<super::RootUavExtent>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -193,6 +194,9 @@ struct Lower<'a> {
     user_reads: BTreeMap<u32, UserData>,
     buffer_addresses: Vec<BufferAddress>,
     group_offsets: Vec<GroupOffset>,
+    /// Values that are a whole dispatch's group id component (a split
+    /// dispatch's offset added), for [`super::extent`].
+    group_ids: Vec<(V, u8)>,
     scalar_uses: Option<HashMap<Value, Vec<ScalarUse>>>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
@@ -501,6 +505,7 @@ impl<'a> Lower<'a> {
             user_reads: BTreeMap::new(),
             buffer_addresses: Vec::new(),
             group_offsets: Vec::new(),
+            group_ids: Vec::new(),
             scalar_uses: None,
             samplers: Vec::new(),
             descriptors: x
@@ -1062,6 +1067,16 @@ impl<'a> Lower<'a> {
             .collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        let root_uav_extents = super::extent::root_uav_extents(
+            &self.s.m,
+            &self.s.root_uavs,
+            &super::extent::Ids {
+                threads: self.s.threads,
+                wave: self.s.wave_size.unwrap_or(128),
+                group_ids: &self.group_ids,
+                user_data: self.user_data,
+            },
+        );
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -1070,6 +1085,7 @@ impl<'a> Lower<'a> {
             descriptor_bindings: self.descriptor_bindings.into_iter().collect(),
             buffer_addresses: self.buffer_addresses,
             group_offsets: self.group_offsets,
+            root_uav_extents,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -1148,13 +1164,16 @@ impl<'a> Lower<'a> {
                     unreachable!()
                 };
                 // A split dispatch (see `GroupOffset`) adds its offset.
-                return match self.group_offset_word(c) {
+                let id = match self.group_offset_word(c) {
                     Some(offset) => {
                         let entry = self.s.entry;
-                        Val::I32(self.s.m.bin(entry, Bin::Add, id, offset))
+                        let sum = self.s.m.bin(entry, Bin::Add, id, offset);
+                        self.group_ids.push((sum, c));
+                        sum
                     }
-                    None => Val::I32(id),
+                    None => id,
                 };
+                return Val::I32(id);
             }
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {

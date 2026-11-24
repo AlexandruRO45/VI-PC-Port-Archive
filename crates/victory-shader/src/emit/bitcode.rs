@@ -148,6 +148,24 @@ enum Op {
     CmpXchg(V, V, V),
 }
 
+/// What defines a value, as [`Module::def`] shows it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Def<'a> {
+    /// An integer constant, zero-extended from its width.
+    Int(u64),
+    Bin(Bin, V, V),
+    /// The cast and its operand, and the result's width (0 if not an integer).
+    Cast(Cast, V, u32),
+    Cmp(u8, V, V),
+    Select(V, V, V),
+    Extract(V, u32),
+    /// The function's name and the arguments (a `dx.op`'s opcode first).
+    Call(&'a str, &'a [V]),
+    Phi(&'a [(V, usize)]),
+    /// Anything else (memory, undef, float constants, globals).
+    Other,
+}
+
 #[derive(Debug, Clone)]
 struct Inst {
     ty: Ty,
@@ -493,6 +511,59 @@ impl Module {
     }
     pub fn named_md(&mut self, name: &str, nodes: Vec<Md>) {
         self.named.push((name.into(), nodes));
+    }
+
+    /// The width of an integer type, `None` for other types.
+    pub fn int_bits(&self, ty: Ty) -> Option<u32> {
+        match self.types[ty.0 as usize] {
+            TypeDef::Int(bits) => Some(bits),
+            _ => None,
+        }
+    }
+
+    /// What defines `v`, for analyses of the built function.
+    pub fn def(&self, v: V) -> Def<'_> {
+        match v {
+            V::Const(i) => match self.consts[i as usize] {
+                (ty, Const::Int(x)) => {
+                    let bits = self.int_bits(ty).unwrap_or(64);
+                    let mask = if bits >= 64 {
+                        u64::MAX
+                    } else {
+                        (1 << bits) - 1
+                    };
+                    Def::Int(x as u64 & mask)
+                }
+                _ => Def::Other,
+            },
+            V::Inst(i) => {
+                let inst = &self.insts[i as usize];
+                match &inst.op {
+                    &Op::Bin(op, a, b) => Def::Bin(op, a, b),
+                    &Op::Cast(op, a) => Def::Cast(op, a, self.int_bits(inst.ty).unwrap_or(0)),
+                    &Op::Cmp(p, a, b) => Def::Cmp(p, a, b),
+                    &Op::Select(c, t, f) => Def::Select(c, t, f),
+                    &Op::Extract(a, k) => Def::Extract(a, k),
+                    Op::Call(f, args) => Def::Call(&self.funcs[*f as usize].name, args),
+                    Op::Phi(incoming) => Def::Phi(incoming),
+                    _ => Def::Other,
+                }
+            }
+            V::Global(_) | V::Func(_) => Def::Other,
+        }
+    }
+
+    /// Every instruction placed in a block (phis included), with the values
+    /// it reads.
+    pub fn each_inst(&self, mut f: impl FnMut(V, &[V])) {
+        let mut reads = Vec::new();
+        for b in &self.blocks {
+            for &i in b.phis.iter().chain(&b.body) {
+                reads.clear();
+                for_each_operand(&self.insts[i as usize].op, |v| reads.push(v));
+                f(V::Inst(i), &reads);
+            }
+        }
     }
 
     /// The module as bitcode.
