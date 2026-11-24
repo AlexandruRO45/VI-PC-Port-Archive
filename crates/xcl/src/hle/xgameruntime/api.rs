@@ -58,6 +58,8 @@ const fn g(v: u128) -> Guid {
     Guid::from_u128(v)
 }
 
+const IID_IUNKNOWN: Guid = g(0x00000000_0000_0000_c000_000000000046);
+
 pub const XUSER: Guid = g(0x01acd177_91f9_4763_a38e_ccbb55ce32e0);
 /// interface of XUserGetGamertag (with a gamertag component): its own vtable
 #[cfg_attr(not(test), allow(dead_code))]
@@ -364,15 +366,17 @@ unsafe impl Send for Obj {}
 const SLOTS: usize = 96;
 
 unsafe extern "system" fn query_interface(this: *const Obj, iid: *const Guid, out: *mut *mut c_void) -> HRESULT {
+    if !out.is_null() {
+        *out = std::ptr::null_mut();
+    }
     if out.is_null() || iid.is_null() {
         return E_INVALIDARG;
     }
     let f = &(*this).iface;
-    if *iid == f.clsid || f.iids.contains(&*iid) || (f.main && own(&f.clsid, &*iid).is_some_and(|o| std::ptr::eq(o, this))) {
+    if *iid == IID_IUNKNOWN || *iid == f.clsid || f.iids.contains(&*iid) || (f.main && own(&f.clsid, &*iid).is_some_and(|o| std::ptr::eq(o, this))) {
         *out = this as *mut c_void;
         return S_OK;
     }
-    *out = std::ptr::null_mut();
     // a title asserting on this (a newer interface version of the class?) ends without a trace otherwise
     crate::xlog_warn!("XGameRuntime: {} QueryInterface({}) refused (E_NOINTERFACE) – an interface version XCL's GDK table does not know?", f.name, *iid);
     E_NOINTERFACE
@@ -2052,6 +2056,48 @@ mod tests {
             let (hr, queried) = query(XACCESSIBILITY, iid);
             assert_eq!(hr, S_OK);
             assert!(!queried.is_null());
+        }
+    }
+
+    #[test]
+    fn query_interface_accepts_iunknown() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let unknown_iid = g(0xdeadbeef_1234_5678_9abc_def012345678);
+            let check_iunknown = |obj: *mut c_void, expect_reject_unknown: bool| {
+                let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> HRESULT = slot(obj, 0);
+
+                let mut unk = std::ptr::null_mut();
+                assert_eq!(qi(obj, &IID_IUNKNOWN, &mut unk), S_OK);
+                assert_eq!(unk, obj);
+
+                if expect_reject_unknown {
+                    let mut bogus = obj;
+                    assert_eq!(qi(obj, &unknown_iid, &mut bogus), E_NOINTERFACE);
+                    assert!(bogus.is_null());
+                }
+
+                let mut cleared = obj;
+                assert_eq!(qi(obj, std::ptr::null(), &mut cleared), E_INVALIDARG);
+                assert!(cleared.is_null());
+            };
+
+            // Non-main interface objects (and built-in fallback objects) previously rejected
+            // IID_IUnknown with E_NOINTERFACE while also rejecting unknown IIDs.
+            for (clsid, iid) in [(XUSER, XUSER_GAMERTAG_IID), (XPACKAGE, XPACKAGE_V1_IID), (XSYSTEM, XSYSTEM_V3_IID)] {
+                let obj = own(&clsid, &iid).expect("non-main XCL object") as *const Obj as *mut c_void;
+                check_iunknown(obj, true);
+            }
+            check_iunknown(xcl_xasync_object() as *const Obj as *mut c_void, true);
+            check_iunknown(xcl_xaccessibility_object() as *const Obj as *mut c_void, true);
+
+            // Main interface objects also accept IID_IUnknown cleanly.
+            for (clsid, iid) in [(XUSER, XUSER), (XSYSTEM, XSYSTEM), (XNETWORKING, XNETWORKING)] {
+                let (hr, obj) = query(clsid, iid);
+                assert_eq!(hr, S_OK);
+                assert!(!obj.is_null());
+                check_iunknown(obj, false);
+            }
         }
     }
 }
