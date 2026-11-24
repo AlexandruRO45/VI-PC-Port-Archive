@@ -3909,6 +3909,103 @@ mod tests {
     }
 
     #[test]
+    fn reads_name_a_parameter_by_its_first_sgpr_and_root_descriptors_stay_apart() {
+        let (srv, cbv, uav) = (0u8, 2u8, 3u8);
+        let (descriptor, table) = (1u8, 3u8);
+        // A table in s4 (slot 2), a root descriptor in s6-s7 (slot 3) and a
+        // root descriptor stating four SGPRs in s10-s13 (slot 5).
+        let params = [(3, 1, 4, 2), (1, 2, 6, 3), (1, 4, 10, 5)];
+        assert!(reading_with(&params, &[(srv, descriptor, 0, 6, 3)]).is_ok());
+        assert!(reading_with(&params, &[(srv, descriptor, 0, 10, 5)]).is_ok());
+        // A read is matched to its parameter's first SGPR alone: the SGPRs
+        // after it (a root descriptor's high half, or the rest of a wider
+        // count) hold no parameter a read can name, nor does a parameter's
+        // first SGPR stated with another's slot.
+        for (read, refusal) in [
+            (
+                (srv, descriptor, 0, 7, 3),
+                "used descriptor names no root descriptor",
+            ),
+            (
+                (srv, descriptor, 0, 12, 5),
+                "used descriptor names no root descriptor",
+            ),
+            (
+                (srv, descriptor, 0, 13, 5),
+                "used descriptor names no root descriptor",
+            ),
+            (
+                (srv, descriptor, 0, 10, 3),
+                "used descriptor names no root descriptor",
+            ),
+            (
+                (srv, descriptor, 0, 6, 5),
+                "used descriptor names no root descriptor",
+            ),
+            ((srv, table, 0, 7, 3), "used descriptor names no root table"),
+            // A root descriptor's own SGPR and slot are no table either.
+            ((srv, table, 0, 6, 3), "used descriptor names no root table"),
+            // Nor is a table's a root descriptor.
+            (
+                (cbv, descriptor, 0, 4, 2),
+                "used descriptor names no root descriptor",
+            ),
+        ] {
+            assert_eq!(
+                why_refused(reading_with(&params, &[read])),
+                refusal,
+                "{read:?}"
+            );
+        }
+        // Each root descriptor is one view of its own: two may be read as
+        // different kinds, and one read twice as one kind at any stated
+        // offset is still that view.
+        assert!(
+            reading_with(
+                &params,
+                &[(cbv, descriptor, 0, 6, 3), (uav, descriptor, 0, 10, 5)]
+            )
+            .is_ok()
+        );
+        assert!(
+            reading_with(
+                &params,
+                &[(srv, descriptor, 0, 6, 3), (srv, descriptor, 4, 6, 3)]
+            )
+            .is_ok()
+        );
+        // One of them read two ways is refused even with the other read
+        // between, and with the second read at another stated offset.
+        assert_eq!(
+            why_refused(reading_with(
+                &params,
+                &[
+                    (srv, descriptor, 0, 6, 3),
+                    (uav, descriptor, 0, 10, 5),
+                    (cbv, descriptor, 8, 6, 3),
+                ]
+            )),
+            "used descriptors read one descriptor two ways"
+        );
+        // The parsed reads keep each root descriptor's SGPR and slot.
+        let p = &reading_with(
+            &params,
+            &[(cbv, descriptor, 0, 6, 3), (uav, descriptor, 0, 10, 5)],
+        )
+        .unwrap()[0];
+        assert_eq!(
+            p.used
+                .iter()
+                .map(|u| (u.kind, u.root, u.user_data, u.slot))
+                .collect::<Vec<_>>(),
+            [
+                (ResourceType::Cbv, RootType::Descriptor, 6, 3),
+                (ResourceType::Uav, RootType::Descriptor, 10, 5),
+            ]
+        );
+    }
+
+    #[test]
     fn refuses_a_table_mixing_samplers_and_views() {
         let (srv, sampler, cbv) = (0u8, 1u8, 2u8);
         let table = 3u8;
