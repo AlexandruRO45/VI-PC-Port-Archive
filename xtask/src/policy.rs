@@ -636,6 +636,27 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     if content.contains(&0) {
         problems.push("binary content (NUL bytes)".to_owned());
     } else {
+        // Binary data need not hold a NUL: byte stuffing such as COBS
+        // removes every one, and what is left passed as text, since bytes
+        // over 0x7F break every run below. Text is UTF-8 here, without
+        // control characters other than tab, line breaks and form feed.
+        match std::str::from_utf8(content) {
+            Err(e) => problems.push(format!(
+                "not UTF-8 text (binary content?): invalid byte at offset {}",
+                e.valid_up_to()
+            )),
+            Ok(text) => {
+                if let Some((at, c)) = text
+                    .char_indices()
+                    .find(|&(_, c)| c.is_control() && !matches!(c, '\t' | '\n' | '\r' | '\x0c'))
+                {
+                    problems.push(format!(
+                        "control character U+{:04X} at offset {at} (binary content?)",
+                        c as u32
+                    ));
+                }
+            }
+        }
         let run = longest_encoded_run(content);
         if run > MAX_ENCODED_RUN {
             problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
@@ -643,7 +664,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
             let run = longest_printable_run(content);
             if run > MAX_ENCODED_RUN {
                 problems.push(format!(
-                    "{run}-character run without whitespace (ascii85, Z85 or uuencoded data?)"
+                    "{run}-character run without whitespace (ascii85, Z85, uuencoded or base65536 data?)"
                 ));
             }
         }
@@ -703,7 +724,8 @@ fn longest_run(content: &[u8], extra: &[u8]) -> usize {
 /// Shortest line after which a line break continues a printable run.
 const MIN_WRAPPED_LINE: usize = 40;
 
-/// Longest run of printable ASCII without whitespace (`!` to `~`).
+/// Longest run of characters that are neither whitespace nor control
+/// characters, counted in characters.
 ///
 /// ascii85 (`!` to `u`: Python's `a85encode`, PostScript, PDF), Z85
 /// (`basenc --z85`, ZeroMQ) and uuencode (`` ` `` to `_`) put punctuation in
@@ -711,15 +733,21 @@ const MIN_WRAPPED_LINE: usize = 40;
 /// base64 run and a file of it passed. Text has whitespace far more often:
 /// the longest such run in the tree is a few dozen characters.
 ///
+/// Characters beyond ASCII count as well: base32768 and base65536 carry 15
+/// or 16 bits in each CJK or other letter they write, with no whitespace,
+/// and passed as text that no ASCII run saw at all.
+///
 /// A single line break continues the run as for base64, but only after a
 /// line of at least `MIN_WRAPPED_LINE` characters: encoders wrap at 60 to 80
 /// columns (`basenc` 76, `uuencode` 61), while a list of short entries
 /// without spaces, such as `.gitignore` patterns, is not one long run.
 fn longest_printable_run(content: &[u8]) -> usize {
-    let is_payload = |b: &u8| b.is_ascii_graphic();
+    let text = String::from_utf8_lossy(content);
+    let content: Vec<char> = text.chars().collect();
+    let is_payload = |c: &char| !c.is_whitespace() && !c.is_control();
     let (mut longest, mut run, mut line, mut i) = (0, 0, 0, 0);
-    while let Some(b) = content.get(i) {
-        if is_payload(b) {
+    while let Some(c) = content.get(i) {
+        if is_payload(c) {
             run += 1;
             line += 1;
             longest = longest.max(run);
@@ -727,8 +755,8 @@ fn longest_printable_run(content: &[u8]) -> usize {
             continue;
         }
         let line_break = match &content[i..] {
-            [b'\r', b'\n', ..] => 2,
-            [b'\n', ..] => 1,
+            ['\r', '\n', ..] => 2,
+            ['\n', ..] => 1,
             _ => 0,
         };
         if line_break > 0
@@ -1914,6 +1942,82 @@ mod tests {
         assert!(check(".gitignore", gitignore.as_bytes()).is_empty());
         let url = format!("<https://example.com/{}?a=1&b=2>\n", "p/".repeat(150));
         assert!(check("README.md", url.as_bytes()).is_empty());
+    }
+
+    /// Binary data with every NUL removed, by COBS byte stuffing here, is
+    /// still binary: it is not UTF-8, or holds control characters.
+    #[test]
+    fn rejects_binary_without_nul_bytes() {
+        fn cobs(data: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            for block in data.split(|&b| b == 0) {
+                for chunk in block.chunks(254) {
+                    out.push(chunk.len() as u8 + 1);
+                    out.extend_from_slice(chunk);
+                }
+                if block.is_empty() {
+                    out.push(1);
+                }
+            }
+            out
+        }
+        let mut state = 0x9e37_79b9u32;
+        let bytes: Vec<u8> = (0..4096)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 24) as u8
+            })
+            .collect();
+        let stuffed = cobs(&bytes);
+        assert!(!stuffed.contains(&0));
+        assert!(super::longest_encoded_run(&stuffed) <= MAX_ENCODED_RUN);
+        assert!(super::longest_printable_run(&stuffed) <= MAX_ENCODED_RUN);
+        let problems = check("strings.txt", &stuffed);
+        assert!(
+            problems.iter().any(|p| p.contains("not UTF-8")),
+            "{problems:?}"
+        );
+        // Bytes under 0x80 only (7-bit stuffing) are UTF-8, but not text.
+        let seven: Vec<u8> = stuffed.iter().map(|b| (b & 0x7f).max(1)).collect();
+        let problems = check("strings.txt", &seven);
+        assert!(
+            problems.iter().any(|p| p.contains("control character")),
+            "{problems:?}"
+        );
+        for ok in [&b"a\tb\r\n\x0cc\n"[..], "naïve café — → ✓\n".as_bytes()] {
+            assert!(check("README.md", ok).is_empty(), "{ok:?}");
+        }
+    }
+
+    /// base32768 and base65536 write 15 or 16 bits per letter, CJK and the
+    /// like, without whitespace: a run of them is a printable run too.
+    #[test]
+    fn rejects_base65536_like_data() {
+        let encoded: String = (0..3000u32)
+            .map(|i| char::from_u32(0x4e00 + (i * 7919) % 0x5000).unwrap())
+            .collect();
+        assert_eq!(super::longest_encoded_run(encoded.as_bytes()), 0);
+        for blob in [
+            format!("const DATA: &str = \"{encoded}\";\n"),
+            encoded
+                .chars()
+                .collect::<Vec<_>>()
+                .chunks(64)
+                .map(|line| line.iter().collect::<String>() + "\n")
+                .collect(),
+        ] {
+            assert!(
+                check("src/data.rs", blob.as_bytes())
+                    .iter()
+                    .any(|p| p.contains("without whitespace")),
+                "{blob:.80}"
+            );
+        }
+        // Prose in any script, with its spaces and line breaks, passes.
+        let prose = "日本語の文章。短い行です。\n".repeat(200);
+        assert!(check("docs/notes.md", prose.as_bytes()).is_empty());
     }
 
     /// `xxd -i` output, a Rust byte array and a byte-escape string: every

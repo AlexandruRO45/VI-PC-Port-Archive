@@ -45,10 +45,12 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
 1. `.gitignore` keeps common data types out of `git status`.
 2. `cargo xtask policy` (run by the pre-commit hook; install with
    `cargo xtask install-hooks`) is an allowlist: files must have an allowed
-   type, be under 512 KiB, contain no binary data or known binary
-   signatures, and hold no long hex/base64 runs, base64url (`-`, `_`) included (a run
+   type, be under 512 KiB, be UTF-8 text without control characters
+   (so binary data with its NUL bytes stuffed away is still refused),
+   contain no known binary signatures, and hold no long hex/base64 runs, base64url (`-`, `_`) included (a run
    wrapped onto several lines, as `base64` writes it, is one run), no long
-   runs without whitespace (ascii85, Z85, uuencode), and no long
+   runs without whitespace (ascii85, Z85, uuencode, and base32768 or
+   base65536 in any script), and no long
    numeric arrays or `\xHH` escape strings (`xxd -i` output; tables over 512
    entries are split into rows). File names must
    be UTF-8, and submodules, like untracked git repositories nested in the
