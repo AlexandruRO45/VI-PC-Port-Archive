@@ -394,6 +394,52 @@ fn plan_ring_chunk(ring_write: u64, want: usize, cap: usize) -> (u64, usize) {
     (aligned, chunk)
 }
 
+#[inline]
+unsafe fn wait_for_fence(fence: &ID3D12Fence, event: windows::Win32::Foundation::HANDLE, target: u64) -> bool {
+    if target == 0 || fence.GetCompletedValue() >= target {
+        return true;
+    }
+    let _ = fence.SetEventOnCompletion(target, event);
+    windows::Win32::System::Threading::WaitForSingleObject(event, 5000);
+    if fence.GetCompletedValue() < target {
+        crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", fence.GetCompletedValue());
+        return false;
+    }
+    true
+}
+
+/// Wait for enough ring space so `need_end - *ring_free <= capacity`.
+/// Returns `false` if waiting for the oldest in-flight fence times out without reclaiming space,
+/// avoiding an infinite stall while holding the global `STATE` mutex.
+fn wait_for_ring_space(
+    inflight: &mut std::collections::VecDeque<(u64, u64)>,
+    ring_free: &mut u64,
+    need_end: u64,
+    capacity: u64,
+    mut wait_completed: impl FnMut(u64) -> Option<u64>,
+) -> bool {
+    while need_end.saturating_sub(*ring_free) > capacity {
+        let Some(&(fv, _)) = inflight.front() else { break };
+        let Some(completed) = wait_completed(fv) else {
+            return false;
+        };
+        let mut progressed = false;
+        while let Some(&(f, end_pos)) = inflight.front() {
+            if f <= completed {
+                *ring_free = end_pos;
+                inflight.pop_front();
+                progressed = true;
+            } else {
+                break;
+            }
+        }
+        if !progressed {
+            return false;
+        }
+    }
+    true
+}
+
 // D3D12 objects are free-threaded; staging pointers and event handle are only used under STATE lock
 unsafe impl Send for State {}
 
@@ -817,15 +863,8 @@ impl State {
     }
 
     #[inline]
-    unsafe fn wait_for(&self, target: u64) {
-        if target == 0 || self.fence.GetCompletedValue() >= target {
-            return;
-        }
-        let _ = self.fence.SetEventOnCompletion(target, self.event);
-        windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-        if self.fence.GetCompletedValue() < target {
-            crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
-        }
+    unsafe fn wait_for(&self, target: u64) -> bool {
+        wait_for_fence(&self.fence, self.event, target)
     }
 
     #[inline]
@@ -1152,10 +1191,16 @@ impl State {
                             self.submit_slot(slot_idx);
                             self.reclaim_ring();
                         }
-                        while (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
-                            let Some(&(fv, _)) = self.inflight.front() else { break };
-                            self.wait_for(fv);
-                            self.reclaim_ring();
+                        let fence = &self.fence;
+                        let event = self.event;
+                        if !wait_for_ring_space(
+                            &mut self.inflight,
+                            &mut self.ring_free,
+                            aligned + chunk as u64,
+                            STAGING as u64,
+                            |fv| wait_for_fence(fence, event, fv).then(|| fence.GetCompletedValue()),
+                        ) {
+                            return;
                         }
                     }
                 }
@@ -2231,5 +2276,31 @@ mod tests {
             let decommit = t.elapsed();
             println!("early: {n} pages: commit {:.1} ms, decommit {:.1} ms", commit.as_secs_f64() * 1e3, decommit.as_secs_f64() * 1e3);
         }
+    }
+
+    #[test]
+    fn wait_for_ring_space_bails_on_timeout_and_reclaims_on_progress() {
+        let mut inflight = std::collections::VecDeque::from([(10u64, 512u64), (20u64, 1024u64)]);
+        let mut ring_free = 0u64;
+        let mut waits = 0usize;
+        // Simulated timeout (None): must bail after one wait rather than spinning forever.
+        let ok = wait_for_ring_space(&mut inflight, &mut ring_free, 1200, 1024, |fv| {
+            assert_eq!(fv, 10);
+            waits += 1;
+            None
+        });
+        assert!(!ok);
+        assert_eq!(waits, 1);
+        assert_eq!(ring_free, 0);
+        assert_eq!(inflight.len(), 2);
+
+        // Simulated fence reaching 10: reclaims first entry (512), enough for 1200 - 512 <= 1024.
+        let ok2 = wait_for_ring_space(&mut inflight, &mut ring_free, 1200, 1024, |fv| {
+            assert_eq!(fv, 10);
+            Some(10)
+        });
+        assert!(ok2);
+        assert_eq!(ring_free, 512);
+        assert_eq!(inflight.len(), 1);
     }
 }
