@@ -1150,6 +1150,9 @@ mod host {
             if super::auto_a() {
                 pad.buttons |= super::A;
             }
+            if super::auto_down() {
+                pad.buttons |= super::DOWN;
+            }
             Some(pad)
         }
 
@@ -1160,6 +1163,9 @@ mod host {
             let mut down = Vec::new();
             if super::auto_a() && !down.contains(&0x0D) {
                 down.push(0x0D);
+            }
+            if super::auto_down() && !down.contains(&0x28) {
+                down.push(0x28);
             }
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
@@ -1647,4 +1653,18 @@ fn auto_a() -> bool {
     }
     let ms = start.elapsed().as_millis();
     ms > 3000 && ms % 2000 < 300
+}
+
+/// Local build: with `VICTORY_AUTO_A=2`, D-pad down for 0.3 s between every other A (each 4 s:
+/// A, down, A), so a menu whose first item does not advance (the legal notices: "Copyright",
+/// "Photosensitivity", then "Next") is walked down to its button.
+fn auto_down() -> bool {
+    use std::sync::LazyLock;
+    use std::time::Instant;
+    static START: LazyLock<Option<Instant>> = LazyLock::new(|| {
+        std::env::var("VICTORY_AUTO_A").is_ok_and(|v| v.trim() == "2").then(Instant::now)
+    });
+    let Some(start) = *START else { return false };
+    let ms = start.elapsed().as_millis();
+    ms > 3000 && (1000..1300).contains(&(ms % 4000))
 }
