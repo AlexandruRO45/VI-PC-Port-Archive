@@ -575,26 +575,23 @@ impl Host {
             ));
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
-        // which tell the title the GPU is done; each range once per
-        // submission, however many dispatches declared it (the world's
-        // passes declare the same big ranges dozens of times).
+        // which tell the title the GPU is done; each buffer copy once per
+        // submission, with its declared ranges merged (the world's passes
+        // declare overlapping views of the same big heap dozens of times).
         let copying = std::time::Instant::now();
         // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        let mut back: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
+                if let Step::GpuWrite(shadow, _, _) = step
+                    && !back.iter().any(|s| std::sync::Arc::ptr_eq(s, shadow))
                 {
-                    back.push((shadow.clone(), *address, *len));
+                    back.push(shadow.clone());
                 }
             }
         }
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
+        for shadow in back {
+            let written = shadow.copy_back_all();
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1444,7 +1441,7 @@ impl Host {
 fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
         27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
-        87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        87 | 90 | 91 => DXGI_FORMAT_B8G8B8A8_UNORM,
         23..=25 => DXGI_FORMAT_R10G10B10A2_UNORM,
         9..=14 => DXGI_FORMAT_R16G16B16A16_FLOAT,
         _ => return None,
