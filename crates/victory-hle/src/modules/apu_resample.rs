@@ -60,6 +60,11 @@ impl Resampler {
             return 0;
         }
         let target = clamp(target);
+        // A zero ramp means the target applies at once, not that the current
+        // pitch is kept. `step` only handles a gradual change.
+        if ramp <= 0.0 || !ramp.is_finite() {
+            self.pitch = target;
+        }
         self.pending.extend_from_slice(input);
         let frames = output.len() / channels;
         let mut written = 0;
@@ -195,6 +200,17 @@ mod tests {
             2
         );
         assert_eq!(output[..2], [0.0, 1.0]);
+    }
+
+    #[test]
+    fn a_zero_ramp_applies_the_target_immediately() {
+        let mut resampler = Resampler::new(1, 1.0);
+        let input: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let mut output = vec![0.0; 16];
+        let written = resampler.convert(&input, &mut output, 2.0, 0.0, false);
+        assert_eq!(written, 8, "twice the pitch consumes twice the input per frame");
+        assert_eq!(resampler.pitch(), 2.0);
+        assert_eq!(output[..8], [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0]);
     }
 
     #[test]
