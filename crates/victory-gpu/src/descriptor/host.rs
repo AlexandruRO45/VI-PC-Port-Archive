@@ -213,6 +213,22 @@ impl HostHeap {
     }
 }
 
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        {
+            let retained = self
+                .kept
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|slot| slot.is_some())
+                .count();
+            KEPT_SLOTS.fetch_sub(retained, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// A plain point sampler at `at`.
 fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
