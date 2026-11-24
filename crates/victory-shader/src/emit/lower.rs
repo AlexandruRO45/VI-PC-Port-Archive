@@ -3471,6 +3471,29 @@ impl<'a> Lower<'a> {
         if let Some(op) = name.strip_prefix("v_pk_") {
             return self.packed16(inst, op, guard);
         }
+        if name == "v_swap_b32" {
+            if v.abs != 0
+                || v.neg != 0
+                || v.dpp.is_some()
+                || v.sdwa.is_some()
+                || v.clamp
+                || v.omod != 0
+            {
+                return Err("v_swap_b32 has unsupported modifiers");
+            }
+            let Some(Operand::Vector { reg: dst, .. }) = v.dst else {
+                return Err("a v_swap_b32 destination outside a VGPR");
+            };
+            let Some(Operand::Vector { reg: src, .. }) = v.src.first() else {
+                return Err("a v_swap_b32 source outside a VGPR");
+            };
+            let (dst, src) = (Reg::V(dst), Reg::V(*src));
+            let old_dst = self.i32_of(inst.read(dst).ok_or("a v_swap_b32 destination")?)?;
+            let old_src = self.src(inst, 0)?;
+            self.write(inst, dst, old_src, guard);
+            self.write(inst, src, old_dst, guard);
+            return Ok(());
+        }
         match name {
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
@@ -4534,19 +4557,25 @@ impl<'a> Lower<'a> {
             l.s.m.bin(c, Bin::And, x, k31)
         };
         Ok(match name {
-            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
-            | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
+            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_xnor_b32" | "v_add_nc_u32"
+            | "v_sub_nc_u32" | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let (op, a, b) = match name {
                     "v_and_b32" => (Bin::And, a, b),
                     "v_or_b32" => (Bin::Or, a, b),
-                    "v_xor_b32" => (Bin::Xor, a, b),
+                    "v_xor_b32" | "v_xnor_b32" => (Bin::Xor, a, b),
                     "v_add_nc_u32" => (Bin::Add, a, b),
                     "v_sub_nc_u32" => (Bin::Sub, a, b),
                     "v_subrev_nc_u32" => (Bin::Sub, b, a),
                     _ => (Bin::Mul, a, b),
                 };
-                self.s.m.bin(c, op, a, b)
+                let r = self.s.m.bin(c, op, a, b);
+                if name == "v_xnor_b32" {
+                    let ones = k(self, u32::MAX);
+                    self.s.m.bin(c, Bin::Xor, r, ones)
+                } else {
+                    r
+                }
             }
             "v_not_b32" => {
                 let a = s(self, 0)?;
