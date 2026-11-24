@@ -983,25 +983,26 @@ impl<'a> Lower<'a> {
             .map(|r| r + 1)
             .max()
             .unwrap_or(0);
+        // D3D12 links stages through 32 registers. A signature that already
+        // uses r31 leaves no row for an id lowering adds, and one at r32 got
+        // the pipeline refused.
+        let fits = free < super::SIGNATURE_REGISTERS;
         let id = match self.s.inputs.iter().position(|e| e.kind == kind) {
             Some(id) => {
-                if kind != 3 {
-                    self.s.inputs[id].row.get_or_insert(free);
+                if kind != 3 && self.s.inputs[id].row.is_none() {
+                    if !fits {
+                        return Val::Missing("a system input past the 32 input registers");
+                    }
+                    self.s.inputs[id].row = Some(free);
                 }
                 id
             }
             None if kind >= 3 => return Val::Missing("a pixel system input the signature lacks"),
+            None if !fits => return Val::Missing("a system input past the 32 input registers"),
             None => {
                 // The console signature leaves out vertex and instance ids; PC
                 // gives them a row after the others.
-                let row = self
-                    .s
-                    .inputs
-                    .iter()
-                    .filter_map(|e| e.row)
-                    .map(|r| r + 1)
-                    .max()
-                    .unwrap_or(0);
+                let row = free;
                 self.s.inputs.push(SigElement {
                     name: ["", "SV_VertexID", "SV_InstanceID"][kind as usize].into(),
                     index: 0,

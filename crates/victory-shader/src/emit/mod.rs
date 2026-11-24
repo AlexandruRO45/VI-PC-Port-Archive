@@ -1073,4 +1073,78 @@ mod tests {
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
+
+    /// A vertex shader reading its vertex id. The console signature leaves
+    /// the id out, so lowering gives it the row after the last one the
+    /// signature uses. After r31 that row is r32, past the 32 registers
+    /// D3D12 links stages through, and the pipeline was refused.
+    #[test]
+    fn a_vertex_id_after_r31_is_refused() {
+        // exp pos0 v0, v0, v0, v0 done; s_endpgm
+        let words = [0xF800_08CFu32, 0x0000_0000, 0xBF81_0000];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Vs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Vs {
+                inputs: vec![],
+                outputs: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let emit_with = |register: u32| {
+            let input = SigElement {
+                name: "TEXCOORD".into(),
+                index: 0,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(register),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            };
+            let position = SigElement {
+                name: "SV_Position".into(),
+                index: 0,
+                kind: 3,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            };
+            let isg1 = super::container::signature(&[input], true);
+            let osg1 = super::container::signature(&[position], false);
+            let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1[..]), (FourCC::OSG1, &osg1[..])]);
+            let c = Container::parse(&bytes).unwrap();
+            emit(&c, &native, &p, &st, &io, &res)
+        };
+        for register in [0, 30] {
+            let shader = emit_with(register).expect("the id fits below r32");
+            let c = Container::parse(&shader.dxil).unwrap();
+            let isg1 = c.part(FourCC::ISG1).unwrap().data;
+            let rows = crate::dxbc::u32_at(isg1, 0).unwrap() as usize;
+            let registers: Vec<u32> = (0..rows)
+                .map(|i| crate::dxbc::u32_at(isg1, 8 + 32 * i + 20).unwrap())
+                .collect();
+            assert_eq!(registers, [register, register + 1], "r{register}");
+        }
+        let Err(why) = emit_with(31) else {
+            panic!("a vertex id at r32 was emitted");
+        };
+        assert!(
+            format!("{why:?}").contains("a system input past the 32 input registers"),
+            "{why:?}"
+        );
+    }
 }
