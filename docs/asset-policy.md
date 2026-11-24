@@ -57,7 +57,8 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
    numeric arrays or `\xHH` / `\u{..}` escape strings (`xxd -i` output;
    a string of escapes split into many literals, by `\` continuations,
    adjacent literals or commas, is one string; tables over 512
-   entries are split into rows). File names must
+   entries are split into rows), nor hex dumps (`xxd`, `hexdump -C`,
+   `od`: lines of short hex groups, offsets and all). File names must
    be UTF-8, and submodules, like untracked git repositories nested in the
    checkout, are refused. A symlink is checked as git stores it, as
    its target path. A tracked file is checked as the index holds it as

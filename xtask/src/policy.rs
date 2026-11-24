@@ -738,6 +738,12 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
                 "{run}-element numeric array or byte-escape string (embedded data?)"
             ));
         }
+        let run = longest_hex_dump(content);
+        if run > MAX_LITERAL_RUN {
+            problems.push(format!(
+                "{run}-value hex dump (xxd, hexdump or od output: embedded data?)"
+            ));
+        }
     }
     problems
 }
@@ -941,6 +947,55 @@ fn string_join_len(rest: &[u8]) -> usize {
         };
         (i, boundary) = (i + len, true);
     }
+}
+
+/// Fewest hex values on a line for it to count as a line of a dump.
+const MIN_DUMP_LINE_VALUES: usize = 4;
+
+/// Number of hex values in the longest block of consecutive lines that read
+/// as a hex dump.
+///
+/// `xxd` (`00000000: 4d5a 9000 ...`), `hexdump -C` (`00000000  4d 5a 90 00
+/// ... |MZ..|`) and `od` (`0000000 055115 000220 ...`) write a file as short
+/// hex or octal groups separated by spaces, with an offset in front and
+/// sometimes the printable bytes behind. No group is a long hex run, there is
+/// whitespace every few characters, and no comma joins them into an array,
+/// so a dump of an executable pasted into a `.txt` or `.md` passed every
+/// other check while it stayed under the size limit.
+///
+/// A line counts when at least `MIN_DUMP_LINE_VALUES` of its
+/// whitespace-separated words, and three in four of them, are hex values (up
+/// to 16 hex digits, after an optional `0x` and before an optional `:`), so
+/// the offset and the printable column do not stop a dump while prose,
+/// even prose fond of `cafe`, `dead` and `beef`, does not count. The values of
+/// consecutive counting lines add up; any other line ends the block.
+fn longest_hex_dump(content: &[u8]) -> usize {
+    let is_value = |word: &[u8]| {
+        let word = word.strip_suffix(b":").unwrap_or(word);
+        let word = word
+            .strip_prefix(b"0x")
+            .or_else(|| word.strip_prefix(b"0X"))
+            .unwrap_or(word);
+        (1..=16).contains(&word.len()) && word.iter().all(u8::is_ascii_hexdigit)
+    };
+    let (mut longest, mut run) = (0, 0);
+    for line in content.split(|&b| b == b'\n') {
+        let words = line
+            .split(u8::is_ascii_whitespace)
+            .filter(|w| !w.is_empty());
+        let (mut values, mut total) = (0, 0);
+        for word in words {
+            total += 1;
+            values += usize::from(is_value(word));
+        }
+        if values >= MIN_DUMP_LINE_VALUES && values * 4 >= total * 3 {
+            run += values;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    longest
 }
 
 #[cfg(test)]
@@ -2455,5 +2510,100 @@ mod tests {
             .collect();
         assert_eq!(run(table.as_bytes()), 16);
         assert!(check("src/table.rs", table.as_bytes()).is_empty());
+    }
+
+    /// A dump of binary data as `xxd`, `hexdump -C`, `od` and space-separated
+    /// `0x` bytes write it: short groups and whitespace, no commas. Each
+    /// passed every other check.
+    #[test]
+    fn rejects_hex_dumps() {
+        let bytes: Vec<u8> = (0..MAX_LITERAL_RUN * 4).map(|i| (i * 37) as u8).collect();
+        let printable = |row: &[u8]| -> String {
+            row.iter()
+                .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
+                .collect()
+        };
+        let lines = |width: usize, line: &dyn Fn(usize, &[u8]) -> String| -> String {
+            bytes
+                .chunks(width)
+                .enumerate()
+                .map(|(i, row)| line(i * width, row) + "\n")
+                .collect()
+        };
+        let xxd = lines(16, &|at, row| {
+            let groups: Vec<String> = row
+                .chunks(2)
+                .map(|g| g.iter().map(|b| format!("{b:02x}")).collect())
+                .collect();
+            format!("{at:08x}: {}  {}", groups.join(" "), printable(row))
+        });
+        let hexdump = lines(16, &|at, row| {
+            let hex: Vec<String> = row.iter().map(|b| format!("{b:02x}")).collect();
+            format!(
+                "{at:08x}  {}  {}  |{}|",
+                hex[..8].join(" "),
+                hex[8..].join(" "),
+                printable(row)
+            )
+        });
+        let od = lines(16, &|at, row| {
+            let words: Vec<String> = row
+                .chunks(2)
+                .map(|w| format!("{:06o}", u16::from_le_bytes([w[0], w[1]])))
+                .collect();
+            format!("{at:07o} {}", words.join(" "))
+        });
+        let spaced = lines(12, &|_, row| {
+            let hex: Vec<String> = row.iter().map(|b| format!("0x{b:02X}")).collect();
+            format!("    {}", hex.join(" "))
+        });
+        for dump in [xxd, hexdump, od, spaced] {
+            assert!(
+                super::longest_hex_dump(dump.as_bytes()) > MAX_LITERAL_RUN,
+                "{dump:.80}"
+            );
+            let problems = check("notes/dump.txt", dump.as_bytes());
+            assert!(
+                problems.iter().any(|p| p.contains("hex dump")),
+                "{dump:.80}: {problems:?}"
+            );
+        }
+    }
+
+    /// Only lines that are mostly hex values count, and any other line ends
+    /// the block: prose, tables and code with the odd hex word or number
+    /// are not dumps.
+    #[test]
+    fn hex_dumps_are_only_lines_of_hex_values() {
+        let dump = super::longest_hex_dump;
+        assert_eq!(dump(b"00000000: 4d5a 9000 0300 0000  MZ......\n"), 5);
+        assert_eq!(dump(b"0x4d 0x5a 0x90:\n"), 0, "too few values");
+        assert_eq!(dump(b"a bad cafe face was fed\n"), 5, "mostly hex");
+        assert_eq!(
+            dump(b"a bad cafe was fed by the dog\n"),
+            0,
+            "too many words"
+        );
+        assert_eq!(
+            dump(b"1 2 3 4\nnot a dump\n5 6 7 8\n"),
+            4,
+            "other lines end the block"
+        );
+        assert_eq!(dump(b"1 2 3 4\r\n5 6 7 8\r\n"), 8, "CRLF lines join");
+        assert_eq!(dump(b"1 2 3 4\n\n5 6 7 8\n"), 4, "a blank line ends it");
+        assert_eq!(
+            dump("fffffffffffffffff ".repeat(4).as_bytes()),
+            0,
+            "too long for values"
+        );
+        assert_eq!(dump(b""), 0);
+
+        let table: String = (0..256)
+            .map(|r| format!("| {r} | {} | {} |\n", r * 2, r % 7))
+            .collect();
+        assert_eq!(dump(table.as_bytes()), 0, "a markdown table of numbers");
+        assert!(check("docs/table.md", table.as_bytes()).is_empty());
+        let prose = "The decade-old cafe had a bead of dead beef on its face.\n".repeat(200);
+        assert_eq!(dump(prose.as_bytes()), 0);
     }
 }
