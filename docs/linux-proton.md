@@ -9,6 +9,12 @@ You supply your own files. Keep them, and everything built or derived from
 them, outside the repository: see [asset-policy.md](asset-policy.md). Never
 commit game data, built binaries or logs that contain title bytes.
 
+See also open PR [#195](https://github.com/Marvisak/VIctory/pull/195)
+(Linux cross-build and Wine host stubs) and
+[#191](https://github.com/Marvisak/VIctory/pull/191) (a Linux launcher and
+smoke test for Proton). Once #195 is merged it is the reference for building
+on Linux; this page keeps the Proton/umu run steps.
+
 ## Host tests
 
 `main` does not build on Linux yet: `victory-gpu` stops at `error[E0425]:
@@ -86,6 +92,10 @@ export VICTORY_GAME_DIR=$(z "$HOME/victory-data/game")
 export VICTORY_DATA_DIR=$(z "$HOME/victory-data/data")
 export VICTORY_CACHE_DIR=$(z "$HOME/victory-data/cache")
 export VICTORY_LOG=info
+# vkd3d-proton writes vkd3d-proton.cache into the working directory by
+# default; keep it outside the checkout or `cargo xtask policy` flags it.
+export VKD3D_SHADER_CACHE_PATH=$HOME/.local/share/victory/vkd3d-cache
+mkdir -p "$VKD3D_SHADER_CACHE_PATH"
 
 # From the repository root: the cargo output from the build step above
 # (use .../diag/victory.exe for the diagnostics build).
@@ -103,12 +113,27 @@ they live under `$LOGS`, not in the repository. If you copy `victory.exe`
 somewhere else, point `VICTORY_BIN` at that copy, also outside the
 repository. `crashes.log` is in the data folder as usual.
 
+`VKD3D_SHADER_CACHE_PATH` must be a directory outside the repository. If a
+`vkd3d-proton.cache` file ever lands in the checkout, delete it rather than
+committing it; `cargo xtask policy` rejects it.
+
 Seen on one machine (NVIDIA RTX 2060 SUPER, UMU-Proton 11.0, release build):
 imports bind, the D3D12 device comes up on vkd3d-proton, the first-boot
 screens and intro video run at 30 fps, and the title starts loading the
 world. Some compute pipelines are refused with `E_INVALIDARG` (NVIDIA has
 32-lane waves; see the README's shader row), and the title's view heap is
 larger than vkd3d-proton allows on that GPU, so it is capped.
+
+### Indirect draws under Wine
+
+Wine's `D3DCompile` can refuse the shader that clamps indirect-draw
+arguments, so indirect execution is dropped
+([#170](https://github.com/Marvisak/VIctory/issues/170)). Two open fixes
+take different routes: [#178](https://github.com/Marvisak/VIctory/pull/178)
+falls back to DXC, and [#190](https://github.com/Marvisak/VIctory/pull/190)
+builds the clamp as hand-written DXIL with no compiler at run time. They
+conflict, so only one of them should be merged; measurements under Proton
+are in the comments on both PRs.
 
 ### Open Wine/Proton fixes
 
