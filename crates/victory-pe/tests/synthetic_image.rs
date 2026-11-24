@@ -1075,3 +1075,56 @@ fn an_import_directory_holding_only_the_terminator_has_no_modules() {
     assert!(info.imports.is_empty());
     assert_eq!(info.import_count(), 0);
 }
+
+#[test]
+fn an_address_at_the_end_of_the_export_directory_is_not_a_forwarder() {
+    // Only addresses inside [directory, directory + size) are forwarder
+    // strings; the first byte past it is ordinary code or data.
+    let mut d = image();
+    add_exports(&mut d);
+    put32(&mut d, at(0x1378), EXPORT_DIRECTORY_END);
+    let info = ImageInfo::parse(&d).unwrap();
+    let local = info
+        .exports
+        .iter()
+        .find(|e| e.name.as_deref() == Some("local"))
+        .unwrap();
+    assert_eq!(local.rva, Some(EXPORT_DIRECTORY_END));
+    assert_eq!(local.forward, None);
+}
+
+#[test]
+fn an_export_directory_without_functions_has_no_exports() {
+    let mut d = image();
+    add_exports(&mut d);
+    let ed = at(EXPORT_DIRECTORY);
+    put32(&mut d, ed + 20, 0); // functions
+    put32(&mut d, ed + 24, 0); // names
+    let info = ImageInfo::parse(&d).unwrap();
+    assert!(info.exports.is_empty());
+}
+
+#[test]
+fn rejects_a_delay_import_name_outside_the_sections() {
+    for name in [SIZE_OF_IMAGE + 0x100, 0xFFFF_FFF0] {
+        let mut d = image();
+        add_delay_import(&mut d);
+        put32(&mut d, at(DELAY_DESCRIPTORS) + 4, name);
+        assert!(ImageInfo::parse(&d).is_err(), "DLL name at {name:#x}");
+    }
+    for hint_name in [SIZE_OF_IMAGE + 0x100, 0x7FFF_FFF0] {
+        let mut d = image();
+        add_delay_import(&mut d);
+        put64(&mut d, at(DELAY_NAME_TABLE), u64::from(hint_name));
+        assert!(ImageInfo::parse(&d).is_err(), "hint/name at {hint_name:#x}");
+    }
+}
+
+#[test]
+fn a_delay_import_directory_holding_only_the_terminator_has_no_modules() {
+    let mut d = image();
+    add_delay_import(&mut d);
+    d[at(DELAY_DESCRIPTORS)..at(DELAY_DESCRIPTORS) + 32].fill(0);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert!(info.delay_imports.is_empty());
+}
