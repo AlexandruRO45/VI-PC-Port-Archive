@@ -970,6 +970,41 @@ mod tests {
     }
 
     #[test]
+    fn packed_bytes_up_to_the_bound_are_a_record() {
+        // A real stream padded out (its end is not checked) to exactly the
+        // most packed bytes the stated size allows is a record and unpacks;
+        // one byte more is not a record (it never hides the next one).
+        for payload in [Vec::new(), vec![0x41; 64], (0..=255).collect()] {
+            let packed = miniz_oxide::deflate::compress_to_vec(&payload, 6);
+            let bound = max_packed(payload.len());
+            for (len, want) in [
+                (bound, vec![Some("PS_a"), Some("PS_after")]),
+                (bound + 1, vec![Some("PS_after")]),
+            ] {
+                let mut padded = packed.clone();
+                padded.resize(len, 0);
+                let n = (padded.len() + 12) as u32;
+                let mut file = MAGIC.to_vec();
+                file.extend_from_slice(b"\x05PS_a\0\x32");
+                for v in [n, 0x000D_DCE7, n, payload.len() as u32] {
+                    file.extend_from_slice(&v.to_le_bytes());
+                }
+                file.extend_from_slice(&padded);
+                file.extend(record_bytes("PS_after", 0x32, b"after"));
+                let found: Vec<_> = records(&file).collect();
+                let names: Vec<_> = found.iter().map(|r| r.name).collect();
+                let at = format!("{} bytes, {len} packed", payload.len());
+                assert_eq!(names, want, "{at}");
+                if len == bound {
+                    assert_eq!(found[0].unpack(), Some(payload.clone()), "{at}");
+                }
+                let last = found.last().expect("PS_after");
+                assert_eq!(last.unpack().as_deref(), Some(&b"after"[..]), "{at}");
+            }
+        }
+    }
+
+    #[test]
     fn marker_stating_more_than_the_cap_is_not_a_record() {
         // A record stored as is (level 0) inside bytes whose marker states
         // an unpacked size: up to the cap they are a record, which holds
