@@ -2091,7 +2091,58 @@ def lds_f64_reference(op, groups):
 
 LDS_F64_CASES = [(op, lds_f64_cmpst(op), LDS_WIDE_BINDING | {"stride": 16 if "_rtn" in op else 8,
                                                           "lds_f64_mode": "normal"}) for op in LDS_F64_CMPST]
-LDS_FLOAT_CASES = LDS_F32_CASES + LDS_F64_CASES
+LDS_F64_ORDER = ("ds_min_f64", "ds_max_f64", "ds_min_rtn_f64", "ds_max_rtn_f64")
+LDS_QWORD_PAIR_CASES = ("lds_qword_exchange_old", "lds_qword_exchange_new")
+
+
+def lds_f64_order(op):
+    returns = "_rtn" in op
+    dest = "v[18:19], " if returns else ""
+    return LDS_WIDE_SETUP + [
+        "v_and_b32_e32 v16, 1, v8", "v_lshrrev_b32_e32 v17, 1, v8", "v_and_b32_e32 v17, 1, v17",
+        "v_mov_b32_e32 v18, 0x40040000", "v_mad_u32_u24 v17, 0x800000, v17, 0",
+        "v_mad_u32_u24 v17, 256, v17, v18",
+        "v_mov_b32_e32 v18, 0", "v_mov_b32_e32 v19, 0xc0040000",
+        "ds_write_b64 v5, v[16:17] offset:8", "s_waitcnt lgkmcnt(0)",
+        f"{op} {dest}v5, v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
+        "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
+    ] + (["v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v13, v19",
+          "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen"] if returns else
+         ["buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]) + ["s_endpgm"]
+
+
+def lds_qword_exchange(name):
+    return LDS_WIDE_SETUP + [
+        "v_mov_b32_e32 v16, 0x11111111", "v_mov_b32_e32 v17, 0x22222222",
+        "v_mov_b32_e32 v18, 0x33333333", "v_mov_b32_e32 v19, 0x44444444",
+        "ds_write_b64 v5, v[16:17]", "s_waitcnt lgkmcnt(0)",
+        "ds_write_b64 v5, v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v10, v6", "v_mov_b32_e32 v11, 0xabcdefed",
+        "v_mov_b32_e32 v12, 0x76543210", "v_mov_b32_e32 v13, 0x87654321",
+        "ds_wrxchg2_rtn_b64 v[10:13], v5, v[10:11], v[12:13] offset0:1", "s_waitcnt lgkmcnt(0)",
+    ] + (["ds_read_b64 v[10:11], v5", "s_waitcnt lgkmcnt(0)",
+          "ds_read_b64 v[12:13], v5 offset:8", "s_waitcnt lgkmcnt(0)"] if name.endswith("new") else []) + [
+        "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
+    ]
+
+
+def lds_f64_order_reference(name, groups):
+    words = []
+    for lane in range(groups * 32):
+        prior = (lane & 1, 0x40040000 | ((lane >> 1 & 1) << 31))
+        other = (0, 0xc0040000)
+        def as_double(pair):
+            return struct.unpack("<d", struct.pack("<II", *pair))[0]
+        words.extend((min if name.startswith("ds_min") else max)((prior, other), key=as_double))
+        if "_rtn" in name:
+            words.extend(prior)
+    return words
+
+
+LDS_FLOAT_CASES = LDS_F32_CASES + LDS_F64_CASES + [
+    (op, lds_f64_order(op), LDS_WIDE_BINDING | {"stride": 16 if "_rtn" in op else 8, "lds_f64_mode": "normal"})
+    for op in LDS_F64_ORDER
+] + [(name, lds_qword_exchange(name), LDS_WIDE_BINDING | {"stride": 16}) for name in LDS_QWORD_PAIR_CASES]
 
 
 LDS_WAVE_COUNTER = DS_PREFIX + [
@@ -2128,6 +2179,10 @@ def lds_controls():
     ):
         rejects(message, aot.lower, variant(lines, (target, replacement)), 32, **binding)
 
+
+    pair = lds_qword_exchange("lds_qword_exchange_old")
+    rejects("Unverified private paired qword exchange", aot.lower,
+            variant(pair, ("offset0:1", "offset0:0")), 32, **(LDS_WIDE_BINDING | {"stride": 16}))
     lines = lds_f64_cmpst("ds_cmpst_f64")
     rejects("Unverified private LDS binary64 mode", aot.lower, lines, 32, **(LDS_WIDE_BINDING | {"stride": 8}))
     lines = lds_f32_program("ds_add_f32")
@@ -2386,11 +2441,7 @@ def lds_controls():
             lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
 
 
-def ds_binary(directory, assembler, objcopy, library):
-    cases = DS_CASES + LDS_CASES + LDS_ARITHMETIC_CASES + LDS_REPLACEMENT_CASES + LDS_PACKED_CASES + LDS_STRIDED_CASES
-    cases += LDS_WIDE_REPLACEMENT_CASES
-    cases += LDS_QWORD_CASES
-    cases += LDS_FLOAT_CASES
+def gfx1030_binary(directory, assembler, objcopy, library, cases, prefix):
     for name, lines, binding in cases:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
@@ -2400,16 +2451,24 @@ def ds_binary(directory, assembler, objcopy, library):
         code = raw.read_bytes()
         decoded = aot.labelled(disassemble(code, library, offsets=True, cpu=b"gfx1030",
                                           features=DS_FEATURES.encode()))
-        assert [line for line in decoded if line.startswith("ds_")] == [
-            line for line in lines if line.startswith("ds_")]
+        assert [line for line in decoded if line.startswith(prefix)] == [
+            line for line in lines if line.startswith(prefix)]
         expected = aot.lower(lines, 32, **binding)
         assert aot.lower(decoded, 32, **binding) == expected
-        container, output = directory / "ds.dxbc", directory / "ds-cli.hlsl"
+        container, output = directory / f"{name}.dxbc", directory / f"{name}-cli.hlsl"
         container.write_bytes(store_container(code, (32, 1, 1)))
         options = [item for key, value in binding.items() for item in ("--" + key.replace("_", "-"), str(value))]
         subprocess.run([sys.executable, "-B", aot.__file__, container, "--output", output,
                         "--llvm", library, *options], check=True)
         assert output.read_text() == expected
+
+
+def ds_binary(directory, assembler, objcopy, library):
+    cases = DS_CASES + LDS_CASES + LDS_ARITHMETIC_CASES + LDS_REPLACEMENT_CASES + LDS_PACKED_CASES + LDS_STRIDED_CASES
+    cases += LDS_WIDE_REPLACEMENT_CASES
+    cases += LDS_QWORD_CASES
+    cases += LDS_FLOAT_CASES
+    gfx1030_binary(directory, assembler, objcopy, library, cases, "ds_")
 
 
 def ds_mutants(name, lines, binding, source):
@@ -2544,6 +2603,11 @@ def ds_mutants(name, lines, binding, source):
         no_update = "ds_read_b32 v10, v5" if "_rtn_" in name else "s_nop 0"
         changed = variant(lines, (lds_counter_instruction(name), no_update))
         yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_F64_ORDER:
+        other = name.replace("min", "max") if name.startswith("ds_min") else name.replace("max", "min")
+        yield aot.lower(variant(lines, (name, other)), 32, **binding), 1
+    elif name in LDS_QWORD_PAIR_CASES:
+        yield aot.lower(variant(lines, ("offset0:1", "offset1:1")), 32, **binding), 0
     elif name in LDS_F64_CMPST:
         changed = variant(lines, ("v[20:21], v[18:19] offset:8", "v[18:19], v[20:21] offset:8"))
         yield aot.lower(changed, 32, **binding), 0
@@ -2607,7 +2671,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
         # Four words per lane fill the fixed 320-word readback before three groups.
         four_words = (name in ("lds_wave_counter", "lds_xchg2_b32") or name in LDS_QWORD_RETURNS
                       or name in LDS_WIDE_QUADS or name in LDS_STRIDED_PROGRAMS
-                      or name in LDS_F64_CMPST and "_rtn" in name
+                      or name in LDS_QWORD_PAIR_CASES
+                      or name in LDS_F64_CMPST + LDS_F64_ORDER and "_rtn" in name
                       or name in LDS_QWORD_COUNTERS and "_rtn" in name
                       or name in LDS_WIDE_REPLACEMENTS and "_rtn" in name)
         group_counts = (1, 2) if four_words else (1, 3)
@@ -2646,6 +2711,13 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
                 words = lds_f32_reference(name, groups)
             elif name in LDS_F64_CMPST:
                 words = lds_f64_reference(name, groups)
+            elif name in LDS_F64_ORDER:
+                words = lds_f64_order_reference(name, groups)
+            elif name == "lds_qword_exchange_old":
+                words = [0x33333333, 0x44444444, 0x11111111, 0x22222222] * (groups * 32)
+            elif name == "lds_qword_exchange_new":
+                words = [word for lane in range(groups * 32)
+                         for word in (0x76543210, 0x87654321, 0x12345670 + lane, 0xabcdefed)]
             elif private:
                 words = lds_reference(groups)
             else:
@@ -2686,6 +2758,8 @@ def binary(directory, assembler, objcopy, library):
     ds_controls()
     lds_controls()
     ds_binary(directory, assembler, objcopy, library)
+    mtbuf_load_controls()
+    gfx1030_binary(directory, assembler, objcopy, library, MTBUF_LOAD_CASES, "tbuffer_")
     two_exits(directory, assembler, objcopy, library)
     for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES:
         src, obj, raw = [directory / x for x in ("test.s", "test.o", "test.bin")]
@@ -2887,6 +2961,69 @@ def draw_guard(directory, compiler, cmd, case, name):
 def source_word(i):
     """t0 as the harness fills it: 320 known words, then 320 sentinel words."""
     return (0x8b02a7f1 + i * 0x413b1) & 0xffffffff if i < 320 else SENTINEL
+
+
+MTBUF_LOAD = "tbuffer_load_format_x v10, v8, s[16:19], 0 format:[BUF_FMT_32_UINT] idxen offset:4"
+MTBUF_LOAD_CASES = [("mtbuf_load_x", [
+    "s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+    "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+    "s_load_dwordx4 s[16:19], s[12:13], 0x40",
+    "v_lshl_add_u32 v8, s11, 5, v0", "s_waitcnt lgkmcnt(0)",
+    MTBUF_LOAD, "s_waitcnt vmcnt(0)",
+    "buffer_store_dword v10, v8, s[20:23], 0 idxen offset:4", "s_endpgm",
+], DS_BINDING | {"stride": 8, "source_descriptor": 0x40, "source_stride": 12})]
+
+
+def mtbuf_load_controls():
+    _, lines, binding = MTBUF_LOAD_CASES[0]
+    for old, new, diagnostic in (
+        ("BUF_FMT_32_UINT", "BUF_FMT_32_FLOAT", "Unsupported compute instruction"),
+        (" format:[BUF_FMT_32_UINT]", "", "Unsupported compute instruction"),
+        (" offset:4", " offset:4 glc", "Unsupported compute instruction"),
+        ("], 0 format:", "], s13 format:", "Unsupported compute instruction"),
+        ("idxen offset:4", "offen offset:4", "Unsupported typed buffer read target or address mode"),
+        ("v10, v8", "v10, v0", "Unsupported read address"),
+        ("s[16:19]", "s[20:23]", "Reads from the stored UAV"),
+        ("offset:4", "offset:2", "Unverified read offset"),
+        ("offset:4", "offset:12", "Read leaves its source element"),
+    ):
+        rejects(diagnostic, aot.lower, [line.replace(old, new) if line == MTBUF_LOAD else line for line in lines],
+                32, **binding)
+    rejects("before s_waitcnt vmcnt(0)", aot.lower, variant(lines, ("s_waitcnt vmcnt(0)", "")), 32, **binding)
+    rejects("Unverified buffer read descriptor", aot.lower,
+            variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 32, **binding)
+    rejects("Unsupported read address", aot.lower, lines, 32, **(binding | {"source_stride": None}))
+    rejects("Unsupported typed buffer read target", aot.lower, lines, 32, **(binding | {"cpu": "gfx1013"}))
+
+
+def mtbuf_load_draw(directory, compiler, renderer, backend):
+    mtbuf_load_controls()
+    for name, lines, binding in MTBUF_LOAD_CASES:
+        src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
+        src.write_text(aot.lower(lines, 32, **binding), encoding="ascii")
+        compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+        subprocess.run(compile, check=True)
+        run = [renderer, backend, "--compute-store-case", cso, case]
+        for groups in (1, 3):
+            words = [SENTINEL] * 320
+            for gid in range(32 * groups):
+                words[2 * gid + 1] = source_word(3 * gid + 1)
+            case.write_bytes(struct.pack("<321I", groups, *words))
+            result = subprocess.run(run)
+            if result.returncode:
+                return result.returncode
+        # Stride 8 still admits the aligned read. Only lanes after lane 0 expose the error.
+        src.write_text(aot.lower(lines, 32, **(binding | {"source_stride": 8})), encoding="ascii")
+        subprocess.run(compile, check=True)
+        bad = subprocess.run(run, capture_output=True, text=True)
+        if bad.returncode != 1 or "word=3 expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: incorrect source stride escaped detection\n{bad.stderr}")
+        print(bad.stderr, end="")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("tbuffer_load_format_x\n", encoding="utf-8")
+    return 0
 
 
 def read_words(name, groups, bound):
@@ -3371,6 +3508,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         # The store cases and the guard/read cases run as separate CTest entries so each stays within its timeout.
         modes = {"binary": binary, "draw": draw,
+                 "draw-mtbuf-load": mtbuf_load_draw,
                  "draw-ds-route": ds_draw,
                  "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),
                  "draw-lds-strided": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_STRIDED_CASES),

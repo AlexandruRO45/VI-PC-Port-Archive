@@ -2523,6 +2523,10 @@ REGION_SALU_DEST = re.compile(r"s_(?:mov_b32|movk_i32|add_i32|mul_i32|cselect_b3
 # Stage 1 of issue #987: scalar instructions that leave every tracked register and counter unchanged may also sit
 # in a region, because skipping them with the whole wave (s_cbranch_execz) or running them changes nothing.
 REGION_NOP = re.compile(r"s_nop (?:0x[0-9a-f]+|\d+)")
+# Stage 3 of issue #987: scalar loads run whatever the execution mask, so the constant and pointer loads the
+# translator already lowers may sit in a region. Group 1 is a single destination SGPR, groups 2 and 3 a range.
+REGION_SLOAD = re.compile(
+    r"s_(?:buffer_)?load_dword(?:x(?:2|4|8))? (?:s(\d+)|s\[(\d+):(\d+)\]), s\[\d+:\d+\], (?:0x[0-9a-f]+|null)")
 WAIT_COUNTERS = {"vmcnt": "vm", "lgkmcnt": "lgkm", "expcnt": "exp", "vscnt": "vs"}
 
 
@@ -2770,6 +2774,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             inner = vector[dst]
             lines.append(f"    precise float alu{i}_{dst} = ({region['cond']} ? {inner} : {outer});")
             vector[dst] = f"alu{i}_{dst}"
+        if region["skip"] is not None:
+            # A wave that skipped the region never ran its waits, so what was outstanding at the opener still is.
+            before_pending, before_samples = region["outstanding"]
+            pending.update(before_pending)
+            sample_dest.update(before_samples)
         vector.masked = False
         vector.reads.clear()
         scalar.masked = False
@@ -2805,17 +2814,22 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             elif (counters := wait_counters(line)) is not None:
                 if re.match(r"s_waitcnt_expcnt\s+s\d+,", line):
                     raise ValueError(f"Unsupported s_waitcnt_expcnt SGPR operand in a masked region: {line}")
-                # A wait is admitted only if every counter it names is already satisfied in the tracked state, so
-                # it resolves nothing whether the wave runs or skips it. Loads leave sample_dest and pending only
-                # through a wait, and overwriting an outstanding destination is refused, so empty means nothing is
-                # outstanding. No export can be outstanding (only s_endpgm may follow one). Scratch stores are
-                # not tracked on the store counter, so vscnt is unknown once any store has been lowered.
-                busy = sorted(name for name, outstanding in (("vm", sample_dest), ("lgkm", pending))
-                              if name in counters and outstanding)
-                if busy:
-                    raise ValueError(f"Wait would resolve outstanding {'/'.join(busy)} work in a masked region: {line}")
+                # A wait is a scalar instruction: it runs whatever the execution mask, so the main wait handler
+                # below resolves outstanding vm/lgkm work exactly as it does outside a region. A region that the
+                # whole wave may skip (s_cbranch_execz) leaves that work outstanding on the skipping path, so
+                # close_region puts the pre-region outstanding state back after such a region. No export can be
+                # outstanding (only s_endpgm may follow one). Scratch stores are not tracked on the store
+                # counter, so vscnt is unknown once any store has been lowered.
                 if "vs" in counters and scratch_written:
                     raise ValueError(f"Store counter state is unknown after a scratch store in a masked region: {line}")
+            elif sload := REGION_SLOAD.fullmatch(line):
+                loaded = ({f"s{sload[1]}"} if sload[1] is not None
+                          else {f"s{n}" for n in range(int(sload[2]), int(sload[3]) + 1)})
+                if loaded.intersection(region["save"]):
+                    raise ValueError(f"Masked scalar load overwrites the saved execution pair: {line}")
+                rstate = (dict(scalar), dict(vector), scc, set(pending), dict(sample_dest),
+                          exported, ended, mask, attribute_input, interpolated,
+                          dict(quad_values), samples, loaded)
             elif REGION_SALU.fullmatch(line):
                 destination = REGION_SALU_DEST.match(line)
                 if destination and destination[1] in region["save"]:
@@ -3041,7 +3055,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Unsupported execution mask save")
             scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
             region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i,
-                      "scalar_written": set(), "scc_written": False, "opener": "saveexec"}
+                      "scalar_written": set(), "scc_written": False, "opener": "saveexec",
+                      "outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
             scc = None
@@ -3071,7 +3086,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    bool cmp{i} = {expr};")
             scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
             region = {"save": pair, "cond": f"cmp{i}", "written": {}, "skip": None, "start": i,
-                      "scalar_written": set(), "scc_written": False, "opener": "cmpx"}
+                      "scalar_written": set(), "scc_written": False, "opener": "cmpx",
+                      "outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
         elif m := match(r"s_cbranch_execz (-?0x[0-9a-f]+|-?\d+)"):
@@ -5250,7 +5266,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
              old_ended, old_mask, old_attribute, old_interpolated, old_quad, old_samples, scalar_alu) = rstate
             writes = {k for k in set(vector) | set(old_vector)
                       if old_vector.get(k, MISSING) != dict.get(vector, k, MISSING)}
-            if scalar_alu:
+            if isinstance(scalar_alu, set):
+                # A scalar load may only add its own destinations: they become outstanding and change nothing else.
+                scalar_writes = {k for k in set(scalar) | set(old_scalar)
+                                 if old_scalar.get(k, MISSING) != dict.get(scalar, k, MISSING)}
+                if (not scalar_writes.issubset(scalar_alu) or writes or scc != old_scc
+                        or pending != old_pending | scalar_alu or sample_dest != old_sample_dest
+                        or exported != old_exported or ended != old_ended or mask != old_mask
+                        or attribute_input != old_attribute or interpolated != old_interpolated
+                        or quad_values != old_quad or samples != old_samples):
+                    raise ValueError(f"Unsupported masked-region scalar load {i}: {line}")
+                if region["skip"] is not None:
+                    region["scalar_written"].update(scalar_alu)
+                else:
+                    # No wave can skip the region, so the load defines these registers on every wave and
+                    # supersedes any earlier conditional write of them.
+                    region["scalar_written"].difference_update(scalar_alu)
+                    scalar.conditional.difference_update(scalar_alu)
+            elif scalar_alu:
                 destination = REGION_SALU_DEST.match(line)
                 scalar_writes = {k for k in set(scalar) | set(old_scalar)
                                  if old_scalar.get(k, MISSING) != dict.get(scalar, k, MISSING)}

@@ -1,6 +1,8 @@
 """A source-built indexed texture selection and coverage-only pixel export."""
 
 import json
+import math
+import operator
 from pathlib import Path
 import struct
 import subprocess
@@ -54,6 +56,25 @@ s_mov_b64 exec, s[48:49]
 exp null off, off, off, off done vm
 s_endpgm
 """.strip().splitlines()
+
+
+def variant(multiply, compare):
+    return [
+        line.replace("v_mul_legacy_f32_e32", multiply).replace(
+            "v_cmpx_gt_f32_e32", compare
+        )
+        for line in PROGRAM
+    ]
+
+
+# The IEEE multiply with each kill relation that the translator accepts. The
+# legacy multiply keeps its original greater-than program above.
+RELATIONS = ("lt", "le", "gt", "ge")
+OP_PROGRAMS = {
+    relation: variant("v_mul_f32_e32", f"v_cmpx_{relation}_f32_e32")
+    for relation in RELATIONS
+}
+PROGRAMS = [PROGRAM, *OP_PROGRAMS.values()]
 
 
 def bindings(slot):
@@ -132,15 +153,48 @@ def controls():
     early_product = source.replace(f"{sample_wait}\n{product}", f"{product}\n{sample_wait}")
     must_reject(lower, decoded(early_product.splitlines()), bindings(0))
 
+    for relation, program in OP_PROGRAMS.items():
+        for slot in range(2):
+            lower(decoded(program), bindings(slot))
+    ieee = "\n".join(OP_PROGRAMS["lt"])
+    for old, new in [
+        ("v_cmpx_lt_f32_e32 s9, v11", "v_cmpx_lg_f32_e32 s9, v11"),
+        ("v_cmpx_lt_f32_e32 s9, v11", "v_cmpx_lt_f64_e32 s9, v11"),
+        ("v_cmpx_lt_f32_e32 s9, v11", "v_cmpx_lt_f32_e32 v11, s9"),
+        ("v_mul_f32_e32 v11, s3, v10", "v_mul_f32_e32 v11, v10, v10"),
+        ("v_mul_f32_e32 v11, s3, v10", "v_mul_f16_e32 v11, s3, v10"),
+        ("v_mul_f32_e32 v11, s3, v10", "v_add_f32_e32 v11, s3, v10"),
+    ]:
+        must_reject(lower, decoded(ieee.replace(old, new).splitlines()), bindings(0))
+    ieee_product = "v_mul_f32_e32 v11, s3, v10"
+    early_ieee = ieee.replace(
+        f"{sample_wait}\n{ieee_product}", f"{ieee_product}\n{sample_wait}"
+    )
+    must_reject(lower, decoded(early_ieee.splitlines()), bindings(0))
+    # Every wrong relation, and the legacy multiply, must give a different
+    # reference somewhere, otherwise the readback controls prove nothing.
+    for slot in range(2):
+        for relation in RELATIONS:
+            for other in RELATIONS:
+                if relation != other:
+                    distinguishing_case(slot, relation, False, other, False)
+    for relation in RELATIONS:
+        distinguishing_case(0, relation, False, relation, True)
+
     wrong_quad_source = source.replace(
         "s_wqm_b64 s[54:55], s[48:49]", "s_wqm_b64 s[54:55], s[52:53]"
     )
     must_reject(lower, decoded(wrong_quad_source.splitlines()), bindings(0))
 
 
-def binary(tmp, assembler, objcopy, library):
+def binary(tmp, *tools):
+    for program in PROGRAMS:
+        binary_program(tmp, program, *tools)
+
+
+def binary_program(tmp, program, assembler, objcopy, library):
     src, obj, raw = (tmp / n for n in ("synthetic.s", "synthetic.o", "synthetic.bin"))
-    src.write_text("\n".join(PROGRAM) + "\n")
+    src.write_text("\n".join(program) + "\n")
     subprocess.run(
         [
             assembler,
@@ -181,7 +235,7 @@ def binary(tmp, assembler, objcopy, library):
             ],
             check=True,
         )
-        assert out.read_text() == lower(decoded(PROGRAM), bindings(slot))
+        assert out.read_text() == lower(decoded(program), bindings(slot))
 
 
 def red_bindings(slot, scale_base=0):
@@ -214,6 +268,80 @@ def case(slot, scale, threshold, scale_word, threshold_word, red=False):
             sample = 1 - slot if red else (255 - byte if slot else byte) / 255
             ref.append(int(sample * scale >= threshold))
     return cb + ref
+
+
+OP_CASES = (
+    (1, 0),
+    (1, 1),
+    (1, 0.5),
+    (-1, -1),
+    (-1, 0),
+    (2, 1.5),
+    (math.inf, 0.25),
+    (math.inf, -0.25),
+)
+
+
+def f32(value):
+    if math.isnan(value) or math.isinf(value):
+        return value
+    try:
+        return struct.unpack("<f", struct.pack("<f", value))[0]
+    except OverflowError:
+        return math.copysign(math.inf, value)
+
+
+def op_case(slot, scale, limit, relation, legacy=False):
+    # An independent CPU model: round the unorm sample and the product to
+    # binary32, then kill a pixel when the relation holds with the limit first.
+    kill = getattr(operator, relation)
+    cb = bytearray(256)
+    struct.pack_into("<f", cb, 4, scale)
+    struct.pack_into("<f", cb, 24, limit)
+    ref = bytearray()
+    for y in range(8):
+        for x in range(8):
+            byte = (41 * x + 19 * y) & 255
+            sample = f32((255 - byte if slot else byte) / 255)
+            product = 0.0 if legacy and (scale == 0 or sample == 0) else f32(scale * sample)
+            ref.append(int(not kill(limit, product)))
+    return cb + ref
+
+
+def distinguishing_case(slot, relation, legacy, other, other_legacy):
+    for scale, limit in OP_CASES:
+        if op_case(slot, scale, limit, relation, legacy) != op_case(
+            slot, scale, limit, other, other_legacy
+        ):
+            return scale, limit
+    raise AssertionError(f"{relation} and {other} are not told apart on texture {slot}")
+
+
+def draw_ops(tmp, dxc, renderer, adapter):
+    for relation, program in OP_PROGRAMS.items():
+        for slot in range(2):
+            src, ps, ref = tmp / "draw.hlsl", tmp / "draw.dxil", tmp / "samples.bin"
+            src.write_text(lower(decoded(program), bindings(slot)))
+            subprocess.run([dxc, "-T", "ps_6_0", "-E", "main", "-Fo", ps, src], check=True)
+            args = [renderer, adapter, "--sampled-coverage", ps, ref]
+            for scale, limit in OP_CASES:
+                ref.write_bytes(op_case(slot, scale, limit, relation))
+                result = subprocess.run(args)
+                if result.returncode == 77:
+                    return 77
+                result.check_returncode()
+            wrong = [(other, False) for other in RELATIONS if other != relation]
+            if slot == 0:
+                wrong.append((relation, True))
+            for other, legacy in wrong:
+                scale, limit = distinguishing_case(slot, relation, False, other, legacy)
+                ref.write_bytes(op_case(slot, scale, limit, other, legacy))
+                result = subprocess.run(args, capture_output=True, text=True)
+                if result.returncode != 1 or "Sample coverage mismatch" not in result.stderr:
+                    raise AssertionError(
+                        f"A {other} reference must fail the {relation} coverage readback"
+                    )
+    return 0
 
 
 def draw(tmp, dxc, renderer, adapter, sources, scale_word, threshold_word, red=False):
@@ -273,4 +401,5 @@ if __name__ == "__main__":
                     10,
                     red=True,
                 )
+                or draw_ops(tmp, *sys.argv[1:])
             )

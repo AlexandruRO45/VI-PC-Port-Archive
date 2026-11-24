@@ -9,6 +9,13 @@ from pixel_aot import container_code, disassemble
 from resource_inventory import parts
 
 
+# Coverage comparisons: the compare kills the lanes for which it is true, so
+# the generated discard uses the same relation with the scalar limit first.
+KILL_RELATIONS = {"lt": "<", "le": "<=", "gt": ">", "ge": ">="}
+SAMPLED_PRODUCTS = ("v_mul_legacy_f32_e32", "v_mul_f32_e32")
+COVERAGE_COMPARES = tuple(f"v_cmpx_{name}_f32_e32" for name in KILL_RELATIONS)
+
+
 def regs(token, bank, width):
     match = re.fullmatch(bank + r"\[(\d+):(\d+)\]", token)
     if not match:
@@ -230,7 +237,7 @@ def lower(decoded, bindings):
             )
             pending_sample.add(match[1])
             samples += 1
-        elif op == "v_mul_legacy_f32_e32":
+        elif op in SAMPLED_PRODUCTS:
             dst, src, v = args
             scale, value = read(src), vector[v]
             if (
@@ -242,8 +249,10 @@ def lower(decoded, bindings):
                 or value[0] != "sample"
             ):
                 raise ValueError("Unresolved sampled product")
-            vector[dst] = ("product", scale[1], value[1])
-        elif op == "v_cmpx_gt_f32_e32":
+            # The legacy multiply returns zero when either input is zero; the
+            # IEEE multiply keeps NaN for zero times infinity.
+            vector[dst] = ("product", scale[1], value[1], op == SAMPLED_PRODUCTS[0])
+        elif op in COVERAGE_COMPARES:
             limit, product = read(args[0]), vector[args[1]]
             if (
                 pending
@@ -257,15 +266,21 @@ def lower(decoded, bindings):
             ):
                 raise ValueError("Unresolved coverage predicate")
             coverage_exit(decoded[i + 1 :], scalar)
-            _, scale, sampled = product
+            _, scale, sampled, legacy = product
+            relation = KILL_RELATIONS[op[len("v_cmpx_") : -len("_f32_e32")]]
+            multiply = (
+                f"({scale} == 0 || alpha == 0) ? 0.0f : {scale} * alpha"
+                if legacy
+                else f"{scale} * alpha"
+            )
             return f"""Texture2D<float4> tex0 : register(t0);
 Texture2D<float4> tex1 : register(t1);
 SamplerState samp : register(s0);
 cbuffer Constants : register(b0) {{ float4 params[16]; }};
 void main(float2 uv : TEXCOORD0) {{
     float alpha = {sampled};
-    precise float product = ({scale} == 0 || alpha == 0) ? 0.0f : {scale} * alpha;
-    if ({limit[1]} > product) discard;
+    precise float product = {multiply};
+    if ({limit[1]} {relation} product) discard;
 }}
 """
         else:

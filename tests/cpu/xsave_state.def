@@ -1,0 +1,13 @@
+LIBRARY cpu_xsave_state
+EXPORTS
+    op_xsave_only
+    op_xsave64_only
+    op_xrstor_xsave
+    op_xrstor64_xsave64
+    op_xrstor_xsave64
+    op_xrstor64_xsave
+    op_xrstor64_disp
+    op_xrstor64_mask_sse
+    op_vzeroupper_xsave64
+    op_pipeline
+    op_discarded_read

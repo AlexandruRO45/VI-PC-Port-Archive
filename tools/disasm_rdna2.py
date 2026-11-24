@@ -201,6 +201,10 @@ SOP1_OPS = {
     0x2b: ("s_xnor_saveexec_b64", "Save execution mask and bitwise XNOR with scalar source 64-bit"),
     0x2c: ("s_quadmask_b32", "Compute quad mask scalar 32-bit"),
     0x2d: ("s_quadmask_b64", "Compute quad mask scalar 64-bit"),
+    0x2e: ("s_movrels_b32", "Scalar move 32-bit with relative source index in M0"),
+    0x2f: ("s_movrels_b64", "Scalar move 64-bit with relative source index in M0"),
+    0x30: ("s_movreld_b32", "Scalar move 32-bit with relative destination index in M0"),
+    0x31: ("s_movreld_b64", "Scalar move 64-bit with relative destination index in M0"),
     0x34: ("s_abs_i32", "Scalar absolute value signed 32-bit"),
     0x37: ("s_andn1_saveexec_b64", "Save execution mask and bitwise AND NOT1 with scalar source 64-bit"),
     0x38: ("s_orn1_saveexec_b64", "Save execution mask and bitwise OR NOT1 with scalar source 64-bit"),
@@ -219,6 +223,7 @@ SOP1_OPS = {
     0x45: ("s_orn1_saveexec_b32", "Save execution mask and bitwise OR NOT1 with scalar source 32-bit"),
     0x46: ("s_andn1_wrexec_b32", "Save execution mask and write bitwise AND NOT1 scalar source 32-bit"),
     0x47: ("s_andn2_wrexec_b32", "Save execution mask and write bitwise AND NOT2 scalar source 32-bit"),
+    0x49: ("s_movrelsd_2_b32", "Scalar move 32-bit with relative source and destination indices in M0"),
 }
 
 SOP2_OPS = {
@@ -401,11 +406,28 @@ SMEM_OPS = {
     0x0a: "s_buffer_load_dwordx4",
     0x0b: "s_buffer_load_dwordx8",
     0x0c: "s_buffer_load_dwordx16",
+    0x18: "s_buffer_store_dword",
+    0x19: "s_buffer_store_dwordx2",
+    0x1a: "s_buffer_store_dwordx4",
+    0x1f: "s_gl1_inv",
+    0x20: "s_dcache_inv",
+    0x21: "s_dcache_wb",
+    0x24: "s_memtime",
+    0x25: "s_memrealtime",
+    0x26: "s_atc_probe",
+    0x27: "s_atc_probe_buffer",
 }
+
+# SMEM ops that take no operands (cache control) and ops whose sdata field is a 7-bit probe immediate.
+SMEM_NO_OPERANDS = frozenset({0x1f, 0x20, 0x21})
+SMEM_PROBE_OPS = frozenset({0x26, 0x27})
 
 SMEM_WIDTHS = {
     0x00: (1, 2), 0x01: (2, 2), 0x02: (4, 2), 0x03: (8, 2), 0x04: (16, 2),
     0x08: (1, 4), 0x09: (2, 4), 0x0a: (4, 4), 0x0b: (8, 4), 0x0c: (16, 4),
+    0x18: (1, 4), 0x19: (2, 4), 0x1a: (4, 4),
+    0x24: (2, 0), 0x25: (2, 0),
+    0x26: (0, 2), 0x27: (0, 4),
 }
 
 MIMG_OPS = {
@@ -882,16 +904,20 @@ VOP3_NATIVE_OPS = {
     0x168: ("v_ldexp_f64", "V_LDEXP_F64 (VOP3A)", 2, False, 2, (2, 1)),
     0x169: ("v_mul_lo_u32", "V_MUL_LO_U32 (VOP3A)", 2, False, 1, (1, 1)),
     0x16a: ("v_mul_hi_u32", "V_MUL_HI_U32 (VOP3A)", 2, False, 1, (1, 1)),
+    0x16b: ("v_mul_lo_i32", "V_MUL_LO_I32 (VOP3A)", 2, False, 1, (1, 1)),
     0x16c: ("v_mul_hi_i32", "V_MUL_HI_I32 (VOP3A)", 2, False, 1, (1, 1)),
     0x16d: ("v_div_scale_f32", "V_DIV_SCALE_F32 (VOP3B)", 3, True, 1, (1, 1, 1)),
     0x16e: ("v_div_scale_f64", "V_DIV_SCALE_F64 (VOP3B)", 3, True, 2, (2, 2, 2)),
     0x16f: ("v_div_fmas_f32", "V_DIV_FMAS_F32 (VOP3A)", 3, False, 1, (1, 1, 1)),
     0x170: ("v_div_fmas_f64", "V_DIV_FMAS_F64 (VOP3A)", 3, False, 2, (2, 2, 2)),
     0x171: ("v_msad_u8", "V_MSAD_U8 (VOP3A)", 3, False, 1, (1, 1, 1)),
+    0x172: ("v_qsad_pk_u16_u8", "V_QSAD_PK_U16_U8 (VOP3A)", 3, False, 2, (2, 1, 2)),
+    0x173: ("v_mqsad_pk_u16_u8", "V_MQSAD_PK_U16_U8 (VOP3A)", 3, False, 2, (2, 1, 2)),
     0x174: ("v_trig_preop_f64", "V_TRIG_PREOP_F64 (VOP3A)", 2, False, 2, (2, 1)),
     0x176: ("v_mad_u64_u32", "V_MAD_U64_U32 (VOP3B)", 3, True, 2, (1, 1, 2)),
     0x177: ("v_mad_i64_i32", "V_MAD_I64_I32 (VOP3B)", 3, True, 2, (1, 1, 2)),
     0x178: ("v_xor3_b32", "V_XOR3_B32 (VOP3A)", 3, False, 1, (1, 1, 1)),
+    0x202: ("v_interp_mov_f32_e64", "V_INTERP_MOV_F32 (VOP3A)", 2, False, 1, (1, 1)),
     0x2ff: ("v_lshlrev_b64", "V_LSHLREV_B64 (VOP3A)", 2, False, 2, (1, 2)),
     0x300: ("v_lshrrev_b64", "V_LSHRREV_B64 (VOP3A)", 2, False, 2, (1, 2)),
     0x301: ("v_ashrrev_i64", "V_ASHRREV_I64 (VOP3A)", 2, False, 2, (1, 2)),
@@ -950,6 +976,51 @@ VOP3_NATIVE_OPS = {
     0x376: ("v_sub_nc_i32", "V_SUB_NC_I32 (VOP3A)", 2, False, 1, (1, 1)),
     0x37f: ("v_add_nc_i32", "V_ADD_NC_I32 (VOP3A)", 2, False, 1, (1, 1)),
 }
+
+
+# gfx1013 VOP3 forms whose modifier grammar is narrower than the generic VOP3A decode:
+# name -> (clamp allowed, omod allowed). llvm-mc rejects abs and neg on all of them, and both the
+# assembler and the disassembler ignore the op_sel bits, so a word with those bits set is not decoded.
+VOP3_RESTRICTED_MODIFIERS = {
+    "v_mul_lo_i32": (False, False),
+    "v_qsad_pk_u16_u8": (True, False),
+    "v_mqsad_pk_u16_u8": (True, False),
+    "v_interp_mov_f32_e64": (True, True),
+}
+
+# The v_interp_mov_f32_e64 parameter selector (src1 field): p10, p20 and p0.
+VINTRP_MOV_PARAMS = ("p10", "p20", "p0")
+
+
+def _vop3_output_modifiers(clamp: int, omod: int) -> str:
+    """Return the trailing clamp and output-modifier spelling of a VOP3 instruction."""
+    text = " clamp" if clamp else ""
+    return text + {1: " mul:2", 2: " mul:4", 3: " div:2"}.get(omod, "")
+
+
+def _vop3_restricted_encoding_is_valid(op_name: str, arity: int, w0: int, w1: int) -> bool:
+    """Check a restricted VOP3 word against the modifier grammar llvm-mc accepts for gfx1013."""
+    allow_clamp, allow_omod = VOP3_RESTRICTED_MODIFIERS[op_name]
+    if (w0 >> 8) & 0x7 or (w1 >> 29) & 0x7:
+        return False
+    if ((w0 >> 15) & 1 and not allow_clamp) or ((w1 >> 27) & 0x3 and not allow_omod):
+        return False
+    if arity < 3 and (w1 >> 18) & 0x1ff:
+        return False
+    if op_name == "v_interp_mov_f32_e64":
+        # src0 holds attr[5:0] and channel[7:6] only; src1 selects p10, p20 or p0.
+        return not (w1 & 0x100) and ((w1 >> 9) & 0x1ff) < len(VINTRP_MOV_PARAMS)
+    return True
+
+
+def _decode_interp_mov_e64(w0: int, w1: int, comment: str) -> tuple[int, str, str, str]:
+    """Decode the VOP3 spelling of v_interp_mov_f32 for a word that already passed validation."""
+    attr = w1 & 0x3f
+    channel = "xyzw"[(w1 >> 6) & 0x3]
+    param = VINTRP_MOV_PARAMS[(w1 >> 9) & 0x1ff]
+    asm = f"v_interp_mov_f32_e64 v{w0 & 0xff}, {param}, attr{attr}.{channel}"
+    asm += _vop3_output_modifiers((w0 >> 15) & 1, (w1 >> 27) & 0x3)
+    return (8, "v_interp_mov_f32_e64", asm, comment)
 
 
 VOP3P_OPS = {
@@ -1028,6 +1099,8 @@ MUBUF_OPS = {
     0x23: ("buffer_load_sbyte_d16_hi", 1, "Buffer load signed byte to high 16 bits"),
     0x24: ("buffer_load_short_d16", 1, "Buffer load 16-bit short to low 16 bits"),
     0x25: ("buffer_load_short_d16_hi", 1, "Buffer load 16-bit short to high 16 bits"),
+    0x26: ("buffer_load_format_d16_hi_x", 1, "Buffer format load of one 16-bit component to the high 16 bits"),
+    0x27: ("buffer_store_format_d16_hi_x", 1, "Buffer format store of one 16-bit component from the high 16 bits"),
     0x30: ("buffer_atomic_swap", 1, "Buffer atomic swap 32-bit"),
     0x31: ("buffer_atomic_cmpswap", 2, "Buffer atomic compare-and-swap 32-bit"),
     0x32: ("buffer_atomic_add", 1, "Buffer atomic add 32-bit"),
@@ -1071,6 +1144,9 @@ MUBUF_OPS = {
     0x86: ("buffer_store_format_d16_xyz", 2, "Buffer format store 3 packed 16-bit channels"),
     0x87: ("buffer_store_format_d16_xyzw", 2, "Buffer format store 4 packed 16-bit channels"),
 }
+
+# The two high-half single-component format ops: spelled by llvm-mc 19 only (llvm-mc 15 rejects them on gfx1013).
+MUBUF_D16_HI_FORMAT_OPS = {"buffer_load_format_d16_hi_x", "buffer_store_format_d16_hi_x"}
 
 # GFX1013 / RDNA 2 MTBUF opcodes: op -> (mnemonic, vdata_width, comment)
 MTBUF_OPS = {
@@ -2148,7 +2224,17 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         sbase = (w0 & 0x3f) * 2
         op_name = SMEM_OPS.get(op, f"s_smem_{op:02x}")
         data_width, base_width = SMEM_WIDTHS.get(op, (4, 2))
-        sdata_str = decode_s_reg(sdata) if data_width == 1 else f"s[{sdata}:{sdata + data_width - 1}]"
+        if op in SMEM_NO_OPERANDS:
+            return (8, op_name, op_name, "Scalar memory cache control")
+        if op in SMEM_PROBE_OPS:
+            sdata_str = str(sdata)
+        else:
+            sdata_str = decode_s_reg(sdata) if data_width == 1 else f"s[{sdata}:{sdata + data_width - 1}]"
+        if base_width == 0:
+            # s_memtime / s_memrealtime read no memory address: only the destination pair.
+            # Named 64-bit specials (vcc, ttmp pairs, null) keep their spelling.
+            timer_dst = decode_s_reg64(sdata) if sdata >= 106 else sdata_str
+            return (8, op_name, f"{op_name} {timer_dst}", "Read a 64-bit hardware timer")
         if base_width == 2 and sbase == 106:
             sbase_str = "vcc"
         else:
@@ -2169,6 +2255,10 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         mod_str = (" " + " ".join(mods)) if mods else ""
         asm = f"{op_name} {sdata_str}, {sbase_str}, {off_str}{mod_str}"
         comment = "Scalar memory load from constant buffer/resource descriptor"
+        if op in (0x18, 0x19, 0x1a):
+            comment = "Scalar memory store to a buffer resource"
+        elif op in SMEM_PROBE_OPS:
+            comment = "Probe the address translation cache"
         return (8, op_name, asm, comment)
 
     # 11. MIMG: 64-bit + optional NSA dwords [31:26] == 0b111100 (0xf0000000)
@@ -2326,6 +2416,12 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             return (8, op_name, op_name, comment)
         allow_lds = op_name.startswith("buffer_load_") and "_d16" not in op_name
         allow_tfe = not op_name.startswith("buffer_atomic_")
+        if op_name in MUBUF_D16_HI_FORMAT_OPS:
+            # llvm-mc rejects the lds bit on these. With tfe set it prints the extra status dword in the vdata range.
+            vdata_width += (w1 >> 23) & 1
+            if (w0 >> 16) & 1 or ((w1 >> 8) & 0xff) + vdata_width > 256:
+                return (8, f"{op_name}_unsupported", f"{op_name} <unsupported MUBUF encoding>",
+                        f"{op_name} word with the lds bit or a VGPR range past v255 that gfx1013 llvm-mc rejects")
         operands, mods = _format_buffer_operands_and_mods(
             w0, w1, vdata_width, allow_lds=allow_lds, allow_tfe=allow_tfe
         )
@@ -2479,6 +2575,14 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         if op_name == "v_nop":
             return (8, "v_nop", "v_nop", "Vector no-op (VOP3A)")
 
+        restricted = op_name in VOP3_RESTRICTED_MODIFIERS
+        if restricted:
+            if not _vop3_restricted_encoding_is_valid(op_name, arity, w0, w1):
+                return (8, f"{op_name}_unsupported", f"{op_name} <unsupported VOP3A encoding>",
+                        f"{op_name} word with modifier bits that gfx1013 llvm-mc rejects")
+            if op_name == "v_interp_mov_f32_e64":
+                return _decode_interp_mov_e64(w0, w1, comment)
+
         has_literal = (arity >= 1 and src0 == 255) or (arity >= 2 and src1 == 255) or (arity >= 3 and src2 == 255)
         length = 8
         literal = None
@@ -2495,7 +2599,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         else:
             sdst = None
             abs_bits = [(w0 >> 8) & 1, (w0 >> 9) & 1, (w0 >> 10) & 1]
-            op_sel = [(w0 >> 11) & 1, (w0 >> 12) & 1, (w0 >> 13) & 1, (w0 >> 14) & 1]
+            op_sel = [0, 0, 0, 0] if restricted else [(w0 >> 11) & 1, (w0 >> 12) & 1, (w0 >> 13) & 1, (w0 >> 14) & 1]
 
         def vop3_operand(reg_id: int, is_abs: int, is_neg: int, width: int = 1) -> str:
             if reg_id == 255 and literal is not None:
@@ -2526,15 +2630,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             else:
                 asm += f" op_sel:[{','.join(str(b) for b in op_sel[:3])}]"
 
-        if clamp:
-            asm += " clamp"
-
-        if omod == 1:
-            asm += " mul:2"
-        elif omod == 2:
-            asm += " mul:4"
-        elif omod == 3:
-            asm += " div:2"
+        asm += _vop3_output_modifiers(clamp, omod)
 
         return (length, op_name, asm, comment)
 

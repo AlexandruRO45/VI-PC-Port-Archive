@@ -266,6 +266,14 @@ class Wave:
             "v_mul_f32_e32",
             "v_mul_f32_e64",
             "v_fma_f32",
+            "v_cvt_f32_u32_e32",
+            "v_cvt_f32_u32_e64",
+            "v_cvt_f32_i32_e32",
+            "v_cvt_f32_i32_e64",
+            "v_min_f32_e32",
+            "v_min_f32_e64",
+            "v_max_f32_e32",
+            "v_max_f32_e64",
         }
         for lane in live:
             vals = [self.lane_value(t, lane) for t in src]
@@ -333,6 +341,14 @@ class Wave:
                     expr = f"({x} - {y})"
                 elif op.startswith("v_subrev_f32_"):
                     expr = f"({y} - {x})"
+                elif op.startswith("v_cvt_f32_"):
+                    # The source is an integer word, never a float expression.
+                    if not isinstance(a, int):
+                        raise ValueError("Integer conversion requires a concrete operand")
+                    word = f"0x{a & U32:08x}u"
+                    expr = f"float({word})" if "_u32_" in op else f"float(asint({word}))"
+                elif op.startswith(("v_min_f32_", "v_max_f32_")):
+                    expr = f"{op[2:5]}({x}, {y})"
                 else:
                     expr = f"({x} + {y})"
                 if expr not in expressions:

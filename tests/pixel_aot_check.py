@@ -924,6 +924,16 @@ def region_wait_program(forms, opener="cmpx", skip=False):
     return offset_pairs(program)
 
 
+def region_load_skip_asm(opener):
+    """region_load_program with the skip as assembler text: the branch names its restore label instead."""
+    restore = REGION_WAIT_OPENERS[opener][1]
+    program = [line for _, line in region_load_program(REGION_LOAD_INSIDE, opener, skip=True)]
+    branch = next(i for i, line in enumerate(program) if line.startswith("s_cbranch_execz"))
+    program[branch] = "s_cbranch_execz .Lload_restore"
+    program.insert(program.index(restore), ".Lload_restore:")
+    return program
+
+
 def region_wait_skip_asm(forms, opener):
     """region_wait_program with the skip as assembler text: the branch names its restore label instead."""
     restore = REGION_WAIT_OPENERS[opener][1]
@@ -934,7 +944,18 @@ def region_wait_skip_asm(forms, opener):
     return program
 
 
-def region_wait_early(slot, body, opener):
+def add_region_skip(program, last_opener_line, restore):
+    """Insert an s_cbranch_execz after last_opener_line that targets restore, as (offset, text) pairs."""
+    program = list(program)
+    branch = program.index(last_opener_line) + 1
+    program.insert(branch, "s_cbranch_execz 0")
+    pairs = offset_pairs(program)
+    target = program.index(restore)
+    program[branch] = f"s_cbranch_execz {(pairs[target][0] - pairs[branch][0] - 4) // 4}"
+    return offset_pairs(program)
+
+
+def region_wait_early(slot, body, opener, skip=False, after=()):
     """A region opened while a load is outstanding: right after the prologue's s_buffer_load_dwordx4 ("lgkm+vm":
     the buffer load and the sample) or after its lgkmcnt(0) wait ("vm": the sample only). The region decides on
     v21 = 1.0, so it reads no register an outstanding load writes."""
@@ -946,7 +967,9 @@ def region_wait_early(slot, body, opener):
         region = ["v_cmp_lt_f32_e64 vcc_lo, v21, 0.5", "s_and_saveexec_b64 s[60:61], vcc", body,
                   "v_mov_b32_e32 v20, 1.0", CMPX_OR_RESTORE]
     at = load + (1 if slot == "lgkm+vm" else 2)
-    program[at:at] = ["v_mov_b32_e32 v21, 1.0", *region]
+    program[at:at] = ["v_mov_b32_e32 v21, 1.0", *region, *after]
+    if skip:
+        return add_region_skip(program, region[1], region[-1])
     return program
 
 
@@ -966,26 +989,29 @@ def check_region_wait_controls():
             for forms in (*((form,) for form in REGION_WAIT_FORMS), REGION_WAIT_FORMS):
                 lowered = lowered_shape(translate(region_wait_program(forms, opener, skip)))
                 assert lowered == reference, (opener, skip, forms)
-    # Per counter: with the buffer load and the sample outstanding, and with the sample only.
-    refused = {
-        "lgkm+vm": {"s_waitcnt lgkmcnt(0)": "lgkm", "s_waitcnt lgkmcnt(1)": "lgkm", "s_waitcnt vmcnt(0)": "vm",
-                    "s_waitcnt vmcnt(3)": "vm", "s_waitcnt 0": "lgkm/vm", "s_waitcnt vmcnt(0) lgkmcnt(0)": "lgkm/vm",
-                    "s_waitcnt_lgkmcnt null, 0x0": "lgkm", "s_waitcnt_vmcnt null, 0x0": "vm"},
-        "vm": {"s_waitcnt vmcnt(0)": "vm", "s_waitcnt vmcnt(3)": "vm", "s_waitcnt 0": "vm",
-               "s_waitcnt vmcnt(0) lgkmcnt(0)": "vm", "s_waitcnt_vmcnt null, 0x0": "vm"},
-    }
-    admitted = {
-        "lgkm+vm": ("s_nop 0", "s_waitcnt expcnt(0)", "s_waitcnt_expcnt null, 0x0", "s_waitcnt_vscnt null, 0x0"),
-        "vm": ("s_nop 0", "s_waitcnt lgkmcnt(0)", "s_waitcnt lgkmcnt(1)", "s_waitcnt_lgkmcnt null, 0x0",
-               "s_waitcnt expcnt(0)", "s_waitcnt_vscnt null, 0x0"),
+    # Stage 3: with the buffer load and the sample outstanding, and with the sample only, every wait form is
+    # admitted in both openers, with and without the skip.
+    resolving = {
+        "lgkm+vm": ("s_waitcnt lgkmcnt(0)", "s_waitcnt lgkmcnt(1)", "s_waitcnt vmcnt(0)", "s_waitcnt vmcnt(3)",
+                    "s_waitcnt 0", "s_waitcnt vmcnt(0) lgkmcnt(0)", "s_waitcnt_lgkmcnt null, 0x0",
+                    "s_waitcnt_vmcnt null, 0x0", "s_nop 0", "s_waitcnt expcnt(0)", "s_waitcnt_expcnt null, 0x0",
+                    "s_waitcnt_vscnt null, 0x0"),
+        "vm": ("s_waitcnt vmcnt(0)", "s_waitcnt vmcnt(3)", "s_waitcnt 0", "s_waitcnt vmcnt(0) lgkmcnt(0)",
+               "s_waitcnt_vmcnt null, 0x0", "s_nop 0", "s_waitcnt lgkmcnt(0)", "s_waitcnt lgkmcnt(1)",
+               "s_waitcnt_lgkmcnt null, 0x0", "s_waitcnt expcnt(0)", "s_waitcnt_vscnt null, 0x0"),
     }
     for opener in REGION_WAIT_OPENERS:
-        for slot in refused:
-            for body, busy in refused[slot].items():
-                expect_value_error(translate, region_wait_early(slot, body, opener),
-                                   f"Wait would resolve outstanding {busy} work in a masked region: {body}")
-            for body in admitted[slot]:
-                translate(region_wait_early(slot, body, opener))
+        for slot, bodies in resolving.items():
+            for body in bodies:
+                for skip in (False, True):
+                    translate(region_wait_early(slot, body, opener, skip))
+        # A wait that resolves the sample inside the region makes its result readable there, not after a skip:
+        # the wave that skipped never ran the wait.
+        inside = "s_waitcnt vmcnt(0)"
+        translate(region_wait_early("vm", inside, opener, False, ("v_mov_b32_e32 v23, v12",)))
+        expect_value_error(translate, region_wait_early("vm", inside, opener, True, ("v_mov_b32_e32 v23, v12",)),
+                           "Sample used before vmcnt wait")
+        translate(region_wait_early("vm", inside, opener, True, ("s_waitcnt vmcnt(0)", "v_mov_b32_e32 v23, v12")))
     # The store counter is not tracked: after a scratch store, vscnt stays refused inside a region.
     store = ["s_mov_b32 s48, 0", "v_mov_b32_e32 v10, s44", "scratch_store_dword off, v10, s48 offset:16"]
     for opener, (save, restore) in REGION_WAIT_OPENERS.items():
@@ -1007,6 +1033,119 @@ def check_region_wait_controls():
         branch = next(i for i, line in enumerate(skipped) if line.startswith("s_cbranch_execz"))
         skipped.insert(branch, "s_nop 0")
         expect_value_error(translate, offset_pairs(skipped), "Instruction cannot run in a masked region: s_cbranch_execz")
+
+
+REGION_LOAD_PREFIX = ("s_load_dwordx4 s[68:71], s[20:21], 0x40", "s_waitcnt lgkmcnt(0)")
+
+
+def region_load_program(inside, opener="cmpx", skip=False, before=(), after=()):
+    """A constant descriptor in s68 to s71, then before, then inside the masked region, then after. The region
+    decides on the sample as the other region programs do; constant words 8 to 11 sit at byte offsets 0x20 to 0x2c."""
+    save, restore = REGION_WAIT_OPENERS[opener]
+    program = uncompressed_export([*REGION_LOAD_PREFIX, *before, *save, *inside, restore, *after])
+    return add_region_skip(program, save[-1], restore) if skip else program
+
+
+# Constant words 8 to 10 as the draw reads them: s72 = word 8, s75 = word 10 of an x2 load into s[74:75].
+REGION_LOAD_INSIDE = ("s_buffer_load_dword s72, s[68:71], 0x20", "s_buffer_load_dwordx2 s[74:75], s[68:71], 0x24",
+                      "s_waitcnt lgkmcnt(0)", "v_mov_b32_e32 v13, s72", "v_mov_b32_e32 v14, s75")
+# One load outstanding at the opener (word 11 into s76), resolved by the wait inside the region.
+REGION_LOAD_RESOLVE = ("s_buffer_load_dword s76, s[68:71], 0x2c",)
+
+
+def check_region_scalar_load_controls():
+    """Stage 3 of #987: scalar loads and the waits that resolve them sit in a region. The loads run on every wave
+    that enters it, so a wave that skips it leaves them undone and outstanding: nothing after the region may read."""
+    for opener in REGION_WAIT_OPENERS:
+        for skip in (False, True):
+            source = translate(region_load_program(REGION_LOAD_INSIDE, opener, skip))
+            assert "precise float alu" in source and "[2].x" in source and "[2].z" in source, source
+            # A load inside the region is read there. After it the register is usable only when no wave can skip.
+            after = ("v_mov_b32_e32 v15, s72",)
+            if skip:
+                expect_value_error(translate, region_load_program(REGION_LOAD_INSIDE, opener, skip, after=after),
+                                   "Read of a register defined only on the masked path")
+                translate(region_load_program(
+                    REGION_LOAD_INSIDE, opener, skip, after=("s_buffer_load_dword s72, s[68:71], 0x20",
+                                                             "s_waitcnt lgkmcnt(0)", *after)))
+            else:
+                translate(region_load_program(REGION_LOAD_INSIDE, opener, skip, after=after))
+            if not skip:
+                # No wave can skip this region, so its load supersedes an earlier conditional write of the register:
+                # one in the same region and one left by an earlier region.
+                redefined = ("s_mov_b32 s72, 0", "s_buffer_load_dword s72, s[68:71], 0x20", "s_waitcnt lgkmcnt(0)")
+                translate(region_load_program(redefined, opener, skip, after=("v_mov_b32_e32 v15, s72",)))
+                save, restore = REGION_WAIT_OPENERS[opener]
+                reload = ("s_buffer_load_dword s72, s[68:71], 0x20", "s_waitcnt lgkmcnt(0)", "v_mov_b32_e32 v13, s72")
+                translate(region_load_program(reload, opener, skip, before=(*save, "s_mov_b32 s72, 0", restore)))
+            # Reading a loaded word before any wait stays refused, inside the region too.
+            expect_value_error(translate, region_load_program(
+                ("s_buffer_load_dword s72, s[68:71], 0x20", "v_mov_b32_e32 v13, s72"), opener, skip),
+                "Constant read before load completion")
+            # An outstanding load at the opener is resolved by a wait inside it. After a skip it is still
+            # outstanding, so the first read must come after a wait outside.
+            inside = ("s_waitcnt lgkmcnt(0)", "v_mov_b32_e32 v13, s76")
+            read = ("v_mov_b32_e32 v14, s76",)
+            program = region_load_program(inside, opener, skip, before=REGION_LOAD_RESOLVE, after=read)
+            if skip:
+                expect_value_error(translate, program, "Constant read before load completion")
+                translate(region_load_program(inside, opener, skip, before=REGION_LOAD_RESOLVE,
+                                              after=("s_waitcnt lgkmcnt(0)", *read)))
+            else:
+                translate(program)
+            # A load may not overwrite the saved execution pair, and needs a resolved constant binding.
+            expect_value_error(translate, region_load_program(
+                ("s_buffer_load_dword s60, s[68:71], 0x20",), opener, skip),
+                "Masked scalar load overwrites the saved execution pair")
+            expect_value_error(translate, region_load_program(
+                ("s_buffer_load_dword s72, s[44:47], 0x10",), opener, skip), "Unresolved constant buffer binding")
+            expect_value_error(translate, region_load_program(
+                ("s_buffer_load_dword s72, s[68:71], 0x100",), opener, skip),
+                "Constant read exceeds binding or is unaligned")
+
+
+def region_load_pixels(threshold):
+    """The reference computed here, from the constants the draw writes: where the sample is below the threshold
+    v13 = word 8 and v14 = word 10, elsewhere the sample's own green and blue."""
+    return masked_pixels(threshold, (REGION_LOAD_WORDS[0], REGION_LOAD_WORDS[2]), False)
+
+
+REGION_LOAD_WORDS = (0.25, 0.5, 0.75)
+
+
+def check_region_scalar_load_draw(directory, compiler, renderer, backend):
+    """Draw loads and waits inside both openers, with and without the skip, under mixed, full and empty masks."""
+    source = directory / "region-scalar-load.hlsl"
+    shader = directory / "region-scalar-load.cso"
+    constants = bytearray(256)
+    struct.pack_into("<3f", constants, 32, *REGION_LOAD_WORDS)
+    for opener in REGION_WAIT_OPENERS:
+        for skip in (False, True):
+            label = f"{opener}-{'skip' if skip else 'plain'}"
+            source.write_text(translate(region_load_program(REGION_LOAD_INSIDE, opener, skip)), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            cases = []
+            for threshold in (0.5, 10.0, -1.0):
+                struct.pack_into("<4f", constants, 12, threshold, 0.0, 0.0, 0.0)
+                case = directory / f"region-scalar-load-{label}-{len(cases)}.case"
+                write_case(case, constants, region_load_pixels(threshold))
+                cases.append((case, "pass"))
+            # Wrong word: the middle word of the x2 load (s74) instead of the one the program reads (s75).
+            struct.pack_into("<4f", constants, 12, 10.0, 0.0, 0.0, 0.0)
+            case = directory / f"region-scalar-load-{label}-word.case"
+            write_case(case, constants, masked_pixels(10.0, (REGION_LOAD_WORDS[0], REGION_LOAD_WORDS[1]), False))
+            cases.append((case, "mismatch"))
+            # Wrong reference: the writes applied to every lane, as if the region ignored the mask.
+            struct.pack_into("<4f", constants, 12, 0.5, 0.0, 0.0, 0.0)
+            case = directory / f"region-scalar-load-{label}-unmasked.case"
+            write_case(case, constants, region_load_pixels(10.0))
+            cases.append((case, "mismatch"))
+            try:
+                run_pixel_batch(renderer, backend, shader, cases)
+            except AssertionError as error:
+                error.add_note(f"Region scalar load draw on {backend}: {label}")
+                raise
+    return 0
 
 
 def check_region_wait_draw(directory, compiler, renderer, backend):
@@ -1066,11 +1205,10 @@ def check_region_scalar_alu_controls():
                 region_scalar_alu_program(
                     opener=opener, body=(f"s_mov_b32 {register}, 0",)),
                 "overwrites the saved execution pair")
-        # Unknown source values, loads, and modeled-but-out-of-slice scalar forms stay refused.
+        # Unknown source values and modeled-but-out-of-slice scalar forms stay refused.
         must_reject(translate, region_scalar_alu_program(
             opener=opener, body=("s_add_i32 s54, s70, 1",)))
-        for body in ("s_abs_i32 s52, s53", "s_add_u32 s52, s53, 1",
-                     "s_buffer_load_dword s70, s[44:47], 0x10"):
+        for body in ("s_abs_i32 s52, s53", "s_add_u32 s52, s53, 1"):
             expect_value_error(
                 translate,
                 region_scalar_alu_program(opener=opener, body=(body,)),
@@ -12156,6 +12294,7 @@ def check_controls(directory):
     check_region_body_controls()
     check_region_wait_controls()
     check_region_scalar_alu_controls()
+    check_region_scalar_load_controls()
     check_pk_fmac_controls()
     check_title_load_controls()
     check_ds_swizzle_controls()
@@ -14257,6 +14396,9 @@ def check_binary(directory, assembler, objcopy, library):
         fixtures.append((region_wait_program(REGION_WAIT_FORMS, opener), translate))
         fixtures.append((region_wait_skip_asm(REGION_WAIT_FORMS, opener), translate, "gfx1013", "",
                          region_wait_program(REGION_WAIT_FORMS, opener, skip=True)))
+        fixtures.append((region_load_program(REGION_LOAD_INSIDE, opener), translate))
+        fixtures.append((region_load_skip_asm(opener), translate, "gfx1013", "",
+                         region_load_program(REGION_LOAD_INSIDE, opener, skip=True)))
         fixtures.append((region_scalar_alu_program(opener=opener), translate))
         fixtures.append((region_scalar_alu_skip_asm(opener), translate, "gfx1013", "",
                          region_scalar_alu_program(opener=opener, skip=True)))
@@ -19191,7 +19333,7 @@ def main():
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
                     "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions",
-                    "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-div-fmas",
+                    "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-region-scalar-load", "draw-div-fmas",
                     "draw-cmp64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers",
                     "draw-dpp-cvt", "draw-dpp-movrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
@@ -19233,6 +19375,7 @@ def main():
                         "draw-region-body": check_region_body_draw,
                         "draw-region-waits": check_region_wait_draw,
                         "draw-region-scalar-alu": check_region_scalar_alu_draw,
+                        "draw-region-scalar-load": check_region_scalar_load_draw,
                         "draw-div-fmas": check_valu_div_fmas_draw,
                         "draw-cmp64": check_cmp64_draw,
                         "draw-shift64": check_shift64_draw,

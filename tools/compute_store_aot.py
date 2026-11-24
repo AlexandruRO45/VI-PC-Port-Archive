@@ -183,7 +183,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         scalar[reg] = ("group", axis)
     vector = {axis: ("local", axis) for axis in range(3) if axis == 0 or dims[axis] > 1}
     pending = set()
-    # VGPRs a buffer_load_dword still writes, with the word they receive (None when unknown);
+    # VGPRs a buffer read still writes, with the word they receive (None when unknown);
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
@@ -515,35 +515,73 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 vector[regs[0]] = lds_word
             lds_word = ("alu", expression)
             ds_wait = True
-        elif m := re.fullmatch(r"ds_cmpst(?P<ret>_rtn)?_f64 "
-                               r"(?:(v\[\d+:\d+\]), )?v(\d+), (v\[\d+:\d+\]), (v\[\d+:\d+\])"
+        elif m := re.fullmatch(r"ds_(cmpst|min|max)(?P<ret>_rtn)?_f64 "
+                               r"(?:(v\[\d+:\d+\]), )?v(\d+), (v\[\d+:\d+\])(?:, (v\[\d+:\d+\]))?"
                                r"(?: offset:(0|8))?", line):
-            returns, dest, addr, compare, replacement, offset = m.groups()
+            op, returns, dest, addr, compare, replacement, offset = m.groups()
             if lds_f64_mode != "normal":
                 raise ValueError("Unverified private LDS binary64 mode")
             slot = int(offset or 0) // 4
             prev = tuple(lds_wide_words.get(i) for i in range(slot, slot + 2))
             if (guard_span is not None or vector.get(int(addr)) != ("lds_wide_address",)
-                    or bool(returns) != (dest is not None) or not all(map(is_word, prev))):
+                    or bool(returns) != (dest is not None) or (op == "cmpst") != (replacement is not None)
+                    or not all(map(is_word, prev))):
                 raise ValueError("Unverified private LDS binary64 access")
             ranges = []
-            for operand in (compare, replacement) + ((dest,) if dest else ()):
+            for operand in (operand for operand in (compare, replacement, dest) if operand is not None):
                 first, last = map(int, operand[2:-1].split(":"))
                 if last > 255 or last != first + 1:
                     raise ValueError("Unverified private LDS binary64 range")
                 ranges.append((first, last))
-            cmp_word, new_word = (tuple(vector.get(i) for i in regs) for regs in ranges[:2])
+            cmp_word = tuple(vector.get(i) for i in ranges[0])
+            new_word = tuple(vector.get(i) for i in ranges[1]) if replacement else cmp_word
             if not all(map(is_word, cmp_word + new_word)):
                 raise ValueError("Unverified private LDS binary64 source")
-            old_lo, old_hi = map(hlsl_word, prev)
-            cmp_lo, cmp_hi = map(hlsl_word, cmp_word)
-            condition = f"({old_lo} == {cmp_lo} && {old_hi} == {cmp_hi})"
-            update = [f"({condition} ? {hlsl_word(new)} : {hlsl_word(old)})" for new, old in zip(new_word, prev)]
-            if any(len(word) > ALU_EXPRESSION_LIMIT for word in update):
+            inputs = tuple(map(hlsl_word, prev + cmp_word + new_word))
+            if len(ds_steps) >= 64 or any(len(word) > ALU_EXPRESSION_LIMIT for word in inputs):
                 raise ValueError("LDS expression exceeds the profile limit")
+            prefix = f"ds_f64_{len(ds_steps)}"
+            old_lo, old_hi, cmp_lo, cmp_hi, new_lo, new_hi = (
+                f"{prefix}_{suffix}" for suffix in ("old_lo", "old_hi", "cmp_lo", "cmp_hi", "new_lo", "new_hi")
+            )
+            if op == "cmpst":
+                condition = f"({old_lo} == {cmp_lo} && {old_hi} == {cmp_hi})"
+            else:
+                # For equal signs, compare the full bit patterns in the
+                # opposite direction for negative numbers. Handle signs first.
+                below = f"({cmp_hi} < {old_hi} || ({cmp_hi} == {old_hi} && {cmp_lo} < {old_lo}))"
+                above = f"({cmp_hi} > {old_hi} || ({cmp_hi} == {old_hi} && {cmp_lo} > {old_lo}))"
+                opposite = f"(({cmp_hi} ^ {old_hi}) & 0x80000000u) != 0u"
+                negative = f"({cmp_hi} & 0x80000000u) != 0u"
+                if op == "min":
+                    condition = f"({opposite} ? ({negative}) : (({negative}) ? {above} : {below}))"
+                else:
+                    condition = f"({opposite} ? !({negative}) : (({negative}) ? {below} : {above}))"
+            names = (old_lo, old_hi, cmp_lo, cmp_hi, new_lo, new_hi)
+            take = f"{prefix}_take"
+            statements = [f"    uint {name} = {word};" for name, word in zip(names, inputs)]
+            statements.append(f"    bool {take} = {condition};")
+            ds_steps.append((None, "\n".join(statements)))
+            update = (f"({take} ? {new_lo} : {old_lo})", f"({take} ? {new_hi} : {old_hi})")
             if dest:
-                vector.update(zip(ranges[2], prev))
+                vector.update(zip(ranges[-1], prev))
             lds_wide_words.update((slot + i, ("alu", word)) for i, word in enumerate(update))
+            ds_wait = True
+        elif m := re.fullmatch(r"ds_wrxchg2_rtn_b64 v\[(\d+):(\d+)\], v(\d+), "
+                               r"v\[(\d+):(\d+)\], v\[(\d+):(\d+)\]"
+                               r"(?: offset0:([01]))?(?: offset1:([01]))?", line):
+            dst, last, addr, first0, last0, first1, last1 = map(int, m.groups()[:7])
+            offsets = tuple(int(offset or 0) for offset in m.groups()[7:])
+            if (guard_span is not None or vector.get(addr) != ("lds_wide_address",) or offsets[0] == offsets[1]
+                    or max(last, last0, last1) > 255 or last != dst + 3 or last0 != first0 + 1 or last1 != first1 + 1):
+                raise ValueError("Unverified private paired qword exchange")
+            slots = [2 * offset + i for offset in offsets for i in range(2)]
+            previous = [lds_wide_words.get(slot) for slot in slots]
+            data = [vector.get(reg) for reg in (first0, last0, first1, last1)]
+            if not all(map(is_word, previous + data)):
+                raise ValueError("Uninitialized private paired qword exchange")
+            vector.update(zip(range(dst, last + 1), previous))
+            lds_wide_words.update(zip(slots, data))
             ds_wait = True
         elif m := re.fullmatch(
                 r"ds_((?:cmpst|mskor)(?:_rtn)?|wrxchg_rtn)_b64 "
@@ -942,29 +980,34 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified row pitch byte offset")
             vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
-        elif m := re.fullmatch(r"buffer_load_dword v(\d+), (off|v\d+), s\[(\d+):(\d+)\], 0( idxen)?( offen)?"
-                               r"(?: offset:(\d+))?", line):
-            dst, base, high = int(m[1]), int(m[3]), int(m[4])
-            offset = int(m[7] or 0)
+        elif m := re.fullmatch(r"(?:buffer_load_dword|(?P<typed>tbuffer_load_format_x)) "
+                               r"v(?P<dst>\d+), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
+                               r"(?(typed) format:\[BUF_FMT_32_UINT\])(?P<idxen> idxen)?(?P<offen> offen)?"
+                               r"(?: offset:(?P<offset>\d+))?", line):
+            dst, base, high = int(m["dst"]), int(m["base"]), int(m["high"])
+            offset = int(m["offset"] or 0)
+            addr, idxen, offen = m["addr"], m["idxen"], m["offen"]
+            if m["typed"] and (cpu != "gfx1030" or not idxen or offen):
+                raise ValueError("Unsupported typed buffer read target or address mode")
             if (dst > 255 or high != base + 3 or base % 4 or high > 105
                     or pending.intersection(range(base, high + 1))):
                 raise ValueError("Unverified buffer read descriptor")
-            kinds = {scalar.get(base + i) for i in range(4)}
-            if kinds == {("uav", i) for i in range(4)}:
+            kinds = tuple(scalar.get(base + i) for i in range(4))
+            if kinds == tuple(("uav", i) for i in range(4)):
                 # The store target would need ordering against other invocations' stores.
                 raise ValueError("Reads from the stored UAV are not supported")
-            if kinds != {("srv", i) for i in range(4)}:
+            if kinds != tuple(("srv", i) for i in range(4)):
                 raise ValueError("Unverified buffer read descriptor")
             if offset % 4 or offset > 4095:
                 raise ValueError("Unverified read offset")
-            tag = vector.get(int(m[2][1:])) if m[2] != "off" else None
-            if m[2] == "off" and not m[5] and not m[6]:
+            tag = vector.get(int(addr[1:])) if addr != "off" else None
+            if addr == "off" and not idxen and not offen:
                 address = f"{offset}u"
-            elif (m[6] and not m[5] and isinstance(tag, tuple) and tag[0] == "thread_bytes"
+            elif (offen and not idxen and isinstance(tag, tuple) and tag[0] == "thread_bytes"
                   and 2 <= tag[2] < 32):
                 # A shift below 2 gives unaligned byte offsets, which ByteAddressBuffer.Load cannot express.
                 address = f"(tid.{AXES[tag[1]]} << {tag[2]}u) + {offset}u"
-            elif (m[5] and not m[6] and source_stride is not None and isinstance(tag, tuple)
+            elif (idxen and not offen and source_stride is not None and isinstance(tag, tuple)
                   and tag[0] == "thread"):
                 # idxen: index * stride + instruction offset, inside one source element.
                 if offset + 4 > source_stride:

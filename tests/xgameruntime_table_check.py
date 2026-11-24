@@ -20,7 +20,14 @@ REQUIRED_COMPONENTS = {
     "XAsync",
     "XTaskQueue",
 }
-REQUIRED_IMPLEMENTED = {"XUser", "XGameSave", "XPersistentLocalStorage", "XPackage"}
+REQUIRED_IMPLEMENTED = {
+    "XUser",
+    "XGameSave",
+    "XPersistentLocalStorage",
+    "XPackage",
+    "XSystem",
+    "XGame",
+}
 REQUIRED_IMPLEMENTED_FUNCTIONS = {
     "XPersistentLocalStorageGetPathSize",
     "XPersistentLocalStorageGetPath",
@@ -29,13 +36,16 @@ REQUIRED_IMPLEMENTED_FUNCTIONS = {
     "XPackageGetMountPathSize",
     "XPackageGetMountPath",
     "XPackageCloseMountHandle",
+    "XSystemGetConsoleId",
+    "XSystemGetDeviceType",
+    "XGameGetXboxTitleId",
 }
 REQUIRED_STUBS = {
     "XUserAddAsync",
     "XGameSaveInitializeProviderAsync",
     "XPackageMountWithUiAsync",
 }
-STATES = {"stub", "implemented_hr", "implemented_void"}
+STATES = {"stub", "implemented_hr", "implemented_void", "implemented_value"}
 
 ROW_RE = re.compile(
     r"^X\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*,\s*"
@@ -128,6 +138,8 @@ def validate(source, rows, library, exports):
             errors.append(f"implemented_hr row does not return HRESULT: {name}")
         elif state == "implemented_void" and return_type != "void":
             errors.append(f"implemented_void row does not return void: {name}")
+        elif state == "implemented_value" and return_type == "void":
+            errors.append(f"implemented_value row returns void: {name}")
 
     if library != "xgameruntime":
         errors.append(f"LIBRARY is {library!r}, expected 'xgameruntime'")

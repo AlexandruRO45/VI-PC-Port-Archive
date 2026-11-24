@@ -918,6 +918,24 @@ OperationResult run_wave_shuffle(const OperationContext& ctx)
         "skip: wave shuffle fixture requires SM 6.6 and a supported forced wave width");
 }
 
+OperationResult run_shader_wave(const OperationContext& ctx)
+{
+    return skip_if_false(check_shader_wave(ctx.device, 0),
+                         "skip: shader wave fixture requires SM 6.0 and WaveOps");
+}
+
+OperationResult run_shader_wave32(const OperationContext& ctx)
+{
+    return skip_if_false(check_shader_wave(ctx.device, 32),
+                         "skip: shader wave32 fixture requires SM 6.6, WaveOps, and a 32-lane wave");
+}
+
+OperationResult run_shader_wave64(const OperationContext& ctx)
+{
+    return skip_if_false(check_shader_wave(ctx.device, 64),
+                         "skip: shader wave64 fixture requires SM 6.6, WaveOps, and a 64-lane wave");
+}
+
 template<bool Swapped>
 OperationResult run_descriptor_heap_paging(const OperationContext& ctx)
 {
@@ -954,6 +972,18 @@ constexpr CapabilityGate kGateWave64{
 constexpr CapabilityGate kGateWaveShuffle{
     D3D_SHADER_MODEL_6_5, false, true, 0,
     "skip: wave shuffle fixture requires SM 6.5 and WaveOps",
+    CapsDiagnostic::wave_6_6};
+constexpr CapabilityGate kGateShaderWave{
+    D3D_SHADER_MODEL_6_0, false, true, 0,
+    "skip: shader wave fixture requires SM 6.0 and WaveOps",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateShaderWave32{
+    D3D_SHADER_MODEL_6_6, false, true, 32,
+    "skip: shader wave32 fixture requires SM 6.6, WaveOps, and a 32-lane wave",
+    CapsDiagnostic::wave_6_6};
+constexpr CapabilityGate kGateShaderWave64{
+    D3D_SHADER_MODEL_6_6, false, true, 64,
+    "skip: shader wave64 fixture requires SM 6.6, WaveOps, and a 64-lane wave",
     CapsDiagnostic::wave_6_6};
 constexpr CapabilityGate kGateSm60MeshFallback{
     D3D_SHADER_MODEL_6_0, false, false, 0,
@@ -1090,6 +1120,9 @@ const OperationSpec kOperations[] = {
     {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
     {"--wave64-emulate", 3, 3, nullptr, kNoGate, run_wave64_emulate},
+    {"--shader-wave", 3, 3, nullptr, kGateShaderWave, run_shader_wave},
+    {"--shader-wave32", 3, 3, nullptr, kGateShaderWave32, run_shader_wave32},
+    {"--shader-wave64", 3, 3, nullptr, kGateShaderWave64, run_shader_wave64},
 };
 
 struct DiagnosticTarget {

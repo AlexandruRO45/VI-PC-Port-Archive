@@ -262,6 +262,13 @@ def evaluate_depth(text, inputs):
         return repr(F32(struct.unpack_from("<f", inputs, base + int(m[2]) * 16 + 4 * "xyzw".index(m[3]))[0]))
 
     def value(expr):
+        # Integer conversions of an exact word, as the lowering writes them.
+        expr = re.sub(
+            r"(?<!\w)float\(asint\(0x([0-9a-f]+)u\)\)",
+            lambda m: repr(F32(int(m[1], 16) - (2**32 if int(m[1], 16) >> 31 else 0))),
+            expr,
+        )
+        expr = re.sub(r"(?<!\w)float\(0x([0-9a-f]+)u\)", lambda m: repr(F32(int(m[1], 16))), expr)
         expr = re.sub(r"asfloat\(0x([0-9a-f]+)u\)", word, expr)
         expr = re.sub(r"(point|matrix)Data\[(\d+)\]\.([xyzw])", buffer, expr)
         return eval(re.sub(r"(?<![\w.])(-?\d+\.\d+(?:e[+-]?\d+)?)", r"F32(\1)", expr), {"F32": F32}, names)
@@ -317,6 +324,105 @@ def float_negative_draws(dxc, renderer, adapter, tmp):
         if mismatch(dxc, renderer, adapter, tmp, text, positions) == 77:
             return 77
     return 0
+
+
+CVT_MINMAX_PROGRAM = PROGRAM.copy()
+CVT_MINMAX_PROGRAM[-2:-2] = [
+    # Each converted value is exact in binary32 and is then clamped by a min or max, so an unsigned or signed
+    # reading of the same word, or a min where a max belongs, moves the depth by many orders of magnitude.
+    "v_cvt_f32_u32_e32 v10, 0xc0000000",
+    "v_cvt_f32_i32_e32 v11, 0xc0000000",
+    "v_cvt_f32_u32_e64 v12, 0x80000000",
+    "v_cvt_f32_i32_e64 v13, 0x80000000",
+    "v_mov_b32_e32 v14, 0x3e000000",
+    "v_mov_b32_e32 v15, 0xbd800000",
+    "v_min_f32_e32 v16, 0.5, v10",
+    "v_max_f32_e32 v17, 0xbe800000, v11",
+    "v_min_f32_e64 v18, v12, v14",
+    "v_max_f32_e64 v19, v13, v15",
+    "v_add_f32_e32 v3, v16, v3",
+    "v_add_f32_e32 v3, v17, v3",
+    "v_add_f32_e32 v3, v18, v3",
+    "v_add_f32_e32 v3, v19, v3",
+]
+# Swapping any one opcode for its sibling must change the depth.
+CVT_MINMAX_SIBLINGS = {
+    "v_cvt_f32_u32_e32": "v_cvt_f32_i32_e32",
+    "v_cvt_f32_i32_e32": "v_cvt_f32_u32_e32",
+    "v_cvt_f32_u32_e64": "v_cvt_f32_i32_e64",
+    "v_cvt_f32_i32_e64": "v_cvt_f32_u32_e64",
+    "v_min_f32_e32": "v_max_f32_e32",
+    "v_max_f32_e32": "v_min_f32_e32",
+    "v_min_f32_e64": "v_max_f32_e64",
+    "v_max_f32_e64": "v_min_f32_e64",
+}
+
+
+def cvt_minmax_program(swap=None, line=None):
+    # The program with one opcode swapped for its sibling, or with one unsupported line appended before the exports.
+    program = CVT_MINMAX_PROGRAM.copy()
+    if swap:
+        program = [
+            l.replace(swap, CVT_MINMAX_SIBLINGS[swap], 1) if l.startswith(swap) else l for l in program
+        ]
+    if line:
+        program.insert(-2, line)
+    return program
+
+
+def cvt_minmax_reference():
+    # Independent of the lowering: plain arithmetic on exact values, in the order the program runs.
+    word = 3 * 2**30  # 0xc0000000 as unsigned; 0xc0000000 - 2**32 as signed
+    z = 0.125 + 0.375  # pointData y plus the matrix value
+    z += min(0.5, float(word))
+    z += max(-0.25, float(word - 2**32))
+    z += min(float(2**31), 0.125)
+    z += max(float(2**31 - 2**32), -0.0625)
+    return z
+
+
+def cvt_minmax_draw(program=None):
+    depth = cvt_minmax_reference()
+    positions = [(x, y, depth, w) for x, y, _, w in TRIANGLE]
+    program = CVT_MINMAX_PROGRAM if program is None else program
+    return lower(enumerate_pcs(program), [4099], (3, 1)), [(triangle_inputs(), positions, True)]
+
+
+def cvt_minmax_negative_draws(dxc, renderer, adapter, tmp):
+    source, cases = cvt_minmax_draw()
+    expected = cases[0][1]
+    # One unit in the last place of the depth word of the last vertex only, then every sibling opcode.
+    word = struct.unpack("<I", struct.pack("<f", expected[2][2]))[0]
+    off_by_one = struct.unpack("<f", struct.pack("<I", word + 1))[0]
+    wrong = [(source, expected[:2] + [(*expected[2][:2], off_by_one, expected[2][3])])]
+    wrong += [(cvt_minmax_draw(cvt_minmax_program(op))[0], expected) for op in CVT_MINMAX_SIBLINGS]
+    for text, positions in wrong:
+        if mismatch(dxc, renderer, adapter, tmp, text, positions) == 77:
+            return 77
+    return 0
+
+
+def cvt_minmax_binary(tmp, tools):
+    inputs, reference = triangle_inputs(), cvt_minmax_reference()
+    text = binary(tmp, *tools, program=CVT_MINMAX_PROGRAM, words=[4099])
+    assert evaluate_depth(text, inputs) == reference, text
+    for op in CVT_MINMAX_SIBLINGS:
+        mutated = evaluate_depth(binary(tmp, *tools, program=cvt_minmax_program(op), words=[4099]), inputs)
+        assert mutated != reference, (op, mutated)
+    # Modifiers change the result, and a float expression is not an integer source: all are refused.
+    for line in (
+        "v_min_f32_e64 v18, -v12, v14",
+        "v_max_f32_e64 v19, |v13|, v15",
+        "v_min_f32_e64 v18, v12, v14 clamp",
+        "v_max_f32_e64 v19, v13, v15 mul:2",
+        "v_cvt_f32_i32_e64 v13, 0x80000000 clamp",
+        "v_cvt_f32_u32_e32 v10, v3",
+    ):
+        try:
+            lower(enumerate_pcs(cvt_minmax_program(line=line)), [4099], (3, 1))
+        except ValueError:
+            continue
+        raise AssertionError(line)
 
 
 def binary(tmp, assembler, objcopy, library, *, program=None, words=None, header=None):
@@ -415,6 +521,29 @@ def float_binary(tmp, tools):
         raise AssertionError(line)
 
 
+def cvt_minmax_binary(tmp, tools):
+    inputs, reference = triangle_inputs(), cvt_minmax_reference()
+    text = binary(tmp, *tools, program=CVT_MINMAX_PROGRAM, words=[4099])
+    assert evaluate_depth(text, inputs) == reference, text
+    for op in CVT_MINMAX_SIBLINGS:
+        mutated = evaluate_depth(binary(tmp, *tools, program=cvt_minmax_program(op), words=[4099]), inputs)
+        assert mutated != reference, (op, mutated)
+    # Modifiers change the result, and a float expression is not an integer source: all are refused.
+    for line in (
+        "v_min_f32_e64 v18, -v12, v14",
+        "v_max_f32_e64 v19, |v13|, v15",
+        "v_min_f32_e64 v18, v12, v14 clamp",
+        "v_max_f32_e64 v19, v13, v15 mul:2",
+        "v_cvt_f32_i32_e64 v13, 0x80000000 clamp",
+        "v_cvt_f32_u32_e32 v10, v3",
+    ):
+        try:
+            lower(enumerate_pcs(cvt_minmax_program(line=line)), [4099], (3, 1))
+        except ValueError:
+            continue
+        raise AssertionError(line)
+
+
 def offset_draw():
     program = PROGRAM.copy()
     program[program.index("s_buffer_load_dword s30, s[16:19], 0x4")] = (
@@ -460,7 +589,14 @@ if __name__ == "__main__":
             assert text.count("asfloat(0x3f200000u)") == 3, text
             assert text.count("asfloat(0xbfc00000u)") == 2, text
             float_binary(Path(directory), sys.argv[2:])
+            cvt_minmax_binary(Path(directory), sys.argv[2:])
             sys.exit(0)
+        if sys.argv[1] == "draw-cvt-minmax":
+            args = sys.argv[2:]
+            sys.exit(
+                draw(*args, Path(directory), *cvt_minmax_draw())
+                or cvt_minmax_negative_draws(*args, Path(directory))
+            )
         if sys.argv[1] == "draw-float":
             args = sys.argv[2:]
             sys.exit(

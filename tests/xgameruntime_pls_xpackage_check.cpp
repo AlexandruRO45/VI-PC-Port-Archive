@@ -2,7 +2,7 @@
 // subset. It loads the fixture-only DLL by explicit path, writes a test-owned
 // marker under the PLS directory, verifies the package mount path and unmount
 // status, and checks that no implemented call logged E_NOTIMPL. The negative
-// controls are the XPackage async stub and an unimplemented XSystem call.
+// controls are the XPackage async stub and the XUserAddAsync stub.
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -39,6 +39,7 @@ struct XPersistentLocalStorageSpaceInfo {
 };
 
 struct XAsyncBlock;
+enum XUserAddOptions : std::uint32_t { XUserAddOptionsNone = 0 };
 struct XPackageMountStorage;
 using XPackageMountHandle = XPackageMountStorage*;
 
@@ -57,7 +58,7 @@ using PackageGetMountPathSize = HRESULT(WINAPI*)(XPackageMountHandle, std::size_
 using PackageGetMountPath = HRESULT(WINAPI*)(XPackageMountHandle, std::size_t, char*);
 using PackageCloseMountHandle = void(WINAPI*)(XPackageMountHandle);
 using PackageMountWithUiAsync = HRESULT(WINAPI*)(const char*, XAsyncBlock*);
-using SystemGetConsoleId = HRESULT(WINAPI*)(std::size_t, char*, std::size_t*);
+using UserAddAsync = HRESULT(WINAPI*)(XUserAddOptions, XAsyncBlock*);
 using GetLog = std::size_t(WINAPI*)(XGameRuntimeShimLogEntry*, std::size_t);
 using ClearLog = void(WINAPI*)();
 
@@ -377,7 +378,7 @@ bool log_checks(HMODULE module)
     bool saw_package_pointer = false;
     bool saw_package_handle = false;
     bool saw_async_stub = false;
-    bool saw_system_stub = false;
+    bool saw_user_stub = false;
     for (std::size_t i = 0; i < count; ++i) {
         const auto& entry = entries[i];
         if (!entry.component || !entry.function || entry.sequence != i + 1) {
@@ -386,7 +387,7 @@ bool log_checks(HMODULE module)
         }
         const bool pls = std::strcmp(entry.component, "XPersistentLocalStorage") == 0;
         const bool package = std::strcmp(entry.component, "XPackage") == 0;
-        const bool system = std::strcmp(entry.component, "XSystem") == 0;
+        const bool user = std::strcmp(entry.component, "XUser") == 0;
         if ((pls || package) && entry.result == not_implemented &&
             std::strcmp(entry.function, "XPackageMountWithUiAsync") != 0) {
             std::printf("FAIL: implemented contract logged E_NOTIMPL: %s\n", entry.function);
@@ -430,19 +431,19 @@ bool log_checks(HMODULE module)
             if (entry.result == E_POINTER) saw_package_pointer = true;
             if (entry.result == E_HANDLE) saw_package_handle = true;
         }
-        if (system && std::strcmp(entry.function, "XSystemGetConsoleId") == 0) {
+        if (user && std::strcmp(entry.function, "XUserAddAsync") == 0) {
             if (entry.result != not_implemented) {
-                std::printf("FAIL: XSystem stub returned 0x%08lx\n",
+                std::printf("FAIL: XUserAddAsync stub returned 0x%08lx\n",
                             static_cast<unsigned long>(entry.result));
                 return false;
             }
-            saw_system_stub = true;
+            saw_user_stub = true;
         }
     }
     if (!saw_pls_path_size || !saw_pls_path || !saw_pls_space || !saw_package_mount ||
         !saw_package_path_size || !saw_package_path || !saw_package_close ||
         !saw_pls_invalid || !saw_pls_pointer || !saw_package_invalid ||
-        !saw_package_pointer || !saw_package_handle || !saw_async_stub || !saw_system_stub) {
+        !saw_package_pointer || !saw_package_handle || !saw_async_stub || !saw_user_stub) {
         std::printf("FAIL: log is missing positive or negative controls\n");
         return false;
     }
@@ -468,7 +469,7 @@ bool run_checks(const wchar_t* dll_path, const wchar_t* fixture_dir,
     PackageGetMountPath get_mount_path = nullptr;
     PackageCloseMountHandle close_mount = nullptr;
     PackageMountWithUiAsync mount_with_ui = nullptr;
-    SystemGetConsoleId get_console_id = nullptr;
+    UserAddAsync user_add = nullptr;
     ClearLog clear_log = nullptr;
     if (!find_proc(shim.module, "XPersistentLocalStorageGetPathSize", get_path_size) ||
         !find_proc(shim.module, "XPersistentLocalStorageGetPath", get_path) ||
@@ -478,7 +479,7 @@ bool run_checks(const wchar_t* dll_path, const wchar_t* fixture_dir,
         !find_proc(shim.module, "XPackageGetMountPath", get_mount_path) ||
         !find_proc(shim.module, "XPackageCloseMountHandle", close_mount) ||
         !find_proc(shim.module, "XPackageMountWithUiAsync", mount_with_ui) ||
-        !find_proc(shim.module, "XSystemGetConsoleId", get_console_id) ||
+        !find_proc(shim.module, "XUserAddAsync", user_add) ||
         !find_proc(shim.module, "XGameRuntimeShimClearLog", clear_log)) {
         return false;
     }
@@ -492,14 +493,14 @@ bool run_checks(const wchar_t* dll_path, const wchar_t* fixture_dir,
         std::printf("FAIL: XPackageMountWithUiAsync is not a logged stub\n");
         return false;
     }
-    if (get_console_id(0, nullptr, nullptr) != not_implemented) {
-        std::printf("FAIL: XSystemGetConsoleId is not a logged stub\n");
+    if (user_add(XUserAddOptionsNone, nullptr) != not_implemented) {
+        std::printf("FAIL: XUserAddAsync is not a logged stub\n");
         return false;
     }
     if (!log_checks(shim.module)) return false;
 
     std::printf("xgameruntime PLS/XPackage: space=%llu/%llu/%llu async=stub "
-                "unmount=E_HANDLE xsystem=E_NOTIMPL calls=%zu PASS\n",
+                "unmount=E_HANDLE user-async=E_NOTIMPL calls=%zu PASS\n",
                 static_cast<unsigned long long>(synthetic_available_free_bytes),
                 static_cast<unsigned long long>(synthetic_total_free_bytes),
                 static_cast<unsigned long long>(synthetic_total_bytes), expected_log_entries);
