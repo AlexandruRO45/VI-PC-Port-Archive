@@ -7106,8 +7106,10 @@ impl<'a> Lower<'a> {
     /// Console flow: an SCC value as a bit. A mask operation's SCC (result
     /// not zero) is whether some lane of the console wave has its bit.
     fn scc_bit(&mut self, v: Value) -> Result<V, Why> {
-        if let Some(&Val::Bit(x)) = self.vals.get(&v) {
-            return Ok(x);
+        match self.vals.get(&v) {
+            Some(&Val::Bit(x)) => return Ok(x),
+            Some(&Val::Missing(why)) if why != LANE_MASK => return Err(why),
+            _ => {}
         }
         let b = *self
             .def_block
@@ -7118,11 +7120,18 @@ impl<'a> Lower<'a> {
             .iter()
             .find(|i| i.writes.iter().any(|w| w.1 == v))
             .ok_or("an SCC without its instruction")?;
+        // SCC tests the new EXEC. `s_*_saveexec` also writes a scalar, the
+        // EXEC it replaces, and that write comes first (`s_*_wrexec` writes
+        // the new EXEC to both).
         let mask = inst
-            .writes
-            .iter()
-            .filter(|w| matches!(w.0, Reg::S(_)))
-            .find_map(|w| self.x.st.masks.get(&w.1).copied())
+            .write(Reg::S(EXEC))
+            .and_then(|w| self.x.st.masks.get(&w).copied())
+            .or_else(|| {
+                inst.writes
+                    .iter()
+                    .filter(|w| matches!(w.0, Reg::S(_)))
+                    .find_map(|w| self.x.st.masks.get(&w.1).copied())
+            })
             .ok_or("an SCC the emitter did not compute")?;
         self.any_lane(mask)
     }
