@@ -2747,6 +2747,53 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
 }
 
+/// The copy a buffer view of `len` bytes at `address`, whose elements are
+/// `element` bytes, reads: the innermost title buffer's ([`find`]), unless the
+/// view does not start on an element of that copy. A host view counts its
+/// first element from its buffer's start, and a console view starts at any
+/// address: the title places structured views at ring positions inside its
+/// big GPU heap (the culling constants, the colour bakes' parameter blocks),
+/// and such a view gets a copy of its own bytes instead of being refused —
+/// refused, its slot read zeros.
+pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
+    let shadow = find(address, len)?;
+    if element == 0 || shadow.offset(address).is_multiple_of(element) {
+        return Some(shadow);
+    }
+    exact(address, len)
+}
+
+/// Copies of single views' bytes ([`for_view`]), by (start, length), with the
+/// tick that last asked for each.
+#[allow(clippy::type_complexity)]
+static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+
+/// Copies [`EXACT`] keeps: ring positions change every frame, so the least
+/// recently asked for go, and a list or heap slot using one keeps it alive.
+const EXACT_KEPT: usize = 1024;
+
+fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let (tick, map) = &mut *guard;
+    *tick += 1;
+    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+        *used = *tick;
+        return Some(shadow.clone());
+    }
+    if map.len() >= EXACT_KEPT
+        && let Some(&oldest) = map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| k)
+    {
+        map.remove(&oldest);
+    }
+    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    map.insert((address, len), (shadow.clone(), *tick));
+    Some(shadow)
+}
+
 /// As [`find`], for an ask that is done with the copy when its list has
 /// run (a draw's vertex and index buffers, indirect arguments): outside
 /// buffer objects it takes a window that is there already and holds the
