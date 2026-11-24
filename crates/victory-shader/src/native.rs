@@ -508,6 +508,18 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 slot: e[17],
             })
             .collect::<Vec<RootParam>>();
+        // The kinds above are the ones shipped layouts use, and each part of
+        // the translation decides what a parameter is by its kind: resource
+        // tracking takes an address only from a table, heap or descriptor,
+        // lowering reads only constants and tables as user data, the host
+        // fills user data only for tables and constants, and the shader
+        // cache stores a kind as a code (`6 + n` for an unknown one, which
+        // overflows near `u32::MAX`). A kind none of them knows is a format
+        // change to name here, not one to guess at, like a read of a kind
+        // not known below.
+        if layout.iter().any(|p| matches!(p.root, RootType::Other(_))) {
+            return Err(Malformed("root parameter of unknown kind"));
+        }
         // A parameter's SGPRs must exist: `user_sgpr` and the high half of a
         // root descriptor are computed from these bytes ([`sgpr_span`]).
         if layout.iter().any(|p| {
@@ -2124,28 +2136,51 @@ mod tests {
         ));
     }
 
+    /// A pixel program with these (root type, SGPRs, user data, slot)
+    /// parameters.
+    fn program(params: &[(u32, u32, u8, u8)]) -> Result<Vec<NativeProgram>, ShaderError> {
+        let mut blob = fssm(&[(HwStage::Ps, &PS_CODE)]);
+        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Ps)).unwrap() as usize;
+        let table = (blob.len() - FSSM_HEADER) as u64;
+        for &(root, sgprs, user_data, slot) in params {
+            for v in [root, 0, sgprs, 0] {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+            blob.extend_from_slice(&[user_data, slot, 0, 0]);
+        }
+        let payload = (blob.len() - FSSM_HEADER) as u64;
+        blob[8..16].copy_from_slice(&payload.to_le_bytes());
+        blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
+        let count = params.len() as u64;
+        blob[record + RECORD_COUNTS..][..8].copy_from_slice(&count.to_le_bytes());
+        native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+    }
+
+    #[test]
+    fn refuses_a_root_parameter_of_unknown_kind() {
+        // Constants, descriptor, table, fixed sampler, resource heap and
+        // sampler heap are the kinds there are; 2 is not one of them.
+        for (root, sgprs) in [(0, 1), (1, 2), (3, 1), (4, 0), (5, 1), (6, 1)] {
+            assert!(program(&[(root, sgprs, 4, 2)]).is_ok(), "kind {root}");
+        }
+        // Whether or not it states SGPRs, and next to a known parameter;
+        // `u32::MAX` would overflow the shader cache's code for it.
+        for params in [
+            &[(2, 1, 4, 2)][..],
+            &[(7, 0, 4, 2)],
+            &[(u32::MAX, 1, 4, 2)],
+            &[(0, 2, 0, 0), (2, 1, 4, 1)],
+        ] {
+            assert_eq!(
+                why_refused(program(params)),
+                "root parameter of unknown kind",
+                "{params:?}"
+            );
+        }
+    }
+
     #[test]
     fn refuses_root_parameters_sharing_an_sgpr() {
-        // A pixel program with these (root type, SGPRs, user data, slot)
-        // parameters.
-        let program = |params: &[(u32, u32, u8, u8)]| {
-            let mut blob = fssm(&[(HwStage::Ps, &PS_CODE)]);
-            let record =
-                FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Ps)).unwrap() as usize;
-            let table = (blob.len() - FSSM_HEADER) as u64;
-            for &(root, sgprs, user_data, slot) in params {
-                for v in [root, 0, sgprs, 0] {
-                    blob.extend_from_slice(&v.to_le_bytes());
-                }
-                blob.extend_from_slice(&[user_data, slot, 0, 0]);
-            }
-            let payload = (blob.len() - FSSM_HEADER) as u64;
-            blob[8..16].copy_from_slice(&payload.to_le_bytes());
-            blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
-            let count = params.len() as u64;
-            blob[record + RECORD_COUNTS..][..8].copy_from_slice(&count.to_le_bytes());
-            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
-        };
         let (constants, descriptor, table, sampler) = (0, 1, 3, 4);
         // Side by side, two ranges of one table, and a fixed sampler (no
         // SGPRs) at a taken user-data dword are all fine.
