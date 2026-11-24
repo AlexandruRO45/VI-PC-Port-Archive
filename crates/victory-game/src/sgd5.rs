@@ -2811,6 +2811,17 @@ mod tests {
         lit: &[u32],
         data: &[u32],
     ) -> Vec<u8> {
+        let mut bits = dynamic_header(hlit, hdist, clen, seq);
+        let lit_codes = canonical(lit);
+        for &sym in data {
+            bits.code(lit_codes[sym as usize], lit[sym as usize]);
+        }
+        bits.out
+    }
+
+    /// The header of a final dynamic-code block, as [`dynamic_block_of`]
+    /// sends it, ready for the block's data.
+    fn dynamic_header(hlit: u32, hdist: u32, clen: &[u32; 19], seq: &[(u32, u32)]) -> Bits {
         let mut bits = Bits::default();
         bits.put(1, 1); // BFINAL
         bits.put(2, 2); // dynamic codes
@@ -2830,11 +2841,7 @@ mod tests {
                 _ => {}
             }
         }
-        let lit_codes = canonical(lit);
-        for &sym in data {
-            bits.code(lit_codes[sym as usize], lit[sym as usize]);
-        }
-        bits.out
+        bits
     }
 
     #[test]
@@ -3112,5 +3119,63 @@ mod tests {
                 assert_eq!(found[1].span().end, file.len(), "{what}");
             }
         }
+    }
+
+    #[test]
+    fn stream_at_deflates_best_ratio_is_a_record_just_above_the_bound() {
+        // The packed-size lower bound holds for any deflate stream, not
+        // just the ones miniz writes: a dynamic block whose length code 285
+        // (258 bytes, no extra bits) and only distance code (1 back) take
+        // one bit each makes 258 bytes from every 2 bits, deflate's best,
+        // and is still at or above the bound, which it misses only by the
+        // block's header. Such a record is found and unpacks, and so does
+        // the record after it.
+        let a = u32::from(b'A');
+        // Literal/length codes: 285 in 1 bit, `A` and the end of the block
+        // in 2; one distance code (distance 1) in 1 bit.
+        let mut lengths = vec![0; 286 + 1];
+        (
+            lengths[285],
+            lengths[a as usize],
+            lengths[256],
+            lengths[286],
+        ) = (1, 2, 2, 1);
+        // Code-length code: 18 in 1 bit, 2 in 2, 1 in 3, 0 and 17 in 4.
+        let mut clen = [0; 19];
+        (clen[18], clen[2], clen[1], clen[0], clen[17]) = (1, 2, 3, 4, 4);
+        let lit = &lengths[..286];
+        let lit_codes = canonical(lit);
+        let copies = 4 * 1024;
+        let mut bits = dynamic_header(286, 1, &clen, &length_symbols(&lengths));
+        bits.code(lit_codes[a as usize], 2);
+        for _ in 0..copies {
+            bits.code(lit_codes[285], 1);
+            bits.code(0, 1); // the one distance code
+        }
+        bits.code(lit_codes[256], 2);
+        let packed = bits.out;
+        let want = vec![b'A'; 1 + 258 * copies];
+        assert_eq!(
+            miniz_oxide::inflate::decompress_to_vec(&packed)
+                .ok()
+                .as_ref(),
+            Some(&want)
+        );
+        assert!(starts_stream(&packed, want.len()));
+
+        let bound = min_packed(want.len());
+        assert_eq!(bound, copies / 4, "2 bits a copy");
+        assert!(packed.len() >= bound);
+        let header = packed.len() - bound;
+        assert!(header < 32, "the bound misses by {header} bytes");
+
+        let (file, marker) = outer_then_after(&packed, want.len());
+        let found: Vec<_> = records(&file).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_outer"), Some("PS_after")]);
+        assert_eq!(found[0].span(), marker..marker + 12 + packed.len());
+        assert_eq!(found[0].unpack().as_ref(), Some(&want));
+        assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+        assert_eq!(found[1].span().end, file.len());
     }
 }
