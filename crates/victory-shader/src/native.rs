@@ -558,6 +558,19 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 slot: e[18],
             })
             .collect::<Vec<UsedResource>>();
+        // Lowering picks a read's access from its kind (UAV if `Uav`, a
+        // constant buffer if `Cbv`, else a read-only view), while the host
+        // makes only an SRV or UAV view ready for the shader (`draw::readable`:
+        // texture upload, resource state). A read of a kind neither knows
+        // would be lowered as a view the host never prepares, reading stale
+        // data with no error, and counts as a view, not a sampler, for the
+        // one-heap check below.
+        if used
+            .iter()
+            .any(|u| matches!(u.kind, ResourceType::Other(_)))
+        {
+            return Err(Malformed("used descriptor of unknown kind"));
+        }
         // The host binds a table read by its root slot (`draw::tables`),
         // while lowering finds what a read is by the table address's SGPR
         // (`used_kind`). A read naming no table parameter with both would be
@@ -2217,6 +2230,22 @@ mod tests {
                 why_refused(reading(&reads)),
                 "root table mixes samplers and views",
                 "{reads:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_a_descriptor_read_of_unknown_kind() {
+        let (descriptor, table) = (1u8, 3u8);
+        // SRV, sampler, CBV and UAV are the kinds there are.
+        for kind in 0..4u8 {
+            assert!(reading(&[(kind, table, 0)]).is_ok(), "kind {kind}");
+        }
+        for (kind, root) in [(4u8, table), (0xFF, table), (4, descriptor)] {
+            assert_eq!(
+                why_refused(reading(&[(kind, root, 0)])),
+                "used descriptor of unknown kind",
+                "kind {kind}, root {root}"
             );
         }
     }
