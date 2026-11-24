@@ -35,10 +35,22 @@ pub const KNOWN: &[Known] = &[
         links: &[698, 704],
     },
     Known {
+        any: &["+0x23cf683"],
+        title: "The title's own watchdog stopped it",
+        explain: "The title ends itself (a deliberate write to address 0) when its frames stop advancing for several seconds, for example while many pipelines are being built or frames take seconds each. It is not a VIctory crash: it comes later as frames get faster and fewer pipelines are refused.",
+        links: &[1118, 1286],
+    },
+    Known {
         any: &["+0xb5a5f8"],
         title: "A known crash at Game Init",
         explain: "Reported on Windows 10 with main, where it went away with the Agility runtime. It has also been seen with that runtime present, so it can have other causes.",
         links: &[741, 998],
+    },
+    Known {
+        any: &["0xc000001d", "ILLEGAL_INSTRUCTION"],
+        title: "The title used a console CPU instruction this CPU lacks",
+        explain: "The console's AMD CPU has instructions that some PC CPUs (most Intel ones) lack, such as CLWB and CLZERO. VIctory emulates the known ones, so updating to the latest main fixes the reported cases; if it remains, the address in crashes.log is what a report needs.",
+        links: &[106, 103],
     },
     Known {
         any: &["has no mesh shaders"],
@@ -47,9 +59,15 @@ pub const KNOWN: &[Known] = &[
         links: &[3, 961],
     },
     Known {
-        any: &["DXGI_ERROR_DEVICE_HUNG", "0x887A0006"],
-        title: "The GPU hung (device removed)",
-        explain: "Most such reports are on NVIDIA, whose waves are 32 lanes while the title's mesh programs are written for 64. Fixes are in progress; on other GPUs, a report with the DRED output helps.",
+        any: &[
+            "DXGI_ERROR_DEVICE_HUNG",
+            "0x887A0006",
+            "DXGI_ERROR_DEVICE_REMOVED",
+            "0x887A0005",
+            "device removed",
+        ],
+        title: "The GPU stopped (hung or removed)",
+        explain: "The GPU stopped responding or was taken away from VIctory. Most such reports are on NVIDIA, whose waves are 32 lanes while the title's mesh programs are written for 64; fixes are in progress. Elsewhere, a diagnostics build with VICTORY_D3D12_DRED=1 shows where it stopped, which is what a report needs.",
         links: &[778, 587, 578],
     },
     Known {
@@ -206,7 +224,19 @@ mod tests {
             ),
             (
                 "ERROR device removed reason=DXGI_ERROR_DEVICE_HUNG (0x887A0006)",
-                "The GPU hung (device removed)",
+                "The GPU stopped (hung or removed)",
+            ),
+            (
+                "WARN host submission not waited for error=0x887A0005",
+                "The GPU stopped (hung or removed)",
+            ),
+            (
+                "VIctory: unhandled exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x23cf683 (write 0x0)",
+                "The title's own watchdog stopped it",
+            ),
+            (
+                "VIctory: unhandled exception 0xc000001d at victory-image-b99f876b74d4a77f.dll+0x4ecc84a",
+                "The title used a console CPU instruction this CPU lacks",
             ),
             (
                 "D3D12 ERROR: the shader requests a wave lane count of 64; the device maximum is 32",
