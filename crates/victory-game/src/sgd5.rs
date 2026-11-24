@@ -60,7 +60,9 @@ pub fn is_sgd5(file: &[u8]) -> bool {
 /// file, whatever markers they happen to hold. It resumes after each
 /// record's packed bytes: a marker inside them (stored deflate blocks carry a
 /// container's bytes as they are) is part of that record, and so is any part
-/// of the next record's header or name, which must follow them.
+/// of the next record's header or name, which must follow them. A record
+/// whose packed bytes run past the end of the file (a truncated file) is not
+/// yielded, and ends the search: every byte after its marker is its own.
 pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     let finder = memchr::memmem::Finder::new(&MARKER);
     // Where the next record may start: after the magic, then after each
@@ -71,35 +73,55 @@ pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     std::iter::from_fn(move || {
         while let Some(found) = finder.find(file.get(from..)?) {
             let at = from + found;
-            if let Some(r) = record(&file[floor..], at - floor) {
-                let r = Record { offset: at, ..r };
-                floor = r.span().end;
-                from = floor + 6;
-                return Some(r);
+            match record(&file[floor..], at - floor) {
+                Found::Record(r) => {
+                    let r = Record { offset: at, ..r };
+                    floor = r.span().end;
+                    from = floor + 6;
+                    return Some(r);
+                }
+                Found::Truncated => {
+                    from = file.len() + 1;
+                    return None;
+                }
+                Found::Nothing => from = at + 1,
             }
-            from = at + 1;
         }
         None
     })
 }
 
+enum Found<'a> {
+    Record(Record<'a>),
+    /// A record header whose packed bytes run past the end of the file.
+    Truncated,
+    Nothing,
+}
+
 /// The record whose marker is at `at`, reading nothing before `file`.
-fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
+fn record(file: &[u8], at: usize) -> Found<'_> {
     let u32_at = |o: usize| {
-        file.get(o..o + 4)
+        file.get(o..o.checked_add(4)?)
             .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize)
     };
-    let n = u32_at(at.checked_sub(4)?)?;
-    let unpacked_size = u32_at(at + 8)?;
-    if u32_at(at + 4)? != n || n < 12 || unpacked_size > MAX_UNPACKED {
-        return None;
+    let Some(nul) = at.checked_sub(6) else {
+        return Found::Nothing;
+    };
+    let (Some(n), Some(n2), Some(unpacked_size)) = (u32_at(at - 4), u32_at(at + 4), u32_at(at + 8))
+    else {
+        return Found::Nothing;
+    };
+    if n2 != n || n < 12 || unpacked_size > MAX_UNPACKED {
+        return Found::Nothing;
     }
-    let nul = at.checked_sub(6)?;
-    Some(Record {
+    let Some(packed) = at.checked_add(n).and_then(|end| file.get(at + 12..end)) else {
+        return Found::Truncated;
+    };
+    Found::Record(Record {
         offset: at,
         name: (file[nul] == 0).then(|| name_before(file, nul)).flatten(),
         kind: file[at - 5],
-        packed: file.get(at + 12..at + n)?,
+        packed,
         unpacked_size,
     })
 }
@@ -279,6 +301,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn truncated_record_hides_the_records_it_stores() {
+        // A record whose packed bytes (stored blocks) hold a whole record,
+        // cut off after that inner record but before its own end.
+        let inner = record_bytes("PS_inner", 0x32, b"inner container");
+        let mut payload = inner.clone();
+        payload.extend_from_slice(&[0x55; 64]);
+        let packed = miniz_oxide::deflate::compress_to_vec(&payload, 0);
+        let n = (packed.len() + 12) as u32;
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("PS_first", 0x32, b"first"));
+        file.extend_from_slice(b"\x09PS_outer\0\x32");
+        for v in [n, 0x000D_DCE7, n, payload.len() as u32] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        let stored = file.len();
+        file.extend_from_slice(&packed);
+        let inner_end = stored + memchr::memmem::find(&packed, &inner).unwrap() + inner.len();
+        let names: Vec<_> = records(&file).map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_first"), Some("PS_outer")]);
+
+        // Before: [PS_first, PS_inner].
+        let names: Vec<_> = records(&file[..inner_end]).map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_first")]);
     }
 
     #[test]
