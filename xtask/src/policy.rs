@@ -107,11 +107,13 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
         ))
     };
     if staged {
+        // T: a path whose type changed (a symlink replaced by a regular file,
+        // or the reverse) carries new content just as a modification does.
         return git(&[
             "diff",
             "--cached",
             "--name-only",
-            "--diff-filter=ACMR",
+            "--diff-filter=ACMRT",
             "-z",
         ])?
         .context("--staged needs a git repository");
@@ -213,6 +215,43 @@ mod tests {
             !check("a.rs", &vec![b'a'; 600 * 1024]).is_empty(),
             "too big"
         );
+    }
+
+    /// A symlink turned into a regular file is staged as a type change (`T`),
+    /// not a modification; the pre-commit check must still read it.
+    #[cfg(unix)]
+    #[test]
+    fn staged_check_reads_type_changes() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::os::unix::fs::symlink("elsewhere.rs", root.join("data.rs")).unwrap();
+        git(&["add", "data.rs"]);
+        git(&["commit", "-q", "--no-verify", "-m", "link"]);
+        std::fs::remove_file(root.join("data.rs")).unwrap();
+        std::fs::write(root.join("data.rs"), b"MZ\x90\0binary").unwrap();
+        git(&["add", "data.rs"]);
+
+        assert_eq!(super::list_files(root, true).unwrap(), ["data.rs"]);
+        assert!(super::run(root, true).is_err());
     }
 
     #[test]
