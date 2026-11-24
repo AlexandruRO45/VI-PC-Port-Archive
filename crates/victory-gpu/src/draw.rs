@@ -1353,7 +1353,12 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
-                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                let sample = HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed) + 1;
+                if sample <= 8 || sample.is_power_of_two() {
+                    tracing::info!(sample, frame, index, heap = heap.start, address, len,
+                        refreshed_copy = shadow.id(),
+                        "a heap buffer slot shows a different host resource from the one refreshed");
+                }
             }
             ranges.insert(index, (shadow, address, address + len));
         }
