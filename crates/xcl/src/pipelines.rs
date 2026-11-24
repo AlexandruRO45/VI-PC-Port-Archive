@@ -54,6 +54,21 @@ fn binary_key(gpu: u64) -> u64 {
 /// Address space only: pages are committed as used.
 const WARM_STACK: usize = 512 << 20;
 
+/// This run's `pipelines.trying`, removed on Ctrl+C, Ctrl+Break or closing the console
+/// (`on_console_close`).
+static TRYING_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The pipelines being made when the user stops the tool (Ctrl+C is how `--watch` ends) were cut
+/// short, not crashed on: without `.trying` the next run makes them again. FALSE: the default
+/// handler then ends the process. (std opens files with FILE_SHARE_DELETE, so the open handle
+/// does not keep it.)
+unsafe extern "system" fn on_console_close(_kind: u32) -> i32 {
+    if let Some(p) = TRYING_PATH.get() {
+        let _ = std::fs::remove_file(p);
+    }
+    0
+}
+
 /// `pipelines.trying`: the pipelines in the making now, written whole at each change, so a run cut
 /// short (a crash, or Ctrl+C) leaves the next run exactly those.
 struct Trying {
@@ -228,8 +243,8 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    // what a run that ended without its summary (a crash in the driver or DXC) was making: left
-    // to the title, so the same pipeline does not end every run
+    // what a run that crashed (in the driver or DXC) was making: left to the title, so the same
+    // pipeline does not end every run (a run the user stopped removes the file)
     let trying_path = journal.with_extension("trying");
     let crashed: Vec<u64> = {
         let t = std::fs::read(&trying_path).unwrap_or_default();
@@ -243,7 +258,11 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         eprintln!("xcl pipelines: the last run ended while making {} pipelines: left to the title", crashed.len());
     }
     let trying = match std::fs::File::create(&trying_path) {
-        Ok(f) => Mutex::new(Trying { file: f, now: Vec::new() }),
+        Ok(f) => {
+            let _ = TRYING_PATH.set(trying_path.clone());
+            unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(on_console_close), 1) };
+            Mutex::new(Trying { file: f, now: Vec::new() })
+        }
         Err(e) => {
             eprintln!("xcl pipelines: {}: {e}", trying_path.display());
             return 2;
