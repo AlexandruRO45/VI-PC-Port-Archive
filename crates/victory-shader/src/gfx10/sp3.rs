@@ -220,6 +220,10 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             if *tfe {
                 out.push_str(" tfe");
             }
+            // The cache invalidations have no operands for a flag to follow.
+            if out.starts_with(' ') {
+                out.remove(0);
+            }
         }
         Fields::Image {
             data,
@@ -1505,5 +1509,29 @@ mod tests {
         };
         assert_eq!(p1ll(0), "v_interp_p1ll_f16 v2, v3, attr1.z");
         assert_eq!(p1ll(1), "v_interp_p1ll_f16 v2, v3, attr1.z high");
+    }
+
+    /// The cache invalidations `buffer_gl0_inv` and `buffer_gl1_inv` take
+    /// no operands, so their address, resource and offset fields print
+    /// nothing; stray cache, lds and tfe bits are still named, one space
+    /// after the mnemonic like any other operand text.
+    #[test]
+    fn buffer_invalidations_print_no_operands_and_only_their_stray_flags() {
+        let inv = |op: u32, w0: u32, w1: u32| one(&[0xE000_0000 | op << 18 | w0, w1], true);
+        for (op, name) in [(0x71, "buffer_gl0_inv"), (0x72, "buffer_gl1_inv")] {
+            assert_eq!(inv(op, 0, 0), name);
+            // Address, data, resource, soffset, offset, offen and idxen
+            // fields have nothing to print into.
+            assert_eq!(inv(op, 0x3FFF, 0xFF1F_FFFF), name);
+            assert_eq!(inv(op, 1 << 14, 0), format!("{name} glc"));
+            assert_eq!(inv(op, 0, 1 << 22), format!("{name} slc"));
+            assert_eq!(inv(op, 1 << 15, 0), format!("{name} dlc"));
+            assert_eq!(inv(op, 1 << 16, 0), format!("{name} lds"));
+            assert_eq!(inv(op, 0, 1 << 23), format!("{name} tfe"));
+            assert_eq!(
+                inv(op, 1 << 14 | 1 << 15 | 1 << 16, 1 << 22 | 1 << 23),
+                format!("{name} glc slc dlc lds tfe")
+            );
+        }
     }
 }
