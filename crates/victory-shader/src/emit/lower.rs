@@ -3052,11 +3052,7 @@ impl<'a> Lower<'a> {
             });
         let Some((at, first)) = use_at else {
             // No access names it: the console words are all there is.
-            let words = self.descriptor_words(site, count)?;
-            for (k, x) in words.into_iter().enumerate() {
-                self.write(inst, Reg::S(code + k as u8), x, None);
-            }
-            return Ok(());
+            return self.words_as_data(inst, site, code, count);
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -3090,11 +3086,13 @@ impl<'a> Lower<'a> {
                     (11 | u, 0)
                 };
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
+                    return self.words_as_data(inst, site, code, count);
                 }
                 (props, None)
             }
-            _ => return Err("a scalar memory read as data"),
+            // A scalar buffer load's descriptor (a constant or structured
+            // buffer): the console words, address and record count included.
+            _ => return self.words_as_data(inst, site, code, count),
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -3162,6 +3160,16 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// The `count` dwords the descriptor load at `site` writes from `code`
+    /// on, as the console's descriptor words.
+    fn words_as_data(&mut self, inst: &Inst, site: Site, code: u8, count: u32) -> Result<(), Why> {
+        let words = self.descriptor_words(site, count)?;
+        for (k, x) in words.into_iter().enumerate() {
+            self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
     }
