@@ -1300,23 +1300,30 @@ fn pass_cost(runs: &[&HostList], gpu: std::time::Duration) {
     drop(span);
     let mut cost = COST.lock().unwrap_or_else(|e| e.into_inner());
     let map = cost.get_or_insert_with(std::collections::HashMap::new);
-    // A submission is many lists, so its time is charged once per **distinct**
-    // pipeline set and split between them: charging every list would enter one
-    // submission's time once per list, and the ranking would then measure how
-    // many lists a set appears in rather than what it cost.
-    let mut sets: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // A submission is many lists, so its time enters the map once and is
+    // charged to each **distinct** pipeline set in proportion to how many lists
+    // that set had: charging every list would count one submission's time once
+    // per list, and splitting evenly would under-charge a set exactly in
+    // proportion to how much of the frame it is — ten lists on one set and one
+    // on another is not a fifty-fifty frame.
+    let mut sets: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut total_lists = 0u64;
     for list in runs {
         let names = list.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if !names.is_empty() {
-            sets.insert(names.into_iter().collect::<Vec<String>>().join(", "));
+        if names.is_empty() {
+            continue;
         }
+        total_lists += 1;
+        *sets
+            .entry(names.into_iter().collect::<Vec<String>>().join(", "))
+            .or_insert(0) += 1;
     }
-    if !sets.is_empty() {
-        let each = gpu.as_micros() as u64 / sets.len() as u64;
-        for key in sets {
+    if total_lists > 0 {
+        let us = gpu.as_micros() as u64;
+        for (key, lists) in sets {
             let entry = map.entry(key).or_insert((0, 0));
-            entry.0 += each;
-            entry.1 += 1;
+            entry.0 += us * lists / total_lists;
+            entry.1 += lists;
         }
     }
     let mut worst: Vec<(&String, &(u64, u64))> = map.iter().collect();
@@ -1327,11 +1334,12 @@ fn pass_cost(runs: &[&HostList], gpu: std::time::Duration) {
     if total < 1_000_000 {
         return;
     }
-    let accounted = if frame_us == 0 {
-        100.0 * total as f64 / (total as f64 + 1.0)
-    } else {
-        100.0 * total as f64 / frame_us as f64
-    };
+    // No span yet means nothing has been measured: the first line of a run must
+    // not read as "everything is in submissions" when nothing is.
+    if frame_us == 0 {
+        return;
+    }
+    let accounted = 100.0 * total as f64 / frame_us as f64;
     tracing::warn!(
         frame_ms = frame_us / 1000,
         accounted = format!("{accounted:.0}%"),
