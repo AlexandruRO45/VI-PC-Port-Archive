@@ -479,6 +479,94 @@ mod tests {
     }
 
     #[test]
+    fn the_magic_and_header_length_come_first() {
+        // A header one byte short is no container, whatever follows "DXBC".
+        let bytes = build(&[]);
+        assert_eq!(
+            Container::parse(&bytes[..HEADER_SIZE - 1]).unwrap_err(),
+            ShaderError::NotDxbc
+        );
+        // The magic is case-sensitive and checked before the version.
+        let mut lower = bytes.clone();
+        lower[0..4].copy_from_slice(b"dxbc");
+        lower[0x14..0x16].copy_from_slice(&9u16.to_le_bytes());
+        assert_eq!(Container::parse(&lower).unwrap_err(), ShaderError::NotDxbc);
+        // A bare header with no parts is a container, and its digest is
+        // carried through untouched.
+        let mut digest = bytes.clone();
+        digest[4..20].copy_from_slice(&core::array::from_fn::<u8, 16, _>(|i| i as u8 * 17));
+        let c = Container::parse(&digest).unwrap();
+        assert_eq!(bytes.len(), HEADER_SIZE);
+        assert_eq!(c.digest, core::array::from_fn(|i| i as u8 * 17));
+        assert_eq!(c.version, (1, 0));
+        assert!(c.parts.is_empty());
+    }
+
+    #[test]
+    fn empty_parts_still_claim_their_header() {
+        let own = FourCC(*b"PRIV");
+        let bytes = build(&[(own, &[]), (own, &[])]);
+        let first = HEADER_SIZE as u32 + 8;
+        // Two empty parts end to end parse.
+        let c = Container::parse(&bytes).unwrap();
+        assert_eq!(c.parts[1].offset, c.parts[0].offset + 8);
+        // Moved four bytes back, the second header starts inside the first:
+        // it reads the first's zero size as its FourCC, and the old header's
+        // FourCC, zeroed here, as its size.
+        let mut half = bytes.clone();
+        half[0x24..0x28].copy_from_slice(&(first + 4).to_le_bytes());
+        half[first as usize + 8..first as usize + 12].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(malformed(&half), "two parts overlap");
+        // An empty part inside another part's data is an overlap too.
+        let bytes = build(&[(own, &[0; 16]), (own, &[])]);
+        let mut inside = bytes.clone();
+        inside[0x24..0x28].copy_from_slice(&(first + 8).to_le_bytes());
+        inside[first as usize + 8..first as usize + 12].copy_from_slice(b"PRIV");
+        assert_eq!(malformed(&inside), "two parts overlap");
+        // Its header ending on the other part's last byte still overlaps;
+        // starting just past it does not.
+        let mut tail = bytes.clone();
+        tail[0x24..0x28].copy_from_slice(&(first + 8 + 16 - 8).to_le_bytes());
+        assert_eq!(malformed(&tail), "two parts overlap");
+        assert_eq!(Container::parse(&bytes).unwrap().parts.len(), 2);
+    }
+
+    #[test]
+    fn known_fourccs_match_case_and_every_byte() {
+        // "dxil" is a title's own part, not DXC's, so it may repeat and is
+        // never taken for the program.
+        let lower = FourCC(*b"dxil");
+        let bytes = build(&[(lower, &[1; 4]), (lower, &[2; 4])]);
+        let c = Container::parse(&bytes).unwrap();
+        assert!(c.part(FourCC::DXIL).is_none());
+        assert_eq!(c.part(lower).unwrap().data, &[1; 4]);
+        // A FourCC one byte off a known one, or padded with a NUL, repeats
+        // freely beside the real part.
+        for near in [*b"DXIM", *b"DXI\0", *b"\0XIL"] {
+            let near = FourCC(near);
+            let bytes = build(&[(FourCC::DXIL, &[3; 4]), (near, &[4; 4]), (near, &[5; 4])]);
+            let c = Container::parse(&bytes).unwrap();
+            assert_eq!(c.part(FourCC::DXIL).unwrap().data, &[3; 4], "{near}");
+            assert_eq!(c.parts.len(), 3);
+        }
+    }
+
+    #[test]
+    fn the_first_offset_failure_wins_in_table_order() {
+        // An overlap and a bad header in one table: the earlier entry is
+        // reported, so a fix to it surfaces the next.
+        let own = FourCC(*b"PRIV");
+        let bytes = build(&[(own, &[0; 4]), (own, &[0; 4]), (own, &[0; 4])]);
+        let first = HEADER_SIZE as u32 + 12;
+        let mut bad = bytes.clone();
+        bad[0x24..0x28].copy_from_slice(&first.to_le_bytes());
+        bad[0x28..0x2C].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(malformed(&bad), "two parts overlap");
+        bad[0x24..0x28].copy_from_slice(&(first + 12).to_le_bytes());
+        assert_eq!(malformed(&bad), "part overlaps the container header");
+    }
+
+    #[test]
     fn fourcc_display_masks_unprintable_bytes() {
         assert_eq!(FourCC::DXIL.to_string(), "DXIL");
         assert_eq!(FourCC(*b"A\0 \xFF").to_string(), "A...");
