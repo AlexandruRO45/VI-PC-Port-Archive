@@ -11,6 +11,22 @@ mod translate;
 
 use std::path::PathBuf;
 
+/// D3D12 Agility SDK (feature `agility`, for Windows 10): the runtime looks
+/// these up in the process's exe and loads `D3D12\D3D12Core.dll` next to it
+/// (put there by `cargo xtask agility`, whose package version must match),
+/// which brings shader model 6.6. Exported by `build.rs`. With them and no
+/// DLL, every D3D12 device fails (`D3D12_ERROR_INVALID_REDIST`), hence
+/// opt-in.
+#[cfg(feature = "agility")]
+#[unsafe(no_mangle)]
+#[used]
+pub static D3D12SDKVersion: u32 = 620;
+/// See [`D3D12SDKVersion`].
+#[cfg(feature = "agility")]
+#[unsafe(no_mangle)]
+#[used]
+pub static D3D12SDKPath: &[u8; 9] = b".\\D3D12\\\0";
+
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 

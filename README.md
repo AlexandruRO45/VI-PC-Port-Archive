@@ -69,6 +69,19 @@ cargo build --release -p victory
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
+**Windows 10.** Its own Direct3D 12 stops at shader model 6.5, so every
+pipeline is refused and the title crashes soon after its first screens.
+Build with the D3D12 Agility SDK instead:
+
+```powershell
+cargo build --release -p victory --features agility
+cargo xtask agility    # downloads Microsoft's Agility SDK from nuget.org into target\<profile>\D3D12\
+```
+
+A build with `agility` cannot make any D3D12 device without that folder, so
+run `cargo xtask agility` again after `cargo clean` or after building a new
+profile (for the diagnostics build: `--features diagnostics,agility`).
+
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.

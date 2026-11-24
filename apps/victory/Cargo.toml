@@ -29,6 +29,10 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# Load the D3D12 Agility SDK from D3D12\ next to victory.exe (Windows 10,
+# whose own D3D12 lacks shader model 6.6). Needs `cargo xtask agility`
+# after building: without the DLL no D3D12 device can be made.
+agility = []
 
 [lints]
 workspace = true

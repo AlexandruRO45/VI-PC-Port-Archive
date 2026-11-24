@@ -125,6 +125,13 @@ pub(crate) fn host() -> Option<&'static Host> {
         Ok(host) => Some(host),
         Err(e) => {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
+            // D3D12_ERROR_INVALID_REDIST
+            if e.code() == windows::core::HRESULT(0x887E_0003_u32 as i32) {
+                tracing::error!(
+                    "victory.exe asks for the D3D12 Agility SDK (feature `agility`) \
+                     but D3D12\\D3D12Core.dll is not next to it: run `cargo xtask agility`"
+                );
+            }
             None
         }
     })
@@ -184,6 +191,28 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // Translated shaders index the heaps directly (shader model 6.6).
+        // Windows 10's own D3D12 stops at 6.5 and then refuses every
+        // pipeline; the Agility SDK next to victory.exe lifts that.
+        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut model).cast(),
+                size_of_val(&model) as u32,
+            )
+            .is_err()
+            || model.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0
+        {
+            tracing::error!(
+                model = format_args!("{:#x}", model.HighestShaderModel.0),
+                "the host D3D12 runtime lacks shader model 6.6, so nothing will draw; \
+                 on Windows 10 build victory with `--features agility` and run \
+                 `cargo xtask agility` (see the README)"
+            );
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
