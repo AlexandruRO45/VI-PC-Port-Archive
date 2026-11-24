@@ -132,31 +132,125 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
-/// The host address of a root view: its buffer's host copy, or for a
-/// constant buffer not 256-byte aligned there (the console needs 16) a
-/// copy in upload memory.
-/// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
-/// other views as 1 MiB (both cut at their buffer's end).
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
-    let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
-        .left(address)
-        .min(if srv { 1 << 20 } else { 1 << 16 });
-    let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
-        shadow.refresh(list, address, len);
-        return Some(gpu);
-    }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
-}
-
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootBuffer {
+    Cbv,
+    Srv,
+    Uav,
+}
+
+struct RootView {
+    gpu: u64,
+    copy: Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+}
+
+/// A valid range in the resource that supplies the GPU address. Mirrored
+/// shadows own an alias for resource operations, but their root VA belongs
+/// to the main mirror allocation.
+fn validate_root_buffer(
+    kind: RootBuffer,
+    gpu: u64,
+    buffer_base: u64,
+    desc: D3D12_RESOURCE_DESC,
+    len: u64,
+) -> Result<(), &'static str> {
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER {
+        return Err("the host resource is not a buffer");
+    }
+    if gpu == 0
+        || buffer_base == 0
+        || gpu
+            .checked_sub(buffer_base)
+            .and_then(|offset| offset.checked_add(len))
+            .is_none_or(|end| end > desc.Width)
+    {
+        return Err("the host GPU address is outside the buffer");
+    }
+    if kind == RootBuffer::Uav
+        && !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+    {
+        return Err("the host buffer does not support unordered access");
+    }
+    if kind == RootBuffer::Srv && desc.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) {
+        return Err("the host buffer does not support shader reads");
+    }
+    // Use the raw-view alignment floor for root SRVs/UAVs as well. The
+    // console can supply offsets aligned only to a dword.
+    if kind != RootBuffer::Cbv && !gpu.is_multiple_of(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
+        return Err("the raw root GPU address is misaligned");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod root_view_tests {
+    use super::*;
+
+    #[test]
+    fn raw_root_uav_rejects_invalid_bindings() {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let base = 0x1000;
+        assert!(validate_root_buffer(RootBuffer::Uav, base, base, desc, 4).is_ok());
+        for gpu in [0, base - 16, base + 4, base + 256] {
+            assert!(validate_root_buffer(RootBuffer::Uav, gpu, base, desc, 4).is_err());
+        }
+        assert!(validate_root_buffer(RootBuffer::Uav, base + 240, base, desc, 17).is_err());
+        let read_only = D3D12_RESOURCE_DESC {
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+            ..desc
+        };
+        assert!(validate_root_buffer(RootBuffer::Uav, base, base, read_only, 4).is_err());
+    }
+}
+
+fn root_view(list: &HostList, address: u64, kind: RootBuffer) -> Result<RootView, &'static str> {
+    if address == 0 {
+        return Err("the title GPU address is null");
+    }
+    let min_len = if kind == RootBuffer::Cbv { 1 } else { 4 };
+    let shadow = crate::shadow::find(address, min_len).ok_or("no host copy of the title buffer")?;
+    // Root views carry no size. Keep the existing limiting spans for reads.
+    let limit = match kind {
+        RootBuffer::Cbv => 1 << 16,
+        RootBuffer::Srv => 1 << 20,
+        RootBuffer::Uav => u64::MAX,
+    };
+    let len = shadow.left(address).min(limit);
+    let gpu = shadow.gpu(address);
+    let resource = if shadow.is_mirrored() {
+        &crate::mirror::get().ok_or("no title memory mirror")?.buffer
+    } else {
+        &shadow.buffer
+    };
+    // SAFETY: the shadow or mirror retains the live resource.
+    let (base, desc) = unsafe { (resource.GetGPUVirtualAddress(), resource.GetDesc()) };
+    validate_root_buffer(kind, gpu, base, desc, len)?;
+    if kind == RootBuffer::Cbv
+        && !gpu.is_multiple_of(u64::from(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT))
+    {
+        let (gpu, to) = list.scratch(len).ok_or("no aligned constant-buffer upload")?;
+        if gpu == 0 || !gpu.is_multiple_of(u64::from(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT)) {
+            return Err("the constant-buffer upload GPU address is invalid");
+        }
+        list.defer_fill(to, address as *const u8, len as usize);
+        return Ok(RootView { gpu, copy: None });
+    }
+    Ok(RootView {
+        gpu,
+        copy: Some((shadow, address, len)),
+    })
 }
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
@@ -427,7 +521,21 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        if p.compute != compute {
+            return false;
+        }
         let l = &list.list;
+        let title_heaps = self.heaps.map(|h| {
+            (h != 0)
+                .then(|| crate::descriptor::heap(h as This).host())
+                .flatten()
+        });
+        for (i, (indexed, heap)) in p.indexed_heaps.into_iter().zip(title_heaps).enumerate() {
+            if indexed && heap.is_none() {
+                once!(pipeline = %p.name, heap = i, "draw or dispatch dropped: missing indexed heap");
+                return false;
+            }
+        }
         let needs_title_memory = p
             .stages
             .iter()
@@ -437,9 +545,7 @@ impl State {
         let mut fallback = None;
         if needs_title_memory {
             title_memory = if self.heaps[0] != 0 {
-                crate::descriptor::heap(self.heaps[0] as This)
-                    .host()
-                    .and_then(|heap| heap.title_memory())
+                title_heaps[0].and_then(|heap| heap.title_memory())
             } else {
                 fallback = crate::mirror::read_heap();
                 bound_heaps[0] = usize::MAX;
@@ -454,11 +560,9 @@ impl State {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != bound_heaps {
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = title_heaps
+                .into_iter()
+                .flatten()
                 .map(|h| Some(h.heap.clone()))
                 .collect();
             if let Some(heap) = fallback {
@@ -493,6 +597,7 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        let mut root_views = Vec::new();
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
@@ -541,9 +646,13 @@ impl State {
                     }
                 }
             }
-            for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+            for (views, kind) in [
+                (&stage.root_cbvs, RootBuffer::Cbv),
+                (&stage.root_srvs, RootBuffer::Srv),
+                (&stage.root_uavs, RootBuffer::Uav),
+            ] {
                 for &(slot, param) in views {
-                    if srv && slot == TITLE_MEMORY_SLOT {
+                    if kind == RootBuffer::Srv && slot == TITLE_MEMORY_SLOT {
                         let Some(handle) = title_memory else {
                             return false;
                         };
@@ -557,7 +666,7 @@ impl State {
                         }
                         continue;
                     }
-                    if srv && slot == DESCRIPTOR_DATA_SLOT {
+                    if kind == RootBuffer::Srv && slot == DESCRIPTOR_DATA_SLOT {
                         let data = (self.heaps[0] != 0)
                             .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                             .flatten()
@@ -581,48 +690,39 @@ impl State {
                     }
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
-                        once!(slot, "a shader reads a root view the title did not set");
-                        continue;
+                        once!(pipeline = %p.name, slot, ?kind, "draw or dispatch dropped: unset root view");
+                        return false;
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
-                        continue;
-                    };
-                    // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                    let view = match root_view(list, *address, kind) {
+                        Ok(view) => view,
+                        Err(reason) => {
+                            once!(pipeline = %p.name, slot, ?kind, reason, "draw or dispatch dropped: invalid root view");
+                            return false;
                         }
-                    }
+                    };
+                    root_views.push((param, kind, view));
                 }
             }
-            for &(slot, param) in &stage.root_uavs {
-                let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                else {
-                    once!(slot, "a dispatch dropped: no root UAV");
-                    return false;
-                };
-                let Some(shadow) = crate::shadow::find(*address, 4) else {
-                    return false;
-                };
-                let gpu = shadow.gpu(*address);
-                // SAFETY: the shadow retains a live D3D12 buffer.
-                let flags = unsafe { shadow.buffer.GetDesc().Flags };
-                if gpu % 4 != 0 || !flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
-                    return false;
+        }
+        // Resolve every required view before recording any root descriptor
+        // setter. Earlier valid views cannot leak into a rejected dispatch.
+        for (param, kind, RootView { gpu, copy }) in root_views {
+            if let Some((shadow, address, len)) = copy {
+                shadow.refresh(list, address, len);
+                if kind == RootBuffer::Uav {
+                    shadow.gpu_writes(list, address, len);
                 }
-                let len = shadow.left(*address);
-                shadow.refresh(list, *address, len);
-                shadow.gpu_writes(list, *address, len);
-                // SAFETY: the open list references a retained, UAV-capable buffer.
-                unsafe {
-                    if compute {
-                        l.SetComputeRootUnorderedAccessView(param, gpu);
-                    } else {
-                        l.SetGraphicsRootUnorderedAccessView(param, gpu);
-                    }
+            }
+            // SAFETY: an open list, a valid GPU address, and the parameter
+            // type installed for this view by the pipeline's root signature.
+            unsafe {
+                match (compute, kind) {
+                    (false, RootBuffer::Cbv) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                    (false, RootBuffer::Srv) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                    (false, RootBuffer::Uav) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+                    (true, RootBuffer::Cbv) => l.SetComputeRootConstantBufferView(param, gpu),
+                    (true, RootBuffer::Srv) => l.SetComputeRootShaderResourceView(param, gpu),
+                    (true, RootBuffer::Uav) => l.SetComputeRootUnorderedAccessView(param, gpu),
                 }
             }
         }
