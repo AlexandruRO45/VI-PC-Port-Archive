@@ -191,12 +191,26 @@ const REPOSITORY_ENV: &[&str] = &[
 /// `GIT_INDEX_FILE` names. Tests point `root` at temporary repositories
 /// instead, and when they run from a hook those variables would send every
 /// one of them to the same, outside index, so there they are dropped.
+///
+/// Temporary repositories also read no global or system configuration: a
+/// developer's `core.excludesFile` would hide the files a test stages, and
+/// their `core.hooksPath` would run their hooks inside it. The checkout
+/// itself keeps that configuration, since a global excludes file is how
+/// files that will never be added (`.DS_Store`) stay out of the full check.
 pub(crate) fn git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(root);
     #[cfg(test)]
-    for var in REPOSITORY_ENV {
-        command.env_remove(var);
+    {
+        for var in REPOSITORY_ENV {
+            command.env_remove(var);
+        }
+        if root != crate::workspace_root() {
+            // Git for Windows opens "/dev/null" as NUL.
+            command
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+        }
     }
     command
 }
@@ -730,6 +744,37 @@ mod tests {
         for var in String::from_utf8(out.stdout).unwrap().lines() {
             assert!(super::REPOSITORY_ENV.contains(&var), "{var} is missing");
         }
+    }
+
+    /// A developer's global `core.excludesFile` used to hide the files the
+    /// temporary repositories stage (`git add` refused them), and their
+    /// `core.hooksPath` ran their hooks there. Only the repository's own
+    /// configuration may reach those tests; the checkout keeps the rest.
+    #[test]
+    fn temporary_repositories_read_only_their_own_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let out = super::git_command(root).args(["init", "-q"]).output();
+        let Some(_) = out.ok().filter(|o| o.status.success()) else {
+            eprintln!("skipped: no git");
+            return;
+        };
+        let out = super::git_command(root)
+            .args(["config", "--list", "--show-scope"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        for line in String::from_utf8(out.stdout).unwrap().lines() {
+            assert!(line.starts_with("local\t"), "outside config: {line}");
+        }
+
+        let checkout = super::git_command(&crate::workspace_root());
+        assert!(
+            checkout
+                .get_envs()
+                .all(|(key, _)| key != "GIT_CONFIG_GLOBAL"),
+            "the checkout's own check must keep the developer's excludes"
+        );
     }
 
     #[test]
