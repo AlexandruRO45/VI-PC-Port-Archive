@@ -1,0 +1,43 @@
+# Interim Linux CI for the crates that already build without Windows.
+# Superseded once full-workspace Linux CI lands; fold or delete then.
+name: linux-subset
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup is preinstalled; this installs the toolchain pinned in rust-toolchain.toml.
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Asset policy
+        run: cargo xtask policy
+
+      - name: cargo check
+        run: >
+          cargo check --all-targets
+          -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
+          -p victory-game -p victory-shader -p victory-loader
+
+      # victory-pe and victory-loader tests parse the test binary itself as a PE
+      # image, so they only pass on Windows; they are checked above, not run.
+      - name: cargo test
+        run: >
+          cargo test
+          -p victory-core -p victory-formats -p victory-pipeline
+          -p victory-game -p victory-shader
