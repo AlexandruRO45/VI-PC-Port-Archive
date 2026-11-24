@@ -2615,7 +2615,11 @@ mod tests {
         }
         // The whole table, every slot absent, holds no programs.
         let blob = xbch(&good);
-        assert!(native_programs(&part(&[(KIND_NATIVE, &blob)])).unwrap().is_empty());
+        assert!(
+            native_programs(&part(&[(KIND_NATIVE, &blob)]))
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(good.len(), FSSM_HEADER + slot(HwStage::Cs) + 8);
     }
 
@@ -4419,5 +4423,85 @@ mod tests {
             read((0, 1), (0, 0)),
             Err(Malformed("root parameter outside the SGPRs"))
         ));
+    }
+
+    #[test]
+    fn records_and_code_need_no_alignment() {
+        // Every record is found through its slot and every offset counts
+        // from the payload, so a record moved 1..7 bytes later (its slot and
+        // code offset following it) reads exactly as it did aligned.
+        let good = fssm(&[(HwStage::Vs, &VS_CODE), (HwStage::Cs, &VS_CODE)]);
+        let want = native_programs(&part(&[(KIND_NATIVE, &xbch(&good))])).unwrap();
+        assert_eq!(want.len(), 2);
+        for pad in 1..8usize {
+            for stage in [HwStage::Vs, HwStage::Cs] {
+                let slot_at = FSSM_HEADER + slot(stage);
+                let record = u64_at(&good, slot_at).unwrap();
+                let at = FSSM_HEADER + record as usize;
+                let mut blob = good.clone();
+                blob.splice(at..at, std::iter::repeat_n(0xA5, pad));
+                // Every offset at or past the insertion moves with it.
+                for s in [HwStage::Vs, HwStage::Cs] {
+                    let s_at = FSSM_HEADER + slot(s);
+                    let r = u64_at(&blob, s_at).unwrap();
+                    let r = if r >= record { r + pad as u64 } else { r };
+                    blob[s_at..][..8].copy_from_slice(&r.to_le_bytes());
+                    let code_at = FSSM_HEADER + r as usize;
+                    let code = u64_at(&blob, code_at).unwrap();
+                    let code = if code >= record {
+                        code + pad as u64
+                    } else {
+                        code
+                    };
+                    blob[code_at..][..8].copy_from_slice(&code.to_le_bytes());
+                }
+                let payload = (blob.len() - FSSM_HEADER) as u64;
+                blob[8..16].copy_from_slice(&payload.to_le_bytes());
+                assert_eq!(
+                    native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap(),
+                    want,
+                    "{stage:?} moved {pad}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_payload_size_and_slot_count_are_whole_64_bit_words() {
+        let good = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let payload = (good.len() - FSSM_HEADER) as u64;
+        let with = |at: usize, value: u64| {
+            let mut blob = good.clone();
+            blob[at..][..8].copy_from_slice(&value.to_le_bytes());
+            refused_blob(&xbch(&blob))
+        };
+        // The stated size must be the payload's, neither more nor less, and
+        // its high half counts.
+        for size in [0, payload + 1, payload | 1 << 32, u64::MAX] {
+            assert_eq!(with(8, size), "FSSM payload size disagrees", "{size:#x}");
+        }
+        // The slot count is six in all 64 bits: a high bit set, or a count of
+        // the six graphics slots plus mesh and compute, is not it.
+        for count in [
+            GRAPHICS_SLOT_COUNT | 1 << 32,
+            GRAPHICS_SLOT_COUNT | 1 << 63,
+            8,
+            0,
+        ] {
+            assert_eq!(
+                with(FSSM_HEADER, count),
+                "unexpected FSSM slot count",
+                "{count:#x}"
+            );
+        }
+        // Bytes after the code, counted in the stated size, are never read.
+        let mut padded = good.clone();
+        padded.extend_from_slice(&[0xCC; 13]);
+        let size = (padded.len() - FSSM_HEADER) as u64;
+        padded[8..16].copy_from_slice(&size.to_le_bytes());
+        assert_eq!(
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&padded))])).unwrap(),
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&good))])).unwrap()
+        );
     }
 }
