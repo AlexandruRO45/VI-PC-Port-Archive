@@ -316,8 +316,8 @@ impl HostHeap {
                 (ResourceType::Uav, true) => null_buffer_uav(at),
                 (ResourceType::Uav, false) => null_texture_uav(4, at),
                 (ResourceType::Cbv, _) => null_cbv(at),
-                (ResourceType::Srv, true) => null_buffer_view(at),
-                (ResourceType::Srv, false) => null_view(at),
+                (ResourceType::Srv | ResourceType::Other(_), true) => null_buffer_view(at),
+                (ResourceType::Srv | ResourceType::Other(_), false) => null_view(at),
                 (ResourceType::Sampler, _) => unreachable!(),
             }
         }
@@ -409,8 +409,8 @@ impl HostHeap {
                     (ResourceType::Uav, true) => NULL_BUFFER_UAV,
                     (ResourceType::Uav, false) => NULL_TEXTURE_UAV,
                     (ResourceType::Cbv, _) => NULL_CBV,
-                    (ResourceType::Srv, true) => NULL_BUFFER_SRV,
-                    (ResourceType::Srv, false) => NULL_SRV,
+                    (ResourceType::Srv | ResourceType::Other(_), true) => NULL_BUFFER_SRV,
+                    (ResourceType::Srv | ResourceType::Other(_), false) => NULL_SRV,
                     (ResourceType::Sampler, _) => unreachable!(),
                 }
             };
@@ -742,12 +742,10 @@ fn fix_depth_stencil_srv(own: u32, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) {
     if let Some(plane) = plane {
         match desc.ViewDimension {
             D3D12_SRV_DIMENSION_TEXTURE2D => {
-                // SAFETY: `ViewDimension` selects the `Texture2D` union member.
-                unsafe { desc.Anonymous.Texture2D.PlaneSlice = plane };
+                desc.Anonymous.Texture2D.PlaneSlice = plane;
             }
             D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
-                // SAFETY: `ViewDimension` selects the `Texture2DArray` union member.
-                unsafe { desc.Anonymous.Texture2DArray.PlaneSlice = plane };
+                desc.Anonymous.Texture2DArray.PlaneSlice = plane;
             }
             _ => {}
         }
@@ -1161,8 +1159,7 @@ mod tests {
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };
-        // SAFETY: `ViewDimension` is `TEXTURE2D`.
-        unsafe { depth.Anonymous.Texture2D.PlaneSlice = 1 };
+        depth.Anonymous.Texture2D.PlaneSlice = 1;
         fix_depth_stencil_srv(19, &mut depth);
         assert_eq!(depth.Format.0, 21); // R32_FLOAT_X8X24_TYPELESS
         // SAFETY: `ViewDimension` is `TEXTURE2D`.

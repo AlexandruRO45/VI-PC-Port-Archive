@@ -35,6 +35,13 @@ struct Clock {
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
 /// Last tick delivered, per event kind (origin, present, ...).
 static LAST: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Frames begun so far (frame waits that ended).
+static FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// Frames begun so far (frame waits that ended).
+pub(crate) fn current() -> u64 {
+    FRAME.load(Ordering::Relaxed)
+}
 
 fn clock() -> MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -246,6 +253,7 @@ pub(crate) extern "system" fn wait(
             sleep_until(target);
         }
         last(kind).fetch_max(tick, Ordering::Relaxed);
+        FRAME.fetch_add(1, Ordering::Relaxed);
         S_OK
     };
     if !token.is_null() {

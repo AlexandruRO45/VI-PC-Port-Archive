@@ -1328,7 +1328,7 @@ extern "system" fn wait_value(this: This, address: u64, comparison: u32, referen
 struct BarrierGroup {
     kind: u32,
     count: u32,
-    barriers: *const c_void,
+    barriers: *const std::ffi::c_void,
 }
 
 #[cfg(windows)]
