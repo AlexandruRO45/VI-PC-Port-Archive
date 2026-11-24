@@ -10,6 +10,7 @@
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/save_store.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,6 +27,7 @@ struct Proxy {
     void** vtable;
     void* real;
     int provider;
+    bool public_save_interface{};
 };
 GUID provider_ids[max_providers];
 Proxy* proxies[max_providers];
@@ -64,6 +66,7 @@ bool tracked(u64 value)
 }
 bool user_call(int slot, u64* args, u64* result);
 bool save_call(int slot, u64* args, u64* result);
+bool save_read_call(int slot, u64* args, u64* result);
 bool area_call(unsigned long provider, int slot, u64* args, u64* result);
 u64 complete_async(u64 async_block);
 void* storage_object();
@@ -92,7 +95,10 @@ __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s
             result = 0;
         }
     }
-    if (!handled && self->provider == save_provider && N >= 3 && fake_user()) handled = save_call(N, args, &result);
+    if (!handled && self->provider == save_provider && N >= 3 && fake_user()) {
+        if (self->public_save_interface) handled = save_read_call(N, args, &result);
+        if (!handled) handled = save_call(N, args, &result);
+    }
     if (!handled && N >= 3 && fake_user()) handled = area_call(provider_ids[self->provider].Data1, N, args, &result);
     if (!handled && self->provider != user_provider && N >= 3 && fake_user()) {
         // Other API families cannot resolve the local user's handle: fail the call instead of passing it on.
@@ -152,7 +158,11 @@ HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
     }
     Proxy* proxy = nullptr;
     if (index >= 0) {
-        if (!proxies[index] || proxies[index]->real != *out) proxies[index] = new Proxy{slot_table, *out, index};
+        constexpr GUID save_class{0x704c3f58,0xe629,0x4cc2,{0xb1,0x97,0x30,0x51,0x1b,0x99,0x6f,0xe2}};
+        constexpr GUID save_iid{0x1bfff3af,0xf14a,0x40a3,{0x8e,0x35,0x9a,0xda,0x90,0x65,0x93,0xf9}};
+        const bool public_save = *provider == save_class && iid && *iid == save_iid;
+        if (!proxies[index] || proxies[index]->real != *out || proxies[index]->public_save_interface != public_save)
+            proxies[index] = new Proxy{slot_table, *out, index, public_save};
         proxy = proxies[index];
     }
     ReleaseSRWLockExclusive(&proxy_lock);
@@ -291,10 +301,9 @@ bool user_call(int slot, u64* args, u64* result)
 }
 
 // ---- local game saves -----------------------------------------------------------------------
-// Slot numbers follow the order of the public XGameSave.h (hypothesis, checked against the logged
-// argument shapes). Containers and blob writes are kept on disk (save_store.h, below
-// storage_path()/x2w-gamesave); enumerations and reads still report nothing and the calls whose
-// argument layout is not known are accepted and dropped. Asynchronous calls are completed by starting the real
+// Containers and submitted blob writes are kept in storage_path()/x2w-gamesave.
+// The synchronous queries for the verified interface use save_read.inl. Unknown
+// interface revisions retain the original empty results. Asynchronous calls are completed by starting the real
 // "add default user silently" operation on the caller's async block: it fails quickly inside the
 // runtime and runs the caller's completion callback on its task queue; the matching Result call is
 // then answered here.
@@ -348,6 +357,7 @@ std::string update_container(u64 update)
     return name;
 }
 u64 last_submit_status;  // what the last asynchronous submit returned (hypothesis: one at a time)
+#include "startup_stubs/save_read.inl"
 // Publishes what an update has staged, all or nothing. The update itself stays open.
 u64 submit_update(u64 update)
 {

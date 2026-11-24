@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -86,6 +87,12 @@ struct Action {
 };
 constexpr std::size_t max_staged_bytes = std::size_t{256} << 20;  // per update
 
+struct Entry {
+    std::string name;
+    std::uint64_t bytes;
+    std::time_t modified;
+};
+
 // Container handles of the game-save stand-in: a fixed table indexed by the low bits of the handle,
 // with a reference count per entry so closed containers give their slot back. The caller holds the
 // lock; no Windows types here so it can be tested on its own.
@@ -153,6 +160,10 @@ public:
         return actions;
     }
     std::size_t staged_count(std::size_t update) const { return update < capacity ? staged_[update].size() : 0; }
+    const std::string* open_name(std::size_t index) const
+    {
+        return index < capacity && refs_[index] ? &names_[index] : nullptr;
+    }
     // Name of the container behind an open update, or empty.
     std::string update_container(std::size_t update) const
     {
@@ -184,6 +195,39 @@ class Store {
 public:
     explicit Store(fs::path root) : root_(std::move(root)) {}
 
+    // Readers take this lock while taking a complete metadata or payload snapshot.
+    // No caller code runs under it.
+    static std::mutex& publication_lock() { static std::mutex lock; return lock; }
+
+    // An empty container selects directories in the storage root. Otherwise select
+    // only regular committed blobs in this container. Never descend into redirects.
+    Status entries(std::string_view container, std::vector<Entry>& result) const
+    {
+        const auto dir = container.empty() ? root_ : container_dir(container);
+        if (dir.empty()) return Status::bad_name;
+        std::error_code ec;
+        const auto parent = fs::symlink_status(dir, ec);
+        if (parent.type() == fs::file_type::not_found) return container.empty() ? Status::ok : Status::not_found;
+        if (ec || redirected(parent) || !fs::is_directory(parent)) return Status::io_error;
+        for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+            const auto state = it->symlink_status(ec);
+            if (ec) break;
+            if (redirected(state) || !(container.empty() ? fs::is_directory(state) : fs::is_regular_file(state))) continue;
+            const auto name = it->path().filename().string();
+            if (!valid_name(name)) continue;
+            const auto bytes = container.empty() ? 0 : it->file_size(ec);
+            if (ec) break;
+            if (bytes > max_blob_bytes) return Status::too_large;
+            const auto file_time = it->last_write_time(ec);
+            if (ec) break;
+            const auto elapsed = file_time - fs::file_time_type::clock::now();
+            const auto modified = std::chrono::system_clock::now() +
+                std::chrono::duration_cast<std::chrono::system_clock::duration>(elapsed);
+            result.push_back({name, bytes, std::chrono::system_clock::to_time_t(modified)});
+        }
+        return ec ? Status::io_error : Status::ok;
+    }
+
     // An existing container directory counts as success; a redirected one is refused.
     Status create_container(std::string_view container) const
     {
@@ -199,6 +243,7 @@ public:
 
     Status delete_container(std::string_view container) const
     {
+        const std::lock_guard guard(publication_lock());
         const fs::path dir = container_dir(container);
         if (dir.empty()) return Status::bad_name;
         std::error_code ec;
@@ -229,8 +274,7 @@ public:
             if (!seen) last.push_back(&action);
         }
         if (const Status made = create_container(container); made != Status::ok) return made;
-        static std::mutex commit_lock;  // one commit or rename at a time in this process
-        const std::lock_guard<std::mutex> guard(commit_lock);
+        const std::lock_guard<std::mutex> guard(publication_lock());
         struct Step {
             fs::path file, part, old;
             bool remove = false, moved_old = false, installed = false;
@@ -337,6 +381,7 @@ public:
 
     Status delete_blob(std::string_view container, std::string_view blob) const
     {
+        const std::lock_guard guard(publication_lock());
         const fs::path file = blob_file(container, blob);
         if (file.empty()) return Status::bad_name;
         std::error_code ec;
