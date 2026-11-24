@@ -1371,6 +1371,16 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
     out
 }
 
+fn relative_vgpr_limit(insts: &[Decoded]) -> u64 {
+    if !insts.iter().any(|d| d.inst.name.starts_with("V_MOVREL") || d.inst.name == "V_SWAPREL_B32") {
+        return 0;
+    }
+    insts.iter().flat_map(|d| {
+        let (reads, writes) = rdna2::vgpr_uses(d);
+        reads.into_iter().chain(writes)
+    }).max().unwrap_or(0)
+}
+
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let normalized;
     let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
@@ -1433,14 +1443,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             em.upper = Some(a);
         }
     }
-    em.max_vgpr = insts
-        .iter()
-        .flat_map(|d| {
-            let (r, w) = rdna2::vgpr_uses(d);
-            r.into_iter().chain(w)
-        })
-        .max()
-        .unwrap_or(0);
+    em.max_vgpr = relative_vgpr_limit(&insts);
     if let Mode::Pixel(ps) = &opt.mode {
         em.ps_modes = emit::ps_attr_modes(&insts, ps.input_ena);
     }
