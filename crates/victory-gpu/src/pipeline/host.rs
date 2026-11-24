@@ -330,12 +330,48 @@ fn wave_lanes_unsupported(
     wave64_stage && host_max < 64
 }
 
+/// Returns a human-readable refusal reason when [`wave_lanes_unsupported`]
+/// holds: reports the emitted `PSV0` and host wave-lane ranges when `PSV0`
+/// provides them, and retains the console 64-lane message when `PSV0` is `None`.
+fn wave_lanes_refusal(
+    stage: &str,
+    console_wave64: bool,
+    emitted_wave: Option<(u32, u32)>,
+    host_lanes: (u32, u32),
+) -> Option<std::borrow::Cow<'static, str>> {
+    if !wave_lanes_unsupported(stage, console_wave64, emitted_wave, host_lanes) {
+        return None;
+    }
+    if let Some((req_min, req_max)) = emitted_wave {
+        let (host_min, host_max) = host_lanes;
+        return Some(
+            format!(
+                "a {stage} shader declaring PSV0 wave lanes [{req_min}, {req_max}] on a host supporting [{host_min}, {host_max}]"
+            )
+            .into(),
+        );
+    }
+    Some(
+        match (stage, host_lanes.1 < 32) {
+            ("mesh", true) => {
+                "a mesh program written for 64-lane waves, on a host without them (e.g. 4-lane WARP)"
+            }
+            ("mesh", false) => "a mesh program written for 64-lane waves, on a host without them",
+            (_, true) => {
+                "a shader requiring wider waves than this host supports (e.g. 4-lane WARP)"
+            }
+            (_, false) => "a shader requiring 64-lane waves, on a host without them",
+        }
+        .into(),
+    )
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
-fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
-    static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
+fn refuse(reason: &str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&reason) {
-        seen.push(reason);
+    if !seen.iter().any(|s| s == reason) {
+        seen.push(reason.to_owned());
         tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
     }
     None
@@ -378,29 +414,15 @@ impl HostPipeline {
         }
         let host_lanes = host()?.wave_lanes();
         if let Some(ms) = mesh
-            && wave_lanes_unsupported(ms.stage, ms.wave64(), None, host_lanes)
+            && let Some(reason) = wave_lanes_refusal(ms.stage, ms.wave64(), None, host_lanes)
         {
-            return refuse(
-                if host_lanes.1 < 32 {
-                    "a mesh program written for 64-lane waves, on a host without them (e.g. 4-lane WARP)"
-                } else {
-                    "a mesh program written for 64-lane waves, on a host without them"
-                },
-                shaders,
-            );
+            return refuse(&reason, shaders);
         }
         for (s, _) in &stages {
             let t = s.translated()?;
             let emitted = dxil_wave_lanes(&t.host.dxil);
-            if wave_lanes_unsupported(s.stage, s.wave64(), emitted, host_lanes) {
-                return refuse(
-                    if host_lanes.1 < 32 {
-                        "a shader requiring wider waves than this host supports (e.g. 4-lane WARP)"
-                    } else {
-                        "a shader requiring 64-lane waves, on a host without them"
-                    },
-                    shaders,
-                );
+            if let Some(reason) = wave_lanes_refusal(s.stage, s.wave64(), emitted, host_lanes) {
+                return refuse(&reason, shaders);
             }
         }
         let host = host()?;
@@ -745,7 +767,7 @@ fn root_signature(
 
 #[cfg(test)]
 mod tests {
-    use super::{dxil_wave_lanes, wave_lanes_unsupported};
+    use super::{dxil_wave_lanes, wave_lanes_refusal, wave_lanes_unsupported};
 
     fn synthetic_dxbc_with_psv0(min_lanes: u32, max_lanes: u32) -> Vec<u8> {
         let mut psv = Vec::new();
@@ -840,6 +862,27 @@ mod tests {
         // Vertex and pixel programs run per lane.
         assert!(!wave_lanes_unsupported("vertex", true, None, (32, 32)));
         assert!(!wave_lanes_unsupported("pixel", true, None, (4, 4)));
+    }
+
+    #[test]
+    fn wave_lanes_refusal_reports_emitted_and_host_ranges() {
+        let wave32_on_64 =
+            wave_lanes_refusal("compute", true, Some((32, 32)), (64, 64)).expect("refused");
+        assert!(wave32_on_64.contains("[32, 32]"));
+        assert!(wave32_on_64.contains("[64, 64]"));
+        assert!(!wave32_on_64.contains("64-lane waves"));
+
+        let wave64_on_32 =
+            wave_lanes_refusal("compute", true, Some((64, 64)), (32, 32)).expect("refused");
+        assert!(wave64_on_32.contains("[64, 64]"));
+        assert!(wave64_on_32.contains("[32, 32]"));
+        assert!(!wave64_on_32.contains("64-lane waves"));
+
+        let unsized_on_32 = wave_lanes_refusal("compute", true, None, (32, 32)).expect("refused");
+        assert_eq!(
+            unsized_on_32,
+            "a shader requiring 64-lane waves, on a host without them"
+        );
     }
 
     #[test]
