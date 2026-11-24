@@ -1980,13 +1980,18 @@ mod tests {
         let register = slot::<Register, _>(&hub.object, 0x48);
         let reg_thread = std::thread::spawn(move || {
             let mut token = 0;
-            // Blocking enumeration delivers pad 0 on this thread.
+            // Blocking enumeration (`2`) delivers pad 0 on this thread.
             assert_eq!(
-                register(&hub.object, std::ptr::null(), GAMEPAD_KIND, STATUS_CONNECTED, 1, std::ptr::null_mut(), Some(cb), &mut token),
+                register(&hub.object, std::ptr::null(), GAMEPAD_KIND, STATUS_CONNECTED, 2, std::ptr::null_mut(), Some(cb), &mut token),
                 S_OK
             );
         });
+        let wait_start = std::time::Instant::now();
         while !FIRST_IN.load(Ordering::SeqCst) {
+            assert!(
+                wait_start.elapsed() < Duration::from_secs(5),
+                "blocking enumeration callback never entered"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
         // Connect pad 1 while blocking enumeration is still inside `cb`.
