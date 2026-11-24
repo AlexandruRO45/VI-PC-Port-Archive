@@ -2994,6 +2994,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn code_length_run_crossing_into_the_distance_codes_is_a_stream() {
+        // A dynamic block sends its literal/length and distance code lengths
+        // as one sequence, and a run (16: the previous length again) may
+        // carry on from the last literal/length codes into the distance
+        // codes. Such a block is a stream; the same run one longer runs
+        // past the codes the header states and breaks it. Either way the
+        // record covers no other, so it is yielded, unpacking only if it is
+        // a stream, and the record after it is found.
+        let a = u32::from(b'A');
+        // Literal/length code: `A` in 1 bit, 255 and the end of the block
+        // in 2; four distance codes in 2 bits each, all complete codes.
+        let mut lengths = vec![0; 257 + 4];
+        lengths[a as usize] = 1;
+        for l in &mut lengths[255..] {
+            *l = 2;
+        }
+        // Code-length code: 18 in 1 bit, 16 in 2, 1 and 2 in 3.
+        let mut clen = [0; 19];
+        (clen[18], clen[16], clen[1], clen[2]) = (1, 2, 3, 3);
+        let head = length_symbols(&lengths[..256]);
+        assert_eq!(head.last(), Some(&(2, 0)), "255's length, sent as is");
+        assert!(head.iter().all(|&(sym, _)| matches!(sym, 1 | 2 | 18)));
+        let data = [a, a, 255, a, 256];
+        let want = vec![b'A', b'A', 255, b'A'];
+        // 16's 2 extra bits state 3 to 6 repeats: 256 and the four distance
+        // codes are 5; 6 runs one past them.
+        let block = |repeats: u32| {
+            let mut seq = head.clone();
+            seq.push((16, repeats - 3));
+            dynamic_block_of(257, 4, &clen, &seq, &lengths[..257], &data)
+        };
+        for (repeats, valid) in [(5, true), (6, false)] {
+            let what = format!("{repeats} repeats");
+            let packed = block(repeats);
+            assert_eq!(
+                miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                valid.then(|| want.clone()),
+                "{what}"
+            );
+            assert_eq!(starts_stream(&packed, want.len()), valid, "{what}");
+
+            let (file, marker) = outer_then_after(&packed, want.len());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            assert_eq!(found[0].unpack(), valid.then(|| want.clone()), "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "{what}");
+        }
+    }
+
     /// A non-final stored block of `before`, then one final fixed-code
     /// block: a copy of 3 bytes from `distance` (1 to 4) bytes back, then
     /// the end of the block.
