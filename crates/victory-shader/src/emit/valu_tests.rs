@@ -197,8 +197,6 @@ fn build_valu_cs_with_stores(body: &[u32], stores: &[[u32; 2]]) -> HostShader {
 /// modules take this lock too.
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
-/// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 /// Checks the emitted SFI0 declares the DXIL NativeLowPrecision feature.
 fn assert_native_low_precision(shader: &HostShader) {
     let container = crate::dxbc::Container::parse(&shader.dxil).expect("DXIL container");
@@ -212,6 +210,8 @@ fn assert_native_low_precision(shader: &HostShader) {
         "SFI0 must declare NativeLowPrecision for rawBufferStore.i16"
     );
 }
+/// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
+/// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
