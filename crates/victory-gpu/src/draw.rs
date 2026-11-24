@@ -505,13 +505,28 @@ impl State {
                 }
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
-                for &(slot, param) in views {
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                    else {
-                        once!(slot, "a shader reads a root view the title did not set");
-                        continue;
+                for &(reg, param) in views {
+                    // A shader that chases a pointer encodes where the
+                    // pointer lives as `((dword + 1) << 8) | slot`: the root
+                    // view is the buffer the pointer holds, not a root the
+                    // title set.
+                    let address = match reg.checked_sub(256) {
+                        Some(at) => {
+                            let (slot, dword) = ((reg & 0xFF) as u8, ((at >> 8) as u32) + 1);
+                            let lo = self.user_value(compute, slot, RootType::Constants, dword);
+                            let hi =
+                                self.user_value(compute, slot, RootType::Constants, dword + 1);
+                            u64::from(lo) | u64::from(hi) << 32
+                        }
+                        None => match self.roots_ref(compute).get(usize::from(reg)) {
+                            Some(&Root::View(address)) => address,
+                            _ => {
+                                once!(reg, "a shader reads a root view the title did not set");
+                                continue;
+                            }
+                        },
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    let Some(gpu) = root_view(list, address, srv) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.

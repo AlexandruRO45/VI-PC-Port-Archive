@@ -433,7 +433,10 @@ fn texture_to_buffer(
     z: u32,
     source_box: *const [u32; 6],
 ) {
-    use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_BOX, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_TEXTURE_COPY_LOCATION,
+    };
     use windows::core::Interface;
     const FOOTPRINT: u32 = 1;
     let miss = || {
@@ -481,6 +484,16 @@ fn texture_to_buffer(
     }
     ensure_state(list, src.resource, COPY_SOURCE);
     from.resource = texture.as_raw().cast_const().cast();
+    // A buffer that ran as indirect arguments or a UAV is left in that state,
+    // and copying into it from there is an invalid transition: move it to the
+    // copy destination first. Buffers accept barriers in any state.
+    let to_copy = crate::host::transition(
+        &shadow.buffer,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    // SAFETY: an open list and a live buffer.
+    unsafe { list.list.ResourceBarrier(&[to_copy]) };
     // The destination buffer reads title memory; what the copy writes there
     // goes back to it once the list has run.
     shadow.refresh(list, at, bytes);
