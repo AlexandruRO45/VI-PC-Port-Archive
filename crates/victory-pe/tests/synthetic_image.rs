@@ -2382,3 +2382,68 @@ fn forwarders_by_ordinal_cover_the_whole_16_bit_range() {
         Err(PeError::Malformed(_))
     ));
 }
+
+/// Shrinks the one section's raw data to `raw` bytes; the rest of its
+/// virtual size becomes zero fill that the file does not hold.
+fn with_raw_size(raw: u32) -> Vec<u8> {
+    let mut d = image();
+    put32(&mut d, OPT + 240 + 16, raw);
+    d
+}
+
+#[test]
+fn an_iat_in_the_zero_filled_tail_of_a_section_is_accepted() {
+    // The loader writes the IAT in memory, so it may sit where the file has
+    // no bytes; only the name table it is paired with must be file data.
+    let mut d = with_raw_size(0x280);
+    let tail_iat = SECTION_RVA + 0x300;
+    put32(&mut d, at(IMPORT_DESCRIPTORS) + 16, tail_iat);
+    let info = ImageInfo::parse(&d).unwrap();
+    let slots: Vec<u32> = info.imports[0]
+        .entries
+        .iter()
+        .map(|e| e.iat_slot_rva)
+        .collect();
+    assert_eq!(slots, [tail_iat, tail_iat + 8]);
+    assert_eq!(info.rva_to_file_offset(tail_iat), None);
+    assert_eq!(
+        info.rva_to_file_offset(NAME_TABLE),
+        Some(at(NAME_TABLE) as u32)
+    );
+}
+
+#[test]
+fn a_name_table_in_the_zero_filled_tail_is_malformed() {
+    // The name table is read from the file; zero fill past the raw data is
+    // not there to read, even though it is inside the section in memory.
+    let mut d = with_raw_size(0x280);
+    put32(&mut d, at(IMPORT_DESCRIPTORS), SECTION_RVA + 0x300);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+}
+
+#[test]
+fn tls_data_in_the_zero_filled_tail_is_outside_the_sections() {
+    // Raw data ends just before the callback array: the directory is read,
+    // the array is not.
+    let raw = TLS_CALLBACKS - SECTION_RVA;
+    match ImageInfo::parse(&with_raw_size(raw)) {
+        Err(PeError::Malformed(m)) => assert!(m.contains("callback array"), "{m}"),
+        other => panic!("expected a malformed callback array, got {other:?}"),
+    }
+    // Raw data ends inside the directory, before its callback field.
+    let raw = TLS_DIRECTORY - SECTION_RVA + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
+    match ImageInfo::parse(&with_raw_size(raw)) {
+        Err(PeError::Malformed(m)) => assert!(m.contains("truncated TLS"), "{m}"),
+        other => panic!("expected a truncated TLS directory, got {other:?}"),
+    }
+    // Raw data ends before the directory starts.
+    let raw = TLS_DIRECTORY - SECTION_RVA;
+    match ImageInfo::parse(&with_raw_size(raw)) {
+        Err(PeError::Malformed(m)) => assert!(m.contains("TLS directory outside"), "{m}"),
+        other => panic!("expected a TLS directory outside the sections, got {other:?}"),
+    }
+    // One whole callback slot past the directory is enough to read it.
+    let raw = TLS_CALLBACKS - SECTION_RVA + 8;
+    let tls = ImageInfo::parse(&with_raw_size(raw)).unwrap().tls.unwrap();
+    assert_eq!(tls.callback_rvas, [0x1010]);
+}
