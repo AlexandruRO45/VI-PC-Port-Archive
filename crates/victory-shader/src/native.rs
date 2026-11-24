@@ -608,7 +608,10 @@ fn sgpr_span(stage: HwStage, p: &RootParam) -> (u32, u32) {
 
 /// Whether no SGPR holds two root parameters: each covers its stated
 /// SGPRs (none for, say, a fixed sampler), a root descriptor also the high
-/// half resource tracking reads after its first.
+/// half resource tracking reads after its first. Only the ranges of one
+/// table (one slot, one table address SGPR) may share; a slot number alone
+/// does not make two entries one parameter, as a table range and constants
+/// stating the same slot would still be read as whichever comes first.
 fn params_apart(stage: HwStage, layout: &[RootParam]) -> bool {
     // The layout was checked first, so every covered SGPR is below `SGPRS`.
     let mut owner = [None; SGPRS as usize];
@@ -618,9 +621,10 @@ fn params_apart(stage: HwStage, layout: &[RootParam]) -> bool {
             RootType::Descriptor => p.sgprs.max(2),
             _ => p.sgprs,
         };
-        (first..first + span).all(|s| {
-            let held = owner[s as usize].get_or_insert(p.slot);
-            *held == p.slot
+        let key = (p.slot, p.root, first);
+        (first..first + span).all(|s| match owner[s as usize].replace(key) {
+            None => true,
+            Some(held) => held == key && p.root == RootType::Table,
         })
     })
 }
@@ -1834,6 +1838,7 @@ mod tests {
         // SGPRs) at a taken user-data dword are all fine.
         assert!(program(&[(constants, 2, 0, 0), (descriptor, 2, 2, 1)]).is_ok());
         assert!(program(&[(table, 1, 4, 2), (table, 1, 4, 2)]).is_ok());
+        assert!(program(&[(table, 1, 4, 2), (table, 1, 4, 2), (table, 1, 4, 2)]).is_ok());
         assert!(program(&[(constants, 2, 0, 0), (sampler, 0, 0, 3)]).is_ok());
         for (params, what) in [
             (
@@ -1847,6 +1852,22 @@ mod tests {
             (
                 [(descriptor, 1, 0, 0), (constants, 1, 1, 1)],
                 "constants in a descriptor's high half",
+            ),
+            (
+                [(table, 1, 3, 2), (constants, 1, 3, 2)],
+                "constants in a table's SGPR stating its slot",
+            ),
+            (
+                [(constants, 2, 0, 0), (constants, 2, 1, 0)],
+                "one slot's constants overlapping themselves",
+            ),
+            (
+                [(constants, 1, 5, 4), (constants, 1, 5, 4)],
+                "constants listed twice",
+            ),
+            (
+                [(descriptor, 2, 0, 1), (descriptor, 2, 0, 1)],
+                "a root descriptor listed twice",
             ),
         ] {
             assert_eq!(
