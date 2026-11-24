@@ -937,3 +937,277 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_mov_b32_bitwise_abs_and_neg() {
+    let patterns = bitwise_patterns();
+    let mov_vop3 = |abs: u32, neg: u32| {
+        let mut w = vop3(0x181, 0, vgpr(1), 0, 0);
+        w[0] |= (abs & 7) << 8;
+        w[1] |= (neg & 7) << 29;
+        build_valu_cs(&w)
+    };
+    let mov_abs = mov_vop3(1, 0);
+    let mov_neg = mov_vop3(0, 1);
+    let mov_neg_abs = mov_vop3(1, 1);
+
+    let mov_cases: Vec<[u32; 4]> = patterns.iter().map(|&(_, bits)| [bits, 0, 0, 0]).collect();
+    run_cases(&mov_abs, &mov_cases, |backend, i, _, got| {
+        let (name, bits) = patterns[i];
+        assert_eq!(
+            got,
+            bits & 0x7FFF_FFFF,
+            "{backend}: v_mov_b32 |{name}| ({bits:#010x})"
+        );
+    });
+    run_cases(&mov_neg, &mov_cases, |backend, i, _, got| {
+        let (name, bits) = patterns[i];
+        assert_eq!(
+            got,
+            bits ^ 0x8000_0000,
+            "{backend}: v_mov_b32 -{name} ({bits:#010x})"
+        );
+    });
+    run_cases(&mov_neg_abs, &mov_cases, |backend, i, _, got| {
+        let (name, bits) = patterns[i];
+        assert_eq!(
+            got,
+            (bits & 0x7FFF_FFFF) ^ 0x8000_0000,
+            "{backend}: v_mov_b32 -|{name}| ({bits:#010x})"
+        );
+    });
+
+    // v_mov_b32 with clamp / omod still uses the float output modifier path.
+    let mut mov_clamp_w = vop3(0x181, 0, vgpr(1), 0, 0);
+    mov_clamp_w[0] |= 1 << 15; // clamp [0, 1]
+    mov_clamp_w[1] |= 1 << 29; // neg src0
+    let mov_clamp = build_valu_cs(&mov_clamp_w);
+    run_cases(
+        &mov_clamp,
+        &[
+            [(-1.5f32).to_bits(), 0, 0, 0],
+            [(-0.25f32).to_bits(), 0, 0, 0],
+            [1.0f32.to_bits(), 0, 0, 0],
+        ],
+        |backend, i, _, got| {
+            let want = [1.0f32, 0.25, 0.0][i].to_bits();
+            assert_eq!(got, want, "{backend}: v_mov_b32 clamp float case {i}");
+        },
+    );
+
+    let mut mov_omod_w = vop3(0x181, 0, vgpr(1), 0, 0);
+    mov_omod_w[1] |= 1 << 27; // omod = *2.0
+    mov_omod_w[1] |= 1 << 29; // neg src0
+    let mov_omod = build_valu_cs(&mov_omod_w);
+    run_cases(
+        &mov_omod,
+        &[[1.25f32.to_bits(), 0, 0, 0], [(-3.5f32).to_bits(), 0, 0, 0]],
+        |backend, i, _, got| {
+            let want = [-2.5f32, 7.0][i].to_bits();
+            assert_eq!(got, want, "{backend}: v_mov_b32 omod float case {i}");
+        },
+    );
+}
+
+#[test]
+fn v_mov_b32_sdwa_and_dpp_apply_bitwise_abs_and_neg() {
+    let patterns = bitwise_patterns();
+    let mov_cases: Vec<[u32; 4]> = patterns.iter().map(|&(_, bits)| [bits, 0, 0, 0]).collect();
+
+    // v_mov_b32_sdwa with DWORD selection + abs / neg runs on both WARP and hardware.
+    let sdwa_dword_neg = build_valu_cs(&[
+        vop1(0x001, 0, 0xF9),
+        (6 << 16) | (6 << 8) | (1 << 20) | 1, // src0_sel=DWORD, dst_sel=DWORD, src0_neg, v1
+    ]);
+    let sdwa_dword_abs_neg = build_valu_cs(&[
+        vop1(0x001, 0, 0xF9),
+        (6 << 16) | (6 << 8) | (1 << 21) | (1 << 20) | 1, // src0_sel=DWORD, dst_sel=DWORD, abs+neg, v1
+    ]);
+    run_cases(&sdwa_dword_neg, &mov_cases, |backend, i, _, got| {
+        let (name, bits) = patterns[i];
+        assert_eq!(
+            got,
+            bits ^ 0x8000_0000,
+            "{backend}: v_mov_b32_sdwa -{name} ({bits:#010x})"
+        );
+    });
+    run_cases(&sdwa_dword_abs_neg, &mov_cases, |backend, i, _, got| {
+        let (name, bits) = patterns[i];
+        assert_eq!(
+            got,
+            (bits & 0x7FFF_FFFF) ^ 0x8000_0000,
+            "{backend}: v_mov_b32_sdwa -|{name}| ({bits:#010x})"
+        );
+    });
+
+    // v_mov_b32_sdwa with BYTE_0 + sext + neg applies bitwise neg to the sign-extended byte.
+    let sdwa_byte_sext_neg = build_valu_cs(&[
+        vop1(0x001, 0, 0xF9),
+        (1 << 20) | (1 << 19) | (6 << 8) | 1, // src0_sel=BYTE_0, sext, src0_neg, dst_sel=DWORD, v1
+    ]);
+    run_cases(
+        &sdwa_byte_sext_neg,
+        &[[0x0000_0081, 0, 0, 0], [0x0000_0001, 0, 0, 0]],
+        |backend, i, inp, got| {
+            let want = [0xFFFF_FF81 ^ 0x8000_0000, 0x0000_0001 ^ 0x8000_0000][i];
+            assert_eq!(
+                got, want,
+                "{backend}: v_mov_b32_sdwa sext neg ({:#010x})",
+                inp[0]
+            );
+        },
+    );
+
+    // v_mov_b32_dpp with neg / abs lowers strictly bitwise (preserving DPP transfer),
+    // validates cleanly with dxil.dll, and executes when the adapter supports wave size 32.
+    let dpp_body_neg = [
+        vop1(0x001, 0, 0xFA),
+        0xFF00_E401 | (1 << 20), // quad_perm:[0,1,2,3], row_mask:0xf, bank_mask:0xf, src0_neg
+    ];
+    let dpp_body_abs = [
+        vop1(0x001, 0, 0xFA),
+        0xFF00_E401 | (1 << 21), // quad_perm:[0,1,2,3], row_mask:0xf, bank_mask:0xf, src0_abs
+    ];
+    for (body, want_bit) in [
+        (&dpp_body_neg[..], "bin:Xor"),
+        (&dpp_body_abs[..], "bin:And"),
+    ] {
+        let mut words = vec![s_mov_b32(5, 0x80)];
+        words.extend_from_slice(&s_load_dwordx4(8, 4));
+        words.push(vop1(0x001, 1, sgpr(0)));
+        words.extend_from_slice(body);
+        words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+        words.push(S_ENDPGM);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, 8).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        assert!(!lowered.op_names.iter().any(|n| n == "dx.op.unary.f32"));
+        assert!(
+            lowered.insts.iter().any(|l| l.starts_with(want_bit)),
+            "expected {want_bit} in {:?}",
+            lowered.insts
+        );
+    }
+    let dpp_neg = build_valu_cs(&dpp_body_neg);
+    let can_run_dpp = {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        Host::new(false).is_ok_and(|host| host.compute_pipeline(&dpp_neg).is_ok())
+    };
+    if can_run_dpp {
+        run_cases(&dpp_neg, &mov_cases, |backend, i, _, got| {
+            let (name, bits) = patterns[i];
+            assert_eq!(
+                got,
+                bits ^ 0x8000_0000,
+                "{backend}: v_mov_b32_dpp -{name} ({bits:#010x})"
+            );
+        });
+    }
+}
+
+#[test]
+fn v_cndmask_b32_applies_abs_and_neg_bitwise() {
+    let patterns = bitwise_patterns();
+    // v_cndmask_b32_e64 v0, -v1, -|v2|, vcc with v_cmp_ne_u32 vcc, 0, v3:
+    // src0 takes bitwise neg, src1 takes bitwise abs+neg.
+    let mut cnd = vop3(0x101, 0, vgpr(1), vgpr(2), 106); // vcc = 106
+    cnd[0] |= 1 << 9; // abs[1] = 1
+    cnd[1] |= (1 << 29) | (1 << 30); // neg[0] = 1, neg[1] = 1
+    let cnd_shader = build_valu_cs(&[
+        0x7D8A_0680, // v_cmp_ne_u32 vcc, 0, v3
+        cnd[0],
+        cnd[1],
+    ]);
+    let mut cnd_cases = Vec::new();
+    for (name, bits) in patterns {
+        let other = !bits;
+        cnd_cases.push((name, 0u32, [bits, other, 0, 0], bits ^ 0x8000_0000));
+        cnd_cases.push((
+            name,
+            1u32,
+            [other, bits, 1, 0],
+            (bits & 0x7FFF_FFFF) ^ 0x8000_0000,
+        ));
+    }
+    let cnd_inputs: Vec<[u32; 4]> = cnd_cases.iter().map(|c| c.2).collect();
+    run_cases(&cnd_shader, &cnd_inputs, |backend, i, inp, got| {
+        let (name, cond, _, want) = cnd_cases[i];
+        assert_eq!(
+            got, want,
+            "{backend}: v_cndmask_b32 cond={cond} {name} ({:#010x}, {:#010x})",
+            inp[0], inp[1]
+        );
+    });
+}
+
+fn bitwise_patterns() -> [(&'static str, u32); 16] {
+    [
+        ("+normal", 1.5f32.to_bits()),
+        ("-normal", (-2.25f32).to_bits()),
+        ("+0.0", 0x0000_0000),
+        ("-0.0", 0x8000_0000),
+        ("+inf", 0x7F80_0000),
+        ("-inf", 0xFF80_0000),
+        ("+denormal", 0x0000_0001),
+        ("+denormal_hi", 0x0040_1234),
+        ("-denormal", 0x8000_0001),
+        ("-denormal_max", 0x807F_FFFF),
+        ("+sNaN", 0x7F80_0001),
+        ("+sNaN_payload", 0x7FBF_1234),
+        ("-sNaN", 0xFF80_0001),
+        ("-sNaN_payload", 0xFFBF_5678),
+        ("+qNaN", 0x7FC0_0001),
+        ("-qNaN", 0xFFC0_0042),
+    ]
+}
