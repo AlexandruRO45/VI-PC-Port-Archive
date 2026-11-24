@@ -2405,3 +2405,305 @@ fn compute_spilled_user_data_table_resolves_constants_table_and_root_srv() {
         assert_eq!(out[0][0], 0x2000_0123, "{label}: spilled compute user data mismatch");
     }
 }
+
+/// Runs a synthetic `[64, 1, 1]` compute shader with 512 B LDS that writes one
+/// `u32` per lane (`v1` -> `uav[v0]`), validating with `dxil.dll` and running
+/// on both RTX 4060 hardware and WARP.
+fn run_64_thread_lds_cs(wave64: bool, max_wave: u32, body: &[u32], taken: u32, skipped: u32) -> Vec<u32> {
+    let mut words = vec![
+        s_mov_b32(1, 0x80), // view table s[0:1] high = 0
+    ];
+    words.extend_from_slice(&s_load_dwordx4(8, 0)); // UAV @ byte 0 -> s[8:11]
+    words.extend_from_slice(body);
+    // addr = v0 << 2 -> v7: v_lshlrev_b32 v7, 2, v0
+    words.push((0x1A << 25) | (7 << 17) | 0x82);
+    // buffer_store_dword v1, v7, s[8:11], 0 offen
+    words.push(0x38 << 26 | 0x1C << 18 | (1 << 12));
+    words.push(0x80 << 24 | ((8 >> 2) << 16) | (1 << 8) | 7);
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: 16,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: (1 << 1) | (1 << 15), // 1 user SGPR (s0) + 512 B LDS
+            threads: [64, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
+    let io = io::raise(&p, &native).expect("io");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        max_wave,
+    })
+    .expect("lower");
+    let mut shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil).expect("DXIL validation failed");
+    }
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut first_out = None;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            continue;
+        };
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0]))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let prefix = out.first().map(|_| {
+            out[0]
+                .iter()
+                .take_while(|&&v| v == out[0][0])
+                .count()
+        });
+        assert_eq!(out[0][0], taken, "{label}: expected wave 0 to execute barrier arm");
+        assert!(
+            prefix.is_some_and(|w| (4..=32).contains(&w) && out[0][w..].iter().all(|&v| v == skipped)),
+            "{label}: unexpected per-wave barrier output {:?}",
+            out[0]
+        );
+        first_out = Some(out[0].clone());
+    }
+    first_out.expect("neither hardware nor WARP device available")
+}
+
+#[test]
+fn non_uniform_s_barrier_omits_group_sync_and_runs_without_deadlock() {
+    // Only lanes 0..31 enter the `s_and_saveexec_b64` / `s_cbranch_execz` arm containing
+    // `s_barrier` while lanes 32..63 skip it. Without omitting SyncThreadGroup (bit 1),
+    // wave32 hardware deadlocks at `bar.sync 0`.
+    let body = [
+        // v1 = 10
+        vop1(0x001, 1, 0x8A),
+        // v_cmp_lt_u32 s[4:5], v0, 32
+        vop3(0x0c1, 4, vgpr(0), 128 + 32, 0)[0],
+        vop3(0x0c1, 4, vgpr(0), 128 + 32, 0)[1],
+        // s_and_saveexec_b64 s[4:5], s[4:5]
+        0xBE84_2404,
+        // s_cbranch_execz +2 (skip s_barrier + v1 = 20)
+        0xBF88_0002,
+        // s_barrier (inside divergent arm!)
+        0xBF8A_0000,
+        // v1 = 20
+        vop1(0x001, 1, 0x94),
+        // s_or_b64 exec, exec, s[4:5]
+        0x88FE_047E,
+    ];
+    let out = run_64_thread_lds_cs(true, 32, &body, 20, 10);
+    for (lane, &val) in out.iter().enumerate() {
+        let want = if lane < 32 { 20 } else { 10 };
+        assert_eq!(val, want, "lane {lane}");
+    }
+}
+
+#[test]
+fn per_wave_branch_and_divergent_loop_barriers_omit_group_sync() {
+    // Part A: scalar branch (`Atom::Uniform(scc)`) derived from per-lane `v0` via
+    // `v_readfirstlane_b32 s4, v0` differs between wave 0 (`0`) and wave 1 (`32`) on wave32.
+    // Part B: divergent loop (`v_cmp_lt_u32` + `s_cbranch_vccnz` back edge) that could abort
+    // followed by a post-loop `s_barrier`.
+    let body = [
+        // v1 = 1
+        vop1(0x001, 1, 0x81),
+        // v_readfirstlane_b32 s4, v0
+        0x7E08_0400 | 256,
+        // s_cmp_eq_u32 s4, 0
+        0xBF06_8004,
+        // s_cbranch_scc0 +2 (wave 1 skips s_barrier + v1 = 2)
+        0xBF84_0002,
+        // s_barrier
+        0xBF8A_0000,
+        // v1 = 2
+        vop1(0x001, 1, 0x82),
+        // Divergent loop: v2 = 0; loop: v2 += 1; if (v2 < (v0 & 1) + 1) goto loop
+        vop1(0x001, 2, 0x80),
+        (0x1B << 25) | (3 << 17) | 0x81,            // v3 = v0 & 1
+        (0x25 << 25) | (3 << 17) | (3 << 9) | 0x81, // v3 = v3 + 1
+        (0x25 << 25) | (2 << 17) | (2 << 9) | 0x81, // loop (word 9): v2 += 1
+        vop3(0x0c1, 106, vgpr(2), vgpr(3), 0)[0], // v_cmp_lt_u32 vcc, v2, v3
+        vop3(0x0c1, 106, vgpr(2), vgpr(3), 0)[1],
+        0xBF87_FFFCu32, // s_cbranch_vccnz -4 -> word 9
+        // Post-loop s_barrier (non-uniform because loop can diverge/abort differently)
+        0xBF8A_0000,
+    ];
+    let out = run_64_thread_lds_cs(false, 64, &body, 2, 1);
+    assert_eq!(out[0], 2);
+}
+
+#[test]
+fn mesh_per_wave_s_barrier_runs_on_hardware_and_clamps_out_of_bounds_prim() {
+    use super::container::SigElement;
+    use super::host::Draw;
+    use crate::native::MeshIo;
+
+    // 128-thread mesh shader (4 wave32 warps) with 512 B LDS:
+    // - Wave 0 (`s3 >> 24 == 0`) enters `s_barrier` while waves 1..3 skip it;
+    //   without omitting SyncThreadGroup (bit 1), wave32 hardware deadlocks!
+    // - Exports vertex positions (`max_vertices = 3`) and a primitive with vertex index 100 >= 3,
+    //   which must be guarded (`flat < max_primitives`) and culled cleanly to (0, 0, 0).
+    let words = [
+        // s_lshr_b32 s4, s3, 24 (24 = 128 + 24 = 0x98)
+        sop2(0x20, 4, 3, 0x98),
+        // s_cmp_eq_u32 s4, 0
+        0xBF06_8004,
+        // s_cbranch_scc0 +1 (skip s_barrier for non-zero waves)
+        0xBF84_0001,
+        // s_barrier
+        0xBF8A_0000,
+        // v0 = 0.0, v1 = 1.0 (inline const 0xF2)
+        vop1(0x001, 0, 0x80),
+        vop1(0x001, 1, 0xF2),
+        // exp pos0, v0, v0, v0, v1
+        0xF800_00CF,
+        0x0100_0000,
+        // v2 = (100 << 20) | (1 << 10) | 0 (out-of-bounds vertex index 100 >= 3)
+        0x7E04_02FF,
+        (100 << 20) | (1 << 10),
+        // exp prim, v2, off, off, off done
+        0xF800_0941,
+        0x0000_0002,
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Ms,
+        wave64: true,
+        vgprs: 8,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ms(MeshIo {
+            outputs: vec![],
+            clip_cntl: 0,
+            threads: 128,
+            max_vertices: 3,
+            max_primitives: 1,
+            topology: 2,
+            lds_bytes: 512,
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
+    let io = io::raise(&p, &native).expect("io");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: vec![SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        }],
+        prims: Vec::new(),
+        mesh_stride: 128,
+        max_wave: 32,
+    })
+    .expect("lower");
+    let ms = HostShader {
+        stage: HwStage::Ms,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+    let ps = HostShader {
+        stage: HwStage::Ps,
+        dxil: super::tests::constant_color(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+    };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let (root, pso) = host
+        .mesh_pipeline(&ms, &ps)
+        .expect("hardware: mesh_pipeline failed");
+    let out = host
+        .draw(
+            &root,
+            &pso,
+            &Draw {
+                roots: vec![],
+                textures: &[],
+                samplers: &[],
+                vertices: &[],
+                stride: 0,
+                size: (4, 4),
+                mesh_groups: 1,
+            },
+        )
+        .expect("hardware: mesh draw failed");
+    assert!(
+        out.iter().all(|px| *px == [0.0; 4]),
+        "out-of-bounds primitive must be culled: {out:?}"
+    );
+}

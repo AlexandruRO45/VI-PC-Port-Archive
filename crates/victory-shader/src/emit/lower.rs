@@ -223,6 +223,8 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Compute and mesh: blocks executed in lockstep by the entire thread group.
+    group_uniform: Vec<bool>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -450,7 +452,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 
 /// Per-block thread-group uniformity (`true` when every thread in the group
 /// executes block `b` in lockstep, assuming group entry is uniform).
-fn uniform_blocks(p: &Program, st: &Structured) -> Vec<bool> {
+fn uniform_blocks(p: &Program, st: &Structured, io: &Io) -> Vec<bool> {
     let n = p.blocks.len();
     if n == 0 {
         return Vec::new();
@@ -554,46 +556,6 @@ fn uniform_blocks(p: &Program, st: &Structured) -> Vec<bool> {
         }
     }
 
-    let is_divergent_branch = |b: usize| match st.exits[b] {
-        LaneExit::Branch { when, .. } => st
-            .bools
-            .support(when)
-            .iter()
-            .any(|a| !matches!(a, Atom::Uniform(_))),
-        _ => false,
-    };
-
-    let mut uniform: Vec<bool> = (0..n)
-        .map(|b| reachable(b) && ipdom[b] != usize::MAX)
-        .collect();
-
-    // Mark blocks between each divergent branch and its immediate post-dominator.
-    for &b in &order {
-        if !is_divergent_branch(b) {
-            continue;
-        }
-        let stop = ipdom[b];
-        let mut work = Vec::new();
-        let mut visited = vec![false; n];
-        for s in succs(b).into_iter().flatten() {
-            if s != stop && !visited[s] {
-                visited[s] = true;
-                work.push(s);
-            }
-        }
-        while let Some(u) = work.pop() {
-            uniform[u] = false;
-            for s in succs(u).into_iter().flatten() {
-                if s != stop && !visited[s] {
-                    visited[s] = true;
-                    work.push(s);
-                }
-            }
-        }
-    }
-
-    // Natural loops whose header/latch becomes non-uniform or that have a
-    // divergent exit branch lose lockstep across the whole loop body.
     let idom = crate::ir::idoms(&p.blocks, &order, &index);
     let dominates = |h: usize, mut u: usize| -> bool {
         while u != usize::MAX {
@@ -629,8 +591,104 @@ fn uniform_blocks(p: &Program, st: &Structured) -> Vec<bool> {
             loops.push((h, body));
         }
     }
+
+    let mesh_group: HashSet<Value> = io
+        .inputs
+        .iter()
+        .filter_map(|&(v, inp)| matches!(inp, Input::MeshGroup).then_some(v))
+        .collect();
+    let mut non_group_uniform: HashSet<Value> = io
+        .inputs
+        .iter()
+        .filter_map(|&(v, inp)| {
+            matches!(
+                inp,
+                Input::ThreadIdInGroup(_) | Input::GroupInfo | Input::MergedWaveInfo
+            )
+            .then_some(v)
+        })
+        .chain(p.inputs.iter().filter_map(|&(reg, v)| {
+            (matches!(reg, Reg::V(_)) && !mesh_group.contains(&v)).then_some(v)
+        }))
+        .collect();
+
+    let mut uniform: Vec<bool> = (0..n)
+        .map(|b| reachable(b) && ipdom[b] != usize::MAX)
+        .collect();
+
+    // Propagate per-thread/per-wave values and divergent/abortable control flow
+    // to a joint fixpoint so wave-divergent branches never emit group barriers.
     loop {
         let mut changed = false;
+
+        for &b in &order {
+            let block = &p.blocks[b];
+            let has_non_uniform_pred = block.preds.iter().any(|&q| reachable(q) && !uniform[q]);
+            for phi in &block.phis {
+                if has_non_uniform_pred || phi.args.iter().any(|v| non_group_uniform.contains(v)) {
+                    changed |= non_group_uniform.insert(phi.value);
+                }
+            }
+            for inst in &block.insts {
+                let mesh_group_read = inst.name() == "v_readfirstlane_b32"
+                    && inst.reads.iter().all(|&(reg, v)| match reg {
+                        Reg::V(_) => mesh_group.contains(&v),
+                        Reg::S(r) => r == EXEC || r == EXEC + 1,
+                        Reg::Scc => false,
+                    });
+                let inst_non_uniform = !mesh_group_read
+                    && (!uniform[b]
+                        || inst.name().starts_with("v_mbcnt_")
+                        || matches!(inst.fields, Fields::Ds { .. })
+                        || inst.reads.iter().any(|&(reg, v)| {
+                            matches!(reg, Reg::S(r) if r == EXEC || r == EXEC + 1)
+                                || non_group_uniform.contains(&v)
+                        }));
+                if inst_non_uniform {
+                    for &(_, w) in &inst.writes {
+                        changed |= non_group_uniform.insert(w);
+                    }
+                }
+            }
+        }
+
+        let is_divergent_branch = |b: usize| match st.exits[b] {
+            LaneExit::Branch { when, .. } => st.bools.support(when).iter().any(|a| match a {
+                Atom::Uniform(v) => non_group_uniform.contains(v),
+                _ => true,
+            }),
+            _ => false,
+        };
+
+        // Mark blocks between each divergent branch and its immediate post-dominator.
+        for &b in &order {
+            if !is_divergent_branch(b) {
+                continue;
+            }
+            let stop = ipdom[b];
+            let mut work = Vec::new();
+            let mut visited = vec![false; n];
+            for s in succs(b).into_iter().flatten() {
+                if s != stop && !visited[s] {
+                    visited[s] = true;
+                    work.push(s);
+                }
+            }
+            while let Some(u) = work.pop() {
+                if std::mem::replace(&mut uniform[u], false) {
+                    changed = true;
+                }
+                for s in succs(u).into_iter().flatten() {
+                    if s != stop && !visited[s] {
+                        visited[s] = true;
+                        work.push(s);
+                    }
+                }
+            }
+        }
+
+        // Natural loops whose header/latch becomes non-uniform or that have a
+        // divergent exit branch lose lockstep across the whole loop body.
         for (h, body) in &loops {
             let latch_divergent = p.blocks[*h]
                 .preds
@@ -648,6 +706,30 @@ fn uniform_blocks(p: &Program, st: &Structured) -> Vec<bool> {
                 }
             }
         }
+
+        // A non-uniform back edge may exit early via `abort_block()` while
+        // other threads continue past the loop.
+        for &u in &order {
+            if uniform[u] || !succs(u).into_iter().flatten().any(|t| index[t] <= index[u]) {
+                continue;
+            }
+            let mut work: Vec<usize> = succs(u).into_iter().flatten().collect();
+            let mut visited = vec![false; n];
+            while let Some(cur) = work.pop() {
+                if !visited[cur] {
+                    visited[cur] = true;
+                    if std::mem::replace(&mut uniform[cur], false) {
+                        changed = true;
+                    }
+                    for s in succs(cur).into_iter().flatten() {
+                        if !visited[s] {
+                            work.push(s);
+                        }
+                    }
+                }
+            }
+        }
+
         if !changed {
             break;
         }
@@ -690,6 +772,9 @@ impl<'a> Lower<'a> {
         let mut emu_total = 0u32;
         let mut emu_lds_base = 0u32;
         let mut title_lds_dwords = 0u32;
+        let group_uniform = matches!(x.native.io, StageIo::Cs(_) | StageIo::Ms(_))
+            .then(|| uniform_blocks(p, x.st, x.io))
+            .unwrap_or_default();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             title_lds_dwords = cs.lds_bytes() / 4;
@@ -749,7 +834,7 @@ impl<'a> Lower<'a> {
             let one_wave = total <= wave;
             if (32..64).contains(&x.max_wave) && x.native.wave64 {
                 if console_lanes || (one_wave && title_lds_dwords > 0) {
-                    let uniform = uniform_blocks(p, x.st);
+                    let uniform = &group_uniform;
                     let waves64 = total.div_ceil(64);
                     let mut uses_readlane = false;
                     let mut uses_readfirstlane = false;
@@ -791,7 +876,7 @@ impl<'a> Lower<'a> {
                                                 p,
                                                 x.st,
                                                 &def_block,
-                                                &uniform,
+                                                uniform,
                                                 r,
                                                 &mut seen,
                                             )
@@ -938,6 +1023,7 @@ impl<'a> Lower<'a> {
             title_lds_dwords,
             flat: None,
             no_barrier,
+            group_uniform,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -3155,11 +3241,21 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                let mode = self.s.m.i32(mode);
-                let void = self.s.t.void;
-                self.s
-                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                // Omit SyncThreadGroup (bit 1) when control flow can diverge
+                // across waves so `bar.sync 0` cannot deadlock on wave32 GPUs.
+                let group_uniform = self.group_uniform.get(b).copied().unwrap_or(true);
+                let mode = if group_uniform {
+                    if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 }
+                } else {
+                    (if self.writes_uavs { 2 } else { 0 })
+                        | (if self.s.lds_dwords > 0 { 8 } else { 0 })
+                };
+                if mode != 0 {
+                    let mode = self.s.m.i32(mode);
+                    let void = self.s.t.void;
+                    self.s
+                        .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                }
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -7721,6 +7817,16 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit output the stage data does not mark");
         }
         // A mesh lane writes its own vertex or primitive, where it exports.
+        let guard = if let Some(ms) = self.s.mesh {
+            let limit = if primitive {
+                ms.max_primitives
+            } else {
+                ms.max_vertices
+            };
+            self.guard_mesh_thread(guard, limit)
+        } else {
+            guard
+        };
         let at = if mesh {
             self.begin_guarded(guard)
         } else {
@@ -7782,20 +7888,45 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Mesh: intersects `guard` with `flat < limit` when the thread-group size
+    /// exceeds `limit` so out-of-range lanes never emit vertices/primitives.
+    fn guard_mesh_thread(&mut self, guard: Option<V>, limit: u32) -> Option<V> {
+        let threads = self.s.threads.map_or(0, |t| t[0]);
+        if threads <= limit {
+            return guard;
+        }
+        let flat = self.mesh_thread();
+        let max = self.s.m.i32(limit);
+        let in_bounds = self.s.m.cmp(self.cur, pred::IULT, flat, max);
+        Some(match guard {
+            Some(g) => self.s.m.bin(self.cur, Bin::And, g, in_bounds),
+            None => in_bounds,
+        })
+    }
+
     /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
     /// indices 0: no area).
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
+        let ms = self.s.mesh.expect("mesh stage");
+        let guard = self.guard_mesh_thread(guard, ms.max_primitives);
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
+        let max_v = self.s.m.i32(ms.max_vertices);
+        let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
+        let mut indices = Vec::with_capacity(3);
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
+            let oob = self.s.m.cmp(c, pred::IUGE, i, max_v);
+            culled = self.s.m.bin(c, Bin::Or, culled, oob);
+            indices.push(i);
+        }
+        let mut args = vec![self.mesh_thread()];
+        for i in indices {
             args.push(self.s.m.select(c, culled, z, i));
         }
         let void = self.s.t.void;
