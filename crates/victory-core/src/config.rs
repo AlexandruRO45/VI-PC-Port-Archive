@@ -7,7 +7,9 @@
 //! relative paths in variables are relative to the working directory. Both
 //! are made absolute when loaded. A
 //! leading `~` in a path (from the file or a variable) is the home directory,
-//! and an error when there is none.
+//! and an error when there is none. A near miss of one of the variables
+//! (`VICTORY_GAMEDIR`, `VICTORY_DATA_PATH`) is an error while the real one
+//! is unset.
 //! See `victory.example.toml` at the repository root.
 
 use std::path::{Component, Path, PathBuf};
@@ -138,6 +140,7 @@ impl Config {
     /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
         let env = |k: &str| std::env::var_os(k);
+        ensure_no_misspelled_variables(std::env::vars_os().map(|(k, _)| k), env)?;
         let home = home_dir(env);
         let file = match config_file(explicit_config(env, home.as_deref())?)? {
             Some(path) => {
@@ -383,6 +386,79 @@ fn config_text(bytes: Vec<u8>) -> Result<String> {
             "line {line} is not UTF-8 text (byte {at}, perhaps a path typed in another \
              encoding): {SAVE_AS}"
         )
+    })
+}
+
+/// The variables [`Config::load`] reads, by the name a misspelling of them
+/// is compared with.
+const SETTINGS: [&str; 5] = [
+    "VICTORY_GAME_DIR",
+    "VICTORY_CACHE_DIR",
+    "VICTORY_DATA_DIR",
+    "VICTORY_TEST_TITLES",
+    "VICTORY_CONFIG",
+];
+
+/// Refuses a near miss of one of the [`SETTINGS`] variables while the real
+/// one is unset or empty. `VICTORY_GAMEDIR`, `VICTORY_DATA_PATH` or a
+/// lowercase `victory_cache_dir` is otherwise ignored without a word, and the
+/// default is used: saves land in `~/.local/share/victory` rather than the
+/// folder the user named, and the game folder is reported as not set.
+/// `names` are the names of the variables in the environment.
+fn ensure_no_misspelled_variables(
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<()> {
+    for name in names {
+        // A name that is not Unicode cannot be one of ours.
+        let Some(name) = name.to_str() else { continue };
+        let Some(meant) = misspelling_of(name) else {
+            continue;
+        };
+        if env(meant).is_some_and(|v| !v.is_empty()) {
+            // The real one wins anyway; the other is someone else's.
+            continue;
+        }
+        anyhow::bail!(
+            "{name} is set, but Victory reads {meant}, which is not set; rename {name} to {meant}"
+        );
+    }
+    Ok(())
+}
+
+/// The [`SETTINGS`] variable `name` looks like a misspelling of: the same
+/// letters ignoring case, `_` and `-` (`VICTORY_GAMEDIR`,
+/// `victory_cache_dir`), or a `_DIR` variable with the suffix dropped or
+/// spelt `_PATH`, `_DIRECTORY` or `_FOLDER` (`VICTORY_DATA`,
+/// `VICTORY_GAME_PATH`), `VICTORY_TEST_TITLE`, `VICTORY_TITLES`, or
+/// `VICTORY_CONFIG` with `_FILE` or `_PATH` (`VICTORY_CONFIG_FILE`). `None`
+/// for the real names (which also match case-insensitively on Windows,
+/// where variable names are) and for everything else.
+fn misspelling_of(name: &str) -> Option<&'static str> {
+    let squash = |s: &str| -> String {
+        s.chars()
+            .filter(|c| !matches!(c, '_' | '-'))
+            .map(|c| c.to_ascii_uppercase())
+            .collect()
+    };
+    let got = squash(name);
+    SETTINGS.into_iter().find(|&real| {
+        if name == real || (cfg!(windows) && name.eq_ignore_ascii_case(real)) {
+            return false;
+        }
+        let near: Vec<String> = match real.strip_suffix("_DIR") {
+            Some(stem) => ["", "_PATH", "_DIRECTORY", "_FOLDER"]
+                .iter()
+                .map(|suffix| format!("{stem}{suffix}"))
+                .collect(),
+            None if real == "VICTORY_TEST_TITLES" => {
+                vec!["VICTORY_TEST_TITLE".into(), "VICTORY_TITLES".into()]
+            }
+            None => vec![format!("{real}_FILE"), format!("{real}_PATH")],
+        };
+        std::iter::once(real.to_owned())
+            .chain(near)
+            .any(|candidate| squash(&candidate) == got)
     })
 }
 
@@ -1651,6 +1727,67 @@ mod tests {
             .to_string();
         assert!(err.contains("[paths].data_dir"), "{err}");
         assert!(err.contains("%LOCALAPPDATA%"), "{err}");
+    }
+
+    #[test]
+    fn misspelled_variables_are_refused() {
+        for (name, meant) in [
+            ("VICTORY_GAMEDIR", "VICTORY_GAME_DIR"),
+            ("VICTORY_GAME_PATH", "VICTORY_GAME_DIR"),
+            ("VICTORY_GAME", "VICTORY_GAME_DIR"),
+            ("VICTORY_CACHE_DIRECTORY", "VICTORY_CACHE_DIR"),
+            ("VICTORY_DATA", "VICTORY_DATA_DIR"),
+            ("VICTORY_DATA_FOLDER", "VICTORY_DATA_DIR"),
+            ("VICTORY-DATA-DIR", "VICTORY_DATA_DIR"),
+            ("VICTORY_TEST_TITLE", "VICTORY_TEST_TITLES"),
+            ("VICTORY_TITLES", "VICTORY_TEST_TITLES"),
+            ("VICTORY_CONFIG_FILE", "VICTORY_CONFIG"),
+            ("VICTORYCONFIG", "VICTORY_CONFIG"),
+        ] {
+            assert_eq!(misspelling_of(name), Some(meant), "{name}");
+        }
+        // Not on Windows, where variable names ignore case.
+        if !cfg!(windows) {
+            assert_eq!(
+                misspelling_of("victory_cache_dir"),
+                Some("VICTORY_CACHE_DIR")
+            );
+        }
+        for name in [
+            "VICTORY_GAME_DIR",
+            "VICTORY_CONFIG",
+            "VICTORY_LOG",
+            "VICTORY_WARP",
+            "VICTORY_CONFIG_DIR",
+            "VICTORY_GAME_DIRS",
+            "HOME",
+            "XDG_DATA_HOME",
+        ] {
+            assert_eq!(misspelling_of(name), None, "{name}");
+        }
+
+        let names =
+            |list: &[&str]| -> Vec<std::ffi::OsString> { list.iter().map(Into::into).collect() };
+        let err = ensure_no_misspelled_variables(names(&["HOME", "VICTORY_DATA_PATH"]), |_| None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("VICTORY_DATA_PATH is set, but Victory reads VICTORY_DATA_DIR"),
+            "{err}"
+        );
+        // The real variable set: the near miss belongs to something else.
+        ensure_no_misspelled_variables(names(&["VICTORY_DATA_PATH"]), |k| {
+            (k == "VICTORY_DATA_DIR").then(|| "/d".into())
+        })
+        .unwrap();
+        // Set but empty counts as unset, like everywhere else.
+        assert!(
+            ensure_no_misspelled_variables(names(&["VICTORY_GAMEDIR"]), |k| {
+                (k == "VICTORY_GAME_DIR").then(Default::default)
+            })
+            .is_err()
+        );
+        ensure_no_misspelled_variables(names(&["VICTORY_LOG", "PATH"]), |_| None).unwrap();
     }
 
     #[test]
