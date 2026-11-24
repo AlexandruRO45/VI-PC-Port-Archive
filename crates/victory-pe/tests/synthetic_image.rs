@@ -699,3 +699,87 @@ fn rva_to_file_offset_picks_the_section_that_holds_the_rva() {
     );
     assert_eq!(info.rva_to_file_offset(DATA_RVA + DATA_SIZE), None);
 }
+
+#[test]
+fn rejects_damaged_dos_and_nt_signatures() {
+    // No `MZ`: not a PE file at all.
+    let mut d = image();
+    d[0..2].copy_from_slice(b"ZM");
+    assert!(ImageInfo::parse(&d).is_err());
+
+    // `MZ`, but the NT signature is wrong.
+    let mut d = image();
+    d[0x40..0x44].copy_from_slice(b"NE\0\0");
+    assert!(ImageInfo::parse(&d).is_err());
+
+    // `e_lfanew` points past the end of the file, or right at its last bytes.
+    for lfanew in [u32::MAX, d.len() as u32, d.len() as u32 - 2] {
+        let mut d = image();
+        put32(&mut d, layout::DOS_E_LFANEW, lfanew);
+        assert!(ImageInfo::parse(&d).is_err(), "e_lfanew {lfanew:#x}");
+    }
+}
+
+#[test]
+fn rejects_an_import_name_outside_the_sections() {
+    for name in [SIZE_OF_IMAGE + 0x100, 0xFFFF_FFF0] {
+        let mut d = image();
+        put32(&mut d, at(IMPORT_DESCRIPTORS) + 12, name);
+        assert!(ImageInfo::parse(&d).is_err(), "DLL name at {name:#x}");
+    }
+    for hint_name in [SIZE_OF_IMAGE + 0x100, 0x7FFF_FFF0] {
+        let mut d = image();
+        put64(&mut d, at(NAME_TABLE), u64::from(hint_name));
+        assert!(ImageInfo::parse(&d).is_err(), "hint/name at {hint_name:#x}");
+    }
+}
+
+#[test]
+fn import_and_tls_directories_pointing_outside_the_image_do_not_panic() {
+    for rva in [SIZE_OF_IMAGE, SIZE_OF_IMAGE + 0x1000, 0xFFFF_FFF0] {
+        for index in [
+            dir::IMPORT,
+            DIR_TLS,
+            DIR_EXPORT,
+            DIR_DEBUG,
+            DIR_DELAY_IMPORT,
+        ] {
+            let mut d = image();
+            set_directory(&mut d, index, rva, 0x40);
+            // Either outcome is acceptable; the parse must simply return.
+            let _ = ImageInfo::parse(&d);
+        }
+    }
+}
+
+#[test]
+fn corrupting_any_header_byte_does_not_panic() {
+    // Every byte of the headers, the section table and the directories in
+    // the section, set to each of a few hostile values.
+    let clean = image();
+    let ranges = [
+        0..OPT + 240 + 40,
+        at(IMPORT_DESCRIPTORS)..at(HINT_NAME) + 16,
+        at(TLS_DIRECTORY)..at(TLS_CALLBACKS) + 16,
+    ];
+    for range in ranges {
+        for i in range {
+            for v in [0x00, 0x7F, 0x80, 0xFF] {
+                if clean[i] == v {
+                    continue;
+                }
+                let mut d = clean.clone();
+                d[i] = v;
+                let _ = ImageInfo::parse(&d);
+            }
+        }
+    }
+}
+
+#[test]
+fn every_truncation_of_the_image_returns() {
+    let d = image();
+    for len in 0..d.len() {
+        let _ = ImageInfo::parse(&d[..len]);
+    }
+}
