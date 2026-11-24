@@ -2201,13 +2201,64 @@ fn only_exact_subsystem_values_have_names() {
 fn the_dll_bit_alone_decides_is_dll() {
     use layout::file_flags::DLL;
     let mut info = ImageInfo::parse(&image()).unwrap();
-    for (characteristics, dll) in [
-        (DLL, true),
-        (u16::MAX, true),
-        (!DLL, false),
-        (0, false),
-    ] {
+    for (characteristics, dll) in [(DLL, true), (u16::MAX, true), (!DLL, false), (0, false)] {
         info.characteristics = characteristics;
         assert_eq!(info.is_dll(), dll, "{characteristics:#x}");
     }
+}
+
+#[test]
+fn the_name_table_not_the_iat_decides_how_many_entries_there_are() {
+    // The name table ends after its first entry, but the IAT still holds a
+    // second (stale) thunk: only the named slot is an import.
+    let mut d = image();
+    put64(&mut d, at(NAME_TABLE) + 8, 0);
+    let info = ImageInfo::parse(&d).unwrap();
+    let entries: Vec<_> = info.imports[0]
+        .entries
+        .iter()
+        .map(|e| (e.symbol.to_string(), e.iat_slot_rva))
+        .collect();
+    assert_eq!(entries, [("ExitProcess".to_string(), IAT)]);
+    assert_eq!(info.import_count(), 1);
+}
+
+#[test]
+fn a_dll_imported_both_directly_and_delay_loaded_is_listed_in_each_table() {
+    let mut d = image();
+    add_delay_import(&mut d);
+    put_bytes(&mut d, DELAY_DLL_NAME, b"KERNEL32.dll\0");
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.imports.len(), 1);
+    assert_eq!(info.delay_imports.len(), 1);
+    assert_eq!(info.imports[0].dll, "KERNEL32.dll");
+    assert_eq!(info.delay_imports[0].dll, "KERNEL32.dll");
+    // Each table keeps its own IAT slots; nothing is merged.
+    assert_eq!(info.imports[0].entries[0].iat_slot_rva, IAT);
+    assert_eq!(info.delay_imports[0].entries[0].iat_slot_rva, DELAY_IAT);
+    assert_eq!(info.import_count(), 2);
+}
+
+#[test]
+fn import_symbols_compare_on_every_field_but_display_without_the_hint() {
+    use std::collections::BTreeSet;
+    let name = |hint: u16, name: &str| ImportSymbol::Name {
+        hint,
+        name: name.into(),
+    };
+    // The hint is part of a symbol's identity even though it is not shown.
+    assert_ne!(name(1, "Sleep"), name(2, "Sleep"));
+    assert_eq!(name(1, "Sleep").to_string(), name(2, "Sleep").to_string());
+    // Names order before ordinals, then by hint, then by name.
+    let set: BTreeSet<_> = [
+        ImportSymbol::Ordinal(3),
+        name(2, "A"),
+        ImportSymbol::Ordinal(1),
+        name(1, "Z"),
+        name(1, "Z"),
+    ]
+    .into_iter()
+    .collect();
+    let shown: Vec<_> = set.iter().map(ToString::to_string).collect();
+    assert_eq!(shown, ["Z", "A", "#1", "#3"]);
 }
