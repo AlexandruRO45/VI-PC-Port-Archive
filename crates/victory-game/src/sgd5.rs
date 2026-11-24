@@ -272,9 +272,23 @@ fn name_before(file: &[u8], nul: usize) -> Option<&str> {
         .iter()
         .rposition(|b| !b.is_ascii_graphic())
         .map_or(0, |p| p + 1);
-    // From 32 characters on, the length byte is printable too.
-    (run.saturating_sub(1)..nul)
-        .find(|&l| usize::from(file[l]) == nul - l)
+    // From 32 characters on, the length byte is printable too, and so may be
+    // the bytes before it (the previous record's packed tail, say) and the
+    // name's own characters: any of them that equals its distance to the NUL
+    // reads as a length byte as well. Shader names are identifiers (letters,
+    // digits, `_`), and a length byte from 33 to 47 (names of 32 to 46
+    // characters) is punctuation, so the earliest length byte whose name is
+    // an identifier wins over a stray byte before it; failing that, the
+    // earliest.
+    let mut lengths = (run.saturating_sub(1)..nul).filter(|&l| usize::from(file[l]) == nul - l);
+    let first = lengths.clone().next();
+    lengths
+        .find(|&l| {
+            file[l + 1..nul]
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+        })
+        .or(first)
         .and_then(|l| std::str::from_utf8(&file[l + 1..nul]).ok())
         .filter(|name| !name.is_empty())
 }
@@ -691,6 +705,37 @@ mod tests {
         let names: Vec<_> = found.iter().map(|r| r.name).collect();
         assert_eq!(names, [None, Some("PS_named")]);
         assert_eq!(found[0].unpack().as_deref(), Some(&b"nameless"[..]));
+    }
+
+    #[test]
+    fn printable_bytes_before_a_long_name_are_not_part_of_it() {
+        // From 32 characters on, a name's length byte is printable, so the
+        // bytes before it (the previous record's packed tail, say) run on
+        // into the name. One that equals its own distance to the NUL reads
+        // as a length byte too, and must not win over the real one.
+        let name = "PS_DeferredLightingComposite_0011aabb_Wrapped";
+        let len = name.len() as u8 + 1;
+        for before in [vec![len + 1], vec![len + 2, b'A'], vec![b'x', len + 1]] {
+            let mut file = MAGIC.to_vec();
+            file.extend_from_slice(&[0, 0]);
+            file.extend_from_slice(&before);
+            let header = record_bytes(name, 0x32, b"container");
+            // Drop the helper's 4 bytes before the length byte.
+            file.extend_from_slice(&header[4..]);
+            let names: Vec<_> = records(&file).map(|r| r.name).collect();
+            assert_eq!(names, [Some(name)], "bytes before: {before:?}");
+        }
+        // A character of the name that equals its distance to the NUL (the
+        // `4`, 52) is not its length byte either.
+        for long in [
+            format!("PS_{}_Wrapped", "x".repeat(100)),
+            format!("PS_4_0_{}", "w".repeat(48)),
+        ] {
+            let mut file = MAGIC.to_vec();
+            file.extend(record_bytes(&long, 0x32, b"long"));
+            let names: Vec<_> = records(&file).map(|r| r.name).collect();
+            assert_eq!(names, [Some(&long[..])]);
+        }
     }
 
     #[test]
