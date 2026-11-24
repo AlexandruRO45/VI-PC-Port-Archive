@@ -479,9 +479,23 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
                 "two signature elements in one register component",
             ));
         }
+        // A semantic (name and index, the name without regard to case) names
+        // one element. The next stage links by it, and D3D12 refuses a
+        // signature that lists one twice, so the pipeline was lost; a second
+        // element in another register passed every check above.
+        let name = String::from_utf8_lossy(name).into_owned();
+        let index = u32_at(part, at + 8)?;
+        if out
+            .iter()
+            .any(|e| e.index == index && e.name.eq_ignore_ascii_case(&name))
+        {
+            return Err(ShaderError::Malformed(
+                "two signature elements with one semantic",
+            ));
+        }
         out.push(container::SigElement {
-            name: String::from_utf8_lossy(name).into_owned(),
-            index: u32_at(part, at + 8)?,
+            name,
+            index,
             kind,
             comp,
             interp: 0,
@@ -779,6 +793,53 @@ mod tests {
             &[(31, 0xE), (31, 0x2)],
         ] {
             assert_eq!(signature(&part(rows)).unwrap_err(), refused, "{rows:x?}");
+        }
+    }
+
+    /// A semantic name and index name one element. A second element with
+    /// them (the name in any case), in another register or none, is
+    /// refused; the same name with another index, or another name with the
+    /// same index, still parses.
+    #[test]
+    fn a_semantic_listed_twice_is_refused() {
+        // One 32-byte row per `(name, index, register)`, names after the rows.
+        let part = |rows: &[(&str, u32, u32)]| {
+            let mut names = Vec::new();
+            let mut p = Vec::new();
+            for w in [rows.len() as u32, 8] {
+                p.extend_from_slice(&u32::to_le_bytes(w));
+            }
+            for &(name, index, register) in rows {
+                let at = 8 + 32 * rows.len() + names.len();
+                names.extend_from_slice(name.as_bytes());
+                names.push(0);
+                for w in [0, at as u32, index, 0, 3, register, 0xF, 0] {
+                    p.extend_from_slice(&u32::to_le_bytes(w));
+                }
+            }
+            p.extend_from_slice(&names);
+            p
+        };
+        for rows in [
+            &[("TEXCOORD", 0, 0), ("TEXCOORD", 1, 1)][..],
+            &[("TEXCOORD", 0, 0), ("COLOR", 0, 1)],
+            &[("TEXCOORD", 0, 0), ("TEXCOORD0", 0, 1)],
+            &[("A", 7, u32::MAX), ("A", 8, u32::MAX)],
+        ] {
+            let parsed = signature(&part(rows)).expect("distinct semantics");
+            let named: Vec<_> = parsed.iter().map(|e| (e.name.as_str(), e.index)).collect();
+            let want: Vec<_> = rows.iter().map(|r| (r.0, r.1)).collect();
+            assert_eq!(named, want);
+        }
+        let refused = ShaderError::Malformed("two signature elements with one semantic");
+        for rows in [
+            &[("TEXCOORD", 0, 0), ("TEXCOORD", 0, 1)][..],
+            &[("TEXCOORD", 3, 0), ("texcoord", 3, 1)],
+            &[("COLOR", 0, 0), ("TEXCOORD", 0, 1), ("Color", 0, 2)],
+            &[("A", 7, u32::MAX), ("A", 7, u32::MAX)],
+            &[("SV_Position", 0, 0), ("SV_POSITION", 0, 1)],
+        ] {
+            assert_eq!(signature(&part(rows)).unwrap_err(), refused, "{rows:?}");
         }
     }
 
