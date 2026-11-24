@@ -259,6 +259,22 @@ impl Host {
             },
             ..Default::default()
         };
+        // A crash inside the compiler leaves no line of its own, so what it
+        // was given has to be in the log first (`VICTORY_PIPELINE_ARGS=1`).
+        if std::env::var_os("VICTORY_PIPELINE_ARGS").is_some() {
+            let head: String = cs
+                .iter()
+                .take(4)
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join("");
+            eprintln!(
+                "compute create arguments (shader host): cs_bytes={} head={head} bound_root={} node={}",
+                cs.len(),
+                desc.pRootSignature.is_some(),
+                desc.NodeMask
+            );
+        }
         // SAFETY: the description points at live data.
         unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|e| self.explained(e))
     }
