@@ -403,6 +403,36 @@ fn directly_indexed_srv_sees_producer_in_same_submission() {
     assert_eq!(read(mapped), 77);
 }
 
+/// Small views into one page of a buffer, as the world's directly indexed
+/// SRVs are, refresh as one range, and each still reads its own bytes.
+#[cfg(feature = "diagnostics")]
+#[test]
+fn directly_indexed_srvs_in_one_page_refresh_as_one_range() {
+    let Some((host, dxc)) = test_host() else {
+        return;
+    };
+    use crate::copystat::{C, read as counter};
+    const VIEWS: u32 = 16;
+    const STRIDE: u64 = 4096;
+    let pipeline = pipeline(host, &dxc);
+    let title = TitleBuffer::new(65536);
+    let heap = TestHeap::new(64);
+    for i in 0..VIEWS {
+        title.set(u64::from(i) * STRIDE, 100 + i);
+        title.srv(heap.handle(i), u64::from(i) * STRIDE, 16);
+    }
+    let (output, mapped) = host.shared_buffer(4).unwrap();
+    for i in [0, VIEWS / 2, VIEWS - 1] {
+        let list = host.new_list().unwrap();
+        record(&list, heap.0, &pipeline, i, &output);
+        list.close();
+        let before = counter(C::DirectRanges);
+        host.execute(&[&list]);
+        assert_eq!(counter(C::DirectRanges) - before, 1);
+        assert_eq!(read(mapped), 100 + i);
+    }
+}
+
 #[cfg(feature = "diagnostics")]
 #[test]
 fn directly_indexed_srv_unwatched_range_preserves_watched_refreshes() {
