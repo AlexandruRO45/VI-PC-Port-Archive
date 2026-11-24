@@ -1600,4 +1600,75 @@ mod tests {
             assert_eq!(one(&[sopk(0x01, sdst, 4)], true), "s_version 0x0004");
         }
     }
+
+    /// A single VGPR is `vN`; a range is `v[a:b]` at both ends of the
+    /// architectural limits, and a one-dword range still uses the bracketed
+    /// form when dwords > 1 would wrap past 255.
+    #[test]
+    fn vector_codes_name_single_registers_and_ranges_at_their_bounds() {
+        let v = |reg: u8, dwords: u8| Operand::Vector { reg, dwords }.to_string();
+        assert_eq!(v(0, 1), "v0");
+        assert_eq!(v(1, 1), "v1");
+        assert_eq!(v(255, 1), "v255");
+        assert_eq!(v(254, 2), "v[254:255]");
+        assert_eq!(v(0, 4), "v[0:3]");
+        assert_eq!(v(252, 4), "v[252:255]");
+    }
+
+    /// Attribute operands name every channel at both ends of the index and
+    /// component ranges VINTRP and VOP3 carry.
+    #[test]
+    fn attribute_channels_name_each_bound() {
+        use std::fmt::Write as _;
+        let a = |index: u8, chan: u8| {
+            let mut s = String::new();
+            let _ = write!(
+                s,
+                "{}",
+                Operand::Attr {
+                    index,
+                    chan,
+                    high: false
+                }
+            );
+            s
+        };
+        assert_eq!((a(0, 0), a(0, 3)), ("attr0.x".into(), "attr0.w".into()));
+        assert_eq!((a(63, 0), a(63, 3)), ("attr63.x".into(), "attr63.w".into()));
+        for (chan, name) in [(0, "x"), (1, "y"), (2, "z"), (3, "w")] {
+            assert_eq!(a(31, chan), format!("attr31.{name}"));
+        }
+    }
+
+    /// MTBUF spells the format word after the operands; table entries keep
+    /// the `BUF_FMT_` prefix and past the table a bare number is used.
+    #[test]
+    fn typed_buffer_loads_spell_their_format_after_the_operands() {
+        // tbuffer_load_format_xyzw: MTBUF encoding 0x3A << 26, opcode 3, format in bits 19..25.
+        let mtbuf = |format: u8| {
+            let w0 = 0xE800_0000 | 3 << 16 | u32::from(format) << 19;
+            one(&[w0, 0x0002_0400], true)
+        };
+        let base = "tbuffer_load_format_xyzw v[4:7], v0, s[8:11], s0";
+        assert_eq!(mtbuf(0), format!("{base} format:[BUF_FMT_INVALID]"));
+        assert_eq!(mtbuf(1), format!("{base} format:[BUF_FMT_8_UNORM]"));
+        assert_eq!(mtbuf(77), format!("{base} format:[BUF_FMT_32_32_32_32_FLOAT]"));
+        assert_eq!(mtbuf(78), format!("{base} format:[78]"));
+    }
+
+    /// An image writes `dmask:0x…` only when the mask is not the default
+    /// single channel; zero and every channel are both spelled out.
+    #[test]
+    fn image_dmask_is_omitted_at_one_and_spelled_otherwise() {
+        // image_load v8, v0, s[16:23]: dmask in bits 8..11 of word 0.
+        let load = |dmask: u32| one(&[0xF000_0000 | dmask << 8, 0x0004_0800], true);
+        let ops = "image_load v8, v0, s[16:23]";
+        let dim = "dim:SQ_RSRC_IMG_1D";
+        assert_eq!(load(1), format!("{ops} {dim}"));
+        assert_eq!(load(0), format!("{ops} dmask:0x0 {dim}"));
+        assert_eq!(
+            load(0xF),
+            format!("image_load v[8:11], v0, s[16:23] dmask:0xf {dim}")
+        );
+    }
 }
