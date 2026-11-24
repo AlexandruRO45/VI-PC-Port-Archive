@@ -227,8 +227,9 @@ struct Mouse {
     velocity: Velocity,
     wheel: Wheel,
     wheel_rest: i32,
-    /// Last absolute mouse position (for MOUSE_MOVE_ABSOLUTE), None if not yet set or after reset
-    last_abs: Option<(i32, i32)>,
+    /// Last absolute mouse position per device (for MOUSE_MOVE_ABSOLUTE).
+    /// Key is the Raw Input device handle. None if not yet set or after reset.
+    last_abs: std::collections::HashMap<usize, (i32, i32)>,
 }
 
 impl Mouse {
@@ -237,7 +238,7 @@ impl Mouse {
         self.velocity = Velocity::default();
         self.wheel = Wheel::default();
         self.wheel_rest = 0;
-        self.last_abs = None;
+        self.last_abs.clear();
     }
 }
 
@@ -318,16 +319,23 @@ pub unsafe fn on_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> b
                     DX.fetch_add(raw.last_x, Ordering::Relaxed);
                     DY.fetch_add(raw.last_y, Ordering::Relaxed);
                 } else {
-                    // Absolute movement: compute delta from last absolute position
+                    // Absolute movement: compute delta from last absolute position for this device
+                    let device = raw.device;
                     let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
-                    let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0 });
-                    if let Some((last_x, last_y)) = m.last_abs {
-                        let dx = raw.last_x - last_x;
-                        let dy = raw.last_y - last_y;
+                    let m = g.get_or_insert_with(|| Mouse {
+                        last: Instant::now(),
+                        velocity: Velocity::default(),
+                        wheel: Wheel::default(),
+                        wheel_rest: 0,
+                        last_abs: std::collections::HashMap::new(),
+                    });
+                    if let Some((last_x, last_y)) = m.last_abs.get(&device) {
+                        let dx = raw.last_x - *last_x;
+                        let dy = raw.last_y - *last_y;
                         DX.fetch_add(dx, Ordering::Relaxed);
                         DY.fetch_add(dy, Ordering::Relaxed);
                     }
-                    m.last_abs = Some((raw.last_x, raw.last_y));
+                    m.last_abs.insert(device, (raw.last_x, raw.last_y));
                 }
                 if raw.button_flags & RI_MOUSE_WHEEL != 0 {
                     WHEEL.fetch_add(raw.button_data as i16 as i32, Ordering::Relaxed);
@@ -448,7 +456,13 @@ pub fn apply(s: &mut GamepadState) {
         s.left_trigger = 1.0;
     }
     let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
-    let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0 });
+    let m = g.get_or_insert_with(|| Mouse {
+        last: Instant::now(),
+        velocity: Velocity::default(),
+        wheel: Wheel::default(),
+        wheel_rest: 0,
+        last_abs: std::collections::HashMap::new(),
+    });
     let now = Instant::now();
     let dt = now.duration_since(m.last).as_secs_f32();
     m.last = now;
@@ -589,32 +603,35 @@ mod tests {
     fn mouse_struct_has_last_abs_field_for_absolute_coordinates() {
         // Issue #962: some Raw Input devices report absolute coordinates (MOUSE_MOVE_ABSOLUTE).
         // The Mouse struct needs a last_abs field to track the previous position for delta calculation.
+        let mut last_abs = std::collections::HashMap::new();
+        last_abs.insert(42, (1000, 500));
         let m = Mouse {
             last: Instant::now(),
             velocity: Velocity::default(),
             wheel: Wheel::default(),
             wheel_rest: 0,
-            last_abs: Some((1000, 500)),
+            last_abs,
         };
-        // The field should store the last absolute position
-        assert_eq!(m.last_abs, Some((1000, 500)));
+        // The field should store the last absolute position per device
+        assert_eq!(m.last_abs.get(&42), Some(&(1000, 500)));
     }
 
     #[test]
     fn mouse_reset_clears_last_abs() {
-        // Reset must clear last_abs to None, so the first absolute move is handled correctly
+        // Reset must clear last_abs, so the first absolute move is handled correctly
         // (first move has no previous position to compute delta from)
+        let mut last_abs = std::collections::HashMap::new();
+        last_abs.insert(42, (1000, 500));
         let mut m = Mouse {
             last: Instant::now(),
             velocity: Velocity::default(),
             wheel: Wheel::default(),
             wheel_rest: 0,
-            last_abs: Some((1000, 500)),
+            last_abs,
         };
         m.reset(Instant::now());
-        // After reset, last_abs should be None
-        assert!(m.last_abs.is_none());
-    }
+        // After reset, last_abs should be empty
+        assert!(m.last_abs.is_empty());
     }
 
     #[test]
@@ -637,6 +654,7 @@ mod tests {
                 velocity: v,
                 wheel: w,
                 wheel_rest: 90,
+                last_abs: std::collections::HashMap::new(),
             });
             let m = g.as_ref().unwrap();
             assert!(m.velocity.x.abs() > REST_SPEED && m.velocity.y.abs() > REST_SPEED);
