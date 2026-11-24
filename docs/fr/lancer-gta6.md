@@ -32,6 +32,47 @@ Le monde est atteint et affiché. Rien ici ne vient de la lecture du code du jeu
 
 Les réglages de l'essai réussi sont maintenant ceux par défaut de `tools/lancer_victory.ps1` (tableau de la section Lancement). Ils demandent la compilation `diag` (`--profile diag --features diagnostics`). Passez `-NoTunedSettings` pour les désactiver.
 
+## Linux (Proton)
+
+VIctory est un programme Windows ; sous Linux il tourne sous Wine. Mesuré le 24/11/2026 par un contributeur (Ryzen 7 9800X3D, 62 Go, RX 9070 XT avec Mesa 26.2.7 RADV, Fedora 44, noyau 7.3.5, Wine de GE-Proton11-12 avec le vkd3d-proton de Proton Experimental), en lançant notre propre copie du build 1.0.2.1, d'après les journaux de VIctory de six lancements. L'image des lancements 3 à 5 a été décrite par la personne qui jouait ; tout le reste vient des journaux. Ce n'est pas une plateforme officielle : rien ci-dessous n'est vérifié par la CI.
+
+### Réglages nécessaires sous Linux
+
+- `VKD3D_CONFIG=descriptor_heap` : le jeu demande un tas de vues de 1 245 184 entrées, au-delà du plafond par défaut de vkd3d-proton (1 000 000).
+- Les remplacements de DLL `d3d12,d3d12core,dxgi=n,b` pour que VIctory utilise vkd3d-proton, et une compilation `diag` croisée pour `x86_64-pc-windows-msvc` (par exemple avec [xwin](https://github.com/Jake-Shadle/xwin)), lancée avec le `wine` de Proton.
+- Les réglages du lanceur, sans DRED : `VICTORY_D3D12_DRED` est actif dès que la variable existe (`host.rs`, `dred_on()`), quelle que soit sa valeur, et ses notes coûtent ici environ 670 ms par image (compteur par image de VIctory).
+- Mesurés ici, sous Linux seulement : `VICTORY_PIPELINE_WAIT_MS=50` (500 par défaut ; 5 ou 6 pipelines restent « en cours de création » pendant tout le lancement et chaque image les attendait) et `VICTORY_TEXTURE_NO_WAIT=1` (les rafraîchissements de textures n'attendent plus le verrou mémoire pendant que Wine remappe la mémoire du jeu).
+
+### Ce que refuse le compilateur de shaders de Wine
+
+VIctory compile à l'exécution quelques programmes HLSL à lui avec `D3DCompile`. Sous Wine, c'est le compilateur HLSL de vkd3d-shader, qui (testé avec un petit programme sur le même Proton) :
+
+- n'a aucune méthode de `RWByteAddressBuffer` en dehors de `Store*` : `Load`, `InterlockedAdd`, `InterlockedOr`, `InterlockedMax` et `InterlockedCompareExchange` échouent avec E5005. Les intrinsèques globales `Interlocked*` sur un `RWStructuredBuffer<uint>` compilent ;
+- refuse `[allow_uav_condition]` (E5017) ;
+- compile un shader qui porte `[RootSignature(...)]` mais laisse la signature racine de côté (avertissement W5302) : `CreateRootSignature` depuis le blob échoue alors avec `E_FAIL` (0x80004005).
+
+Effets dans le journal avec le commit épinglé à ce moment-là (`d279e69`) ; `7b0f736`, épinglé maintenant, compile ces programmes de la même façon (lu statiquement) :
+
+| Ligne du journal | Effet |
+| --- | --- |
+| `argument clamp: clamp:67:10: E5005: Method 'InterlockedMax' is not defined on type 'RWByteAddressBuffer'`, puis `no argument clamp: indirect execution dropped` | Environ 800 dessins et dispatches indirects abandonnés par image (3 dans l'essai Windows du mainteneur). |
+| `no pipeline to draw a depth plane from its twin: such planes stay as they are error=Call failed. (0x80004005)` (formats 45 et 20) | La passe qui écrit les classes de matériau 16 bits du jeu dans son plan de profondeur ne tourne jamais ; les passes par matériau du jeu testent cette profondeur à l'égalité, donc beaucoup de surfaces du monde restent sans ombrage. Les personnages et les cheveux n'y passent pas. |
+| `no host copies in the card's memory: the compare could not be made` | La vérification de la mémoire écrite par les shaders se fait sur le CPU : 0,6 à 1,1 Go par image. |
+
+### Lancements mesurés
+
+| Lancement | Compilation | Dans le monde | Fin |
+| --- | --- | --- | --- |
+| 2 | `d279e69` épinglé, réglages du lanceur | 0,1 à 0,6 i/s, environ 800 indirects abandonnés par image | `int3` du jeu lui-même après 8 min 35 s, dans l'intro (suivi sous VIctory #698 : un pool du jeu est plein) |
+| 3 | + clamp des arguments réécrit pour Wine (correctif local), DRED coupé, les deux réglages Linux | 3,7 à 5,2 i/s en jeu, 0,4 à 0,8 pendant le streaming | quitté à la main après environ 29 min, sans plantage |
+| 4 | + `main` du fork jusqu'à `1684989` (inclut `7b0f736`) et pull requests du fork #21 (DXC pour ces programmes, fermée depuis), #11 (fusionnée depuis), #9 ; limite de boucles 256 | 4,4 à 4,9 i/s ; cheveux corrects | quitté à la main |
+| 5 | + VIctory amont #1130/#1067 (descripteur lu comme donnée), #1152 (pas de mélange sur les cibles entières), une somme de vague f16 ; limite de boucles 0 (valeurs par étage) | environ 5 i/s ; visage de Lucia affiché ; monde plus sombre, yeux trop lumineux | quitté à la main |
+| 6 | + signature racine de la passe de plan de profondeur construite dans le code quand le blob n'en a pas (correctif local) ; limite de boucles 256 | 3,1 à 4,2 i/s, environ 4 700 dessins par image (jusqu'à 6 260) ; l'erreur du plan de profondeur a disparu | violation d'accès dans le jeu (écriture à l'adresse 0) après environ 11 min dans le monde ; cause non étudiée |
+
+Les lancements 3 à 6 utilisent des correctifs absents du commit épinglé ; ils sont décrits ici pour pouvoir être portés vers le fork. Avec le seul `d279e69`, Linux obtient le lancement 2. Aucun de ces lancements n'utilisait `VICTORY_RELAY=2`, réglage par défaut du lanceur depuis `7b0f736` : il n'est pas mesuré sous Linux.
+
+Ce qui manque encore sous Linux comme sous Windows : le ray tracing (le constructeur BVH du jeu est coupé ; l'activer a planté en quelques secondes dans les essais du fork) et 29 créations de pipelines à partir des pipelines précompilés de la console (VIctory #829).
+
 ## Ce que vous obtenez aujourd'hui
 
 Mesuré le 2026-11-24 sur i7-13700KF + RTX 4070 SUPER, Windows 11, avec l'intégration stable :

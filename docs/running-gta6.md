@@ -32,6 +32,47 @@ The world is reached and displayed. Nothing here comes from reading the game's c
 
 The settings of the successful run are now the defaults of `tools/lancer_victory.ps1` (table in the Run section). They need the `diag` build (`--profile diag --features diagnostics`). Pass `-NoTunedSettings` to turn them off.
 
+## Linux (Proton)
+
+VIctory is a Windows program; on Linux it runs under Wine. Measured on 2026-11-24 by a contributor (Ryzen 7 9800X3D, 62 GB, RX 9070 XT with Mesa 26.2.7 RADV, Fedora 44, kernel 7.3.5, GE-Proton11-12's Wine with Proton Experimental's vkd3d-proton), by running our own copy of the 1.0.2.1 build, from the VIctory logs of six runs. The picture in runs 3 to 5 was described by the person playing; everything else comes from the logs. This is not an official platform: nothing below is checked by the CI.
+
+### Settings Linux needs
+
+- `VKD3D_CONFIG=descriptor_heap`: the title asks for a 1,245,184-entry view heap, over vkd3d-proton's default cap of 1,000,000.
+- DLL overrides `d3d12,d3d12core,dxgi=n,b` so VIctory gets vkd3d-proton, and a `diag` build cross-compiled for `x86_64-pc-windows-msvc` (for example with [xwin](https://github.com/Jake-Shadle/xwin)), started with Proton's `wine`.
+- The launcher's settings, without DRED: `VICTORY_D3D12_DRED` is on as soon as the variable exists (`host.rs`, `dred_on()`), whatever its value, and its notes cost about 670 ms per frame here (VIctory's own per-frame counter).
+- Measured here, Linux only: `VICTORY_PIPELINE_WAIT_MS=50` (default 500; 5 or 6 pipelines stay "being made" for the whole run and each frame waited for them) and `VICTORY_TEXTURE_NO_WAIT=1` (texture refreshes stop waiting on the memory lock while Wine remaps title memory).
+
+### What Wine's shader compiler refuses
+
+VIctory compiles a few HLSL programs of its own at run time with `D3DCompile`. Under Wine that is vkd3d-shader's HLSL compiler, which (tested with a small program on the same Proton):
+
+- has no `RWByteAddressBuffer` methods besides `Store*`: `Load`, `InterlockedAdd`, `InterlockedOr`, `InterlockedMax` and `InterlockedCompareExchange` fail with E5005. The global `Interlocked*` intrinsics on a `RWStructuredBuffer<uint>` compile;
+- refuses `[allow_uav_condition]` (E5017);
+- compiles a shader that has `[RootSignature(...)]` but leaves the root signature out (warning W5302), so `CreateRootSignature` from the blob fails with `E_FAIL` (0x80004005).
+
+Effects in the log with the commit pinned at the time (`d279e69`); `7b0f736`, pinned now, compiles these programs the same way (read statically):
+
+| Log line | Effect |
+| --- | --- |
+| `argument clamp: clamp:67:10: E5005: Method 'InterlockedMax' is not defined on type 'RWByteAddressBuffer'`, then `no argument clamp: indirect execution dropped` | About 800 indirect draws and dispatches dropped per frame (3 on the maintainer's Windows run). |
+| `no pipeline to draw a depth plane from its twin: such planes stay as they are error=Call failed. (0x80004005)` (formats 45 and 20) | The pass that writes the title's 16-bit material classes into its depth plane never runs; the title's per-material passes test that depth for equality, so many world surfaces stay unshaded. Characters and hair do not go through it. |
+| `no host copies in the card's memory: the compare could not be made` | The check of shader-written memory runs on the CPU: 0.6 to 1.1 GB per frame. |
+
+### Measured runs
+
+| Run | Build | In the world | Ended |
+| --- | --- | --- | --- |
+| 2 | pinned `d279e69`, launcher settings | 0.1 to 0.6 fps, about 800 indirects dropped per frame | the title's own `int3` after 8 min 35 s, in the intro (tracked as VIctory #698: a title pool is full) |
+| 3 | + argument clamp rewritten for Wine (local patch), DRED off, the two Linux settings | 3.7 to 5.2 fps in play, 0.4 to 0.8 while streaming | quit by hand after about 29 min, no crash |
+| 4 | + fork `main` up to `1684989` (includes `7b0f736`) and fork pull requests #21 (DXC for these programs, since closed), #11 (since merged), #9; loop limit 256 | 4.4 to 4.9 fps; hair right | quit by hand |
+| 5 | + upstream VIctory #1130/#1067 (descriptor read as data), #1152 (no blending on integer targets), an f16 wave sum; loop limit 0 (per-stage defaults) | about 5 fps; Lucia's face drawn; world darker, eyes too bright | quit by hand |
+| 6 | + depth-plane root signature built in code when the blob has none (local patch); loop limit 256 | 3.1 to 4.2 fps, about 4,700 draws per frame (up to 6,260); the depth-plane error is gone | an access violation in the title (write to address 0) after about 11 min in the world; cause not investigated |
+
+Runs 3 to 6 use patches that are not in the pinned commit; they are described here so they can be carried to the fork. With `d279e69` alone, Linux gets run 2. None of these runs used `VICTORY_RELAY=2`, a launcher default since `7b0f736`: it is not measured on Linux.
+
+What stays missing on Linux as on Windows: ray tracing (the title's BVH builder is off; turning it on crashed within seconds on the fork's tests), and 29 pipeline creations from the console's own pre-built pipelines (VIctory #829).
+
 ## What you get today
 
 Measured on 2026-11-24 on an i7-13700KF + RTX 4070 SUPER, Windows 11, with the stable integration:
