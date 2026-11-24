@@ -272,7 +272,10 @@ fn staged_files(root: &Path) -> Result<Vec<File>> {
     // id and submodules are seen as such. T: a path whose type changed (a
     // symlink replaced by a regular file, or the reverse) carries new content
     // just as a modification does. --no-renames: a rename is checked as the
-    // addition it is, with one path per record.
+    // addition it is, with one path per record. --ignore-submodules=none:
+    // `diff.ignoreSubmodules` or an `ignore = all` line in .gitmodules (read
+    // from the working tree, even untracked) would otherwise leave a staged
+    // submodule out of the list.
     let fields = git_z(
         root,
         &[
@@ -283,6 +286,7 @@ fn staged_files(root: &Path) -> Result<Vec<File>> {
             "--no-abbrev",
             "--no-renames",
             "--diff-filter=ACMT",
+            "--ignore-submodules=none",
         ],
     )?
     .context("--staged needs a git repository")?;
@@ -542,6 +546,38 @@ mod tests {
         // Not checked out, so nothing is on disk.
         assert_eq!(names(root, false), ["vendor"]);
         assert!(super::run(root, false).is_err());
+    }
+
+    /// Git's own settings can hide a submodule from `git diff`; the staged
+    /// check must see it anyway.
+    #[cfg(unix)]
+    #[test]
+    fn staged_submodules_are_seen_whatever_git_ignores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git_str(root, &["init", "-q"]);
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        git_str(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{oid},vendor"),
+            ],
+        );
+        git_str(root, &["config", "diff.ignoreSubmodules", "all"]);
+        // Untracked, so it is not itself staged, yet `git diff` honours it.
+        std::fs::write(
+            root.join(".gitmodules"),
+            "[submodule \"v\"]\n\tpath = vendor\n\turl = x\n\tignore = all\n",
+        )
+        .unwrap();
+        let hidden = git_str(root, &["diff", "--cached", "--name-only"]);
+        assert!(hidden.is_empty(), "git itself hides the submodule");
+
+        assert_eq!(names(root, true), ["vendor"]);
+        assert!(super::run(root, true).is_err());
     }
 
     /// Tests run git in temporary repositories; from a hook (`git commit -a`
