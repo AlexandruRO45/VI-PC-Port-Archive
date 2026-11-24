@@ -1500,3 +1500,94 @@ fn delay_descriptor_attributes_are_not_checked() {
     assert_eq!(user32.dll, "USER32.dll");
     assert_eq!(user32.entries[0].iat_slot_rva, DELAY_IAT);
 }
+
+#[test]
+fn a_codeview_entry_after_other_debug_entries_is_found() {
+    // A POGO entry first, then the CodeView one: entries of other types are
+    // skipped, not taken as the end of the directory.
+    const TWO_ENTRIES: u32 = 0x1280;
+    let mut d = image();
+    add_codeview(&mut d, b"RSDS");
+    let codeview_entry = d[at(DEBUG_DIRECTORY)..at(DEBUG_DIRECTORY) + 28].to_vec();
+    put32(&mut d, at(TWO_ENTRIES) + 12, 13); // IMAGE_DEBUG_TYPE_POGO
+    put_bytes(&mut d, TWO_ENTRIES + 28, &codeview_entry);
+    set_directory(&mut d, DIR_DEBUG, TWO_ENTRIES, 56);
+    let cv = ImageInfo::parse(&d).unwrap().codeview.unwrap();
+    assert_eq!((cv.pdb_path.as_str(), cv.age), ("t.pdb", 0x2A));
+}
+
+#[test]
+fn a_debug_directory_that_is_not_whole_entries_is_malformed() {
+    let mut d = image();
+    add_codeview(&mut d, b"RSDS");
+    for size in [27, 30, 55] {
+        set_directory(&mut d, DIR_DEBUG, DEBUG_DIRECTORY, size);
+        assert!(
+            matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))),
+            "debug directory of {size} bytes"
+        );
+    }
+}
+
+#[test]
+fn the_codeview_record_is_read_at_its_file_offset_not_its_rva() {
+    let mut d = image();
+    add_codeview(&mut d, b"RSDS");
+    // AddressOfRawData is ignored: a zero there changes nothing.
+    put32(&mut d, at(DEBUG_DIRECTORY) + 20, 0);
+    let cv = ImageInfo::parse(&d).unwrap().codeview.unwrap();
+    assert_eq!(cv.pdb_path, "t.pdb");
+    // PointerToRawData past the end of the file is malformed.
+    let past_end = d.len() as u32;
+    put32(&mut d, at(DEBUG_DIRECTORY) + 24, past_end);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+}
+
+#[test]
+fn files_that_are_not_pe_images_are_unsupported() {
+    // An import library and a bare AMD64 COFF object are recognised for what
+    // they are and turned away, not parsed as a PE.
+    let mut coff = vec![0u8; 20];
+    put16(&mut coff, 0, MACHINE_AMD64);
+    // The kind is read from the first 16 bytes, so the archive is padded.
+    let mut archive = b"!<arch>\n".to_vec();
+    archive.resize(68, b' ');
+    for (what, data) in [("archive", archive), ("COFF object", coff)] {
+        assert!(
+            matches!(ImageInfo::parse(&data), Err(PeError::Unsupported(_))),
+            "{what}: {:?}",
+            ImageInfo::parse(&data)
+        );
+    }
+}
+
+#[test]
+fn two_descriptors_for_the_same_dll_stay_separate_modules() {
+    // A second KERNEL32.dll descriptor, as linkers emit when objects import
+    // from the same DLL through different import libraries.
+    const SECOND_DESCRIPTOR: u32 = IMPORT_DESCRIPTORS + 20;
+    const NAMES: u32 = 0x1140;
+    const SLOTS: u32 = 0x1150;
+    let mut d = image();
+    set_directory(&mut d, dir::IMPORT, IMPORT_DESCRIPTORS, 60);
+    let desc = at(SECOND_DESCRIPTOR);
+    put32(&mut d, desc, NAMES);
+    put32(&mut d, desc + 12, DLL_NAME);
+    put32(&mut d, desc + 16, SLOTS);
+    for table in [NAMES, SLOTS] {
+        put64(&mut d, at(table), (1 << 63) | 9);
+    }
+    let info = ImageInfo::parse(&d).unwrap();
+    let modules: Vec<_> = info
+        .imports
+        .iter()
+        .map(|m| (m.dll.as_str(), m.entries.len()))
+        .collect();
+    assert_eq!(modules, [("KERNEL32.dll", 2), ("KERNEL32.dll", 1)]);
+    let second = &info.imports[1].entries[0];
+    assert_eq!(
+        (second.symbol.clone(), second.iat_slot_rva),
+        (ImportSymbol::Ordinal(9), SLOTS)
+    );
+    assert_eq!(info.import_count(), 3);
+}
