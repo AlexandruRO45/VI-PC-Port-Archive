@@ -2636,9 +2636,11 @@ The trace will enumerate them.
   stores `0x7fff` vs WARP `0x8000` (all on `main` before this change; same 1-ulp class as SRGB, not addressed here).
   `D32_FLOAT` and `D32_FLOAT_S8X24_UINT` match WARP.
   This does not add typed-view reinterpretation of typeless resources.
-- **Depth clears** use `VK_EXT_depth_range_unrestricted` when the Vulkan device supports it, allowing floating-point
-  depth outside `[0, 1]` and NaN to reach the driver for both full and rectangle clears. Without the extension, replay
-  clamps the clear depth to `[0, 1]` and uses zero for NaN. The UNORM depth format conversions still apply.
+- **Depth clears.** Microsoft documents a `[0, 1]` clamp. On Windows 11 build 26100, both WARP and native D3D12 on
+  an RTX 5070 Ti (610.74) preserved finite out-of-range `D32_FLOAT` values and quiet NaN in full and rectangle
+  clears. Replay preserves those values when the Vulkan device has enabled `VK_EXT_depth_range_unrestricted`.
+  With the extension disabled, replay clamps finite values to `[0, 1]` and uses zero for NaN. The UNORM depth
+  format conversions still apply. [D3D12 reference](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-cleardepthstencilview)
 - `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` (public release note) and DCC: ignore the flag, let the
   Vulkan driver choose compression, and fail loudly if the game aliases a buffer over a compressed image or reads
   raw DCC metadata.
