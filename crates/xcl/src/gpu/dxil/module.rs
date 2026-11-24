@@ -21,7 +21,7 @@ use super::bitstream::{signed, BitWriter};
 pub struct Ty(u32);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum TypeDef {
+pub(super) enum TypeDef {
     Void,
     Label,
     Metadata,
@@ -47,7 +47,7 @@ pub enum Value {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum ConstDef {
+pub(super) enum ConstDef {
     /// Sign-extended to 64 bits from the type's width.
     Int(Ty, i64),
     /// Raw IEEE bits of the type's width.
@@ -57,11 +57,11 @@ enum ConstDef {
     Aggregate(Ty, Vec<Value>),
 }
 
-struct FuncDecl {
-    name: String,
-    ty: Ty,
-    attrs: FnAttrs,
-    defined: bool,
+pub(super) struct FuncDecl {
+    pub(super) name: String,
+    pub(super) ty: Ty,
+    pub(super) attrs: FnAttrs,
+    pub(super) defined: bool,
 }
 
 /// Function attribute sets DXIL intrinsics use.
@@ -91,15 +91,15 @@ impl FnAttrs {
     }
 }
 
-struct GlobalDef {
-    name: String,
+pub(super) struct GlobalDef {
+    pub(super) name: String,
     /// Value type (the global itself is a pointer to it).
-    ty: Ty,
-    ptr: Ty,
-    addrspace: u32,
-    init: Option<Value>,
-    constant: bool,
-    align: u32,
+    pub(super) ty: Ty,
+    pub(super) ptr: Ty,
+    pub(super) addrspace: u32,
+    pub(super) init: Option<Value>,
+    pub(super) constant: bool,
+    pub(super) align: u32,
 }
 
 // --------------------------------------------------------- instructions
@@ -186,7 +186,7 @@ pub enum RmwOp {
 }
 
 #[derive(Debug, Clone)]
-enum Op {
+pub(super) enum Op {
     Bin(BinOp, Value, Value, u64),
     Cast(CastOp, Value, Ty),
     Cmp(Pred, Value, Value),
@@ -208,9 +208,9 @@ enum Op {
     Unreachable,
 }
 
-struct InstDef {
-    op: Op,
-    ty: Ty,
+pub(super) struct InstDef {
+    pub(super) op: Op,
+    pub(super) ty: Ty,
 }
 
 // ------------------------------------------------------------- metadata
@@ -218,7 +218,7 @@ struct InstDef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Md(u32);
 
-enum MdDef {
+pub(super) enum MdDef {
     Str(String),
     Val(Ty, Value),
     Node(Vec<Option<Md>>),
@@ -239,18 +239,18 @@ pub mod fmf {
 }
 
 pub struct Module {
-    types: Vec<TypeDef>,
-    type_ids: HashMap<TypeDef, Ty>,
-    consts: Vec<ConstDef>,
-    const_ids: HashMap<ConstDef, u32>,
-    funcs: Vec<FuncDecl>,
-    func_ids: HashMap<String, u32>,
-    globals: Vec<GlobalDef>,
-    insts: Vec<InstDef>,
-    blocks: Vec<Vec<u32>>,
-    cur: Block,
-    md: Vec<MdDef>,
-    named_md: Vec<(String, Vec<Md>)>,
+    pub(super) types: Vec<TypeDef>,
+    pub(super) type_ids: HashMap<TypeDef, Ty>,
+    pub(super) consts: Vec<ConstDef>,
+    pub(super) const_ids: HashMap<ConstDef, u32>,
+    pub(super) funcs: Vec<FuncDecl>,
+    pub(super) func_ids: HashMap<String, u32>,
+    pub(super) globals: Vec<GlobalDef>,
+    pub(super) insts: Vec<InstDef>,
+    pub(super) blocks: Vec<Vec<u32>>,
+    pub(super) cur: Block,
+    pub(super) md: Vec<MdDef>,
+    pub(super) named_md: Vec<(String, Vec<Md>)>,
     md_strings: HashMap<String, Md>,
     /// The first misuse of the builder (see [`Module::error`]); later ones are dropped.
     error: std::cell::RefCell<Option<String>>,
@@ -375,7 +375,7 @@ impl Module {
             self.i32()
         })
     }
-    fn pointee_of(&self, t: Ty) -> Option<(Ty, u32)> {
+    pub(super) fn pointee_of(&self, t: Ty) -> Option<(Ty, u32)> {
         match self.types[t.0 as usize] {
             TypeDef::Ptr(p, a) => Some((p, a)),
             _ => None,
@@ -390,7 +390,7 @@ impl Module {
 
     // ---- constants
 
-    fn constant(&mut self, c: ConstDef) -> Value {
+    pub(super) fn constant(&mut self, c: ConstDef) -> Value {
         if let Some(&id) = self.const_ids.get(&c) {
             return Value::Const(id);
         }
@@ -917,7 +917,7 @@ impl Module {
         w.finish()
     }
 
-    fn is_void(&self, t: Ty) -> bool {
+    pub(super) fn is_void(&self, t: Ty) -> bool {
         matches!(self.types[t.0 as usize], TypeDef::Void)
     }
 
@@ -1135,7 +1135,7 @@ impl Module {
     }
 
     /// `type_of` without interning (writer side; pointer types already exist).
-    fn value_ty(&self, v: Value) -> Ty {
+    pub(super) fn value_ty(&self, v: Value) -> Ty {
         match v {
             Value::Global(g) => self.globals[g as usize].ptr,
             Value::Func(f) => self.type_ids[&TypeDef::Ptr(self.funcs[f as usize].ty, 0)],
@@ -1282,11 +1282,14 @@ impl Module {
     /// integers (DXC's shader-flag rules; `Fma` is flagged by its helper).
     pub fn uses_double_extensions(&self) -> bool {
         let Some(f64) = self.type_ids.get(&TypeDef::Double).copied() else { return false };
-        self.insts.iter().any(|d| match &d.op {
-            Op::Bin(BinOp::UDiv | BinOp::SDiv, ..) => d.ty == f64,
-            Op::Cast(CastOp::FPToUI | CastOp::FPToSI, v, _) => self.value_ty(*v) == f64,
-            Op::Cast(CastOp::UIToFP | CastOp::SIToFP, _, t) => *t == f64,
-            _ => false,
+        self.blocks.iter().flatten().any(|&i| {
+            let d = &self.insts[i as usize];
+            match &d.op {
+                Op::Bin(BinOp::UDiv | BinOp::SDiv, ..) => d.ty == f64,
+                Op::Cast(CastOp::FPToUI | CastOp::FPToSI, v, _) => self.value_ty(*v) == f64,
+                Op::Cast(CastOp::UIToFP | CastOp::SIToFP, _, t) => *t == f64,
+                _ => false,
+            }
         })
     }
     pub fn insts_use_type(&self, t: Ty) -> bool {
@@ -1389,5 +1392,25 @@ impl Module {
     /// [`Module::global_bytes`] under the native 16-bit layout when `native16`.
     pub fn global_bytes_layout(&self, addrspace: u32, native16: bool) -> u64 {
         self.globals.iter().filter(|g| g.addrspace == addrspace).map(|g| self.alloc_size_layout(g.ty, native16)).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uses_double_extensions_ignores_dead_instructions_outside_blocks() {
+        let mut m = Module::new();
+        let i32t = m.i32();
+        let f64t = m.f64();
+        let c = m.const_int(i32t, 7);
+        let _cast = m.cast(CastOp::SIToFP, c, f64t);
+        assert!(m.uses_double_extensions());
+
+        // Remove the instruction from Block(0) while leaving it in `m.insts`.
+        m.blocks[0].clear();
+        m.ret();
+        assert!(!m.uses_double_extensions());
     }
 }
