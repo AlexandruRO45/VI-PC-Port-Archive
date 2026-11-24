@@ -85,6 +85,59 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+## Building and running on Linux
+
+VIctory is a Windows program; on Linux it is cross-compiled for
+`x86_64-pc-windows-msvc` with [cargo-xwin](https://github.com/rust-cross/cargo-xwin)
+and run under Wine with VKD3D-Proton (Direct3D 12) and DXVK (DXGI). A native
+Linux build is not supported. Wine's own D3D12 cannot run the translated
+shaders (it rejects the shader model 6.6 query).
+
+Tools: rustup (it reads `rust-toolchain.toml`), cargo-xwin, clang (for
+`clang-cl`), lld (`lld-link`), llvm (`llvm-lib`) and Wine. On NixOS or with
+Nix, `nix-shell` at the repository root provides them and sets up the
+variables below. Elsewhere, install them from your distribution
+(`cargo install cargo-xwin` for cargo-xwin) and export the variables yourself.
+
+```sh
+nix-shell                                       # or set the variables in shell.nix
+rustup show                                     # installs the pinned toolchain and target
+cargo xwin build --release --target x86_64-pc-windows-msvc
+```
+
+The first build downloads the MSVC CRT and the Windows SDK; using them
+means accepting Microsoft's license.
+
+A Wine prefix of its own (`shell.nix` uses `~/.local/share/victory-wine`):
+
+```sh
+export WINEPREFIX="$HOME/.local/share/victory-wine"
+wineboot -i
+# Copy the x64 DLLs of a VKD3D-Proton release (d3d12.dll, d3d12core.dll) and
+# a DXVK release (dxgi.dll, d3d11.dll, d3d10core.dll) into
+# "$WINEPREFIX/drive_c/windows/system32", then prefer them over Wine's:
+export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3d11,d3d10core=n"
+```
+
+Run the title:
+
+```sh
+wine target/x86_64-pc-windows-msvc/release/victory.exe run "<game dir>/<the title's exe>" --execute
+```
+
+Tests run under Wine too
+(`cargo xwin test --workspace --target x86_64-pc-windows-msvc` with
+`CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=wine`). Under Wine these fail
+for reasons of the environment: `load_probe` and the policy test (they
+start `cargo` and `git` from inside Wine), and `stub_pipeline_is_created`
+(VKD3D-Proton does not check DXIL hashes); run `cargo xtask policy`
+natively. Three GPU tests also fail under VKD3D-Proton and are not yet
+explained: `buffer_data_reaches_the_host_texture`, `argument_clamp_builds`
+and `a_rejected_blob_gives_an_empty_library`.
+
+Tested on NixOS with Wine 11.21, VKD3D-Proton 3.0.1, DXVK 3.1.1 and an
+NVIDIA RTX 5060 Ti: the title starts and renders its first screens.
+
 ## Commands
 
 ```
