@@ -799,7 +799,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod library_tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 
@@ -880,7 +880,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod blend_tests {
     use super::*;
 
     fn targets(formats: &[DXGI_FORMAT]) -> D3D12_RT_FORMAT_ARRAY {
