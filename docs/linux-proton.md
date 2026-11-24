@@ -25,6 +25,21 @@ cargo test --workspace          # needs no game data
 cargo xtask install-hooks       # asset-policy check on every commit
 ```
 
+## Tools on Linux vs running the title
+
+The `victory` subcommands that only read files (`inspect`, `census`,
+`lib-exports`, `shader-info`, `translate`, `config`) do CPU work and need no
+Windows API, so they can build as a native Linux ELF once the workspace
+builds on Linux (the E0425 fix and Linux gates in
+[#112](https://github.com/Marvisak/VIctory/pull/112), tracking
+[#90](https://github.com/Marvisak/VIctory/issues/90)). In a local test of
+that approach, not merged anywhere, the workspace tests passed on Linux and
+`translate` ran on the host without Wine.
+
+`victory run` is different: running the title needs D3D12 and the rest of
+the Windows runtime, so it stays the cross-built `victory.exe` under
+Proton, as described below. A Linux build of the tools does not change that.
+
 ## Cross-building victory.exe
 
 Needs the pinned toolchain with the `x86_64-pc-windows-msvc` target, LLVM
