@@ -3063,3 +3063,141 @@ fn bytes_no_directory_points_at_do_not_change_what_is_read() {
     d[at(TLS_CALLBACKS) + 24..at(SECTION_RVA + SECTION_SIZE)].fill(0xEE);
     assert_eq!(parsed(&d), before);
 }
+
+/// Two CodeView debug entries at 0x1280: the first points at a record with
+/// signature `first_sig` at 0x1360, the second at the `add_codeview` record
+/// (age 0x2A). The first record has age 0x07 and path `a.pdb`.
+fn with_two_codeview_entries(first_sig: &[u8; 4]) -> Vec<u8> {
+    const ENTRIES: u32 = 0x1280;
+    const FIRST: u32 = 0x1360;
+    let mut d = image();
+    add_codeview(&mut d, b"RSDS");
+    let second = d[at(DEBUG_DIRECTORY)..at(DEBUG_DIRECTORY) + 28].to_vec();
+    put_bytes(&mut d, ENTRIES, &second);
+    put32(&mut d, at(ENTRIES) + 20, FIRST);
+    put32(&mut d, at(ENTRIES) + 24, at(FIRST) as u32);
+    put_bytes(&mut d, ENTRIES + 28, &second);
+    put_bytes(&mut d, FIRST, first_sig);
+    put_bytes(&mut d, FIRST + 4, &[0xAB; 16]);
+    put32(&mut d, at(FIRST) + 20, 0x07);
+    put_bytes(&mut d, FIRST + 24, b"a.pdb\0");
+    set_directory(&mut d, DIR_DEBUG, ENTRIES, 56);
+    d
+}
+
+#[test]
+fn a_codeview_record_that_is_not_rsds_is_skipped_for_a_later_one() {
+    // An old NB10 record ahead of an RSDS one does not hide it.
+    let cv = ImageInfo::parse(&with_two_codeview_entries(b"NB10"))
+        .unwrap()
+        .codeview
+        .unwrap();
+    assert_eq!((cv.pdb_path.as_str(), cv.age), ("t.pdb", 0x2A));
+}
+
+#[test]
+fn the_first_rsds_record_is_the_one_reported() {
+    let cv = ImageInfo::parse(&with_two_codeview_entries(b"RSDS"))
+        .unwrap()
+        .codeview
+        .unwrap();
+    assert_eq!((cv.pdb_path.as_str(), cv.age), ("a.pdb", 0x07));
+    assert_eq!(cv.guid, [0xAB; 16]);
+    assert_eq!(cv.symbol_key(), format!("{}7", "AB".repeat(16)));
+}
+
+#[test]
+fn a_codeview_record_too_short_for_its_header_is_malformed() {
+    // The signature, GUID and age must all fit in the entry's SizeOfData;
+    // the bytes after it in the file do not count.
+    let mut d = image();
+    add_codeview(&mut d, b"RSDS");
+    for size in [0, 3, 4, 4 + 15, 4 + 16, 4 + 16 + 3] {
+        put32(&mut d, at(DEBUG_DIRECTORY) + 16, size);
+        assert!(
+            matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))),
+            "record of {size} bytes: {:?}",
+            ImageInfo::parse(&d).map(|i| i.codeview)
+        );
+    }
+}
+
+#[test]
+fn a_non_codeview_record_too_short_for_anything_is_not_read() {
+    // Only CodeView entries have their record read; a one-byte POGO entry
+    // pointing past the end of the file is skipped.
+    let mut d = image();
+    add_codeview(&mut d, b"RSDS");
+    let before = parsed(&d);
+    let codeview_entry = d[at(DEBUG_DIRECTORY)..at(DEBUG_DIRECTORY) + 28].to_vec();
+    put32(&mut d, at(0x1280) + 12, 13); // IMAGE_DEBUG_TYPE_POGO
+    put32(&mut d, at(0x1280) + 16, 1);
+    put32(&mut d, at(0x1280) + 24, u32::MAX);
+    put_bytes(&mut d, 0x1280 + 28, &codeview_entry);
+    set_directory(&mut d, DIR_DEBUG, 0x1280, 56);
+    assert_eq!(parsed(&d), before);
+}
+
+#[test]
+fn optional_header_fields_image_info_does_not_keep_are_not_read() {
+    // Linker version, code and data sizes, base of code, the OS, image and
+    // subsystem versions, Win32VersionValue, the checksum, the heap sizes
+    // and the loader flags.
+    let before = parsed(&image());
+    let mut d = image();
+    d[OPT + 2] = 0xFF;
+    d[OPT + 3] = 0xFF;
+    for field in [4, 8, 12, 20, 52, 64, 104] {
+        put32(&mut d, OPT + field, u32::MAX);
+    }
+    for field in [40, 42, 44, 46, 48, 50] {
+        put16(&mut d, OPT + field, u16::MAX);
+    }
+    put64(&mut d, OPT + 88, u64::MAX);
+    put64(&mut d, OPT + 96, u64::MAX);
+    assert_eq!(parsed(&d), before);
+}
+
+#[test]
+fn a_broken_coff_symbol_table_does_not_stop_the_parse() {
+    // PE images deprecate the COFF symbol table: a pointer past the file
+    // and a huge symbol count are ignored.
+    let before = parsed(&image());
+    let mut d = image();
+    put32(&mut d, 0x4C, u32::MAX - 8); // PointerToSymbolTable
+    put32(&mut d, 0x50, u32::MAX); // NumberOfSymbols
+    assert_eq!(parsed(&d), before);
+}
+
+#[test]
+fn dos_header_fields_besides_the_magic_and_e_lfanew_are_not_read() {
+    let before = parsed(&image());
+    let mut d = image();
+    d[2..layout::DOS_E_LFANEW].fill(0xFF);
+    assert_eq!(parsed(&d), before);
+}
+
+#[test]
+fn section_relocation_and_line_number_fields_are_not_read() {
+    // PointerToRelocations, PointerToLinenumbers and their counts belong
+    // to object files; in an image they are ignored.
+    let before = parsed(&image());
+    let mut d = image();
+    let sec = OPT + 240;
+    put32(&mut d, sec + 24, u32::MAX);
+    put32(&mut d, sec + 28, u32::MAX);
+    put16(&mut d, sec + 32, u16::MAX);
+    put16(&mut d, sec + 34, u16::MAX);
+    assert_eq!(parsed(&d), before);
+}
+
+#[test]
+fn import_descriptor_timestamp_and_forwarder_chain_are_not_read() {
+    // With a name table present, a bound timestamp of -1 and any forwarder
+    // chain leave the names, the IAT slots and the module unchanged.
+    let before = parsed(&image());
+    let mut d = image();
+    put32(&mut d, at(IMPORT_DESCRIPTORS) + 4, u32::MAX);
+    put32(&mut d, at(IMPORT_DESCRIPTORS) + 8, 0x1234_5678);
+    assert_eq!(parsed(&d), before);
+}
