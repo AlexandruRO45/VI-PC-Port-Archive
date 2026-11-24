@@ -239,13 +239,21 @@ static BACKING: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// the texture pages there follow it before the title's next submit (`before_execute`).
 pub fn title_memory_changed(a: usize, n: usize) {
     if n > 0 {
-        BACKING.lock().unwrap().push((a, n));
+        // a CPU view's change is its GPU view's too
+        let gpu = crate::hle::kernelx::mirrors::gpu_of(a);
+        let mut b = BACKING.lock().unwrap();
+        b.push((a, n));
+        if let Some(g) = gpu {
+            b.push((g, n));
+        }
     }
 }
 
 /// Whether the title has memory at the 64 KiB page `a`: committed, a physical page mapped there,
-/// or one mapped and not touched yet (`lazy`).
+/// or one mapped and not touched yet (`lazy`). In a GPU view of the title's CPU memory
+/// (`kernelx::mirrors`) that is the memory of the CPU view behind it.
 fn title_backed(a: usize) -> bool {
+    let a = crate::hle::kernelx::mirrors::source(a).unwrap_or(a);
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let committed = unsafe { VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
