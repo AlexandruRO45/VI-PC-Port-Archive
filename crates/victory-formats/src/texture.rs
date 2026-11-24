@@ -1458,4 +1458,122 @@ mod tests {
             }
         }
     }
+
+    /// For random addressable layouts (every addressable mode, dimension,
+    /// element size, block size, mip count and array size), tiling one
+    /// subresource writes exactly that subresource's elements, each where
+    /// [`Layout::offset`] says, and nothing else; detiling reads exactly
+    /// those bytes back and leaves the linear padding alone. Mips stay
+    /// padded to whole elements, and mips outside the tail sit block
+    /// aligned, apart from each other, inside their slice.
+    #[test]
+    fn random_copies_touch_exactly_their_subresource() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let modes = [0, 1, 2, 5, 6, 9, 10];
+        let mut checked = 0;
+        while checked < 300 {
+            let dimension =
+                [Dimension::Tex1d, Dimension::Tex2d, Dimension::Tex3d][(next() % 3) as usize];
+            let width = 1 + (next() % 150) as u32;
+            let height = if dimension == Dimension::Tex1d {
+                1
+            } else {
+                1 + (next() % 150) as u32
+            };
+            let depth = 1 + (next() % 12) as u32;
+            let mips = 1 + (next() % 9) as u32;
+            let d = Desc {
+                dimension,
+                width,
+                height,
+                depth,
+                mips,
+                element_bytes: 1 << (next() % 5),
+                block: [1, 1, 4][(next() % 3) as usize],
+                samples: 1,
+                swizzle: Swizzle(modes[(next() % modes.len() as u64) as usize]),
+            };
+            let Ok(l) = Layout::new(&d) else { continue };
+            if l.size > 1 << 21 {
+                continue;
+            }
+            checked += 1;
+            assert!(l.addressable(), "{d:?}");
+            let three_d = d.dimension == Dimension::Tex3d;
+            let mut placed: Vec<(u64, u64)> = vec![];
+            for (i, m) in l.mips.iter().enumerate() {
+                assert!(m.pitch >= m.width && m.rows >= m.height, "{d:?} mip {i}");
+                assert_eq!(
+                    m.tail.is_some(),
+                    i as u32 >= l.first_tail_mip,
+                    "{d:?} mip {i}"
+                );
+                if m.tail.is_none() && d.swizzle != Swizzle::LINEAR {
+                    assert_eq!(m.offset % l.alignment, 0, "{d:?} mip {i}");
+                }
+                if m.tail.is_none() {
+                    let bytes = u64::from(m.pitch)
+                        * u64::from(m.rows)
+                        * u64::from(if l.thick { l.block[2] } else { 1 })
+                        * u64::from(d.element_bytes);
+                    placed.push((m.offset, bytes));
+                }
+            }
+            if d.swizzle != Swizzle::LINEAR {
+                placed.sort_unstable();
+                for w in placed.windows(2) {
+                    assert!(w[0].0 + w[0].1 <= w[1].0, "{d:?} mips overlap: {placed:?}");
+                }
+                if let Some(&(offset, bytes)) = placed.last() {
+                    assert!(offset + bytes <= l.slice_size, "{d:?} past its slice");
+                }
+            }
+            let n = d.element_bytes as usize;
+            let mip = (next() % u64::from(d.mips)) as u32;
+            let m = l.mips[mip as usize];
+            let slice = if three_d {
+                0
+            } else {
+                (next() % u64::from(d.depth)) as u32
+            };
+            let row = m.width as usize * n + (next() % 9) as usize;
+            let plane = row * m.height as usize + (next() % 9) as usize;
+            let linear: Vec<u8> = (0..plane * m.depth as usize)
+                .map(|_| (next() % 255) as u8 + 1)
+                .collect();
+            let mut tiled = vec![0u8; l.size as usize];
+            l.tile(&mut tiled, mip, slice, &linear, row, plane).unwrap();
+            let mut expect = vec![0u8; tiled.len()];
+            for z in 0..m.depth {
+                for y in 0..m.height {
+                    for x in 0..m.width {
+                        let at = l.offset(mip, x, y, slice + z).unwrap() as usize;
+                        let from = z as usize * plane + y as usize * row + x as usize * n;
+                        expect[at..at + n].copy_from_slice(&linear[from..from + n]);
+                    }
+                }
+            }
+            assert!(
+                tiled == expect,
+                "{d:?} mip {mip} slice {slice}: tile wrote elsewhere"
+            );
+            let mut back = vec![0u8; linear.len()];
+            l.detile(&tiled, mip, slice, &mut back, row, plane).unwrap();
+            for (i, (&b, &a)) in back.iter().zip(&linear).enumerate() {
+                let (z, rest) = (i / plane, i % plane);
+                let inside = rest / row < m.height as usize && rest % row < m.width as usize * n;
+                assert_eq!(
+                    b,
+                    if inside { a } else { 0 },
+                    "{d:?} mip {mip} byte {i} (slice {z})"
+                );
+            }
+        }
+    }
 }
