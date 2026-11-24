@@ -2953,7 +2953,15 @@ impl<'a> Lower<'a> {
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
         // host waves know every lane runs that block.
         let made = self.def_block.get(&lo).copied();
-        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
+        // Two host waves of one console wave learn "all of them" only where
+        // both halves are there (`exchange`). A host wave that is the console
+        // wave needs no such promise: a ballot in the block that writes the
+        // mask sees exactly the lanes the console's compare wrote, the ones
+        // outside this block included.
+        let whole = match self.exchange {
+            Some(_) => !self.local && made.is_none_or(|b| self.all_lanes(b)),
+            None => made.is_some(),
+        };
         if !self.x.st.active.contains(&lo) && !whole {
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
