@@ -718,8 +718,9 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         let mut transient = Vec::new();
+        let mut page_table_pins = std::collections::HashMap::new();
         for list in runs {
-            let uploads = list.run_deferred(self, &mut batch);
+            let uploads = list.run_deferred(self, &mut batch, &mut page_table_pins);
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
@@ -870,6 +871,7 @@ impl Host {
         }
         // Only the successful fence path releases the old references.
         drop(transient);
+        drop(page_table_pins);
         self.retired.finish();
         self.log_messages();
         // A listed frame: what this submission's lists drew, as it is now
@@ -1627,7 +1629,7 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, host: &Host, batch: &mut Batch) -> Vec<TextureUpload> {
+    fn run_deferred(&self, host: &Host, batch: &mut Batch, pins: &mut PageTablePins) -> Vec<TextureUpload> {
         let mut uploads = Vec::new();
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
@@ -1706,7 +1708,11 @@ impl HostList {
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    let copies = pins.entry(heap).or_insert_with(|| crate::memory::pin(heap));
+                    for copy in copies {
+                        let (at, len) = copy.range();
+                        batch.add(copy, at as usize, len as usize);
+                    }
                     continue;
                 }
             };
@@ -1717,6 +1723,7 @@ impl HostList {
     }
 }
 
+type PageTablePins = std::collections::HashMap<usize, Vec<std::sync::Arc<crate::shadow::Shadow>>>;
 type TextureUpload = (std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>, ID3D12Resource);
 
 /// A submission's refreshes not done yet, merged per buffer copy into the

@@ -500,6 +500,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             }
         }
     }
+    drop(g);
+    crate::shadow::evict_loose(at, len);
 }
 
 /// The runtime mapped the page at `at` where `others` show it already: the

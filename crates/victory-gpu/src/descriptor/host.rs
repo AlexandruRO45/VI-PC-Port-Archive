@@ -526,9 +526,9 @@ impl HostHeap {
     }
 
     /// Makes slots `index` and `index + 1` (dynamic ones) a raw shader
-    /// resource view and a raw unordered access view of the first `bytes`
-    /// (a multiple of 4) of `buffer`, which they hold; null views for no
-    /// buffer.
+    /// resource view and raw unordered access view. These page-table-only
+    /// slots borrow the buffer: submission pins keep it live until the fence,
+    /// and the table is rebuilt before using a stale slot.
     pub(crate) fn raw_pair_at(&self, index: u32, buffer: Option<&ID3D12Resource>, bytes: u64) {
         let Some(host) = host() else { return };
         // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw);
@@ -565,8 +565,8 @@ impl HostHeap {
             host.device
                 .CreateUnorderedAccessView(buffer, None, Some(&uav), self.cpu(index + 1));
         }
-        self.keep(index, buffer.map(|b| (b.clone(), None)));
-        self.keep(index + 1, buffer.map(|b| (b.clone(), None)));
+        self.keep(index, None);
+        self.keep(index + 1, None);
         self.write_stride(index, 4);
         self.write_stride(index + 1, 4);
     }

@@ -83,7 +83,7 @@ impl Map {
 /// block (block 0 is the null one), and the copy each entry names.
 #[derive(Default)]
 struct Layout {
-    copies: Vec<Arc<Shadow>>,
+    copies: Vec<std::sync::Weak<Shadow>>,
     blocks: Vec<usize>,
     owner: Vec<Option<usize>>,
 }
@@ -272,12 +272,26 @@ impl Shared {
         })
     }
 
+    fn pin(&mut self, heap: &HostHeap) -> Vec<Arc<Shadow>> {
+        let now = crate::shadow::generation();
+        if self.generation == now
+            && let Some(pins) = self.layout.copies.iter().map(std::sync::Weak::upgrade).collect::<Option<Vec<_>>>()
+        {
+            return pins;
+        }
+        // An eviction can race weak upgrades. An actual rewrite takes
+        // strong ownership of the named copies until the submission ends.
+        self.rewrite(heap, now)
+    }
+
     /// Names every host copy there is now (`now`: their generation): view
     /// pairs made for new copies, those of copies gone made null and given
     /// back, the table rewritten. Only while no submission runs (the GPU
     /// reads the table and the views).
-    fn rewrite(&mut self, heap: &HostHeap, now: u64) {
+    fn rewrite(&mut self, heap: &HostHeap, now: u64) -> Vec<Arc<Shadow>> {
         let copies = crate::shadow::all();
+        // `layout.copies` still holds weak identities until the end of the
+        // rewrite, so a dead Arc's address cannot be reused by a new copy.
         let live: HashSet<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
         self.pairs.retain(|copy, &mut slot| {
             let keep = live.contains(copy);
@@ -313,12 +327,13 @@ impl Shared {
         unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len()) };
         tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
         self.layout = Arc::new(Layout {
-            copies: named,
+            copies: named.iter().map(Arc::downgrade).collect(),
             blocks,
             owner,
         });
         self.generation = now;
         stats(|s| s.tables += 1);
+        named
     }
 }
 
@@ -332,26 +347,16 @@ fn layout(key: usize) -> Arc<Layout> {
         .unwrap_or_default()
 }
 
-/// At submission, for a list using title memory with view heap `key`
-/// bound: the heap's page table names every host copy there is, each
-/// brought up to date (`add` takes a copy's range, once per submission
-/// until a step writes title memory).
-pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    let layout = with_heap(key, |heap| {
+/// Fix the descriptor table's identity and pin its copies until copy-back.
+/// Call only once per heap per submission; a rewrite must not invalidate the
+/// table used by an earlier list of the same submission.
+pub(crate) fn pin(key: usize) -> Vec<Arc<Shadow>> {
+    with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
         let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
-        let now = crate::shadow::generation();
-        if s.generation != now {
-            s.rewrite(heap, now);
-        }
-        Some(s.layout.clone())
-    })
-    .flatten();
-    for c in layout.iter().flat_map(|l| &l.copies) {
-        let (start, len) = c.range();
-        add(c, start as usize, len as usize);
-    }
+        Some(s.pin(heap))
+    }).flatten().unwrap_or_default()
 }
 
 /// `list` uses title memory with view heap `key` bound: the heap's page
@@ -437,10 +442,11 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let withheld = if pages + regions > 0 { writes.len() as u64 } else { 0 };
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
-            let n = copies[k].copy_back_page(at as usize);
+            let Some(copy) = copies[k].upgrade() else { continue };
+            let n = copy.copy_back_page(at as usize);
             tracing::debug!(
                 page = format_args!("{at:#x}"),
-                copy = format_args!("{:#x?}", copies[k].range()),
+                copy = format_args!("{:#x?}", copy.range()),
                 bytes = n,
                 "title memory page written back"
             );
@@ -465,6 +471,34 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_loose_copy_is_pinned_then_replaced_after_invalidation() {
+        const ADDRESS: u64 = 0x77_4400_0000;
+        let heap = HostHeap::new(false, 8).expect("host heap");
+        let mut shared = Shared::new(&heap).expect("page table");
+        let window = crate::shadow::find(ADDRESS, 64).unwrap();
+        let weak = Arc::downgrade(&window);
+        let before = crate::shadow::generation();
+        let pins = shared.pin(&heap);
+        let id = Arc::as_ptr(&window) as usize;
+        assert!(shared.pairs.contains_key(&id));
+        drop(window);
+        crate::shadow::evict_loose(ADDRESS as usize, 64);
+        assert!(weak.upgrade().is_some(), "submission pins outlive invalidation");
+        assert_ne!(crate::shadow::generation(), before);
+        assert!(pins.iter().any(|s| Arc::as_ptr(s) as usize == id));
+        drop(pins);
+        assert!(weak.upgrade().is_none(), "metadata is not a strong owner");
+        let replacement = crate::shadow::find(ADDRESS, 64).unwrap();
+        let id2 = Arc::as_ptr(&replacement) as usize;
+        assert_ne!(id, id2);
+        let pins = shared.pin(&heap);
+        assert!(!shared.pairs.contains_key(&id));
+        assert!(shared.pairs.contains_key(&id2));
+        assert!(pins.iter().any(|s| Arc::ptr_eq(s, &replacement)));
+        crate::shadow::evict_loose(ADDRESS as usize, 64);
+    }
 
     /// The shader's lookup (`victory_shader` lowering) over a table's
     /// dwords: the view index and the byte offset in that view.
