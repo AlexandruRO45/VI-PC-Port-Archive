@@ -1,7 +1,7 @@
-//! DualSense (PlayStation 5) pads over HID.
+//! DualSense and DualShock 4 (PlayStation) pads over HID.
 //!
-//! The console reports gamepads through GameInput; on a PC a DualSense is not
-//! an XInput device, so the title never sees it. This reads the pad's HID
+//! The console reports gamepads through GameInput; on a PC these are not
+//! XInput devices, so the title never sees them. This reads the pad's HID
 //! reports and exposes the same state shape the XInput source does.
 //!
 //! The reports differ between USB (64 bytes) and Bluetooth (78 bytes, and a
@@ -50,10 +50,20 @@ const RIGHT_SHOULDER: u32 = 0x800;
 const LEFT_STICK: u32 = 0x1000;
 const RIGHT_STICK: u32 = 0x2000;
 
-/// Sony's vendor id and the DualSense / DualSense Edge product ids.
+/// Sony's vendor id and the DualSense, DualSense Edge, and DualShock 4
+/// product ids (the last is the DualShock 4 USB wireless adaptor).
 const SONY: u16 = 0x054c;
 const DUALSENSE: u16 = 0x0ce6;
 const DUALSENSE_EDGE: u16 = 0x0df2;
+const DUALSHOCK4: [u16; 3] = [0x05c4, 0x09cc, 0x0ba0];
+
+/// Whether a HID device is a PlayStation pad this module reads. The DualShock
+/// 4's descriptor declares the same usages as the DualSense's (X/Y/Z/Rz sticks,
+/// Rx/Ry triggers, hat, buttons 1-14 in the same order), so it reads the same.
+fn is_playstation_pad(vendor: u16, product: u16) -> bool {
+    vendor == SONY
+        && (product == DUALSENSE || product == DUALSENSE_EDGE || DUALSHOCK4.contains(&product))
+}
 
 const GENERIC_READ: u32 = 0x8000_0000;
 
@@ -76,7 +86,7 @@ static START: Once = Once::new();
 pub fn latest() -> Option<Reading> {
     START.call_once(|| {
         let _ = std::thread::Builder::new()
-            .name("dualsense".into())
+            .name("playstation-pad".into())
             .spawn(reader);
     });
     *READING.lock().unwrap_or_else(|e| e.into_inner())
@@ -143,7 +153,7 @@ fn read_reports(pad: &Pad) {
                 left = format_args!("{:.2},{:.2}", reading.left_x, reading.left_y),
                 right = format_args!("{:.2},{:.2}", reading.right_x, reading.right_y),
                 triggers = format_args!("{:.2},{:.2}", reading.left_trigger, reading.right_trigger),
-                "DualSense report"
+                "PlayStation pad report"
             );
         }
         last = Some(reading);
@@ -151,7 +161,7 @@ fn read_reports(pad: &Pad) {
     }
 }
 
-/// Opens the first DualSense and keeps its HID description.
+/// Opens the first PlayStation pad and keeps its HID description.
 fn open_pad() -> Option<Pad> {
     for path in device_paths() {
         // SAFETY: a path from SetupAPI, opened for reading only.
@@ -175,8 +185,7 @@ fn open_pad() -> Option<Pad> {
         // SAFETY: a live HID handle and room for the attributes.
         let known = unsafe { HidD_GetAttributes(handle, &mut attributes) };
         if known
-            && attributes.VendorID == SONY
-            && (attributes.ProductID == DUALSENSE || attributes.ProductID == DUALSENSE_EDGE)
+            && is_playstation_pad(attributes.VendorID, attributes.ProductID)
         {
             let mut preparsed: isize = 0;
             // SAFETY: a live HID handle and room for the pointer.
@@ -197,7 +206,7 @@ fn open_pad() -> Option<Pad> {
             tracing::info!(
                 product = format_args!("{:#06x}", attributes.ProductID),
                 report = input_len,
-                "DualSense connected over HID"
+                "PlayStation pad connected over HID"
             );
             return Some(Pad {
                 handle,
@@ -478,6 +487,15 @@ mod tests {
         assert!(!input_report(&[]));
     }
 
+    #[test]
+    fn playstation_pad_product_ids_are_recognised() {
+        for product in [DUALSENSE, DUALSENSE_EDGE, 0x05c4, 0x09cc, 0x0ba0] {
+            assert!(is_playstation_pad(SONY, product), "{product:#06x}");
+        }
+        assert!(!is_playstation_pad(0x045e, 0x02ea)); // an Xbox pad
+        assert!(!is_playstation_pad(SONY, 0x0ce7)); // another Sony device
+    }
+
     /// Not part of the suite: prints what the HID scan sees on this machine.
     /// `cargo test -p victory-hle --lib dualsense -- --ignored --nocapture`
     #[test]
@@ -489,8 +507,8 @@ mod tests {
             println!("  {}", String::from_utf16_lossy(path));
         }
         match open_pad() {
-            Some(pad) => println!("opened a DualSense: report length {}", pad.input_len),
-            None => println!("no DualSense opened"),
+            Some(pad) => println!("opened a PlayStation pad: report length {}", pad.input_len),
+            None => println!("no PlayStation pad opened"),
         }
     }
 }
