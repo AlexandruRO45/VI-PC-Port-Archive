@@ -2262,3 +2262,123 @@ fn import_symbols_compare_on_every_field_but_display_without_the_hint() {
     let shown: Vec<_> = set.iter().map(ToString::to_string).collect();
     assert_eq!(shown, ["Z", "A", "#1", "#3"]);
 }
+
+#[test]
+fn errors_name_their_kind_and_what_went_wrong() {
+    let message = |d: &[u8]| ImageInfo::parse(d).unwrap_err().to_string();
+
+    let mut d = image();
+    put16(&mut d, 0x44, 0xAA64);
+    assert_eq!(
+        message(&d),
+        "unsupported image: machine 0xaa64 is not AMD64"
+    );
+
+    let mut d = image();
+    put32(&mut d, at(IMPORT_DESCRIPTORS) + 16, SIZE_OF_IMAGE - 8);
+    assert_eq!(
+        message(&d),
+        format!(
+            "malformed image: IAT at {:#x} runs outside the image",
+            SIZE_OF_IMAGE - 8
+        )
+    );
+
+    let mut d = image();
+    put64(&mut d, at(TLS_CALLBACKS) + 8, IMAGE_BASE - 0x1000);
+    assert_eq!(
+        message(&d),
+        format!(
+            "malformed image: VA 0x{:x} is outside the image",
+            IMAGE_BASE - 0x1000
+        )
+    );
+
+    let mut d = image();
+    set_directory(&mut d, DIR_TLS, SECTION_RVA + SECTION_SIZE + 0x100, 40);
+    assert_eq!(
+        message(&d),
+        "malformed image: TLS directory outside of sections"
+    );
+
+    let mut d = image();
+    put64(
+        &mut d,
+        at(TLS_DIRECTORY) + layout::TLS64_ADDRESS_OF_CALLBACKS,
+        IMAGE_BASE + u64::from(SECTION_RVA + SECTION_SIZE + 0x100),
+    );
+    assert_eq!(
+        message(&d),
+        "malformed image: TLS callback array outside of sections"
+    );
+
+    // Errors from `object` keep its own text behind the same prefix.
+    let mut d = image();
+    d[0x40] = b'X';
+    assert!(
+        message(&d).starts_with("malformed image: "),
+        "{}",
+        message(&d)
+    );
+    // Too short to tell what kind of file it is: malformed, not unsupported.
+    assert!(
+        message(b"").starts_with("malformed image: "),
+        "{}",
+        message(b"")
+    );
+    // A 32-bit optional header is named by the kind found.
+    let mut d = image();
+    put16(&mut d, OPT, 0x10B);
+    assert_eq!(message(&d), "unsupported image: expected PE32+, found Pe32");
+}
+
+#[test]
+fn the_callback_pointer_read_through_layout_is_the_one_reported() {
+    let d = image();
+    let info = ImageInfo::parse(&d).unwrap();
+    let tls = info.tls.as_ref().unwrap();
+    let entry = layout::data_directory_offset(&d, DIR_TLS).unwrap();
+    let directory_rva = layout::read_u32(&d, entry).unwrap();
+    assert_eq!(directory_rva, tls.directory_rva);
+    let directory = info.rva_to_file_offset(directory_rva).unwrap() as usize;
+    let field = directory + layout::TLS64_ADDRESS_OF_CALLBACKS;
+    assert_eq!(layout::read_u64(&d, field), Some(tls.callbacks_va));
+    // Each callback slot is a 64-bit VA at the preferred base.
+    let array = info
+        .rva_to_file_offset(u32::try_from(tls.callbacks_va - info.image_base).unwrap())
+        .unwrap() as usize;
+    for (i, &rva) in tls.callback_rvas.iter().enumerate() {
+        assert_eq!(
+            layout::read_u64(&d, array + i * 8),
+            Some(info.image_base + u64::from(rva))
+        );
+    }
+    assert_eq!(
+        layout::read_u64(&d, array + tls.callback_rvas.len() * 8),
+        Some(0)
+    );
+}
+
+#[test]
+fn forwarders_by_ordinal_cover_the_whole_16_bit_range() {
+    for (forward, kept) in [
+        (&b"NTDLL.#0\0"[..], "NTDLL.#0"),
+        (b"NTDLL.#1\0", "NTDLL.#1"),
+        (b"NTDLL.#65535\0", "NTDLL.#65535"),
+        // A forwarder by ordinal is re-rendered, so leading zeros go.
+        (b"NTDLL.#007\0", "NTDLL.#7"),
+    ] {
+        let info = ImageInfo::parse(&with_forwarder(forward)).unwrap();
+        let fwd = info.exports.iter().find(|e| e.ordinal == 2).unwrap();
+        assert_eq!(
+            (fwd.rva, fwd.forward.as_deref()),
+            (None, Some(kept)),
+            "{}",
+            String::from_utf8_lossy(forward)
+        );
+    }
+    assert!(matches!(
+        ImageInfo::parse(&with_forwarder(b"NTDLL.#65536\0")),
+        Err(PeError::Malformed(_))
+    ));
+}
