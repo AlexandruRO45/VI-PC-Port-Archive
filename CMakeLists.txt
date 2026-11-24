@@ -2490,12 +2490,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_trap COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/trap.py"
         check "$<TARGET_FILE:cpu_trap_harness>" "$<TARGET_FILE:cpu_trap>" "$<TARGET_FILE:cpu_trap_lifted>"
         ${trap_controls} "${trap_o2}")
-    # The opt-in host-MXCSR profile: the lifted DLL, the noload and fixed controls that must break a rule, and
+    # The opt-in host-MXCSR profile, legacy and VEX forms: the lifted DLL, the controls that must break a rule, and
     # an /O2 build of the translation.
     cpu_asm_fixture(cpu_mxcsr_harness mxcsr_harness)
     cpu_asm_fixture(cpu_mxcsr mxcsr)
     set(mxcsr_controls)
-    foreach(variant IN ITEMS lifted noload fixed)
+    foreach(variant IN ITEMS lifted noload fixed vexnoload vexfixed vexunmasked mixvldload mixvstread mixvstentry mixvldrestore)
         set(mxcsr_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_mxcsr_${variant}.cpp")
         add_custom_command(OUTPUT "${mxcsr_fixture}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr.py"
@@ -2516,6 +2516,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_mxcsr COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr.py"
         check "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_mxcsr>" "$<TARGET_FILE:cpu_mxcsr_lifted>"
         ${mxcsr_controls} "${mxcsr_o2}")
+    # The native VEX exports against their translation; capability skip 77 on a host without AVX.
+    add_test(NAME cpu_aot_mxcsr_vex_native COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr.py"
+        check-avx "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_mxcsr>" "$<TARGET_FILE:cpu_mxcsr_lifted>")
+    set_tests_properties(cpu_aot_mxcsr_vex_native PROPERTIES SKIP_RETURN_CODE 77)
     # FTZ and DAZ in the profile's denormals opt-in: the lifted DLL, the sim variant that must keep every rule,
     # the noftz, nodaz and nomask controls that must break one, and an /O2 build of the translation.
     cpu_asm_fixture(cpu_mxcsr_denormals mxcsr_denormals)

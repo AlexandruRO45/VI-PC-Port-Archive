@@ -347,7 +347,7 @@ def string_op(i):
     return f"{{ const word step = direction ? 0ull - {size}ull : {size}ull; {body} }}"
 
 
-# The host-MXCSR profile's refusal statuses: a requested word with a reserved bit (16-31), with one of the six
+# The host-MXCSR profile's refusal statuses (the same for the legacy and VEX encodings): a requested word with a reserved bit (16-31), with one of the six
 # exception masks (bits 7-12) clear, or with FTZ (bit 15) or DAZ (bit 6), which the first profile leaves out.
 MXCSR_STATUS = {"reserved": 1, "unmasked": 2, "unsupported": 3}
 # A file that lowers with the host-MXCSR profile observes the floating-point environment.
@@ -948,16 +948,17 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         elif i.code == C.UD2:
             # UD2 (0F 0B) raises the host's STATUS_ILLEGAL_INSTRUCTION; UD0 and UD1 stay refused.
             stmt = "__ud2();"
-        elif op == M.LDMXCSR and host_mxcsr is not None and i.op0_kind == K.MEMORY:
+        elif op in (M.LDMXCSR, M.VLDMXCSR) and host_mxcsr is not None and i.op0_kind == K.MEMORY:
             # The opt-in host-MXCSR profile: the requested word is checked before it reaches the host register,
-            # so a refused word changes nothing and no later guest instruction runs.
+            # so a refused word changes nothing and no later guest instruction runs. VLDMXCSR is the same
+            # operation; the decoder already rejects VEX.L = 1, vvvv other than 1111 and a non-zero pp.
             stmt = (f"{{ const uint32_t want = {guest('uint32_t')}; "
                     f"if (want & 0xffff0000u) {host_mxcsr.leave('reserved')} "
                     f"if ((want & 0x1f80u) != 0x1f80u) {host_mxcsr.leave('unmasked')} "
                     f"if (want & {'~mxcsr_mask' if host_mxcsr.denormals else '0x8040u'}) "
                     f"{host_mxcsr.leave('unsupported')} "
                     f"_mm_setcsr(want); }}")
-        elif op == M.STMXCSR and host_mxcsr is not None and i.op0_kind == K.MEMORY:
+        elif op in (M.STMXCSR, M.VSTMXCSR) and host_mxcsr is not None and i.op0_kind == K.MEMORY:
             stmt = f"store<uint32_t>({address()}, _mm_getcsr());"
         elif op == M.XGETBV and host_cpu:
             # The host's extended control register ECX into EDX:EAX, flags kept. Any ECX is passed through, but

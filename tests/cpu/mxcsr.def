@@ -4,3 +4,13 @@ EXPORTS
     mxcsr_after
     mxcsr_badload
     mxcsr_fault
+    mxcsr_vex_round
+    mxcsr_mix_lv
+    mxcsr_mix_vl
+    mxcsr_vex_leak
+    mxcsr_vex_after
+    mxcsr_vex_badload
+    mxcsr_bad_vld_l1
+    mxcsr_bad_vld_vvvv
+    mxcsr_bad_vst_l1
+    mxcsr_bad_vst_vvvv
