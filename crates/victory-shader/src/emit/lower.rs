@@ -168,6 +168,10 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
+    /// Descriptor dwords no HLSL program can read (addresses, formats, meta
+    /// data): at a join with data they are what an undefined path left in
+    /// the register.
+    stale: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
@@ -541,6 +545,7 @@ impl<'a> Lower<'a> {
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
+            stale: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -3240,6 +3245,18 @@ impl<'a> Lower<'a> {
             }
             None => vec![(2, field(self, 0))],
         };
+        // Words HLSL cannot see: `GetDimensions` reads an image's sizes and
+        // levels (dwords 1-4) and a buffer's count (dword 2), and a structured
+        // buffer's stride (dword 1). Addresses (image 0, buffer 0 and 1),
+        // formats (buffer 3) and an image's array pitch and meta data (5-7)
+        // are not. Read as data they are refused, but at a join with data
+        // they are the stale register of a path that leaves the value
+        // undefined (see `fill_phis`).
+        let hidden = |rel: u32| match image {
+            Some(_) => matches!(rel, 0 | 5..=7),
+            None if props.0 & 0xFFF == 12 => matches!(rel, 0 | 3),
+            None => matches!(rel, 0 | 1 | 3),
+        };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
@@ -3247,6 +3264,9 @@ impl<'a> Lower<'a> {
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
                         self.vals.insert(v, Val::Missing(OTHER));
+                        if hidden(rel) {
+                            self.stale.insert(v);
+                        }
                     }
                 }
             }
@@ -7300,6 +7320,13 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            // Whether a reachable path brings data: a stale descriptor dword
+            // on another path is then a value that path left undefined.
+            let data_in = !bit
+                && p.blocks[b].preds.iter().enumerate().any(|(n, &q)| {
+                    self.tail[q].is_some()
+                        && matches!(self.vals.get(&phi.args[n]), Some(Val::I32(_)))
+                });
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
@@ -7328,6 +7355,12 @@ impl<'a> Lower<'a> {
                     // wave's, so a join read some other way would differ from the
                     // console, which `mask_ok` does not see; upgrade if one shows up.
                     (None | Some(Val::Missing(_)), false) if ballot_ok => ballot.unwrap(),
+                    // shortcut: zero for the undefined path, as for an unread
+                    // join below. A program that did read such a word on that
+                    // path would see 0; HLSL has no way to.
+                    (Some(Val::Missing(_)), false) if data_in && self.stale.contains(&arg) => {
+                        self.s.m.i32(0)
+                    }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
                     }
@@ -7721,6 +7754,66 @@ mod tests {
             err.to_string().contains("constant buffer's descriptor read as data"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A raw buffer descriptor at s[8:11], used by `s_buffer_load_dword`,
+    /// whose dword 1 (`s9`, address high bits) `tail` reads as data, either
+    /// directly or (`join`) after a branch on s1 that overwrites s9 with data
+    /// on one path only.
+    fn raw_dword1(join: bool) -> Result<Lowered, crate::ShaderError> {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], null
+        ];
+        if join {
+            words.extend([
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF85_0001, // s_cbranch_scc1 +1 (s9 keeps the descriptor's dword)
+                0xBE89_030C, // s_mov_b32 s9, s12
+            ]);
+        }
+        words.extend([
+            0x870D_C009, // s_and_b32 s13, s9, 64
+            0x7E02_020D, // v_mov_b32 v1, s13
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ]);
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        lower_with(&words, layout, used)
+    }
+
+    #[test]
+    fn a_raw_views_address_read_as_data_is_refused() {
+        let err = raw_dword1(false)
+            .err()
+            .expect("no host value for the address");
+        assert!(
+            err.to_string()
+                .contains("a descriptor's address or format read as data"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_raw_views_address_joined_with_data_is_the_undefined_path() {
+        // HLSL cannot read a raw view's address, so at the join the
+        // descriptor's dword is a register the other path left undefined.
+        raw_dword1(true).unwrap();
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
