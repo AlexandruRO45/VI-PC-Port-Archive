@@ -28,7 +28,7 @@ from project_tuxbox.verify import SUITES, verify, status
 
 def launch_game(args):
     exe = launch_target(args.target.expanduser(), args.app_id)
-    host = Host(args.backend, args.proton, args.prefix)
+    host = Host(args.backend, args.proton, args.prefix, offline=args.offline)
     if args.log_file:
         check_log_path(host.backend, host.env, exe.parent, args.log_file.expanduser().resolve())
     with game_log(exe, args.log_file) as log:
@@ -36,6 +36,8 @@ def launch_game(args):
         log.status(f"Executable: {exe}")
         if host.backend in ("wine", "proton"):
             log.status(f"Prefix: {host.env['WINEPREFIX']}")
+        if host.offline:
+            log.status("Network: offline. The game cannot reach servers or upload crash reports.")
         try:
             if args.prepare_only or (not args.no_shader_prep and os.environ.get("TUXBOX_SHADER_PREP") != "0"
                                      and "-nullrhi" not in (arg.lower() for arg in args.arguments)):
@@ -78,6 +80,8 @@ def main():
                      help="show Vulkan performance metrics and record frame times beside the game log on Linux")
     run.add_argument("--profile-pipelines", action="store_true",
                      help="record vkd3d-proton pipeline creation times and keys beside the game log")
+    run.add_argument("--offline", action="store_true",
+                     help="on Linux, launch without network access so the game cannot upload crash reports")
     preparation = run.add_mutually_exclusive_group()
     preparation.add_argument("--prepare-only", action="store_true", help="prepare supported shader caches and exit")
     preparation.add_argument("--no-shader-prep", action="store_true", help="skip shader preparation for this launch")

@@ -35,14 +35,17 @@ def proton_installation(selection):
 
 
 class Host:
-    def __init__(self, backend, proton, prefix):
+    def __init__(self, backend, proton, prefix, offline=False):
         if platform.machine().lower() not in {"amd64", "x86_64"}:
             raise ValueError("This native CPU baseline requires an x86-64 host")
         self.backend = backend or ("native" if os.name == "nt" else "proton")
         self.env = os.environ.copy()
         self.command = []
         self.version = platform.platform()
+        self.offline = False
         if self.backend == "native":
+            if offline:
+                raise ValueError("--offline requires the Wine or Proton backend on Linux")
             if os.name != "nt" or proton or prefix:
                 raise ValueError("Native execution requires Windows and takes no Proton or prefix arguments")
             return
@@ -72,6 +75,24 @@ class Host:
         prefix.mkdir(parents=True, exist_ok=True)
         self.env["WINEPREFIX"] = str(prefix)
         self.command = [executable]
+        if offline:
+            self.isolate_network()
+
+    def isolate_network(self):
+        # A new network namespace has only a loopback device that is down, so the
+        # game and its crash handler cannot upload minidumps or reach any server.
+        unshare = shutil.which("unshare")
+        if not unshare:
+            raise ValueError("Install util-linux unshare to launch with --offline")
+        wrapper = [unshare, "--user", "--map-current-user", "--net", "--"]
+        probe = subprocess.run([*wrapper, "true"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if probe.returncode:
+            reason = probe.stderr.strip() or f"exit code {probe.returncode}"
+            raise ValueError(f"Cannot create an offline network namespace: {reason}")
+        self.command = [*wrapper, *self.command]
+        # umu-run otherwise tries to update the Steam Runtime before starting.
+        self.env["UMU_RUNTIME_UPDATE"] = "0"
+        self.offline = True
 
     def run(self, executable, arguments, *, timeout=None, capture=False):
         options = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT} if capture else {}

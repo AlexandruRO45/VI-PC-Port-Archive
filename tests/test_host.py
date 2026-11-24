@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -54,6 +55,37 @@ class SelectProton(unittest.TestCase):
             self.assertEqual(configured_target(), str(prefix / "custom"))
             host.backend = "native"
             self.assertIsNone(configured_target())
+
+
+@unittest.skipUnless(sys.platform == "linux", "Network namespaces require Linux")
+class OfflineLaunch(unittest.TestCase):
+    def host(self, probe_code=0, stderr=""):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        probe = subprocess.CompletedProcess([], probe_code, stderr=stderr)
+        with patch("project_tuxbox.host.shutil.which", side_effect=lambda tool: f"/usr/bin/{tool}"), \
+             patch("project_tuxbox.host.subprocess.check_output", return_value="wine-10.0\n"), \
+             patch("project_tuxbox.host.subprocess.run", return_value=probe) as run:
+            host = Host("wine", None, Path(tmp.name), offline=True)
+        return host, run
+
+    def test_wraps_every_launch_in_a_network_namespace(self):
+        host, run = self.host()
+        wrapper = ["/usr/bin/unshare", "--user", "--map-current-user", "--net", "--"]
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], [*wrapper, "true"])
+        self.assertEqual(host.command, [*wrapper, "/usr/bin/wine"])
+        self.assertEqual(host.env["UMU_RUNTIME_UPDATE"], "0")
+        self.assertTrue(host.offline)
+
+    def test_refuses_to_launch_online_when_isolation_fails(self):
+        with self.assertRaisesRegex(ValueError, "Operation not permitted"):
+            self.host(1, "unshare: unshare failed: Operation not permitted\n")
+
+    def test_native_backend_rejects_offline(self):
+        with patch("project_tuxbox.host.platform.machine", return_value="x86_64"), \
+             self.assertRaisesRegex(ValueError, "--offline"):
+            Host("native", None, None, offline=True)
 
 
 class ConsoleConstantBuffers(unittest.TestCase):
