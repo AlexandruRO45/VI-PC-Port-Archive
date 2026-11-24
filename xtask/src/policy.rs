@@ -1822,6 +1822,52 @@ mod tests {
         super::run(&root, false).unwrap();
     }
 
+    /// A TMPDIR is judged by the directory made in it, not by the candidate:
+    /// a rule naming only the temporary directories' own names (`.tmp*`,
+    /// or `.tmp*/`, which matches directories alone) makes them ignored in
+    /// an otherwise visible directory, and they are taken; a negation that
+    /// re-includes those names under an ignored directory makes them seen,
+    /// and they are refused and removed, though the directory holding them
+    /// is ignored.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_judged_by_the_directory_made() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(
+            root.join(".gitignore"),
+            "/reincluded/*\n!/reincluded/.tmp*\n/named/.tmp*\n/dirs/.tmp*/\n",
+        )
+        .unwrap();
+        let reincluded = root.join("reincluded");
+        let named = root.join("named");
+        let dirs = root.join("dirs");
+        for dir in [&reincluded, &named, &dirs] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(dir.join("a.rs"), b"fn a() {}\n").unwrap();
+        }
+        let ignored = super::git_command(root)
+            .args(["check-ignore", "-q", "--", "reincluded/a.rs"])
+            .status()
+            .unwrap();
+        assert_eq!(ignored.code(), Some(0));
+
+        let tmp = tempdir_in_first(root, [reincluded.clone(), named.clone()]);
+        assert_eq!(tmp.path().parent(), Some(named.as_path()));
+        let tmp_dirs = tempdir_in_first(root, [reincluded.clone(), dirs.clone()]);
+        assert_eq!(tmp_dirs.path().parent(), Some(dirs.as_path()));
+        assert_eq!(std::fs::read_dir(&reincluded).unwrap().count(), 1);
+        for dir in [tmp.path(), tmp_dirs.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        assert_eq!(
+            names(root, false),
+            [".gitignore", "dirs/a.rs", "named/a.rs"]
+        );
+        super::run(root, false).unwrap();
+    }
+
     /// A CARGO_TARGET_DIR that is the checkout itself is never passed over,
     /// whatever its tag says: the whole tree would go unchecked. What is
     /// built there is listed, in a repository and outside one, and passing
