@@ -3683,4 +3683,54 @@ mod tests {
             assert_eq!(found[1].span().end, file.len(), "{what}");
         }
     }
+
+    #[test]
+    fn bytes_after_the_final_block_are_never_read() {
+        // A stream ends with the block whose BFINAL bit is set: the rest of
+        // its last byte and every byte after it (up to the size the record
+        // states) are padding and never read, whatever they hold, a reserved
+        // block type, a broken stored header or a marker among them. With
+        // BFINAL clear, the same bits are read as the next block's header
+        // (here all ones: the reserved type 3) and the stream breaks; with
+        // no bytes after it, the stream runs out instead, which is the start
+        // of one that does not unpack. Either way the record covers no
+        // other, so it is yielded with the span its size states, unpacking
+        // only with BFINAL set, and the record after it is found.
+        let block = literal_then_copy(1);
+        assert_eq!(block.len(), 4, "30 bits: two left over in the last byte");
+        let want = b"AAAA".to_vec();
+        let mut marker = MARKER.to_vec();
+        marker.extend_from_slice(&[16, 0, 0, 0, 4, 0, 0, 0]);
+        for (what, tail) in [
+            ("nothing", &[][..]),
+            ("ones", &[0xFF; 8][..]),
+            ("a reserved block", &[0x07, 0, 0, 0][..]),
+            ("a broken stored header", &[1, 4, 0, 4, 0, b'x', b'y'][..]),
+            ("a marker", &marker[..]),
+        ] {
+            for last in [true, false] {
+                let what = format!("BFINAL {last}, then {what}");
+                let mut packed = block.clone();
+                packed[0] = (packed[0] & !1) | u8::from(last);
+                *packed.last_mut().unwrap() |= 0b1100_0000;
+                packed.extend_from_slice(tail);
+                assert_eq!(
+                    miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                    last.then(|| want.clone()),
+                    "{what}"
+                );
+                let stream = last || tail.is_empty();
+                assert_eq!(starts_stream(&packed, want.len()), stream, "{what}");
+
+                let (file, at) = outer_then_after(&packed, want.len());
+                let found: Vec<_> = records(&file).collect();
+                let names: Vec<_> = found.iter().map(|r| r.name).collect();
+                assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+                assert_eq!(found[0].span(), at..at + 12 + packed.len(), "{what}");
+                assert_eq!(found[0].unpack(), last.then(|| want.clone()), "{what}");
+                assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+                assert_eq!(found[1].span().end, file.len(), "{what}");
+            }
+        }
+    }
 }
