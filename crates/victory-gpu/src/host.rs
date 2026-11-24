@@ -119,6 +119,7 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     // With `VICTORY_PROFILE`: the last frames, memory and caches as they
     // were, before the run ends.
     victory_profile::dump(&text);
+    victory_profile::live::failure(&text);
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
@@ -132,6 +133,7 @@ pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
         Ok(host) => {
             victory_profile::sampler(video_memory);
+            victory_profile::live::progress(live_progress);
             Some(host)
         }
         Err(e) => {
@@ -388,6 +390,43 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_PROFILE_LIVE`: where the GPU says how far it got
+    /// through the noted commands (diagnostics, notes on).
+    #[cfg(feature = "diagnostics")]
+    marks: OnceLock<Option<Marks>>,
+}
+
+/// Two words in read-back memory the GPU writes as it runs a list
+/// (`WriteBufferImmediate` before each noted command and at the end): the
+/// noted commands begun, then those finished. Read while the list runs, so
+/// a stall shows where the GPU is before the device is removed (the
+/// device-removed data says it only after).
+#[cfg(feature = "diagnostics")]
+struct Marks {
+    buffer: ID3D12Resource,
+    /// The buffer's mapped address.
+    data: usize,
+    list: ID3D12GraphicsCommandList2,
+}
+
+#[cfg(feature = "diagnostics")]
+impl Marks {
+    /// Commands begun and finished, as written so far.
+    fn read(&self) -> (u32, u32) {
+        let words = self.data as *const u32;
+        // SAFETY: two mapped words; the GPU writes them whole.
+        unsafe { (words.read_volatile(), words.add(1).read_volatile()) }
+    }
+
+    /// Forgets the last run's values, before the list is submitted again.
+    fn clear(&self) {
+        let words = self.data as *mut u32;
+        // SAFETY: as above; the GPU is not running the list.
+        unsafe {
+            words.write_volatile(0);
+            words.add(1).write_volatile(0);
+        }
+    }
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -615,6 +654,8 @@ impl Host {
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                marks: OnceLock::new(),
             })
         }
     }
@@ -712,6 +753,10 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         let mut removed_in = None;
+        let live = victory_profile::live::on();
+        if live {
+            live_begin(*submitted + 1, runs);
+        }
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -743,17 +788,32 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
+            // `VICTORY_PROFILE` with `VICTORY_GPU_TIMING`: each list ran
+            // alone, so its commands' times are its own.
+            #[cfg(feature = "diagnostics")]
+            if groups.len() > 1 && victory_profile::on() {
+                // SAFETY: a plain query.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let list_ms = started.elapsed().as_secs_f64() * 1e3;
+                for (ms, op) in runs[i].slowest(frequency, 16) {
+                    victory_profile::gpu::command(&op, ms, list_ms);
+                }
+            }
             // SAFETY: a plain query.
             if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
                 removed_in = Some(i);
             }
             let _ = (i, started);
         }
+        if live {
+            live_end(runs);
+        }
         let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         victory_profile::submission(lists.len(), prepared - started, gpu);
+        victory_profile::gpu::submission_done(gpu, runs.len(), || pipelines_of(runs, 8));
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -1035,6 +1095,74 @@ impl Host {
 }
 
 impl HostList {
+    /// The list's progress words (diagnostics, `VICTORY_PROFILE_LIVE`),
+    /// made on first use.
+    #[cfg(feature = "diagnostics")]
+    fn marks(&self) -> Option<&Marks> {
+        if !victory_profile::live::on() {
+            return None;
+        }
+        self.marks
+            .get_or_init(|| {
+                let device = &host()?.device;
+                if !write_buffer_immediate(device) {
+                    return None;
+                }
+                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 8,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut buffer: Option<ID3D12Resource> = None;
+                let mut data = std::ptr::null_mut();
+                // SAFETY: plain creation and mapping of a read-back buffer,
+                // which stays mapped (and in the copy destination state the
+                // writes need) for its life.
+                unsafe {
+                    device
+                        .CreateCommittedResource(
+                            &readback,
+                            D3D12_HEAP_FLAG_NONE,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            None,
+                            &mut buffer,
+                        )
+                        .ok()?;
+                    let buffer = buffer?;
+                    buffer.Map(0, None, Some(&mut data)).ok()?;
+                    let marks = Marks { list: self.list.cast().ok()?, buffer, data: data as usize };
+                    marks.clear();
+                    Some(marks)
+                }
+            })
+            .as_ref()
+    }
+
+    /// Has the GPU write `n` as the commands begun and finished once all
+    /// before this point began and finished (diagnostics, live on).
+    #[cfg(feature = "diagnostics")]
+    fn mark(&self, n: u32) {
+        if let Some(m) = self.marks() {
+            // SAFETY: a plain query of a live buffer.
+            let at = unsafe { m.buffer.GetGPUVirtualAddress() };
+            let words = [
+                D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at, Value: n },
+                D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4, Value: n },
+            ];
+            let modes = [D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT];
+            // SAFETY: an open list; the buffer is in the copy destination
+            // state and lives as long as the list.
+            unsafe { m.list.WriteBufferImmediate(2, words.as_ptr(), Some(modes.as_ptr())) };
+        }
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -1112,6 +1240,10 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        #[cfg(feature = "diagnostics")]
+        if dred_on() && self.marks.get().is_some_and(Option::is_some) {
+            self.mark(self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32);
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1331,6 +1463,7 @@ impl HostList {
                 // SAFETY: an open list and our query heap.
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
+            self.mark(at);
             let what = what();
             traced(&what);
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
@@ -1905,6 +2038,151 @@ impl Host {
             }
         }
     }
+}
+
+/// Whether direct lists take `WriteBufferImmediate` (asked once; live
+/// markers are off without it, with one line).
+#[cfg(feature = "diagnostics")]
+fn write_buffer_immediate(device: &ID3D12Device) -> bool {
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        // SAFETY: the query writes its own structure of the given size.
+        let asked = unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS3,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        let ok = asked.is_ok()
+            && (options.WriteBufferImmediateSupportFlags & D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT).0 != 0;
+        if !ok {
+            tracing::warn!("no WriteBufferImmediate on direct lists: VICTORY_PROFILE_LIVE has no GPU markers");
+        }
+        ok
+    })
+}
+
+/// Some of the pipelines `runs` bind, for reports: the first `n`, and how
+/// many more.
+fn pipelines_of(runs: &[&HostList], n: usize) -> String {
+    let all: std::collections::BTreeSet<String> = runs
+        .iter()
+        .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        .collect();
+    let mut text = all.iter().take(n).cloned().collect::<Vec<_>>().join(", ");
+    if all.len() > n {
+        text.push_str(&format!(" and {} more", all.len() - n));
+    }
+    text
+}
+
+/// The submission the GPU runs, for `VICTORY_PROFILE_LIVE`: its number,
+/// when it began and its lists (as addresses: [`execute`](Host::execute)
+/// takes it back, under the lock, before they can go).
+struct Inflight {
+    submission: u64,
+    started: std::time::Instant,
+    runs: Vec<usize>,
+}
+
+static INFLIGHT: Mutex<Option<Inflight>> = Mutex::new(None);
+/// The last noted command of the last finished submission (diagnostics).
+static LAST_DONE: Mutex<Option<String>> = Mutex::new(None);
+
+fn live_begin(submission: u64, runs: &[&HostList]) {
+    #[cfg(feature = "diagnostics")]
+    for r in runs {
+        if let Some(m) = r.marks.get().and_then(Option::as_ref) {
+            m.clear();
+        }
+    }
+    *INFLIGHT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Inflight {
+        submission,
+        started: std::time::Instant::now(),
+        runs: runs.iter().map(|&r| std::ptr::from_ref(r) as usize).collect(),
+    });
+}
+
+fn live_end(runs: &[&HostList]) {
+    let mut inflight = INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    {
+        // The last command the GPU says it finished (all of them, unless
+        // the device was removed on the way).
+        let last = runs.iter().rev().find_map(|r| {
+            let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
+            let done = r
+                .marks
+                .get()
+                .and_then(Option::as_ref)
+                .map_or(notes.len(), |m| (m.read().1 as usize).min(notes.len()));
+            done.checked_sub(1).map(|k| victory_profile::gpu::command_key(&notes[k].0))
+        });
+        if last.is_some() {
+            *LAST_DONE.lock().unwrap_or_else(|e| e.into_inner()) = last;
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = runs;
+    *inflight = None;
+}
+
+/// Where the GPU is, for `VICTORY_PROFILE_LIVE`'s lines and stall
+/// warnings (called from its thread).
+fn live_progress() -> victory_profile::live::Progress {
+    let last_done = LAST_DONE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let inflight = INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(f) = inflight.as_ref() else {
+        return victory_profile::live::Progress { busy: None, last_done };
+    };
+    // SAFETY: `execute` holds these lists until it takes `INFLIGHT` back,
+    // which waits for this lock.
+    let runs: Vec<&HostList> = f.runs.iter().map(|&r| unsafe { &*(r as *const HostList) }).collect();
+    let busy = victory_profile::live::Busy {
+        submission: f.submission,
+        for_ms: f.started.elapsed().as_secs_f64() * 1e3,
+        lists: runs.len(),
+        pipelines: pipelines_of(&runs, 6),
+        ..Default::default()
+    };
+    #[cfg(feature = "diagnostics")]
+    let (busy, last_done) = at_markers(&runs, busy, last_done);
+    victory_profile::live::Progress { busy: Some(busy), last_done }
+}
+
+/// Where the markers of the submission's lists say the GPU is: the list
+/// it is in, the command it has not finished, the last it finished
+/// (diagnostics, notes on).
+#[cfg(feature = "diagnostics")]
+fn at_markers(
+    runs: &[&HostList],
+    mut busy: victory_profile::live::Busy,
+    mut last_done: Option<String>,
+) -> (victory_profile::live::Busy, Option<String>) {
+    for (i, r) in runs.iter().enumerate() {
+        let Some(m) = r.marks.get().and_then(Option::as_ref) else {
+            continue;
+        };
+        let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let count = notes.len() as u32;
+        if count == 0 {
+            continue;
+        }
+        let done = m.read().1.min(count);
+        if done > 0 {
+            last_done = Some(victory_profile::gpu::command_key(&notes[done as usize - 1].0));
+        }
+        if done < count {
+            busy.list = Some(i);
+            busy.done = done;
+            busy.commands = count;
+            busy.running = Some(victory_profile::gpu::command_key(&notes[done as usize].0));
+            break;
+        }
+    }
+    (busy, last_done)
 }
 
 /// For `VICTORY_PROFILE`: draws and dispatches run on the host since the
