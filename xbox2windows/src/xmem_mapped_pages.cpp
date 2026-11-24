@@ -4,6 +4,11 @@
 
 #include "era_physical.h"
 
+#include <cstring>
+#include "startup_stubs/local_log.h"
+
+#include <vector>
+
 #include <iterator>
 #include <limits>
 #include <map>
@@ -23,6 +28,13 @@ struct PhysicalMemory {
     std::map<ULONG_PTR, Backing> backings;
     std::map<ULONG_PTR, ULONG_PTR> views;
     std::map<ULONG_PTR, SIZE_T> reservations;
+    // A no-access graphics reservation (protection 0x801) made right after a
+    // read-write one of the same size is that memory's GPU view on the console. Pages mapped into
+    // the CPU view are mapped at the same offset into the GPU view too (the same section).
+    ULONG_PTR last_cpu_base = 0;
+    SIZE_T last_cpu_bytes = 0;
+    ULONG_PTR mirror_cpu = 0, mirror_gpu = 0;
+    SIZE_T mirror_bytes = 0;
 
     ~PhysicalMemory()
     {
@@ -183,15 +195,184 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
 }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Experimental (docs/startup-runtime.md). With X2W_XMEM_PERMISSIVE=1 the exports
+// below accept the call shapes of a startup run on top of the section-backed pages above.
+// Observations behind it:
+// - Page numbers: the caller rebuilds them as (21-bit entry << 4), so it expects 4 KiB frame numbers
+//   with the low four bits clear. Callers get page << 4 and pass it back.
+// - XMemAllocatePhysicalPages flags other than MEM_64K_PAGES occur (0x280) and are served the same.
+// - XMemVirtualAlloc: commits (type 0x20003000/0x20403000) become plain commits; reservations become
+//   placeholders that pages can be mapped into; a "replace placeholder" call (0x20406000) on a piece
+//   the caller split from its own placeholder keeps the placeholder and records it for mapping.
+// - Scatter mapping passes page 0 to unmap and may name pages that are already mapped elsewhere
+//   (a second view; the sections give real sharing).
+namespace {
+bool local_permissive() noexcept { return x2w_local::env_on("X2W_XMEM_PERMISSIVE"); }
+
+void record_reservation(void* base, SIZE_T bytes)
+{
+    const std::lock_guard guard(memory.mutex);
+    memory.reservations.insert_or_assign(reinterpret_cast<ULONG_PTR>(base), bytes);
+}
+
+void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG attributes, DWORD protection)
+{
+    const DWORD low = protection & 0xFF;
+    const bool accessible = low == PAGE_READONLY || low == PAGE_READWRITE || low == PAGE_EXECUTE_READ ||
+                            low == PAGE_EXECUTE_READWRITE;
+    const DWORD protect = accessible ? low : PAGE_READWRITE;
+    void* result = nullptr;
+    const char* how = "";
+    if ((type & MEM_REPLACE_PLACEHOLDER) && address) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(address, &info, sizeof(info)) && info.State == MEM_RESERVE) {
+            record_reservation(address, bytes);
+            result = address;
+        }
+        how = "placeholder kept for page mapping";
+    } else if (type & MEM_COMMIT) {
+        if (!address) {
+            result = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, protect);
+            how = "commit";
+        } else {
+            result = VirtualAlloc(address, bytes, MEM_COMMIT, protect);
+            if (!result) {
+                VirtualFree(address, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                result = VirtualAlloc2(GetCurrentProcess(), address, bytes,
+                                       MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, protect, nullptr, 0);
+            }
+            how = "commit at address";
+        }
+    } else {
+        result = VirtualAlloc2(GetCurrentProcess(), address, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+                               nullptr, 0);
+        // A caller that asks for a placeholder splits it itself; other reservations are split here on mapping.
+        if (result && !(type & MEM_RESERVE_PLACEHOLDER)) record_reservation(result, bytes);
+        how = "placeholder reserve";
+    }
+    const DWORD error = result ? 0 : GetLastError();
+    x2w_local::logf("x2w-xmem XMemVirtualAlloc addr=%p size=0x%llx type=0x%lx attr=0x%llx prot=0x%lx -> %p (%s, err %lu)",
+                    address, static_cast<unsigned long long>(bytes), static_cast<unsigned long>(type),
+                    static_cast<unsigned long long>(attributes), static_cast<unsigned long>(protection), result, how,
+                    static_cast<unsigned long>(error));
+    SetLastError(error);
+    return result;
+}
+
+// Applies (address, page) pairs; page 0 unmaps. An address that already shows the requested page is
+// left alone; one that shows another page is unmapped first.
+BOOL local_apply(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* pages, const char* what)
+{
+    std::map<ULONG_PTR, ULONG_PTR> want;
+    for (ULONG_PTR i = 0; i < count; ++i) want[addresses[i]] = pages[i];
+    std::vector<ULONG_PTR> unmap, map_at, map_page;
+    {
+        const std::lock_guard guard(memory.mutex);
+        for (const auto& [address, page] : want) {
+            const auto live = memory.views.find(address);
+            if (!page) {
+                if (live != memory.views.end()) unmap.push_back(address);
+                continue;
+            }
+            if (live != memory.views.end()) {
+                if (live->second == page) continue;
+                unmap.push_back(address);
+            }
+            map_at.push_back(address);
+            map_page.push_back(page);
+        }
+    }
+    BOOL ok = TRUE;
+    DWORD error = 0;
+    if (!unmap.empty() && !map_pages(unmap.size(), nullptr, [&](ULONG_PTR i) { return unmap[i]; })) {
+        ok = FALSE;
+        error = GetLastError();
+    }
+    if (ok && !map_at.empty() &&
+        !map_pages(map_at.size(), map_page.data(), [&](ULONG_PTR i) { return map_at[i]; })) {
+        ok = FALSE;
+        error = GetLastError();
+    }
+    static LONG calls;
+    if (!ok || x2w_local::first_calls(calls, 16))
+        x2w_local::logf("x2w-xmem %s count=0x%llx first=%p map=%llu unmap=%llu -> %d (err %lu)", what,
+                        static_cast<unsigned long long>(count), count ? reinterpret_cast<void*>(addresses[0]) : nullptr,
+                        static_cast<unsigned long long>(map_at.size()), static_cast<unsigned long long>(unmap.size()), ok,
+                        static_cast<unsigned long>(error));
+    SetLastError(error);
+    return ok;
+}
+
+// Applies the same (address, page) pairs again at the GPU view for those addresses in the CPU view.
+void local_mirror(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* pages)
+{
+    ULONG_PTR cpu, gpu;
+    SIZE_T bytes;
+    {
+        const std::lock_guard guard(memory.mutex);
+        cpu = memory.mirror_cpu, gpu = memory.mirror_gpu, bytes = memory.mirror_bytes;
+    }
+    if (!cpu) return;
+    std::vector<ULONG_PTR> at, page;
+    for (ULONG_PTR i = 0; i < count; ++i)
+        if (addresses[i] >= cpu && addresses[i] - cpu < bytes) {
+            at.push_back(addresses[i] - cpu + gpu);
+            page.push_back(pages[i]);
+        }
+    if (!at.empty()) local_apply(at.size(), at.data(), page.data(), "GPU view mirror");
+}
+
+bool to_pages(ULONG_PTR count, const ULONG_PTR* tokens, std::vector<ULONG_PTR>& pages)
+{
+    pages.resize(count);
+    for (ULONG_PTR i = 0; i < count; ++i) {
+        if (tokens[i] & 0xF) return false;
+        pages[i] = tokens[i] >> 4;
+    }
+    return true;
+}
+}  // namespace
+
+namespace {
+BOOL free_pages(ULONG_PTR count, PULONG_PTR pages);
+}
+
 extern "C" BOOL WINAPI XMemAllocatePhysicalPages(ULONG_PTR flags, PULONG_PTR count, PULONG_PTR pages)
 {
     static_assert(sizeof(ULONG_PTR) == sizeof(std::uint64_t));
+    if (local_permissive()) {
+        const ULONG_PTR requested = count ? *count : 0;
+        era_physical::Status status;
+        {
+            const std::lock_guard guard(memory.mutex);
+            status = era_physical::allocate(era_physical::mem_64k_pages, reinterpret_cast<std::uint64_t*>(count),
+                                            reinterpret_cast<std::uint64_t*>(pages));
+        }
+        if (status == era_physical::Status::ok)
+            for (ULONG_PTR i = 0; i < *count; ++i) pages[i] <<= 4;
+        x2w_local::logf("x2w-xmem XMemAllocatePhysicalPages flags=0x%llx pages=0x%llx -> %d",
+                        static_cast<unsigned long long>(flags), static_cast<unsigned long long>(requested),
+                        status == era_physical::Status::ok);
+        return physical_result(status);
+    }
     const std::lock_guard guard(memory.mutex);
     return physical_result(era_physical::allocate(flags, reinterpret_cast<std::uint64_t*>(count),
                                                   reinterpret_cast<std::uint64_t*>(pages)));
 }
 
 extern "C" BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, PULONG_PTR pages)
+{
+    if (local_permissive() && pages && count && count <= era_physical::capacity_pages) {
+        std::vector<ULONG_PTR> converted;
+        if (!to_pages(count, pages, converted)) return physical_result(era_physical::Status::invalid);
+        return free_pages(count, converted.data());
+    }
+    return free_pages(count, pages);
+}
+
+namespace {
+BOOL free_pages(ULONG_PTR count, PULONG_PTR pages)
 {
     if (!pages || !count || count > era_physical::capacity_pages)
         return physical_result(era_physical::Status::invalid);
@@ -213,6 +394,47 @@ extern "C" BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR count, PULONG_PTR pages)
     }
     return physical_result(status);
 }
+}  // namespace
+
+// Experimental export: one snapshot of the physical-page accounting for the startup heartbeat
+// (#1199). A page gets its 64 KiB section on first use, by a mapping or by a page-token write, and
+// loses it when the grant is released; the count is reported so runs can be compared.
+extern "C" BOOL WINAPI x2w_xmem_page_stats(ULONGLONG* live_sections)
+{
+    if (!live_sections) return FALSE;
+    const std::lock_guard guard(memory.mutex);
+    *live_sections = static_cast<ULONGLONG>(memory.backings.size());
+    return TRUE;
+}
+
+// Experimental export: writes bytes into physical pages named by the title's
+// page tokens (page number << 4, as XMemMapPhysicalPages takes them), starting offset bytes into the
+// first page. DirectStorage requests can name such pages as their destination.
+extern "C" BOOL WINAPI x2w_xmem_write_physical(const ULONG_PTR* tokens, ULONG_PTR count, SIZE_T offset, const void* data, SIZE_T bytes)
+{
+    if (!tokens || !data || offset >= page_bytes) return FALSE;
+    const auto* source = static_cast<const unsigned char*>(data);
+    ULONG_PTR index = 0;
+    while (bytes) {
+        if (index >= count || (tokens[index] & 0xF)) return FALSE;
+        HANDLE section = nullptr;
+        {
+            const std::lock_guard guard(memory.mutex);
+            section = section_for(tokens[index] >> 4);
+        }
+        if (!section) return FALSE;
+        void* view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, page_bytes);
+        if (!view) return FALSE;
+        const SIZE_T chunk = bytes < page_bytes - offset ? bytes : page_bytes - offset;
+        std::memcpy(static_cast<unsigned char*>(view) + offset, source, chunk);
+        UnmapViewOfFile(view);
+        source += chunk;
+        bytes -= chunk;
+        offset = 0;
+        ++index;
+    }
+    return TRUE;
+}
 
 extern "C" void* WINAPI XMemMapPhysicalPages(void* base, ULONG_PTR count, const ULONG_PTR* tokens)
 {
@@ -221,6 +443,19 @@ extern "C" void* WINAPI XMemMapPhysicalPages(void* base, ULONG_PTR count, const 
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
+    if (local_permissive()) {
+        // A null array unmaps (seen on a cleanup path, also with a zero count).
+        std::vector<ULONG_PTR> addresses(count), pages(count, 0);
+        for (ULONG_PTR i = 0; i < count; ++i) addresses[i] = address + i * page_bytes;
+        if (tokens && !to_pages(count, tokens, pages)) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        if (!count) return base;
+        if (!local_apply(count, addresses.data(), pages.data(), "XMemMapPhysicalPages")) return nullptr;
+        local_mirror(count, addresses.data(), pages.data());
+        return base;
+    }
     return map_pages(count, tokens, [=](ULONG_PTR i) { return address + i * page_bytes; }) ? base : nullptr;
 }
 
@@ -228,18 +463,62 @@ extern "C" BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, ULONG
                                                    const ULONG_PTR* tokens)
 {
     if (!addresses) return physical_result(era_physical::Status::invalid);
+    if (local_permissive() && tokens) {
+        std::vector<ULONG_PTR> pages;
+        if (!to_pages(count, tokens, pages)) return physical_result(era_physical::Status::invalid);
+        if (!local_apply(count, reinterpret_cast<const ULONG_PTR*>(addresses), pages.data(), "XMemMapPhysicalPagesScatter"))
+            return FALSE;
+        local_mirror(count, reinterpret_cast<const ULONG_PTR*>(addresses), pages.data());
+        return TRUE;
+    }
     return map_pages(count, tokens, [=](ULONG_PTR i) { return reinterpret_cast<ULONG_PTR>(addresses[i]); });
 }
 
-// Reserve-only desktop profile from the source-built #888 comparison.
+// Reserve+commit desktop profile for the startup blocks observed on #870: the pool loop asks
+// for type 0x20003000 with 0x183/0x22004, 0x283/0x2404 or 0x283/0x2004, and later startup code for type
+// 0x20403000 (64 KiB pages) with 0x181/PAGE_READWRITE, each with a null base. Proposed
+// desktop policy: commit a fresh block of ordinary zero-filled read/write pages, whose size
+// must be a nonzero multiple of 64 KiB and is committed exactly, without rounding. The
+// MEM_LARGE_PAGES type gets a 2 MiB-aligned base (the x64 large-page size); the
+// MEM_64K_PAGES type (MEM_LARGE_PAGES | MEM_PHYSICAL) keeps the 64 KiB allocation
+// granularity. Large pages themselves and the console protection bits above PAGE_READWRITE
+// are not reproduced. A host failure returns NULL with the host error.
+static void* commit_startup_block(SIZE_T bytes, DWORD allocation_type, ULONGLONG attributes,
+                                  DWORD protection) noexcept
+{
+    constexpr SIZE_T granularity = SIZE_T{64} << 10;
+    const bool large_pages = allocation_type == 0x20003000;
+    const bool supported = large_pages
+                               ? (attributes == 0x183 && protection == 0x22004)
+                                     || (attributes == 0x283 && (protection == 0x2404 || protection == 0x2004))
+                               : attributes == 0x181 && protection == PAGE_READWRITE;
+    if (!bytes || bytes % granularity || !supported) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    if (!large_pages) return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    MEM_ADDRESS_REQUIREMENTS requirements{};
+    requirements.Alignment = SIZE_T{2} << 20;
+    MEM_EXTENDED_PARAMETER parameter{};
+    parameter.Type = MemExtendedParameterAddressRequirements;
+    parameter.Pointer = &requirements;
+    return VirtualAlloc2(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE,
+                         &parameter, 1);
+}
+
+// The startup commit profile above, and the reserve-only desktop profile from the source-built
+// #888 comparison.
 extern "C" void* WINAPI XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allocation_type,
                                         ULONGLONG attributes, DWORD protection)
 {
     constexpr DWORD startup_reserve = 0x20402000;
     constexpr SIZE_T gib = SIZE_T{1} << 30;
+    if (!address && (allocation_type == 0x20003000 || allocation_type == (startup_reserve | MEM_COMMIT)))
+        return commit_startup_block(bytes, allocation_type, attributes, protection);
     const bool supported = (attributes == 0x21 && protection == PAGE_READWRITE)
                            || (attributes == 3 && protection == (0x800 | PAGE_NOACCESS));
     if (address || (bytes != 16 * gib && bytes != 24 * gib) || allocation_type != startup_reserve || !supported) {
+        if (local_permissive()) return local_virtual_alloc(address, bytes, allocation_type, attributes, protection);
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
@@ -258,6 +537,18 @@ extern "C" void* WINAPI XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allo
     if (!reservation) return nullptr;
     try {
         memory.reservations.insert_or_assign(reinterpret_cast<ULONG_PTR>(reservation), bytes);
+        const auto base = reinterpret_cast<ULONG_PTR>(reservation);
+        if (protection == PAGE_READWRITE) {
+            memory.last_cpu_base = base;
+            memory.last_cpu_bytes = bytes;
+        } else if (memory.last_cpu_base && memory.last_cpu_bytes == bytes && x2w_local::env_on("X2W_XMEM_GPU_MIRROR")) {
+            memory.mirror_cpu = memory.last_cpu_base;
+            memory.mirror_gpu = base;
+            memory.mirror_bytes = bytes;
+            x2w_local::logf("x2w-xmem GPU view %p (+0x%llx) mirrors CPU view %p, 0x%llx bytes", reservation,
+                            static_cast<unsigned long long>(base - memory.last_cpu_base), reinterpret_cast<void*>(memory.last_cpu_base),
+                            static_cast<unsigned long long>(bytes));
+        }
     } catch (const std::bad_alloc&) {
         VirtualFree(reservation, 0, MEM_RELEASE);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);

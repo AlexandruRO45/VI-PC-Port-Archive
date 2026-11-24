@@ -21,6 +21,13 @@ constexpr UINT alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 static_assert(constants_offset % alignment == 0);
 constexpr UINT sentinel = 0xc5c5c5c5u;
 constexpr std::array<UINT, 16> constants{count, 73, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 23, 29};
+constexpr UINT uavs = 13, srvs = 21;
+// The image-load case binds one R32G32B32A32_UINT source texture at t0. The case file carries the
+// texture words, so the same runner checks dmask variants without a second content generator.
+constexpr UINT texture_width = 32, texture_height = 8, texture_channels = 4;
+constexpr UINT texture_words = texture_width * texture_height * texture_channels;
+constexpr UINT texture_mip_levels = 3;
+constexpr UINT texture_mip_words = texture_words + texture_words / 4 + texture_words / 16;
 }
 
 static UINT input_word(UINT i) { return 0x8b02a7f1u + i * 0x413b1u; }
@@ -42,10 +49,58 @@ static void fill_upload(ID3D12Resource* upload)
     upload->Unmap(0, nullptr);
 }
 
-static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12GraphicsCommandList* list,
-                                         ID3D12Resource* input, ID3D12Resource* output)
+// Upload the source texture and leave it in the compute read state. The caller keeps the staging
+// buffer alive until the command list has executed.
+static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                                             const std::vector<UINT>& texels,
+                                             ComPtr<ID3D12Resource>& staging)
 {
-    constexpr UINT uavs = 13, srvs = 21;
+    const UINT mips = texels.size() == texture_words ? 1 : texture_mip_levels;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = texture_width;
+    desc.Height = texture_height;
+    desc.DepthOrArraySize = desc.SampleDesc.Count = 1;
+    desc.MipLevels = static_cast<UINT16>(mips);
+    desc.Format = DXGI_FORMAT_R32G32B32A32_UINT;
+    auto texture = resource(device, desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, texture_mip_levels> layouts{};
+    UINT64 upload_bytes = 0;
+    device->GetCopyableFootprints(&desc, 0, mips, 0, layouts.data(), nullptr, nullptr, &upload_bytes);
+    staging = make_buffer(device, upload_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    void* mapped = nullptr;
+    const D3D12_RANGE no_reads{};
+    check(staging->Map(0, &no_reads, &mapped), "Map texture upload");
+    std::memset(mapped, 0, static_cast<std::size_t>(upload_bytes));
+    std::size_t word = 0;
+    for (UINT level = 0; level < mips; ++level) {
+        const auto& layout = layouts[level];
+        const UINT row_words = (texture_width >> level) * texture_channels;
+        for (UINT y = 0; y < (texture_height >> level); ++y) {
+            auto* row = static_cast<unsigned char*>(mapped) + layout.Offset + y * layout.Footprint.RowPitch;
+            std::memcpy(row, texels.data() + word, row_words * sizeof(UINT));
+            word += row_words;
+        }
+    }
+    staging->Unmap(0, nullptr);
+    D3D12_TEXTURE_COPY_LOCATION dest{}, src{};
+    dest.pResource = texture.Get();
+    dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.pResource = staging.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    for (UINT level = 0; level < mips; ++level) {
+        dest.SubresourceIndex = level;
+        src.PlacedFootprint = layouts[level];
+        list->CopyTextureRegion(&dest, 0, 0, 0, &src, nullptr);
+    }
+    transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    return texture;
+}
+
+static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                                         ID3D12Resource* input, ID3D12Resource* output,
+                                         ID3D12Resource* texture = nullptr, UINT output_register = uavs - 1)
+{
     D3D12_DESCRIPTOR_HEAP_DESC desc{};
     desc.NumDescriptors = uavs + srvs;
     desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -59,16 +114,22 @@ static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12Grap
     uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     uav.Buffer.NumElements = capacity;
     uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    if (output_register >= uavs) throw std::runtime_error("Invalid output register");
     for (UINT i = 0; i < uavs; ++i, cpu.ptr += stride)
-        device->CreateUnorderedAccessView(i == uavs - 1 ? output : nullptr, nullptr, &uav, cpu);
+        device->CreateUnorderedAccessView(i == output_register ? output : nullptr, nullptr, &uav, cpu);
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = DXGI_FORMAT_R32_TYPELESS;
     srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Buffer.NumElements = capacity;
     srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-    for (UINT i = 0; i < srvs; ++i, cpu.ptr += stride)
-        device->CreateShaderResourceView(i == srvs - 1 ? input : nullptr, &srv, cpu);
+    for (UINT i = 0; i < srvs; ++i, cpu.ptr += stride) {
+        // A texture SRV at t0 selects its own format; every other slot stays a raw buffer or null.
+        if (texture && i == 0)
+            device->CreateShaderResourceView(texture, nullptr, cpu);
+        else
+            device->CreateShaderResourceView(!texture && i == srvs - 1 ? input : nullptr, &srv, cpu);
+    }
     ID3D12DescriptorHeap* heaps[]{heap.Get()};
     list->SetDescriptorHeaps(1, heaps);
     auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
@@ -94,8 +155,9 @@ struct StoreCase {
 
 static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE shader,
                         D3D12_SHADER_BYTECODE rootBytes, bool conversion_pair = false,
-                        const StoreCase* store = nullptr)
+                        const StoreCase* store = nullptr, const std::vector<UINT>* texels = nullptr)
 {
+    if (texels && !tables) throw std::runtime_error("An image load needs the descriptor-table signature");
     ComPtr<ID3D12RootSignature> signature;
     check(device->CreateRootSignature(0, rootBytes.pShaderBytecode, rootBytes.BytecodeLength, IID_PPV_ARGS(&signature)),
           "Create compute root signature");
@@ -112,13 +174,18 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
     fill_upload(input.Get());
     ComputeCommands commands(device, pipeline.Get());
     auto& list = commands.list;
+    ComPtr<ID3D12Resource> texture_upload, texture;
+    if (texels) texture = upload_texture(device, list.Get(), *texels, texture_upload);
     transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     list->CopyBufferRegion(output.Get(), 0, input.Get(), bytes, bytes);
     transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list->SetComputeRootSignature(signature.Get());
     ComPtr<ID3D12DescriptorHeap> heap;
     if (tables) {
-        heap = bind_tables(device, list.Get(), input.Get(), output.Get());
+        // An image-load case binds its output at u0 and the source texture at t0; the table
+        // signature's UAV range starts at u0, while the root-descriptor path keeps u12.
+        heap = bind_tables(device, list.Get(), input.Get(), output.Get(), texture.Get(),
+                           texels ? 0 : uavs - 1);
     } else {
         list->SetComputeRootShaderResourceView(0, input->GetGPUVirtualAddress());
         list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
@@ -194,6 +261,38 @@ void check_compute_file(ID3D12Device* device, const char* path, bool conversion_
     } else {
         run_compute(device, false, shader, shader, conversion_pair);
     }
+}
+
+// A translated image-load shader always uses the descriptor-table signature: a texture SRV cannot
+// be a root descriptor. The case file extends the store reference with the source texture words.
+void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference)
+{
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) throw std::runtime_error(std::string("Could not open compute shader: ") + path);
+    const auto size = file.tellg();
+    if (size <= 0) throw std::runtime_error(std::string("Empty compute shader: ") + path);
+    std::vector<char> bytes(static_cast<std::size_t>(size));
+    file.seekg(0);
+    if (!file.read(bytes.data(), static_cast<std::streamsize>(bytes.size())))
+        throw std::runtime_error(std::string("Could not read compute shader: ") + path);
+    const D3D12_SHADER_BYTECODE shader{bytes.data(), bytes.size()};
+    StoreCase store{};
+    std::vector<UINT> texels(texture_words);
+    std::ifstream source(reference, std::ios::binary);
+    if (!source) throw std::runtime_error(std::string("Could not open compute reference: ") + reference);
+    source.read(reinterpret_cast<char*>(&store.groups), sizeof(store.groups));
+    source.read(reinterpret_cast<char*>(store.expected.data()), sizeof(store.expected));
+    source.read(reinterpret_cast<char*>(texels.data()), static_cast<std::streamsize>(texels.size() * sizeof(UINT)));
+    // Older cases stop after the base image. A mip case appends levels one and two.
+    if (source && source.peek() != std::char_traits<char>::eof()) {
+        texels.resize(texture_mip_words);
+        source.read(reinterpret_cast<char*>(texels.data() + texture_words),
+                    (texture_mip_words - texture_words) * sizeof(UINT));
+    }
+    if (!source || source.peek() != std::char_traits<char>::eof() || store.groups >> 24 || !store.axis(0) ||
+        store.axis(0) > 5 || store.axis(1) > 5 || store.axis(2) > 5)
+        throw std::runtime_error("Invalid compute image load reference");
+    run_compute(device, true, shader, {compute_tables, sizeof(compute_tables)}, false, &store, &texels);
 }
 
 void check_bvh_root_roundtrip(ID3D12Device* device)

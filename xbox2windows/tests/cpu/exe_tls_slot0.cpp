@@ -66,15 +66,10 @@ struct Array {
     unsigned char bytes[ARRAY_BYTES];
 };
 
-constexpr Array make_array() {
-    Array array{};
-    for (unsigned i = 0; i < ARRAY_BYTES; ++i) array.bytes[i] = 0xFF;
-    return array;
-}
 }  // namespace
 
 __declspec(thread) int t_value = 7;
-__declspec(thread) Array t_array = make_array();
+extern "C" __declspec(thread) Array t_array;  // Initialized bytes in exe_tls_template.asm.
 
 namespace {
 constexpr UINT CREATE_FAILED = 0xE0000002u, WAIT_FAILED_CODE = 0xE0000003u, LOG_FULL = 0xE0000006u;

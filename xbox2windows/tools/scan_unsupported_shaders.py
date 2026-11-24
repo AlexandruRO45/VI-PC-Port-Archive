@@ -56,6 +56,7 @@ PIXEL_VOP3P_INT16 = pixel_aot.VOP3P_INT16 if pixel_aot is not None else {}
 PIXEL_VOP3_INT16 = pixel_aot.VOP3_INT16 if pixel_aot is not None else {}
 PIXEL_VOP2_F16 = tuple(pixel_aot.VOP2_F16) if pixel_aot is not None else ()
 PIXEL_VOP1_F16_ROUND = tuple(pixel_aot.VOP1_F16_ROUND) if pixel_aot is not None else ()
+PIXEL_VOP2_F16_FUSED_SCALE = tuple(pixel_aot.VOP2_F16_FUSED_SCALE) if pixel_aot is not None else ()
 PIXEL_INLINE_F16 = tuple(pixel_aot.INLINE_F16) if pixel_aot is not None else ()
 PIXEL_VCC = r"(?:vcc(?:_lo)?)"
 PIXEL_VOP3_INT16_TERNARY = pixel_aot.VOP3_INT16_TERNARY if pixel_aot is not None else {}
@@ -206,14 +207,26 @@ if PIXEL_INT_COMPARE:
     )
 else:
     INT64_COMPARE_PATTERN = None
-# Plain binary16 e32 forms whose result keeps only the low half (pixel_aot proves finite sources and results).
+# Plain binary16 e32 and e64 forms whose result keeps only the low half (pixel_aot proves finite sources and results).
+# The e32 src1 must be a VGPR; the e64 spelling takes any source that the e32 src0 accepts. Neither takes a modifier.
 if PIXEL_VOP2_F16:
+    _vop2_f16 = "|".join(map(re.escape, PIXEL_VOP2_F16))
     SUPPORTED_INSTRUCTIONS_REGEX.append(
-        rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP2_F16))})_f16_e32\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE},\s+{INT16_VGPR}"
+        rf"v_(?:{_vop2_f16})_f16_e32\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE},\s+{INT16_VGPR}"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:{_vop2_f16})_f16_e64\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE},\s+{F16_ARITH_SOURCE}"
+    )
+# The accumulating v_fmac_f16 and the scaling v_ldexp_f16 have the same e32 shape; pixel_aot additionally needs the accumulator
+# and the exponent to be statically proven.
+if PIXEL_VOP2_F16_FUSED_SCALE:
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP2_F16_FUSED_SCALE))})_f16_e32\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE},\s+{INT16_VGPR}"
     )
 if PIXEL_VOP1_F16_ROUND:
+    _vop1_f16_round = "|".join(map(re.escape, PIXEL_VOP1_F16_ROUND))
     SUPPORTED_INSTRUCTIONS_REGEX.append(
-        rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP1_F16_ROUND))})_f16_e32\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE}"
+        rf"v_(?:{_vop1_f16_round})_f16_(?:e32|e64)\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE}"
     )
 if pixel_aot is not None:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
@@ -287,6 +300,8 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_quadmask_b32", "s_quadmask_b64", "s_abs_i32",
     "s_andn1_saveexec_b64", "s_orn1_saveexec_b64", "s_andn1_wrexec_b64", "s_andn2_wrexec_b64",
     "s_bitreplicate_b64_b32",
+    # Relative scalar moves: decoded by tools/disasm_rdna2.py, recognition only, no lowering.
+    "s_movrels_b32", "s_movrels_b64", "s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32",
     # SOP2
     "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_absdiff_i32", "s_addc_u32", "s_subb_u32",
     "s_min_i32", "s_min_u32", "s_max_i32", "s_max_u32", "s_cselect_b32", "s_cselect_b64",
@@ -326,7 +341,7 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "v_pk_add_f16", "v_pk_mul_f16", "v_pk_min_f16", "v_pk_max_f16",
     "v_dot2_f32_f16", "v_dot2_i32_i16", "v_dot2_u32_u16",
     "v_dot4_i32_i8", "v_dot4_u32_u8", "v_dot8_i32_i4", "v_dot8_u32_u4",
-        "v_mad_legacy_f32", "v_mad_i32_i24", "v_mad_u32_u24", "v_fma_f64", "v_lerp_u8", "v_alignbit_b32", "v_alignbyte_b32", "v_mullit_f32", "v_min3_f32", "v_max3_f32", "v_med3_f32", "v_sad_u8", "v_sad_hi_u8", "v_sad_u16", "v_sad_u32", "v_cvt_pk_u8_f32", "v_div_fixup_f32", "v_div_fixup_f64", "v_add_f64", "v_mul_f64", "v_min_f64", "v_max_f64", "v_ldexp_f64", "v_mul_lo_u32", "v_mul_hi_u32", "v_mul_hi_i32", "v_div_scale_f32", "v_div_scale_f64", "v_div_fmas_f32", "v_div_fmas_f64", "v_msad_u8", "v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8", "v_trig_preop_f64", "v_mqsad_u32_u8", "v_mad_u64_u32", "v_mad_i64_i32", "v_xor3_b32", "v_lshlrev_b64", "v_lshrrev_b64", "v_ashrrev_i64", "v_add_nc_u16", "v_sub_nc_u16", "v_mul_lo_u16", "v_lshrrev_b16", "v_ashrrev_i16", "v_max_u16", "v_max_i16", "v_min_u16", "v_min_i16", "v_add_nc_i16", "v_sub_nc_i16", "v_add_co_u32", "v_sub_co_u32", "v_pack_b32_f16", "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16", "v_lshlrev_b16", "v_subrev_co_u32", "v_mad_u16", "v_interp_p1ll_f16", "v_interp_p1lv_f16", "v_perm_b32", "v_xad_u32", "v_lshl_add_u32", "v_add_lshl_u32", "v_fma_f16", "v_min3_f16", "v_min3_i16", "v_min3_u16", "v_max3_f16", "v_max3_i16", "v_max3_u16", "v_med3_f16", "v_med3_i16", "v_med3_u16", "v_interp_p2_f16", "v_mad_i16", "v_div_fixup_f16", "v_readlane_b32", "v_writelane_b32", "v_bfm_b32", "v_bcnt_u32_b32", "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32", "v_cvt_pk_u16_u32", "v_cvt_pk_i16_i32", "v_add3_u32", "v_lshl_or_b32", "v_and_or_b32", "v_or3_b32", "v_mad_u32_u16", "v_mad_i32_i16", "v_sub_nc_i32", "v_permlane16_b32", "v_permlanex16_b32", "v_add_nc_i32", "v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32",
+        "v_mad_legacy_f32", "v_mad_i32_i24", "v_mad_u32_u24", "v_fma_f64", "v_lerp_u8", "v_alignbit_b32", "v_alignbyte_b32", "v_mullit_f32", "v_min3_f32", "v_max3_f32", "v_med3_f32", "v_sad_u8", "v_sad_hi_u8", "v_sad_u16", "v_sad_u32", "v_cvt_pk_u8_f32", "v_div_fixup_f32", "v_div_fixup_f64", "v_add_f64", "v_mul_f64", "v_min_f64", "v_max_f64", "v_ldexp_f64", "v_mul_lo_u32", "v_mul_hi_u32", "v_mul_lo_i32", "v_mul_hi_i32", "v_div_scale_f32", "v_div_scale_f64", "v_div_fmas_f32", "v_div_fmas_f64", "v_msad_u8", "v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8", "v_trig_preop_f64", "v_mqsad_u32_u8", "v_mad_u64_u32", "v_mad_i64_i32", "v_xor3_b32", "v_lshlrev_b64", "v_lshrrev_b64", "v_ashrrev_i64", "v_add_nc_u16", "v_sub_nc_u16", "v_mul_lo_u16", "v_lshrrev_b16", "v_ashrrev_i16", "v_max_u16", "v_max_i16", "v_min_u16", "v_min_i16", "v_add_nc_i16", "v_sub_nc_i16", "v_add_co_u32", "v_sub_co_u32", "v_pack_b32_f16", "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16", "v_lshlrev_b16", "v_subrev_co_u32", "v_mad_u16", "v_interp_p1ll_f16", "v_interp_p1lv_f16", "v_perm_b32", "v_xad_u32", "v_lshl_add_u32", "v_add_lshl_u32", "v_fma_f16", "v_min3_f16", "v_min3_i16", "v_min3_u16", "v_max3_f16", "v_max3_i16", "v_max3_u16", "v_med3_f16", "v_med3_i16", "v_med3_u16", "v_interp_p2_f16", "v_mad_i16", "v_div_fixup_f16", "v_readlane_b32", "v_writelane_b32", "v_bfm_b32", "v_bcnt_u32_b32", "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32", "v_cvt_pk_u16_u32", "v_cvt_pk_i16_i32", "v_add3_u32", "v_lshl_or_b32", "v_and_or_b32", "v_or3_b32", "v_mad_u32_u16", "v_mad_i32_i16", "v_sub_nc_i32", "v_permlane16_b32", "v_permlanex16_b32", "v_add_nc_i32", "v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32",
     "v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16",
     # VINTRP
     "v_interp_p1_f32", "v_interp_p2_f32", "v_interp_mov_f32",
@@ -340,6 +355,19 @@ KNOWN_RDNA2_BASE_OPCODES = {
 }
 
 
+# Scalar-memory store, cache-control, timer and probe forms the disassembler decodes: recognition only, no lowering.
+KNOWN_RDNA2_BASE_OPCODES |= {
+    "s_buffer_store_dword", "s_buffer_store_dwordx2", "s_buffer_store_dwordx4", "s_gl1_inv", "s_dcache_inv",
+    "s_dcache_wb", "s_memtime", "s_memrealtime", "s_atc_probe", "s_atc_probe_buffer",
+}
+
+# Scalar program-control and compare-immediate forms the disassembler decodes: recognition only, no lowering.
+KNOWN_RDNA2_BASE_OPCODES |= {
+    "s_wakeup", "s_setkill", "s_sethalt", "s_sendmsg", "s_sendmsghalt", "s_icache_inv", "s_incperflevel",
+    "s_decperflevel", "s_ttracedata", "s_ttracedata_imm", "s_endpgm_saved", "s_endpgm_ordered_ps_done",
+    "s_wait_idle", "s_waitcnt_depctr", "s_denorm_mode", "s_call_b64",
+}
+
 KNOWN_RDNA2_BASE_OPCODES |= (
     SUPPORTED_ALU
     | {f"v_{name}" for name in PIXEL_INTEGER}
@@ -349,8 +377,14 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {f"v_pk_{name}" for name in PIXEL_VOP3P_INT16}
     | {f"v_{name}" for name in PIXEL_VOP3_INT16}
     | {f"v_{name}" for name in PIXEL_VOP3_INT16_TERNARY}
-    | {f"v_{name}_f16" for name in PIXEL_VOP2_F16 + PIXEL_VOP1_F16_ROUND}
+    | {f"v_{name}_f16" for name in PIXEL_VOP2_F16 + PIXEL_VOP2_F16_FUSED_SCALE + PIXEL_VOP1_F16_ROUND}
     | {"v_cvt_f16_i16", "v_cvt_f16_u16"}
+    | {
+        # Decoding only: no translator lowers these binary16 VOP1/VOP2 forms.
+        "v_cvt_u16_f16", "v_cvt_i16_f16", "v_fract_f16",
+        "v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16",
+        "v_fmac_f16", "v_max_f16", "v_min_f16", "v_ldexp_f16", "v_pk_fmac_f16",
+    }
     | {name for name, _, _ in MUBUF_OPS.values()}
     | {name for name, _, _ in MTBUF_OPS.values()}
     | {entry[0] for entry in FLAT_OPS.values()}

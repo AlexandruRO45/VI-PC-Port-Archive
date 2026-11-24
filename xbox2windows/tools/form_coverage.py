@@ -81,6 +81,8 @@ CPU_FIXTURES = {
     "address_size": "cpu_aot_address_size",
     "avx2_regs": "cpu_aot_avx2_regs",
     "avx_int_regs": "cpu_aot_avx_int_regs",
+    "avx_int_ymm_addsub": "cpu_aot_avx_int_ymm_addsub",
+    "avx_int_ymm_minmax": "cpu_aot_avx_int_ymm_minmax",
     "avx_move_regs": "cpu_aot_avx_move_regs",
     "call_pair": "cpu_aot_call_pair",
     "movbe": "cpu_aot_movbe",
@@ -191,12 +193,16 @@ def read_results(junit):
     status = {"run": "pass", "fail": "fail", "notrun": "skip"}
     results = {}
     for case in suite.iter("testcase"):
+        name = case.get("name")
+        if name in results:
+            # Coverage records have only the test name, not its CTest directory.
+            raise ValueError(f"duplicate CTest <testcase> name {name!r}; coverage records require unique names")
         state = status.get(case.get("status"), "fail")
         if case.find("failure") is not None or case.find("error") is not None:
             state = "fail"
         elif state == "pass" and case.find("skipped") is not None:
             state = "skip"
-        results[case.get("name")] = state
+        results[name] = state
     return results, (start - 1, start + duration + 2)
 
 

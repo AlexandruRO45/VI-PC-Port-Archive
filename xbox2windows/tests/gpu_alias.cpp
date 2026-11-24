@@ -32,6 +32,69 @@ struct TitleAllocation {
 
 Word source_word(Word i) { return (i * 2654435761u) ^ 0x13579bdfu; }
 Word expected_word(Word i) { return (source_word(i) ^ 0xa5a5a5a5u) + i; }
+
+void dispatch(ID3D12Device* device, const Kernel& kernel, ID3D12Resource* src_buffer,
+              std::uint64_t source, ID3D12Resource* dst_buffer, std::uint64_t destination)
+{
+    ComputeCommands cmd(device, kernel.pipeline.Get());
+    auto* list = cmd.list.Get();
+    constexpr auto common = D3D12_RESOURCE_STATE_COMMON;
+    constexpr auto uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    transition(list, src_buffer, common, uav);
+    if (dst_buffer != src_buffer) transition(list, dst_buffer, common, uav);
+    list->SetComputeRootSignature(kernel.root.Get());
+    list->SetComputeRootUnorderedAccessView(0, source);
+    list->SetComputeRootUnorderedAccessView(1, destination);
+    list->SetComputeRoot32BitConstant(2, count, 0);
+    list->Dispatch(count / 64, 1, 1);
+    transition(list, src_buffer, uav, common);
+    if (dst_buffer != src_buffer) transition(list, dst_buffer, uav, common);
+    cmd.submit_and_wait(device);
+}
+
+void check_address_width(ID3D12Device* device, const Kernel& kernel, unsigned char* low_cpu,
+                         const era_gpu_alias::Alias& low_alias)
+{
+    TitleAllocation high;
+    era_gpu_alias::Alias high_alias;
+    if (!high.base) throw std::runtime_error("second graphics allocation failed");
+    check(era_gpu_alias::open(device, high.base, allocation_bytes, high_alias), "Open second title allocation");
+
+    // Synthetic guest addresses let every host exercise a collision in exactly the same bit.
+    constexpr std::uint64_t low = 0x20000000;
+    constexpr std::uint64_t high_bit = 1ull << 40;
+    constexpr std::uint64_t high_address = high_bit | low;
+    era_title_va::Table table;
+    if (!table.add(low, allocation_bytes, low_alias.buffer->GetGPUVirtualAddress()) ||
+        !table.add(high_address, allocation_bytes, high_alias.buffer->GetGPUVirtualAddress()))
+        throw std::runtime_error("failed to register both guest ranges");
+
+    auto* low_dst = reinterpret_cast<Word*>(low_cpu + destination_offset);
+    auto* high_dst = reinterpret_cast<Word*>(static_cast<unsigned char*>(high.base) + destination_offset);
+    const auto source = table.translate(low + source_offset, count * sizeof(Word));
+    const auto destination = high_address + destination_offset;
+    const auto masked = destination & (high_bit - 1);
+    for (bool truncate : {false, true}) {
+        for (Word i = 0; i < count + guard_words; ++i) low_dst[i] = high_dst[i] = sentinel;
+        low_dst[-1] = high_dst[-1] = sentinel;
+        const auto gpu_va = table.translate(truncate ? masked : destination, count * sizeof(Word));
+        const auto& target = truncate ? low_alias : high_alias;
+        if (!source || gpu_va != target.buffer->GetGPUVirtualAddress() + destination_offset)
+            throw std::runtime_error("destination lookup selected the wrong GPU range");
+        dispatch(device, kernel, low_alias.buffer.Get(), source, target.buffer.Get(), gpu_va);
+
+        equal(low_dst[-1], sentinel, 0, 2);
+        equal(high_dst[-1], sentinel, 0, 3);
+        for (Word i = 0; i < count + guard_words; ++i) {
+            equal(low_dst[i], truncate && i < count ? expected_word(i) : sentinel, i, 0);
+            equal(high_dst[i], !truncate && i < count ? expected_word(i) : sentinel, i, 1);
+        }
+    }
+    if (!table.remove(high_address) || table.translate(destination) ||
+        table.translate(masked) != low_alias.buffer->GetGPUVirtualAddress() + destination_offset)
+        throw std::runtime_error("removing one range disturbed its low-bit neighbor");
+    std::printf("gpu_alias high_address_bit=40 words=%u truncation_writes_low_range=1\n", count);
+}
 }
 
 bool check_gpu_alias(ID3D12Device* device)
@@ -73,22 +136,14 @@ bool check_gpu_alias(ID3D12Device* device)
     for (Word i = count; i < count + guard_words; ++i) destination_words[i] = sentinel;
 
     Kernel kernel(device, {AliasTransform, sizeof(AliasTransform)});
-    ComputeCommands cmd(device, kernel.pipeline.Get());
-    auto* list = cmd.list.Get();
-    transition(list, alias.buffer.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    list->SetComputeRootSignature(kernel.root.Get());
-    list->SetComputeRootUnorderedAccessView(0, source);
-    list->SetComputeRootUnorderedAccessView(1, destination);
-    list->SetComputeRoot32BitConstant(2, count, 0);
-    list->Dispatch(count / 64, 1, 1);
-    transition(list, alias.buffer.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-    cmd.submit_and_wait(device);
+    dispatch(device, kernel, alias.buffer.Get(), source, alias.buffer.Get(), destination);
 
     for (Word i = 0; i < count; ++i) {
         equal(destination_words[i], expected_word(i), i, 0);
         equal(source_words[i], source_word(i), i, 1);
     }
     for (Word i = count; i < count + guard_words; ++i) equal(destination_words[i], sentinel, i, 2);
+    check_address_width(device, kernel, base, alias);
     std::printf("gpu_alias bytes=%zu words=%u source=+0x%zx destination=+0x%zx guard_words=%u "
                 "interior_open=0x%08lx mismatches=0\n",
                 allocation_bytes, count, source_offset, destination_offset, guard_words,

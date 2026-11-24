@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Browse the Archive</title>
-<meta name="description" content="Search every issue, pull request and comment from Leonida, xcl, VIctory and Xbox2Windows.">
+<meta name="description" content="Search every issue, pull request and comment from Leonida (old and new), xcl, VIctory and Xbox2Windows.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
@@ -71,15 +71,17 @@
 
 <script>
 const REPO = "https://github.com/Guernica4u/GTA6-PC-Port-Archive";
+// branch = this project's branch prefix in the repo (old Leonida kept its original "leonida/" branches)
 const PROJECTS = {
-  leonida: { name: "Leonida", desc: "Native PC recompilation of the Xbox version. Original: ItsNotRexed/Leonida (removed from GitHub on 2026-11-23).", lic: "GPL-3.0" },
-  xcl: { name: "xcl", desc: "Xbox Series compatibility layer for Windows: runs console code natively and recompiles RDNA2 shaders to DXIL. Original: ivall/xcl.", lic: "GPL-2.0" },
-  victory: { name: "VIctory", desc: "An attempt at running GTA VI on PC. Original: Marvisak/VIctory.", lic: "GPL-3.0" },
-  xbox2windows: { name: "Xbox2Windows", desc: "Static recompilation of Xbox Series X|S software for x64 Windows, with CPU and GPU tests. Original: R0Y00/Xbox2Windows.", lic: "MIT" },
+  "leonida-new": { name: "Leonida (new)", branch: "leonida-new" },
+  "leonida-old": { name: "Leonida (old)", branch: "leonida" },
+  xcl: { name: "xcl", branch: "xcl" },
+  victory: { name: "VIctory", branch: "victory" },
+  xbox2windows: { name: "Xbox2Windows", branch: "xbox2windows" },
 };
 const PAGE = 150;
 const cache = {}, commentCache = {};
-let project = "leonida", shown = PAGE, current = null;
+let project = "leonida-new", shown = PAGE, current = null;
 const $ = id => document.getElementById(id);
 const fmt = n => n.toLocaleString("en-US");
 const esc = s => s.replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
@@ -143,7 +145,7 @@ async function renderDetail(n) {
   document.querySelectorAll(".row").forEach(el => el.setAttribute("aria-current", String(+el.dataset.n === n)));
   const st = status(r);
   const labels = r.l.length ? ` · ${r.l.map(esc).join(", ")}` : "";
-  const branch = r.pr ? ` · <a href="${REPO}/tree/${p}/pr/${n}">code (${p}/pr/${n})</a>` : "";
+  const branch = r.pr ? ` · <a href="${REPO}/tree/${PROJECTS[p].branch}/pr/${n}">code (${PROJECTS[p].branch}/pr/${n})</a>` : "";
   $("detail").innerHTML = `<h3>${esc(r.t)} <span class="meta">#${n}</span></h3>
     <div class="meta"><span class="badge ${st}">${r.pr ? "PR" : "Issue"} · ${st}</span>${esc(r.u)} · ${r.c}${labels}${branch}</div>
     <div class="md">${md(r.b) || '<p class="meta">No description.</p>'}</div><div id="cm"><p class="meta">Loading comments…</p></div>`;
@@ -154,6 +156,7 @@ async function renderDetail(n) {
 }
 
 function route() {
+  if (/^#leonida(\/|$)/.test(location.hash)) { location.replace(location.hash.replace("#leonida", "#leonida-old")); return; } // old links
   const [p, n] = location.hash.slice(1).split("/");
   if (PROJECTS[p] && p !== project) { project = p; shown = PAGE; current = null; tabs(); renderList(); }
   if (n && /^\d+$/.test(n)) renderDetail(+n);

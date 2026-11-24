@@ -1,6 +1,6 @@
 // Synthetic title-level check for the implemented synchronous XUser and
 // XGameSave subset. The DLL is loaded from its explicit fixture path; the
-// negative controls call XPackage/XGame stubs and must remain E_NOTIMPL.
+// negative control calls the XPackage async stub and must remain E_NOTIMPL.
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -74,7 +74,6 @@ using CloseProvider = void(WINAPI*)(XGameSaveProviderHandle);
 using CloseContainer = void(WINAPI*)(XGameSaveContainerHandle);
 using CloseUpdate = void(WINAPI*)(XGameSaveUpdateHandle);
 using PackageMount = HRESULT(WINAPI*)(const char*, XAsyncBlock*);
-using GameGetXboxTitleId = HRESULT(WINAPI*)(std::uint32_t*);
 using GetLog = std::size_t(WINAPI*)(XGameRuntimeShimLogEntry*, std::size_t);
 using ClearLog = void(WINAPI*)();
 
@@ -143,7 +142,6 @@ bool contract_checks(HMODULE module)
     CloseContainer close_container = nullptr;
     CloseUpdate close_update = nullptr;
     PackageMount package_mount = nullptr;
-    GameGetXboxTitleId game_get_title_id = nullptr;
 
     if (!find_proc(module, "XUserFindUserById", find_user) ||
         !find_proc(module, "XUserGetId", get_user_id) ||
@@ -158,8 +156,7 @@ bool contract_checks(HMODULE module)
         !find_proc(module, "XGameSaveCloseProvider", close_provider) ||
         !find_proc(module, "XGameSaveCloseContainer", close_container) ||
         !find_proc(module, "XGameSaveCloseUpdate", close_update) ||
-        !find_proc(module, "XPackageMountWithUiAsync", package_mount) ||
-        !find_proc(module, "XGameGetXboxTitleId", game_get_title_id)) {
+        !find_proc(module, "XPackageMountWithUiAsync", package_mount)) {
         return false;
     }
 
@@ -274,8 +271,7 @@ bool contract_checks(HMODULE module)
     close_user(user);
 
     // The negative controls stay logged stubs, not implemented contracts.
-    if (package_mount(nullptr, nullptr) != not_implemented ||
-        game_get_title_id(nullptr) != not_implemented) {
+    if (package_mount(nullptr, nullptr) != not_implemented) {
         std::printf("FAIL: negative stub result\n");
         return false;
     }
@@ -299,7 +295,6 @@ bool log_checks(HMODULE module, std::size_t expected_calls)
     bool saw_user = false;
     bool saw_save = false;
     bool saw_package = false;
-    bool saw_game = false;
     bool saw_expired_submit = false;
     bool saw_missing_read = false;
     constexpr const char* implemented_names[] = {
@@ -322,9 +317,6 @@ bool log_checks(HMODULE module, std::size_t expected_calls)
         if (std::strcmp(entry.function, "XPackageMountWithUiAsync") == 0) {
             saw_package = entry.result == not_implemented;
         }
-        if (std::strcmp(entry.function, "XGameGetXboxTitleId") == 0) {
-            saw_game = entry.result == not_implemented;
-        }
         if (std::strcmp(entry.function, "XGameSaveSubmitUpdate") == 0 &&
             entry.result == e_gs_handle_expired) {
             saw_expired_submit = true;
@@ -343,7 +335,7 @@ bool log_checks(HMODULE module, std::size_t expected_calls)
             }
         }
     }
-    if (!saw_user || !saw_save || !saw_package || !saw_game || !saw_expired_submit ||
+    if (!saw_user || !saw_save || !saw_package || !saw_expired_submit ||
         !saw_missing_read ||
         std::find(implemented_seen.begin(), implemented_seen.end(), false) != implemented_seen.end()) {
         std::printf("FAIL: log does not contain positive and negative controls\n");
@@ -363,7 +355,7 @@ bool run(const wchar_t* dll_path, const wchar_t* fixture_dir, const wchar_t* nor
     ClearLog clear_log = nullptr;
     const bool has_log = find_proc(module, "XGameRuntimeShimClearLog", clear_log);
     if (has_log) clear_log();
-    const bool passed = has_log && contract_checks(module) && log_checks(module, 35);
+    const bool passed = has_log && contract_checks(module) && log_checks(module, 34);
     FreeLibrary(module);
     return passed;
 }

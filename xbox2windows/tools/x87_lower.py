@@ -25,7 +25,7 @@ The profile accepts:
 A function starts with control word 0x027F, TOP 0, eight empty registers and a clear status word, and
 must return with the stack empty. The stack depth before every instruction is fixed at translation
 time, so each register maps to a C++ slot and no TOP is needed at run time. Translation rejects any x87
-instruction outside the profile (including FLDCW, FNINIT, FBLD, FNSTSW with a memory operand, environment access, a
+instruction outside the profile (including FLDCW, FNINIT, FBLD, FNSTSW with an operand other than AX or an m16, environment access, a
 popping form with ST(0) as the destination, and the undocumented FSTP, FXCH, FCOM and FCOMP alias
 encodings), a stack overflow or underflow, a depth that differs where control flow joins, an x87
 instruction it cannot reach from the entry through direct edges, and x87 state that is live at a call, a
@@ -51,6 +51,15 @@ while AX holds one, except:
 - TEST AH, imm8 and AND AH, imm8 leave ZF, PF and SF undefined when the immediate selects an unknown bit,
   and AND makes the bits it clears known.
 The flag rule then rejects a reader of a flag that an unknown bit left undefined.
+
+FNSTSW m16 (and FSTSW m16, which is WAIT and FNSTSW m16) stores the status word to memory, which cannot
+record an unknown bit, so it is accepted only where every bit but TOP is known on every path from the
+entry: C0 to C3, C1, the exception flags IE to PE, SF, ES and the busy bit. Only FNINIT leaves them all known
+(the whole word is clear), so only the checked entry reaches it, and only through instructions that are not
+x87 (WAIT, FNSTCW, FNSTSW, a comparison and every other x87 instruction leave C0 to C3 undefined, and FCOMI,
+FPREM and FPREM1 may raise an exception flag). Anywhere else the translation is rejected with the unknown
+bits named, and the fixed profile rejects it. The stored word is x87_sw with TOP, which is 8 minus the
+depth, modulo 8, in bits 11 to 13; it is a guest store of two bytes like FNSTCW m16.
 
 The checked entry, lower(..., x87=Checked(reject)), also accepts FLDCW m16. The control word becomes a
 local of the lowered function, and every rounding helper, FNSTCW and the constant loads follow it. FLDCW
@@ -115,6 +124,10 @@ COMPARE_SW = "x87_sw = static_cast<uint16_t>(r == 0 ? 0x0100 : r == 1 ? 0x4000 :
 C_BITS = 0x4500
 C1_BIT = 0x0200
 TOP_BITS = 0x3800
+# IE, DE, ZE, OE, UE, PE, SF and ES (bits 0 to 7) and the busy bit (bit 15): the bits that FNINIT clears and that
+# no other instruction of the profile leaves known. With C0 to C3 they are every bit of the status word but TOP.
+EXCEPTION_BITS = 0x80FF
+STATUS_BITS = C_BITS | C1_BIT | EXCEPTION_BITS
 # The slots and the control word, which the fixed profile keeps at 0x027F.
 DECLARATION = "X87Value x87_slot[8]{}; const uint16_t x87_cw = 0x027f; (void)x87_cw;"
 # The checked entry's control word, which FLDCW changes.
@@ -246,8 +259,9 @@ def _effect(i, depth, checked=None):
         if depth <= i.op1_register - R.ST0:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
         return depth - 1 if op in (M.FCOMIP, M.FUCOMIP) else depth
-    if op == M.FNSTSW:
-        if i.op0_kind != K.REGISTER or i.op0_register != R.AX:
+    if op == M.FNSTSW:  # AX, or an m16 that check_flags accepts only where every status-word bit is known
+        if not (i.op0_kind == K.REGISTER and i.op0_register == R.AX) \
+                and not (i.op0_kind == K.MEMORY and i.memory_size == S.UINT16):
             raise ValueError(f"unsupported x87 operand at {i.ip:#x}: {i}")
         return depth
     if op in STATUS_COMPARES:
@@ -385,8 +399,9 @@ def depths(body, exits, checked=None):
     return depth
 
 
-# Instructions that put a function under the flag and status-word rules.
-GATED = frozenset({*FCMOV, M.FNSTSW, M.SAHF, M.JP, M.JNP})
+# Instructions that put a function under the flag and status-word rules. SETP, SETNP, CMOVP and CMOVNP read PF as
+# JP and JNP do (ffx_version_query.PF_CONSUMERS).
+GATED = frozenset({*FCMOV, M.FNSTSW, M.SAHF, M.JP, M.JNP, M.SETP, M.SETNP, M.CMOVP, M.CMOVNP})
 
 
 # The six status flags. FCMOV reads ZF and CF; DF is not tracked, because the Windows x64 calling
@@ -439,9 +454,9 @@ _INFO = InstructionInfoFactory()
 
 
 def assigns_parity(i):
-    """Whether the integer lowering sets PF for i: SAHF, the FCOMI family, and TEST and AND with an 8-bit
-    destination."""
-    if i.mnemonic == M.SAHF or i.mnemonic in COMPARES:
+    """Whether the integer lowering sets PF for i: SAHF, the FCOMI family, the VEX scalar compares, and TEST and
+    AND with an 8-bit destination."""
+    if i.mnemonic in (M.SAHF, M.VCOMISS, M.VUCOMISS, M.VCOMISD, M.VUCOMISD) or i.mnemonic in COMPARES:
         return True
     if i.mnemonic not in (M.TEST, M.AND):
         return False
@@ -509,17 +524,21 @@ def _after(i, s):
             tainted |= RESULT_FLAGS
         if op == M.AND:  # a cleared bit is known to be 0
             ax |= 0xFF00 & ~immediate
-    elif op == M.FNSTSW:
-        ax = s.c | TOP_BITS
+    elif op == M.FNSTSW and i.op0_kind == K.REGISTER:
+        ax = (s.c & ~EXCEPTION_BITS) | TOP_BITS
     elif call:
         ax = 0xFFFF  # the return value
     else:
         ax |= _ax_access(i)[1]
     if op in STATUS_WRITERS:
         c = C_BITS
-    elif op in REMAINDERS or op == M.FNINIT:  # quotient bits and C2 = 0, or FNINIT clearing C0 to C3
+    elif op == M.FNINIT:  # the whole status word is clear
+        c = STATUS_BITS
+    elif op in REMAINDERS:  # quotient bits and C2 = 0; the exception flags may be raised
         c = C_BITS | C1_BIT
-    elif op in COMPARES or not (is_x87(i) or call):  # FCOMI and integer instructions leave C0, C2 and C3
+    elif op in COMPARES:  # FCOMI leaves C0, C2 and C3, but may raise an exception flag
+        c = s.c & ~EXCEPTION_BITS
+    elif not (is_x87(i) or call):  # integer instructions change none of it
         c = s.c
     else:
         c = 0
@@ -579,6 +598,9 @@ def check_flags(body, exits):
         if i.rflags_read & F.PF and not s.parity:
             raise ValueError(f"{i} at {i.ip:#x} reads PF, which the integer lowering models only after SAHF, "
                              "FCOMI, FCOMIP, FUCOMI, FUCOMIP and an 8-bit TEST or AND")
+        if i.mnemonic == M.FNSTSW and i.op0_kind == K.MEMORY and s.c & STATUS_BITS != STATUS_BITS:
+            raise ValueError(f"{i} at {i.ip:#x} stores status-word bits {_bits(STATUS_BITS & ~s.c)}, which are not "
+                             "known on every path from the entry (only FNINIT leaves all of them known)")
         unknown = 0xFFFF & ~s.ax
         if not unknown:
             continue
@@ -650,6 +672,9 @@ def _statement(i, depth, address, checked, parity, status_word=False):
         return f"if ({FCMOV[op]}) x87_slot[{top}] = x87_slot[{top - k}];  // {name} st({k})"
     if op == M.FNSTSW:  # C0, C2 and C3 of the last comparison, and TOP; the other bits read as 0
         stack_top = (8 - depth) & 7
+        if i.op0_kind == K.MEMORY:  # every bit is known here (check_flags), so the word is exact
+            return (f"{{ const word a = {address()}; store<uint16_t>(a, static_cast<uint16_t>(x87_sw | "
+                    f"{stack_top << 11:#06x})); }}  // fnstsw m16, top {stack_top}")
         return (f"rax = (rax & ~0xffffull) | static_cast<uint16_t>(x87_sw | {stack_top << 11:#06x});  "
                 f"// fnstsw ax, top {stack_top}")
     if op in STATUS_COMPARES:  # C3, C2 and C0: 0 0 1 less, 1 0 0 equal, 0 0 0 greater, 1 1 1 unordered

@@ -4,7 +4,9 @@ Each export takes three integer words in RCX, RDX and R8 and returns RAX. The
 translator follows branches and jump-table entries from the export, so data
 placed after the code (as MSVC does with its tables) is never decoded. An
 indirect JMP is accepted only at the end of one of these sequences, reached by
-the fallthrough of an unsigned bound check on the index:
+the fallthrough of an unsigned bound check on the index (JA or JAE to the default),
+or by the taken branch of the inverted form (JB or JBE to the dispatch block,
+which a JMP to the default precedes and no other edge enters):
 
     mov E32, [B+I*4+table]; add E, B; jmp E   B = image base (MSVC)
     movsxd E, [B+I*4];      add E, B; jmp E   B = table      (LLVM)
@@ -26,6 +28,31 @@ CMOVcc) in one straight-line run that no edge enters. Overflow and low-byte
 parity conditions use the producer operand width, including narrow arithmetic.
 Instructions that leave the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc, and
 CBW, CWDE, CDQE, CDQ and CQO) may sit between them.
+
+SHL, SHR and SAR produce flags only with an immediate count whose masked value
+(five bits, six for a 64-bit operand) is 1 to the operand width minus 1. A count
+of 0 leaves the flags of an earlier instruction, which a shift by CL may do, and
+CF is undefined for SHL and SHR by the operand width or more, so those are
+refused, and SAR by such a count with them. CF is the last bit
+shifted out and ZF, SF and PF come from the result. OF is defined only for a
+count of 1 (MSB of the result XOR CF for SHL, MSB of the operand for SHR, 0 for
+SAR), so O, NO, L, GE, LE and G are refused after a larger count.
+
+BT, BTS, BTR and BTC take a 16-, 32- or 64-bit register or memory bit base and
+a register or immediate bit offset. The offset is taken modulo the operand
+width, except that a register offset into memory addresses a bit string
+outside the operand, which is refused. CF is the selected bit before the
+write; the Intel SDM leaves ZF unaffected and the other flags undefined, so
+only the B and AE conditions may read it.
+
+POPCNT, LZCNT and TZCNT take a 16-, 32- or 64-bit register or memory source.
+LZCNT and TZCNT return the operand width for a zero source. As the Intel SDM
+defines their flags, POPCNT sets ZF for a zero source and clears OF, SF, AF, CF
+and PF, so every condition may read them. LZCNT and TZCNT set CF for a zero
+source and ZF for a zero result and leave OF, SF, AF and PF undefined, so only
+B, AE, E, NE, BE and A may read them. The host must support the instructions
+whose results the original computes: without ABM and BMI1 a processor runs
+LZCNT and TZCNT as BSR and BSF.
 
 One-operand MUL, IMUL, DIV and IDIV and the sign extensions read and write RAX
 and RDX without naming them. Products of up to 32-bit factors are computed in
@@ -180,6 +207,10 @@ MAX_CALLEES = 256
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
 SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
 ROTATES = {M.ROL: "true", M.ROR: "false"}
+# Bit tests, by the C++ operator that writes the selected bit (BT writes nothing).
+BIT_TESTS = {M.BT: None, M.BTS: "|", M.BTR: "& ~", M.BTC: "^"}
+# Bit counts, by the PRELUDE helper that computes each.
+BIT_COUNTS = {M.POPCNT: "count_ones", M.LZCNT: "leading_zeros", M.TZCNT: "trailing_zeros"}
 _CODES = "O NO B AE E NE BE A S NS P NP L GE LE G".split()
 SETCC = {getattr(M, "SET" + code) for code in _CODES}
 CMOVCC = {getattr(M, "CMOV" + code) for code in _CODES}
@@ -198,9 +229,9 @@ STRING_TRANSFERS = {
 }
 # Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
 # which only read them.
-FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
+FLAG_NEUTRAL = {M.CLZERO, M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
                 M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD, M.LEAVE}
-FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG}
+FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS, *BIT_TESTS, *BIT_COUNTS}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
               CC.E: "e", CC.NE: "ne", CC.B: "b", CC.AE: "ae", CC.BE: "be", CC.A: "a",
@@ -695,20 +726,33 @@ class Function:
         else:
             raise ValueError(f"unrecognized table load at RVA {load.ip:#x}")
 
-        # The bound check must fall through into the dispatch block.
+        # The bound check falls through into the dispatch block, or (inverted) branches to it with a
+        # JMP to the default in front of it.
         bound = load
         between = []
+        inverted = False
         while True:
             bound = self.ending.get(bound.ip)
             if bound is None:
                 raise ValueError(f"unbounded jump-table index at RVA {ip:#x}")
             if bound.flow_control == FlowControl.CONDITIONAL_BRANCH:
                 break
+            if (bound.flow_control == FlowControl.UNCONDITIONAL_BRANCH and bound.is_jmp_short_or_near
+                    and not inverted):
+                inverted = True
+                first = between[-1] if between else load
+                bound = self.ending.get(bound.ip)
+                if (bound is None or bound.flow_control != FlowControl.CONDITIONAL_BRANCH
+                        or not bound.is_jcc_short_or_near or bound.near_branch_target != first.ip):
+                    raise ValueError(f"unbounded jump-table index at RVA {ip:#x}")
+                break
             if bound.flow_control != FlowControl.NEXT or len(between) >= 8:
                 raise ValueError(f"unbounded jump-table index at RVA {ip:#x}")
             between.append(bound)
         compare = self.ending.get(bound.ip)
-        if bound.condition_code not in (CC.A, CC.AE):
+        # The branch that enters the table is the one the index passed: JA/JAE when the default is
+        # taken, JB/JBE when the table is.
+        if bound.condition_code not in ((CC.B, CC.BE) if inverted else (CC.A, CC.AE)):
             raise ValueError(f"jump-table bound is not an unsigned upper limit at RVA {bound.ip:#x}")
         if (compare is None or compare.mnemonic != M.CMP or compare.op0_kind != OpKind.REGISTER
                 or compare.op1_kind not in (OpKind.IMMEDIATE8TO32, OpKind.IMMEDIATE8TO64,
@@ -716,7 +760,7 @@ class Function:
                 or RegisterExt.size(compare.op0_register) not in (4, 8)):
             raise ValueError(f"unbounded jump-table index at RVA {bound.ip:#x}")
         limit = compare.immediate(1) & ((1 << RegisterExt.size(compare.op0_register) * 8) - 1)
-        count = limit + 1 if bound.condition_code == CC.A else limit
+        count = limit + 1 if bound.condition_code in (CC.A, CC.BE) else limit
         if not 0 < count <= MAX_CASES:
             raise ValueError(f"unsupported jump-table size {count} at RVA {compare.ip:#x}")
         entries = struct.unpack(f"<{count}{'I' if kind == 'image' else 'i'}",
@@ -730,7 +774,14 @@ class Function:
 
     def prove(self, ip, edges, constants):
         index, _, sequence, window, _, (compare, bound, base, anchor) = self.dispatches[ip]
-        if any(address in edges for address in (bound.ip, *(i.ip for i in window), *sequence, ip)):
+        block = [*(i.ip for i in window), *sequence, ip]
+        if bound.condition_code in (CC.B, CC.BE):
+            # The inverted bound branch is the one way into the block, and it enters at the top.
+            entries = {source for source, targets in self.successors.items() if block[0] in targets}
+            if entries != {bound.ip}:
+                raise ValueError(f"second entry into the dispatch block at RVA {ip:#x}")
+            block = block[1:]
+        if any(address in edges for address in (bound.ip, *block)):
             raise ValueError(f"second entry into the dispatch block at RVA {ip:#x}")
         if constants.get(sequence[0], {}).get(base) != anchor:
             raise ValueError(f"table base {NAMES[base]} differs on another path to RVA {sequence[0]:#x}")
@@ -917,6 +968,29 @@ class Lifter:
 
     def condition(self, producer, jcc):
         code = CONDITIONS.get(jcc.condition_code)
+        if producer.mnemonic in BIT_TESTS:
+            # fb is CF, the selected bit. ZF is unaffected and OF, SF, AF and PF are undefined.
+            if code not in ("b", "ae"):
+                raise ValueError(f"only CF is defined after {str(producer).split()[0].upper()} at RVA {jcc.ip:#x}")
+            return "fb != 0" if code == "b" else "fb == 0"
+        if producer.mnemonic in BIT_COUNTS:
+            # fa is the source and fb the result.
+            source_zero = f"static_cast<{unsigned(self.width(producer))}>(fa) == 0"
+            if producer.mnemonic == M.POPCNT:
+                # ZF is set for a zero source; OF, SF, AF, CF and PF are cleared.
+                table = {"e": source_zero, "be": source_zero, "le": source_zero, "o": "false", "b": "false",
+                         "s": "false", "p": "false", "l": "false"}
+            else:
+                result_zero = f"static_cast<{unsigned(self.width(producer))}>(fb) == 0"
+                table = {"b": source_zero, "e": result_zero, "be": f"{source_zero} || {result_zero}"}
+            for negated, base in (("no", "o"), ("ae", "b"), ("ne", "e"), ("a", "be"), ("ns", "s"), ("np", "p"),
+                                  ("ge", "l"), ("g", "le")):
+                if base in table:
+                    table[negated] = f"!({table[base]})"
+            if code not in table:
+                name = str(producer).split()[0].upper()
+                raise ValueError(f"OF, SF and PF are undefined after {name} at RVA {jcc.ip:#x}")
+            return table[code]
         width = self.width(producer)
         u, s = unsigned(width), signed(width)
         a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
@@ -930,6 +1004,22 @@ class Lifter:
                      "le": f"static_cast<{s}>({a}) <= static_cast<{s}>({b})",
                      "g": f"static_cast<{s}>({a}) > static_cast<{s}>({b})",
                      "s": f"static_cast<{s}>({flag_result}) < 0", "ns": f"static_cast<{s}>({flag_result}) >= 0"}
+        elif producer.mnemonic in SHIFTS:
+            # fa is the result; bit 0 of fb is CF and bit 1 is OF (see lower()).
+            flag_result = f"static_cast<{u}>(fa)"
+            carry, zero = "((fb & 1u) != 0)", f"{flag_result} == 0"
+            s_cond = f"static_cast<{s}>({flag_result}) < 0"
+            table = {"e": zero, "ne": f"{flag_result} != 0", "s": s_cond,
+                     "ns": f"static_cast<{s}>({flag_result}) >= 0",
+                     "b": carry, "ae": f"!{carry}", "be": f"{carry} || {zero}", "a": f"!{carry} && !({zero})"}
+            overflow = None
+            if shift_count(producer) == 1:
+                overflow = "((fb & 2u) != 0)"
+                table.update({"l": f"({s_cond}) != {overflow}", "ge": f"({s_cond}) == {overflow}",
+                              "le": f"{zero} || ({s_cond}) != {overflow}",
+                              "g": f"!({zero}) && ({s_cond}) == {overflow}"})
+            elif code in ("o", "no", "l", "ge", "le", "g"):
+                raise ValueError(f"OF is undefined after a shift by more than 1 at RVA {jcc.ip:#x}")
         else:
             if producer.mnemonic == M.ADD:
                 flag_result = f"static_cast<{u}>({a} + {b})"
@@ -964,8 +1054,9 @@ class Lifter:
                                   "be": "true", "a": "false"})
         # PF is even parity of only the low result byte. OF is signed overflow,
         # independent of the host's signed arithmetic and its overflow rules.
-        table.update({"o": overflow, "no": f"!({overflow})",
-                      "p": f"even_parity({flag_result})", "np": f"!even_parity({flag_result})"})
+        table.update({"p": f"even_parity({flag_result})", "np": f"!even_parity({flag_result})"})
+        if overflow is not None:
+            table.update({"o": overflow, "no": f"!({overflow})"})
         if code not in table:
             raise ValueError(f"unsupported condition after {producer.mnemonic} at RVA {jcc.ip:#x}")
         return table[code]
@@ -982,6 +1073,14 @@ class Lifter:
         sets_flags records the flag inputs for a later consumer; producer is the
         instruction whose flags a SETcc or CMOVcc reads."""
         mnemonic = ins.mnemonic
+        if mnemonic == M.CLZERO:
+            if ins.len != 3:
+                raise ValueError(f"unsupported CLZERO prefix or address size at RVA {ins.ip:#x}")
+            address = self.reg(R.RAX)
+            # One aligned cache line per executed instruction. Volatile retains writes
+            # even when a following iteration or caller overwrites the same line.
+            return (f"{{ auto* line = reinterpret_cast<volatile unsigned char*>({address} & ~63ull); "
+                    "for (unsigned i = 0; i < 64; ++i) line[i] = 0; }", {R.RAX: 8}, {})
         if ins.code in STRING_TRANSFERS:
             kind, width = STRING_TRANSFERS[ins.code]
             if (ins.has_segment_prefix or ins.has_repne_prefix or ins.has_lock_prefix
@@ -1091,11 +1190,46 @@ class Lifter:
                 self.flags = True
                 line = f"fa = static_cast<{unsigned(width)}>({value}); " + line
             return line, reads, writes
+        if mnemonic in BIT_TESTS:
+            if ins.op0_kind == OpKind.MEMORY and ins.op1_kind == OpKind.REGISTER:
+                raise ValueError(f"unsupported bit-string operand at RVA {ins.ip:#x}")
+            note(0, 1)
+            bits = width * 8
+            a = self.operand(ins, 0, width)
+            offset = (f"(static_cast<std::uint64_t>({self.operand(ins, 1, width)}) & {bits - 1}u)"
+                      if ins.op1_kind == OpKind.REGISTER else f"{ins.immediate(1) & (bits - 1)}u")
+            lines = []
+            if sets_flags:
+                self.flags = True
+                lines.append(f"fb = (static_cast<std::uint64_t>({a}) >> {offset}) & 1u;")
+            if mnemonic == M.BT:
+                writes.clear()
+            else:
+                lines.append(self.write(ins, width, f"{a} {BIT_TESTS[mnemonic]}(1ull << {offset})"))
+            return " ".join(lines), reads, writes
+        if mnemonic in BIT_COUNTS:
+            note(1)
+            source = self.operand(ins, 1, width)
+            value = f"{BIT_COUNTS[mnemonic]}<{unsigned(width)}>({source})"
+            if not sets_flags:
+                return self.write(ins, width, value), reads, writes
+            self.flags = True
+            return (f"fa = {source}; fb = {value}; " + self.write(ins, width, "fb")), reads, writes
         if mnemonic in (*SHIFTS, *ROTATES):
             if sets_flags:
-                raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}")
+                if mnemonic in ROTATES:
+                    raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}")
+                if ins.op1_kind == OpKind.REGISTER:
+                    # A masked count of 0 leaves the flags unchanged, so they may come from an earlier instruction.
+                    raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}: a shift by CL may leave the flags unchanged")
+                if shift_count(ins) == 0:
+                    raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}: a zero-count shift leaves the flags unchanged")
+                if shift_count(ins) >= width * 8:
+                    # CF is undefined for SHL and SHR (Intel SDM, SAL/SAR/SHL/SHR); SAR is refused with them.
+                    raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}: "
+                                     "a shift by the operand width or more (CF is undefined for SHL and SHR)")
             note(0)
-            a = self.operand(ins, 0, width)
+            a = source = self.operand(ins, 0, width)
             # x86 masks the count to six bits for 64-bit operands and to five bits otherwise.
             # Shifts widen to 64 bits (count < 64, no host overflow) and truncate on write;
             # rotates mask modulo the operand width inside rotate_bits.
@@ -1115,6 +1249,19 @@ class Lifter:
                 else:
                     a = f"static_cast<std::uint64_t>({a})"
                 value = f"{a} {SHIFTS[mnemonic]} {count}"
+            if sets_flags:
+                # CF is the last bit shifted out. OF, defined only for a count of 1, is the MSB of the
+                # result XOR CF for SHL, the MSB of the operand for SHR and 0 for SAR.
+                self.flags = True
+                bits, n, wide = width * 8, shift_count(ins), f"static_cast<std::uint64_t>({source})"
+                carry = f"(({wide} >> {bits - n if mnemonic == M.SHL else n - 1}) & 1u)"
+                overflow = "0u"
+                if n == 1 and mnemonic == M.SHL:
+                    overflow = f"((({wide} >> {bits - 1}) ^ ({wide} >> {bits - 2})) & 1u)"
+                elif n == 1 and mnemonic == M.SHR:
+                    overflow = f"(({wide} >> {bits - 1}) & 1u)"
+                return (f"fa = static_cast<{unsigned(width)}>({value}); fb = {carry} | ({overflow} << 1); "
+                        + self.write(ins, width, "fa")), reads, writes
             return self.write(ins, width, value), reads, writes
         if mnemonic == M.IMUL and ins.op_count in (2, 3):
             # The two-operand form reads its destination; the three-operand form only writes it.
@@ -1207,6 +1354,12 @@ class Lifter:
             # Which bytes of RAX are a return value is decided by the definedness pass in lift().
             return "return rax;", {}, {}
         raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
+
+
+def shift_count(ins):
+    """The immediate count of a shift, masked as x86 does: to six bits for a 64-bit operand, else five."""
+    width = RegisterExt.size(ins.op0_register) if ins.op0_kind == OpKind.REGISTER else _memory_width(ins)
+    return ins.immediate(1) & (63 if width == 8 else 31)
 
 
 def _memory_width(ins):
@@ -1877,6 +2030,22 @@ template <class T> static inline T rotate_bits(T value, word count, bool left) {
     const unsigned amount = left ? shift : bits - shift;
     const word wide = value;
     return static_cast<T>((wide << amount) | (wide >> (bits - amount)));
+}
+// POPCNT, LZCNT and TZCNT, at the width of T; LZCNT and TZCNT of 0 are the width.
+template <class T> static inline T count_ones(T value) {
+    unsigned count = 0;
+    for (word bits = value; bits != 0; bits &= bits - 1) ++count;
+    return static_cast<T>(count);
+}
+template <class T> static inline T leading_zeros(T value) {
+    unsigned count = 0;
+    while (count < sizeof(T) * 8 && ((static_cast<word>(value) >> (sizeof(T) * 8 - 1 - count)) & 1u) == 0) ++count;
+    return static_cast<T>(count);
+}
+template <class T> static inline T trailing_zeros(T value) {
+    unsigned count = 0;
+    while (count < sizeof(T) * 8 && ((static_cast<word>(value) >> count) & 1u) == 0) ++count;
+    return static_cast<T>(count);
 }
 // A read of the function's own frame array, which cannot fault.
 template <class T> static T load(word address) {

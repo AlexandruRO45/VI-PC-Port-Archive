@@ -56,6 +56,28 @@ def check_sampler_dimensions(directory):
         validate_sampler(directory, f"{texture}_split", lowered)
         print(f"{texture}: shared and split SPIR-V validated")
 
+def check_phi_parent(directory, tool, direct):
+    """An atomic splits its block, so a phi in a successor must name the block that now ends in the branch."""
+    source = (direct
+        .replace("%main = OpFunction",
+                 "%atomic_rmw = OpConstant %uint 72\n"
+                 "%main = OpFunction", 1)
+        .replace("OpStore %p2 %d Aligned 4",
+                 "%old_add = OpAtomicIAdd %uint %p1 %c1 %atomic_rmw %d\n"
+                 "OpBranch %next\n"
+                 "%next = OpLabel\n"
+                 "%carried = OpPhi %uint %old_add %entry\n"
+                 "OpStore %p2 %carried Aligned 4", 1))
+    assert "%carried = OpPhi" in source
+    path = Path(directory) / "phi_parent.spvasm"
+    path.write_text(source, encoding="utf-8")
+    target = Path(directory) / "phi_parent.spv"
+    # The tool assembles and validates the lowered module, so a stale phi parent fails here.
+    subprocess.run([*tool, path, target], check=True)
+    assert target.read_bytes()[:4] == bytes.fromhex("03022307")
+    assert "%carried = OpPhi %uint %old_add %x2w_atomic_old_add_merge" in window.lower(source).splitlines()
+
+
 fixture = Path(__file__).with_name("subtract.spvasm")
 original = fixture.read_text(encoding="utf-8")
 adapted = window.lower(original)
@@ -72,6 +94,24 @@ direct = original.replace(
 )
 assert direct != original
 assert "%x2w_address_p1_low = OpBitwiseAnd %ulong %a1 %x2w_mask" in window.lower(direct).splitlines()
+
+# Exercise atomics on both a direct word cast and an indexed physical address.
+atomic_instructions = (
+    "%old_add = OpAtomicIAdd %uint %p1 %c1 %atomic_rmw %d",
+    "%old_exchange = OpAtomicExchange %uint %p2 %c1 %atomic_rmw %old_add",
+    "%old_min = OpAtomicUMin %uint %p2 %c1 %atomic_rmw %old_exchange",
+    "%old_max = OpAtomicUMax %uint %p2 %c1 %atomic_rmw %old_min",
+    "%old_and = OpAtomicAnd %uint %p2 %c1 %atomic_rmw %old_max",
+    "%old_or = OpAtomicOr %uint %p2 %c1 %atomic_rmw %old_and",
+    "%old_xor = OpAtomicXor %uint %p2 %c1 %atomic_rmw %old_or",
+    "%old_cmp = OpAtomicCompareExchange %uint %p2 %c1 %atomic_rmw %atomic_fail %d %old_xor",
+)
+atomics = (direct
+    .replace("%main = OpFunction",
+             "%atomic_rmw = OpConstant %uint 72\n"  # AcquireRelease | UniformMemory
+             "%atomic_fail = OpConstant %uint 66\n"  # Acquire | UniformMemory
+             "%main = OpFunction", 1)
+    .replace("OpStore %p2 %d Aligned 4", "\n".join(atomic_instructions) + "\nOpStore %p0 %old_cmp Aligned 4", 1))
 
 # Add a ballot read whose bit controls the value written through the physical address.
 combined = (original
@@ -93,6 +133,7 @@ for source, reason in (
      "descriptor sets"),
     (original.replace("OpStore %p2 %d", "%leak = OpConvertPtrToU %ulong %p2\nOpStore %p2 %d"),
      "physical word pointer"),
+    (atomics.replace("OpAtomicIAdd", "OpAtomicISub"), "physical word pointer"),
     (original.replace("OpTypePointer PhysicalStorageBuffer %uint", "OpTypePointer PhysicalStorageBuffer %ulong"),
      "scalar layout"),
     (original.replace("OpDecorate %UserData Block",
@@ -115,6 +156,106 @@ for source, reason in (
     else:
         raise AssertionError(f"accepted invalid profile: {reason}")
 
+# A bounded 64-bit access is two DWORD accesses inside one branch taken only for an aligned, in-window, non-wrapping
+# address; the plain-access substitute index is never used for it.
+qword = fixture.with_name("qword.spvasm").read_text(encoding="utf-8")
+
+
+def check_qword_lowering(text):
+    lines = text.splitlines()
+    assert "OpConvertUToPtr" not in text and "PhysicalStorageBuffer" not in text
+    assert lines.count("%x2w_mask_wide = OpConstant %ulong 7") == 1
+    assert lines.count("%x2w_end_wide = OpConstant %ulong 4294967288") == 1
+    assert lines.count("%x2w_shift_wide = OpConstant %uint 3") == 1
+    assert not any("_selected" in line and "x2w_address_source" in line or "x2w_address_target_selected" in line
+                   for line in lines)
+
+    def block(stem, condition):
+        # The branch that guards a QWORD access, and the instructions that run only inside it.
+        at = lines.index(f"{stem}_issue = OpLabel")
+        assert lines[at - 2] == f"OpSelectionMerge {stem}_merge None"
+        assert lines[at - 1] == f"OpBranchConditional {condition} {stem}_issue {stem}_merge"
+        end = lines.index(f"OpBranch {stem}_merge")
+        assert lines[end + 1] == f"{stem}_merge = OpLabel"
+        return lines[at + 1:end]
+
+    # The indexed source is checked for wrap-around; the direct target has no index addition to wrap.
+    assert "%x2w_address_source_nowrap = OpUGreaterThanEqual %bool %x2w_address_source_address %base" in lines
+    assert "%x2w_address_target_checked" not in text
+    load = block("%x2w_load_value", "%x2w_address_source_checked")
+    assert load[:3] == ["%x2w_load_value_next = OpIAdd %uint %x2w_address_source_word %x2w_one",
+                        "%x2w_load_value_low_ptr = OpAccessChain %_ptr_PSB_uint %x2w_heap %c0 %x2w_address_source_word",
+                        "%x2w_load_value_high_ptr = OpAccessChain %_ptr_PSB_uint %x2w_heap %c0 %x2w_load_value_next"]
+    assert "%x2w_load_value_low = OpLoad %uint %x2w_load_value_low_ptr" in load
+    assert "%x2w_load_value_high = OpLoad %uint %x2w_load_value_high_ptr" in load
+    assert "%x2w_load_value_high_shifted = OpShiftLeftLogical %ulong %x2w_load_value_high64 %x2w_shift_half" in load
+    assert "%value = OpPhi %ulong %x2w_load_value_value %x2w_load_value_issue %x2w_zero64 %entry" in lines
+    stores = [line for line in lines if line.startswith("OpStore %x2w_store_")]
+    store = block(next(line.split()[1].rsplit("_low_ptr", 1)[0] for line in stores if "_low_ptr" in line),
+                  "%x2w_address_target_valid")
+    assert len(stores) == 2 and all(line in store for line in stores)
+    assert stores[0].split()[1].endswith("_low_ptr") and stores[1].split()[1].endswith("_high_ptr")
+    assert [line for line in lines if line.startswith("OpStore ")] == stores
+
+
+qword_lowered = window.lower(qword)
+check_qword_lowering(qword_lowered)
+# Each mutation of the lowering breaks a different part of that contract and must be caught.
+for mutation, (old, new) in {
+    "DWORD alignment": ("%x2w_mask_wide = OpConstant %ulong 7", "%x2w_mask_wide = OpConstant %ulong 3"),
+    "window end": ("%x2w_end_wide = OpConstant %ulong 4294967288", "%x2w_end_wide = OpConstant %ulong 4294967292"),
+    "wrap guard": ("OpBranchConditional %x2w_address_source_checked", "OpBranchConditional %x2w_address_source_valid"),
+    "store guard": ("OpBranchConditional %x2w_address_target_valid", "OpBranchConditional %x2w_address_target_range"),
+    "halves swapped": ("%x2w_load_value_low = OpLoad %uint %x2w_load_value_low_ptr",
+                       "%x2w_load_value_low = OpLoad %uint %x2w_load_value_high_ptr"),
+    "load result outside the branch": ("%x2w_zero64 %entry", "%x2w_load_value_value %entry"),
+}.items():
+    assert qword_lowered.count(old) == 1, mutation
+    try:
+        check_qword_lowering(qword_lowered.replace(old, new))
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError(f"QWORD lowering mutation not caught: {mutation}")
+
+# A successor phi that names the block holding a QWORD access must follow the block's terminator into the merge block.
+phi_qword = qword.replace("OpReturn\nOpFunctionEnd", "OpBranch %exit\n%exit = OpLabel\n"
+                          "%copied = OpPhi %ulong %result %entry\nOpStore %target %copied Aligned 8\nOpReturn\nOpFunctionEnd")
+assert phi_qword != qword
+with tempfile.TemporaryDirectory() as folder:
+    validate_sampler(Path(folder), "phi_qword_original", phi_qword)
+    phi_lowered = window.lower(phi_qword)
+    assert "%copied = OpPhi %ulong %result %x2w_store_2_merge" in phi_lowered.splitlines()
+    validate_sampler(Path(folder), "phi_qword_lowered", phi_lowered)
+
+    mixed = phi_qword.replace("OpBranch %exit\n",
+                              "%atomic_ptr = OpConvertUToPtr %_ptr_PSB_uint %base\n"
+                              "%old_word = OpAtomicIAdd %uint %atomic_ptr %c1 %c0 %c1\nOpBranch %exit\n")
+    assert mixed != phi_qword
+    validate_sampler(Path(folder), "phi_mixed_original", mixed)
+    mixed_lowered = window.lower(mixed)
+    assert "%copied = OpPhi %ulong %result %x2w_atomic_old_word_merge" in mixed_lowered.splitlines()
+    validate_sampler(Path(folder), "phi_mixed_lowered", mixed_lowered)
+
+for source, reason in (
+    (qword.replace("%value = OpLoad %ulong %source Aligned 8", "%value = OpAtomicIAdd %ulong %source %c1 %c0 %increment"),
+     "physical word pointer"),
+    (qword.replace("%value = OpLoad %ulong %source Aligned 8", "%value = OpLoad %ulong %source Aligned 4"),
+     "physical word pointer"),
+    (qword.replace("OpStore %target %result Aligned 8", "OpStore %target %result Volatile"), "physical word pointer"),
+    (qword.replace("OpStore %target", "%leak = OpConvertPtrToU %ulong %target\nOpStore %target"), "physical word pointer"),
+    (qword.replace("%array = OpConvertUToPtr %_ptr_PSB_arr64", "%array = OpConvertUToPtr %_ptr_PSB_arr"),
+     "unknown physical array pointer"),
+    (qword.replace("%_ptr_PSB_ulong = OpTypePointer PhysicalStorageBuffer %ulong", ""), "scalar layout"),
+    (qword.replace("OpDecorate %rt_ulong ArrayStride 8", "OpDecorate %rt_ulong ArrayStride 4"), "scalar layout"),
+):
+    try:
+        window.lower(source)
+    except ValueError as error:
+        assert reason in str(error), error
+    else:
+        raise AssertionError(f"accepted invalid QWORD profile: {reason}")
+
 output = ROOT / "out"
 output.mkdir(exist_ok=True)
 with tempfile.TemporaryDirectory(dir=output) as directory:
@@ -132,7 +273,8 @@ with tempfile.TemporaryDirectory(dir=output) as directory:
     # This input name previously overlapped the temporaries for %ballot_bit.
     renamed = combined.replace("%p2 ", "%ballot_ballot_bit ")
     assert renamed != combined
-    for label, source in (("combined", combined), ("renamed_pointer", renamed), ("direct", direct)):
+    for label, source in (("combined", combined), ("renamed_pointer", renamed), ("direct", direct),
+                          ("atomics", atomics), ("qword", qword)):
         mixed = Path(directory) / f"{label}.spvasm"
         mixed.write_text(source, encoding="utf-8")
         mixed_target = Path(directory) / f"{label}.spv"
@@ -142,4 +284,27 @@ with tempfile.TemporaryDirectory(dir=output) as directory:
     assert "OpMemoryModel Logical GLSL450" in lowered
     assert "OpGroupNonUniformBallotBitExtract" not in lowered
     assert "OpConvertUToPtr" not in lowered
-print("physical, logical and combined SPIR-V validated; rejection cases passed")
+
+    check_phi_parent(directory, tool, direct)
+
+    lowered_atomics = window.lower(atomics).splitlines()
+    for pointer in ("p1", "p2"):
+        assert any(line.startswith(f"%{pointer} = OpAccessChain ")
+                   and line.endswith(f"%x2w_heap %c0 %x2w_address_{pointer}_selected")
+                   for line in lowered_atomics)
+    # Each atomic keeps its operands, scope and semantics, but issues only in a branch taken for a valid address; the
+    # result is a phi of that atomic's old value and zero, so an invalid address issues nothing.
+    issued = [line for line in lowered_atomics if " = OpAtomic" in line]
+    assert len(issued) == len(atomic_instructions)
+    for line, original_line in zip(issued, atomic_instructions):
+        result, rest = original_line.split(" = ", 1)
+        stem = "%x2w_atomic_" + result[1:]
+        assert line == f"{stem}_old = {rest}", line
+        at = lowered_atomics.index(line)
+        pointer = original_line.split()[4]
+        assert lowered_atomics[at - 1] == f"{stem}_issue = OpLabel"
+        assert lowered_atomics[at - 2].startswith("OpBranchConditional %x2w_address_" + pointer[1:])
+        assert lowered_atomics[at - 3] == f"OpSelectionMerge {stem}_merge None"
+        assert lowered_atomics[at + 1] == f"OpBranch {stem}_merge"
+        assert lowered_atomics[at + 3].startswith(f"{result} = OpPhi %uint {stem}_old {stem}_issue %c0 ")
+print("physical, logical and combined SPIR-V validated; 8 atomics, bounded QWORD accesses and rejection cases passed")

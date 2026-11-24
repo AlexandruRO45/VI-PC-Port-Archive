@@ -158,9 +158,9 @@ def check_scalar_float():
         groups.setdefault(group, set()).add(form)
     assert not [form for form in forms if not fc.x64_forms({form}, reference)]
     assert groups["SSE"] == {"movss", "movaps", "addss", "subss", "mulss", "divss", "cvtsi2ss", "cvttss2si",
-                             "ucomiss", "comiss", "xorps"}, sorted(groups["SSE"])
+                             "ucomiss", "comiss", "xorps", "minss", "maxss", "sqrtss"}, sorted(groups["SSE"])
     assert groups["SSE2"] == {"addsd", "subsd", "mulsd", "divsd", "cvtsi2sd", "cvttsd2si", "cvtss2sd", "cvtsd2ss",
-                              "ucomisd", "comisd", "xorpd"}, sorted(groups["SSE2"])
+                              "ucomisd", "comisd", "xorpd", "minsd", "maxsd", "sqrtsd"}, sorted(groups["SSE2"])
     # The reference files a mnemonic under its oldest encoding, so these three sit outside both groups.
     assert groups["MMX"] == {"movd", "movq", "pxor"} and "movsd" in groups["Integer"]
     with tempfile.TemporaryDirectory() as tmp:
@@ -177,7 +177,7 @@ def check_scalar_float():
     # In the real repository the fixture is classified and counts with its own test only.
     real = fc.measure({"cpu_aot_scalar_float": "pass"})
     assert real["fixtures"]["scalar_float.asm"] == "pass" and "scalar_float.asm" not in real["unclassified"]
-    assert [real["x64_zen2"]["groups"][group]["covered"] for group in ("SSE", "SSE2")] == [11, 11]
+    assert [real["x64_zen2"]["groups"][group]["covered"] for group in ("SSE", "SSE2")] == [14, 14]
     assert fc.measure({"cpu_aot_jump_tables": "pass"})["x64_zen2"]["groups"]["SSE"]["covered"] == 0
 
 
@@ -336,6 +336,8 @@ def check_shader_records():
     sop2_absdiff_forms = {
         ("SOP2", "s_absdiff_i32"),
     }
+    sop1_scalar_alu_forms = {("SOP1", op) for op in pixel.SCALAR_ALU_SOP1_OPS}
+    sop2_scalar_alu_forms = {("SOP2", op) for op in pixel.SCALAR_ALU_SOP2_OPS}
     rejected_forms = {
         "s_or_saveexec_b64", "s_andn2_saveexec_b64", "s_and_saveexec_b32",
         "v_mul_i32_i24_sdwa",
@@ -364,6 +366,10 @@ def check_shader_records():
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
         assert sop2_absdiff_forms <= covered, (name, sop2_absdiff_forms - covered)
+        assert sop1_scalar_alu_forms <= covered, (name, sop1_scalar_alu_forms - covered)
+        assert sop2_scalar_alu_forms <= covered, (name, sop2_scalar_alu_forms - covered)
+        stripped = pixel.ACCEPTED - set(pixel.SCALAR_ALU_OPS)
+        assert not sop2_scalar_alu_forms & fc.gfx_forms(stripped, fc.load_reference(name)), name
         assert pack_int16_forms <= covered, (name, pack_int16_forms - covered)
         assert pack_b32_forms <= covered, (name, pack_b32_forms - covered)
         # v_mac_f32 is in the gfx1013 list only.
@@ -599,6 +605,38 @@ def check_f16_round_forms():
         pixel.ACCEPTED.update(saved)
 
 
+def check_f16_fmac_ldexp_forms():
+    """The two plain e32 binary16 forms v_fmac_f16 and v_ldexp_f16 count as covered once the translator accepts their
+    fixtures; their e64, DPP and SDWA spellings and the arithmetic they resemble stay uncovered."""
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for key in pixel.F16_FMAC_LDEXP_PROGRAMS:
+            pixel.translate_f16(pixel.f16_fmac_ldexp_program(*key))
+        forms = {("VOP2", "v_fmac_f16"), ("VOP2", "v_ldexp_f16")}
+        neighbours = {("VOP3", "v_fmac_f16_e64"), ("VOP3", "v_ldexp_f16_e64"), ("SDWA", "v_ldexp_f16_sdwa"),
+                      ("DPP16", "v_fmac_f16_dpp"), ("DPP16", "v_ldexp_f16_dpp"), ("DPP8", "v_fmac_f16_dpp"),
+                      ("DPP8", "v_ldexp_f16_dpp"), ("VOP2", "v_pk_fmac_f16"), ("VOP2", "v_add_f16")}
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, forms - reference)
+            assert neighbours <= reference, (name, neighbours - reference)
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, forms - covered)
+            assert not neighbours & covered, (name, neighbours & covered)
+        # Without the fixtures neither form is covered, not even through the binary16 arithmetic and rounding ones.
+        pixel.ACCEPTED.clear()
+        for key in pixel.F16_ARITH_PROGRAMS:
+            pixel.translate_f16(pixel.f16_arith_program(*key))
+        for key in pixel.F16_ROUND_PROGRAMS:
+            pixel.translate_f16(pixel.f16_round_program(*key))
+        assert not forms & fc.gfx_forms(pixel.ACCEPTED, fc.load_reference("gfx1013.tsv"))
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
 def check_f16_cvt_int16_forms():
     """The four integer to binary16 conversion forms (e32 and e64 spellings of v_cvt_f16_i16 and v_cvt_f16_u16) count as
     covered once the translator accepts their fixtures; the normalizing conversions v_cvt_norm_i16_f16 and v_cvt_norm_u16_f16 and
@@ -775,7 +813,9 @@ def check_junit_errors():
     The record window needs one CTest run, so a merged <testsuites> file is refused rather than guessed."""
     import subprocess
     tool = Path(fc.__file__)
-    valid = '<testsuite time="1" timestamp="2026-11-21T21:05:21"><testcase name="a" status="run"/></testsuite>'
+    passed = '<testcase name="a" status="run"/>'
+    failed = '<testcase name="a" status="fail"><failure/></testcase>'
+    valid = f'<testsuite time="1" timestamp="2026-11-21T21:05:21">{passed}</testsuite>'
     cases = {
         "missing.xml": (None, "No such file"),
         "malformed.xml": ("not xml", "syntax error: line 1, column 0"),
@@ -785,6 +825,12 @@ def check_junit_errors():
         "bad_time.xml": ('<testsuite time="soon" timestamp="2026-11-21T21:05:21"/>', "time"),
         "valid.xml": (valid, None),
     }
+    # Names from different CTest directories can be identical. Neither order
+    # can identify which test produced the name-keyed coverage record.
+    for label, cases_xml in (("fail_then_pass", failed + passed), ("pass_then_fail", passed + failed)):
+        cases[f"duplicate_{label}.xml"] = (
+            valid.replace(passed, cases_xml), "duplicate CTest <testcase> name 'a'",
+        )
     cases.update({
         f"time_{value}.xml": (valid.replace('time="1"', f'time="{value}"'), "finite and nonnegative")
         for value in ("nan", "inf", "-1")
@@ -1211,6 +1257,7 @@ if __name__ == "__main__":
     check_int16_ternary_forms()
     check_f16_arith_forms()
     check_f16_round_forms()
+    check_f16_fmac_ldexp_forms()
     check_f16_cvt_int16_forms()
     check_f16_to_int16_forms()
     check_swap_coverage()

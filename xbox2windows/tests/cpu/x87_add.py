@@ -485,7 +485,7 @@ def check_rejections():
         "the profile off (default)": (attempt(f"{fld} {fstp} c3", x87=False), "unsupported query operation"),
         "fbld m80": (attempt(f"{fld} df 21 de c1 {fstp} c3"), "unsupported x87 operation"),
         "fsin": (attempt(f"{fld} d9 fe {fstp} c3"), "unsupported x87 operation"),
-        "fnstsw m16": (attempt(f"{fld} dd 3a {fstp} c3"), "unsupported x87 operand"),
+        "fnstsw m16": (attempt(f"{fld} dd 3a {fstp} c3"), "stores status-word bits"),
         "fldcw": (attempt(f"d9 29 {fld} {fstp} c3"), "fldcw"),
         "fninit": (attempt(f"{fld} db e3 {fstp} c3"), "unsupported x87 operation"),
         "ffree st(1)": (attempt(f"{fld} dd c1 {fstp} c3"), "unsupported x87 operation"),

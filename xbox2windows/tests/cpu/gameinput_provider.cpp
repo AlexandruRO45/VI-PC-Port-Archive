@@ -68,10 +68,10 @@ struct DeviceInfoHead {  // GameInputDeviceInfo up to and including deviceRootId
     std::uint8_t deviceRootId[32];
     std::uint32_t deviceFamily, capabilities, supportedInput, supportedRumbleMotors;
 };
-static_assert(sizeof(KeyState) == 12);
-static_assert(sizeof(GamepadState) == 28);
-static_assert(sizeof(RumbleParams) == 16);
-static_assert(offsetof(DeviceInfoHead, deviceId) == 0x20);
+static_assert(sizeof(KeyState) == 12, "KeyState layout");
+static_assert(sizeof(GamepadState) == 28, "GamepadState layout");
+static_assert(sizeof(RumbleParams) == 16, "RumbleParams layout");
+static_assert(offsetof(DeviceInfoHead, deviceId) == 0x20, "DeviceInfoHead layout");
 
 using DeviceCallback = void(__stdcall*)(std::uint64_t token, void* context, void* device, std::uint64_t timestamp,
                                         std::uint32_t current_status, std::uint32_t previous_status);

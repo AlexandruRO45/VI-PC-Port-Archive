@@ -9,6 +9,27 @@ from pixel_aot import container_code, disassemble
 from resource_inventory import parts
 
 
+# Coverage comparisons: the compare kills the lanes for which it is true, so
+# the generated discard uses the same relation with the scalar limit first.
+KILL_RELATIONS = {"lt": "<", "le": "<=", "gt": ">", "ge": ">="}
+# Both the VOP2 (e32) and the VOP3 (e64) spellings are accepted. Only the plain
+# register form is lowered: the e64 encoding also carries clamp, output scale
+# and input negate or absolute value, which the lowering does not model.
+FORMS = ("e32", "e64")
+SAMPLED_PRODUCTS = tuple(
+    f"v_mul{kind}_f32_{form}" for kind in ("_legacy", "") for form in FORMS
+)
+COVERAGE_COMPARES = tuple(
+    f"v_cmpx_{name}_f32_{form}" for name in KILL_RELATIONS for form in FORMS
+)
+
+
+def plain(bank, *tokens):
+    # One unmodified register of the bank, so a modifier suffix or prefix, a
+    # special register or an inline constant is rejected rather than ignored.
+    return all(re.fullmatch(bank + r"\d+", token) for token in tokens)
+
+
 def regs(token, bank, width):
     match = re.fullmatch(bank + r"\[(\d+):(\d+)\]", token)
     if not match:
@@ -230,7 +251,11 @@ def lower(decoded, bindings):
             )
             pending_sample.add(match[1])
             samples += 1
-        elif op == "v_mul_legacy_f32_e32":
+        elif op in SAMPLED_PRODUCTS:
+            if len(args) != 3 or not (
+                plain("v", args[0], args[2]) and plain("s", args[1])
+            ):
+                raise ValueError("Unsupported multiply operands or modifiers")
             dst, src, v = args
             scale, value = read(src), vector[v]
             if (
@@ -242,8 +267,12 @@ def lower(decoded, bindings):
                 or value[0] != "sample"
             ):
                 raise ValueError("Unresolved sampled product")
-            vector[dst] = ("product", scale[1], value[1])
-        elif op == "v_cmpx_gt_f32_e32":
+            # The legacy multiply returns zero when either input is zero; the
+            # IEEE multiply keeps NaN for zero times infinity.
+            vector[dst] = ("product", scale[1], value[1], op.startswith("v_mul_legacy_"))
+        elif op in COVERAGE_COMPARES:
+            if len(args) != 2 or not (plain("s", args[0]) and plain("v", args[1])):
+                raise ValueError("Unsupported compare operands or modifiers")
             limit, product = read(args[0]), vector[args[1]]
             if (
                 pending
@@ -257,15 +286,21 @@ def lower(decoded, bindings):
             ):
                 raise ValueError("Unresolved coverage predicate")
             coverage_exit(decoded[i + 1 :], scalar)
-            _, scale, sampled = product
+            _, scale, sampled, legacy = product
+            relation = KILL_RELATIONS[op.split("_")[2]]
+            multiply = (
+                f"({scale} == 0 || alpha == 0) ? 0.0f : {scale} * alpha"
+                if legacy
+                else f"{scale} * alpha"
+            )
             return f"""Texture2D<float4> tex0 : register(t0);
 Texture2D<float4> tex1 : register(t1);
 SamplerState samp : register(s0);
 cbuffer Constants : register(b0) {{ float4 params[16]; }};
 void main(float2 uv : TEXCOORD0) {{
     float alpha = {sampled};
-    precise float product = ({scale} == 0 || alpha == 0) ? 0.0f : {scale} * alpha;
-    if ({limit[1]} > product) discard;
+    precise float product = {multiply};
+    if ({limit[1]} {relation} product) discard;
 }}
 """
         else:

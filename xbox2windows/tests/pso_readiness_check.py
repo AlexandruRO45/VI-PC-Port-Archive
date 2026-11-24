@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from mesh_entry_check import PROGRAM, enumerate_pcs
 from pixel_aot_check import assembly
 from pso_readiness import report
 
@@ -128,19 +129,102 @@ def check_scanner_tracks_pixel_aot():
     assert not is_instruction_supported("v_not_b32 v0, -v1")
 
 
+def check_mesh():
+    code = b"synthetic mesh"
+    mesh = {"stage": "mesh", "sha256": hashlib.sha256(code).hexdigest()}
+    manifest = {"shaders": [dict(mesh, native_file="mesh.bin")]}
+    pipelines = {"pipelines": [
+        {"id": "mesh", "effective_root_signature": "present", "shaders": [mesh]},
+        {"id": "mesh-unknown-root", "effective_root_signature": "unknown", "shaders": [mesh]},
+    ]}
+    invalid_alloc = ["s_mov_b32 m0, 0" if op == "s_mov_b32 m0, s7" else op for op in PROGRAM]
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "mesh.bin").write_bytes(code)
+        for decoded, stage_status, pipeline_status, detail in (
+                (enumerate_pcs(PROGRAM), "mesh_lowering_passed", "needs_pso_validation", None),
+                (enumerate_pcs(invalid_alloc), "mesh_lowering_rejected", "blocked",
+                 "Expected a single three-vertex triangle"),
+                ([(0, "s_mov_b32 m0, s99")], "mesh_lowering_rejected", "blocked", "99"),
+                ([], "disassembly_failed", "blocked", "empty instruction stream"),
+                (ValueError("Unknown instruction at byte 4"), "disassembly_failed", "blocked",
+                 "Unknown instruction at byte 4")):
+            patch_args = {"side_effect": decoded} if isinstance(decoded, Exception) else {"return_value": decoded}
+            with patch("pixel_aot.disassemble", **patch_args) as scan:
+                row, unknown = report(manifest, pipelines, root, "test-llvm")["pipelines"]
+                assert row["shaders"]["mesh"] == {
+                    "sha256": mesh["sha256"], "archive_records": 1,
+                    "status": stage_status, "detail": detail,
+                }, row
+                assert row["status"] == pipeline_status, row
+                assert unknown["status"] == ("blocked" if detail else "needs_evidence"), unknown
+                expected_blocker = {"reason": stage_status, "stage": "mesh", "detail": detail} if detail else None
+                assert row["first_blocker"] == expected_blocker, row
+                scan.assert_called_once_with(
+                    code, "test-llvm", offsets=True, features=b"+wavefrontsize64,-wavefrontsize32"
+                )
+        with patch("pixel_aot.disassemble", return_value=[(0, "s_getpc_b64 s[0:1]")]):
+            row, unknown = report(manifest, pipelines, root, "test-llvm")["pipelines"]
+        assert row["shaders"]["mesh"]["status"] == "mesh_lowering_rejected", row
+        assert row["shaders"]["mesh"]["detail"].startswith("lowering failed unexpectedly"), row
+        assert row["status"] == "blocked" and unknown["status"] == "blocked", (row, unknown)
+        untested = report(manifest, pipelines, root)["pipelines"][0]
+        assert untested["shaders"]["mesh"]["status"] == "mesh_scan_untested", untested
+        assert untested["status"] == "needs_evidence", untested
+    print("PSO mesh probe passed (1 lowered, 2 lowering rejections, 2 disassembly failures)")
+
+
+def check_compute():
+    from compute_store_check import READ_COPY
+    code = b"synthetic compute"
+    digest = hashlib.sha256(code).hexdigest()
+    compute = {"stage": "compute", "sha256": digest}
+    manifest = {"shaders": [dict(compute, native_file="compute.bin")]}
+    pipelines = {"pipelines": [
+        {"id": "compute", "effective_root_signature": "present", "shaders": [compute]},
+        {"id": "compute-missing-root", "effective_root_signature": "missing", "shaders": [compute]},
+    ]}
+    program = [line for line in READ_COPY if not line.endswith(":")]
+    mutated = [line.replace("buffer_load_dword", "buffer_load_imaginary") for line in program]
+    assert mutated != program
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "compute.bin").write_bytes(code)
+        for decoded, status, pipeline_status, detail in (
+                (program, "compute_isa_recognized", "needs_evidence", "ISA recognized; bindings not assessed"),
+                (mutated, "unsupported_opcodes", "blocked", "buffer_load_imaginary"),
+                ([], "disassembly_failed", "blocked", "empty instruction stream"),
+                (ValueError("Unknown instruction at byte 8"), "disassembly_failed", "blocked",
+                 "Unknown instruction at byte 8"),
+                ([None], "compute_scan_failed", "needs_evidence", "scan failed unexpectedly: AttributeError")):
+            patch_args = {"side_effect": decoded} if isinstance(decoded, Exception) else {"return_value": decoded}
+            with patch("pixel_aot.disassemble", **patch_args) as scan:
+                row, missing = report(manifest, pipelines, root, "test-llvm")["pipelines"]
+            actual = row["shaders"]["compute"]
+            assert (actual["sha256"], actual["archive_records"], actual["status"]) == (digest, 1, status), row
+            assert (actual["detail"] or "").startswith(detail), row
+            assert row["status"] == pipeline_status, row
+            assert missing["first_blocker"] == {"reason": "missing_root_signature"}, missing
+            scan.assert_called_once_with(code, "test-llvm")
+        untested = report(manifest, pipelines, root)["pipelines"][0]
+        assert untested["shaders"]["compute"]["status"] == "compute_scan_untested", untested
+        assert untested["status"] == "needs_evidence", untested
+    print("PSO compute probe passed (1 recognized, 1 unsupported opcode, 2 disassembly failures, 1 scan failure)")
+
+
 def check():
     check_scanner_tracks_pixel_aot()
     code = b"synthetic native bytes"
     digest = hashlib.sha256(code).hexdigest()
     pixel = {"stage": "pixel", "sha256": digest}
-    mesh = {"stage": "mesh", "sha256": digest}
+    vertex = {"stage": "vertex", "sha256": digest}
     manifest = {"shaders": [
         dict(pixel, native_file="pixel.bin"), dict(pixel, native_file="alias.bin"),
-        mesh, {"stage": "vertex"},
+        vertex, {"stage": "vertex"},
     ]}
     pipelines = {"pipelines": [
         {"id": "missing-root", "effective_root_signature": "missing", "shaders": [pixel]},
-        {"id": "mesh-evidence", "effective_root_signature": "present", "shaders": [mesh]},
+        {"id": "vertex-evidence", "effective_root_signature": "present", "shaders": [vertex]},
         {"id": "absent-record", "effective_root_signature": "unknown",
          "shaders": [dict(pixel, sha256="0" * 64)]},
         {"id": "pixel", "effective_root_signature": "present", "shaders": [pixel]},
@@ -156,9 +240,9 @@ def check():
         actual = json.loads(completed.stdout)
         assert (actual["archive_records"], actual["records_with_native_sha256"],
                 actual["unique_native_stage_hashes"]) == (4, 3, 2)
-        missing, mesh_row, absent, untested = actual["pipelines"]
+        missing, vertex_row, absent, untested = actual["pipelines"]
         assert missing["first_blocker"] == {"reason": "missing_root_signature"}
-        assert mesh_row["shaders"]["mesh"]["status"] == "stage_not_assessed"
+        assert vertex_row["shaders"]["vertex"]["status"] == "stage_not_assessed"
         assert absent["shaders"]["pixel"]["status"] == "shader_not_in_manifest"
         assert untested["status"] == "needs_evidence"
         assert untested["shaders"]["pixel"]["archive_records"] == 2
@@ -206,4 +290,6 @@ def check():
 
 
 if __name__ == "__main__":
+    check_mesh()
+    check_compute()
     check()

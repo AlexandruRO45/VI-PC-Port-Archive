@@ -13,15 +13,39 @@ DEFINITION = ROOT / "src" / "xgameruntime_shim.def"
 REQUIRED_COMPONENTS = {
     "XUser",
     "XGameSave",
+    "XPersistentLocalStorage",
     "XPackage",
     "XSystem",
     "XGame",
     "XAsync",
     "XTaskQueue",
 }
-REQUIRED_IMPLEMENTED = {"XUser", "XGameSave"}
-REQUIRED_STUBS = {"XUserAddAsync", "XGameSaveInitializeProviderAsync"}
-STATES = {"stub", "implemented_hr", "implemented_void"}
+REQUIRED_IMPLEMENTED = {
+    "XUser",
+    "XGameSave",
+    "XPersistentLocalStorage",
+    "XPackage",
+    "XSystem",
+    "XGame",
+}
+REQUIRED_IMPLEMENTED_FUNCTIONS = {
+    "XPersistentLocalStorageGetPathSize",
+    "XPersistentLocalStorageGetPath",
+    "XPersistentLocalStorageGetSpaceInfo",
+    "XPackageMount",
+    "XPackageGetMountPathSize",
+    "XPackageGetMountPath",
+    "XPackageCloseMountHandle",
+    "XSystemGetConsoleId",
+    "XSystemGetDeviceType",
+    "XGameGetXboxTitleId",
+}
+REQUIRED_STUBS = {
+    "XUserAddAsync",
+    "XGameSaveInitializeProviderAsync",
+    "XPackageMountWithUiAsync",
+}
+STATES = {"stub", "implemented_hr", "implemented_void", "implemented_value"}
 
 ROW_RE = re.compile(
     r"^X\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*,\s*"
@@ -94,6 +118,10 @@ def validate(source, rows, library, exports):
     for component in sorted(REQUIRED_IMPLEMENTED):
         if not any(row[1] == component and row[4] != "stub" for row in rows):
             errors.append(f"missing implemented contract for {component}")
+    for name in sorted(REQUIRED_IMPLEMENTED_FUNCTIONS):
+        matches = [row for row in rows if row[0] == name]
+        if len(matches) != 1 or matches[0][4] == "stub":
+            errors.append(f"{name} must be one implemented table row")
     for name in sorted(REQUIRED_STUBS):
         matches = [row for row in rows if row[0] == name]
         if len(matches) != 1 or matches[0][4] != "stub":
@@ -110,6 +138,8 @@ def validate(source, rows, library, exports):
             errors.append(f"implemented_hr row does not return HRESULT: {name}")
         elif state == "implemented_void" and return_type != "void":
             errors.append(f"implemented_void row does not return void: {name}")
+        elif state == "implemented_value" and return_type == "void":
+            errors.append(f"implemented_value row returns void: {name}")
 
     if library != "xgameruntime":
         errors.append(f"LIBRARY is {library!r}, expected 'xgameruntime'")

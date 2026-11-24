@@ -1,5 +1,5 @@
 // Loads the built xgameruntime.dll from its fixture-only directory, checks the
-// seven explicit stub exports retained from the skeleton, and validates the
+// five explicit stub exports retained after the synchronous contracts, and validates the
 // deterministic E_NOTIMPL call log. It also rejects a DLL elsewhere or a copy
 // in the normal shim directory. The unknown-export lookup is a negative
 // control: a missing export returns null.
@@ -39,12 +39,10 @@ struct ExpectedThunk {
     const char* function;
 };
 
-constexpr std::array<ExpectedThunk, 7> expected_thunks{{
+constexpr std::array<ExpectedThunk, 5> expected_thunks{{
     {"XUserAddAsync", "XUser", "XUserAddAsync"},
     {"XGameSaveInitializeProviderAsync", "XGameSave", "XGameSaveInitializeProviderAsync"},
     {"XPackageMountWithUiAsync", "XPackage", "XPackageMountWithUiAsync"},
-    {"XSystemGetConsoleId", "XSystem", "XSystemGetConsoleId"},
-    {"XGameGetXboxTitleId", "XGame", "XGameGetXboxTitleId"},
     {"XAsyncGetStatus", "XAsync", "XAsyncGetStatus"},
     {"XTaskQueueCreate", "XTaskQueue", "XTaskQueueCreate"},
 }};
@@ -65,8 +63,6 @@ static_assert(offsetof(XGameRuntimeShimLogEntry, function) == 16);
 using UserAddAsync = HRESULT(WINAPI*)(XUserAddOptions, XAsyncBlock*);
 using GameSaveInitializeProviderAsync = HRESULT(WINAPI*)(XUserHandle, const char*, bool, XAsyncBlock*);
 using PackageMountWithUiAsync = HRESULT(WINAPI*)(const char*, XAsyncBlock*);
-using SystemGetConsoleId = HRESULT(WINAPI*)(std::size_t, char*, std::size_t*);
-using GameGetXboxTitleId = HRESULT(WINAPI*)(std::uint32_t*);
 using AsyncGetStatus = HRESULT(WINAPI*)(XAsyncBlock*, bool);
 using TaskQueueCreate = HRESULT(WINAPI*)(XTaskQueueDispatchMode, XTaskQueueDispatchMode,
                                          XTaskQueueHandle*);
@@ -178,18 +174,14 @@ bool calls_return_not_implemented(HMODULE module)
     UserAddAsync user_add = nullptr;
     GameSaveInitializeProviderAsync game_save_initialize = nullptr;
     PackageMountWithUiAsync package_mount = nullptr;
-    SystemGetConsoleId system_get_console_id = nullptr;
-    GameGetXboxTitleId game_get_xbox_title_id = nullptr;
     AsyncGetStatus async_get_status = nullptr;
     TaskQueueCreate task_queue_create = nullptr;
 
     if (!find_proc(module, expected_thunks[0].name, user_add) ||
         !find_proc(module, expected_thunks[1].name, game_save_initialize) ||
         !find_proc(module, expected_thunks[2].name, package_mount) ||
-        !find_proc(module, expected_thunks[3].name, system_get_console_id) ||
-        !find_proc(module, expected_thunks[4].name, game_get_xbox_title_id) ||
-        !find_proc(module, expected_thunks[5].name, async_get_status) ||
-        !find_proc(module, expected_thunks[6].name, task_queue_create)) {
+        !find_proc(module, expected_thunks[3].name, async_get_status) ||
+        !find_proc(module, expected_thunks[4].name, task_queue_create)) {
         return false;
     }
 
@@ -197,14 +189,12 @@ bool calls_return_not_implemented(HMODULE module)
         const char* name;
         HRESULT result;
     };
-    const std::array<Call, 7> calls{{
+    const std::array<Call, 5> calls{{
         {expected_thunks[0].name, user_add(XUserAddOptions::None, nullptr)},
         {expected_thunks[1].name, game_save_initialize(nullptr, nullptr, false, nullptr)},
         {expected_thunks[2].name, package_mount(nullptr, nullptr)},
-        {expected_thunks[3].name, system_get_console_id(0, nullptr, nullptr)},
-        {expected_thunks[4].name, game_get_xbox_title_id(nullptr)},
-        {expected_thunks[5].name, async_get_status(nullptr, false)},
-        {expected_thunks[6].name, task_queue_create(XTaskQueueDispatchMode::Manual,
+        {expected_thunks[3].name, async_get_status(nullptr, false)},
+        {expected_thunks[4].name, task_queue_create(XTaskQueueDispatchMode::Manual,
                                                     XTaskQueueDispatchMode::Manual, nullptr)},
     }};
     for (const auto& call : calls) {

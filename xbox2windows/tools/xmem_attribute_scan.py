@@ -1,10 +1,14 @@
-"""Report the attribute word at each XMemAlloc and XMemFree call site in a PE image.
+"""Report the attribute word at each xmem call site in a PE image.
+
+The names covered are the exports XMemAlloc, XMemFree and the Default aliases XMemAllocDefault
+and XMemFreeDefault, which released images import by name as well. Each site records the name it
+imported, so a site through XMemAllocDefault is never reported as XMemAlloc.
 
 Usage: xmem_attribute_scan.py <image> [--output report.json] [--fail-on-null] [--fail-on-unresolved]
 
 The image is read, never loaded or run.
 
-Sites. A site is a call or tail jump into xmem.dll's XMemAlloc or XMemFree, from a normal or
+Sites. A site is a call or tail jump into one of those xmem.dll exports, from a normal or
 delay-load import:
 - through the IAT slot;
 - through an import thunk (a jmp through the slot that starts a block of code, as the linker
@@ -59,7 +63,10 @@ REGISTER_NAMES = {value: name for name, value in vars(R).items()
 REGISTERS = {name: value for value, name in REGISTER_NAMES.items()}
 
 FORMAT = 2
-TARGETS = ("XMemAlloc", "XMemFree")
+# Released images import the Default aliases by name, so a scan that only knows the first two
+# names misses those call sites. The alias exports forward to the same two implementations, but
+# they have their own IAT slots, thunks and import names.
+TARGETS = ("XMemAlloc", "XMemAllocDefault", "XMemFree", "XMemFreeDefault")
 GRANULARITY = 64 << 10  # x64 Windows allocation granularity
 PAGE = 4 << 10
 SCN_EXECUTE = 0x20000000

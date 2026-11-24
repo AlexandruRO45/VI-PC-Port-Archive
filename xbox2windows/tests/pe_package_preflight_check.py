@@ -189,7 +189,20 @@ class OfflinePreflightChecks(unittest.TestCase):
                 inspect(root, "../outside.exe")
             with self.assertRaisesRegex(ValueError, "Entry must be"):
                 inspect(root, "data.rpf")
-            (root / "linked.dll").symlink_to(root / "shim.dll")
+
+    def test_inspect_refuses_a_symlinked_pe_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "main.exe").write_bytes(b"source-built synthetic fixture")
+            (root / "shim.dll").write_bytes(b"source-built synthetic fixture")
+            try:
+                (root / "linked.dll").symlink_to(root / "shim.dll")
+            except OSError as error:
+                # Windows refuses symlink creation without Developer Mode or
+                # SeCreateSymbolicLinkPrivilege (ERROR_PRIVILEGE_NOT_HELD).
+                if getattr(error, "winerror", None) != 1314:
+                    raise
+                self.skipTest("this Windows account cannot create symlinks (WinError 1314)")
             with self.assertRaisesRegex(ValueError, "symlink"):
                 inspect(root, "main.exe")
 

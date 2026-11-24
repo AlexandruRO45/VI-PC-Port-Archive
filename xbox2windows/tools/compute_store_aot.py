@@ -16,11 +16,17 @@ AXES = "xyz"
 GUARD_COMPARES = {"gt": ">", "lt": "<", "ge": ">=", "le": "<="}
 # The data ALU subset: the unsigned 32-bit operations the LLVM 15 code generator emits for the
 # read-compute-write fixture, on known words only. v_and_b32, v_or_b32, v_xor_b32 and v_lshrrev_b32 (src1 >> src0[4:0])
-# reuse the pixel profile's integer templates, as does v_mul_lo_u32. v_mad_u32_u24 is
+# reuse the pixel profile's integer templates, as does v_mul_lo_u32. v_lshlrev_b32 and v_ashrrev_i32 shift src1
+# by src0[4:0], the latter arithmetically; v_sub_nc_u32 is src0 - src1 and v_subrev_nc_u32 src1 - src0, both
+# modulo 2^32. v_mad_u32_u24 is
 # src0[23:0] * src1[23:0] + src2, modulo 2^32. None of them writes vcc, so the guard compare stays valid.
 ALU = {
     "v_and_b32_e32": f"({INTEGER['and_b32'][1]})",
     "v_lshrrev_b32_e32": f"({INTEGER['lshrrev_b32'][1]})",
+    "v_lshlrev_b32_e32": f"({INTEGER['lshlrev_b32'][1]})",
+    "v_ashrrev_i32_e32": INTEGER["ashrrev_i32"][1],
+    "v_sub_nc_u32_e32": "({0} - {1})",
+    "v_subrev_nc_u32_e32": "({1} - {0})",
     "v_min_u32_e32": "min({0}, {1})",
     "v_max_u32_e32": "max({0}, {1})",
     "v_add_nc_u32_e32": "({0} + {1})",
@@ -29,9 +35,49 @@ ALU = {
     "v_mul_lo_u32": INTEGER["mul_lo_u32"][1],
     "v_mad_u32_u24": "((({0} & 0xffffffu) * ({1} & 0xffffffu)) + {2})",
 }
+# The scalar ALU subset, on known words only: s_<op> sD, a, b with two scalar sources (an SGPR holding a known
+# word, an integer inline constant or a 32-bit literal). The carry out of s_add_u32 and s_sub_u32 and the
+# nonzero flag of the logic forms go to SCC, which no accepted instruction reads. s_lshr_b32 is a logical
+# shift of src0 by src1[4:0].
+SALU = {
+    "s_add_u32": "({0} + {1})",
+    "s_sub_u32": "({0} - {1})",
+    "s_and_b32": "({0} & {1})",
+    "s_or_b32": "({0} | {1})",
+    "s_xor_b32": "({0} ^ {1})",
+    "s_lshr_b32": "({0} >> ({1} & 31u))",
+}
+# The binary32 vector ALU subset: VOP2 src0 is any source, src1 a VGPR. v_sub_f32 is src0 - src1 and v_subrev_f32
+# is src1 - src0. Each operation rounds once to nearest even on the bit pattern of a uint word, so a result is again
+# a word. The helpers keep the one rounding per operation: a multiply followed by an add must not be contracted.
+# Fused multiply-add (v_fma_f32, v_fmac_f32) is not in the subset: DXIL has no binary32 fused form to lower it to.
+# NaN payloads, infinities and denormals are not modelled. A literal that is one is refused; a word read from memory
+# is not known statically, so the caller must keep its operands and results finite and normal.
+FALU = {
+    "v_add_f32_e32": "f32_add({0}, {1})",
+    "v_sub_f32_e32": "f32_sub({0}, {1})",
+    "v_subrev_f32_e32": "f32_sub({1}, {0})",
+    "v_mul_f32_e32": "f32_mul({0}, {1})",
+}
+F32_HELPERS = {
+    name: f"uint f32_{name}(uint a, uint b) {{ precise float r = asfloat(a) {op} asfloat(b); return asuint(r); }}\n"
+    for name, op in (("add", "+"), ("sub", "-"), ("mul", "*"))
+}
+# The inline float constants of the encoding, as LLVM prints them, and the bits they hold.
+FLOAT_INLINE = {
+    "0.5": 0x3f000000, "-0.5": 0xbf000000, "1.0": 0x3f800000, "-1.0": 0xbf800000, "2.0": 0x40000000,
+    "-2.0": 0xc0000000, "4.0": 0x40800000, "-4.0": 0xc0800000, "0.15915494": 0x3e22f983,
+}
+FLOAT_SOURCE = r"(s\d+|v\d+|-?\d+\.\d+|0x[0-9a-f]+|-?\d+)"
+SALU_SOURCE = r"(s\d+|-?\d+|0x[0-9a-f]+)"
 ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
 # Results are inline HLSL expressions; a longer one is rejected instead of growing without bound.
 ALU_EXPRESSION_LIMIT = 1024
+# Caller guarantees for a MIMG image descriptor: an 8-dword resource descriptor that names a 2D,
+# linear (non-swizzled) image of the listed format. The translator checks where the eight words were
+# loaded from, not the 9-bit GFX10 format, type, swizzle, level or size fields inside them; the two
+# 16-byte descriptor slots are bound to t0. Value: (HLSL texel type, channel count).
+IMAGE_FORMATS = {"R32G32B32A32_UINT": ("uint4", 4)}
 # Template operands are the old LDS word and the source VGPR, both HLSL uints.
 LDS_RMW = {
     "ds_add_u32": "({0} + {1})",
@@ -68,6 +114,11 @@ def is_word(value):
                                       and value[0] in ("constant_word", "thread", "source", "alu"))
 
 
+def alu_data_word(value):
+    """A known word that is not a dispatch index: a shift of one is data, where a shifted index is a byte offset."""
+    return is_word(value) and not (isinstance(value, tuple) and value[0] == "thread")
+
+
 def hlsl_word(value):
     if isinstance(value, int):
         return f"0x{value:08x}u"
@@ -89,6 +140,14 @@ def alu_word(token, scalar, vector, pending):
     else:
         value = int(token, 0) & 0xffffffff if -(1 << 31) <= int(token, 0) <= 0xffffffff else None
     return value if is_word(value) else None
+
+
+def float_word(token, scalar, vector, pending):
+    """The known word a binary32 source names, or None: as alu_word, but a constant must be a finite normal value or zero."""
+    word = FLOAT_INLINE.get(token) if "." in token else alu_word(token, scalar, vector, pending)
+    if isinstance(word, int) and ((word >> 23) & 0xff == 0xff or ((word >> 23) & 0xff == 0 and word & 0x7fffff)):
+        return None
+    return word
 
 
 def vector_operands(line):
@@ -121,12 +180,15 @@ def labelled(decoded):
 
 def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
           constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
-          source_stride=None, cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None):
+          source_stride=None, image_descriptor=None, image_format=None,
+          cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
     group dimension is larger than one. Descriptors name u0 and optionally b0 and a read-only raw
-    source t0; source_stride is the t0 byte stride that indexed reads use.
+    source t0; source_stride is the t0 byte stride that indexed reads use. image_descriptor is the
+    table byte offset of the 8-dword image descriptor; image_format is the caller's statement of
+    the image format inside it, and the texel is bound to t0.
     """
     dims = checked_group(group)
     if cpu not in ("gfx1013", "gfx1030"):
@@ -148,6 +210,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     if source_stride is not None and (source_descriptor is None or not 4 <= source_stride <= 0x3fff
                                       or source_stride % 4):
         raise ValueError("Indexed reads require a source binding and aligned stride")
+    if image_descriptor is not None or image_format is not None:
+        # The 8-dword image descriptor occupies two 16-byte slots, both bound to t0.
+        if (image_format not in IMAGE_FORMATS or image_descriptor is None or source_descriptor is not None
+                or not 0 <= image_descriptor < 1 << 20 or image_descriptor % 4
+                or any(image_descriptor + half in descriptor_bindings for half in (0, 16))
+                or any(abs(image_descriptor + half - offset) < 16
+                       for half in (0, 16) for offset in descriptor_bindings)):
+            raise ValueError("Invalid or overlapping image descriptor binding")
+        descriptor_bindings[image_descriptor] = ("image", 0)
+        descriptor_bindings[image_descriptor + 16] = ("image", 1)
     group_regs = {axis: reg for axis, reg in enumerate((group_reg, group_reg_y, group_reg_z)) if reg is not None}
     if (any(not 0 <= reg <= 105 or reg == table_reg for reg in group_regs.values())
             or len(set(group_regs.values())) != len(group_regs)):
@@ -159,11 +231,14 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         scalar[reg] = ("group", axis)
     vector = {axis: ("local", axis) for axis in range(3) if axis == 0 or dims[axis] > 1}
     pending = set()
-    # VGPRs a buffer_load_dword still writes, with the word they receive (None when unknown);
+    # VGPRs a buffer read still writes, with the word they receive (None when unknown);
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
-    ds_steps = []
+    # DS operations and image loads can consume each other's temporaries. Keep them in instruction order.
+    staged_steps = []
+    ds_step_count = 0
+    image_step_count = 0
     lds_enabled = ds_group and 128 <= lds_bytes <= 65536
     lds_word = None
     lds_strided_words = {}
@@ -283,6 +358,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 if not -(1 << 31) <= value <= 0xffffffff:
                     raise ValueError("Invalid scalar immediate")
                 scalar[dst] = value & 0xffffffff
+        elif m := re.fullmatch(rf"(s_(?:add_u32|sub_u32|and_b32|or_b32|xor_b32|lshr_b32)) s(\d+), {SALU_SOURCE}, {SALU_SOURCE}",
+                               line):
+            op, dst = m[1], int(m[2])
+            words = [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]
+            if dst > 105 or dst in pending or None in words:
+                raise ValueError("Unverified scalar ALU operand")
+            expression = SALU[op].format(*map(hlsl_word, words))
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            scalar[dst] = ("alu", expression)
         elif m := re.fullmatch(r"s_movk_i32 s(\d+), (-?\d+|0x[0-9a-f]+)", line):
             dst = int(m[1])
             value = int(m[2], 0)
@@ -381,7 +466,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if dst > 255:
                 raise ValueError("Invalid vector destination")
             vector[dst] = ("ds_lane", tag[1])
-        elif m := re.fullmatch(r"v_lshlrev_b32(?:_e32|_e64)? v(\d+), (\d+), v(\d+)", line):
+        elif ((m := re.fullmatch(r"v_lshlrev_b32(?:_e32|_e64)? v(\d+), (\d+), v(\d+)", line))
+              and not alu_data_word(vector.get(int(m[3])))):
             dst, shift, src = map(int, m.groups())
             tag = vector.get(src)
             if ds_group and dst <= 255 and shift == 2 and isinstance(tag, tuple) and tag[0] == "ds_lane":
@@ -407,13 +493,14 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             value = vector.get(src)
             if (not ds_group or guard_span is not None or max(dst, addr, src) > 255
                     or not isinstance(address, tuple) or address[0] != "ds_address" or not is_word(value)
-                    or len(ds_steps) >= 64):
+                    or ds_step_count >= 64):
                 raise ValueError("Unverified DS lane routing")
             # The bijective address is (local X + bias) mod 32. Scatter reads from its inverse.
             bias = address[1] if op == "bpermute" else (-address[1]) % 32
-            slot = f"ds_stage_{len(ds_steps)}"
-            result = f"ds_result_{len(ds_steps)}"
-            ds_steps.append((slot, f"    {slot}[local.x] = {hlsl_word(value)};\n"
+            slot = f"ds_stage_{ds_step_count}"
+            result = f"ds_result_{ds_step_count}"
+            ds_step_count += 1
+            staged_steps.append((slot, f"    {slot}[local.x] = {hlsl_word(value)};\n"
                                    f"    GroupMemoryBarrierWithGroupSync();\n"
                                    f"    uint {result} = {slot}[(local.x + {bias}u) & 31u];"))
             vector[dst] = ("alu", result)
@@ -466,10 +553,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unverified private LDS floating-point access")
             old, src = map(hlsl_word, (lds_word, value))
             if op.startswith("add"):
-                if len(ds_steps) >= 64:
+                if ds_step_count >= 64:
                     raise ValueError("Too many private LDS floating-point steps")
-                name = f"ds_f32_{len(ds_steps)}"
-                ds_steps.append((None, f"    precise float {name} = asfloat({old}) + asfloat({src});"))
+                name = f"ds_f32_{ds_step_count}"
+                ds_step_count += 1
+                staged_steps.append((None, f"    precise float {name} = asfloat({old}) + asfloat({src});"))
                 expression = f"asuint({name})"
             else:
                 condition = {"min": "<", "max": ">", "cmpst": "=="}[op]
@@ -480,35 +568,74 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 vector[regs[0]] = lds_word
             lds_word = ("alu", expression)
             ds_wait = True
-        elif m := re.fullmatch(r"ds_cmpst(?P<ret>_rtn)?_f64 "
-                               r"(?:(v\[\d+:\d+\]), )?v(\d+), (v\[\d+:\d+\]), (v\[\d+:\d+\])"
+        elif m := re.fullmatch(r"ds_(cmpst|min|max)(?P<ret>_rtn)?_f64 "
+                               r"(?:(v\[\d+:\d+\]), )?v(\d+), (v\[\d+:\d+\])(?:, (v\[\d+:\d+\]))?"
                                r"(?: offset:(0|8))?", line):
-            returns, dest, addr, compare, replacement, offset = m.groups()
+            op, returns, dest, addr, compare, replacement, offset = m.groups()
             if lds_f64_mode != "normal":
                 raise ValueError("Unverified private LDS binary64 mode")
             slot = int(offset or 0) // 4
             prev = tuple(lds_wide_words.get(i) for i in range(slot, slot + 2))
             if (guard_span is not None or vector.get(int(addr)) != ("lds_wide_address",)
-                    or bool(returns) != (dest is not None) or not all(map(is_word, prev))):
+                    or bool(returns) != (dest is not None) or (op == "cmpst") != (replacement is not None)
+                    or not all(map(is_word, prev))):
                 raise ValueError("Unverified private LDS binary64 access")
             ranges = []
-            for operand in (compare, replacement) + ((dest,) if dest else ()):
+            for operand in (operand for operand in (compare, replacement, dest) if operand is not None):
                 first, last = map(int, operand[2:-1].split(":"))
                 if last > 255 or last != first + 1:
                     raise ValueError("Unverified private LDS binary64 range")
                 ranges.append((first, last))
-            cmp_word, new_word = (tuple(vector.get(i) for i in regs) for regs in ranges[:2])
+            cmp_word = tuple(vector.get(i) for i in ranges[0])
+            new_word = tuple(vector.get(i) for i in ranges[1]) if replacement else cmp_word
             if not all(map(is_word, cmp_word + new_word)):
                 raise ValueError("Unverified private LDS binary64 source")
-            old_lo, old_hi = map(hlsl_word, prev)
-            cmp_lo, cmp_hi = map(hlsl_word, cmp_word)
-            condition = f"({old_lo} == {cmp_lo} && {old_hi} == {cmp_hi})"
-            update = [f"({condition} ? {hlsl_word(new)} : {hlsl_word(old)})" for new, old in zip(new_word, prev)]
-            if any(len(word) > ALU_EXPRESSION_LIMIT for word in update):
+            inputs = tuple(map(hlsl_word, prev + cmp_word + new_word))
+            if ds_step_count >= 64 or any(len(word) > ALU_EXPRESSION_LIMIT for word in inputs):
                 raise ValueError("LDS expression exceeds the profile limit")
+            prefix = f"ds_f64_{ds_step_count}"
+            ds_step_count += 1
+            old_lo, old_hi, cmp_lo, cmp_hi, new_lo, new_hi = (
+                f"{prefix}_{suffix}" for suffix in ("old_lo", "old_hi", "cmp_lo", "cmp_hi", "new_lo", "new_hi")
+            )
+            if op == "cmpst":
+                condition = f"({old_lo} == {cmp_lo} && {old_hi} == {cmp_hi})"
+            else:
+                # For equal signs, compare the full bit patterns in the
+                # opposite direction for negative numbers. Handle signs first.
+                below = f"({cmp_hi} < {old_hi} || ({cmp_hi} == {old_hi} && {cmp_lo} < {old_lo}))"
+                above = f"({cmp_hi} > {old_hi} || ({cmp_hi} == {old_hi} && {cmp_lo} > {old_lo}))"
+                opposite = f"(({cmp_hi} ^ {old_hi}) & 0x80000000u) != 0u"
+                negative = f"({cmp_hi} & 0x80000000u) != 0u"
+                if op == "min":
+                    condition = f"({opposite} ? ({negative}) : (({negative}) ? {above} : {below}))"
+                else:
+                    condition = f"({opposite} ? !({negative}) : (({negative}) ? {below} : {above}))"
+            names = (old_lo, old_hi, cmp_lo, cmp_hi, new_lo, new_hi)
+            take = f"{prefix}_take"
+            statements = [f"    uint {name} = {word};" for name, word in zip(names, inputs)]
+            statements.append(f"    bool {take} = {condition};")
+            staged_steps.append((None, "\n".join(statements)))
+            update = (f"({take} ? {new_lo} : {old_lo})", f"({take} ? {new_hi} : {old_hi})")
             if dest:
-                vector.update(zip(ranges[2], prev))
+                vector.update(zip(ranges[-1], prev))
             lds_wide_words.update((slot + i, ("alu", word)) for i, word in enumerate(update))
+            ds_wait = True
+        elif m := re.fullmatch(r"ds_wrxchg2_rtn_b64 v\[(\d+):(\d+)\], v(\d+), "
+                               r"v\[(\d+):(\d+)\], v\[(\d+):(\d+)\]"
+                               r"(?: offset0:([01]))?(?: offset1:([01]))?", line):
+            dst, last, addr, first0, last0, first1, last1 = map(int, m.groups()[:7])
+            offsets = tuple(int(offset or 0) for offset in m.groups()[7:])
+            if (guard_span is not None or vector.get(addr) != ("lds_wide_address",) or offsets[0] == offsets[1]
+                    or max(last, last0, last1) > 255 or last != dst + 3 or last0 != first0 + 1 or last1 != first1 + 1):
+                raise ValueError("Unverified private paired qword exchange")
+            slots = [2 * offset + i for offset in offsets for i in range(2)]
+            previous = [lds_wide_words.get(slot) for slot in slots]
+            data = [vector.get(reg) for reg in (first0, last0, first1, last1)]
+            if not all(map(is_word, previous + data)):
+                raise ValueError("Uninitialized private paired qword exchange")
+            vector.update(zip(range(dst, last + 1), previous))
+            lds_wide_words.update(zip(slots, data))
             ds_wait = True
         elif m := re.fullmatch(
                 r"ds_((?:cmpst|mskor)(?:_rtn)?|wrxchg_rtn)_b64 "
@@ -642,15 +769,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         elif m := re.fullmatch(r"ds_(append|consume) v(\d+)(?: offset:0)?", line):
             op, dst = m[1], int(m[2])
             if (not lds_m0_zero or guard_span is not None or dst > 255
-                    or lds_address_shift != 2 or not is_word(lds_word) or len(ds_steps) >= 64):
+                    or lds_address_shift != 2 or not is_word(lds_word) or ds_step_count >= 64):
                 raise ValueError("Unverified LDS wave counter")
             old = hlsl_word(lds_word)
-            slot = f"ds_stage_{len(ds_steps)}"
-            previous = f"ds_result_{len(ds_steps)}"
+            slot = f"ds_stage_{ds_step_count}"
+            previous = f"ds_result_{ds_step_count}"
+            ds_step_count += 1
             # LDS byte zero is lane zero's word. Snapshot it once per group,
             # then only change that lane's word in the private layout.
             operator = "+" if op == "append" else "-"
-            ds_steps.append((slot, f"    if (local.x == 0u) {slot}[0] = {old};\n"
+            staged_steps.append((slot, f"    if (local.x == 0u) {slot}[0] = {old};\n"
                              "    GroupMemoryBarrierWithGroupSync();\n"
                              f"    uint {previous} = {slot}[0];"))
             vector[dst] = ("alu", previous)
@@ -692,12 +820,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     raise ValueError("Uninitialized private wide LDS word")
                 vector.update(zip(registers, (lds_wide_words[slot] for slot in slots)))
             ds_wait = True
-        elif ((m := re.fullmatch(r"ds_(add|sub|rsub|and|or|xor|min|max)(?P<ret>_rtn)?(_[uib]64) "
+        elif ((m := re.fullmatch(r"ds_(add|sub|rsub|and|or|xor|min|max|inc|dec|condxchg32)(?P<ret>_rtn)?(_[uib]64) "
                                  r"(?(ret)v\[(?P<dst_first>\d+):(?P<dst_last>\d+)\], )"
                                  r"v(?P<addr>\d+), v\[(?P<src_first>\d+):(?P<src_last>\d+)\]"
                                  r"(?: offset:(?P<offset>0|8))?", line))
               and ((op := m[1] + m[3]) in ("add_u64", "sub_u64", "rsub_u64", "and_b64", "or_b64",
-                                        "xor_b64", "min_i64", "max_i64", "min_u64", "max_u64"))):
+                                        "xor_b64", "min_i64", "max_i64", "min_u64", "max_u64", "inc_u64", "dec_u64")
+                   or op == "condxchg32_b64" and m["ret"])):
             addr, first, last = (int(m[key]) for key in ("addr", "src_first", "src_last"))
             destination = tuple(int(m[key]) for key in ("dst_first", "dst_last")) if m["ret"] else None
             slot = int(m["offset"] or 0) // 4
@@ -710,7 +839,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             left, right = (source, previous) if op == "rsub_u64" else (previous, source)
             lo, hi = map(hlsl_word, left)
             rhs_lo, rhs_hi = map(hlsl_word, right)
-            if op in ("and_b64", "or_b64", "xor_b64"):
+            if op == "inc_u64":
+                reset = f"({hi} > {rhs_hi} || ({hi} == {rhs_hi} && {lo} >= {rhs_lo}))"
+                low = f"({reset} ? 0u : ({lo} + 1u))"
+                high = f"({reset} ? 0u : ({hi} + uint({lo} == 0xffffffffu)))"
+            elif op == "dec_u64":
+                reset = f"(({hi} | {lo}) == 0u || {hi} > {rhs_hi} || ({hi} == {rhs_hi} && {lo} > {rhs_lo}))"
+                low = f"({reset} ? {rhs_lo} : ({lo} - 1u))"
+                high = f"({reset} ? {rhs_hi} : ({hi} - uint({lo} == 0u)))"
+            elif op == "condxchg32_b64":
+                low = f"(({rhs_lo} & 0x80000000u) != 0u ? {rhs_lo} : {lo})"
+                high = f"(({rhs_hi} & 0x80000000u) != 0u ? {rhs_hi} : {hi})"
+            elif op in ("and_b64", "or_b64", "xor_b64"):
                 symbol = {"and_b64": "&", "or_b64": "|", "xor_b64": "^"}[op]
                 low = f"({lo} {symbol} {rhs_lo})"
                 high = f"({hi} {symbol} {rhs_hi})"
@@ -868,7 +1008,22 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified plane byte offset")
             vector[dst] = ("plane_bytes", row_tag[1], shift, *column_tag[1:])
-        elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
+        elif ((m := re.fullmatch(r"v_and_b32_e32 v(\d+), (?:0xffff|65535), v(\d+)", line))
+              and isinstance(partial := vector.get(int(m[2])), tuple) and partial[0] == "source_low16"):
+            dst = int(m[1])
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            vector[dst] = ("alu", f"(inputData.Load({partial[1]}) & 0xffffu)")
+        elif m := re.fullmatch(rf"(v_(?:add|sub|subrev|mul)_f32_e32) v(\d+), {FLOAT_SOURCE}, (v\d+)", line):
+            op, dst = m[1], int(m[2])
+            words = [float_word(token, scalar, vector, pending) for token in m.groups()[2:]]
+            if dst > 255 or None in words:
+                raise ValueError("Unverified float operand")
+            expression = FALU[op].format(*map(hlsl_word, words))
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
+        elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
               or (m := re.fullmatch(rf"(v_mul_lo_u32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_mad_u32_u24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
               and None not in [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]):
@@ -895,56 +1050,170 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified row pitch byte offset")
             vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
-        elif m := re.fullmatch(r"buffer_load_dword v(\d+), (off|v\d+), s\[(\d+):(\d+)\], 0( idxen)?( offen)?"
-                               r"(?: offset:(\d+))?", line):
-            dst, base, high = int(m[1]), int(m[3]), int(m[4])
-            offset = int(m[7] or 0)
-            if (dst > 255 or high != base + 3 or base % 4 or high > 105
+        elif m := re.fullmatch(r"(?:buffer_load_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>[us](?:byte|short))"
+                               r"|(?P<d16_kind>[us]byte|short)_d16(?P<hi>_hi)?)"
+                               r"|tbuffer_load_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
+                               r"(?P<dst>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
+                               r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
+                               r"(?P<idxen> idxen)?(?P<offen> offen)?"
+                               r"(?: offset:(?P<offset>\d+))?", line):
+            channels = m["channels"]
+            packed = channels is not None and channels.startswith("d16_")
+            raw_count = m["raw_count"]
+            components = len(channels.removeprefix("d16_")) if channels else int(raw_count or 1)
+            count = (components + 1) // 2 if packed else components
+            dst, *last = map(int, re.findall(r"\d+", m["dst"]))
+            base, high = int(m["base"]), int(m["high"])
+            offset = int(m["offset"] or 0)
+            addr, idxen, offen = m["addr"], m["idxen"], m["offen"]
+            d16_kind = m["d16_kind"]
+            subword = m["subword"] or d16_kind
+            width = 4 if subword is None else 1 if subword.endswith("byte") else 2
+            if subword and (cpu != "gfx1030" or not idxen or offen):
+                raise ValueError("Unsupported subword buffer read target or address mode")
+            if raw_count and (cpu != "gfx1030" or not idxen or offen):
+                raise ValueError("Unsupported vector buffer read target or address mode")
+            if channels and (cpu != "gfx1030" or not idxen or offen):
+                raise ValueError("Unsupported typed buffer read target or address mode")
+            # The three-component D16 form uses the four-component 16-bit format.
+            format_components = 4 if packed and components == 3 else components
+            if channels and m["format"] != f"BUF_FMT_{('16_' if packed else '32_') * format_components}UINT":
+                raise ValueError("Unsupported typed buffer read format")
+            if last != ([] if count == 1 else [dst + count - 1]) or dst + count > 256:
+                raise ValueError("Unverified buffer read destination")
+            old = vector.get(dst) if d16_kind else None
+            if d16_kind and not is_word(old):
+                raise ValueError("Unverified D16 buffer read destination input")
+            if (high != base + 3 or base % 4 or high > 105
                     or pending.intersection(range(base, high + 1))):
                 raise ValueError("Unverified buffer read descriptor")
-            kinds = {scalar.get(base + i) for i in range(4)}
-            if kinds == {("uav", i) for i in range(4)}:
+            kinds = tuple(scalar.get(base + i) for i in range(4))
+            if kinds == tuple(("uav", i) for i in range(4)):
                 # The store target would need ordering against other invocations' stores.
                 raise ValueError("Reads from the stored UAV are not supported")
-            if kinds != {("srv", i) for i in range(4)}:
+            if kinds != tuple(("srv", i) for i in range(4)):
                 raise ValueError("Unverified buffer read descriptor")
-            if offset % 4 or offset > 4095:
+            if offset % width or offset > 4095:
                 raise ValueError("Unverified read offset")
-            tag = vector.get(int(m[2][1:])) if m[2] != "off" else None
-            if m[2] == "off" and not m[5] and not m[6]:
-                address = f"{offset}u"
-            elif (m[6] and not m[5] and isinstance(tag, tuple) and tag[0] == "thread_bytes"
+            tag = vector.get(int(addr[1:])) if addr != "off" else None
+            if addr == "off" and not idxen and not offen:
+                addresses = [f"{offset}u"]
+            elif (offen and not idxen and isinstance(tag, tuple) and tag[0] == "thread_bytes"
                   and 2 <= tag[2] < 32):
                 # A shift below 2 gives unaligned byte offsets, which ByteAddressBuffer.Load cannot express.
-                address = f"(tid.{AXES[tag[1]]} << {tag[2]}u) + {offset}u"
-            elif (m[5] and not m[6] and source_stride is not None and isinstance(tag, tuple)
+                addresses = [f"(tid.{AXES[tag[1]]} << {tag[2]}u) + {offset}u"]
+            elif (idxen and not offen and source_stride is not None and isinstance(tag, tuple)
                   and tag[0] == "thread"):
                 # idxen: index * stride + instruction offset, inside one source element.
-                if offset + 4 > source_stride:
+                if offset + width * count > source_stride:
                     raise ValueError("Read leaves its source element")
-                address = f"tid.{AXES[tag[1]]} * {source_stride}u + {offset}u"
+                aligned = offset & ~3
+                addresses = [f"tid.{AXES[tag[1]]} * {source_stride}u + {aligned + 4*i}u" for i in range(count)]
             else:
                 raise ValueError("Unsupported read address")
-            vector.pop(dst, None)
-            loading[dst] = ("source", address)
-        elif m := re.fullmatch(r"buffer_store_dword(?:x([234]))? (v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), "
-                               r"s\[(\d+):(\d+)\], 0( idxen)?( offen)?(?: offset:(\d+))?", line):
-            count = int(m[1] or 1)
-            first, *last = map(int, re.findall(r"\d+", m[2]))
+            # The address has been captured, so the index can alias a destination.
+            for reg, address in enumerate(addresses, dst):
+                vector.pop(reg, None)
+                # Whole-word consumers cannot read the undefined upper half of an odd D16 result.
+                kind = "source_low16" if packed and components % 2 and reg == dst + count - 1 else "source"
+                word = (kind, address)
+                if subword:
+                    # The stride and SRV base are DWORD-aligned, so the enclosing word stays in the record.
+                    bits, shift = width * 8, (offset % 4) * 8
+                    field = f"(({hlsl_word(word)} >> {shift}u) & {((1 << bits) - 1):#x}u)"
+                    if subword in ("sbyte", "sshort"):
+                        sign = f"{1 << (bits - 1):#x}u"
+                        field = f"(({field} ^ {sign}) - {sign})"
+                    if d16_kind:
+                        hi = bool(m["hi"])
+                        keep = "0xffffu" if hi else "0xffff0000u"
+                        field = f"(({hlsl_word(old)} & {keep}) | (({field} & 0xffffu) << {16 if hi else 0}u))"
+                        if len(field) > ALU_EXPRESSION_LIMIT:
+                            raise ValueError("D16 buffer read expression is too large")
+                    word = ("alu", field)
+                loading[reg] = word
+        elif m := re.fullmatch(r"image_load(_mip)? (v\d+|v\[\d+:\d+\]), (v\d+|v\[\d+:\d+\]), "
+                               r"s\[(\d+):(\d+)\] dmask:0x([0-9a-f]+) dim:SQ_RSRC_IMG_2D(?: unorm)?( a16)?", line):
+            # The non-sampler 2D address is (x, y[, mip]). A16 packs x and y into the first
+            # dword and takes the mip from the low half of the second dword when present.
+            mip, a16 = bool(m[1]), bool(m[7])
+            vaddr = [int(n) for n in re.findall(r"\d+", m[3])]
+            address_words = (1 if a16 else 2) + int(mip)
             base, high = int(m[4]), int(m[5])
-            offset = int(m[8] or 0)
+            dmask = int(m[6], 16)
+            count = bin(dmask).count("1")
+            destination = [int(n) for n in re.findall(r"\d+", m[2])]
+            first, last = destination[0], destination[-1]
+            if (cpu != "gfx1030" or image_format is None or guard_span is not None
+                    or len(vaddr) != min(address_words, 2) or vaddr[-1] != vaddr[0] + address_words - 1
+                    or vaddr[-1] > 255 or last != first + count - 1
+                    or dmask != (1 << count) - 1 or count > IMAGE_FORMATS[image_format][1]
+                    or any(first + index > 255 or first + index in loading for index in range(count))):
+                raise ValueError("Unsupported image load target")
+            if high != base + 7 or base % 4 or pending.intersection(range(base, high + 1)):
+                raise ValueError("Unresolved image descriptor")
+            if tuple(scalar.get(base + index) for index in range(8)) != tuple(
+                    (("image", index // 4), index % 4) for index in range(8)):
+                raise ValueError("Unverified image descriptor")
+            coordinates = [vector.get(reg) for reg in range(vaddr[0], vaddr[-1] + 1)]
+            if not all(is_word(value) for value in coordinates):
+                raise ValueError("Unverified image coordinates")
+            if a16:
+                packed = hlsl_word(coordinates[0])
+                x, y = f"{packed} & 0xffffu", f"{packed} >> 16u"
+            else:
+                x, y = map(hlsl_word, coordinates[:2])
+            lod = "0"
+            if mip:
+                mip_word = hlsl_word(coordinates[-1])
+                lod = f"asint({mip_word}{' & 0xffffu' if a16 else ''})"
+            address = f"int3(asint({x}), asint({y}), {lod})"
+            name = f"image_load_{image_step_count}"
+            image_step_count += 1
+            staged_steps.append((None, f"    {IMAGE_FORMATS[image_format][0]} {name} = imageData.Load({address});"))
+            for index in range(count):
+                reg = first + index
+                vector.pop(reg, None)
+                loading[reg] = ("alu", f"{name}.{'xyzw'[index]}")
+        elif m := re.fullmatch(r"(?:buffer_store_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>byte|short)(?P<store_hi>_d16_hi)?)|"
+                               r"tbuffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
+                               r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+|v\[\d+:\d+\]), "
+                               r"s\[(?P<base>\d+):(?P<high>\d+)\], 0"
+                               r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
+                               r"(?P<idxen> idxen)?(?P<offen> offen)?(?: offset:(?P<offset>\d+))?", line):
+            channels = m["channels"]
+            packed = channels is not None and channels.startswith("d16_")
+            components = len(channels.removeprefix("d16_")) if channels else int(m["raw_count"] or 1)
+            partial = packed and components % 2 != 0
+            count = (components + 1) // 2 if packed else components
+            idxen, offen = m["idxen"], m["offen"]
+            subword = m["subword"]
+            if subword and (cpu != "gfx1030" or not idxen or offen or stride is None):
+                raise ValueError("Unsupported subword buffer store target or address mode")
+            width = {"byte": 1, "short": 2}.get(subword, 4)
+            format_components = 4 if packed and components == 3 else components
+            fmt = f"BUF_FMT_{('16_' if packed else '32_') * format_components}UINT"
+            if channels and (cpu != "gfx1030" or not idxen or offen or m["format"] != fmt):
+                raise ValueError("Unsupported typed buffer store format, target or address mode")
+            first, *last = map(int, re.findall(r"\d+", m["data"]))
+            base, high = int(m["base"]), int(m["high"])
+            offset = int(m["offset"] or 0)
             if (last != ([] if count == 1 else [first + count - 1])
-                    or high != base + 3 or base % 4 or offset % 4 or offset > 4095
+                    or high != base + 3 or base % 4 or offset % width or offset > 4095
                     or pending.intersection(range(base, high + 1))
                     or any(scalar.get(base + i) != ("uav", i) for i in range(4))):
                 raise ValueError("Unverified raw UAV store")
+            byte_shift = (offset % 4) * 8
+            # Reserve and address the containing DWORD for a subword store.
+            offset &= ~3
             address = f"{offset}u"
-            addr_regs = list(map(int, re.findall(r"\d+", m[3])))
+            addr = m["addr"]
+            addr_regs = list(map(int, re.findall(r"\d+", addr)))
             tags = [vector.get(reg) for reg in addr_regs]
-            if (m[3] == "off" and not m[6] and not m[7] and dims == (1, 1, 1) and stride is None):
+            if addr == "off" and not idxen and not offen and dims == (1, 1, 1) and stride is None:
                 store_layout = ("fixed",)
                 covered = set()
-            elif (stride is not None and m[6] and not m[7] and len(addr_regs) == 1
+            elif (stride is not None and idxen and not offen and len(addr_regs) == 1
                     and isinstance(tags[0], tuple) and tags[0][0] == "thread" and offset + 4 * count <= stride):
                 # One index axis: every other group dimension must be one, so no two
                 # invocations of a group share an address.
@@ -952,7 +1221,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 store_layout = ("index", index)
                 covered = {index}
                 address = f"tid.{AXES[index]} * {stride}u + {offset}u"
-            elif (stride is not None and m[6] and m[7] and len(addr_regs) == 2 and addr_regs[1] == addr_regs[0] + 1
+            elif (stride is not None and idxen and offen and len(addr_regs) == 2 and addr_regs[1] == addr_regs[0] + 1
                     and all(isinstance(tag, tuple) for tag in tags)
                     and tags[0][0] == "thread" and tags[1][0] == "thread_bytes" and tags[0][1] != tags[1][1]):
                 # idxen offen: address = index * stride + byte offset + instruction offset.
@@ -962,7 +1231,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 store_layout = ("index_offset", index, column, shift)
                 covered = {index, column}
                 address = f"tid.{AXES[index]} * {stride}u + (tid.{AXES[column]} << {shift}u) + {offset}u"
-            elif (stride is not None and m[6] and m[7] and len(addr_regs) == 2 and addr_regs[1] == addr_regs[0] + 1
+            elif (stride is not None and idxen and offen and len(addr_regs) == 2 and addr_regs[1] == addr_regs[0] + 1
                     and all(isinstance(tag, tuple) for tag in tags)
                     and tags[0][0] == "thread" and tags[1][0] == "plane_bytes"
                     and tags[0][1] not in (tags[1][1], tags[1][3])):
@@ -975,7 +1244,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 covered = {index, row, column}
                 address = (f"tid.{AXES[index]} * {stride}u + (tid.{AXES[row]} << {row_shift}u)"
                            f" + (tid.{AXES[column]} << {shift}u) + {offset}u")
-            elif (m[7] and not m[6] and len(addr_regs) == 1
+            elif (offen and not idxen and len(addr_regs) == 1
                     and isinstance(tags[0], tuple) and tags[0][0] == "pitch_bytes"):
                 # offen only: (row & 0xffffff) * pitch + (column << shift) + instruction offset.
                 # Without idxen the descriptor stride is not used, so the stride binding is ignored.
@@ -1002,7 +1271,20 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             values = [vector.get(reg) for reg in range(first, first + count)]
             if not all(is_word(value) for value in values):
                 raise ValueError("Store data is not a known word")
-            words = ", ".join(map(hlsl_word, values))
+            words = list(map(hlsl_word, values))
+            if subword:
+                # The indexed layout and whole-DWORD reservation make the read/modify/write single-writer.
+                mask = (1 << (width * 8)) - 1
+                keep = 0xffffffff ^ (mask << byte_shift)
+                source_shift = 16 if m["store_hi"] else 0
+                words[0] = (f"((outputData.Load({address}) & {keep:#x}u) | "
+                            f"((({words[0]} >> {source_shift}u) & {mask:#x}u) << {byte_shift}u))")
+            elif partial:
+                # Reserve the entire final DWORD, including the untouched high half. The indexed
+                # layout, aligned stride and overlap checks give that word a single writer.
+                final_address = address if count == 1 else f"{address} + 4u"
+                words[-1] = f"((outputData.Load({final_address}) & 0xffff0000u) | ({words[-1]} & 0xffffu))"
+            words = ", ".join(words)
             arg = words if count == 1 else f"uint{count}({words})"
             stores.append(f"    outputData.Store{count if count > 1 else ''}({address}, {arg});")
         else:
@@ -1026,13 +1308,17 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                if constant_descriptor is not None else "")
     if source_descriptor is not None:
         cbuffer += "ByteAddressBuffer inputData : register(t0);\n"
+    if image_descriptor is not None:
+        cbuffer += f"Texture2D<{IMAGE_FORMATS[image_format][0]}> imageData : register(t0);\n"
     local = ""
-    if ds_steps:
-        shared = [slot for slot, _ in ds_steps if slot is not None]
+    if staged_steps:
+        body = "\n".join([*(step for _, step in staged_steps), body])
+        shared = [slot for slot, _ in staged_steps if slot is not None]
         cbuffer += "".join(f"groupshared uint {slot}[32];\n" for slot in shared)
-        body = "\n".join([*(step for _, step in ds_steps), body])
         if shared:
             local = ", uint3 local : SV_GroupThreadID"
+    # Helpers are selected from the final body, so a float ALU result used only by a DS step still gets its definition.
+    cbuffer += "".join(text for name, text in F32_HELPERS.items() if f"f32_{name}(" in body)
     return (f"{cbuffer}RWByteAddressBuffer outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
 
@@ -1058,6 +1344,10 @@ def main():
     parser.add_argument("--source-descriptor", type=lambda n: int(n, 0),
                         help="Table byte offset bound to stable read-only t0, with no overlap with u0")
     parser.add_argument("--source-stride", type=int, help="Indexed t0 byte stride")
+    parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
+                        help="Table byte offset of the 8-dword image descriptor bound to t0")
+    parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS),
+                        help="Caller statement of the format inside the image descriptor")
     args = parser.parse_args()
     if args.output.suffix.lower() != ".hlsl" or args.output.resolve() == args.container.resolve():
         parser.error("Choose an HLSL destination distinct from the input")
@@ -1071,7 +1361,8 @@ def main():
                    descriptor_offset=args.descriptor_offset, group_reg=args.group_reg, stride=args.stride,
                    constant_descriptor=args.constant_descriptor, group_reg_y=args.group_reg_y,
                    group_reg_z=args.group_reg_z, source_descriptor=args.source_descriptor,
-                   source_stride=args.source_stride, cpu=args.cpu, lds_bytes=args.lds_bytes,
+                   source_stride=args.source_stride, image_descriptor=args.image_descriptor,
+                   image_format=args.image_format, cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")

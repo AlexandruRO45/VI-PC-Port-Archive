@@ -4,78 +4,57 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GTA6 PC Port Archive</title>
-<meta name="description" content="Archive of Leonida, xcl, VIctory and Xbox2Windows: open-source projects that worked on running GTA VI on PC. Code, commit history, pull requests, issues and comments.">
+<meta name="description" content="Archive of five open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory and Xbox2Windows. How far each gets, plus code, issues and comments.">
 <script>
-  // old links pointed issues at index.html#project/number; they live on browse.html now
-  if (/^#(leonida|xcl|victory|xbox2windows)(\/\d+)?$/.test(location.hash)) location.replace("browse.html" + location.hash);
+  // old links pointed issues at index.html#project/number; they live on browse.html now ("leonida" is now "leonida-old")
+  if (/^#(leonida|leonida-old|leonida-new|xcl|victory|xbox2windows)(\/\d+)?$/.test(location.hash))
+    location.replace("browse.html" + location.hash.replace(/^#leonida(?=\/|$)/, "#leonida-old"));
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
 <style>
+.sr { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
+
 /* hero */
 .hero { padding:48px 0 0; }
 .kicker { font-size:14px; font-weight:500; color:var(--muted); }
 .hero h1 { font-size:clamp(30px, 4.4vw, 42px); line-height:1.1; margin:6px 0 10px; }
-.hero .lede { font-size:17px; color:var(--ink2); max-width:52ch; margin:0; }
+.hero .lede { font-size:17px; color:var(--ink2); max-width:56ch; margin:0; }
 .cta { display:flex; gap:10px; flex-wrap:wrap; margin-top:22px; }
+.answer { margin-top:28px; background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--ink); border-radius:12px; padding:16px 18px; }
+.answer b { display:block; font-size:19px; margin-bottom:2px; }
+.answer span { color:var(--ink2); }
 
-/* stat cards */
-.stats { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:10px; margin-top:32px; }
-@media (max-width:700px) { .stats { grid-template-columns:repeat(2, minmax(0, 1fr)); } }
-.stat { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
-.stat b { display:block; font-size:26px; font-weight:700; line-height:1.15; font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
-.stat span { font-size:14px; color:var(--ink2); }
-
-/* activity chart: small multiples, one row per project */
-.chart { position:relative; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:8px 16px 0; }
-.crow { display:grid; grid-template-columns:150px minmax(0, 1fr); gap:14px; align-items:end; padding:10px 0; border-bottom:1px solid var(--line); }
-.crow .who b { display:flex; align-items:center; gap:8px; font-size:15px; }
-.crow .who span { font-size:13px; color:var(--muted); }
-.crow svg { display:block; width:100%; height:52px; overflow:visible; }
-.axis { display:grid; grid-template-columns:150px minmax(0, 1fr); gap:14px; }
-.axis div { position:relative; height:30px; }
-.axis span { position:absolute; top:7px; font-size:12px; color:var(--muted); white-space:nowrap; border-left:1px solid var(--line); padding-left:6px; }
+/* how far each gets */
+.ladder { display:flex; flex-direction:column; gap:10px; }
+.prow { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; display:grid; grid-template-columns:170px minmax(0, 1fr); gap:10px 16px; align-items:center; }
+.prow .nm { display:flex; align-items:center; gap:8px; font-weight:600; }
+.prow .nm small { font-weight:400; color:var(--muted); font-size:13px; }
+.steps { list-style:none; margin:0; padding:0; display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:6px; }
+.steps li { font-size:13px; line-height:1.25; text-align:center; padding:7px 4px; border-radius:7px; border:1.5px dashed var(--line); color:var(--muted); }
+.steps li.ok { border:1.5px solid var(--open); background:color-mix(in srgb, var(--open) 14%, transparent); color:var(--ink); font-weight:600; }
+.steps li.ok::before { content:"✓ "; color:var(--open); }
+.prow .note { grid-column:2; margin:0; font-size:14.5px; color:var(--ink2); }
+.prow .note a { color:var(--muted); white-space:nowrap; }
 @media (max-width:700px) {
-  .crow, .axis { grid-template-columns:minmax(0, 1fr); gap:4px; }
-  .axis > :first-child { display:none; }
+  .prow { grid-template-columns:minmax(0, 1fr); }
+  .prow .note { grid-column:1; }
+  .steps li { font-size:12px; padding:6px 2px; }
 }
-.plot { cursor:crosshair; outline:none; }
-.plot:focus-visible { outline:2px solid var(--ink); outline-offset:4px; }
-.tip { position:absolute; pointer-events:none; z-index:5; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:13px; box-shadow:0 8px 24px rgba(0,0,0,.14); min-width:180px; display:none; }
-.tip .when { font-size:12px; color:var(--muted); margin-bottom:6px; }
-.tip div.r { display:flex; align-items:center; gap:8px; }
-.tip div.r b { margin-left:auto; font-variant-numeric:tabular-nums; padding-left:16px; }
-details.table { margin-top:10px; font-size:14px; }
-details.table summary { cursor:pointer; color:var(--ink2); }
-.tbl { width:100%; border-collapse:collapse; margin-top:8px; font-size:14px; font-variant-numeric:tabular-nums; }
-.tbl th, .tbl td { padding:6px 10px; border-bottom:1px solid var(--line); text-align:right; }
-.tbl th:first-child, .tbl td:first-child { text-align:left; }
-.tbl thead th { font-weight:600; color:var(--ink2); }
-.tblwrap { overflow-x:auto; }
+.src { margin-top:10px; font-size:13px; color:var(--muted); }
 
 /* project cards */
 .projs { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; }
 @media (max-width:760px) { .projs { grid-template-columns:minmax(0, 1fr); } }
-.proj { background:var(--panel); border:1px solid var(--line); border-top:3px solid var(--pc); border-radius:12px; padding:18px; display:flex; flex-direction:column; gap:14px; }
+.proj { background:var(--panel); border:1px solid var(--line); border-top:3px solid var(--pc); border-radius:12px; padding:18px; display:flex; flex-direction:column; gap:12px; }
 .proj .hd { display:flex; align-items:center; justify-content:space-between; gap:10px; }
 .proj h3 { font-family:Inter, system-ui, sans-serif; font-size:19px; letter-spacing:-.01em; }
-.proj p { margin:-8px 0 0; color:var(--ink2); font-size:15px; }
-.mini { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:8px; }
-.mini div { background:var(--soft); border-radius:8px; padding:8px 10px; }
-.mini b { display:block; font-size:18px; font-variant-numeric:tabular-nums; }
-.mini span { font-size:13px; color:var(--ink2); }
+.proj p { margin:0; color:var(--ink2); font-size:15px; }
+.proj .reach { font-size:14px; font-weight:600; }
+.proj .reach span { font-weight:400; color:var(--muted); }
 .proj .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:auto; }
-
-/* people */
-.people { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:8px; list-style:none; margin:0; padding:0; }
-@media (max-width:860px) { .people { grid-template-columns:repeat(2, minmax(0, 1fr)); } }
-@media (max-width:480px) { .people { grid-template-columns:minmax(0, 1fr); } }
-.people li { display:flex; align-items:center; gap:10px; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; min-width:0; }
-.people .nm { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
-.people .nm a { text-decoration:none; } .people .nm a:hover { text-decoration:underline; }
-.people .ct { margin-left:auto; font-size:14px; color:var(--ink2); font-variant-numeric:tabular-nums; white-space:nowrap; }
 
 /* get the code */
 .code { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
@@ -97,42 +76,35 @@ details.table summary { cursor:pointer; color:var(--ink2); }
 <nav class="nav" aria-label="Site"><div class="wrap">
   <a class="brand" href="./"><i aria-hidden="true"><b></b><b></b><b></b><b></b></i><span>GTA6 PC Port Archive</span></a>
   <ul>
-    <li><a href="#projects">Projects</a></li><li><a href="#activity">Activity</a></li><li><a href="#people">People</a></li>
+    <li><a href="#progress">Progress</a></li><li><a href="#projects">Projects</a></li>
     <li><a href="#code">Code</a></li><li><a href="#links">Links</a></li><li><a class="go" href="browse.html">Browse issues</a></li>
   </ul>
 </div></nav>
 
 <main class="wrap">
   <header class="hero">
-    <div class="kicker">Saved 23–24 Nov 2026</div>
+    <div class="kicker">Updated 24 Nov 2026</div>
     <h1>GTA6 PC Port Archive</h1>
-    <p class="lede">Code, history, issues and comments from four open-source GTA VI PC projects. No game files.</p>
-    <div class="cta">
-      <a class="btn solid" href="browse.html">Browse issues and PRs →</a>
-      <a class="btn" href="#code">Download the code</a>
+    <p class="lede">Saved copies of five open-source projects trying to run GTA VI on PC: their code, issues and comments. No game files.</p>
+    <div class="answer" role="note">
+      <b>Can you play it on PC yet? No.</b>
+      <span>Furthest so far: VIctory loads into the world, but the screen stays dark there.</span>
     </div>
-    <div class="stats" id="stats">
-      <div class="stat"><b>–</b><span>commits</span></div>
-      <div class="stat"><b>–</b><span>contributors</span></div>
-      <div class="stat"><b>–</b><span>issues and PRs</span></div>
-      <div class="stat"><b>–</b><span>comments</span></div>
+    <div class="cta">
+      <a class="btn solid" href="#progress">See how far each one gets</a>
+      <a class="btn" href="browse.html">Browse issues and PRs</a>
     </div>
   </header>
+
+  <section class="sec" id="progress" aria-labelledby="prog-h">
+    <div class="sec-head"><h2 id="prog-h">How far each one gets</h2><p>Green means that part works.</p></div>
+    <div class="ladder" id="ladder"></div>
+    <p class="src">From each project's own README on 24 Nov 2026. Tested by the developers on their own PCs.</p>
+  </section>
 
   <section class="sec" id="projects" aria-labelledby="proj-h">
     <div class="sec-head"><h2 id="proj-h">Projects</h2></div>
     <div class="projs" id="projlist"></div>
-  </section>
-
-  <section class="sec" id="activity" aria-labelledby="act-h">
-    <div class="sec-head"><h2 id="act-h">Commits per hour</h2><p id="act-sub">UTC. Each row is scaled to its own busiest hour.</p></div>
-    <div class="chart" id="chart"><p class="meta">Loading…</p></div>
-    <details class="table"><summary>Show as a table</summary><div class="tblwrap" id="table"></div></details>
-  </section>
-
-  <section class="sec" id="people" aria-labelledby="people-h">
-    <div class="sec-head"><h2 id="people-h">Top contributors</h2><p id="people-sub">Most commits across all four projects.</p></div>
-    <ol class="people" id="peoplelist"></ol>
   </section>
 
   <section class="sec" id="code" aria-labelledby="code-h">
@@ -151,139 +123,72 @@ details.table summary { cursor:pointer; color:var(--ink2); }
 </main>
 
 <footer><div class="wrap">
-  <span>Licenses: Leonida GPL-3.0 · xcl GPL-2.0 · VIctory GPL-3.0 · Xbox2Windows MIT</span>
+  <span>Licenses: Leonida (old and new) GPL-3.0 · xcl GPL-2.0 · VIctory GPL-3.0 · Xbox2Windows MIT</span>
   <a href="https://github.com/Guernica4u/GTA6-PC-Port-Archive">GitHub repository</a>
 </div></footer>
 
 <script>
 const REPO = "https://github.com/Guernica4u/GTA6-PC-Port-Archive";
+const STEPS = ["Starts", "Menus", "Loads the world", "World on screen", "Playable"];
+// reached = how many STEPS work, from each project's README (24 Nov 2026); branch = its branch prefix in this repo
 const PROJECTS = {
-  leonida: { name: "Leonida", lic: "GPL-3.0", desc: "Native PC recompilation of the Xbox version." },
-  xcl: { name: "xcl", lic: "GPL-2.0", desc: "Xbox Series compatibility layer for Windows." },
-  victory: { name: "VIctory", lic: "GPL-3.0", desc: "An attempt at running GTA VI on PC." },
-  xbox2windows: { name: "Xbox2Windows", lic: "MIT", desc: "Static recompiler for Xbox Series software." },
+  "leonida-new": { name: "Leonida", tag: "new", lic: "GPL-3.0", branch: "leonida-new", up: "https://github.com/ubiquitarianism/leonida",
+    desc: "Leonida Continued: picks up the original Leonida with its full history.", reached: 0,
+    note: "The game doesn't start yet. Its tools already unpack the game's shaders, models, textures and audio.", src: "https://github.com/ubiquitarianism/leonida#project-status" },
+  "leonida-old": { name: "Leonida", tag: "old", lic: "GPL-3.0", branch: "leonida", up: null,
+    desc: "The original. Removed from GitHub on 23 Nov 2026; this is the last copy saved.", reached: 0,
+    note: "Stopped before the game starts. The new Leonida carries on from here.", src: `${REPO}/tree/main/leonida-old#project-status` },
+  xcl: { name: "xcl", lic: "GPL-2.0", branch: "xcl", up: "https://github.com/ivall/xcl",
+    desc: "Runs Xbox Series games on Windows. Minecraft Preview and Unicorn Overlord are already fully playable.", reached: 2,
+    note: "Starts in about 4 seconds and shows the menus at 30 fps. Gameplay not reached yet. (Its README calls it “a newer retail game”.)", src: "https://github.com/ivall/xcl#games" },
+  victory: { name: "VIctory", lic: "GPL-3.0", branch: "victory", up: "https://github.com/Marvisak/VIctory",
+    desc: "Runs GTA VI's Xbox code natively on Windows.", reached: 3,
+    note: "Starts, plays the intro, shows the menus and loads into the world. The world itself is still a dark screen.", src: "https://github.com/Marvisak/VIctory#status-2026-11-23" },
+  xbox2windows: { name: "Xbox2Windows", lic: "MIT", branch: "xbox2windows", up: "https://github.com/R0Y00/Xbox2Windows",
+    desc: "Turns Xbox Series code into a Windows program.", reached: 1,
+    note: "With a modified test EXE it plays the intro and reaches a loading screen. Menus not checked yet.", src: "https://github.com/R0Y00/Xbox2Windows#readme" },
 };
 const KEYS = Object.keys(PROJECTS);
 const $ = id => document.getElementById(id);
-const fmt = n => n.toLocaleString("en-US");
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
-const day = t => new Date(t * 1000).toLocaleDateString("en-GB", { weekday:"short", day:"numeric", month:"short", timeZone:"UTC" });
-const who = (name, login) => login ? `<a href="https://github.com/${encodeURIComponent(login)}">${esc(name)}</a>` : esc(name);
+const label = P => P.tag ? `${P.name} <small>(${P.tag})</small>` : P.name;
+const date = t => new Date(t * 1000).toLocaleDateString("en-GB", { day:"numeric", month:"short", year:"numeric", timeZone:"UTC" });
+const reach = P => P.reached ? `Gets to: ${STEPS[P.reached - 1]}` : "Doesn't start yet";
 
-async function json(url) { try { const r = await fetch(url); return r.ok ? r.json() : null; } catch { return null; } }
-
-function stats(site, st) {
-  const sum = f => KEYS.reduce((a, k) => a + ((st || {})[k]?.[f] || 0), 0);
-  const vals = [site ? KEYS.reduce((a, k) => a + site.projects[k].commits, 0) : null, site?.people_total,
-    st ? sum("issues") + sum("prs") : null, st ? sum("comments") : null];
-  [...$("stats").children].forEach((d, i) => { if (vals[i] != null) d.querySelector("b").textContent = fmt(vals[i]); });
-}
-
-/* ---------- activity chart ---------- */
-function barPath(x, y, w, h, r) {
-  r = Math.min(r, w / 2, h);
-  return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`;
-}
-function chart(site) {
-  const N = site.hours, t0 = site.start;
-  const rows = KEYS.map(k => {
-    const p = site.projects[k], peak = Math.max(...p.hourly);
-    return `<div class="crow p-${k}"><div class="who"><b><i class="dot"></i>${PROJECTS[k].name}</b>
-      <span>${fmt(p.commits)} commits</span></div><svg class="plot" data-k="${k}" role="img"
-      aria-label="${PROJECTS[k].name}: ${fmt(p.commits)} commits, busiest hour ${fmt(peak)} commits"></svg></div>`;
+function ladder() {
+  $("ladder").innerHTML = KEYS.map(k => {
+    const P = PROJECTS[k];
+    return `<div class="prow p-${k}">
+      <div class="nm"><i class="dot"></i>${label(P)}</div>
+      <ol class="steps" aria-label="${esc(P.name + (P.tag ? " " + P.tag : ""))}: ${esc(reach(P))}">${STEPS.map((s, i) =>
+        `<li${i < P.reached ? ' class="ok"' : ""}>${s}<span class="sr">${i < P.reached ? ": works" : ": not yet"}</span></li>`).join("")}</ol>
+      <p class="note">${esc(P.note)} <a href="${P.src}" target="_blank" rel="noopener">Source</a></p>
+    </div>`;
   }).join("");
-  const ticks = [];
-  for (let i = 0; i < N; i++) if ((t0 + i * 3600) % 86400 === 0) ticks.push(i);
-  const axis = `<div class="axis"><div></div><div>${ticks.map(i => `<span style="left:${(i / N * 100).toFixed(3)}%${i / N > .85 ? ";transform:translateX(-100%);border-left:0;border-right:1px solid var(--line);padding:0 6px 0 0" : ""}">${day(t0 + i * 3600)}</span>`).join("")}</div></div>`;
-  $("chart").innerHTML = rows + axis + `<div class="tip" id="tip" role="status"></div>`;
-  const svgs = [...$("chart").querySelectorAll("svg.plot")];
-  let hover = -1;
-
-  function draw() {
-    for (const svg of svgs) {
-      const data = site.projects[svg.dataset.k].hourly, peak = Math.max(...data);
-      const W = svg.clientWidth, H = svg.clientHeight, bw = W / N, gap = bw > 6 ? 2 : 1;
-      svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
-      let d = "";
-      data.forEach((v, i) => { if (v) { const h = Math.max(1.5, v / peak * (H - 2)); d += barPath(i * bw + gap / 2, H - h, Math.max(1, bw - gap), h, 2); } });
-      svg.innerHTML = `<rect class="hl" x="0" y="0" width="${bw}" height="${H}" fill="var(--soft)" visibility="hidden"/>` +
-        `<line x1="0" x2="${W}" y1="${H - .5}" y2="${H - .5}" stroke="var(--line)"/><path d="${d}" fill="var(--pc)"/>`;
-    }
-    show(hover);
-  }
-  function show(i) {
-    hover = i;
-    const tip = $("tip");
-    for (const svg of svgs) {
-      const hl = svg.querySelector(".hl"); if (!hl) continue;
-      hl.setAttribute("visibility", i < 0 ? "hidden" : "visible");
-      hl.setAttribute("x", i * svg.clientWidth / N);
-    }
-    if (i < 0) { tip.style.display = "none"; return; }
-    const t = t0 + i * 3600, hh = s => new Date(s * 1000).toISOString().slice(11, 13);
-    tip.innerHTML = `<div class="when">${day(t)}, ${hh(t)}:00–${hh(t + 3600)}:00 UTC</div>` +
-      KEYS.map(k => `<div class="r p-${k}"><i class="dot"></i>${PROJECTS[k].name}<b>${fmt(site.projects[k].hourly[i])}</b></div>`).join("");
-    tip.style.display = "block";
-    const box = $("chart").getBoundingClientRect(), svg = svgs[0].getBoundingClientRect();
-    const x = svg.left - box.left + (i + .5) * svg.width / N, w = tip.offsetWidth;
-    tip.style.left = Math.max(0, Math.min(box.width - w, x + 14 > box.width - w ? x - w - 14 : x + 14)) + "px";
-    tip.style.top = (svg.top - box.top) + "px";
-  }
-  const idx = e => { const r = e.currentTarget.getBoundingClientRect(); return Math.max(0, Math.min(N - 1, Math.floor((e.clientX - r.left) / r.width * N))); };
-  for (const svg of svgs) {
-    const data = site.projects[svg.dataset.k].hourly;
-    svg.addEventListener("pointermove", e => show(idx(e)));
-    svg.addEventListener("pointerdown", e => show(idx(e)));
-    svg.addEventListener("pointerleave", e => { if (e.pointerType === "mouse") show(-1); });
-    svg.tabIndex = 0;
-    svg.addEventListener("focus", () => { if (hover < 0) show(data.indexOf(Math.max(...data))); });
-    svg.addEventListener("blur", () => show(-1));
-    svg.addEventListener("keydown", e => {
-      if (e.key === "ArrowRight") { show(Math.min(N - 1, hover + 1)); e.preventDefault(); }
-      if (e.key === "ArrowLeft") { show(Math.max(0, hover - 1)); e.preventDefault(); }
-      if (e.key === "Escape") show(-1);
-    });
-  }
-  new ResizeObserver(draw).observe($("chart"));
-  draw();
-
-  const days = {};
-  for (let i = 0; i < N; i++) { const d = day(t0 + i * 3600); days[d] ??= Object.fromEntries(KEYS.map(k => [k, 0])); KEYS.forEach(k => days[d][k] += site.projects[k].hourly[i]); }
-  $("table").innerHTML = `<table class="tbl"><thead><tr><th>Day (UTC)</th>${KEYS.map(k => `<th>${PROJECTS[k].name}</th>`).join("")}<th>Total</th></tr></thead><tbody>` +
-    Object.entries(days).map(([d, v]) => `<tr><td>${d}</td>${KEYS.map(k => `<td>${fmt(v[k])}</td>`).join("")}<td>${fmt(KEYS.reduce((a, k) => a + v[k], 0))}</td></tr>`).join("") + "</tbody></table>";
 }
 
-/* ---------- projects ---------- */
-function projects(site, st) {
+function projects(st) {
   $("projlist").innerHTML = KEYS.map(k => {
-    const P = PROJECTS[k], h = site?.projects[k], s = (st || {})[k] || {};
-    const n = v => v == null ? "–" : fmt(v);
+    const P = PROJECTS[k], s = (st || {})[k] || {};
     return `<article class="proj p-${k}">
-      <div class="hd"><h3>${P.name}</h3><span class="chip">${P.lic}</span></div>
+      <div class="hd"><h3>${label(P)}</h3><span class="chip">${P.lic}</span></div>
       <p>${esc(P.desc)}</p>
-      <div class="mini"><div><b>${n(h?.commits)}</b><span>commits</span></div><div><b>${n(h?.authors)}</b><span>contributors</span></div><div><b>${n(s.prs)}</b><span>pull requests</span></div></div>
+      <div class="reach">${esc(reach(P))}${s.updated ? ` <span>· last code change ${date(s.updated)}</span>` : ""}</div>
       <div class="actions">
         <a class="btn solid sm" href="browse.html#${k}">Issues and PRs</a>
         <a class="btn sm" href="${REPO}/tree/main/${k}">Code</a>
-        <a class="btn sm" href="${REPO}/archive/refs/heads/${k}/main.zip">Download zip</a>
+        <a class="btn sm" href="${REPO}/archive/refs/heads/${P.branch}/main.zip">Download zip</a>
+        ${P.up ? `<a class="btn sm" href="${P.up}" target="_blank" rel="noopener">Original ↗</a>` : ""}
       </div>
     </article>`;
   }).join("");
 }
 
-/* ---------- people ---------- */
-function people(site) {
-  $("peoplelist").innerHTML = site.people.slice(0, 12).map(([name, login, n]) =>
-    `<li><span class="nm">${who(name, login)}</span><span class="ct">${fmt(n)} commits</span></li>`).join("");
-  $("people-sub").textContent = `Most commits across all four projects, out of ${fmt(site.people_total)} people.`;
-}
-
-/* ---------- get the code ---------- */
 function cmds() {
   const all = `git clone ${REPO}.git`;
-  const one = k => `git clone --branch ${k}/main --single-branch ${REPO}.git ${k}`;
+  const one = k => `git clone --branch ${PROJECTS[k].branch}/main --single-branch ${REPO}.git ${k}`;
   $("cmds").innerHTML = `<div class="cmdline"><pre id="cmd">${esc(all)}</pre><button type="button" class="btn sm" data-copy>Copy</button></div>
-    <div class="one">Only one project: ${KEYS.map(k => `<button type="button" class="btn sm p-${k}" data-k="${k}" aria-pressed="false"><i class="dot"></i>${PROJECTS[k].name}</button>`).join("")}
+    <div class="one">Only one project: ${KEYS.map(k => `<button type="button" class="btn sm p-${k}" data-k="${k}" aria-pressed="false"><i class="dot"></i>${label(PROJECTS[k])}</button>`).join("")}
       <button type="button" class="btn sm" data-k="" aria-pressed="true">All</button></div>`;
   $("cmds").addEventListener("click", async e => {
     const pick = e.target.closest("[data-k]");
@@ -300,12 +205,10 @@ function cmds() {
 }
 
 (async () => {
+  ladder();
   cmds();
-  const [site, st] = await Promise.all([json("data/site.json"), json("data/stats.json")]);
-  stats(site, st);
-  projects(site, st);
-  if (site) { chart(site); people(site); }
-  else { $("chart").innerHTML = '<p class="meta">Could not load the commit data.</p>'; $("people").hidden = true; }
+  projects(null);
+  try { const r = await fetch("data/stats.json"); if (r.ok) projects(await r.json()); } catch {}
 })();
 </script>
 </body>

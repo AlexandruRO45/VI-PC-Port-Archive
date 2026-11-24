@@ -26,3 +26,6 @@ EXPORTS
     caller_copy
     caller_copy_low
     forward_alloc
+    default_alloc
+    default_free_tail
+    cmove_guarded

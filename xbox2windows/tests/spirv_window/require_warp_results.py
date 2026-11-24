@@ -8,7 +8,7 @@ missing from the report, skipped or failed fails this check.
 import sys
 import xml.etree.ElementTree as ET
 
-REQUIRED = [f"spirv_{name}_warp" for name in ("address_window", "sampler_views", "ballot_extract",
+REQUIRED = [f"spirv_{name}_warp" for name in ("address_window", "address_window_qword", "sampler_views", "ballot_extract",
                                                "compaction", "compare_sampler", "minlod", "minlod_levels",
                                                "minlod_exact", "minlod_fractional")]
 

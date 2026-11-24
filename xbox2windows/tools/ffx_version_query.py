@@ -48,7 +48,7 @@ INTEGER_HEADER = """#include <array>
 using std::memcpy;
 using std::memset;
 using word = uint64_t;
-static_assert(sizeof(void*) == sizeof(word));
+static_assert(sizeof(void*) == sizeof(word), "lowered code needs 64-bit pointers");
 // A read of host data, or of the lowered function's own frame array, which cannot fault.
 template<class T> T load(word address) {
     T v; memcpy(&v, reinterpret_cast<const void*>(address), sizeof v); return v;
@@ -440,6 +440,43 @@ def lahf_sources(body, host_ops):
     return sources
 
 
+# Readers of PF in the integer lowering, and the instructions whose lowering assigns PF when the function declares
+# it: the VEX scalar compares (PF = unordered) and the tests and string compares that clear it. A register ADD, SUB
+# or CMP that a LAHF reads also assigns it (lahf_sources).
+PF_CONSUMERS = frozenset({M.JP, M.JNP, M.SETP, M.SETNP, M.CMOVP, M.CMOVNP})
+PF_DEFINERS = frozenset({M.VCOMISS, M.VUCOMISS, M.VCOMISD, M.VUCOMISD, M.VTESTPS, M.VTESTPD, M.VPTEST, M.PTEST,
+                         M.PCMPESTRI, M.PCMPESTRM, M.PCMPISTRI, M.PCMPISTRM})
+
+
+def check_parity(body, lahf_from, host_ops):
+    """Reject a PF reader of a function outside the x87 profile unless, on every path from the entry, the last
+    instruction that changes PF is one whose lowering assigns it (PF_DEFINERS or a LAHF source). A call, a host
+    binding (opaque emitted code), an instruction that leaves PF undefined and any other PF writer make PF unknown;
+    a join keeps PF known only when it is known on every incoming path. A reader that no path from the entry
+    reaches (for example after an indirect branch) is refused too."""
+    index = {i.ip: i for i in body}
+    known = {body[0].ip: False}
+    work = [body[0].ip]
+    while work:
+        i = index[work.pop()]
+        if i.ip in host_ops or i.flow_control in (FlowControl.CALL, FlowControl.INDIRECT_CALL):
+            after = False
+        elif i.rflags_modified & F.PF:
+            after = (i.mnemonic in PF_DEFINERS or i.ip in lahf_from) and not i.rflags_undefined & F.PF
+        else:
+            after = known[i.ip]
+        for target in x87_lower._successors(i):
+            if target in index:
+                joined = after if target not in known else known[target] and after
+                if target not in known or joined != known[target]:
+                    known[target] = joined
+                    work.append(target)
+    for i in body:
+        if i.ip not in host_ops and i.rflags_read & F.PF and not known.get(i.ip, False):
+            raise ValueError(f"{i} at {i.ip:#x} reads PF, which no modeled PF producer defines on every path "
+                             "from the entry")
+
+
 def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, host_entropy=False,
           host_cpu=False, host_mxcsr=None):
     """Emit only query integer operations. All external edges and calls need named bindings."""
@@ -453,11 +490,14 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
     # JP, JNP, FCMOVU and FCMOVNU read PF, which only a function the x87 profile has checked models
     # (x87_lower.check_flags); SAHF, the FCOMI family and the 8-bit TEST and AND set it there. Other functions
     # keep their two flags.
-    parity = x87_depth is not None and any(i.mnemonic in (M.JP, M.JNP, M.FCMOVU, M.FCMOVNU) for i in body)
-    if parity:
-        lines[2] = "bool zero=false, carry=false, overflow=false, sign=false, parity=false;"
     # A register ADD, SUB or CMP that a LAHF reads also assigns AF and PF (lahf_sources).
     lahf_from = lahf_sources(body, host_ops or {})
+    # Outside the x87 profile a PF reader needs a modeled PF definition on every path (check_parity).
+    parity = any(i.mnemonic in PF_CONSUMERS | {M.FCMOVU, M.FCMOVNU} for i in body)
+    if parity and x87_depth is None:
+        check_parity(body, lahf_from, host_ops or {})
+    if parity:
+        lines[2] = "bool zero=false, carry=false, overflow=false, sign=false, parity=false;"
     if lahf_from:
         lines[2] = lines[2][:-1] + ("" if parity else ", parity=false") + ", aux=false;"
     # FNSTSW is the only reader of the x87 status word (x87_lower.statement).
@@ -885,6 +925,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             # A memory source is read whether or not the condition holds: guest() reads it before the
             # condition is evaluated.
             stmt = write(f"({cond}) ? {operand(1)} : {operand(0)}")
+        elif op in (M.CMOVP, M.CMOVNP) and parity:
+            # As for the other CMOVcc: the memory source is read either way, and a 32-bit destination is
+            # zero-extended even when the condition is false.
+            stmt = write(f"({'parity' if op == M.CMOVP else '!parity'}) ? {operand(1)} : {operand(0)}")
         elif op == M.LEA:
             stmt = write(address())
         elif op == M.MOVBE:
@@ -948,7 +992,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         elif i.code == C.UD2:
             # UD2 (0F 0B) raises the host's STATUS_ILLEGAL_INSTRUCTION; UD0 and UD1 stay refused.
             stmt = "__ud2();"
-        elif op == M.LDMXCSR and host_mxcsr is not None and i.op0_kind == K.MEMORY:
+        elif op in (M.LDMXCSR, M.VLDMXCSR) and host_mxcsr is not None and i.op0_kind == K.MEMORY:
+            # VLDMXCSR (VEX.128, vvvv 1111; iced decodes every other VEX form as invalid) behaves the same.
             # The opt-in host-MXCSR profile: the requested word is checked before it reaches the host register,
             # so a refused word changes nothing and no later guest instruction runs.
             stmt = (f"{{ const uint32_t want = {guest('uint32_t')}; "
@@ -957,7 +1002,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                     f"if (want & {'~mxcsr_mask' if host_mxcsr.denormals else '0x8040u'}) "
                     f"{host_mxcsr.leave('unsupported')} "
                     f"_mm_setcsr(want); }}")
-        elif op == M.STMXCSR and host_mxcsr is not None and i.op0_kind == K.MEMORY:
+        elif op in (M.STMXCSR, M.VSTMXCSR) and host_mxcsr is not None and i.op0_kind == K.MEMORY:
             stmt = f"store<uint32_t>({address()}, _mm_getcsr());"
         elif op == M.XGETBV and host_cpu:
             # The host's extended control register ECX into EDX:EAX, flags kept. Any ECX is passed through, but
@@ -3034,6 +3079,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             stmt = write(f"({cond})")
         elif op == M.SETO:
             stmt = write("overflow")
+        elif op in (M.SETP, M.SETNP) and parity:
+            stmt = write("(parity)" if op == M.SETP else "(!parity)")
         elif op == M.CALL:
             stmt = calls[i.ip]
         elif op == M.XLATB:

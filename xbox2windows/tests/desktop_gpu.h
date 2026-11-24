@@ -1,5 +1,6 @@
 #pragma once
 #include <d3d12.h>
+#include <cstdint>
 #include <stdexcept>
 #include <vector>
 #include <wrl/client.h>
@@ -12,6 +13,15 @@ Microsoft::WRL::ComPtr<ID3D12Resource> resource(ID3D12Device* device, const D3D1
     D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear = nullptr);
 void check_compute(ID3D12Device* device, bool tables);
 void check_sampler_views(ID3D12Device* device, const char* shader_path);
+bool check_startup_sampler_x(ID3D12Device* device, bool swapped);
+int check_startup_cb_blend(ID3D12Device* device, bool swapped);
+void check_dynamic_sampler_index(ID3D12Device* device);
+float check_startup_sampler_heap(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
+                                 std::uint32_t byte_offset, const char* manifest, const char* binding_case);
+void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
+                            float color[4]);
+void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
+                              std::uint32_t words[4]);
 void dump_raw_uav(ID3D12Device* device, const char* shader_path, const char* groups,
                   const char* bytes, const char* out_path);
 void check_spirv_window(ID3D12Device* device, const char* shader_path);
@@ -19,6 +29,7 @@ void check_spirv_compaction(ID3D12Device* device, const char* shader_path);
 void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, const char* ordinary_register,
                                  const char* reference_path, const char* descriptors = nullptr);
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr);
+void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference);
 void check_ffx_device_init(ID3D12Device* device);
 void check_ffx_recurrent(ID3D12Device* device);
 void check_dual_uav(ID3D12Device* device);
@@ -70,11 +81,14 @@ void check_bvh_hits(ID3D12Device* device);
 bool check_bvh_differential(ID3D12Device* device, bool forcePipeline);
 bool check_bvh_waves(ID3D12Device* device, bool force64);
 bool check_gpu_alias(ID3D12Device* device);
+bool check_gpu_alias_window(ID3D12Device* device);
 bool check_gpu_alias_lookup(ID3D12Device* device);
 bool check_gpu_alias_lookup_writes(ID3D12Device* device);
 bool check_gpu_alias_atomic_waterfall(ID3D12Device* device);
 bool check_gpu_alias_registry(ID3D12Device* device);
 bool check_wave_shuffle(ID3D12Device* device);
+void check_wave64_emulate(ID3D12Device* device);
+bool check_shader_wave(ID3D12Device* device, unsigned forced);
 bool check_dxr_rays(ID3D12Device* device, bool usePipeline);
 bool check_dxr_update(ID3D12Device* device, bool usePipeline);
 bool check_dxr_facing(ID3D12Device* device, bool usePipeline);

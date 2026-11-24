@@ -510,10 +510,11 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
          "unsupported query operation"),
         ("out_of_scope_pop_rax", encode_seq(Instruction.create_reg(Code.POP_R64, R.RAX), ret_ins),
          "unsupported query operation"),
+        # SETP reads PF, which an ADD that no LAHF reads does not assign (#1153 models PF only where it is assigned).
         ("out_of_scope_setp", encode_seq(
-            ld_rax, Instruction.create_reg_i32(Code.ADD_EAX_IMM32, R.EAX, 1), Instruction.create(Code.LAHF),
+            ld_rax, Instruction.create_reg_i32(Code.ADD_EAX_IMM32, R.EAX, 1),
             Instruction.create_mem(Code.SETP_RM8, MemoryOperand(R.R8)), ret_ins),
-         "unsupported query operation"),
+         "reads PF"),
         # #1022 LAHF source-discipline rejections (after other flag writers / memory arith / entry / control flow)
         ("refuse_lahf_after_inc", encode_seq(
             ld_rax, Instruction.create_reg(Code.INC_RM32, R.EAX), Instruction.create(Code.LAHF), ret_ins),

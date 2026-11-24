@@ -126,6 +126,7 @@ SOPP_OPS = {
     0x00: ("s_nop", "No operation (wait cycles)"),
     0x01: ("s_endpgm", "Terminate shader execution"),
     0x02: ("s_branch", "Unconditional branch"),
+    0x03: ("s_wakeup", "Wake a sleeping wave"),
     0x04: ("s_cbranch_scc0", "Branch if SCC == 0"),
     0x05: ("s_cbranch_scc1", "Branch if SCC == 1"),
     0x06: ("s_cbranch_vccz", "Branch if VCC is zero"),
@@ -133,10 +134,28 @@ SOPP_OPS = {
     0x08: ("s_cbranch_execz", "Branch if EXEC is zero"),
     0x09: ("s_cbranch_execnz", "Branch if EXEC is non-zero"),
     0x0a: ("s_barrier", "Synchronize wavefronts in workgroup"),
+    0x0b: ("s_setkill", "Set the wave kill bit"),
     0x0c: ("s_waitcnt", "Wait for memory operations"),
+    0x0d: ("s_sethalt", "Set the wave halt bit"),
+    0x0e: ("s_sleep", "Suspend the wave temporarily"),
+    0x0f: ("s_setprio", "Set wave priority"),
+    0x10: ("s_sendmsg", "Send a message"),
+    0x11: ("s_sendmsghalt", "Send a message and halt the wave"),
+    0x12: ("s_trap", "Raise a trap"),
+    0x13: ("s_icache_inv", "Invalidate the instruction cache"),
+    0x14: ("s_incperflevel", "Increment the selected performance counter"),
+    0x15: ("s_decperflevel", "Decrement the selected performance counter"),
+    0x16: ("s_ttracedata", "Emit thread trace data"),
+    0x1b: ("s_endpgm_saved", "Terminate the wave and signal that its context was saved"),
+    0x1e: ("s_endpgm_ordered_ps_done", "Terminate an ordered pixel shader wave"),
     0x1f: ("s_code_end", "Code end marker"),
     0x20: ("s_inst_prefetch", "Instruction cache prefetch"),
     0x21: ("s_clause", "Begin hard clause"),
+    0x22: ("s_wait_idle", "Wait for outstanding operations to finish"),
+    0x23: ("s_waitcnt_depctr", "Wait for dependency counters"),
+    0x24: ("s_round_mode", "Set floating-point rounding mode"),
+    0x25: ("s_denorm_mode", "Set floating-point denormal mode"),
+    0x28: ("s_ttracedata_imm", "Emit immediate thread trace data"),
 }
 
 SOP1_OPS = {
@@ -182,6 +201,10 @@ SOP1_OPS = {
     0x2b: ("s_xnor_saveexec_b64", "Save execution mask and bitwise XNOR with scalar source 64-bit"),
     0x2c: ("s_quadmask_b32", "Compute quad mask scalar 32-bit"),
     0x2d: ("s_quadmask_b64", "Compute quad mask scalar 64-bit"),
+    0x2e: ("s_movrels_b32", "Scalar move 32-bit with relative source index in M0"),
+    0x2f: ("s_movrels_b64", "Scalar move 64-bit with relative source index in M0"),
+    0x30: ("s_movreld_b32", "Scalar move 32-bit with relative destination index in M0"),
+    0x31: ("s_movreld_b64", "Scalar move 64-bit with relative destination index in M0"),
     0x34: ("s_abs_i32", "Scalar absolute value signed 32-bit"),
     0x37: ("s_andn1_saveexec_b64", "Save execution mask and bitwise AND NOT1 with scalar source 64-bit"),
     0x38: ("s_orn1_saveexec_b64", "Save execution mask and bitwise OR NOT1 with scalar source 64-bit"),
@@ -200,6 +223,7 @@ SOP1_OPS = {
     0x45: ("s_orn1_saveexec_b32", "Save execution mask and bitwise OR NOT1 with scalar source 32-bit"),
     0x46: ("s_andn1_wrexec_b32", "Save execution mask and write bitwise AND NOT1 scalar source 32-bit"),
     0x47: ("s_andn2_wrexec_b32", "Save execution mask and write bitwise AND NOT2 scalar source 32-bit"),
+    0x49: ("s_movrelsd_2_b32", "Scalar move 32-bit with relative source and destination indices in M0"),
 }
 
 SOP2_OPS = {
@@ -263,11 +287,21 @@ SOPK_OPS = {
     0x03: ("s_cmpk_eq_i32", "Scalar compare equal immediate"),
     0x04: ("s_cmpk_lg_i32", "Scalar compare not-equal immediate"),
     0x05: ("s_cmpk_gt_i32", "Scalar compare greater immediate"),
+    0x06: ("s_cmpk_ge_i32", "Scalar signed compare greater-or-equal immediate"),
+    0x07: ("s_cmpk_lt_i32", "Scalar signed compare less immediate"),
+    0x08: ("s_cmpk_le_i32", "Scalar signed compare less-or-equal immediate"),
+    0x09: ("s_cmpk_eq_u32", "Scalar unsigned compare equal immediate"),
+    0x0a: ("s_cmpk_lg_u32", "Scalar unsigned compare not-equal immediate"),
+    0x0b: ("s_cmpk_gt_u32", "Scalar unsigned compare greater immediate"),
+    0x0c: ("s_cmpk_ge_u32", "Scalar unsigned compare greater-or-equal immediate"),
+    0x0d: ("s_cmpk_lt_u32", "Scalar unsigned compare less immediate"),
+    0x0e: ("s_cmpk_le_u32", "Scalar unsigned compare less-or-equal immediate"),
     0x0f: ("s_addk_i32", "Scalar add immediate"),
     0x10: ("s_mulk_i32", "Scalar multiply immediate"),
     0x12: ("s_getreg_b32", "Read a hardware register field into an SGPR"),
     0x13: ("s_setreg_b32", "Write a hardware register field from an SGPR"),
     0x15: ("s_setreg_imm32_b32", "Write a hardware register field from a 32-bit literal"),
+    0x16: ("s_call_b64", "Call a PC-relative target and save the return address"),
     0x17: ("s_waitcnt_vscnt", "Wait for vector store counter"),
     0x18: ("s_waitcnt_vmcnt", "Wait for vector memory counter"),
     0x19: ("s_waitcnt_expcnt", "Wait for export counter"),
@@ -372,11 +406,28 @@ SMEM_OPS = {
     0x0a: "s_buffer_load_dwordx4",
     0x0b: "s_buffer_load_dwordx8",
     0x0c: "s_buffer_load_dwordx16",
+    0x18: "s_buffer_store_dword",
+    0x19: "s_buffer_store_dwordx2",
+    0x1a: "s_buffer_store_dwordx4",
+    0x1f: "s_gl1_inv",
+    0x20: "s_dcache_inv",
+    0x21: "s_dcache_wb",
+    0x24: "s_memtime",
+    0x25: "s_memrealtime",
+    0x26: "s_atc_probe",
+    0x27: "s_atc_probe_buffer",
 }
+
+# SMEM ops that take no operands (cache control) and ops whose sdata field is a 7-bit probe immediate.
+SMEM_NO_OPERANDS = frozenset({0x1f, 0x20, 0x21})
+SMEM_PROBE_OPS = frozenset({0x26, 0x27})
 
 SMEM_WIDTHS = {
     0x00: (1, 2), 0x01: (2, 2), 0x02: (4, 2), 0x03: (8, 2), 0x04: (16, 2),
     0x08: (1, 4), 0x09: (2, 4), 0x0a: (4, 4), 0x0b: (8, 4), 0x0c: (16, 4),
+    0x18: (1, 4), 0x19: (2, 4), 0x1a: (4, 4),
+    0x24: (2, 0), 0x25: (2, 0),
+    0x26: (0, 2), 0x27: (0, 4),
 }
 
 MIMG_OPS = {
@@ -569,6 +620,17 @@ VOP1_OPS = {
     0x43: ("v_movrels_b32_e32", "Vector copy with relative source"),
     0x44: ("v_movrelsd_b32_e32", "Vector copy with relative source and destination"),
     0x48: ("v_movrelsd_2_b32_e32", "Vector copy with relative source and destination (extended form)"),
+    0x50: ("v_cvt_f16_u16_e32", "Convert uint16 to float16"),
+    0x51: ("v_cvt_f16_i16_e32", "Convert int16 to float16"),
+    0x52: ("v_cvt_u16_f16_e32", "Convert float16 to uint16"),
+    0x53: ("v_cvt_i16_f16_e32", "Convert float16 to int16"),
+    0x5b: ("v_floor_f16_e32", "Floor float16"),
+    0x5c: ("v_ceil_f16_e32", "Ceiling float16"),
+    0x5d: ("v_trunc_f16_e32", "Truncate toward zero float16"),
+    0x5e: ("v_rndne_f16_e32", "Round to nearest even float16"),
+    0x5f: ("v_fract_f16_e32", "Fractional part float16"),
+    0x63: ("v_cvt_norm_i16_f16_e32", "Convert float16 to normalized int16"),
+    0x64: ("v_cvt_norm_u16_f16_e32", "Convert float16 to normalized uint16"),
 }
 
 VOPC_OPS = {
@@ -803,10 +865,17 @@ VOP2_OPS = {
     0x2c: ("v_fmamk_f32", "Vector fused multiply-add with literal multiplier"),
     0x2d: ("v_fmaak_f32", "Vector fused multiply-add with literal addend"),
     0x2f: ("v_cvt_pkrtz_f16_f32_e32", "Convert two float32 to packed float16 (round to zero)"),
+    0x32: ("v_add_f16_e32", "Vector add float16"),
+    0x33: ("v_sub_f16_e32", "Vector subtract float16"),
+    0x34: ("v_subrev_f16_e32", "Vector reverse subtract float16"),
+    0x35: ("v_mul_f16_e32", "Vector multiply float16"),
     0x36: ("v_fmac_f16_e32", "Vector fused multiply-accumulate float16"),
     0x37: ("v_fmamk_f16", "Vector fused multiply-add float16 with literal multiplier"),
     0x38: ("v_fmaak_f16", "Vector fused multiply-add float16 with literal addend"),
+    0x39: ("v_max_f16_e32", "Vector maximum float16"),
+    0x3a: ("v_min_f16_e32", "Vector minimum float16"),
     0x3b: ("v_ldexp_f16_e32", "Vector scale float16 by a power of two"),
+    0x3c: ("v_pk_fmac_f16", "Vector packed fused multiply-accumulate float16"),
 }
 
 VOP3_NATIVE_OPS = {
@@ -853,16 +922,20 @@ VOP3_NATIVE_OPS = {
     0x168: ("v_ldexp_f64", "V_LDEXP_F64 (VOP3A)", 2, False, 2, (2, 1)),
     0x169: ("v_mul_lo_u32", "V_MUL_LO_U32 (VOP3A)", 2, False, 1, (1, 1)),
     0x16a: ("v_mul_hi_u32", "V_MUL_HI_U32 (VOP3A)", 2, False, 1, (1, 1)),
+    0x16b: ("v_mul_lo_i32", "V_MUL_LO_I32 (VOP3A)", 2, False, 1, (1, 1)),
     0x16c: ("v_mul_hi_i32", "V_MUL_HI_I32 (VOP3A)", 2, False, 1, (1, 1)),
     0x16d: ("v_div_scale_f32", "V_DIV_SCALE_F32 (VOP3B)", 3, True, 1, (1, 1, 1)),
     0x16e: ("v_div_scale_f64", "V_DIV_SCALE_F64 (VOP3B)", 3, True, 2, (2, 2, 2)),
     0x16f: ("v_div_fmas_f32", "V_DIV_FMAS_F32 (VOP3A)", 3, False, 1, (1, 1, 1)),
     0x170: ("v_div_fmas_f64", "V_DIV_FMAS_F64 (VOP3A)", 3, False, 2, (2, 2, 2)),
     0x171: ("v_msad_u8", "V_MSAD_U8 (VOP3A)", 3, False, 1, (1, 1, 1)),
+    0x172: ("v_qsad_pk_u16_u8", "V_QSAD_PK_U16_U8 (VOP3A)", 3, False, 2, (2, 1, 2)),
+    0x173: ("v_mqsad_pk_u16_u8", "V_MQSAD_PK_U16_U8 (VOP3A)", 3, False, 2, (2, 1, 2)),
     0x174: ("v_trig_preop_f64", "V_TRIG_PREOP_F64 (VOP3A)", 2, False, 2, (2, 1)),
     0x176: ("v_mad_u64_u32", "V_MAD_U64_U32 (VOP3B)", 3, True, 2, (1, 1, 2)),
     0x177: ("v_mad_i64_i32", "V_MAD_I64_I32 (VOP3B)", 3, True, 2, (1, 1, 2)),
     0x178: ("v_xor3_b32", "V_XOR3_B32 (VOP3A)", 3, False, 1, (1, 1, 1)),
+    0x202: ("v_interp_mov_f32_e64", "V_INTERP_MOV_F32 (VOP3A)", 2, False, 1, (1, 1)),
     0x2ff: ("v_lshlrev_b64", "V_LSHLREV_B64 (VOP3A)", 2, False, 2, (1, 2)),
     0x300: ("v_lshrrev_b64", "V_LSHRREV_B64 (VOP3A)", 2, False, 2, (1, 2)),
     0x301: ("v_ashrrev_i64", "V_ASHRREV_I64 (VOP3A)", 2, False, 2, (1, 2)),
@@ -921,6 +994,51 @@ VOP3_NATIVE_OPS = {
     0x376: ("v_sub_nc_i32", "V_SUB_NC_I32 (VOP3A)", 2, False, 1, (1, 1)),
     0x37f: ("v_add_nc_i32", "V_ADD_NC_I32 (VOP3A)", 2, False, 1, (1, 1)),
 }
+
+
+# gfx1013 VOP3 forms whose modifier grammar is narrower than the generic VOP3A decode:
+# name -> (clamp allowed, omod allowed). llvm-mc rejects abs and neg on all of them, and both the
+# assembler and the disassembler ignore the op_sel bits, so a word with those bits set is not decoded.
+VOP3_RESTRICTED_MODIFIERS = {
+    "v_mul_lo_i32": (False, False),
+    "v_qsad_pk_u16_u8": (True, False),
+    "v_mqsad_pk_u16_u8": (True, False),
+    "v_interp_mov_f32_e64": (True, True),
+}
+
+# The v_interp_mov_f32_e64 parameter selector (src1 field): p10, p20 and p0.
+VINTRP_MOV_PARAMS = ("p10", "p20", "p0")
+
+
+def _vop3_output_modifiers(clamp: int, omod: int) -> str:
+    """Return the trailing clamp and output-modifier spelling of a VOP3 instruction."""
+    text = " clamp" if clamp else ""
+    return text + {1: " mul:2", 2: " mul:4", 3: " div:2"}.get(omod, "")
+
+
+def _vop3_restricted_encoding_is_valid(op_name: str, arity: int, w0: int, w1: int) -> bool:
+    """Check a restricted VOP3 word against the modifier grammar llvm-mc accepts for gfx1013."""
+    allow_clamp, allow_omod = VOP3_RESTRICTED_MODIFIERS[op_name]
+    if (w0 >> 8) & 0x7 or (w1 >> 29) & 0x7:
+        return False
+    if ((w0 >> 15) & 1 and not allow_clamp) or ((w1 >> 27) & 0x3 and not allow_omod):
+        return False
+    if arity < 3 and (w1 >> 18) & 0x1ff:
+        return False
+    if op_name == "v_interp_mov_f32_e64":
+        # src0 holds attr[5:0] and channel[7:6] only; src1 selects p10, p20 or p0.
+        return not (w1 & 0x100) and ((w1 >> 9) & 0x1ff) < len(VINTRP_MOV_PARAMS)
+    return True
+
+
+def _decode_interp_mov_e64(w0: int, w1: int, comment: str) -> tuple[int, str, str, str]:
+    """Decode the VOP3 spelling of v_interp_mov_f32 for a word that already passed validation."""
+    attr = w1 & 0x3f
+    channel = "xyzw"[(w1 >> 6) & 0x3]
+    param = VINTRP_MOV_PARAMS[(w1 >> 9) & 0x1ff]
+    asm = f"v_interp_mov_f32_e64 v{w0 & 0xff}, {param}, attr{attr}.{channel}"
+    asm += _vop3_output_modifiers((w0 >> 15) & 1, (w1 >> 27) & 0x3)
+    return (8, "v_interp_mov_f32_e64", asm, comment)
 
 
 VOP3P_OPS = {
@@ -999,6 +1117,8 @@ MUBUF_OPS = {
     0x23: ("buffer_load_sbyte_d16_hi", 1, "Buffer load signed byte to high 16 bits"),
     0x24: ("buffer_load_short_d16", 1, "Buffer load 16-bit short to low 16 bits"),
     0x25: ("buffer_load_short_d16_hi", 1, "Buffer load 16-bit short to high 16 bits"),
+    0x26: ("buffer_load_format_d16_hi_x", 1, "Buffer format load of one 16-bit component to the high 16 bits"),
+    0x27: ("buffer_store_format_d16_hi_x", 1, "Buffer format store of one 16-bit component from the high 16 bits"),
     0x30: ("buffer_atomic_swap", 1, "Buffer atomic swap 32-bit"),
     0x31: ("buffer_atomic_cmpswap", 2, "Buffer atomic compare-and-swap 32-bit"),
     0x32: ("buffer_atomic_add", 1, "Buffer atomic add 32-bit"),
@@ -1042,6 +1162,9 @@ MUBUF_OPS = {
     0x86: ("buffer_store_format_d16_xyz", 2, "Buffer format store 3 packed 16-bit channels"),
     0x87: ("buffer_store_format_d16_xyzw", 2, "Buffer format store 4 packed 16-bit channels"),
 }
+
+# The two high-half single-component format ops: spelled by llvm-mc 19 only (llvm-mc 15 rejects them on gfx1013).
+MUBUF_D16_HI_FORMAT_OPS = {"buffer_load_format_d16_hi_x", "buffer_store_format_d16_hi_x"}
 
 # GFX1013 / RDNA 2 MTBUF opcodes: op -> (mnemonic, vdata_width, comment)
 MTBUF_OPS = {
@@ -1149,7 +1272,14 @@ MTBUF_FORMATS = {
 # DPP8 (233, or 234 with FI set), SDWA (249) and DPP16 (250). The dword holds the real SRC0 and
 # the lane or sub-dword controls.
 VOP_EXTENSION_FORMS = {233: "DPP8", 234: "DPP8", 249: "SDWA", 250: "DPP16"}
+VOP1_DPP_UNSUPPORTED = frozenset(("v_readfirstlane_b32", "v_pipeflush", "v_clrexcp", "v_swap_b32", "v_swaprel_b32"))
+VOP2_DPP_UNSUPPORTED_OPS = frozenset((0x06, 0x20, 0x21, 0x2c, 0x2d, 0x37, 0x38, 0x3c))
 SDWA_SEL_NAMES = ("BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD")
+SDWA_DST_UNUSED_NAMES = ("UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE")
+SDWA_OMOD_NAMES = ("", " mul:2", " mul:4", " div:2")
+VOP1_SDWA_UNSUPPORTED = frozenset(("v_readfirstlane_b32", "v_pipeflush", "v_clrexcp", "v_swap_b32", "v_swaprel_b32"))
+VOP1_SDWA_VGPR_ONLY_SRC0 = frozenset(("v_movrels_b32", "v_movrelsd_b32", "v_movrelsd_2_b32"))
+VOP2_SDWA_UNSUPPORTED_OPS = frozenset((0x02, 0x06, 0x0d, 0x1f, 0x20, 0x21, 0x2b, 0x2c, 0x2d, 0x36, 0x37, 0x38, 0x3c))
 # Scalar source codes 209-234 are outside the supported LLVM 15 decoder subset for GFX10 SDWA: LLVM 15
 # refuses every VOPC SDWA record that names one as src0 or src1. This records LLVM 15's behaviour; it is
 # not a claim about the ISA.
@@ -1228,6 +1358,288 @@ def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[
         dst_str = decode_s_reg(sdst) if sdst_en else "vcc_lo"
         asm = f"{sdwa_name} {dst_str}, {src0_str}, {src1_str} {sels}"
     return (8, sdwa_name, asm, comment)
+
+
+def _format_sdwa_source(raw: int, is_sgpr: int, is_float: bool, is_sext: int, is_neg: int, is_abs: int) -> str:
+    """Format a GFX10 SDWA source operand with type-appropriate modifiers."""
+    val = decode_s_reg(raw) if is_sgpr else f"v{raw}"
+    if is_float:
+        return _format_sdwa_float_modifiers(val, raw if is_sgpr else None, is_abs, is_neg)
+    if is_sext:
+        return f"sext({val})"
+    return val
+
+
+def _vop1_sdwa_spec(op_name: str) -> tuple[bool, bool, bool] | None:
+    """Return (src0_is_float, dst_is_float, src0_vgpr_only) or None if VOP1 SDWA is unsupported."""
+    if op_name.startswith("v_vop1_") or op_name in VOP1_SDWA_UNSUPPORTED:
+        return None
+    if (op_name.startswith(("v_cvt_f64_", "v_cvt_i32_f64", "v_cvt_u32_f64", "v_cvt_f32_f64", "v_frexp_exp_i32_f64"))
+            or op_name.endswith(("_f64_e32", "_f64", "_b64_e32", "_b64"))):
+        return None
+    base = op_name[:-4] if op_name.endswith("_e32") else op_name
+    src0_is_float = base.endswith(("_f32", "_f16"))
+    dst_is_float = (
+        "_f32_" in base
+        or "_f16_" in base
+        or (src0_is_float and not any(tok in base for tok in ("_i32_", "_u32_", "_i16_", "_u16_")))
+    )
+    return (src0_is_float, dst_is_float, base in VOP1_SDWA_VGPR_ONLY_SRC0)
+
+
+def _decode_vop1_sdwa(w1: int, vdst: int, op_name: str, comment: str) -> tuple[int, str, str, str]:
+    """Decode a GFX10 VOP_SDWA9Ae (VOP1 SDWA) 8-byte instruction."""
+    if op_name == "v_nop":
+        # VOP_NOP_PROFILE allows V_NOP_sdwa_gfx10 only when vdst and all fixed-zero SDWA control fields are zero.
+        if vdst == 0 and (w1 & 0xbfffe0ff) == 0:
+            return (8, "v_nop", "v_nop", comment)
+        return (8, "vop1_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOP1 SDWA encoding")
+    spec = _vop1_sdwa_spec(op_name)
+    if spec is None:
+        return (8, "vop1_sdwa", f"{op_name} <unsupported SDWA>", "VOP1 SDWA is not supported for this opcode")
+    if (w1 >> 24) & 0xbf:
+        return (8, "vop1_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOP1 SDWA src1 field")
+    src0_is_float, dst_is_float, src0_vgpr_only = spec
+    dst_sel = (w1 >> 8) & 0x7
+    dst_unused = (w1 >> 11) & 0x3
+    clamp = (w1 >> 13) & 1
+    omod = (w1 >> 14) & 0x3
+    src0_sel = (w1 >> 16) & 0x7
+    if dst_sel >= len(SDWA_SEL_NAMES) or dst_unused >= len(SDWA_DST_UNUSED_NAMES) or src0_sel >= len(SDWA_SEL_NAMES):
+        return (8, "vop1_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOP1 SDWA selector")
+    if omod and not dst_is_float:
+        return (8, "vop1_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOP1 SDWA omod modifier")
+
+    src0_raw = w1 & 0xff
+    src0_sext = (w1 >> 19) & 1
+    src0_neg = (w1 >> 20) & 1
+    src0_abs = (w1 >> 21) & 1
+    src0_sgpr = (w1 >> 23) & 1
+    if src0_sgpr and src0_vgpr_only:
+        return (8, "vop1_sdwa", f"{op_name} <unsupported SDWA>", "VOP1 SDWA source operand must be a VGPR")
+    if src0_sgpr and src0_raw in (249, 250, 255):
+        return (8, "vop1_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOP1 SDWA scalar operand")
+    if src0_sgpr and src0_raw in SDWA_LLVM15_UNSUPPORTED_SCALAR_CODES:
+        return (8, "vop1_sdwa", f"{op_name} <unsupported SDWA>",
+                "VOP1 SDWA scalar operand outside the supported LLVM 15 decoder subset")
+    if (src0_is_float and src0_sext) or (not src0_is_float and (src0_neg or src0_abs)):
+        return (8, "vop1_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOP1 SDWA src0 modifier")
+
+    sdwa_name = f"{op_name[:-4]}_sdwa" if op_name.endswith("_e32") else f"{op_name}_sdwa"
+    src0_str = _format_sdwa_source(src0_raw, src0_sgpr, src0_is_float, src0_sext, src0_neg, src0_abs)
+    out_mods = f"{' clamp' if clamp else ''}{SDWA_OMOD_NAMES[omod]}"
+    sels = (f"dst_sel:{SDWA_SEL_NAMES[dst_sel]} dst_unused:{SDWA_DST_UNUSED_NAMES[dst_unused]} "
+            f"src0_sel:{SDWA_SEL_NAMES[src0_sel]}")
+    return (8, sdwa_name, f"{sdwa_name} v{vdst}, {src0_str}{out_mods} {sels}", comment)
+
+
+def _vop2_sdwa_spec(op: int, op_name: str) -> tuple[bool, bool, bool] | None:
+    """Return (src0_is_float, src1_is_float, dst_is_float) or None if VOP2 SDWA is unsupported."""
+    if op_name.startswith("v_vop2_") or op in VOP2_SDWA_UNSUPPORTED_OPS:
+        return None
+    base = op_name[:-4] if op_name.endswith("_e32") else op_name
+    if base == "v_ldexp_f16":
+        return (True, False, True)
+    if base == "v_cvt_pkrtz_f16_f32":
+        return (True, True, True)
+    is_float = base.endswith(("_f32", "_f16"))
+    return (is_float, is_float, is_float)
+
+
+def _decode_vop2_sdwa(w1: int, vdst: int, vsrc1: int, op: int, op_name: str, comment: str) -> tuple[int, str, str, str]:
+    """Decode a GFX10 VOP_SDWA9Ae (VOP2 SDWA) 8-byte instruction."""
+    spec = _vop2_sdwa_spec(op, op_name)
+    if spec is None:
+        return (8, "vop2_sdwa", f"{op_name} <unsupported SDWA>", "VOP2 SDWA is not supported for this opcode")
+    src0_is_float, src1_is_float, dst_is_float = spec
+    dst_sel = (w1 >> 8) & 0x7
+    dst_unused = (w1 >> 11) & 0x3
+    clamp = (w1 >> 13) & 1
+    omod = (w1 >> 14) & 0x3
+    src0_sel = (w1 >> 16) & 0x7
+    src1_sel = (w1 >> 24) & 0x7
+    if (dst_sel >= len(SDWA_SEL_NAMES) or dst_unused >= len(SDWA_DST_UNUSED_NAMES)
+            or src0_sel >= len(SDWA_SEL_NAMES) or src1_sel >= len(SDWA_SEL_NAMES)):
+        return (8, "vop2_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOP2 SDWA selector")
+    if omod and not dst_is_float:
+        return (8, "vop2_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOP2 SDWA omod modifier")
+
+    src0_raw = w1 & 0xff
+    src0_sext = (w1 >> 19) & 1
+    src0_neg = (w1 >> 20) & 1
+    src0_abs = (w1 >> 21) & 1
+    src0_sgpr = (w1 >> 23) & 1
+    src1_sext = (w1 >> 27) & 1
+    src1_neg = (w1 >> 28) & 1
+    src1_abs = (w1 >> 29) & 1
+    src1_sgpr = (w1 >> 31) & 1
+    if (src0_sgpr and src0_raw in (249, 250, 255)) or (src1_sgpr and vsrc1 in (249, 250, 255)):
+        return (8, "vop2_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOP2 SDWA scalar operand")
+    if ((src0_sgpr and src0_raw in SDWA_LLVM15_UNSUPPORTED_SCALAR_CODES)
+            or (src1_sgpr and vsrc1 in SDWA_LLVM15_UNSUPPORTED_SCALAR_CODES)):
+        return (8, "vop2_sdwa", f"{op_name} <unsupported SDWA>",
+                "VOP2 SDWA scalar operand outside the supported LLVM 15 decoder subset")
+    if (src0_is_float and src0_sext) or (not src0_is_float and (src0_neg or src0_abs)):
+        return (8, "vop2_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOP2 SDWA src0 modifier")
+    if (src1_is_float and src1_sext) or (not src1_is_float and (src1_neg or src1_abs)):
+        return (8, "vop2_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOP2 SDWA src1 modifier")
+
+    sdwa_name = f"{op_name[:-4]}_sdwa" if op_name.endswith("_e32") else f"{op_name}_sdwa"
+    src0_str = _format_sdwa_source(src0_raw, src0_sgpr, src0_is_float, src0_sext, src0_neg, src0_abs)
+    src1_str = _format_sdwa_source(vsrc1, src1_sgpr, src1_is_float, src1_sext, src1_neg, src1_abs)
+    out_mods = f"{' clamp' if clamp else ''}{SDWA_OMOD_NAMES[omod]}"
+    sels = (f"dst_sel:{SDWA_SEL_NAMES[dst_sel]} dst_unused:{SDWA_DST_UNUSED_NAMES[dst_unused]} "
+            f"src0_sel:{SDWA_SEL_NAMES[src0_sel]} src1_sel:{SDWA_SEL_NAMES[src1_sel]}")
+    if op_name == "v_cndmask_b32_e32":
+        asm = f"{sdwa_name} v{vdst}, {src0_str}, {src1_str}, vcc_lo{out_mods} {sels}"
+    elif op in (0x28, 0x29, 0x2a):
+        asm = f"{sdwa_name} v{vdst}, vcc_lo, {src0_str}, {src1_str}, vcc_lo{out_mods} {sels}"
+    else:
+        asm = f"{sdwa_name} v{vdst}, {src0_str}, {src1_str}{out_mods} {sels}"
+    return (8, sdwa_name, asm, comment)
+
+
+def _vop1_dpp_has_mods(op_name: str) -> bool | None:
+    """Return whether VOP1 DPP16 supports float input modifiers, or None if DPP is unsupported."""
+    if op_name.startswith("v_vop1_") or op_name in VOP1_DPP_UNSUPPORTED:
+        return None
+    if (op_name.startswith(("v_cvt_f64_", "v_cvt_i32_f64", "v_cvt_u32_f64", "v_cvt_f32_f64", "v_frexp_exp_i32_f64"))
+            or op_name.endswith(("_f64_e32", "_f64", "_b64_e32", "_b64"))):
+        return None
+    base = op_name[:-4] if op_name.endswith("_e32") else op_name
+    return base.endswith(("_f32", "_f16"))
+
+
+def _vop2_dpp_mods(op: int, op_name: str) -> tuple[bool, bool] | None:
+    """Return (src0_has_mods, src1_has_mods) for VOP2 DPP16, or None if DPP is unsupported."""
+    if op_name.startswith("v_vop2_") or op in VOP2_DPP_UNSUPPORTED_OPS:
+        return None
+    base = op_name[:-4] if op_name.endswith("_e32") else op_name
+    if base == "v_ldexp_f16":
+        return (True, False)
+    if base == "v_cvt_pkrtz_f16_f32":
+        return (True, True)
+    is_float = base.endswith(("_f32", "_f16"))
+    return (is_float, is_float)
+
+
+def _format_dpp16_ctrl(dpp_ctrl: int) -> str | None:
+    """Decode a 9-bit GFX10 DPP16 control field, or return None if invalid on GFX10."""
+    if dpp_ctrl <= 0xff:
+        return (f"quad_perm:[{dpp_ctrl & 0x3},{(dpp_ctrl >> 2) & 0x3},"
+                f"{(dpp_ctrl >> 4) & 0x3},{(dpp_ctrl >> 6) & 0x3}]")
+    if 0x101 <= dpp_ctrl <= 0x10f:
+        return f"row_shl:{dpp_ctrl & 0xf}"
+    if 0x111 <= dpp_ctrl <= 0x11f:
+        return f"row_shr:{dpp_ctrl & 0xf}"
+    if 0x121 <= dpp_ctrl <= 0x12f:
+        return f"row_ror:{dpp_ctrl & 0xf}"
+    if dpp_ctrl == 0x140:
+        return "row_mirror"
+    if dpp_ctrl == 0x141:
+        return "row_half_mirror"
+    if 0x150 <= dpp_ctrl <= 0x15f:
+        return f"row_share:{dpp_ctrl & 0xf}"
+    if 0x160 <= dpp_ctrl <= 0x16f:
+        return f"row_xmask:{dpp_ctrl & 0xf}"
+    return None
+
+
+def _format_dpp8_ctrl(w1: int, fi: int) -> str:
+    """Format the 8-lane DPP8 selector list and optional fi:1 flag."""
+    lanes = ",".join(str((w1 >> (8 + 3 * k)) & 0x7) for k in range(8))
+    return f"dpp8:[{lanes}]{' fi:1' if fi else ''}"
+
+
+def _decode_vop1_dpp(w1: int, vdst: int, src0: int, op_name: str, comment: str) -> tuple[int, str, str, str]:
+    """Decode a GFX10 VOP1 DPP8 (src0=233/234) or DPP16 (src0=250) 8-byte instruction."""
+    is_dpp8 = src0 in (233, 234)
+    form = "DPP8" if is_dpp8 else "DPP16"
+    kind = "vop1_dpp8" if is_dpp8 else "vop1_dpp16"
+    src0_mods = _vop1_dpp_has_mods(op_name)
+    if src0_mods is None:
+        return (8, kind, f"{op_name} <unsupported {form}>", f"VOP1 {form} is not supported for this opcode")
+
+    src0_vgpr = w1 & 0xff
+    if is_dpp8:
+        fi = 1 if src0 == 234 else 0
+        if op_name == "v_nop":
+            if vdst == 0 and src0_vgpr == 0:
+                return (8, "v_nop", f"v_nop {_format_dpp8_ctrl(w1, fi)}", comment)
+            return (8, kind, f"{op_name} <unsupported DPP8>", "Invalid VOP1 DPP8 encoding")
+        dpp_name = f"{op_name[:-4]}_dpp" if op_name.endswith("_e32") else f"{op_name}_dpp"
+        return (8, dpp_name, f"{dpp_name} v{vdst}, v{src0_vgpr} {_format_dpp8_ctrl(w1, fi)}", comment)
+
+    dpp_ctrl = (w1 >> 8) & 0x1ff
+    dpp_ctrl_str = _format_dpp16_ctrl(dpp_ctrl)
+    if dpp_ctrl_str is None:
+        return (8, kind, f"{op_name} <unsupported DPP16>", "Invalid GFX10 DPP16 control")
+    fi = (w1 >> 18) & 1
+    bound_ctrl = (w1 >> 19) & 1
+    src0_neg = (w1 >> 20) & 1
+    src0_abs = (w1 >> 21) & 1
+    src1_neg = (w1 >> 22) & 1
+    src1_abs = (w1 >> 23) & 1
+    bank_mask = (w1 >> 24) & 0xf
+    row_mask = (w1 >> 28) & 0xf
+    if src1_neg or src1_abs or (not src0_mods and (src0_neg or src0_abs)):
+        return (8, kind, f"{op_name} <unsupported DPP16>", "Invalid VOP1 DPP16 modifier")
+    suffix = (f"{dpp_ctrl_str} row_mask:0x{row_mask:x} bank_mask:0x{bank_mask:x}"
+              f"{' bound_ctrl:1' if bound_ctrl else ''}{' fi:1' if fi else ''}")
+    if op_name == "v_nop":
+        if vdst == 0 and src0_vgpr == 0:
+            return (8, "v_nop", f"v_nop {suffix}", comment)
+        return (8, kind, f"{op_name} <unsupported DPP16>", "Invalid VOP1 DPP16 encoding")
+    dpp_name = f"{op_name[:-4]}_dpp" if op_name.endswith("_e32") else f"{op_name}_dpp"
+    src0_str = _format_operand_modifiers(f"v{src0_vgpr}", src0_abs, src0_neg)
+    return (8, dpp_name, f"{dpp_name} v{vdst}, {src0_str} {suffix}", comment)
+
+
+def _decode_vop2_dpp(w1: int, vdst: int, vsrc1: int, src0: int, op: int, op_name: str,
+                     comment: str) -> tuple[int, str, str, str]:
+    """Decode a GFX10 VOP2 DPP8 (src0=233/234) or DPP16 (src0=250) 8-byte instruction."""
+    is_dpp8 = src0 in (233, 234)
+    form = "DPP8" if is_dpp8 else "DPP16"
+    kind = "vop2_dpp8" if is_dpp8 else "vop2_dpp16"
+    mods = _vop2_dpp_mods(op, op_name)
+    if mods is None:
+        return (8, kind, f"{op_name} <unsupported {form}>", f"VOP2 {form} is not supported for this opcode")
+    src0_has_mods, src1_has_mods = mods
+    src0_vgpr = w1 & 0xff
+    dpp_name = f"{op_name[:-4]}_dpp" if op_name.endswith("_e32") else f"{op_name}_dpp"
+
+    if is_dpp8:
+        fi = 1 if src0 == 234 else 0
+        ctrl = _format_dpp8_ctrl(w1, fi)
+        src0_str = f"v{src0_vgpr}"
+        src1_str = f"v{vsrc1}"
+    else:
+        dpp_ctrl = (w1 >> 8) & 0x1ff
+        dpp_ctrl_str = _format_dpp16_ctrl(dpp_ctrl)
+        if dpp_ctrl_str is None:
+            return (8, kind, f"{op_name} <unsupported DPP16>", "Invalid GFX10 DPP16 control")
+        fi = (w1 >> 18) & 1
+        bound_ctrl = (w1 >> 19) & 1
+        src0_neg = (w1 >> 20) & 1
+        src0_abs = (w1 >> 21) & 1
+        src1_neg = (w1 >> 22) & 1
+        src1_abs = (w1 >> 23) & 1
+        bank_mask = (w1 >> 24) & 0xf
+        row_mask = (w1 >> 28) & 0xf
+        if (not src0_has_mods and (src0_neg or src0_abs)) or (not src1_has_mods and (src1_neg or src1_abs)):
+            return (8, kind, f"{op_name} <unsupported DPP16>", "Invalid VOP2 DPP16 modifier")
+        src0_str = _format_operand_modifiers(f"v{src0_vgpr}", src0_abs, src0_neg)
+        src1_str = _format_operand_modifiers(f"v{vsrc1}", src1_abs, src1_neg)
+        ctrl = (f"{dpp_ctrl_str} row_mask:0x{row_mask:x} bank_mask:0x{bank_mask:x}"
+                f"{' bound_ctrl:1' if bound_ctrl else ''}{' fi:1' if fi else ''}")
+
+    if op_name == "v_cndmask_b32_e32":
+        asm = f"{dpp_name} v{vdst}, {src0_str}, {src1_str}, vcc_lo {ctrl}"
+    elif op in (0x28, 0x29, 0x2a):
+        asm = f"{dpp_name} v{vdst}, vcc_lo, {src0_str}, {src1_str}, vcc_lo {ctrl}"
+    else:
+        asm = f"{dpp_name} v{vdst}, {src0_str}, {src1_str} {ctrl}"
+    return (8, dpp_name, asm, comment)
 
 
 def _vop_extension(data: bytes, offset: int, encoding: str, op_name: str, src0: int) -> tuple[int, str, str, str]:
@@ -1772,6 +2184,51 @@ def _decode_interp_f16(op: int, w0: int, w1: int) -> tuple[int, str, str, str]:
     return (8, name, asm, comment)
 
 
+# VOP3 32-bit interpolation (issue #938). gfx10/gfx1013 encodes v_interp_p1_f32_e64,
+# v_interp_p2_f32_e64 and v_interp_mov_f32_e64 at 0x200, 0x201 and 0x202
+# (LLVM 15 llvm/lib/Target/AMDGPU/VOP3Instructions.td:1045-1047), not at the gfx8/gfx9 opcodes
+# 0x270-0x272 that the VI branch below still handles. The VOP3_INTERP / VOP3_INTERP_MOV operand
+# profiles (VOP3Instructions.td:55-105) print
+# "$vdst, $src0_modifiers, $attr$attrchan$clamp$omod" (the mov form prints its InterpSlot
+# instead of a register), and VOP3Interp_gfx10 (llvm/lib/Target/AMDGPU/VOPInstructions.td:296-312)
+# places attr in SRC0[5:0], attrchan in SRC0[7:6], the data VGPR in SRC1, and fixes SRC0[8] (the
+# f16-only high bit), the SRC2 field and every abs/neg bit except index 1 to zero. The vectors
+# this layout was derived from are VOP3_INTERP_F32_E64_VECTORS in tests/rdna2_tools_check.py.
+INTERP_F32_E64_OPS = {
+    0x200: ("v_interp_p1_f32_e64", "Interpolate f32 attribute, P1 stage (VOP3A)"),
+    0x201: ("v_interp_p2_f32_e64", "Interpolate f32 attribute, P2 stage (VOP3A)"),
+}
+
+
+def _decode_interp_f32_e64(op: int, w0: int, w1: int) -> tuple[int, str, str, str]:
+    """Decode the gfx10/gfx1013 VOP3 spelling of v_interp_p1_f32 or v_interp_p2_f32.
+
+    SRC0 is the attribute operand, so the data source keeps the abs/neg bits of index 1 (w0[9]
+    and w1[30]); the modifier bits of index 0 (the attribute) and index 2 (the operand this
+    profile does not have), the f16-only high bit and the SRC2 field are fixed zero and are
+    reported as an unsupported encoding when set, because LLVM's TableGen decoder only matches
+    the zeroes. The data source in SRC1 is a VGPR_32 (VOPInterp_gfx10 fixes it to a VGPR, unlike
+    the VRegSrc_32 of _decode_interp_f16), so only source codes 256..511 are legal there.
+    """
+    name, comment = INTERP_F32_E64_OPS[op]
+    attr, attrchan = w1 & 0x3f, (w1 >> 6) & 0x3
+    source_code = (w1 >> 9) & 0x1ff
+    abs_bits, neg_bits = (w0 >> 8) & 0x7, (w1 >> 29) & 0x7
+    # SRC1 is a VGPR_32 field, so codes 0..255 -- SGPRs, inline constants, literals, and every code
+    # in INTERP_F16_REFUSED_SOURCES -- are not a legal data operand. LLVM's gfx1013 disassembler
+    # marks them as an invalid register instead of printing an operand, so refuse them.
+    if abs_bits & 0x5 or neg_bits & 0x5 or w1 & 0x100 or (w1 >> 18) & 0x1ff \
+            or not 256 <= source_code <= 511:
+        return (8, f"{name}_unsupported", f"{name} <unsupported VOP3 encoding>",
+                f"LLVM 15 refuses this {name} encoding for gfx1013")
+
+    is_abs, is_neg = (abs_bits >> 1) & 1, (neg_bits >> 1) & 1
+    source = _format_operand_modifiers(decode_v_reg(source_code), is_abs, is_neg)
+    asm = f"{name} v{w0 & 0xff}, {source}, attr{attr}.{'xyzw'[attrchan]}"
+    asm += _vop3_output_modifiers((w0 >> 15) & 1, (w1 >> 27) & 0x3)
+    return (8, name, asm, comment)
+
+
 def _packed_addr_regs(count: int) -> int:
     """Registers LLVM 15 prints for a packed (non-NSA) MIMG address of count dwords.
 
@@ -1829,10 +2286,16 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         op_info = SOPP_OPS.get(op, (f"s_sopp_{op:02x}", "Unknown SOPP"))
         op_name, comment = op_info
 
-        if op_name in {"s_endpgm", "s_code_end"}:
+        if op_name in {
+            "s_endpgm", "s_code_end", "s_wakeup", "s_icache_inv", "s_ttracedata",
+            "s_endpgm_saved", "s_endpgm_ordered_ps_done", "s_wait_idle",
+        }:
             asm = op_name
-        elif op_name == "s_nop":
-            asm = f"s_nop {simm}"
+        elif op_name in {
+            "s_nop", "s_setkill", "s_sethalt", "s_sleep", "s_setprio", "s_trap",
+            "s_incperflevel", "s_decperflevel", "s_denorm_mode",
+        }:
+            asm = f"{op_name} {simm}"
         elif op_name == "s_waitcnt":
             # GFX10 split: vmcnt is simm16[3:0] plus [15:14], expcnt [6:4], lgkmcnt [13:8].
             # Like LLVM, omit counters at their "no wait" maximum unless all three are.
@@ -1926,6 +2389,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         if op_name == "s_version":
             # No destination operand; the SDST field is not printed.
             return (4, op_name, f"{op_name} 0x{simm:x}", comment)
+        if op_name == "s_call_b64":
+            return (4, op_name, f"{op_name} {decode_s_reg64(sdst)}, {simm}", comment)
         asm = f"{op_name} {decode_s_reg(sdst)}, 0x{simm:x}"
         return (4, op_name, asm, comment)
 
@@ -1960,6 +2425,17 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src0 = w0 & 0x1ff
         op_info = VOP1_OPS.get(op, (f"v_vop1_{op:02x}", "Unknown VOP1"))
         op_name, comment = op_info
+        if src0 == 249:
+            if offset + 8 > len(data):
+                return (4, "vop1_truncated", f"{op_name} <truncated>", "Incomplete VOP1 SDWA")
+            w1, = struct.unpack_from("<I", data, offset + 4)
+            return _decode_vop1_sdwa(w1, vdst, op_name, comment)
+        if src0 in (233, 234, 250):
+            form = VOP_EXTENSION_FORMS[src0]
+            if offset + 8 > len(data):
+                return (4, "vop1_truncated", f"{op_name} <truncated>", f"Incomplete VOP1 {form}")
+            w1, = struct.unpack_from("<I", data, offset + 4)
+            return _decode_vop1_dpp(w1, vdst, src0, op_name, comment)
         if src0 in VOP_EXTENSION_FORMS:
             return _vop_extension(data, offset, "vop1", op_name, src0)
         length = 4
@@ -2031,6 +2507,17 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src0 = w0 & 0x1ff
         op_info = VOP2_OPS.get(op, (f"v_vop2_{op:02x}", "Unknown VOP2"))
         op_name, comment = op_info
+        if src0 == 249:
+            if offset + 8 > len(data):
+                return (4, "vop2_truncated", f"{op_name} <truncated>", "Incomplete VOP2 SDWA")
+            w1, = struct.unpack_from("<I", data, offset + 4)
+            return _decode_vop2_sdwa(w1, vdst, vsrc1, op, op_name, comment)
+        if src0 in (233, 234, 250):
+            form = VOP_EXTENSION_FORMS[src0]
+            if offset + 8 > len(data):
+                return (4, "vop2_truncated", f"{op_name} <truncated>", f"Incomplete VOP2 {form}")
+            w1, = struct.unpack_from("<I", data, offset + 4)
+            return _decode_vop2_dpp(w1, vdst, vsrc1, src0, op, op_name, comment)
         if src0 in VOP_EXTENSION_FORMS:
             return _vop_extension(data, offset, "vop2", op_name, src0)
         has_literal = src0 == 255 or op in (0x20, 0x21, 0x2c, 0x2d, 0x37, 0x38)
@@ -2111,7 +2598,17 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         sbase = (w0 & 0x3f) * 2
         op_name = SMEM_OPS.get(op, f"s_smem_{op:02x}")
         data_width, base_width = SMEM_WIDTHS.get(op, (4, 2))
-        sdata_str = decode_s_reg(sdata) if data_width == 1 else f"s[{sdata}:{sdata + data_width - 1}]"
+        if op in SMEM_NO_OPERANDS:
+            return (8, op_name, op_name, "Scalar memory cache control")
+        if op in SMEM_PROBE_OPS:
+            sdata_str = str(sdata)
+        else:
+            sdata_str = decode_s_reg(sdata) if data_width == 1 else f"s[{sdata}:{sdata + data_width - 1}]"
+        if base_width == 0:
+            # s_memtime / s_memrealtime read no memory address: only the destination pair.
+            # Named 64-bit specials (vcc, ttmp pairs, null) keep their spelling.
+            timer_dst = decode_s_reg64(sdata) if sdata >= 106 else sdata_str
+            return (8, op_name, f"{op_name} {timer_dst}", "Read a 64-bit hardware timer")
         if base_width == 2 and sbase == 106:
             sbase_str = "vcc"
         else:
@@ -2132,6 +2629,10 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         mod_str = (" " + " ".join(mods)) if mods else ""
         asm = f"{op_name} {sdata_str}, {sbase_str}, {off_str}{mod_str}"
         comment = "Scalar memory load from constant buffer/resource descriptor"
+        if op in (0x18, 0x19, 0x1a):
+            comment = "Scalar memory store to a buffer resource"
+        elif op in SMEM_PROBE_OPS:
+            comment = "Probe the address translation cache"
         return (8, op_name, asm, comment)
 
     # 11. MIMG: 64-bit + optional NSA dwords [31:26] == 0b111100 (0xf0000000)
@@ -2185,12 +2686,20 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             mods.append("slc")
         if r128:
             mods.append("r128")
-        if (w0 >> 14) & 1:
-            mods.append("lwe")
         if (w0 >> 7) & 1:
             mods.append("dlc")
+        if (w0 >> 16) & 1:
+            mods.append("tfe")
+        if (w0 >> 17) & 1:
+            mods.append("lwe")
+        if (w1 >> 30) & 1:
+            mods.append("a16")
         if d16:
             mods.append("d16")
+        # Word 0 bits 6 and 14 and word 1 bits 29:26 are reserved on gfx10: LLVM assembles none of them and
+        # ignores them when disassembling, so a set bit is surfaced instead of vanishing from the listing.
+        if (w0 & 0x4040) or (w1 >> 26) & 0xf:
+            mods.append("reserved")
         asm = f"{op_name} {', '.join(operands)} {' '.join(mods)}"
         comment = "Image memory load/store/sample operation"
         return (length, op_name, asm, comment)
@@ -2289,6 +2798,12 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             return (8, op_name, op_name, comment)
         allow_lds = op_name.startswith("buffer_load_") and "_d16" not in op_name
         allow_tfe = not op_name.startswith("buffer_atomic_")
+        if op_name in MUBUF_D16_HI_FORMAT_OPS:
+            # llvm-mc rejects the lds bit on these. With tfe set it prints the extra status dword in the vdata range.
+            vdata_width += (w1 >> 23) & 1
+            if (w0 >> 16) & 1 or ((w1 >> 8) & 0xff) + vdata_width > 256:
+                return (8, f"{op_name}_unsupported", f"{op_name} <unsupported MUBUF encoding>",
+                        f"{op_name} word with the lds bit or a VGPR range past v255 that gfx1013 llvm-mc rejects")
         operands, mods = _format_buffer_operands_and_mods(
             w0, w1, vdata_width, allow_lds=allow_lds, allow_tfe=allow_tfe
         )
@@ -2412,7 +2927,20 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
                 else:
                     dst_width = 1
                     src_widths = (1,)
+        elif 0x200 <= op < 0x203:
+            # gfx10/gfx1013 VOP3 interpolation (see INTERP_F32_E64_OPS). The p1/p2 forms are
+            # decoded here; the mov form keeps its table-driven, restricted-modifier decode
+            # below, whose second operand is an InterpSlot (p10/p20/p0), not a register.
+            if op == 0x202:
+                op_name, comment, arity, is_vop3b, dst_width, src_widths = VOP3_NATIVE_OPS[op]
+            else:
+                return _decode_interp_f32_e64(op, w0, w1)
         elif 0x270 <= op < 0x274:
+            # gfx8/gfx9 (VI) range, not gfx1013: LLVM 15 defines these three as
+            # VOP3Interp_Real_vi at 0x270-0x272 under AssemblerPredicate = isGFX8GFX9
+            # (VOP3Instructions.td:1365-1367). No gfx10 instruction uses them (gfx1013 puts the
+            # same three forms at 0x200-0x202 above), so the branch is kept only so gfx8/gfx9
+            # words still render the way LLVM's VI tests show.
             vintrp_names = {0: "v_interp_p1_f32_e64", 1: "v_interp_p2_f32_e64", 2: "v_interp_mov_f32_e64"}
             vop_int = op - 0x270
             op_name = vintrp_names.get(vop_int, f"v_interp_{vop_int}_e64")
@@ -2442,6 +2970,14 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         if op_name == "v_nop":
             return (8, "v_nop", "v_nop", "Vector no-op (VOP3A)")
 
+        restricted = op_name in VOP3_RESTRICTED_MODIFIERS
+        if restricted:
+            if not _vop3_restricted_encoding_is_valid(op_name, arity, w0, w1):
+                return (8, f"{op_name}_unsupported", f"{op_name} <unsupported VOP3A encoding>",
+                        f"{op_name} word with modifier bits that gfx1013 llvm-mc rejects")
+            if op_name == "v_interp_mov_f32_e64":
+                return _decode_interp_mov_e64(w0, w1, comment)
+
         has_literal = (arity >= 1 and src0 == 255) or (arity >= 2 and src1 == 255) or (arity >= 3 and src2 == 255)
         length = 8
         literal = None
@@ -2451,6 +2987,15 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             literal, = struct.unpack_from("<I", data, offset + 8)
             length = 12
 
+        if op == 0x13c:
+            # The VOP2-only v_pk_fmac_f16 has no VOP3 form on gfx1013 (llvm-mc:
+            # "e64 variant of this instruction is not supported").  Keep the
+            # real record length so the stream stays aligned, but do not
+            # report a lowerable instruction.
+            return (length, "v_pk_fmac_f16_unsupported",
+                    "v_pk_fmac_f16 <unsupported VOP3A encoding>",
+                    "VOP3A encoding of v_pk_fmac_f16 is not available on gfx1013")
+
         if is_vop3b:
             sdst = (w0 >> 8) & 0x7f
             abs_bits = [0, 0, 0]
@@ -2458,7 +3003,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         else:
             sdst = None
             abs_bits = [(w0 >> 8) & 1, (w0 >> 9) & 1, (w0 >> 10) & 1]
-            op_sel = [(w0 >> 11) & 1, (w0 >> 12) & 1, (w0 >> 13) & 1, (w0 >> 14) & 1]
+            op_sel = [0, 0, 0, 0] if restricted else [(w0 >> 11) & 1, (w0 >> 12) & 1, (w0 >> 13) & 1, (w0 >> 14) & 1]
 
         def vop3_operand(reg_id: int, is_abs: int, is_neg: int, width: int = 1) -> str:
             if reg_id == 255 and literal is not None:
@@ -2489,15 +3034,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             else:
                 asm += f" op_sel:[{','.join(str(b) for b in op_sel[:3])}]"
 
-        if clamp:
-            asm += " clamp"
-
-        if omod == 1:
-            asm += " mul:2"
-        elif omod == 2:
-            asm += " mul:4"
-        elif omod == 3:
-            asm += " div:2"
+        asm += _vop3_output_modifiers(clamp, omod)
 
         return (length, op_name, asm, comment)
 

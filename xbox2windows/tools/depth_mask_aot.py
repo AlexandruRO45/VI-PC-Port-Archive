@@ -8,6 +8,31 @@ from pixel_aot import container_code, disassemble
 from resource_inventory import parts
 
 
+# Plain binary32 VOP2 forms. src0 may be a constant, scalar word or VGPR; vsrc1 is
+# always a VGPR. subrev swaps the operands. The fixtures keep values finite and
+# normal, so NaN and subnormal behavior is not claimed.
+BINARY_F32 = {
+    "v_add_f32_e32": lambda x, y: f"({x} + {y})",
+    "v_sub_f32_e32": lambda x, y: f"({x} - {y})",
+    "v_subrev_f32_e32": lambda x, y: f"({y} - {x})",
+    "v_mul_f32_e32": lambda x, y: f"({x} * {y})",
+    "v_min_f32_e32": lambda x, y: f"min({x}, {y})",
+    "v_max_f32_e32": lambda x, y: f"max({x}, {y})",
+}
+
+
+# Ordered binary32 compares that write EXEC with the lanes where the compare holds.
+# A lane for which src0 OP vsrc1 holds is discarded. Only the four ordered forms are
+# claimed: a NaN operand makes every one of them false, as the HLSL operators do. The
+# unordered (n*) forms are true for NaN and stay rejected, as do other widths and e64.
+CMPX_F32 = {
+    "v_cmpx_lt_f32_e32": "<",
+    "v_cmpx_le_f32_e32": "<=",
+    "v_cmpx_gt_f32_e32": ">",
+    "v_cmpx_ge_f32_e32": ">=",
+}
+
+
 def lower(decoded, tables):
     if (
         len(tables) != 2
@@ -40,6 +65,8 @@ def lower(decoded, tables):
 
     def fp(token):
         if re.fullmatch(r"v\d+", token):
+            if int(token[1:]) not in vector:
+                raise ValueError("Unwritten vector register")
             return vector[int(token[1:])]
         if re.fullmatch(r"-?\d+\.\d+", token):
             return token + "f"
@@ -134,10 +161,16 @@ def lower(decoded, tables):
             elif op == "v_mul_legacy_f32_e32" and len(args) == 3:
                 x, y = map(fp, args[1:])
                 expr = f"(({x} == 0 || {y} == 0) ? 0.0f : {x} * {y})"
+            elif op in BINARY_F32 and len(args) == 3 and re.fullmatch(r"v\d+", args[2]):
+                x, y = map(fp, args[1:])
+                expr = BINARY_F32[op](x, y)
             elif op == "v_fmac_f32_e32" and len(args) == 3:
                 expr = f"mad({fp(args[1])}, {fp(args[2])}, {vector[dest]})"
             elif op == "v_fract_f32_e32" and len(args) == 2:
-                expr = f"min(frac({fp(args[1])}), asfloat(0x3f7fffffu))"
+                # D3D min returns the other operand for a NaN, so a min cap would turn a NaN input
+                # into the finite cap; a comparison fails for NaN and passes it through.
+                frac = f"frac({fp(args[1])})"
+                expr = f"({frac} >= 1.0f ? asfloat(0x3f7fffffu) : {frac})"
             else:
                 raise ValueError(f"Unsupported depth instruction: {op}")
             vector[dest] = f"value{index}"
@@ -148,7 +181,7 @@ def lower(decoded, tables):
     compare, invert, branch, restore, depth, end, empty, null, last = (
         s for _, s in tail
     )
-    cmp = re.fullmatch(r"v_cmpx_lt_f32_e32 (s\d+), (v\d+)", compare)
+    cmp = re.fullmatch(r"(v_cmpx_(?:lt|le|gt|ge)_f32_e32) (s\d+), (v\d+)", compare)
     inv = re.fullmatch(r"s_andn2_b64 (s\[(\d+):(\d+)\]), \1, exec", invert)
     take = re.fullmatch(r"s_cbranch_scc0 (-?\d+)", branch)
     mask = re.fullmatch(r"s_and_b64 exec, (s\[(\d+):(\d+)\]), (s\[\d+:\d+\])", restore)
@@ -174,7 +207,7 @@ def lower(decoded, tables):
         ]:
             raise ValueError("Expected the original entry mask")
     lines += [
-        f"    if ({fp(cmp[1])} < {fp(cmp[2])}) discard;",
+        f"    if ({fp(cmp[2])} {CMPX_F32[cmp[1]]} {fp(cmp[3])}) discard;",
         f"    return {fp(exp[1])};",
         "}",
     ]
