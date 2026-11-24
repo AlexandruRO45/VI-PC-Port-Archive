@@ -819,6 +819,71 @@ mod tests {
         assert_eq!(msg(0x0409), "s_sendmsg 0x0409");
     }
 
+    /// The edges of `s_sendmsg`'s operand: every message without operations
+    /// is named bare; a system message takes operations 1-4 only, and no
+    /// stream; a GS message's operation 4-7 has no name; bit 7, between the
+    /// operation and the stream, and bits 10-15 are no field; and
+    /// `s_sendmsghalt` spells its operand the same way.
+    #[test]
+    fn sendmsg_edges_stay_raw_rather_than_lose_bits() {
+        let msg = |imm: u32| one(&[0xBF90_0000 | imm], true);
+        let bare = [
+            (1, "MSG_INTERRUPT"),
+            (4, "MSG_SAVEWAVE"),
+            (5, "MSG_STALL_WAVE_GEN"),
+            (6, "MSG_HALT_WAVES"),
+            (10, "MSG_GET_DOORBELL"),
+            (11, "MSG_GET_DDID"),
+        ];
+        for (id, name) in bare {
+            assert_eq!(msg(id), format!("s_sendmsg sendmsg({name})"), "id {id}");
+            // An operation or a stream on a message that has neither.
+            assert_eq!(msg(id | 0x10), format!("s_sendmsg 0x{:04x}", id | 0x10));
+            assert_eq!(msg(id | 0x100), format!("s_sendmsg 0x{:04x}", id | 0x100));
+        }
+        // Message 0 and 12-14 have no name.
+        for id in [0, 12, 13, 14] {
+            assert_eq!(msg(id), format!("s_sendmsg 0x{id:04x}"), "id {id}");
+        }
+        // System message operations: 1-4 are named, 0 and 5-7 are not, and
+        // a stream is never one of its fields.
+        let sys: Vec<String> = (0..8).map(|op| msg(op << 4 | 15)).collect();
+        assert_eq!(
+            sys,
+            [
+                "s_sendmsg 0x000f",
+                "s_sendmsg sendmsg(MSG_SYSMSG, SYSMSG_OP_ECC_ERR_INTERRUPT)",
+                "s_sendmsg sendmsg(MSG_SYSMSG, SYSMSG_OP_REG_RD)",
+                "s_sendmsg sendmsg(MSG_SYSMSG, SYSMSG_OP_HOST_TRAP_ACK)",
+                "s_sendmsg sendmsg(MSG_SYSMSG, SYSMSG_OP_TTRACE_PC)",
+                "s_sendmsg 0x005f",
+                "s_sendmsg 0x006f",
+                "s_sendmsg 0x007f",
+            ]
+        );
+        assert_eq!(msg(0x021F), "s_sendmsg 0x021f");
+        // A GS message: NOP with no stream, CUT with stream 3, and the
+        // operations past EMIT_CUT.
+        assert_eq!(msg(0x0002), "s_sendmsg sendmsg(MSG_GS, GS_OP_NOP)");
+        assert_eq!(msg(0x0312), "s_sendmsg sendmsg(MSG_GS, GS_OP_CUT, 3)");
+        for op in 4..8 {
+            let imm = op << 4 | 2;
+            assert_eq!(msg(imm), format!("s_sendmsg 0x{imm:04x}"), "op {op}");
+        }
+        // Bit 7 and each of bits 10-15 leave an otherwise named operand raw.
+        assert_eq!(msg(0x0089), "s_sendmsg 0x0089");
+        assert_eq!(msg(0x00A2), "s_sendmsg 0x00a2");
+        for bit in 10..16 {
+            let imm = 1 << bit | 0x0122;
+            assert_eq!(msg(imm), format!("s_sendmsg 0x{imm:04x}"), "bit {bit}");
+        }
+        // s_sendmsghalt is SOPP opcode 0x11 and shares the spelling.
+        let halt = |imm: u32| one(&[0xBF91_0000 | imm], true);
+        assert_eq!(halt(0x0009), "s_sendmsghalt sendmsg(MSG_GS_ALLOC_REQ)");
+        assert_eq!(halt(0x0122), "s_sendmsghalt sendmsg(MSG_GS, GS_OP_EMIT, 1)");
+        assert_eq!(halt(0x8009), "s_sendmsghalt 0x8009");
+    }
+
     #[test]
     fn image_d16_data_is_packed() {
         // Three f16 channels occupy two VGPRs; NSA lists the addresses.
