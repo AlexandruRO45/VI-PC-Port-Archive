@@ -727,6 +727,7 @@ dependencies = [
  "victory-hle",
  "victory-loader",
  "victory-pe",
+ "victory-profile",
  "victory-shader",
  "walkdir",
 ]
@@ -766,6 +767,7 @@ dependencies = [
  "tracing",
  "victory-formats",
  "victory-pipeline",
+ "victory-profile",
  "victory-shader",
  "windows",
  "windows-sys",
@@ -783,6 +785,7 @@ dependencies = [
  "victory-gpu",
  "victory-loader",
  "victory-pe",
+ "victory-profile",
  "windows",
  "windows-core",
  "windows-sys",
@@ -819,6 +822,16 @@ dependencies = [
  "tempfile",
  "tracing",
  "victory-core",
+]
+
+[[package]]
+name = "victory-profile"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tracing",
+ "victory-core",
+ "windows-sys",
 ]
 
 [[package]]
