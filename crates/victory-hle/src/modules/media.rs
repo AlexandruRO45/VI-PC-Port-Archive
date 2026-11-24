@@ -503,7 +503,13 @@ mod tests {
         std::fs::write(dir.path().join("movies").join("intro.mp4"), b"1").unwrap();
         std::fs::write(dir.path().join("movies").join("intro a.mp4"), b"2").unwrap();
         let letter = files::mount(dir.path()).expect("a free drive letter");
-        let host = text(&local(&wide(&format!(r"{letter}:\movies\intro.mp4"))).unwrap());
+        #[cfg(windows)]
+        let intro_path = format!(r"{letter}:\movies\intro.mp4");
+        #[cfg(not(windows))]
+        let intro_path = format!("{letter}:/movies/intro.mp4");
+        let host = text(&local(&wide(&intro_path)).unwrap());
+        #[cfg(not(windows))]
+        let host = host.replace('\\', "/");
         assert_eq!(
             std::fs::read(&host).ok().as_deref(),
             Some(&b"1"[..]),
@@ -511,6 +517,8 @@ mod tests {
         );
         let from_url =
             text(&local(&wide(&format!("file:///{letter}:/movies/intro%20a.mp4"))).unwrap());
+        #[cfg(not(windows))]
+        let from_url = from_url.replace('\\', "/");
         assert_eq!(
             std::fs::read(&from_url).ok().as_deref(),
             Some(&b"2"[..]),

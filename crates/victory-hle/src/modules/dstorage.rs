@@ -20,8 +20,10 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
+#[cfg(windows)]
 use std::os::windows::fs::FileExt;
-use std::os::windows::io::FromRawHandle;
+#[cfg(not(windows))]
+use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
@@ -143,7 +145,13 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     }
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
+    #[cfg(windows)]
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    #[cfg(not(windows))]
+    let file = unsafe {
+        use std::os::fd::FromRawFd;
+        std::fs::File::from_raw_fd(handle as i32)
+    };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
     put(out, file)
 }
@@ -928,7 +936,11 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        #[cfg(windows)]
+        let read_res = file.seek_read(&mut out[done..], request.offset + done as u64);
+        #[cfg(not(windows))]
+        let read_res = file.read_at(&mut out[done..], request.offset + done as u64);
+        match read_res {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
@@ -1007,7 +1019,6 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
-    use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -1025,7 +1036,7 @@ mod tests {
     }
 
     fn open(path: &std::path::Path) -> *mut c_void {
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain([0]).collect();
         let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
             call(factory(), 0x20);
         let mut file = std::ptr::null_mut();

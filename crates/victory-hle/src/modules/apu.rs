@@ -14,8 +14,25 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 
 use opus_pure::OpusDecoder;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
+
+#[cfg(not(windows))]
+type HANDLE = *mut c_void;
+#[cfg(not(windows))]
+unsafe fn CloseHandle(_: HANDLE) -> i32 {
+    1
+}
+#[cfg(not(windows))]
+unsafe fn CreateEventW(_: *const c_void, _: i32, _: i32, _: *const u16) -> HANDLE {
+    0x1000 as HANDLE
+}
+#[cfg(not(windows))]
+unsafe fn SetEvent(_: HANDLE) -> i32 {
+    1
+}
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};

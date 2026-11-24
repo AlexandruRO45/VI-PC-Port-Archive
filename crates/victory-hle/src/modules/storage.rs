@@ -52,10 +52,7 @@ fn folder() -> Option<String> {
     if storage.as_os_str().is_empty() {
         return None;
     }
-    #[cfg(windows)]
-    return super::files::mount(&storage).map(|letter| format!("{letter}:\\"));
-    #[cfg(not(windows))]
-    None
+    super::files::mount(&storage).map(|letter| format!("{letter}:\\"))
 }
 
 extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {

@@ -14,11 +14,14 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::ffi::{CStr, c_char, c_void};
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
+#[cfg(windows)]
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
+#[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
 use crate::{HleExport, HleModule, hle_export};
@@ -45,6 +48,13 @@ fn drives() -> MutexGuard<'static, Vec<(u16, Vec<u16>)>> {
     DRIVES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn logical_drives() -> u32 {
+    #[cfg(windows)]
+    unsafe { GetLogicalDrives() }
+    #[cfg(not(windows))]
+    0
+}
+
 /// Gives the host folder `root` a drive letter (the same one if it already
 /// has one): the highest letter neither the host nor another mount uses.
 pub fn mount(root: &Path) -> Option<char> {
@@ -54,7 +64,7 @@ pub fn mount(root: &Path) -> Option<char> {
         return char::from_u32(letter.into());
     }
     // SAFETY: no arguments.
-    let host = unsafe { GetLogicalDrives() };
+    let host = logical_drives();
     let letter = (b'D'..=b'Z').rev().find(|&l| {
         host >> (l - b'A') & 1 == 0 && !drives.iter().any(|(m, _)| *m == u16::from(l))
     })?;
@@ -75,7 +85,7 @@ pub fn mount_at(letter: char, root: &Path) {
         return;
     };
     // SAFETY: no arguments.
-    let hides_host_drive = unsafe { GetLogicalDrives() } >> index & 1 != 0;
+    let hides_host_drive = logical_drives() >> index & 1 != 0;
     tracing::info!(drive = %letter, root = %root.display(), hides_host_drive, "virtual drive");
     let mut drives = drives();
     drives.retain(|(l, _)| u32::from(*l) != u32::from(letter));
@@ -86,7 +96,10 @@ pub fn mount_at(letter: char, root: &Path) {
 /// keeps its own).
 fn root_wide(root: &Path) -> Vec<u16> {
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
+    #[cfg(windows)]
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
+    #[cfg(not(windows))]
+    let mut wide: Vec<u16> = root.to_string_lossy().encode_utf16().collect();
     while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
         wide.pop();
     }
@@ -226,12 +239,19 @@ fn narrow(path: *const c_char) -> Option<Vec<u16>> {
         }
     }
     let len = i32::try_from(bytes.len()).ok()?;
-    // SAFETY: sizing call, then a call with room for `n` units.
-    let wide = unsafe {
-        let n = MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0);
-        let mut wide = vec![0u16; usize::try_from(n).ok()?];
-        MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n);
-        wide
+    let wide = {
+        #[cfg(windows)]
+        unsafe {
+            let n = MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0);
+            let mut wide = vec![0u16; usize::try_from(n).ok()?];
+            MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n);
+            wide
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = len;
+            String::from_utf8_lossy(bytes).encode_utf16().collect::<Vec<u16>>()
+        }
     };
     let host = translate(&wide);
     trace(&wide, host.as_deref());
@@ -740,13 +760,20 @@ mod tests {
 
     #[test]
     fn kernel_reads_reach_the_buffer() {
+        #[cfg(windows)]
         use std::os::windows::io::AsRawHandle;
+        #[cfg(not(windows))]
+        use std::os::fd::AsRawFd;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.bin");
         std::fs::write(&path, b"0123456789").unwrap();
         let file = std::fs::File::open(&path).unwrap();
         let (mut out, mut n) = ([0u8; 10], 0);
+        #[cfg(windows)]
         let handle = file.as_raw_handle().cast();
+        #[cfg(not(windows))]
+        let handle = file.as_raw_fd() as *mut c_void;
         assert_ne!(ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()), 0);
         assert_eq!((&out, n), (b"0123456789", 10));
     }

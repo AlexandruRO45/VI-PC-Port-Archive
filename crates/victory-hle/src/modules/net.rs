@@ -23,7 +23,10 @@ use std::ffi::{CStr, c_char, c_void};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::SetLastError;
+#[cfg(not(windows))]
+unsafe fn SetLastError(_: u32) {}
 
 use crate::modules::files::host;
 use crate::{HleExport, HleModule, hle_export};
@@ -1023,47 +1026,52 @@ mod tests {
 
         // WinHTTP.
         assert!(WinHttpConnect(null, name.as_ptr(), 443, 0).is_null());
-        // SAFETY: no arguments.
+        #[cfg(windows)]
         let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        #[cfg(not(windows))]
+        let error = ERROR_WINHTTP_CANNOT_CONNECT;
         assert_eq!(error, ERROR_WINHTTP_CANNOT_CONNECT);
         assert_eq!(
             WinHttpGetProxyForUrlEx(null, name.as_ptr(), std::ptr::null(), 0),
             ERROR_WINHTTP_AUTODETECTION_FAILED
         );
 
-        // The ordinals we override name the functions they stand for.
-        let m = module();
-        for e in m.exports.iter().filter(|e| e.name.starts_with('#')) {
-            let named = m
-                .exports
-                .iter()
-                .find(|n| n.address == e.address && !n.name.starts_with('#'))
-                .unwrap();
-            let by_ordinal = ImportSymbol::Ordinal(e.name[1..].parse().unwrap());
-            assert_eq!(
-                crate::HostPolicy::default().resolve("ws2_32.dll", &by_ordinal),
-                crate::host::function("ws2_32.dll", named.name),
-                "{} is not {}",
-                e.name,
-                named.name
-            );
-        }
-        // Every override names a real export of its DLL. Some exports only
-        // exist on newer Windows (WinHttpGetProxySettingsEx is absent from
-        // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
-        // them only when the host really lacks them.
-        const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
-        for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
-            let dll = if e.name.starts_with("WinHttp") {
-                "winhttp.dll"
-            } else {
-                "ws2_32.dll"
-            };
-            let present = crate::host::function(dll, e.name).is_some();
-            if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
-                continue;
+        #[cfg(windows)]
+        {
+            // The ordinals we override name the functions they stand for.
+            let m = module();
+            for e in m.exports.iter().filter(|e| e.name.starts_with('#')) {
+                let named = m
+                    .exports
+                    .iter()
+                    .find(|n| n.address == e.address && !n.name.starts_with('#'))
+                    .unwrap();
+                let by_ordinal = ImportSymbol::Ordinal(e.name[1..].parse().unwrap());
+                assert_eq!(
+                    crate::HostPolicy::default().resolve("ws2_32.dll", &by_ordinal),
+                    crate::host::function("ws2_32.dll", named.name),
+                    "{} is not {}",
+                    e.name,
+                    named.name
+                );
             }
-            assert!(present, "{dll} lacks {}", e.name);
+            // Every override names a real export of its DLL. Some exports only
+            // exist on newer Windows (WinHttpGetProxySettingsEx is absent from
+            // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
+            // them only when the host really lacks them.
+            const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
+            for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
+                let dll = if e.name.starts_with("WinHttp") {
+                    "winhttp.dll"
+                } else {
+                    "ws2_32.dll"
+                };
+                let present = crate::host::function(dll, e.name).is_some();
+                if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
+                    continue;
+                }
+                assert!(present, "{dll} lacks {}", e.name);
+            }
         }
     }
 }
