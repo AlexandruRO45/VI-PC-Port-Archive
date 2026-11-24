@@ -5333,6 +5333,72 @@ mod tests {
     }
 
     #[test]
+    fn one_entry_may_be_both_a_parameter_and_a_read_each_by_its_own_fields() {
+        let good = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let record = stage_data_at(&good, HwStage::Vs) - RECORD_SIZE as usize;
+        // Both tables at the same 20 bytes, one entry each.
+        let shared = |entry: [u8; ENTRY_SIZE as usize]| {
+            let mut blob = good.clone();
+            let table = (blob.len() - FSSM_HEADER) as u64;
+            blob.extend_from_slice(&entry);
+            let payload = (blob.len() - FSSM_HEADER) as u64;
+            blob[8..16].copy_from_slice(&payload.to_le_bytes());
+            for at in [RECORD_LAYOUT, RECORD_USED] {
+                blob[record + at..][..8].copy_from_slice(&table.to_le_bytes());
+            }
+            for at in [RECORD_COUNTS, RECORD_COUNTS + 4] {
+                blob[record + at..][..4].copy_from_slice(&1u32.to_le_bytes());
+            }
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        let mut entry = [0u8; ENTRY_SIZE as usize];
+        entry[0] = 3;
+        entry[4..8].copy_from_slice(&8u32.to_le_bytes());
+        entry[8..12].copy_from_slice(&1u32.to_le_bytes());
+        entry[12..16].copy_from_slice(&2u32.to_le_bytes());
+        entry[16..20].copy_from_slice(&[4, 5, 7, 0xAA]);
+        // As a parameter, byte 0 starts a whole-dword kind (3, a table) and
+        // bytes 16 and 17 are its user data and slot; as a read, byte 0 is
+        // its kind (3, a UAV), byte 1 its root kind (0, constants), and bytes
+        // 16, 17 and 18 its size, user data and slot. A constants read keeps
+        // none of the table rules, so the table it shares bytes with is no
+        // parameter it must name.
+        let p = &shared(entry).unwrap()[0];
+        assert_eq!(
+            p.layout,
+            [RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                sgprs: 1,
+                base_register: 2,
+                user_data: 4,
+                slot: 5,
+            }]
+        );
+        assert_eq!(
+            p.used,
+            [UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Constants,
+                table_offset_dwords: 8,
+                lower_bound: 1,
+                stride: 2,
+                dwords: 4,
+                user_data: 5,
+                slot: 7,
+            }]
+        );
+        // A table read needs byte 1 to be 3, which makes the parameter's
+        // kind 0x303: shared bytes never hold a table read, and the layout,
+        // checked first, names why.
+        entry[1] = 3;
+        assert_eq!(why_refused(shared(entry)), "root parameter of unknown kind");
+        // A parameter of kind 0 with byte 1 at 3 would still be 0x300.
+        entry[0] = 0;
+        assert_eq!(why_refused(shared(entry)), "root parameter of unknown kind");
+    }
+
+    #[test]
     fn records_and_code_need_no_alignment() {
         // Every record is found through its slot and every offset counts
         // from the payload, so a record moved 1..7 bytes later (its slot and
