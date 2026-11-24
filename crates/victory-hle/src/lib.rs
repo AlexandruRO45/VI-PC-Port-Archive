@@ -11,6 +11,7 @@
 //! Resolution order for every import: an implementation in [`modules`],
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
+pub mod bink;
 mod host;
 pub mod modules;
 mod registry;
@@ -47,6 +48,15 @@ impl ImportResolver for HleResolver {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
         // Ordinal imports look up `#n`.
         if let Some(address) = registry::lookup(dll, &symbol.to_string()) {
+            return Resolution::Found {
+                address,
+                provenance: Provenance::Hle,
+            };
+        }
+        // A title's own DLL is served by the image the loader mapped
+        // (`WithTitleDlls`), except where we wrap one of its imports to see
+        // what the title hands it and what it puts there (`bink`).
+        if let Some(address) = crate::bink::instrument(dll, symbol) {
             return Resolution::Found {
                 address,
                 provenance: Provenance::Hle,

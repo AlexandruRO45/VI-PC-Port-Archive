@@ -49,6 +49,7 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
+pub mod movie;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
