@@ -96,6 +96,21 @@ pub(crate) fn function(dll: &str, name: &str) -> Option<usize> {
     imp::resolve(dll, &name)
 }
 
+/// [`function`] as a typed function pointer, looked up once: what the
+/// import would have been bound to (on Linux, our `crate::linux` one).
+macro_rules! host {
+    ($dll:literal, $name:literal: $ty:ty) => {{
+        static ADDRESS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let address = *ADDRESS.get_or_init(|| {
+            crate::host::function($dll, $name)
+                .unwrap_or_else(|| panic!("the host lacks {}!{}", $dll, $name))
+        });
+        // SAFETY: the host exports this function with this signature.
+        unsafe { std::mem::transmute::<usize, $ty>(address) }
+    }};
+}
+pub(crate) use host;
+
 #[cfg(windows)]
 mod imp {
     use std::collections::HashMap;

@@ -132,8 +132,9 @@ static ANALYTICS_VTABLE: Methods<4> = Methods([
 
 /// The device type is not a runtime call: code linked into the title reads
 /// `ConsoleMode` from this key (`RegOpenKeyW`, `RegQueryValueExW`) and
-/// takes a missing value for a PC.
-#[cfg(windows)]
+/// takes a missing value for a PC. Other keys go to the host's registry
+/// (on Linux, our empty one).
+#[cfg(any(windows, target_os = "linux"))]
 mod device_type {
     #![allow(non_snake_case)]
 
@@ -141,7 +142,7 @@ mod device_type {
 
     use victory_gpu::console::{self, Console};
 
-    use crate::modules::files::host;
+    use crate::host::host;
     use crate::{HleModule, hle_export};
 
     type Key = *mut c_void;
@@ -339,6 +340,16 @@ mod device_type {
             assert_eq!(again, oem());
         }
 
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn other_keys_reach_the_empty_registry() {
+            let mut key = std::ptr::null_mut();
+            let path = w(r"Software\Microsoft\Windows NT\CurrentVersion");
+            assert_eq!(RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key), FILE_NOT_FOUND);
+            assert_eq!(RegCloseKey(LOCAL_MACHINE), SUCCESS);
+        }
+
+        #[cfg(windows)]
         #[test]
         fn other_keys_reach_the_host() {
             let mut key = std::ptr::null_mut();
@@ -362,7 +373,7 @@ mod device_type {
         }
     }
 }
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub(crate) use device_type::module;
 
 #[cfg(test)]

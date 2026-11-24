@@ -17,7 +17,6 @@ pub fn run(
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
     // A title that relaunched itself: the old process must be gone first.
-    #[cfg(windows)]
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
@@ -120,12 +119,15 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    victory_loader::report_crashes();
+    victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    // Linux timers are fine-grained already.
     #[cfg(windows)]
-    {
-        victory_loader::report_crashes();
-        victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
-        victory_hle::runtime::use_console_timers();
-    }
+    victory_hle::runtime::use_console_timers();
+    // Ctrl+C, a kill or closing the window ends the title as the console
+    // ends it (on Windows, the window close is caught by its procedure).
+    #[cfg(target_os = "linux")]
+    victory_hle::modules::lifecycle::end_on_signals();
     #[cfg(all(windows, feature = "diagnostics"))]
     diagnostics(&image, &cfg);
     let late = LateDlls {

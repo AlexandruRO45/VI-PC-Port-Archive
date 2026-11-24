@@ -68,18 +68,18 @@ pub extern "win64" fn GetSystemTimeAdjustment(adjustment: *mut u32, increment: *
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct SystemTime {
-    year: u16,
-    month: u16,
-    day_of_week: u16,
-    day: u16,
-    hour: u16,
-    minute: u16,
-    second: u16,
-    milliseconds: u16,
+    pub(crate) year: u16,
+    pub(crate) month: u16,
+    pub(crate) day_of_week: u16,
+    pub(crate) day: u16,
+    pub(crate) hour: u16,
+    pub(crate) minute: u16,
+    pub(crate) second: u16,
+    pub(crate) milliseconds: u16,
 }
 
 /// Days since 1970-01-01 of a civil date (Howard Hinnant's algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;

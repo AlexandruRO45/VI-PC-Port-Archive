@@ -14,12 +14,31 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 
 use opus_pure::OpusDecoder;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
+use crate::host::host;
 use crate::{HleModule, hle_export};
+
+type HANDLE = *mut c_void;
+
+// The title waits on the event, so it is the host's (on Linux, ours).
+fn create_event() -> HANDLE {
+    host!("kernel32.dll", "CreateEventW": extern "win64" fn(*const c_void, i32, i32, *const u16) -> HANDLE)(
+        std::ptr::null(),
+        0,
+        0,
+        std::ptr::null(),
+    )
+}
+
+fn set_event(event: HANDLE) {
+    host!("kernel32.dll", "SetEvent": extern "win64" fn(HANDLE) -> i32)(event);
+}
+
+fn close_handle(handle: HANDLE) {
+    host!("kernel32.dll", "CloseHandle": extern "win64" fn(HANDLE) -> i32)(handle);
+}
 
 const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
@@ -180,8 +199,7 @@ pub extern "win64" fn XApuConnect(
         return E_OUTOFMEMORY;
     }
     let event = if input.options & RESULT_EVENT != 0 {
-        // SAFETY: plain auto-reset event, no name.
-        unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) }
+        create_event()
     } else {
         std::ptr::null_mut()
     };
@@ -224,8 +242,7 @@ pub extern "win64" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
     // SAFETY: made by `XApuConnect`; disconnected once.
     let connection = unsafe { Box::from_raw(handle) };
     if !connection.event.is_null() {
-        // SAFETY: our event.
-        unsafe { CloseHandle(connection.event) };
+        close_handle(connection.event);
     }
     // SAFETY: allocated in `XApuConnect` with this layout.
     unsafe { std::alloc::dealloc(connection.memory, connection.layout) };
@@ -306,8 +323,7 @@ pub extern "win64" fn XApuEnqueueCommand(
         unsafe { total.write(state.commands) };
     }
     if id.options & SIGNAL != 0 && !connection.event.is_null() {
-        // SAFETY: our event.
-        unsafe { SetEvent(connection.event) };
+        set_event(connection.event);
     }
     S_OK
 }
