@@ -132,6 +132,9 @@ const MAX_LDS_BYTES: u32 = 64 << 10;
 /// vertices and 256 primitives out.
 const MAX_MESH_THREADS: u32 = 128;
 const MAX_MESH_OUTPUTS: u32 = 256;
+/// The furthest dword a table read may name: D3D12's tier 2 limit of a
+/// million descriptors in a shader-visible heap, of 8 dwords each.
+const MAX_TABLE_DWORDS: u32 = 1_000_000 * 8;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
 
@@ -613,6 +616,18 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
             .any(|u| u.root == RootType::Descriptor && !named(u))
         {
             return Err(Malformed("used descriptor names no root descriptor"));
+        }
+        // The host makes a table holding a constant buffer afresh with a slot
+        // for every descriptor up to the furthest read (`draw::tables`: its
+        // offset / 8 + 1), reading each from title memory to key it before
+        // asking the heap for that many slots. An offset past any heap would
+        // read gigabytes past the table (536 million slots near `u32::MAX`)
+        // before the allocation fails.
+        if used
+            .iter()
+            .any(|u| u.root == RootType::Table && u.table_offset_dwords >= MAX_TABLE_DWORDS)
+        {
+            return Err(Malformed("used descriptor past any heap"));
         }
         if !used_one_way(&used) {
             return Err(Malformed("used descriptors read one descriptor two ways"));
@@ -2349,6 +2364,33 @@ mod tests {
                 why_refused(reading(&[(kind, root, 0)])),
                 "used descriptor of unknown kind",
                 "kind {kind}, root {root}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_a_table_read_past_any_heap() {
+        let (srv, cbv, sampler) = (0u8, 2u8, 1u8);
+        let (descriptor, table) = (1u8, 3u8);
+        // The last descriptor of a full heap is fine, as is a root
+        // descriptor's read, which has no table to index.
+        let last = MAX_TABLE_DWORDS - 8;
+        assert!(reading(&[(cbv, table, last)]).is_ok());
+        assert!(reading(&[(sampler, table, MAX_TABLE_DWORDS - 4)]).is_ok());
+        assert!(reading(&[(srv, descriptor, u32::MAX)]).is_ok());
+        for (reads, what) in [
+            (vec![(cbv, table, MAX_TABLE_DWORDS)], "one descriptor past"),
+            (vec![(srv, table, u32::MAX)], "the furthest offset"),
+            (vec![(sampler, table, u32::MAX - 3)], "a sampler table"),
+            (
+                vec![(cbv, table, 0), (cbv, table, 1 << 30)],
+                "past a read in bounds",
+            ),
+        ] {
+            assert_eq!(
+                why_refused(reading(&reads)),
+                "used descriptor past any heap",
+                "{what}"
             );
         }
     }
