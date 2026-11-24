@@ -573,7 +573,9 @@ fn buffer_uav(
 /// view; the host refuses (and removes the device for) views without the
 /// resource's permission, of typed depth, and in another format than a
 /// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
+/// family takes the texture's format. A texture UAV a shader uses with an
+/// i64 atomic must stay `DXGI_FORMAT_R32G32_UINT` (a typeless resource
+/// keeps the view's format); an R32 view there fails shader creation.
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {

@@ -5652,8 +5652,8 @@ impl<'a> Lower<'a> {
                 .is_some_and(|u| u.kind == ResourceType::Uav);
         let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
-            // DXIL's atomic operations on a 32-bit integer texture UAV; the
-            // old value returns with glc. Sub is the add of the negation.
+            // DXIL's atomic operations on an integer texture UAV; the old
+            // value returns with glc. Sub is the add of the negation.
             let code = match op {
                 "add" | "sub" => 0,
                 "and" => 1,
@@ -5673,11 +5673,18 @@ impl<'a> Lower<'a> {
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
             }
-            // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
+            // AMD's dmask gives the operand width: 1/3 for 32-/64-bit binary
+            // atomics, 3/0xF for 32-/64-bit cmpswap (an R32 or R32G32 view).
+            let cmp = code == u32::MAX;
+            let wide = *dmask == if cmp { 0xF } else { 3 };
+            let expected = match (cmp, wide) {
+                (false, false) => 1,
+                (false, true) => 3,
+                (true, false) => 3,
+                (true, true) => 0xF,
+            };
+            if *dmask != expected {
+                return Err("an image atomic dmask");
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
@@ -5687,42 +5694,106 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
-            let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
-            let mut value = vals[0];
-            if op == "sub" {
-                let z = self.s.m.i32(0);
-                value = self.s.m.bin(c, Bin::Sub, z, value);
-            }
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if cache.glc => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
+            let i32t = self.s.t.i32;
+            let i64t = self.s.m.int(64);
+            let k32 = self.s.m.int_const(i64t, 32);
+            let join64 = |l: &mut Self, lo: V, hi: V| -> Result<V, Why> {
+                let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
+                let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
+                let hi = l.s.m.bin(c, Bin::Shl, hi, k32);
+                Ok(l.s.m.bin(c, Bin::Or, lo, hi))
             };
+            // cmpswap's data is (new, compare), each a register pair if wide.
+            let dwords = (1 + u8::from(cmp)) * (1 + u8::from(wide));
+            let vals = self.vgprs(inst, data, dwords)?;
             let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
             let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
-            let mut args = vec![h];
-            let r = if code == u32::MAX {
-                // cmpswap: data is (new, compare).
-                args.extend(cs);
-                args.extend([vals[1], vals[0]]);
-                self.s.op(
-                    self.cur,
-                    "atomicCompareExchange.i32",
-                    Attr::NoUnwind,
-                    i32t,
-                    79,
-                    &args,
-                )
+            if wide {
+                // SM 6.6: i64 atomics need Int64, a typed R32G32 UAV and a
+                // descriptor-heap resource (the new typed/heap feature bits).
+                self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_TYPED | flags::ATOMIC_INT64_HEAP;
+            }
+            let r = if wide {
+                let mut value = join64(self, vals[0], vals[1])?;
+                if op == "sub" {
+                    let z = self.s.m.int_const(i64t, 0);
+                    value = self.s.m.bin(c, Bin::Sub, z, value);
+                }
+                let old_dword = |l: &mut Self, k: u8| -> V {
+                    match inst.read(Reg::V(reg + k)).and_then(|v| l.i32_of(v).ok()) {
+                        Some(v) => v,
+                        // The validator refuses reads of undef.
+                        None => l.s.m.i32(0),
+                    }
+                };
+                let old = if cache.glc {
+                    let lo = old_dword(self, 0);
+                    let hi = old_dword(self, 1);
+                    join64(self, lo, hi)?
+                } else {
+                    self.s.m.int_const(i64t, 0)
+                };
+                let r = if cmp {
+                    let compare = join64(self, vals[2], vals[3])?;
+                    let mut args = vec![h];
+                    args.extend(cs);
+                    args.extend([compare, value]);
+                    self.s.op(
+                        self.cur,
+                        "atomicCompareExchange.i64",
+                        Attr::NoUnwind,
+                        i64t,
+                        79,
+                        &args,
+                    )
+                } else {
+                    let mut args = vec![h, self.s.m.i32(code)];
+                    args.extend(cs);
+                    args.push(value);
+                    self.s
+                        .op(self.cur, "atomicBinOp.i64", Attr::NoUnwind, i64t, 78, &args)
+                };
+                self.end_guarded(at, &[(r, old)])[0]
             } else {
-                args.push(self.s.m.i32(code));
-                args.extend(cs);
-                args.push(value);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                let mut value = vals[0];
+                if op == "sub" {
+                    let z = self.s.m.i32(0);
+                    value = self.s.m.bin(c, Bin::Sub, z, value);
+                }
+                let old = match inst.read(Reg::V(reg)) {
+                    Some(v) if cache.glc => self.i32_of(v)?,
+                    _ => self.s.m.i32(0),
+                };
+                let mut args = vec![h];
+                let r = if cmp {
+                    // cmpswap: data is (new, compare).
+                    args.extend(cs);
+                    args.extend([vals[1], vals[0]]);
+                    self.s.op(
+                        self.cur,
+                        "atomicCompareExchange.i32",
+                        Attr::NoUnwind,
+                        i32t,
+                        79,
+                        &args,
+                    )
+                } else {
+                    args.push(self.s.m.i32(code));
+                    args.extend(cs);
+                    args.push(value);
+                    self.s
+                        .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                };
+                self.end_guarded(at, &[(r, old)])[0]
             };
-            let r = self.end_guarded(at, &[(r, old)])[0];
             if cache.glc {
-                self.write(inst, Reg::V(reg), r, None);
+                if wide {
+                    let (lo, hi) = self.split64(r);
+                    self.write(inst, Reg::V(reg), lo, None);
+                    self.write(inst, Reg::V(reg + 1), hi, None);
+                } else {
+                    self.write(inst, Reg::V(reg), r, None);
+                }
             }
             return Ok(());
         }

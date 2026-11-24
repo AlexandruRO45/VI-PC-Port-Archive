@@ -7,6 +7,7 @@
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
+use crate::dxbc::{Container, FourCC};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -65,14 +66,32 @@ const fn vgpr(n: u8) -> u16 {
     256 + n as u16
 }
 
+/// SMEM `s_load_dwordx8 s[dst:dst+7], s[base:base+1], 0` (soffset = null):
+/// an image descriptor is eight dwords.
+const fn s_load_dwordx8(dst: u8, base: u8) -> [u32; 2] {
+    [
+        0x3D << 26 | 0x03 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25,
+    ]
+}
+
 /// Builds and lowers a 1-thread synthetic RDNA2 compute shader that receives
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_cs(body, false)
+}
+
+/// `image` loads the heap descriptor as eight dwords (s[8:15]).
+fn build_cs(body: &[u32], image: bool) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
-    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    if image {
+        words.extend_from_slice(&s_load_dwordx8(8, 4));
+    } else {
+        words.extend_from_slice(&s_load_dwordx4(8, 4));
+    }
     // Copy root constants s0..s3 into v1..v4 so VALU instructions operate on
     // VGPRs just as they do in real shaders.
     for i in 0..4u8 {
@@ -932,8 +951,86 @@ fn v_cmp_class_f16_matches_rdna2() {
         let want = hi_cases[i].1;
         assert_eq!(
             got, want,
-            "{backend}: v_cmp_class_f16(-hi({:#010x}), {:#05x}) = {got}, want {want}",
+            "{backend}: v_cmp_class_f16(-hi({:#06x}), {:#05x}) = {got}, want {want}",
             inp[0], inp[1],
         );
     });
+}
+
+/// MIMG `image_atomic_* v[data], v[addr], s[srsrc] dmask:D dim:2D unorm glc`.
+/// The address is sequential (one VGPR per 2D coordinate), `srsrc` is the
+/// first SGPR of the 8-register image descriptor (a multiple of 4).
+const fn image_atomic(opcode: u8, dmask: u8, addr: u8, data: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x3C << 26 | (opcode as u32) << 18 | 1 << 13 | 1 << 12 | (dmask as u32) << 8 | 1 << 3,
+        (addr as u32) | (data as u32) << 8 | ((srsrc as u32 / 4) << 16),
+    ]
+}
+
+/// The SFI0 feature bits a shader declares (the u64 in the container part).
+fn features(shader: &HostShader) -> u64 {
+    let c = Container::parse(&shader.dxil).expect("container");
+    let part = c.part(FourCC::SFI0).expect("SFI0");
+    u64::from_le_bytes(part.data.try_into().unwrap())
+}
+
+/// Lowers image atomics of both widths and validates the DXIL with `dxil.dll`.
+/// GFX10's dmask is 1/3 for 32-/64-bit binary atomics and 3/0xF for
+/// 32-/64-bit cmpswap; the 64-bit cases used to stop the translation.
+#[test]
+fn image_atomic_64_dxil_validates() {
+    // v1/v2 = the 2D coordinates, v3/v4 = a 64-bit value, v5/v6 = a second
+    // 64-bit value for cmpswap; all from root constants, as `build_valu_cs`
+    // copies s0..s3 to v1..v4. The descriptor is at s8 (heap index 0).
+    let mut cmpswap_data = Vec::new();
+    for reg in [5u8, 6] {
+        cmpswap_data.push(vop1(0x001, reg, sgpr(reg - 5)));
+    }
+    let result_to_v0 = vop1(0x001, 0, vgpr(3));
+    let cases = [
+        ("add", image_atomic(0x011, 3, 1, 3, 8)),
+        ("sub", image_atomic(0x012, 3, 1, 3, 8)),
+        ("and", image_atomic(0x018, 3, 1, 3, 8)),
+        ("or", image_atomic(0x019, 3, 1, 3, 8)),
+        ("xor", image_atomic(0x01a, 3, 1, 3, 8)),
+        ("smin", image_atomic(0x014, 3, 1, 3, 8)),
+        ("smax", image_atomic(0x016, 3, 1, 3, 8)),
+        ("umin", image_atomic(0x015, 3, 1, 3, 8)),
+        ("umax", image_atomic(0x017, 3, 1, 3, 8)),
+        ("swap", image_atomic(0x00f, 3, 1, 3, 8)),
+        ("cmpswap", image_atomic(0x010, 0xF, 1, 3, 8)),
+    ];
+    let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref())
+        .ok();
+    for (name, atomic) in cases {
+        let mut body = Vec::new();
+        if name == "cmpswap" {
+            body.extend_from_slice(&cmpswap_data);
+        }
+        body.extend_from_slice(&atomic);
+        body.push(result_to_v0);
+        let shader = build_cs(&body, true);
+        let f = features(&shader);
+        assert_ne!(f & 0x8000, 0, "{name}: no Int64Ops feature");
+        assert_ne!(f & 0x40_0000, 0, "{name}: no AtomicInt64OnTypedResource");
+        assert_ne!(f & 0x1000_0000, 0, "{name}: no AtomicInt64OnHeapResource");
+        let mut dxil = shader.dxil.clone();
+        if let Some(v) = validator.as_mut() {
+            v.validate(&mut dxil)
+                .unwrap_or_else(|e| panic!("{name}: dxil.dll rejected the 64-bit atomic: {e}"));
+        }
+    }
+    // The 32-bit forms still lower and validate (dmask 1, or 3 for cmpswap).
+    for atomic in [
+        image_atomic(0x011, 1, 1, 3, 8),
+        image_atomic(0x010, 3, 1, 3, 8),
+    ] {
+        let shader = build_cs(&[atomic[0], atomic[1], result_to_v0], true);
+        assert_eq!(features(&shader) & 0x8000, 0, "32-bit atomic set Int64Ops");
+        let mut dxil = shader.dxil.clone();
+        if let Some(v) = validator.as_mut() {
+            v.validate(&mut dxil)
+                .unwrap_or_else(|e| panic!("dxil.dll rejected the 32-bit atomic: {e}"));
+        }
+    }
 }
