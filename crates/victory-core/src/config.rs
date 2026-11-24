@@ -292,8 +292,16 @@ impl Config {
             ),
         ] {
             if let Some(dir) = dir {
-                ensure_not_a_file(name, dir, origin, setting)?;
+                ensure_not_a_file(&format!("{name} folder"), dir, origin, setting)?;
             }
+        }
+        for title in &test_titles {
+            ensure_not_a_file(
+                "test title",
+                title,
+                origins.test_titles,
+                "VICTORY_TEST_TITLES or [paths].test_titles",
+            )?;
         }
         Ok(Config {
             game_dir,
@@ -691,26 +699,27 @@ fn ensure_titles_apart(
 /// the game's executable or a file in the dump rather than its folder
 /// (`VICTORY_GAME_DIR=~/games/gta/default.xex`, picked in a file dialog or
 /// pasted from a launcher's target); it was accepted and only failed later,
-/// per file, with "Not a directory". For the cache or data folder
-/// `create_dir_all` would fail on first use with "File exists", naming
-/// neither the setting nor the fix. A path that does not exist yet is fine:
-/// the cache and data folders are created when needed. `name` is the
-/// folder ("game", "cache", "data") and `setting` the variable and key that
-/// set it.
-fn ensure_not_a_file(name: &str, dir: &Path, origin: Origin, setting: &str) -> Result<()> {
+/// per file, with "Not a directory". The same goes for each entry of
+/// `VICTORY_TEST_TITLES` / `[paths].test_titles`, which is also a dump.
+/// For the cache or data folder `create_dir_all` would fail on first use
+/// with "File exists", naming neither the setting nor the fix. A path that
+/// does not exist yet is fine: the cache and data folders are created when
+/// needed. `what` is the folder ("game folder", "cache folder", "data
+/// folder", "test title") and `setting` the variable and key that set it.
+fn ensure_not_a_file(what: &str, dir: &Path, origin: Origin, setting: &str) -> Result<()> {
     if !dir.is_file() {
         return Ok(());
     }
     let parent = dir.parent().filter(|p| !p.as_os_str().is_empty());
-    let hint = match (name, parent) {
-        ("game", Some(parent)) => format!(
+    let hint = match (what, parent) {
+        ("game folder" | "test title", Some(parent)) => format!(
             "set {setting} to the folder holding the dump, perhaps {}",
             parent.display()
         ),
         _ => format!("set {setting} to a folder, or move the file away"),
     };
     anyhow::bail!(
-        "the {name} folder {} (from {origin}) is a file, not a folder; {hint}",
+        "the {what} {} (from {origin}) is a file, not a folder; {hint}",
         dir.display()
     );
 }
@@ -2002,7 +2011,43 @@ mod tests {
             assert!(err.contains(&format!("[paths].{key}_dir")), "{err}");
         }
 
+        // A test title naming a file, from the variable or the file.
+        let err = Config::resolve(
+            FilePaths::default(),
+            None,
+            with("VICTORY_TEST_TITLES", exe.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("the test title") && err.contains("(from VICTORY_TEST_TITLES) is a file"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("perhaps {}", parent.display())),
+            "{err}"
+        );
+        let titles = FilePaths {
+            test_titles: vec![parent.clone(), exe.clone()],
+            ..FilePaths::default()
+        };
+        let err = Config::resolve(titles, None, with("VICTORY_GAME_DIR", parent.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("(from config file) is a file") && err.contains("[paths].test_titles"),
+            "{err}"
+        );
+
         // The folder itself, and a folder that does not exist yet, are fine.
+        assert!(
+            Config::resolve(
+                FilePaths::default(),
+                None,
+                with("VICTORY_TEST_TITLES", parent.clone())
+            )
+            .is_ok()
+        );
         assert!(
             Config::resolve(FilePaths::default(), None, with("VICTORY_GAME_DIR", parent)).is_ok()
         );
