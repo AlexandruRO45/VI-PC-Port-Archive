@@ -171,11 +171,20 @@ fn build_valu_cs_with_stores(body: &[u32], stores: &[[u32; 2]]) -> HostShader {
         root_srvs: lowered.root_srvs,
     };
 
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        let mut copy = shader.dxil.clone();
-        let ours = copy[4..20].to_vec();
-        v.validate(&mut copy).expect("DXIL validation failed");
-        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    let validator_path = validator::Validator::default_path();
+    match validator::Validator::load(validator_path.as_deref()) {
+        Ok(mut v) => {
+            let mut copy = shader.dxil.clone();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy).expect("DXIL validation failed");
+            assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+        }
+        Err(error) if std::env::var_os("VICTORY_REQUIRE_DXIL_VALIDATOR").is_some() => {
+            panic!(
+                "DXIL validator is required while VICTORY_REQUIRE_DXIL_VALIDATOR=1: {error}"
+            );
+        }
+        Err(error) => eprintln!("no DXIL validator; validation skipped: {error}"),
     }
 
     shader
@@ -190,6 +199,19 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
+/// Checks the emitted SFI0 declares the DXIL NativeLowPrecision feature.
+fn assert_native_low_precision(shader: &HostShader) {
+    let container = crate::dxbc::Container::parse(&shader.dxil).expect("DXIL container");
+    let sfi0 = container
+        .part(crate::dxbc::FourCC::SFI0)
+        .expect("SFI0 feature flags");
+    let flags = u64::from_le_bytes(sfi0.data.try_into().expect("eight-byte SFI0"));
+    assert_ne!(
+        flags & (1 << 18),
+        0,
+        "SFI0 must declare NativeLowPrecision for rawBufferStore.i16"
+    );
+}
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
@@ -969,6 +991,7 @@ fn buffer_store_short_preserves_the_adjacent_high_halfword() {
         buffer_store_short(2, 8, 0, false),
     ];
     let shader = build_valu_cs_with_stores(&[], &stores);
+    assert_native_low_precision(&shader);
     let cases = &[
         [0xaabb_ccdd, 0x1234_5678, 0, 0],
         [0xfedc_ba98, 0xdead_beef, 0, 0],
@@ -992,6 +1015,7 @@ fn buffer_store_short_d16_hi_preserves_the_adjacent_low_halfword() {
         buffer_store_short(2, 8, 2, true),
     ];
     let shader = build_valu_cs_with_stores(&[], &stores);
+    assert_native_low_precision(&shader);
     let cases = &[
         [0xaabb_ccdd, 0x1234_5678, 0, 0],
         [0xfedc_ba98, 0xdead_beef, 0, 0],
