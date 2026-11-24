@@ -206,6 +206,12 @@ pub fn use_console_timers() {
     }
 }
 
+/// Persist graphics cache metadata after normal title termination.
+#[cfg(windows)]
+pub fn flush_graphics_cache() {
+    victory_gpu::pipeline::save_pipeline_cache();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,11 +229,4 @@ mod tests {
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
     }
-}
-
-
-/// Persist graphics cache metadata after normal title termination.
-#[cfg(windows)]
-pub fn flush_graphics_cache() {
-    victory_gpu::pipeline::save_pipeline_cache();
 }

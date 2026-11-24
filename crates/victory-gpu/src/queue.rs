@@ -268,6 +268,8 @@ extern "system" fn execute(
         return;
     }
 
+    // SAFETY: the queue ABI requires count readable list pointers for this call;
+    // the null and zero-count cases were handled above.
     let lists=unsafe{
         std::slice::from_raw_parts(lists,count as usize)
     };
@@ -494,9 +496,11 @@ extern "system" fn present(
     _extra:*const u8
 )->HRESULT {
     let resource=if planes>0 && !parameters.is_null() {
+        // SAFETY: the present ABI supplies at least one readable Plane here.
         let plane=unsafe{&*parameters};
 
         if plane.count>0 && !plane.resources.is_null() {
+            // SAFETY: the plane ABI supplies count readable resource pointers.
             let resource=unsafe{*plane.resources};
 
             if resource.is_null() {
@@ -663,6 +667,8 @@ extern "system" fn copy_page_mappings(
     let mut owned=Vec::new();
 
     if count>0 {
+        // SAFETY: the mapping ABI supplies count readable PageBatch values;
+        // batches is non-null when count is positive.
         for batch in unsafe{
             std::slice::from_raw_parts(
                 batches,count as usize
@@ -672,6 +678,7 @@ extern "system" fn copy_page_mappings(
                 continue;
             }
 
+            // SAFETY: each batch supplies count readable ranges, copied before return.
             let ranges=unsafe{
                 std::slice::from_raw_parts(
                     batch.ranges,batch.count as usize

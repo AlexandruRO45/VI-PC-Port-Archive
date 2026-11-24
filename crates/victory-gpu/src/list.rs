@@ -156,6 +156,7 @@ impl PendingList {
     pub(crate) fn new(this:This)->Self {
         object::add_ref(this);
 
+        // SAFETY: the queue ABI supplies a live List, and the reference above retains it.
         let list=unsafe{&*this.cast::<List>()};
 
         list.pending_submissions.fetch_add(
@@ -172,6 +173,7 @@ impl PendingList {
 
 impl Drop for PendingList {
     fn drop(&mut self) {
+        // SAFETY: PendingList owns a reference until release_boxed below.
         let list=unsafe{&*self.this().cast::<List>()};
 
         list.pending_submissions.fetch_sub(
@@ -299,6 +301,7 @@ extern "system" fn close(this: This) -> HRESULT {
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
+    // SAFETY: reset is called through the vtable of a live List.
     let list=unsafe{&*this.cast::<List>()};
 
     if list.pending_submissions.load(

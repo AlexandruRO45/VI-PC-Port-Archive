@@ -343,11 +343,10 @@ mod systems_fence_conformance {
         assert_eq!(signal(f,5), S_OK);
 
         for rx in &receivers[..2] {
-            assert_eq!(
+            assert!(
                 rx.recv_timeout(
                     Duration::from_secs(3)
-                ).unwrap(),
-                true
+                ).unwrap()
             );
         }
 
@@ -364,11 +363,10 @@ mod systems_fence_conformance {
 
         assert_eq!(signal(f,9), S_OK);
 
-        assert_eq!(
+        assert!(
             receivers[2].recv_timeout(
                 Duration::from_secs(3)
-            ).unwrap(),
-            true
+            ).unwrap()
         );
 
         assert!(matches!(
@@ -382,11 +380,10 @@ mod systems_fence_conformance {
 
         assert_eq!(signal(f,12), S_OK);
 
-        assert_eq!(
+        assert!(
             receivers[3].recv_timeout(
                 Duration::from_secs(3)
-            ).unwrap(),
-            true
+            ).unwrap()
         );
 
         for worker in workers {
@@ -489,11 +486,10 @@ mod systems_fence_sticky {
                 assert_eq!(signal(f,0),S_OK);
             }
 
-            assert_eq!(
+            assert!(
                 rx.recv_timeout(
                     Duration::from_secs(3)
-                ).unwrap(),
-                true
+                ).unwrap()
             );
 
             worker.join().unwrap();

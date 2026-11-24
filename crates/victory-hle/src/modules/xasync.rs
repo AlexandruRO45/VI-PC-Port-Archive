@@ -364,13 +364,15 @@ pub struct Queue {
 }
 
 
+type TimerEntries = std::collections::BTreeMap<
+    (std::time::Instant, u64),
+    (Arc<Queue>, u64, u32),
+>;
+
 // Shared scheduler for delayed callbacks.
 // It holds no queue lock while delivering callbacks.
 struct SharedTimer {
-    entries: Mutex<std::collections::BTreeMap<
-        (std::time::Instant,u64),
-        (Arc<Queue>,u64,u32)
-    >>,
+    entries: Mutex<TimerEntries>,
     changed: Condvar,
     sequence: AtomicU64,
 }
@@ -669,6 +671,7 @@ impl Queue {
         let monitors = lock(&self.monitors).clone();
 
         for (_, context, callback) in monitors {
+            // SAFETY: The address was stored from a MonitorCallback during registration.
             let callback: MonitorCallback = unsafe {
                 std::mem::transmute(callback)
             };
@@ -955,7 +958,6 @@ pub fn XTaskQueueSubmitDelayedCallback(
 
 /// Cancels what is still queued (callbacks see `canceled`), refuses new
 /// work, then calls `callback`.
-
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
     wait: bool,
@@ -1949,6 +1951,7 @@ mod systems_hle_critical {
         context: *mut c_void,
         canceled: bool
     ) {
+        // SAFETY: The test passes a leaked Counts allocation as the callback context.
         let c = unsafe {
             &*context.cast::<Counts>()
         };
@@ -1963,6 +1966,7 @@ mod systems_hle_critical {
     extern "system" fn terminated(
         context: *mut c_void
     ) {
+        // SAFETY: The termination context is the same leaked Counts allocation.
         let c = unsafe {
             &*context.cast::<Counts>()
         };
@@ -2198,6 +2202,7 @@ mod systems_hle_critical {
         context:*mut c_void,
         _canceled:bool
     ) {
+        // SAFETY: The test supplies a leaked Running allocation to this callback.
         let state = unsafe {
             &*context.cast::<Running>()
         };
@@ -2430,8 +2435,10 @@ mod systems_hle_critical {
         op:u32,
         data:*const ProviderData
     ) -> HRESULT {
+        // SAFETY: The runtime supplies valid ProviderData for the duration of this call.
         let data=unsafe { &*data };
 
+        // SAFETY: XAsyncBegin receives the leaked AsyncCounters allocation as context.
         let c=unsafe {
             &*data.context.cast::<AsyncCounters>()
         };
@@ -2450,6 +2457,7 @@ mod systems_hle_critical {
     extern "system" fn completed(
         b:*mut AsyncBlock
     ) {
+        // SAFETY: The test keeps its AsyncBlock alive through dispatch; its context is leaked.
         let c=unsafe {
             &*(*b).context.cast::<AsyncCounters>()
         };
@@ -2594,6 +2602,7 @@ mod systems_upstream_review {
         context:*mut c_void,
         _canceled:bool
     ) {
+        // SAFETY: The test context points to a leaked State allocation.
         let s=unsafe {
             &*context.cast::<State>()
         };
@@ -2611,6 +2620,7 @@ mod systems_upstream_review {
     extern "system" fn on_terminated(
         context:*mut c_void
     ) {
+        // SAFETY: The termination callback receives the same leaked State allocation.
         let s=unsafe {
             &*context.cast::<State>()
         };
@@ -2849,6 +2859,7 @@ mod systems_upstream_review {
         context:*mut c_void,
         canceled:bool
     ) {
+        // SAFETY: Counter::new leaks the allocation used as this callback context.
         let c=unsafe {
             &*context.cast::<Counter>()
         };
@@ -3000,6 +3011,7 @@ mod systems_unified_stress {
         context:*mut c_void,
         _canceled:bool
     ) {
+        // SAFETY: Item::new leaks each test item passed to this callback.
         let item=unsafe {
             &*context.cast::<Item>()
         };
@@ -3043,9 +3055,9 @@ mod systems_unified_stress {
             (0..136).map(|_|Item::new()).collect();
 
         // Ensure a nonzero number of accepted tasks.
-        for i in 0..8 {
+        for (i, &item) in items[..8].iter().enumerate() {
             submit(
-                q,items[i],
+                q,item,
                 (i%2) as u32,
                 100
             );
@@ -3312,6 +3324,7 @@ mod systems_affinity {
         context:*mut c_void,
         canceled:bool
     ) {
+        // SAFETY: The work callback receives the leaked Manual test state.
         let s=unsafe {
             &*context.cast::<Manual>()
         };
@@ -3328,6 +3341,7 @@ mod systems_affinity {
         context:*mut c_void,
         canceled:bool
     ) {
+        // SAFETY: The completion callback receives the leaked Manual test state.
         let s=unsafe {
             &*context.cast::<Manual>()
         };
@@ -3346,6 +3360,7 @@ mod systems_affinity {
     extern "system" fn notify(
         context:*mut c_void
     ) {
+        // SAFETY: The notification context is the leaked Manual test state.
         let s=unsafe {
             &*context.cast::<Manual>()
         };
@@ -3468,6 +3483,7 @@ mod systems_affinity {
         context:*mut c_void,
         canceled:bool
     ) {
+        // SAFETY: The test supplies a leaked Serial allocation as callback context.
         let s=unsafe {
             &*context.cast::<Serial>()
         };
@@ -3490,6 +3506,7 @@ mod systems_affinity {
         context:*mut c_void,
         canceled:bool
     ) {
+        // SAFETY: The cancellation callback uses the same leaked Serial allocation.
         let s=unsafe {
             &*context.cast::<Serial>()
         };
@@ -3504,6 +3521,7 @@ mod systems_affinity {
     extern "system" fn serialized_notify(
         context:*mut c_void
     ) {
+        // SAFETY: The notification callback uses the leaked Serial allocation.
         let s=unsafe {
             &*context.cast::<Serial>()
         };
@@ -3606,6 +3624,7 @@ mod systems_affinity {
     extern "system" fn reentrant_notify(
         context:*mut c_void
     ) {
+        // SAFETY: The reentrant notification uses a leaked Reentrant allocation.
         let s=unsafe {
             &*context.cast::<Reentrant>()
         };
@@ -3623,6 +3642,7 @@ mod systems_affinity {
         context:*mut c_void,
         canceled:bool
     ) {
+        // SAFETY: The reentrant work callback uses a leaked Reentrant allocation.
         let s=unsafe {
             &*context.cast::<Reentrant>()
         };
@@ -3749,6 +3769,7 @@ mod systems_shared_timer {
     }
 
     fn thread_count()->usize {
+        // SAFETY: The snapshot handle is checked; ThreadEntry has C layout and its size is initialized. The handle is closed after enumeration.
         unsafe {
             let snapshot=
                 CreateToolhelp32Snapshot(4,0);
@@ -3823,6 +3844,7 @@ mod systems_shared_timer {
         context:*mut c_void,
         canceled:bool
     ) {
+        // SAFETY: Hits::new leaks the allocation used as the callback context.
         let s=unsafe {
             &*context.cast::<Hits>()
         };
@@ -4112,6 +4134,7 @@ mod systems_shared_timer {
         extern "system" fn blocked(
             ctx:*mut c_void,_:bool
         ) {
+            // SAFETY: The test leaks the Gate allocation before registering this callback.
             let gate=unsafe{&*ctx.cast::<Gate>()};
             gate.entered.store(true,SEQ);
 
