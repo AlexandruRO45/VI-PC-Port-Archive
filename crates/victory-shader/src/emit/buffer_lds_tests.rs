@@ -729,3 +729,105 @@ fn typed_offsets_refused_inside_an_element_or_of_unknown_size() {
     // Offset 0 needs no element size.
     build_typed(&load(0), 0, ResourceType::Srv).expect("offset 0");
 }
+
+const BUFFER_STORE_FORMAT_X: u8 = 0x04;
+const BUFFER_STORE_FORMAT_XY: u8 = 0x05;
+const BUFFER_STORE_FORMAT_XYZ: u8 = 0x06;
+const BUFFER_STORE_FORMAT_D16_XY: u8 = 0x85;
+/// The halves 1.0 (low) and 5.0 (high).
+const D16_PAIR: u32 = 0x4500_3C00;
+
+/// 32 lanes store some channels of elements 4t.. of the typed view at
+/// entry 1: x of 4t, xy of 4t + 1, xyz of 4t + 2 (even lanes only, by EXEC
+/// alone), and two halves of 4t + 3.
+fn partial_store_program(size: u32) -> Vec<u32> {
+    let mut w = prologue();
+    w.push(vop1(V_CVT_F32_U32, 20, v(0)));
+    w.push(vop2(V_ADD_F32, 21, HALF, 20));
+    w.push(vop2(V_MUL_F32, 22, TWO, 20));
+    w.extend(mov_lit(24, D16_PAIR));
+    w.push(vop2(V_LSHLREV_B32, 1, int(2), 0));
+    let s = size as u16;
+    w.extend(mubuf(
+        BUFFER_STORE_FORMAT_X,
+        20,
+        1,
+        12,
+        0x80,
+        0,
+        false,
+        true,
+    ));
+    w.extend(mubuf(
+        BUFFER_STORE_FORMAT_XY,
+        20,
+        1,
+        12,
+        0x80,
+        s,
+        false,
+        true,
+    ));
+    w.extend(mubuf(
+        BUFFER_STORE_FORMAT_D16_XY,
+        24,
+        1,
+        12,
+        0x80,
+        3 * s,
+        false,
+        true,
+    ));
+    w.push(vop2(V_AND_B32, 10, int(1), 0));
+    w.push(0x7D84_0000 | 10 << 9 | int(0) as u32); // v_cmp_eq_u32 vcc_lo, 0, v10
+    w.push(0xBE80_3C00 | 20 << 16 | VCC_LO as u32); // s_and_saveexec_b32 s20, vcc_lo
+    w.extend(mubuf(
+        BUFFER_STORE_FORMAT_XYZ,
+        20,
+        1,
+        12,
+        0x80,
+        2 * s,
+        false,
+        true,
+    ));
+    w.push(0x8800_0000 | (EXEC_LO as u32) << 16 | 20 << 8 | EXEC_LO as u32); // s_or_b32 exec_lo, exec_lo, s20
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn typed_stores_of_some_channels_keep_the_others() {
+    for (format, size, data) in typed_formats(128) {
+        let shader = build_typed(&partial_store_program(size), size, ResourceType::Uav)
+            .unwrap_or_else(|e| panic!("{size}-byte elements: {e}"));
+        let views = [
+            View::RawUav(1),
+            View::FormatUav {
+                data: &data,
+                format,
+                bytes: size,
+            },
+        ];
+        for (label, uavs) in run(&shader, &views, &[]) {
+            for e in 0..128u32 {
+                let t = (e / 4) as f32;
+                let given: &[f32] = match e % 4 {
+                    0 => &[t],
+                    1 => &[t, t + 0.5],
+                    2 if e / 4 % 2 == 0 => &[t, t + 0.5, 2.0 * t],
+                    2 => &[],
+                    _ => &[1.0, 5.0],
+                };
+                for c in 0..4 {
+                    let want = given.get(c as usize).copied().unwrap_or(channel(e, c));
+                    let got = typed_channel(&uavs[1], size, e, c);
+                    assert_eq!(
+                        got, want,
+                        "{label}, {size}-byte elements: element {e} channel {c}"
+                    );
+                }
+            }
+        }
+    }
+}

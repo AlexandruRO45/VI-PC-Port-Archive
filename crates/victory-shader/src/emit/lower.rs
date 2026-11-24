@@ -9706,18 +9706,26 @@ impl<'a> Lower<'a> {
             // Where the write starts in the view, and how many bytes it may
             // cover (for its marks).
             let (byte, bytes);
+            // A typed store of fewer than four channels: the element to
+            // load the others from.
+            let mut merge = None;
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
-                if count != 4 {
-                    return Err("a typed buffer store of some channels");
-                }
                 let h = typed_h.ok_or("a typed buffer store")?;
                 let element = self.typed_element(index, off, fixed, used)?;
                 args.push(h);
                 args.extend([element, iu]);
                 for x in vals {
                     args.push(self.as_float(x));
+                }
+                if count < 4 {
+                    // DXIL typed stores write all four channels; the console
+                    // writes those it is given. shortcut: the others are
+                    // taken to keep what memory holds (they are loaded and
+                    // stored back, converted through floats: exact for float
+                    // and unorm formats, and not atomic with other lanes'
+                    // stores to the same element).
+                    self.s.flags |= flags::TYPED_UAV_LOADS;
+                    merge = Some((h, element));
                 }
                 // The element's size is the view's stride (16 bytes at most).
                 (byte, bytes) = match self.s.view_index.get(&h).copied() {
@@ -9758,6 +9766,20 @@ impl<'a> Lower<'a> {
                 args.push(self.s.m.i32(4));
             }
             let at = self.begin_guarded(guard);
+            if let Some((h, e)) = merge {
+                let r = self.s.op(
+                    self.cur,
+                    "bufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    68,
+                    &[h, e, iu],
+                );
+                for k in count..4 {
+                    let x = self.s.m.extract(self.cur, r, k);
+                    args.insert(3 + k as usize, x);
+                }
+            }
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.mark_view_write(args[0], byte, bytes, None);
