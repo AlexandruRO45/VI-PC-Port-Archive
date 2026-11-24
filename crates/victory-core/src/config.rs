@@ -2567,6 +2567,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_config_that_is_a_socket_or_a_link_to_one_is_refused_without_opening_it() {
+        // A socket left by an editor or a language server where victory.toml
+        // should be: the kind is checked before anything is read, so the
+        // error says what it is rather than "No such device or address", and
+        // nothing blocks on a peer. Scratch folder under the system temp
+        // folder, removed when dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let default = dir.path().join("victory.toml");
+        let _listener = std::os::unix::net::UnixListener::bind(&default).unwrap();
+
+        let err = config_file_or(None, &default).unwrap_err().to_string();
+        assert!(
+            err.starts_with(&format!("the config file {}", default.display())),
+            "{err}"
+        );
+        assert!(err.ends_with("which is not a regular file"), "{err}");
+        let err = config_file(Some(default.clone())).unwrap_err().to_string();
+        assert!(err.starts_with("VICTORY_CONFIG points at"), "{err}");
+        assert!(err.ends_with("which is not a regular file"), "{err}");
+
+        // A link to the socket is checked where it leads, and the error names
+        // the link as written.
+        let link = dir.path().join("linked.toml");
+        std::os::unix::fs::symlink(&default, &link).unwrap();
+        let err = config_file_or(None, &link).unwrap_err().to_string();
+        assert!(err.contains(&link.display().to_string()), "{err}");
+        assert!(err.ends_with("which is not a regular file"), "{err}");
+
+        // A trailing slash on the socket is "Not a directory" from the OS,
+        // reported with the path, not passed over as a missing file.
+        let slashed = PathBuf::from(format!("{}/", default.display()));
+        let err = config_file(Some(slashed)).unwrap_err();
+        assert!(
+            err.to_string().contains(&default.display().to_string()),
+            "{err}"
+        );
+        assert!(!err.to_string().contains("does not exist"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn victory_config_with_a_trailing_slash_names_the_file_or_the_link() {
         // A scratch folder under the system temp folder, never the
         // repository or the working directory; removed at the end.
