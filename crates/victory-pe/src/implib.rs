@@ -342,6 +342,27 @@ mod tests {
         assert_eq!(lib.other_members, 1);
     }
 
+    #[test]
+    fn import_aliases_are_deduplicated_by_the_resolved_export() {
+        let lib = ImportLibrary::parse(&archive(&[
+            short_import("a.dll", "Open", 9, CODE, BY_NAME),
+            short_import("a.dll", "_Open", 7, CODE, NO_PREFIX),
+            short_import("a.dll", "_Open@8", 3, CODE, UNDECORATE),
+            export_as_import("a.dll", "OpenAlias", "Open"),
+            // The same public symbol can also refer to a different DLL export.
+            export_as_import("a.dll", "OpenAlias", "OpenEx"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            lib.imports,
+            [
+                name("a.dll", "Open", LibImportKind::Code),
+                name("a.dll", "OpenEx", LibImportKind::Code),
+            ]
+        );
+        assert_eq!(lib.other_members, 0);
+    }
+
     /// Import type 3 and name types 5 to 7 are not defined. Such members
     /// are counted, and the members around them are still read.
     #[test]
