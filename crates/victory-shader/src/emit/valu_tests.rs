@@ -16,7 +16,12 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// SOP1 `s_mov_b32 sdst, src0`.
 const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
-    0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32
+    sop1(0x03, sdst, src0)
+}
+
+/// SOP1 `op sdst, src0`.
+const fn sop1(op: u8, sdst: u8, src0: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32 & 0x7F) << 16 | (op as u32) << 8 | src0 as u32
 }
 
 /// SOP2 `op sdst, src0, src1`.
@@ -936,4 +941,187 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+#[test]
+fn scalar_bitops_zero_rev_and_64bit_match_rdna2_without_int64() {
+    let assert_no_int64 = |shader: &HostShader, label: &str| {
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        let flags = u64::from_le_bytes(features.data.try_into().unwrap());
+        assert_eq!(flags & 0x8000, 0, "{label} must not require INT64");
+    };
+
+    // s_bcnt0_i32_b32 (SOP1 0x0d) + SCC check.
+    let bcnt0_32 = build_valu_cs(&[sop1(0x0d, 6, 0), vop1(0x001, 0, sgpr(6))]);
+    let bcnt0_32_scc = build_valu_cs(&[
+        sop1(0x0d, 6, 0),
+        sop2(0x0a, 7, 0x81, 0x80),
+        vop1(0x001, 0, sgpr(7)),
+    ]);
+    let bcnt0_32_cases = [
+        ([0x0000_0000, 0, 0, 0], 32, 1),
+        ([0xffff_ffff, 0, 0, 0], 0, 0),
+        ([0xf0f0_55aa, 0, 0, 0], 16, 1),
+    ];
+    let bcnt0_32_in = bcnt0_32_cases.map(|c| c.0);
+    run_cases(&bcnt0_32, &bcnt0_32_in, |backend, i, _, got| {
+        assert_eq!(got, bcnt0_32_cases[i].1, "{backend}: s_bcnt0_i32_b32[{i}]");
+    });
+    run_cases(&bcnt0_32_scc, &bcnt0_32_in, |backend, i, _, got| {
+        assert_eq!(got, bcnt0_32_cases[i].2, "{backend}: s_bcnt0_i32_b32 SCC[{i}]");
+    });
+
+    // s_bcnt0_i32_b64 (SOP1 0x0e) + SCC check.
+    let bcnt0_64 = build_valu_cs(&[sop1(0x0e, 6, 0), vop1(0x001, 0, sgpr(6))]);
+    let bcnt0_64_scc = build_valu_cs(&[
+        sop1(0x0e, 6, 0),
+        sop2(0x0a, 7, 0x81, 0x80),
+        vop1(0x001, 0, sgpr(7)),
+    ]);
+    assert_no_int64(&bcnt0_64, "s_bcnt0_i32_b64");
+    let bcnt0_64_cases = [
+        ([0, 0, 0, 0], 64, 1),
+        ([u32::MAX, u32::MAX, 0, 0], 0, 0),
+        ([u32::MAX, 0xffff_fffe, 0, 0], 1, 1),
+        ([0x5555_5555, 0x0000_ffff, 0, 0], 32, 1),
+    ];
+    let bcnt0_64_in = bcnt0_64_cases.map(|c| c.0);
+    run_cases(&bcnt0_64, &bcnt0_64_in, |backend, i, _, got| {
+        assert_eq!(got, bcnt0_64_cases[i].1, "{backend}: s_bcnt0_i32_b64[{i}]");
+    });
+    run_cases(&bcnt0_64_scc, &bcnt0_64_in, |backend, i, _, got| {
+        assert_eq!(got, bcnt0_64_cases[i].2, "{backend}: s_bcnt0_i32_b64 SCC[{i}]");
+    });
+
+    // s_ff0_i32_b32 (SOP1 0x11) and s_ff0_i32_b64 (SOP1 0x12).
+    let ff0_32 = build_valu_cs(&[sop1(0x11, 6, 0), vop1(0x001, 0, sgpr(6))]);
+    let ff0_32_cases = [
+        ([u32::MAX, 0, 0, 0], u32::MAX),
+        ([0x0000_0000, 0, 0, 0], 0),
+        ([0x7fff_ffff, 0, 0, 0], 31),
+        ([0xffff_ff0f, 0, 0, 0], 4),
+    ];
+    run_cases(&ff0_32, &ff0_32_cases.map(|c| c.0), |backend, i, _, got| {
+        assert_eq!(got, ff0_32_cases[i].1, "{backend}: s_ff0_i32_b32[{i}]");
+    });
+
+    let ff0_64 = build_valu_cs(&[sop1(0x12, 6, 0), vop1(0x001, 0, sgpr(6))]);
+    assert_no_int64(&ff0_64, "s_ff0_i32_b64");
+    let ff0_64_cases = [
+        ([u32::MAX, u32::MAX, 0, 0], u32::MAX),
+        ([u32::MAX, 0x7fff_ffff, 0, 0], 63),
+        ([u32::MAX, 0xffff_fffe, 0, 0], 32),
+        ([0xffff_fff7, 0, 0, 0], 3),
+    ];
+    run_cases(&ff0_64, &ff0_64_cases.map(|c| c.0), |backend, i, _, got| {
+        assert_eq!(got, ff0_64_cases[i].1, "{backend}: s_ff0_i32_b64[{i}]");
+    });
+
+    // s_flbit_i32_b64 (SOP1 0x16) and s_flbit_i32_i64 (SOP1 0x18).
+    let flbit_b64 = build_valu_cs(&[sop1(0x16, 6, 0), vop1(0x001, 0, sgpr(6))]);
+    assert_no_int64(&flbit_b64, "s_flbit_i32_b64");
+    let flbit_b64_cases = [
+        ([0, 0, 0, 0], u32::MAX),
+        ([0, 0x8000_0000, 0, 0], 0),
+        ([0, 0x0000_0001, 0, 0], 31),
+        ([0x8000_0000, 0, 0, 0], 32),
+        ([0x0000_0001, 0, 0, 0], 63),
+    ];
+    run_cases(&flbit_b64, &flbit_b64_cases.map(|c| c.0), |backend, i, _, got| {
+        assert_eq!(got, flbit_b64_cases[i].1, "{backend}: s_flbit_i32_b64[{i}]");
+    });
+
+    let flbit_i64 = build_valu_cs(&[sop1(0x18, 6, 0), vop1(0x001, 0, sgpr(6))]);
+    assert_no_int64(&flbit_i64, "s_flbit_i32_i64");
+    let flbit_i64_cases = [
+        ([0, 0, 0, 0], u32::MAX),
+        ([u32::MAX, u32::MAX, 0, 0], u32::MAX),
+        ([0, 0x8000_0000, 0, 0], 1),
+        ([u32::MAX, 0x7fff_ffff, 0, 0], 1),
+        ([0x8000_0000, 0, 0, 0], 32),
+        ([0x7fff_ffff, u32::MAX, 0, 0], 32),
+        ([0x0000_0001, 0, 0, 0], 63),
+        ([0xffff_fffe, u32::MAX, 0, 0], 63),
+    ];
+    run_cases(&flbit_i64, &flbit_i64_cases.map(|c| c.0), |backend, i, _, got| {
+        assert_eq!(got, flbit_i64_cases[i].1, "{backend}: s_flbit_i32_i64[{i}]");
+    });
+
+    // s_brev_b64 (SOP1 0x0c): reverses all 64 bits across the dword pair.
+    for (reg, label) in [(6u8, "lo"), (7u8, "hi")] {
+        let brev64 = build_valu_cs(&[sop1(0x0c, 6, 0), vop1(0x001, 0, sgpr(reg))]);
+        assert_no_int64(&brev64, "s_brev_b64");
+        let lo_in = 0x1234_5678u32;
+        let hi_in = 0x8000_0001u32;
+        let want = if reg == 6 {
+            hi_in.reverse_bits()
+        } else {
+            lo_in.reverse_bits()
+        };
+        run_cases(&brev64, &[[lo_in, hi_in, 0, 0]], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: s_brev_b64 ({label})");
+        });
+    }
+
+    // s_bitset0_b64 (SOP1 0x1c) and s_bitset1_b64 (SOP1 0x1e).
+    for (op, name, set) in [(0x1cu8, "s_bitset0_b64", false), (0x1eu8, "s_bitset1_b64", true)] {
+        for (reg, label) in [(6u8, "lo"), (7u8, "hi")] {
+            let shader = build_valu_cs(&[
+                s_mov_b32(6, 0),
+                s_mov_b32(7, 1),
+                sop1(op, 6, 2),
+                vop1(0x001, 0, sgpr(reg)),
+            ]);
+            assert_no_int64(&shader, name);
+            let cases = [
+                [0x1234_5678u32, 0x9abc_def0, 0, 0],
+                [0x1234_5678, 0x9abc_def0, 31, 0],
+                [0x1234_5678, 0x9abc_def0, 32, 0],
+                [0x1234_5678, 0x9abc_def0, 63, 0],
+                [0x1234_5678, 0x9abc_def0, 64 + 5, 0], // bit index masks to [5:0]
+            ];
+            run_cases(&shader, &cases, |backend, i, inp, got| {
+                let mut val = u64::from(inp[0]) | (u64::from(inp[1]) << 32);
+                let bit = 1u64 << (inp[2] & 63);
+                if set {
+                    val |= bit;
+                } else {
+                    val &= !bit;
+                }
+                let want = if reg == 6 { val as u32 } else { (val >> 32) as u32 };
+                assert_eq!(got, want, "{backend}: {name} ({label}) case {i}");
+            });
+        }
+    }
+
+    // s_bitreplicate_b64_b32 (SOP1 0x3b).
+    for (reg, label) in [(6u8, "lo"), (7u8, "hi")] {
+        let shader = build_valu_cs(&[sop1(0x3b, 6, 0), vop1(0x001, 0, sgpr(reg))]);
+        assert_no_int64(&shader, "s_bitreplicate_b64_b32");
+        let inputs = [
+            [0x0000_0000, 0, 0, 0],
+            [0xffff_ffff, 0, 0, 0],
+            [0x8000_0001, 0, 0, 0],
+            [0x55aa_0f3c, 0, 0, 0],
+        ];
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let mut want64 = 0u64;
+            for b in 0..32u32 {
+                if (inp[0] >> b) & 1 != 0 {
+                    want64 |= 3u64 << (2 * b);
+                }
+            }
+            let want = if reg == 6 {
+                want64 as u32
+            } else {
+                (want64 >> 32) as u32
+            };
+            assert_eq!(
+                got, want,
+                "{backend}: s_bitreplicate_b64_b32 ({label}) case {i} ({:#010x})",
+                inp[0],
+            );
+        });
+    }
 }
