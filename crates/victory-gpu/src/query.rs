@@ -337,6 +337,8 @@ mod tests {
         let heap = heap(HEAP_OCCLUSION, 3);
         let this = (&raw const *heap).cast_mut().cast();
         let list = gpu.new_list().unwrap();
+        // Only what the queries record counts (debug builds).
+        let _ = gpu.log_messages();
         // Nothing drawn: the host counts no samples.
         begin(&list, this, OCCLUSION, 0);
         end(&list, this, OCCLUSION, 0);
@@ -395,6 +397,8 @@ mod tests {
         let heap = heap(HEAP_OCCLUSION, 2);
         let this = (&raw const *heap).cast_mut().cast();
         let list = gpu.new_list().unwrap();
+        // Only what the queries record counts (debug builds).
+        let _ = gpu.log_messages();
         let mut results = [0u64; 2];
         let dst = results.as_mut_ptr().cast::<u8>();
         assert!(!resolve(
@@ -431,6 +435,8 @@ mod tests {
         let heap = heap(HEAP_TIMESTAMP, 2);
         let this = (&raw const *heap).cast_mut().cast();
         let list = gpu.new_list().unwrap();
+        // Only what the queries record counts (debug builds).
+        let _ = gpu.log_messages();
         end(&list, this, TIMESTAMP, 0);
         end(&list, this, TIMESTAMP, 1);
         let mut results = [0u64; 3];
