@@ -3834,10 +3834,19 @@ mod tests {
     /// As [`reading`], with each read's (kind, root type, table offset,
     /// user data, slot) stated in full.
     fn reading_named(reads: &[Read]) -> Result<Vec<NativeProgram>, ShaderError> {
+        reading_with(&[(3, 1, 4, 2), (1, 2, 6, 3)], reads)
+    }
+
+    /// As [`reading_named`], over these (root type, SGPRs, user data, slot)
+    /// parameters instead of a table in s4 and a root descriptor in s6.
+    fn reading_with(
+        params: &[(u32, u32, u8, u8)],
+        reads: &[Read],
+    ) -> Result<Vec<NativeProgram>, ShaderError> {
         let mut blob = fssm(&[(HwStage::Ps, &PS_CODE)]);
         let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Ps)).unwrap() as usize;
         let tables = (blob.len() - FSSM_HEADER) as u64;
-        for (root, sgprs, user_data, slot) in [(3u32, 1u32, 4u8, 2u8), (1, 2, 6, 3)] {
+        for &(root, sgprs, user_data, slot) in params {
             for v in [root, 0, sgprs, 0] {
                 blob.extend_from_slice(&v.to_le_bytes());
             }
@@ -3853,9 +3862,9 @@ mod tests {
         let payload = (blob.len() - FSSM_HEADER) as u64;
         blob[8..16].copy_from_slice(&payload.to_le_bytes());
         blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&tables.to_le_bytes());
-        let used = tables + 2 * ENTRY_SIZE;
+        let used = tables + params.len() as u64 * ENTRY_SIZE;
         blob[record + RECORD_USED..][..8].copy_from_slice(&used.to_le_bytes());
-        blob[record + RECORD_COUNTS..][..4].copy_from_slice(&2u32.to_le_bytes());
+        blob[record + RECORD_COUNTS..][..4].copy_from_slice(&(params.len() as u32).to_le_bytes());
         blob[record + RECORD_COUNTS + 4..][..4]
             .copy_from_slice(&(reads.len() as u32).to_le_bytes());
         native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
@@ -3915,6 +3924,50 @@ mod tests {
                 "{reads:?}"
             );
         }
+    }
+
+    #[test]
+    fn separate_root_tables_are_separate_descriptors_and_heaps() {
+        let (srv, sampler, uav) = (0u8, 1u8, 3u8);
+        let table = 3u8;
+        // Tables in s4 (slot 2) and s5 (slot 3): one may hold samplers and
+        // the other views, and the same offset in each may be read as a
+        // different kind, as they are different descriptors.
+        let two = [(3, 1, 4, 2), (3, 1, 5, 3)];
+        assert!(reading_with(&two, &[(sampler, table, 0, 4, 2), (srv, table, 0, 5, 3)]).is_ok());
+        assert!(reading_with(&two, &[(srv, table, 8, 4, 2), (uav, table, 8, 5, 3)]).is_ok());
+        // Two tables stating one slot from different SGPRs are still two:
+        // each read names its table by both.
+        let one_slot = [(3, 1, 4, 2), (3, 1, 5, 2)];
+        assert!(
+            reading_with(
+                &one_slot,
+                &[(sampler, table, 0, 4, 2), (srv, table, 0, 5, 2)]
+            )
+            .is_ok()
+        );
+        // Two ranges of one table are one table: they share its heap and
+        // its descriptors.
+        let ranges = [(3, 1, 4, 2), (3, 1, 4, 2)];
+        assert_eq!(
+            why_refused(reading_with(
+                &ranges,
+                &[(sampler, table, 0, 4, 2), (srv, table, 8, 4, 2)]
+            )),
+            "root table mixes samplers and views"
+        );
+        assert_eq!(
+            why_refused(reading_with(
+                &ranges,
+                &[(srv, table, 8, 4, 2), (uav, table, 8, 4, 2)]
+            )),
+            "used descriptors read one descriptor two ways"
+        );
+        // A read naming one table's SGPR with the other's slot names neither.
+        assert_eq!(
+            why_refused(reading_with(&two, &[(srv, table, 0, 4, 3)])),
+            "used descriptor names no root table"
+        );
     }
 
     #[test]
@@ -4198,6 +4251,51 @@ mod tests {
         let e = stage_data_at(&blob, HwStage::Vs);
         blob[e..e + STAGE_DATA].fill(0xFF);
         assert_eq!(refused_blob(&xbch(&blob)), "implausible semantic count");
+    }
+
+    #[test]
+    fn an_empty_export_patch_is_still_bounded_by_the_code() {
+        // Seven bytes: one whole dword and three more, so the code ends at
+        // dword 1 for a patch.
+        let code = [0x5a; 7];
+        let ps = fssm(&[(HwStage::Ps, &code)]);
+        let e = stage_data_at(&ps, HwStage::Ps);
+        let patch_at = |offset: u32| {
+            let mut blob = ps.clone();
+            blob[e + PS_PATCH_SIZE..][..4].copy_from_slice(&0u32.to_le_bytes());
+            blob[e + PS_PATCHES..][..4].copy_from_slice(&offset.to_le_bytes());
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        // At the start or at the end of the whole dwords, it is kept and
+        // patches nothing.
+        for offset in [0, 1] {
+            let p = &patch_at(offset).unwrap()[0];
+            let StageIo::Ps { patches, .. } = &p.io else {
+                panic!("{:?}", p.io)
+            };
+            assert_eq!(
+                patches[..],
+                [ExportPatch {
+                    mrt: 0,
+                    offset,
+                    code: vec![],
+                }]
+            );
+            assert_eq!(p.patched_code(), code);
+        }
+        // Past them it is refused like any patch, the last offset before
+        // the absent marker included; the marker itself is no patch.
+        for offset in [2, 1 << 30, u32::MAX - 1] {
+            assert!(
+                matches!(
+                    patch_at(offset),
+                    Err(Malformed("export patch outside the code"))
+                ),
+                "dword {offset}"
+            );
+        }
+        let p = &patch_at(u32::MAX).unwrap()[0];
+        assert!(matches!(&p.io, StageIo::Ps { patches, .. } if patches.is_empty()));
     }
 
     #[test]
