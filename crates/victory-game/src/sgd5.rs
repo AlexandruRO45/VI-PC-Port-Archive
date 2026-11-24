@@ -2324,4 +2324,81 @@ mod tests {
             assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
         }
     }
+
+    #[test]
+    fn stated_size_cutting_a_stream_short_ends_the_record_there() {
+        // A record's stated size, not its stream, says where it ends. Cut
+        // short by that size at every byte, a stream packed at any level is
+        // still the start of one: the record is yielded with the span its
+        // size states, does not unpack, and the record after it is found in
+        // the bytes the stream would have gone on through.
+        let container: Vec<u8> = (0..200_u32).map(|i| (i * 7 % 61) as u8).collect();
+        for level in [0, 1, 6, 10] {
+            let whole = miniz_oxide::deflate::compress_to_vec(&container, level);
+            for keep in min_packed(container.len())..=whole.len() {
+                let (mut file, marker) = outer_then_after(&whole[..keep], container.len());
+                file.splice(
+                    marker + 12 + keep..marker + 12 + keep,
+                    whole[keep..].to_vec(),
+                );
+                let what = format!("level {level}, {keep} of {} bytes", whole.len());
+                let found: Vec<_> = records(&file).collect();
+                let names: Vec<_> = found.iter().map(|r| r.name).collect();
+                assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+                assert_eq!(found[0].span(), marker..marker + 12 + keep, "{what}");
+                assert_eq!(
+                    found[0].unpack(),
+                    (keep == whole.len()).then(|| container.clone()),
+                    "{what}"
+                );
+                assert_eq!(found[1].span().end, file.len(), "{what}");
+                assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            }
+        }
+    }
+
+    #[test]
+    fn record_stored_past_where_a_stated_size_cuts_its_block_is_the_next_record() {
+        // A record stored as is in a container whose record states fewer
+        // packed bytes than its stored block holds: where the stated end
+        // falls at or before the stored record's header, the stored record
+        // is the next one, read whole from the bytes after the cut; where it
+        // falls inside that header or later, the stored record starts inside
+        // the outer one, which is a stream (cut short) and wins.
+        let inner = record_bytes("PS_inner", 0x41, b"stored inside");
+        let mut container = b"DXBC head ".to_vec();
+        let inner_at = container.len();
+        container.extend_from_slice(&inner);
+        container.extend_from_slice(b" DXBC tail");
+        let whole = stored_block(&container);
+        // The inner header (NUL, kind, n) is the 6 bytes before its marker.
+        let inner_marker = 5 + inner_at + memchr::memmem::find(&inner, &MARKER).unwrap();
+        for keep in min_packed(container.len())..whole.len() {
+            let (mut file, marker) = outer_then_after(&whole[..keep], container.len());
+            let end = marker + 12 + keep;
+            file.splice(end..end, whole[keep..].to_vec());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(found[0].name, Some("PS_outer"), "keep {keep}");
+            assert_eq!(found[0].span(), marker..end, "keep {keep}");
+            assert_eq!(found[0].unpack(), None, "keep {keep}");
+            let stored = marker + 12 + inner_marker;
+            assert_eq!(&file[stored..stored + 4], &MARKER, "keep {keep}");
+            if keep <= inner_marker - 6 {
+                assert_eq!(names.len(), 3, "keep {keep}");
+                assert_eq!(found[1].offset, stored, "keep {keep}");
+                assert_eq!(found[1].kind, 0x41, "keep {keep}");
+                assert_eq!(found[1].unpack().as_deref(), Some(&b"stored inside"[..]));
+                assert!(!in_record(&found, stored - 1), "keep {keep}");
+                if keep < inner_marker - 6 - 13 {
+                    // Its length byte and name are past the cut too.
+                    assert_eq!(found[1].name, Some("PS_inner"), "keep {keep}");
+                }
+            } else {
+                assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "keep {keep}");
+                assert!(!found.iter().any(|r| r.offset == stored), "keep {keep}");
+            }
+            assert_eq!(found.last().unwrap().name, Some("PS_after"), "keep {keep}");
+        }
+    }
 }
