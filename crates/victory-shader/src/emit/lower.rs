@@ -276,6 +276,76 @@ const LANE_MASK: Why = "a lane mask read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
+/// Whether `name` is a pure bitwise scalar copy/logic SOP whose lane-mask result
+/// can be derived algebraically from its operands' masks/values.
+fn is_bitwise_mask_sop(name: &str) -> bool {
+    matches!(
+        name,
+        "s_mov_b32"
+            | "s_mov_b64"
+            | "s_not_b32"
+            | "s_not_b64"
+            | "s_and_b32"
+            | "s_and_b64"
+            | "s_or_b32"
+            | "s_or_b64"
+            | "s_xor_b32"
+            | "s_xor_b64"
+            | "s_andn2_b32"
+            | "s_andn2_b64"
+            | "s_orn2_b32"
+            | "s_orn2_b64"
+            | "s_nand_b32"
+            | "s_nand_b64"
+            | "s_nor_b32"
+            | "s_nor_b64"
+            | "s_xnor_b32"
+            | "s_xnor_b64"
+    )
+}
+
+/// Checks whether every mask definition (walking pure bitwise SOPs for
+/// non-active masks) lies in a uniform block when wave64 emulation ballots run.
+fn mask_defs_uniform(
+    p: &Program,
+    st: &Structured,
+    def_block: &HashMap<Value, usize>,
+    uniform: &[bool],
+    v: Value,
+    seen: &mut HashSet<Value>,
+) -> bool {
+    let lo = st.highs.get(&v).copied().unwrap_or(v);
+    if !seen.insert(lo) {
+        return true;
+    }
+    let Some(&db) = def_block.get(&lo) else {
+        return true;
+    };
+    if !uniform[db] {
+        return false;
+    }
+    if st.active.contains(&lo) {
+        return true;
+    }
+    let Some(inst) = p.blocks[db]
+        .insts
+        .iter()
+        .find(|i| i.writes.iter().any(|w| w.1 == lo))
+    else {
+        return true;
+    };
+    if !is_bitwise_mask_sop(inst.name()) {
+        return true;
+    }
+    inst.reads.iter().all(|&(_, r)| {
+        if st.masks.contains_key(&r) || st.highs.contains_key(&r) {
+            mask_defs_uniform(p, st, def_block, uniform, r, seen)
+        } else {
+            true
+        }
+    })
+}
+
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
@@ -689,15 +759,19 @@ impl<'a> Lower<'a> {
                             if reads_mask_as_data(x.st, inst) {
                                 uses_ballot_or_red = true;
                                 if total > 32 {
+                                    let mut seen = HashSet::new();
                                     for &(_, r) in &inst.reads {
-                                        if is_mask(r) {
-                                            let lo = x.st.highs.get(&r).copied().unwrap_or(r);
-                                            if def_block
-                                                .get(&lo)
-                                                .is_some_and(|&db| !uniform[db])
-                                            {
-                                                can_emulate = false;
-                                            }
+                                        if is_mask(r)
+                                            && !mask_defs_uniform(
+                                                p,
+                                                x.st,
+                                                &def_block,
+                                                &uniform,
+                                                r,
+                                                &mut seen,
+                                            )
+                                        {
+                                            can_emulate = false;
                                         }
                                     }
                                 }
@@ -1584,47 +1658,176 @@ impl<'a> Lower<'a> {
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
-    /// taken in the block that writes the mask (see [`MaskData`]).
+    /// taken in the block that writes the mask (see [`MaskData`]), or an
+    /// algebraic bitwise combination over its source masks/constants when the
+    /// combined mask spans lanes from separate branches.
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
         let (lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        if !self.x.st.active.contains(&lo) {
-            return Err("a lane mask holding lanes elsewhere read as data");
-        }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
             None => {
-                let at = match self.def_block.get(&lo) {
-                    // Program inputs (EXEC on entry).
-                    None => self.s.entry,
-                    Some(&b) if b == self.cur_ir => self.cur,
-                    Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
-                };
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
-                let bit = self.boolean(m, at);
-                self.balloting.remove(&lo);
-                let bit = bit?;
-                let xy = if self.emulate_wave64 {
-                    self.emulate_ballot(at, bit)
+                let xy = if self.x.st.active.contains(&lo) {
+                    let at = match self.def_block.get(&lo) {
+                        // Program inputs (EXEC on entry).
+                        None => self.s.entry,
+                        Some(&b) if b == self.cur_ir => self.cur,
+                        Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+                    };
+                    let ballot = self.boolean(m, at).map(|bit| {
+                        if self.emulate_wave64 {
+                            self.emulate_ballot(at, bit)
+                        } else {
+                            let i32t = self.s.t.i32;
+                            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                            let r = self
+                                .s
+                                .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+                            self.s.flags |= flags::WAVE_OPS;
+                            (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1))
+                        }
+                    });
+                    self.balloting.remove(&lo);
+                    ballot
                 } else {
-                    let i32t = self.s.t.i32;
-                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                    let r = self
-                        .s
-                        .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                    self.s.flags |= flags::WAVE_OPS;
-                    (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1))
-                };
+                    let res = self.combine_mask_dwords(lo);
+                    self.balloting.remove(&lo);
+                    res
+                }?;
                 self.ballots.insert(lo, xy);
                 xy
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Resolves `(lo, hi)` dwords of a bitwise SOP operand (`b64`: 64-bit; `b32`: low 32-bit + 0).
+    fn mask_sop_operand(&mut self, inst: &Inst, op: &Operand, b64: bool) -> Result<(V, V), Why> {
+        let z = self.s.m.i32(0);
+        match *op {
+            Operand::Scalar { code: NULL, .. } => Ok((z, z)),
+            Operand::Scalar { code, .. } => {
+                let lo_v = inst.read(Reg::S(code)).ok_or("an unread operand")?;
+                let is_mask = |l: &Self, r: Value| {
+                    l.x.st.masks.contains_key(&r) || l.x.st.highs.contains_key(&r)
+                };
+                let lo = if is_mask(self, lo_v) {
+                    self.mask_dword(lo_v)?
+                } else {
+                    self.i32_of(lo_v)?
+                };
+                let hi = if b64 && self.x.p.wave64 {
+                    let hi_v = inst.read(Reg::S(code + 1)).ok_or("an unread operand")?;
+                    if is_mask(self, hi_v) {
+                        self.mask_dword(hi_v)?
+                    } else {
+                        self.i32_of(hi_v)?
+                    }
+                } else {
+                    z
+                };
+                Ok((lo, hi))
+            }
+            Operand::Const(c) => {
+                let x = crate::resource::inline(c)
+                    .ok_or("a special operand (vccz, execz, scc, lds_direct)")?;
+                let hi = if b64 && self.x.p.wave64 {
+                    (x as i32 >> 31) as u32
+                } else {
+                    0
+                };
+                Ok((self.s.m.i32(x), self.s.m.i32(hi)))
+            }
+            Operand::Literal(x) => {
+                let hi = if b64 && self.x.p.wave64 {
+                    (x as i32 >> 31) as u32
+                } else {
+                    0
+                };
+                Ok((self.s.m.i32(x), self.s.m.i32(hi)))
+            }
+            _ => Err("a lane mask holding lanes elsewhere read as data"),
+        }
+    }
+
+    /// Computes `(lo, hi)` dwords of a non-active mask defined by a pure bitwise SOP.
+    fn combine_mask_dwords(&mut self, lo: Value) -> Result<(V, V), Why> {
+        const NON_ACTIVE: Why = "a lane mask holding lanes elsewhere read as data";
+        let Some(&db) = self.def_block.get(&lo) else {
+            return Err(NON_ACTIVE);
+        };
+        let inst: &'a Inst = self.x.p.blocks[db]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == lo))
+            .ok_or(NON_ACTIVE)?;
+        let name = inst.name();
+        let Fields::Sop { dst: Some(_), src, .. } = &inst.fields else {
+            return Err(NON_ACTIVE);
+        };
+        if !is_bitwise_mask_sop(name) {
+            return Err(NON_ACTIVE);
+        }
+        let at = if db == self.cur_ir {
+            self.cur
+        } else {
+            self.tail[db].ok_or("a lane mask written after its use")?
+        };
+        let b64 = name.ends_with("_b64");
+        let (a0, a1) = self.mask_sop_operand(inst, src.first().ok_or(NON_ACTIVE)?, b64)?;
+        let z = self.s.m.i32(0);
+        let ones = self.s.m.i32(u32::MAX);
+        if name.starts_with("s_mov") {
+            return Ok((a0, a1));
+        }
+        if name.starts_with("s_not") {
+            let x0 = self.s.m.bin(at, Bin::Xor, a0, ones);
+            let x1 = if b64 && self.x.p.wave64 {
+                self.s.m.bin(at, Bin::Xor, a1, ones)
+            } else {
+                z
+            };
+            return Ok((x0, x1));
+        }
+        let (mut b0, mut b1) = self.mask_sop_operand(inst, src.get(1).ok_or(NON_ACTIVE)?, b64)?;
+        if name.contains("n2") {
+            b0 = self.s.m.bin(at, Bin::Xor, b0, ones);
+            if b64 && self.x.p.wave64 {
+                b1 = self.s.m.bin(at, Bin::Xor, b1, ones);
+            }
+        }
+        let op = match &name[2..5] {
+            "and" | "nan" => Bin::And,
+            "or_" | "orn" | "nor" => Bin::Or,
+            _ => Bin::Xor,
+        };
+        let mut r0 = self.s.m.bin(at, op, a0, b0);
+        let mut r1 = if b64 && self.x.p.wave64 {
+            self.s.m.bin(at, op, a1, b1)
+        } else {
+            z
+        };
+        if matches!(
+            name,
+            "s_nand_b32"
+                | "s_nand_b64"
+                | "s_nor_b32"
+                | "s_nor_b64"
+                | "s_xnor_b32"
+                | "s_xnor_b64"
+        ) {
+            r0 = self.s.m.bin(at, Bin::Xor, r0, ones);
+            if b64 && self.x.p.wave64 {
+                r1 = self.s.m.bin(at, Bin::Xor, r1, ones);
+            }
+        }
+        Ok((r0, r1))
     }
 
     // ---- operands ----

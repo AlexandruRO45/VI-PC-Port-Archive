@@ -1701,3 +1701,42 @@ fn wave64_readfirstlane_only_with_large_title_lds_fits_on_wave32() {
         assert_eq!(val, want, "lane {i}");
     }
 }
+
+#[test]
+fn non_active_bitwise_mask_combining_branch_masks_lowers_and_runs() {
+    // Compare even threads in first arm (v0 < 16) and thread == 21 in else arm (v0 >= 16),
+    // then OR those two disjoint-EXEC masks and read the combined mask as data.
+    // Expected 32-bit mask: even bits in 0..15 (0x5555) | bit 21 (0x0020_0000) = 0x0020_5555.
+    const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
+        (op << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (src0 as u32 & 0x1FF)
+    }
+    let body = [
+        // v1 = v0 & 1
+        vop2(0x01B, 1, 0, 0x81),
+        // Split mask: s[6:7] = (v0 < 16)
+        vop3(0x0c1, 6, vgpr(0), 128 + 16, 0)[0],
+        vop3(0x0c1, 6, vgpr(0), 128 + 16, 0)[1],
+        // s_and_saveexec_b64 s[6:7], s[6:7] (old exec = !0 saved in s[6:7])
+        0xBE86_2406,
+        // Arm A (v0 < 16): s[2:3] = (v1 == 0)
+        vop3(0x0c2, 2, vgpr(1), 0x80, 0)[0],
+        vop3(0x0c2, 2, vgpr(1), 0x80, 0)[1],
+        // Switch to Arm B (v0 >= 16): s_andn2_b64 exec, s[6:7], exec
+        0x8AFE_7E06,
+        // Arm B: s[4:5] = (v0 == 21)
+        vop3(0x0c2, 4, vgpr(0), 128 + 21, 0)[0],
+        vop3(0x0c2, 4, vgpr(0), 128 + 21, 0)[1],
+        // Restore exec: s_mov_b64 exec, s[6:7]
+        0xBEFE_0406,
+        // Combine disjoint masks (result holds lanes active elsewhere): s[16:17] = s[2:3] | s[4:5]
+        0x8890_0402,
+        // Read s16 as data!
+        vop1(0x001, 2, sgpr(16)),
+    ];
+    let Some(out) = run_wave64_on_wave32([32, 1, 1], 0, &body, 2) else {
+        return;
+    };
+    for (i, &val) in out.iter().enumerate() {
+        assert_eq!(val, 0x0020_5555, "lane {i}");
+    }
+}
