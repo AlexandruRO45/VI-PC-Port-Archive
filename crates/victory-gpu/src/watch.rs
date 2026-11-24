@@ -526,15 +526,15 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
-    open(&mut guards(), at, at + len);
+    // The length is the title's (`fread`'s size times count, saturated).
+    open(&mut guards(), at, at.saturating_add(len));
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`.
 /// The old guards and shadow copies describe the previous mapping.
 pub fn title_memory_remapped(at: usize, len: usize) {
-    let Some(end) = at.checked_add(len) else {
-        return;
-    };
+    // The length can run past the end of the address space; cover up to it.
+    let end = at.saturating_add(len);
     if at == end {
         return;
     }
@@ -1025,5 +1025,15 @@ pub(crate) mod tests {
         assert_eq!(shadow.update(start + watched - 4, 8), 8);
         assert_eq!(shadow.update(start, watched), PAGE - 4);
         assert_eq!(shadow.update(start, watched), 0);
+    }
+
+    /// A write or mapping that runs past the end of the address space (a
+    /// title's `fread` with a huge count) covers up to the end; the sum used
+    /// to overflow. Up there no test has guarded blocks.
+    #[test]
+    fn ranges_past_the_address_space_end_do_not_overflow() {
+        let top = usize::MAX - 16;
+        writing(top, PAGE);
+        title_memory_remapped(top, usize::MAX);
     }
 }
