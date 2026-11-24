@@ -573,11 +573,8 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
-    if let Some((buffer, gpu)) = crate::direct::buffer(&host()?.device, start, len) {
-        let shadow = Arc::new(Shadow::direct(buffer, gpu, start, len));
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
-    }
+    // (no direct heap here: a run of loose memory takes in the title's CPU structures, and
+    // reading those in place made it crash at start)
     // Local build: a whole window more past the end: shaders read across a window's end (a GPU
     // page fault 1.1 MB past one removed the device)
     let (buffer, data) = host()?.shared_buffer(len + WINDOW)?;
