@@ -50,6 +50,16 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+**Windows 10 only:** the D3D12 runtime inside Windows 10 predates SM 6.6 heap
+indexing, so every translated draw is refused (`root signature flags c01`) and
+the screen stays black. `victory.exe` therefore asks for the D3D12 Agility SDK
+(it exports `D3D12SDKVersion` and `D3D12SDKPath`). Download the NuGet package
+`Microsoft.Direct3D.D3D12` 1.619.x from nuget.org (a `.nupkg` is a zip), and copy
+`build\native\bin\x64\D3D12Core.dll` to a `D3D12` folder next to `victory.exe`
+(`target\release\D3D12\D3D12Core.dll`). Without that file Windows uses its own
+runtime, which is what Windows 11 needs. The DLL is Microsoft's and is not
+part of this repository.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
