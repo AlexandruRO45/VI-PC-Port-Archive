@@ -1706,6 +1706,12 @@ extern "system" fn execute_indirect(
             address.is_some(),
             count.is_null() || counter.is_some()
         ));
+        // Not run at all: for a stage of the structure builder, a dropped
+        // stage (its stages run all or none).
+        #[cfg(windows)]
+        with_state(this, |_, s| {
+            s.builder_stage_dropped("one of its indirect executions has a signature the host does not run");
+        });
     }
     if ran {
         return;

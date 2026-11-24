@@ -63,9 +63,33 @@ thread_local! {
     /// and whether a view its shaders read is of that same texture.
     static TESTED_DEPTH: std::cell::Cell<(usize, bool)> =
         const { std::cell::Cell::new((0, false)) };
-    /// While a stage's tables are walked (`State::tables`): whether that
-    /// stage's shader can store to buffers (`Translated::stores`).
+    /// While a stage's tables are walked (`State::tables`): whether the
+    /// buffer ranges its unordered access views name are given back after
+    /// it: its shader can store to buffers (`Translated::stores`, or every
+    /// range with `VICTORY_WRITE_SKIP=0`), and it is no quarantined stage
+    /// of the structure builder.
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// What is given back into title memory after a shader runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GivesBack {
+    /// The buffer ranges of its unordered access views and root views.
+    views: bool,
+    /// The copies of title memory by address (`memory.rs`).
+    memory: bool,
+}
+
+/// What is given back after a shader that `stores` and stores
+/// `by_address` (`Translated::stores`, `Translated::stores_by_address`)
+/// runs: what it can store to (or everything, without `skip`:
+/// `VICTORY_WRITE_SKIP=0`), and nothing after a `quarantined` stage of the
+/// structure builder.
+fn gives_back(stores: bool, by_address: bool, skip: bool, quarantined: bool) -> GivesBack {
+    GivesBack {
+        views: (stores || !skip) && !quarantined,
+        memory: (by_address || !skip) && !quarantined,
+    }
 }
 
 /// Whether a buffer range a shader names through an unordered access view
@@ -913,22 +937,26 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        // What a quarantined stage of the structure builder stores stays in
+        // the host's copies: none of it is given back, by view or by address.
+        let quarantined = crate::pipeline::builder_quarantined(self.pipeline as This);
         for stage in &p.stages {
             let t = stage.translated();
-            STORES.set(t.stores);
+            let back = gives_back(t.stores, t.stores_by_address, write_skip(), quarantined);
+            STORES.set(back.views);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
-            // What the shader stores through root views and raw addresses is
-            // copied back into title memory afterwards.
-            let writes = (t.stores || !write_skip())
-                && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            // What the shader stores through root views is copied back into
+            // title memory afterwards; the copies of title memory by address
+            // only after a shader that stores by address.
+            let (writes, writes_memory) = (back.views, back.memory);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let Some(ready) = self.memory_ready(list, compute, writes_memory) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -1730,9 +1758,7 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
-            if crate::pipeline::is_builder(self.pipeline as This) {
-                crate::pipeline::builder_off("one of its dispatches could not be bound");
-            }
+            self.builder_stage_dropped("one of its dispatches could not be bound");
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -2309,6 +2335,38 @@ impl State {
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
+        signature: (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        // The ray-tracing structure builder's stages run all or none.
+        let builder = crate::pipeline::is_builder(self.pipeline as This);
+        if builder && !crate::pipeline::builder_runs() {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+            return false;
+        }
+        let ran = self.run_indirect(list, signature, arguments, count);
+        if builder && !ran {
+            self.builder_stage_dropped("one of its indirect dispatches could not run");
+        }
+        ran
+    }
+
+    /// A stage of the structure builder is dropped after all (the title
+    /// gave it something the host cannot run): it would leave the next
+    /// stages garbage to compute their stores from, so none runs from here
+    /// on ([`crate::pipeline::builder_off`]).
+    pub(crate) fn builder_stage_dropped(&self, why: &'static str) {
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            crate::pipeline::builder_off(why);
+        }
+    }
+
+    /// [`Self::execute_indirect`] for a pipeline allowed to run.
+    fn run_indirect(
+        &mut self,
+        list: &HostList,
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
@@ -2317,9 +2375,6 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
-            return false;
-        }
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             return false;
         }
         const DRAW: u32 = 0;
@@ -2602,7 +2657,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
+            if STORES.get() {
                 shadow.gpu_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]
@@ -2745,5 +2800,26 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GivesBack, gives_back};
+
+    /// A shader that reads title memory by address and stores only through
+    /// views (the ray-tracing passes) gives the copies of title memory
+    /// nothing back; a quarantined builder stage gives nothing back at all,
+    /// even with every range declared (`VICTORY_WRITE_SKIP=0`).
+    #[test]
+    fn view_stores_leave_title_memory_by_address_alone() {
+        let back = |views, memory| GivesBack { views, memory };
+        assert_eq!(gives_back(true, false, true, false), back(true, false));
+        assert_eq!(gives_back(true, true, true, false), back(true, true));
+        assert_eq!(gives_back(false, false, true, false), back(false, false));
+        assert_eq!(gives_back(false, false, false, false), back(true, true));
+        for skip in [true, false] {
+            assert_eq!(gives_back(true, true, skip, true), back(false, false));
+        }
     }
 }

@@ -126,6 +126,11 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store to title memory by address
+    /// ([`stores_by_address`]): only then are the copies of title memory
+    /// by address (`memory.rs`) given back after it. True when its code is
+    /// not known.
+    pub(crate) stores_by_address: bool,
 }
 
 #[cfg(windows)]
@@ -183,7 +188,8 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => Vec::new(),
     };
     let host = crate::shader_cache::host_shader(container)?;
-    let stores = programs.is_empty() || programs.iter().any(stores);
+    let stores = programs.is_empty() || programs.iter().any(|p| stores(&p.code));
+    let stores_by_address = programs.is_empty() || programs.iter().any(|p| stores_by_address(&p.code));
     let used = programs
         .into_iter()
         .find(|p| {
@@ -194,7 +200,12 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated {
+        host,
+        used,
+        stores,
+        stores_by_address,
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -269,9 +280,20 @@ pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
+/// `VICTORY_BVH_BUILDER=1`: the builder may run (see [`Builder`]).
+#[cfg(windows)]
+fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
 /// A stage of the builder was dropped after all: none runs from here on.
 #[cfg(windows)]
 pub(crate) fn builder_off(why: &'static str) {
+    // Off from the start: nothing to turn off, nothing to say.
+    if !builder_allowed() {
+        return;
+    }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if !b.off {
         b.off = true;
@@ -283,8 +305,7 @@ pub(crate) fn builder_off(why: &'static str) {
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -320,9 +341,9 @@ pub(crate) fn builder_runs() -> bool {
 /// count: neither reaches a buffer's host copy. After upstream #413,
 /// which leaves scalar-memory stores out and counts image stores.
 #[cfg(windows)]
-fn stores(program: &victory_shader::NativeProgram) -> bool {
+fn stores(code: &[u8]) -> bool {
     use victory_shader::gfx10::{Encoding, decode};
-    let Ok(code) = decode(&program.code) else {
+    let Ok(code) = decode(code) else {
         return true;
     };
     code.iter().any(|i| {
@@ -333,6 +354,34 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             | Encoding::Smem
             | Encoding::Flat
             | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether console code can store to title memory by address: a flat or
+/// global store or atomic (the only accesses the translation lowers onto
+/// the copies of title memory by address, `resource::MEMORY`), a scalar
+/// store or atomic (refused by that lowering today; counted so a later
+/// one is not missed), or code that is not all known. Stores through
+/// buffer views (MUBUF, MTBUF), to textures and to scratch do not reach
+/// those copies. The ray-tracing passes walk the structures by address and
+/// write their results through views: counting their view stores declared
+/// every copy of the structures written after each of them (a snapshot, a
+/// compare and a copy back) and let a quarantined builder's output out.
+#[cfg(windows)]
+fn stores_by_address(code: &[u8]) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Flat | Encoding::Global | Encoding::Smem => name.is_none_or(|n| {
                 (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
             }),
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
@@ -736,6 +785,45 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// Console code from its dwords, ended by `s_endpgm`, and the names
+    /// they decode to.
+    #[cfg(windows)]
+    fn console(words: &[u32]) -> (Vec<u8>, Vec<&'static str>) {
+        let code: Vec<u8> = words
+            .iter()
+            .chain(&[0xBF81_0000])
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let names = victory_shader::gfx10::decode(&code)
+            .unwrap()
+            .iter()
+            .map(|i| i.name().unwrap_or("?"))
+            .collect();
+        (code, names)
+    }
+
+    /// Stores through views count as stores, and only flat and global ones
+    /// as stores to title memory by address: the ray-tracing passes read
+    /// the structures by address and write through views.
+    #[cfg(windows)]
+    #[test]
+    fn only_global_stores_and_atomics_store_by_address() {
+        let (views, names) = console(&[0xE070_0000, 0x8002_0100, 0xDC38_8000, 0x047D_0000]);
+        assert_eq!(names, ["buffer_store_dword", "global_load_dwordx4", "s_endpgm"]);
+        assert!(stores(&views));
+        assert!(!stores_by_address(&views), "a view store and a load by address");
+        let (global, names) = console(&[0xDC70_8000, 0x007D_0200]);
+        assert_eq!(names, ["global_store_dword", "s_endpgm"]);
+        assert!(stores(&global) && stores_by_address(&global));
+        let (atomic, names) = console(&[0xDCC8_8000, 0x007D_0200]);
+        assert_eq!(names, ["global_atomic_add", "s_endpgm"]);
+        assert!(stores_by_address(&atomic));
+        let (scratch, names) = console(&[0xDC70_4000, 0x007D_0200]);
+        assert_eq!(names, ["scratch_store_dword", "s_endpgm"]);
+        assert!(!stores(&scratch) && !stores_by_address(&scratch));
+        assert!(stores_by_address(&[1, 2, 3]), "code that does not decode is not known");
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
