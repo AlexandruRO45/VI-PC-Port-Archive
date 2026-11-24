@@ -562,6 +562,12 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         {
             return Err(Malformed("used descriptor names no root descriptor"));
         }
+        if !used_one_way(&used) {
+            return Err(Malformed("used descriptors read one descriptor two ways"));
+        }
+        if !tables_one_heap(&used) {
+            return Err(Malformed("root table mixes samplers and views"));
+        }
         // The record is in bounds, so its end is too.
         let stage_data = &payload[(start + RECORD_SIZE) as usize..];
         let io = match stage {
@@ -647,6 +653,43 @@ fn params_apart(stage: HwStage, layout: &[RootParam]) -> bool {
             None => true,
             Some(held) => held == key && p.root == RootType::Table,
         })
+    })
+}
+
+/// The descriptor a table or root-descriptor read names: its parameter and,
+/// in a table, its offset. A root descriptor is one view, so all its reads
+/// name the same one.
+fn read_of(u: &UsedResource) -> Option<(RootType, u8, u8, u32)> {
+    match u.root {
+        RootType::Table => Some((u.root, u.slot, u.user_data, u.table_offset_dwords)),
+        RootType::Descriptor => Some((u.root, u.slot, u.user_data, 0)),
+        _ => None,
+    }
+}
+
+/// Whether no descriptor is read as two kinds. Lowering classifies a read
+/// by one entry (`used_kind`: a root descriptor's first, a table's last at
+/// or below the offset) and picks CBV, SRV or UAV access from its kind,
+/// while the host binds each entry by its own kind (`draw::readable`): a
+/// second entry of another kind would bind the view one way and read it
+/// another.
+fn used_one_way(used: &[UsedResource]) -> bool {
+    used.iter().enumerate().all(|(k, a)| {
+        used[..k]
+            .iter()
+            .all(|b| read_of(a).is_none() || read_of(b) != read_of(a) || b.kind == a.kind)
+    })
+}
+
+/// Whether each root table holds samplers only or views only. D3D12 puts
+/// samplers in their own heap, so one table can't hold both, and the host
+/// makes a table with a constant buffer afresh in its view heap
+/// (`draw::tables`), where a sampler has no place.
+fn tables_one_heap(used: &[UsedResource]) -> bool {
+    let tables = || used.iter().filter(|u| u.root == RootType::Table);
+    let sampler = |u: &UsedResource| u.kind == ResourceType::Sampler;
+    tables().all(|a| {
+        tables().all(|b| (a.slot, a.user_data) != (b.slot, b.user_data) || sampler(a) == sampler(b))
     })
 }
 
@@ -1980,6 +2023,100 @@ mod tests {
                 "root parameters share an SGPR",
                 "{what}"
             );
+        }
+    }
+
+    /// A pixel program with a table in s4 (slot 2), a root descriptor in
+    /// s6-s7 (slot 3), and these (kind, root type, table offset) reads.
+    fn reading(reads: &[(u8, u8, u32)]) -> Result<Vec<NativeProgram>, ShaderError> {
+        let mut blob = fssm(&[(HwStage::Ps, &PS_CODE)]);
+        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Ps)).unwrap() as usize;
+        let tables = (blob.len() - FSSM_HEADER) as u64;
+        for (root, user_data, slot) in [(3u32, 4u8, 2u8), (1, 6, 3)] {
+            for v in [root, 0, 2, 0] {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+            blob.extend_from_slice(&[user_data, slot, 0, 0]);
+        }
+        for &(kind, root, offset) in reads {
+            let (user_data, slot) = if root == 3 { (4, 2) } else { (6, 3) };
+            blob.extend_from_slice(&[kind, root, 0, 0]);
+            for v in [offset, 0, 0] {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+            blob.extend_from_slice(&[8, user_data, slot, 0]);
+        }
+        let payload = (blob.len() - FSSM_HEADER) as u64;
+        blob[8..16].copy_from_slice(&payload.to_le_bytes());
+        blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&tables.to_le_bytes());
+        let used = tables + 2 * ENTRY_SIZE;
+        blob[record + RECORD_USED..][..8].copy_from_slice(&used.to_le_bytes());
+        blob[record + RECORD_COUNTS..][..4].copy_from_slice(&2u32.to_le_bytes());
+        blob[record + RECORD_COUNTS + 4..][..4]
+            .copy_from_slice(&(reads.len() as u32).to_le_bytes());
+        native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+    }
+
+    #[test]
+    fn refuses_a_descriptor_read_two_ways() {
+        let (srv, cbv, uav) = (0u8, 2u8, 3u8);
+        let (descriptor, table) = (1u8, 3u8);
+        // Distinct table entries, the same entry listed twice as one kind,
+        // and a root descriptor read twice as one kind are fine.
+        assert!(reading(&[(srv, table, 0), (uav, table, 8), (cbv, table, 16)]).is_ok());
+        assert!(reading(&[(srv, table, 8), (srv, table, 8)]).is_ok());
+        assert!(reading(&[(cbv, descriptor, 0), (cbv, descriptor, 0)]).is_ok());
+        for (reads, what) in [
+            (
+                [(srv, table, 8), (uav, table, 8)],
+                "an SRV and a UAV at one offset",
+            ),
+            (
+                [(cbv, table, 0), (srv, table, 0)],
+                "a CBV and an SRV at one offset",
+            ),
+            (
+                [(cbv, descriptor, 0), (srv, descriptor, 0)],
+                "a root descriptor as a CBV and an SRV",
+            ),
+            (
+                [(srv, descriptor, 0), (uav, descriptor, 4)],
+                "a root descriptor at two offsets",
+            ),
+        ] {
+            assert_eq!(
+                why_refused(reading(&reads)),
+                "used descriptors read one descriptor two ways",
+                "{what}"
+            );
+        }
+        // A table and a root descriptor are different descriptors even at
+        // the same stated offset.
+        assert!(reading(&[(srv, table, 0), (cbv, descriptor, 0)]).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_table_mixing_samplers_and_views() {
+        let (srv, sampler, cbv) = (0u8, 1u8, 2u8);
+        let table = 3u8;
+        assert!(reading(&[(sampler, table, 0), (sampler, table, 4)]).is_ok());
+        assert!(reading(&[(srv, table, 0), (cbv, table, 8)]).is_ok());
+        for reads in [
+            [(sampler, table, 0), (srv, table, 8)],
+            [(cbv, table, 0), (sampler, table, 8)],
+        ] {
+            assert_eq!(
+                why_refused(reading(&reads)),
+                "root table mixes samplers and views",
+                "{reads:?}"
+            );
+        }
+    }
+
+    fn why_refused(r: Result<Vec<NativeProgram>, ShaderError>) -> &'static str {
+        match r {
+            Err(Malformed(why)) => why,
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 }
