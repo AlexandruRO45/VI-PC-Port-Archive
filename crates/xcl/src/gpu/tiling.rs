@@ -449,6 +449,22 @@ impl Chain {
             let y = y + l.origin.1;
             let row_blocks = (y / t.block_h) * pitch_blocks;
             let yz = t.oy[y % t.block_h] ^ hi(&t.hy, y, t.block_h) ^ z;
+            macro_rules! copy_elements {
+                ($width:literal) => {{
+                    for (&(block_x, x), dst) in columns.iter().zip(row.chunks_exact_mut($width)) {
+                        let o = l.offset + (row_blocks + block_x) * t.block_bytes + ((x ^ yz) as usize ^ t.base_xor);
+                        if let Some(s) = src.get(o..o + $width) {
+                            dst.copy_from_slice(s);
+                        }
+                    }
+                    continue;
+                }};
+            }
+            match (e, run) {
+                (8, 1 | 2) => copy_elements!(8),
+                (16, 1) => copy_elements!(16),
+                _ => {}
+            }
             // `run` neighbouring elements from an aligned x are contiguous (16 B in the swizzled
             // modes): one copy each, element by element only where a run leaves `src`
             for (cols, dst) in columns.chunks(run).zip(row.chunks_mut(run * e)) {
