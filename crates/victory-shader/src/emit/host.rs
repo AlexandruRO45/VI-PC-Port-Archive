@@ -18,6 +18,121 @@ pub struct Host {
     pub software: bool,
 }
 
+/// Summary of the Windows host GPU's DirectX 12 capabilities for VIctory (#910).
+#[derive(Debug, Clone)]
+pub struct AdapterReport {
+    pub name: String,
+    pub software: bool,
+    pub vram_mb: u64,
+    pub shader_model_6_6: bool,
+    pub highest_shader_model: u32,
+    pub mesh_shaders: bool,
+    pub wave_ops: bool,
+    pub wave_lanes_min: u32,
+    pub wave_lanes_max: u32,
+    pub resource_binding_tier: u32,
+}
+
+/// Probes the default D3D12 adapter (or WARP when `VICTORY_WARP=1`) and
+/// returns its GPU/shader capability report without failing if SM 6.6 is
+/// absent (#910).
+pub fn probe_host() -> Result<AdapterReport, String> {
+    let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    // SAFETY: plain D3D12/DXGI calls with valid out pointers.
+    unsafe {
+        let mut device: Option<ID3D12Device> = None;
+        let factory: IDXGIFactory4 =
+            CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+        if warp {
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+        } else {
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+        }
+        let device = device.ok_or("no Direct3D 12 device")?;
+        let desc = factory
+            .EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid())
+            .and_then(|a| a.GetDesc1())
+            .ok();
+        let (name, software, vram_mb) = match desc {
+            Some(d) => {
+                let end = d
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(d.Description.len());
+                let name = String::from_utf16_lossy(&d.Description[..end]);
+                let sw = warp
+                    || (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+                    || (d.VendorId == 0x1414 && d.DeviceId == 0x008C);
+                (name, sw, (d.DedicatedVideoMemory as u64) >> 20)
+            }
+            None => ("Unknown D3D12 Adapter".to_owned(), warp, 0),
+        };
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        let sm_ok = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+            .is_ok();
+        let highest_shader_model = if sm_ok {
+            sm.HighestShaderModel.0 as u32
+        } else {
+            0
+        };
+        let shader_model_6_6 = sm_ok && sm.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+
+        let mut opt = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        let opt_ok = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut opt).cast(),
+                size_of_val(&opt) as u32,
+            )
+            .is_ok();
+        let resource_binding_tier = if opt_ok {
+            opt.ResourceBindingTier.0 as u32
+        } else {
+            0
+        };
+
+        let mut opt1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        let opt1_ok = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut opt1).cast(),
+                size_of_val(&opt1) as u32,
+            )
+            .is_ok();
+
+        let mut opt7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+        let opt7_ok = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7,
+                (&raw mut opt7).cast(),
+                size_of_val(&opt7) as u32,
+            )
+            .is_ok();
+
+        Ok(AdapterReport {
+            name,
+            software,
+            vram_mb,
+            shader_model_6_6,
+            highest_shader_model,
+            mesh_shaders: opt7_ok && opt7.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED,
+            wave_ops: opt1_ok && opt1.WaveOps.as_bool(),
+            wave_lanes_min: if opt1_ok { opt1.WaveLaneCountMin } else { 0 },
+            wave_lanes_max: if opt1_ok { opt1.WaveLaneCountMax } else { 0 },
+            resource_binding_tier,
+        })
+    }
+}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;

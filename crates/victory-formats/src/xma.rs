@@ -180,6 +180,7 @@ impl Bits<'_> {
         if n == 0 {
             return 0;
         }
+        let n = n.min(32);
         let v = self.peek32() >> (32 - n);
         self.pos += n as usize;
         v
@@ -190,6 +191,10 @@ impl Bits<'_> {
     }
 
     fn signed(&mut self, n: u32) -> i32 {
+        if n == 0 {
+            return 0;
+        }
+        let n = n.min(32);
         ((self.read(n) << (32 - n)) as i32) >> (32 - n)
     }
 
@@ -1243,5 +1248,23 @@ mod tests {
             );
             assert!(errors == 0 && snr > 40.0);
         }
+    }
+
+    #[test]
+    fn bits_read_and_signed_handle_zero_and_wide_widths() {
+        let data = [0xFFu8, 0x00, 0xAB, 0xCD, 0x12, 0x34];
+        let mut b = Bits {
+            data: &data,
+            pos: 0,
+            end: data.len() * 8,
+        };
+        assert_eq!(b.read(0), 0);
+        assert_eq!(b.signed(0), 0);
+        assert_eq!(b.consumed(), 0);
+        assert_eq!(b.signed(32), 0xFF00_ABCD_u32 as i32);
+        assert_eq!(b.consumed(), 32);
+        // Oversized widths clamp cleanly to 32 without shift overflow (#907).
+        assert_eq!(b.read(40), 0x1234_0000);
+        assert_eq!(b.signed(64), 0);
     }
 }

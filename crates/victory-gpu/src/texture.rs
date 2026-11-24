@@ -198,7 +198,8 @@ impl Staging {
         if !last.not_watched
             && let Some((now, written)) = crate::watch::writes(start, end, false)
         {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            let prev = last.asked;
+            if prev != 0 && written.iter().all(|&(_, w)| w <= prev) {
                 return 0;
             }
             last.asked = now;
@@ -206,7 +207,20 @@ impl Staging {
             // big pools is too slow to ask page by page.
             last.read.resize(size, 0);
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            // If we already detiled once, only re-detile subresources whose
+            // tiled byte extents overlap pages written since `prev` (#915).
+            let dirty: Option<Vec<(u64, u64)>> = (prev != 0).then(|| {
+                written
+                    .iter()
+                    .filter(|&&(_, w)| w > prev)
+                    .map(|&(page, _)| {
+                        let lo = page.saturating_sub(start) as u64;
+                        let hi = page.saturating_add(0x1000).saturating_sub(start).min(size) as u64;
+                        (lo, hi)
+                    })
+                    .collect()
+            });
+            self.detile_ranges(&last.read, dirty.as_deref());
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
@@ -253,8 +267,14 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        self.detile_ranges(tiled, None);
+    }
+
+    /// Detiles subresources whose tiled extents intersect `dirty` (or all
+    /// subresources when `dirty` is `None`).
+    fn detile_ranges(&self, tiled: &[u8], dirty: Option<&[(u64, u64)]>) {
         #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
+        if dirty.is_none() && tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
                 memory = ?self.memory,
                 desc = ?self.layout.desc,
@@ -263,6 +283,12 @@ impl Staging {
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            if let Some(ranges) = dirty
+                && let Ok((lo, hi)) = self.layout.extents(mip, slice)
+                && !ranges.iter().any(|&(a, b)| a < hi && lo < b)
+            {
+                continue;
+            }
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let Some(len) = footprint_slice_len(self.size, footprint.Offset, f.RowPitch, rows, f.Depth)

@@ -599,6 +599,59 @@ impl Layout {
         Ok(())
     }
 
+    /// Exact `[start, end)` byte range in tiled memory touched by one
+    /// subresource (`mip`, `slice`), for partial detiling of dirty pages (#915).
+    pub fn extents(&self, mip: u32, slice: u32) -> Result<(u64, u64), Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let depth = m.depth;
+        let first = if self.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return Err(Error::Invalid);
+            }
+            0
+        } else {
+            slice
+        };
+        if first >= self.slices {
+            return Err(Error::Invalid);
+        }
+        if !self.addressable() {
+            return Err(Error::Unsupported);
+        }
+        let n = u64::from(self.desc.element_bytes);
+        let bytes = u64::from(m.width) * n;
+        let mut lo = u64::MAX;
+        let mut hi = 0u64;
+        if self.desc.swizzle == Swizzle::LINEAR {
+            let tiled_pitch = u64::from(m.pitch) * n;
+            for z in 0..depth {
+                let (s, _) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                let end = base + u64::from(m.height.saturating_sub(1)) * tiled_pitch + bytes;
+                lo = lo.min(base);
+                hi = hi.max(end);
+            }
+        } else {
+            let mut min_col = u64::MAX;
+            let mut max_col = 0u64;
+            for x in 0..m.width {
+                let col = self.column(m, x);
+                min_col = min_col.min(col);
+                max_col = max_col.max(col + n);
+            }
+            for z in 0..depth {
+                let (s, inner) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                for y in 0..m.height {
+                    let row = base + self.row(m, y, inner);
+                    lo = lo.min(row + min_col);
+                    hi = hi.max(row + max_col);
+                }
+            }
+        }
+        Ok((lo, hi))
+    }
+
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
     pub fn tile(
         &self,
@@ -1396,6 +1449,31 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn extents_cover_exact_subresource_bytes() {
+        let mut d = desc(64, 64, 1, 4, Swizzle::SW_64KB_S);
+        d.mips = 4;
+        d.slices = 2;
+        let l = Layout::new(&d).unwrap();
+        for slice in 0..d.slices {
+            for mip in 0..d.mips {
+                let (lo, hi) = l.extents(mip, slice).unwrap();
+                assert!(lo < hi && hi <= l.size);
+                let m = &l.mips[mip as usize];
+                let mut min_off = u64::MAX;
+                let mut max_off = 0u64;
+                for y in 0..m.height {
+                    for x in 0..m.width {
+                        let off = l.offset(mip, x, y, slice).unwrap();
+                        min_off = min_off.min(off);
+                        max_off = max_off.max(off + u64::from(d.element_bytes));
+                    }
+                }
+                assert_eq!((lo, hi), (min_off, max_off));
+            }
+        }
     }
 
     #[test]

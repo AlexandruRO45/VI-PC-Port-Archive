@@ -8330,13 +8330,23 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            let has_data = !bit
+                && p.blocks[b].preds.iter().enumerate().any(|(n, &q)| {
+                    self.tail[q].is_some()
+                        && matches!(self.vals.get(&phi.args[n]), Some(Val::I32(_)))
+                });
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                let is_mask =
+                    self.x.st.masks.contains_key(&arg) || self.x.st.highs.contains_key(&arg);
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
+                    // Register reuse puts a dead lane-mask dword on one edge of
+                    // a data join while another edge carries real data (#878).
+                    (_, false) if has_data && is_mask => self.s.m.undef(self.s.t.i32),
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }

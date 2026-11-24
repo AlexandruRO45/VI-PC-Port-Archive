@@ -173,6 +173,7 @@ extern "system" fn create_status_array(
 /// The queue's description: as in 2020 (source type, capacity, priority,
 /// name), plus a field Grand Theft Auto VI sets to 1.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct QueueDesc {
     source_type: u64,
     capacity: u16,
@@ -204,6 +205,11 @@ extern "system" fn create_queue(
     let Some(scheduler) = scheduler() else {
         return E_OUTOFMEMORY;
     };
+    let owned_name = std::ffi::CString::new(name.as_str()).ok();
+    let mut stored_desc = *desc;
+    stored_desc.name = owned_name
+        .as_ref()
+        .map_or(std::ptr::null(), |s| s.as_ptr());
     let mut lanes = scheduler.lock();
     let id = lanes.next_id;
     lanes.next_id += 1;
@@ -212,7 +218,14 @@ extern "system" fn create_queue(
     drop(lanes);
     put(
         out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+        Instance::create(
+            Object::new("dstorage queue", &QUEUE_VTABLE),
+            Queue {
+                id,
+                desc: stored_desc,
+                _name: owned_name,
+            },
+        ),
     )
 }
 
@@ -305,9 +318,25 @@ static STATUS_VTABLE: Methods<5> = Methods([
 
 // Queues.
 
-/// A queue object: its lane in the scheduler.
+/// A queue object: its lane in the scheduler, plus the creation description
+/// (with an owned C string so `Query` always returns a valid `name` pointer).
 struct Queue {
     id: u64,
+    desc: QueueDesc,
+    _name: Option<std::ffi::CString>,
+}
+
+// SAFETY: `desc.name` points into `_name` (immutable heap CString) or is null.
+unsafe impl Send for Queue {}
+// SAFETY: as above.
+unsafe impl Sync for Queue {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QueueInfo {
+    desc: QueueDesc,
+    empty_slot_count: u32,
+    request_count_until_auto_submit: u32,
 }
 
 impl Drop for Queue {
@@ -784,6 +813,61 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// Drops unsubmitted and queued-not-yet-started reads matching
+/// `(tag & mask) == value` without recording an error, flushes any newly
+/// unblocked statuses, and wakes capacity waiters (#889).
+extern "system" fn cancel_requests_with_tag(this: QueueRef, mask: u64, value: u64) {
+    // SAFETY: a queue we created and the title still holds.
+    let id = unsafe { &*this }.state.id;
+    let Some(scheduler) = scheduler() else {
+        return;
+    };
+    let mut lanes = scheduler.lock();
+    let Some(lane) = lanes.lanes.get_mut(&id).filter(|l| !l.closed) else {
+        return;
+    };
+    lane.unsubmitted.retain(|cmd| match cmd {
+        Command::Read(req) => (req.tag & mask) != value,
+        Command::Status(_) => true,
+    });
+    lane.reads.retain(|(_, req)| (req.tag & mask) != value);
+    lane.flush();
+    scheduler.finished.notify_all();
+}
+
+/// Fills `DSTORAGE_QUEUE_INFO` with the creation description and live slot
+/// counts (#889).
+extern "system" fn query_queue(this: QueueRef, info: *mut QueueInfo) {
+    if info.is_null() {
+        return;
+    }
+    // SAFETY: a queue we created and the title still holds.
+    let q = unsafe { &*this };
+    let (empty_slot_count, until_auto) = scheduler()
+        .map(|s| {
+            let lanes = s.lock();
+            match lanes.lanes.get(&q.state.id).filter(|l| !l.closed) {
+                Some(lane) => {
+                    let cap = lane.capacity.max(2);
+                    let empty = cap.saturating_sub(lane.entries() + 1) as u32;
+                    let half = (lane.capacity / 2).max(1);
+                    let until = half.saturating_sub(lane.unsubmitted.len()) as u32;
+                    (empty, until)
+                }
+                None => (0, 0),
+            }
+        })
+        .unwrap_or((0, 0));
+    // SAFETY: checked non-null; the title passes a writable `QueueInfo`.
+    unsafe {
+        info.write(QueueInfo {
+            desc: q.state.desc,
+            empty_slot_count,
+            request_count_until_auto_submit: until_auto,
+        });
+    }
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
@@ -1061,15 +1145,15 @@ static QUEUE_VTABLE: Methods<12> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<Queue> as *const (),
     release::<Queue> as *const (),
-    enqueue_request as *const (), // 0x18
-    enqueue_status as *const (),  // 0x20
-    missing::<5> as *const (),    // 0x28 (2020: fence signal)
-    submit as *const (),          // 0x30
-    missing::<7> as *const (),    // 0x38 (2020: cancel by tag)
-    close as *const (),           // 0x40
-    missing::<9> as *const (),    // 0x48 (2020: error event)
-    missing::<10> as *const (),   // 0x50 (2020: error record)
-    missing::<11> as *const (),   // 0x58 (2020: queue info)
+    enqueue_request as *const (),          // 0x18
+    enqueue_status as *const (),           // 0x20
+    missing::<5> as *const (),             // 0x28 (2020: fence signal)
+    submit as *const (),                   // 0x30
+    cancel_requests_with_tag as *const (), // 0x38 (2020: cancel by tag)
+    close as *const (),                    // 0x40
+    missing::<9> as *const (),             // 0x48 (2020: error event)
+    missing::<10> as *const (),            // 0x50 (2020: error record)
+    query_queue as *const (),              // 0x58 (2020: queue info)
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -1616,5 +1700,81 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn cancel_requests_with_tag_and_query_track_queue_state() {
+        let create_queue: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 1,
+            capacity: 16,
+            priority: 0,
+            name: c"cancel-test".as_ptr(),
+            unknown: 1,
+        };
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(
+            create_queue(factory(), &desc, std::ptr::null(), &mut queue),
+            S_OK
+        );
+        let array = status_array(2);
+
+        // Query on empty queue (null pointer is tolerated).
+        let qfn: extern "system" fn(*mut c_void, *mut QueueInfo) = call(queue, 0x58);
+        qfn(queue, std::ptr::null_mut());
+        let mut info = std::mem::MaybeUninit::<QueueInfo>::zeroed();
+        qfn(queue, info.as_mut_ptr());
+        // SAFETY: written by `query_queue`.
+        let info = unsafe { info.assume_init() };
+        assert_eq!(info.desc.capacity, 16);
+        assert_eq!(text(info.desc.name), "cancel-test");
+        assert_eq!(info.empty_slot_count, 15);
+        assert_eq!(info.request_count_until_auto_submit, 8);
+
+        // Enqueue two tagged reads; cancel one before submit.
+        let src = [0x42u8; 16];
+        let mut dst_a = [0u8; 16];
+        let mut dst_b = [0u8; 16];
+        let mut r1 = request(
+            MEMORY_SOURCE,
+            dst_a.as_mut_ptr().cast(),
+            16,
+            src.as_ptr().cast(),
+            0,
+            16,
+        );
+        r1.tag = 0xAA01;
+        let mut r2 = request(
+            MEMORY_SOURCE,
+            dst_b.as_mut_ptr().cast(),
+            16,
+            src.as_ptr().cast(),
+            0,
+            16,
+        );
+        r2.tag = 0xBB02;
+        enqueue(queue, &r1);
+        enqueue(queue, &r2);
+        let cancel: extern "system" fn(*mut c_void, u64, u64) = call(queue, 0x38);
+        cancel(queue, 0xFF00, 0xAA00);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30); // submit
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(dst_a, [0u8; 16], "cancelled read must leave destination untouched");
+        assert_eq!(dst_b, src, "unmatched read must complete");
+
+        // Close sets empty_slot_count to 0 while keeping name valid.
+        void(queue, 0x40);
+        let mut closed = std::mem::MaybeUninit::<QueueInfo>::zeroed();
+        qfn(queue, closed.as_mut_ptr());
+        // SAFETY: written by `query_queue`.
+        let closed = unsafe { closed.assume_init() };
+        assert_eq!(closed.empty_slot_count, 0);
+        assert_eq!(text(closed.desc.name), "cancel-test");
+        let rel: extern "system" fn(*mut c_void) -> u32 = call(queue, 0x10);
+        assert_eq!(rel(queue), 0);
+        let rel_arr: extern "system" fn(*mut c_void) -> u32 = call(array, 0x10);
+        assert_eq!(rel_arr(array), 0);
     }
 }

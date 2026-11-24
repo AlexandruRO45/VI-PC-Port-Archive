@@ -66,8 +66,14 @@ Run the title:
 
 ```powershell
 cargo build --release -p victory
+target\release\victory.exe doctor                              # check GPU / SM 6.6 / Mesh Shaders
+target\release\victory.exe                                     # interactive Windows launcher menu
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
+
+You can also double-click `victory.exe` to open the interactive PC readiness &
+title launcher menu, or drag-and-drop a title `.exe` directly onto `victory.exe`
+in Windows Explorer.
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
@@ -96,6 +102,8 @@ victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
+victory doctor
+victory                                    # interactive Windows launcher menu
 ```
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs

@@ -10,6 +10,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put};
@@ -263,30 +264,141 @@ extern "system" fn stream_data(
     S_OK
 }
 
+/// Matches GDK `XClosedCaptionProperties` (`XAccessibility.h`, #865).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClosedCaptionProperties {
+    pub background_color: u32,
+    pub font_color: u32,
+    pub window_color: u32,
+    pub font_edge_attribute: u32,
+    pub font_style: u32,
+    pub font_scale: f32,
+    pub enabled: u8,
+}
+
+const _: () = assert!(size_of::<ClosedCaptionProperties>() == 28);
+const _: () = assert!(align_of::<ClosedCaptionProperties>() == 4);
+
+static CAPTIONS: AtomicBool = AtomicBool::new(false);
+static HYPOTHESIS_ID: AtomicU32 = AtomicU32::new(1);
+
+extern "system" fn closed_caption_get_properties(
+    _: This,
+    out: *mut ClosedCaptionProperties,
+) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    put(
+        out,
+        ClosedCaptionProperties {
+            background_color: 0xFF00_0000,
+            font_color: 0xFFFF_FFFF,
+            window_color: 0x0000_0000,
+            font_edge_attribute: 0,
+            font_style: 0,
+            font_scale: 1.0,
+            enabled: u8::from(CAPTIONS.load(Ordering::Acquire)),
+        },
+    )
+}
+
+extern "system" fn closed_caption_set_enabled(_: This, enabled: bool) -> HRESULT {
+    CAPTIONS.store(enabled, Ordering::Release);
+    S_OK
+}
+
+extern "system" fn high_contrast_get_mode(_: This, out: *mut u32) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    put(out, 0u32) // XHighContrastMode::Off
+}
+
+extern "system" fn stt_position_hint(_: This, position: u32) -> HRESULT {
+    tracing::debug!(position, "speech-to-text position hint");
+    S_OK
+}
+
+extern "system" fn stt_send_string(
+    _: This,
+    speaker: *const c_char,
+    content: *const c_char,
+    kind: u32,
+) -> HRESULT {
+    tracing::debug!(
+        speaker = read_cstr(speaker),
+        content = read_cstr(content),
+        kind,
+        "speech-to-text send"
+    );
+    S_OK
+}
+
+extern "system" fn stt_begin_hypothesis(
+    _: This,
+    speaker: *const c_char,
+    content: *const c_char,
+    kind: u32,
+    out: *mut u32,
+) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    let mut id = HYPOTHESIS_ID.fetch_add(1, Ordering::Relaxed);
+    if id == 0 {
+        id = HYPOTHESIS_ID.fetch_add(1, Ordering::Relaxed);
+    }
+    tracing::debug!(
+        id,
+        speaker = read_cstr(speaker),
+        content = read_cstr(content),
+        kind,
+        "speech-to-text begin hypothesis"
+    );
+    put(out, id)
+}
+
+extern "system" fn stt_update_hypothesis(_: This, id: u32, content: *const c_char) -> HRESULT {
+    tracing::debug!(id, content = read_cstr(content), "speech-to-text update");
+    S_OK
+}
+
+extern "system" fn stt_finalize_hypothesis(_: This, id: u32, content: *const c_char) -> HRESULT {
+    tracing::debug!(id, content = read_cstr(content), "speech-to-text finalize");
+    S_OK
+}
+
+extern "system" fn stt_cancel_hypothesis(_: This, id: u32) -> HRESULT {
+    tracing::debug!(id, "speech-to-text cancel");
+    S_OK
+}
+
 /// Slots by the 2020 order; Grand Theft Auto VI calls 0x40-0x80 and 0xa8.
 static VTABLE: Methods<22> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    missing::<3> as *const (),
-    missing::<4> as *const (),
-    missing::<5> as *const (),
-    missing::<6> as *const (),
-    missing::<7> as *const (),
-    enumerate_voices as *const (),   // 0x40
-    create as *const (),             // 0x48
-    close_synthesizer as *const (),  // 0x50
-    set_default_voice as *const (),  // 0x58
-    set_custom_voice as *const (),   // 0x60
-    create_stream as *const (),      // 0x68 text
-    close_stream as *const (),       // 0x70
-    stream_size as *const (),        // 0x78
-    stream_data as *const (),        // 0x80
-    missing::<17> as *const (),      // 0x88
-    missing::<18> as *const (),      // 0x90
-    missing::<19> as *const (),      // 0x98
-    missing::<20> as *const (),      // 0xa0
-    create_stream_ssml as *const (), // 0xa8 SSML
+    closed_caption_get_properties as *const (), // 0x18
+    closed_caption_set_enabled as *const (),    // 0x20
+    high_contrast_get_mode as *const (),        // 0x28
+    stt_position_hint as *const (),             // 0x30
+    stt_send_string as *const (),               // 0x38
+    enumerate_voices as *const (),              // 0x40
+    create as *const (),                        // 0x48
+    close_synthesizer as *const (),             // 0x50
+    set_default_voice as *const (),             // 0x58
+    set_custom_voice as *const (),              // 0x60
+    create_stream as *const (),                 // 0x68 text
+    close_stream as *const (),                  // 0x70
+    stream_size as *const (),                   // 0x78
+    stream_data as *const (),                   // 0x80
+    stt_begin_hypothesis as *const (),          // 0x88
+    stt_update_hypothesis as *const (),         // 0x90
+    stt_finalize_hypothesis as *const (),       // 0x98
+    stt_cancel_hypothesis as *const (),         // 0xa0
+    create_stream_ssml as *const (),            // 0xa8 SSML
 ]);
 
 /// Windows SAPI 5 speech synthesis via dynamically loaded `ole32.dll` COM
@@ -699,5 +811,49 @@ mod tests {
             S_OK
         );
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn accessibility_captions_high_contrast_and_stt_slots_work() {
+        use crate::modules::xgameruntime::method;
+
+        type GetCc = extern "system" fn(This, *mut ClosedCaptionProperties) -> HRESULT;
+        type SetCc = extern "system" fn(This, bool) -> HRESULT;
+        type GetHc = extern "system" fn(This, *mut u32) -> HRESULT;
+        type Begin =
+            extern "system" fn(This, *const c_char, *const c_char, u32, *mut u32) -> HRESULT;
+        type Update = extern "system" fn(This, u32, *const c_char) -> HRESULT;
+        type Cancel = extern "system" fn(This, u32) -> HRESULT;
+
+        let mut props = ClosedCaptionProperties {
+            background_color: 0,
+            font_color: 0,
+            window_color: 0,
+            font_edge_attribute: 0,
+            font_style: 0,
+            font_scale: 0.0,
+            enabled: 9,
+        };
+        assert_eq!(method::<GetCc>(&OBJECT, 0x18)(&OBJECT, std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(method::<SetCc>(&OBJECT, 0x20)(&OBJECT, true), S_OK);
+        assert_eq!(method::<GetCc>(&OBJECT, 0x18)(&OBJECT, &mut props), S_OK);
+        assert_eq!(props.enabled, 1);
+        assert_eq!(props.font_scale, 1.0);
+        assert_eq!(method::<SetCc>(&OBJECT, 0x20)(&OBJECT, false), S_OK);
+
+        let mut hc = 7u32;
+        assert_eq!(method::<GetHc>(&OBJECT, 0x28)(&OBJECT, std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(method::<GetHc>(&OBJECT, 0x28)(&OBJECT, &mut hc), S_OK);
+        assert_eq!(hc, 0);
+
+        let (mut id1, mut id2) = (0u32, 0u32);
+        let begin = method::<Begin>(&OBJECT, 0x88);
+        assert_eq!(begin(&OBJECT, c"P1".as_ptr(), c"hi".as_ptr(), 0, std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(begin(&OBJECT, c"P1".as_ptr(), c"hi".as_ptr(), 0, &mut id1), S_OK);
+        assert_eq!(begin(&OBJECT, c"P1".as_ptr(), c"yo".as_ptr(), 0, &mut id2), S_OK);
+        assert!(id1 > 0 && id2 > id1);
+        assert_eq!(method::<Update>(&OBJECT, 0x90)(&OBJECT, id1, c"hi!".as_ptr()), S_OK);
+        assert_eq!(method::<Update>(&OBJECT, 0x98)(&OBJECT, id1, c"hi!".as_ptr()), S_OK);
+        assert_eq!(method::<Cancel>(&OBJECT, 0xa0)(&OBJECT, id2), S_OK);
     }
 }

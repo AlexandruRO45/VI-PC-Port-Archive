@@ -65,23 +65,29 @@ impl Cache {
             .open(&tmp)?;
         let written = file.write_all(&output);
         drop(file);
-        let published = written.and_then(|()| {
-            match std::fs::rename(&tmp, &path) {
+        // Publish atomically without replacing an already-published entry:
+        // on Windows NTFS, `rename` uses `MOVEFILE_REPLACE_EXISTING` which
+        // briefly marks an existing file delete-pending and causes concurrent
+        // readers to fail with `ERROR_ACCESS_DENIED` (os error 5) (#890).
+        // `hard_link` leaves any existing file untouched and fails cleanly
+        // with `AlreadyExists` on a race.
+        let published = written.and_then(|()| match std::fs::hard_link(&tmp, &path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&tmp);
+                Ok(())
+            }
+            Err(_) if path.is_file() => {
+                let _ = std::fs::remove_file(&tmp);
+                Ok(())
+            }
+            Err(_) => match std::fs::rename(&tmp, &path) {
                 Ok(()) => Ok(()),
-                // On Windows, concurrent publication of the same
-                // content-addressed key races on `rename` when the winning
-                // file already exists or is open for reading (#890).
-                Err(e) if path.is_file() => {
-                    tracing::trace!(
-                        error = %e,
-                        path = %path.display(),
-                        "cache entry published concurrently"
-                    );
+                Err(_) if path.is_file() => {
                     let _ = std::fs::remove_file(&tmp);
                     Ok(())
                 }
                 Err(e) => Err(e),
-            }
+            },
         });
         if published.is_err() {
             let _ = std::fs::remove_file(&tmp);
