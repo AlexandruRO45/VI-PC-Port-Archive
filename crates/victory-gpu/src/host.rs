@@ -1297,7 +1297,8 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
+        let entries = std::mem::take(&mut self.refreshes);
+        let done = |shadow: &crate::shadow::Shadow, from: usize, to: usize| {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
@@ -1305,7 +1306,28 @@ impl Batch {
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        };
+        // One buffer each, so the copies are independent, and they are the
+        // kernel reads of title memory that one thread does at a fraction of
+        // what the machine can. `VICTORY_COPY_THREADS=1` puts them back on
+        // one thread, for an A/B of the frame line.
+        let threads = copy_threads().min(entries.len());
+        if threads <= 1 {
+            for (shadow, from, to) in &entries {
+                done(shadow, *from, *to);
+            }
+            return;
         }
+        let per = entries.len().div_ceil(threads);
+        std::thread::scope(|s| {
+            for part in entries.chunks(per) {
+                s.spawn(move || {
+                    for (shadow, from, to) in part {
+                        done(shadow, *from, *to);
+                    }
+                });
+            }
+        });
     }
 }
 

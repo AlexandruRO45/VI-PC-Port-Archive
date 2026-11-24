@@ -690,3 +690,91 @@ mod parallel_cost {
         );
     }
 }
+#[cfg(test)]
+mod flush_cost {
+    use super::*;
+    use std::time::Instant;
+
+    /// `Shadow::update` - what a submission pays to bring its ranges up to
+    /// date before the lists run - on independent ranges, one thread against
+    /// eight. Synthetic memory, no write-watch, so every range is copied
+    /// whole: the worst case that `Batch::flush` does when the watch cannot
+    /// answer.
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture shadow_flush`
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn shadow_flush() {
+        const RANGES: usize = 16;
+        const MIB: usize = 4;
+        const THREADS: usize = 8;
+        let size = MIB << 20;
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host device");
+            return;
+        };
+        let setup = |ranges: usize| -> Option<(Vec<Vec<u8>>, Vec<Shadow>)> {
+            let mut titles = Vec::new();
+            let mut shadows = Vec::new();
+            for _ in 0..ranges {
+                let mut title = vec![0u8; size];
+                for (i, b) in title.iter_mut().enumerate() {
+                    *b = (i % 251) as u8;
+                }
+                let (buffer, data) = host.shared_buffer(size as u64)?;
+                // SAFETY: the mapping is `size` bytes.
+                let gpu = unsafe {
+                    std::ptr::copy_nonoverlapping(title.as_ptr(), data, size);
+                    buffer.GetGPUVirtualAddress()
+                };
+                let start = title.as_ptr() as usize;
+                shadows.push(Shadow::new(buffer, data.cast(), gpu, start as u64, size as u64));
+                titles.push(title);
+            }
+            Some((titles, shadows))
+        };
+
+        let Some((titles, shadows)) = setup(RANGES) else {
+            eprintln!("no host device or buffer");
+            return;
+        };
+        let starts: Vec<usize> = titles.iter().map(|t| t.as_ptr() as usize).collect();
+        let t = Instant::now();
+        let mut one = 0usize;
+        for (shadow, start) in shadows.iter().zip(&starts) {
+            one += shadow.update(*start, size);
+        }
+        let sequential = t.elapsed();
+
+        let Some((titles2, shadows2)) = setup(RANGES) else {
+            return;
+        };
+        let starts2: Vec<usize> = titles2.iter().map(|t| t.as_ptr() as usize).collect();
+        let per = RANGES.div_ceil(THREADS);
+        let t = Instant::now();
+        let many: usize = std::thread::scope(|s| {
+            let handles: Vec<_> = shadows2
+                .chunks(per)
+                .enumerate()
+                .map(|(i, part)| {
+                    let starts = &starts2;
+                    s.spawn(move || {
+                        part.iter()
+                            .enumerate()
+                            .map(|(k, shadow)| shadow.update(starts[i * per + k], size))
+                            .sum::<usize>()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
+        });
+        let parallel = t.elapsed();
+        println!(
+            "\n{RANGES} x {MIB} MiB update: sequential {:.1} ms, {THREADS} threads {:.1} ms, {:.2}x ({} vs {} bytes)\n",
+            sequential.as_secs_f64() * 1e3,
+            parallel.as_secs_f64() * 1e3,
+            sequential.as_secs_f64() / parallel.as_secs_f64(),
+            one,
+            many
+        );
+    }
+}
