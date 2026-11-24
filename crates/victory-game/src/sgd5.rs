@@ -3925,4 +3925,77 @@ mod tests {
             }
         }
     }
+
+    /// One final fixed-code block: the literals `ABC`, then a copy coded by
+    /// length symbol `length` (257 to 264: 3 to 10 bytes, or 285: 258)
+    /// from `distance` (1 to 4) bytes back, then the end of the block.
+    fn abc_then_copy(length: u32, distance: u32) -> Vec<u8> {
+        let mut bits = Bits::default();
+        bits.put(1, 1); // BFINAL
+        bits.put(1, 2); // fixed codes
+        for b in *b"ABC" {
+            bits.code(0x30 + u32::from(b), 8); // literals 0-143: 8 bits from 0x30
+        }
+        match length {
+            257..=264 => bits.code(length - 256, 7), // 256-279: 7 bits from 0
+            285 => bits.code(0xC0 + 285 - 280, 8),   // 280-287: 8 bits from 0xC0
+            _ => unreachable!("a length symbol without extra bits"),
+        }
+        bits.code(distance - 1, 5); // distance codes 0-3: 1-4, no extra bits
+        bits.code(0, 7); // end of block (256)
+        bits.out
+    }
+
+    #[test]
+    fn copy_longer_than_its_distance_repeats_what_it_makes() {
+        // A copy may be longer than its distance: it then reads bytes it has
+        // just made, repeating the last `distance` bytes. After `ABC`, every
+        // length from 3 bytes back reaches the first byte and no further,
+        // and is a stream; from 4 bytes back it reaches before the start
+        // and breaks, however long. A copy 1 or 2 back repeats a shorter
+        // tail. Either way the record covers no other, so it is yielded,
+        // unpacking only if it is a stream, and the record after it is
+        // found.
+        let repeat = |length: usize, distance: usize| -> Vec<u8> {
+            let mut out = b"ABC".to_vec();
+            for _ in 0..length {
+                out.push(out[out.len() - distance]);
+            }
+            out
+        };
+        assert_eq!(repeat(4, 3), b"ABCABCA");
+        assert_eq!(repeat(4, 2), b"ABCBCBC");
+        for (symbol, length) in [(257, 3), (258, 4), (264, 10), (285, 258)] {
+            for distance in 1..=4 {
+                let what = format!("{length} bytes from {distance} back");
+                let packed = abc_then_copy(symbol, distance);
+                let valid = distance <= 3;
+                let want = repeat(length, distance.min(3) as usize);
+                assert_eq!(want.len(), 3 + length, "{what}");
+                assert_eq!(
+                    miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                    valid.then(|| want.clone()),
+                    "{what}"
+                );
+                assert_eq!(starts_stream(&packed, want.len()), valid, "{what}");
+                if valid {
+                    assert!(!starts_stream(&packed, want.len() - 1), "{what}");
+                    assert!(!starts_stream(&packed, want.len() + 1), "{what}");
+                }
+
+                let (file, marker) = outer_then_after(&packed, want.len());
+                let found: Vec<_> = records(&file).collect();
+                let names: Vec<_> = found.iter().map(|r| r.name).collect();
+                assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+                assert_eq!(
+                    found[0].span(),
+                    marker..marker + 12 + packed.len(),
+                    "{what}"
+                );
+                assert_eq!(found[0].unpack(), valid.then(|| want.clone()), "{what}");
+                assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+                assert_eq!(found[1].span().end, file.len(), "{what}");
+            }
+        }
+    }
 }
