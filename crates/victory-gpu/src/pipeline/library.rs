@@ -26,6 +26,10 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+mod mapped;
+use mapped::View;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -45,8 +49,12 @@ pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 
 struct Library {
     library: ID3D12PipelineLibrary1,
-    /// The blob the library was made from: it must outlive the library.
-    _blob: Vec<u8>,
+    /// The mapping and its original file drop after the COM object.
+    source: Option<View>,
+    touched: Option<Instant>,
+    /// Tag for the last successfully published generation, not necessarily
+    /// the one still mapped by this COM object.
+    published_tag: Option<String>,
     /// Pipelines stored since the last save.
     added: u64,
     /// Title pipelines the pre-build put in the library or found there, by
@@ -65,20 +73,28 @@ const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
+static LIBRARY: OnceLock<Option<Mutex<Library>>> = OnceLock::new();
+
 fn library() -> Option<&'static Mutex<Library>> {
-    static LIBRARY: OnceLock<Option<Mutex<Library>>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
-            let blob = read(LIBRARY_FILE).unwrap_or_default();
-            let tag = tag(&blob);
-            let mut library = open(&device, blob);
-            // The pre-build's list, if it was saved with these bytes.
-            if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
-                && !l._blob.is_empty()
+            let source = DIR.get().and_then(|d| match View::open_latest(&d.join(LIBRARY_FILE)) {
+                Ok(view) => Some(view),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot map host pipeline library");
+                    None
+                }
+            });
+            let mut library = open(&device, source);
+            // A stale manifest cannot skip AOT work on another generation.
+            if let Some(l) = library.as_mut()
+                && let Some(tag) = &l.published_tag
+                && let Some(list) = read(PREBUILT_FILE)
             {
-                l.prebuilt = listed(&list, &tag);
+                l.prebuilt = listed(&list, tag);
             }
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -90,22 +106,24 @@ fn library() -> Option<&'static Mutex<Library>> {
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
-fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
+fn open(device: &ID3D12Device1, source: Option<View>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
         }
     };
-    if !blob.is_empty() {
-        let started = std::time::Instant::now();
-        match make(&blob) {
+    if let Some(source) = source {
+        let started = Instant::now();
+        match make(source.bytes()) {
             Ok(library) => {
                 let ms = started.elapsed().as_millis() as u64;
-                tracing::info!(bytes = blob.len(), ms, "host pipeline library loaded");
+                tracing::info!(bytes = source.bytes().len(), ms, "host pipeline library mapped");
                 return Some(Library {
                     library,
-                    _blob: blob,
+                    published_tag: Some(tag(source.bytes())),
+                    source: Some(source),
+                    touched: Some(Instant::now()),
                     added: 0,
                     prebuilt: HashSet::new(),
                     prebuilt_changed: false,
@@ -119,7 +137,9 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     let library = make(&[]).ok()?;
     Some(Library {
         library,
-        _blob: Vec::new(),
+        source: None,
+        touched: None,
+        published_tag: None,
         added: 0,
         prebuilt: HashSet::new(),
         prebuilt_changed: false,
@@ -201,9 +221,14 @@ pub(crate) fn pipeline(
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
-    if let Ok(pso) = load(&library.lock().unwrap_or_else(|e| e.into_inner()).library, PCWSTR(wide.as_ptr())) {
-        LOADED.fetch_add(1, Ordering::Relaxed);
-        return Ok(pso);
+    {
+        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+        let loaded = load(&l.library, PCWSTR(wide.as_ptr()));
+        l.touch();
+        if let Ok(pso) = loaded {
+            LOADED.fetch_add(1, Ordering::Relaxed);
+            return Ok(pso);
+        }
     }
     // Compiled outside the lock: compiles take up to seconds.
     #[cfg(feature = "diagnostics")]
@@ -216,6 +241,7 @@ pub(crate) fn pipeline(
     if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
         l.added += 1;
     }
+    l.touch();
     Ok(pso)
 }
 
@@ -227,12 +253,44 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+impl Library {
+    fn touch(&mut self) {
+        if self.source.is_some() {
+            self.touched = Some(Instant::now());
+        }
+    }
+}
+
+/// Evict cold file-backed pages without opening a library on the frame thread.
+pub(crate) fn trim_idle() {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_TRIM").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let Some(lock) = LIBRARY.get().and_then(Option::as_ref) else { return };
+    let cold = |l: &Library| l.touched.is_some_and(|t| t.elapsed() >= Duration::from_secs(10));
+    if !lock.try_lock().is_ok_and(|l| cold(&l)) {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("victory-library-trim".into()).spawn(move || {
+        let mut l = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if cold(&l) {
+            l.touched = None;
+            if let Some(view) = &l.source
+                && let Err(e) = view.trim()
+            {
+                tracing::debug!(error = %e, "pipeline library trim failed");
+            }
+        }
+    });
+}
+
+/// Save the early list independently from the driver's cache blob. Keep
+/// the AOT manifest tagged with the exact bytes successfully published.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -240,45 +298,44 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    let (blob, prebuilt) = {
-        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
-            return;
+    let early = save_early(dir);
+    let Some(library) = library() else { return };
+    let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+    if l.added == 0 && !l.prebuilt_changed {
+        return;
+    }
+    let written = (|| -> std::io::Result<usize> {
+        std::fs::create_dir_all(dir)?;
+        let mut size = 0;
+        if l.added != 0 || l.published_tag.is_none() {
+            // SAFETY: the library mutex guards the size/serialization pair.
+            size = unsafe { l.library.GetSerializedSize() };
+            let mut published = None;
+            let result = mapped::publish(&dir.join(LIBRARY_FILE), size, |out| {
+                // SAFETY: an exclusive mapped buffer of the requested size.
+                unsafe { l.library.Serialize(out) }.map_err(std::io::Error::other)?;
+                published = Some(tag(out));
+                Ok(())
+            });
+            l.touch();
+            result?;
+            l.added = 0;
+            l.published_tag = published;
+            l.prebuilt_changed |= !l.prebuilt.is_empty();
         }
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe {
-            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-            l.library.Serialize(&mut bytes).map(|()| bytes)
-        };
-        match bytes {
-            Ok(bytes) => {
-                l.added = 0;
-                l.prebuilt_changed = false;
-                // Kept beside the bytes it holds for (also when a run adds
-                // pipelines).
-                let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
-                return;
-            }
+        if l.prebuilt_changed && let Some(tag) = &l.published_tag {
+            write_atomically(&dir.join(PREBUILT_FILE), list(tag, &l.prebuilt).as_bytes())?;
+            l.prebuilt_changed = false;
         }
-    };
-    let used = USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
-        .and_then(|()| match &prebuilt {
-            Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
-            None => Ok(()),
-        });
+        Ok(size)
+    })();
+    drop(l);
     let (created, distinct) = created();
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
-        Ok(()) => tracing::info!(
-            bytes = blob.len(),
-            early = used.len(),
+        Ok(bytes) => tracing::info!(
+            bytes,
+            early,
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
@@ -290,6 +347,22 @@ pub(crate) fn save(now: bool) {
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
+}
+
+fn save_early(dir: &std::path::Path) -> usize {
+    let used = USED.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(used) = used.as_ref() else { return 0 };
+    if !USED_CHANGED.load(Ordering::Relaxed) {
+        return 0;
+    }
+    let keys = used.list();
+    match std::fs::create_dir_all(dir)
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), keys.join("\n").as_bytes()))
+    {
+        Ok(()) => USED_CHANGED.store(false, Ordering::Relaxed),
+        Err(e) => tracing::warn!(error = %e, "early pipelines not saved"),
+    }
+    keys.len()
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -411,9 +484,36 @@ mod tests {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
-        let library = open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        std::fs::write(&path, b"not a pipeline library").unwrap();
+        let library = open(&device, Some(View::open_latest(&path).unwrap())).expect("empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
-        assert!(library._blob.is_empty());
+        assert!(library.source.is_none());
+    }
+
+    #[test]
+    fn manifest_tag_follows_the_published_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        let keys = HashSet::from(["fixture".to_owned()]);
+        let save = |byte| {
+            let mut result = None;
+            mapped::publish(&path, 4096, |out| {
+                out.fill(byte);
+                result = Some(list(&tag(out), &keys));
+                Ok(())
+            }).unwrap();
+            result.unwrap()
+        };
+        let previous = save(0xa5);
+        let old = View::open_latest(&path).unwrap();
+        let current = save(0x5a);
+        let new = View::open_latest(&path).unwrap();
+        assert_eq!(listed(current.as_bytes(), &tag(new.bytes())), keys);
+        assert!(listed(previous.as_bytes(), &tag(new.bytes())).is_empty());
+        old.trim().unwrap();
+        assert_eq!(listed(previous.as_bytes(), &tag(old.bytes())), keys);
     }
 }
