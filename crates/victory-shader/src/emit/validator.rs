@@ -5,7 +5,8 @@
 //! The DLL is found at `VICTORY_DXIL` if set, else the newest Windows SDK's
 //! `bin\<version>\x64\dxil.dll`, else wherever `LoadLibrary` finds it.
 
-use std::ffi::c_void;
+use std::ffi::{OsStr, c_void};
+use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
@@ -152,17 +153,13 @@ impl Validator {
 
     /// Loads `path`'s validator (or `dxil.dll` from the DLL search path).
     pub fn load(path: Option<&std::path::Path>) -> Result<Self, String> {
-        let name: Vec<u16> = path
-            .map_or_else(|| "dxil.dll".into(), |p| p.as_os_str().to_owned())
-            .to_string_lossy()
-            .encode_utf16()
-            .chain([0])
-            .collect();
+        let target: &OsStr = path.map_or(OsStr::new("dxil.dll"), |p| p.as_os_str());
+        let name: Vec<u16> = target.encode_wide().chain([0]).collect();
         // SAFETY: plain Win32 calls with a NUL-terminated name.
         unsafe {
             let module = LoadLibraryW(name.as_ptr());
             if module.is_null() {
-                return Err(format!("cannot load {}", String::from_utf16_lossy(&name)));
+                return Err(format!("cannot load {}", target.to_string_lossy()));
             }
             Self::from_module(module, FreeLibrary, |module| {
                 let create = GetProcAddress(module, c"DxcCreateInstance".as_ptr().cast())
@@ -198,6 +195,13 @@ impl Validator {
     /// Validates `container` and signs it in place; the error text if it
     /// is rejected.
     pub fn validate(&mut self, container: &mut [u8]) -> Result<(), String> {
+        // `dxil.dll` trusts header size/part fields on `"DXBC"` blobs before
+        // checking `IDxcBlob::GetBufferSize()`, causing an access violation on
+        // truncated/malformed containers. Pre-validate DXBC framing in safe Rust
+        // while leaving non-DXBC unit-test stubs untouched.
+        if container.starts_with(b"DXBC") {
+            crate::dxbc::Container::parse(container).map_err(|e| e.to_string())?;
+        }
         let mut blob = Blob {
             vtable: &BLOB_VTABLE,
             data: container.as_mut_ptr(),
@@ -610,5 +614,39 @@ mod tests {
         drop(validator);
         assert_eq!(module.frees, 1);
         assert_eq!(module.object_releases_at_free, 1);
+    }
+
+    #[test]
+    fn load_error_has_no_trailing_nul() {
+        let missing = std::path::Path::new(r"Z:\nonexistent\victory_missing_dxil_test.dll");
+        let err = Validator::load(Some(missing)).err().unwrap();
+        assert!(!err.contains('\0'), "error string had trailing NUL: {err:?}");
+        assert!(err.contains("victory_missing_dxil_test.dll"));
+    }
+
+    #[test]
+    fn truncated_dxbc_container_is_rejected_before_calling_dxil() {
+        unsafe extern "system" fn panic_validate(
+            _: Object,
+            _: *mut Blob,
+            _: u32,
+            _: *mut Object,
+        ) -> Hresult {
+            panic!("IDxcValidator::Validate must not be called on malformed DXBC");
+        }
+        let vtable = [
+            0,
+            0,
+            mock_release as *const () as usize,
+            panic_validate as *const () as usize,
+        ];
+        let mut validator_mock = Mock::new(&vtable, ());
+        let mut validator = Validator {
+            object: validator_mock.object(),
+            _module: None,
+        };
+        // Starts with "DXBC" magic but is truncated (< 32-byte header).
+        let mut truncated = b"DXBC\x00\x00\x00\x00".to_vec();
+        assert!(validator.validate(&mut truncated).is_err());
     }
 }
