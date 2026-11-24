@@ -286,6 +286,82 @@ fn import_size_that_excludes_the_terminator_still_finds_it() {
 }
 
 #[test]
+fn the_terminator_follows_every_import_descriptor() {
+    // Three descriptors, the third for the same DLL as the first in another
+    // case, as linkers emit when objects spell it differently. Each one is
+    // its own module, so the terminator sits 3 * 20 bytes in.
+    const TABLE: u32 = 0x1380; // 4 * 20 bytes, up to the section end
+    const IAT2: u32 = 0x1210;
+    const IAT3: u32 = 0x1220;
+    const NAME2: u32 = 0x1230;
+    const NAME3: u32 = 0x1240;
+    let mut original = image();
+    let old = file(IMPORTS);
+    let descriptor = original[old..old + 20].to_vec();
+    put(&mut original, file(TABLE), &descriptor);
+    for (i, (iat, name, thunk)) in [
+        (IAT2, NAME2, u64::from(HINT_NAME)),
+        (IAT3, NAME3, 0x8000_0000_0000_0001),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // No name table: old linkers leave OriginalFirstThunk at 0.
+        let at = file(TABLE) + (i + 1) * 20;
+        put32(&mut original, at + 12, name);
+        put32(&mut original, at + 16, iat);
+        put64(&mut original, file(iat), thunk);
+    }
+    put(&mut original, file(NAME2), b"USER32.dll\0");
+    put(&mut original, file(NAME3), b"kernel32.dll\0");
+    set_dir(&mut original, dir::IMPORT, TABLE, 4 * 20);
+
+    let prepared = prepare(&original).unwrap();
+    let modules: Vec<(&str, Vec<u32>)> = prepared
+        .info
+        .imports
+        .iter()
+        .map(|m| {
+            let slots = m.entries.iter().map(|e| e.iat_slot_rva).collect();
+            (m.dll.as_str(), slots)
+        })
+        .collect();
+    assert_eq!(
+        modules,
+        [
+            ("KERNEL32.dll", vec![IAT, IAT + 8]),
+            ("USER32.dll", vec![IAT2]),
+            ("kernel32.dll", vec![IAT3]),
+        ]
+    );
+
+    let import = dir_offset(dir::IMPORT);
+    assert_eq!(
+        layout::read_u32(&prepared.bytes, import),
+        Some(TABLE + 3 * 20)
+    );
+    assert_eq!(layout::read_u32(&prepared.bytes, import + 4), Some(20));
+    assert_eq!(&prepared.bytes[file(TABLE + 3 * 20)..][..20], &[0; 20]);
+    assert!(
+        ImageInfo::parse(&prepared.bytes)
+            .unwrap()
+            .imports
+            .is_empty()
+    );
+    // The descriptors and the IATs the title binds against are untouched.
+    let differing: Vec<usize> = (0..original.len())
+        .filter(|&i| original[i] != prepared.bytes[i])
+        .collect();
+    let expected = expected_changes();
+    assert!(
+        differing
+            .iter()
+            .all(|i| expected.iter().any(|r| r.contains(i))),
+        "unexpected bytes changed: {differing:#x?}"
+    );
+}
+
+#[test]
 fn an_image_without_imports_or_tls_only_changes_its_headers() {
     let mut original = image();
     set_dir(&mut original, dir::IMPORT, 0, 0);
