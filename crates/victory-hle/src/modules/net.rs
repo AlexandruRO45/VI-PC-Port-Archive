@@ -540,6 +540,8 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
 /// Return the error used for a blocked name and clear the mandatory result
 /// pointer, matching Winsock's failed lookup behavior.
 fn blocked_forward_lookup(result: *mut *mut c_void) -> i32 {
+    // SAFETY: the Winsock caller provides a writable output pointer; `as_mut`
+    // checks for null before the result is cleared.
     if let Some(result) = unsafe { result.as_mut() } {
         *result = std::ptr::null_mut();
     }
