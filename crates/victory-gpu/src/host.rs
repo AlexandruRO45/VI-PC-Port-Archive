@@ -292,6 +292,14 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// The state each title buffer host copy (and each buffer of the indirect
+    /// passes) is in at this point of the list, by buffer. A buffer promoted
+    /// to a write state (unordered access) does not decay to the common
+    /// state, and a later read as vertex, index or constant data without a
+    /// barrier is invalid (the debug layer reports it, and NVIDIA GPUs
+    /// hang), so every change of state goes through [`HostList::resource_state`]
+    /// and every list ends with these buffers in the common state again.
+    buffer_states: Mutex<std::collections::HashMap<usize, (ID3D12Resource, D3D12_RESOURCE_STATES)>>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -308,6 +316,10 @@ pub(crate) struct HostList {
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
 }
+
+/// The read states a buffer can hold together: vertex and constant, index,
+/// shader resource (both stages) and indirect argument data.
+pub(crate) const BUFFER_READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(0x2C3);
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
@@ -476,6 +488,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                buffer_states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -857,6 +870,54 @@ impl HostList {
         times
     }
 
+    /// Shaders of this list read (`BUFFER_READ`: as vertex, index, constant,
+    /// indirect-argument or shader-resource data) or write
+    /// (`D3D12_RESOURCE_STATE_UNORDERED_ACCESS`) the buffer from here on:
+    /// moves it to that state with a barrier if it is in another one. Every
+    /// change of a title buffer copy's state in the list goes through here
+    /// (the shadows' uses and the indirect passes), so a barrier always
+    /// names the state the list left the buffer in. The list starts and
+    /// ends with each such buffer in the common state.
+    pub(crate) fn resource_state(&self, buffer: &ID3D12Resource, want: D3D12_RESOURCE_STATES) {
+        let mut states = self.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = states
+            .entry(buffer.as_raw() as usize)
+            .or_insert_with(|| (buffer.clone(), D3D12_RESOURCE_STATE_COMMON));
+        if entry.1 != want {
+            let barrier = transition(buffer, entry.1, want);
+            // SAFETY: an open list and a live buffer (the list holds a reference).
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+            entry.1 = want;
+        }
+    }
+
+    /// [`HostList::resource_state`] for a title buffer's host copy.
+    pub(crate) fn buffer_use(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, write: bool) {
+        self.resource_state(
+            &shadow.buffer,
+            if write { D3D12_RESOURCE_STATE_UNORDERED_ACCESS } else { BUFFER_READ },
+        );
+    }
+
+    /// At the list's end: every buffer it moved goes back to the common
+    /// state, where the next list's first use finds it.
+    fn buffers_to_common(&self) {
+        let mut states = self.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
+            .values_mut()
+            .filter(|(_, state)| *state != D3D12_RESOURCE_STATE_COMMON)
+            .map(|(buffer, state)| {
+                let barrier = transition(buffer, *state, D3D12_RESOURCE_STATE_COMMON);
+                *state = D3D12_RESOURCE_STATE_COMMON;
+                barrier
+            })
+            .collect();
+        if !barriers.is_empty() {
+            // SAFETY: an open list and live buffers.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
+    }
+
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -867,6 +928,7 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        self.buffers_to_common();
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -880,6 +942,10 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.buffer_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();

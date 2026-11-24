@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{HostList, host};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
@@ -162,6 +162,7 @@ pub(crate) fn bound(
     // the caller's list holds.
     unsafe {
         // Earlier shader writes (the title's argument passes) first.
+        list.resource_state(buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         l.ResourceBarrier(&[uav_barrier()]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
@@ -169,14 +170,8 @@ pub(crate) fn bound(
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(
-                buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
-        ]);
+        l.ResourceBarrier(&[uav_barrier()]);
+        list.resource_state(buffer, crate::host::BUFFER_READ);
     }
     true
 }
@@ -184,14 +179,7 @@ pub(crate) fn bound(
 /// After the execution: the buffer back to unordered access, where the
 /// title's passes keep using it.
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
-    // SAFETY: an open list and a live buffer.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        )])
-    };
+    list.resource_state(buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
