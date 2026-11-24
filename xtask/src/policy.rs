@@ -2696,6 +2696,54 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// Ignoring every file under a directory while re-including the
+    /// directories in it (`/layout/**` then `!/layout/**/`, the idiom that
+    /// keeps a tree's shape and none of its files) leaves those directories
+    /// visible, so a TMPDIR there is refused and left empty, though no
+    /// plain file made in it would be listed: the temporary repository a
+    /// test makes there is a directory holding `.git`, which git lists as a
+    /// nested repository, and that fails the full check. A later
+    /// `!/layout/**/*.rs` brings `.rs` files back, which are listed as well.
+    /// The directory a plain `/hidden/` ignores is taken.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_under_reincluded_directories_are_refused() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(
+            root.join(".gitignore"),
+            "/layout/**\n!/layout/**/\n!/layout/**/*.rs\n/hidden/\n",
+        )
+        .unwrap();
+        let layout = root.join("layout");
+        let hidden = root.join("hidden");
+        for dir in [&layout, &hidden] {
+            std::fs::create_dir(dir).unwrap();
+        }
+
+        let tmp = tempdir_in_first(root, [layout.clone(), hidden.clone()]);
+        assert_eq!(tmp.path().parent(), Some(hidden.as_path()));
+        assert_eq!(std::fs::read_dir(&layout).unwrap().count(), 0);
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+
+        std::fs::create_dir_all(layout.join("sub")).unwrap();
+        std::fs::write(layout.join("sub/game.bin"), b"MZ\x90\0fixture").unwrap();
+        std::fs::write(layout.join("sub/f.rs"), b"fn f() {}\n").unwrap();
+        assert_eq!(names(root, false), [".gitignore", "layout/sub/f.rs"]);
+        super::run(root, false).unwrap();
+
+        let made = layout.join("made");
+        std::fs::create_dir(&made).unwrap();
+        git_str(&made, &["init", "-q"]);
+        std::fs::write(made.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        assert_eq!(
+            names(root, false),
+            [".gitignore", "layout/made/", "layout/sub/f.rs"]
+        );
+        assert!(super::run(root, false).is_err());
+    }
+
     /// A TMPDIR spelled with `.` or `..` is judged by the directory it
     /// names, not by its spelling: `visible/../ignored` and `ignored/.` are
     /// taken in `ignored`, while `ignored/../visible`, which passes through
