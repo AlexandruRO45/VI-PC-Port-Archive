@@ -1891,3 +1891,53 @@ fn data_appended_after_the_last_section_is_not_mapped() {
             .all(|offset| offset < overlay_offset)
     );
 }
+
+#[test]
+fn flag_directories_are_judged_by_their_entry_not_their_target() {
+    // Relocation, exception and load-config presence come from the directory
+    // entry alone: an entry past SizeOfImage, past the section data, or one
+    // byte long still counts, because nothing reads what it points at.
+    for (rva, size) in [
+        (SIZE_OF_IMAGE + 0x1000, 12),
+        (SECTION_RVA + SECTION_SIZE + 0x10, 12),
+        (0xFFFF_FFF0, 0xFFFF_FFFF),
+        (0x1380, 1),
+    ] {
+        let mut d = image();
+        set_directory(&mut d, dir::BASERELOC, rva, size);
+        set_directory(&mut d, dir::EXCEPTION, rva, size);
+        set_directory(&mut d, dir::LOAD_CONFIG, rva, size);
+        let info = ImageInfo::parse(&d).unwrap();
+        assert!(info.has_relocations, "{rva:#x}+{size:#x}");
+        assert!(info.has_exception_table, "{rva:#x}+{size:#x}");
+        assert!(info.has_load_config, "{rva:#x}+{size:#x}");
+        // The rest of the parse is untouched by those entries.
+        assert_eq!(info.import_count(), 2);
+        assert_eq!(info.tls.unwrap().callback_rvas, [0x1010, 0x1020]);
+    }
+}
+
+#[test]
+fn relocations_need_both_a_directory_and_no_stripped_flag() {
+    let fh = layout::file_header_offset(&image()).unwrap();
+    let flags_at = fh + layout::FILE_HEADER_CHARACTERISTICS;
+    let stripped = 0x0022 | layout::file_flags::RELOCS_STRIPPED;
+    for (directory, flags, expected) in [
+        (false, 0x0022, false),
+        (false, stripped, false),
+        (true, 0x0022, true),
+        (true, stripped, false),
+    ] {
+        let mut d = image();
+        if directory {
+            set_directory(&mut d, dir::BASERELOC, 0x1380, 12);
+        }
+        put16(&mut d, flags_at, flags);
+        let info = ImageInfo::parse(&d).unwrap();
+        assert_eq!(info.has_relocations, expected, "{directory} {flags:#x}");
+        // The flag word itself is reported as written either way.
+        assert_eq!(info.characteristics, flags);
+        // Stripping relocations says nothing about the other directories.
+        assert!(!info.has_exception_table && !info.has_load_config);
+    }
+}
