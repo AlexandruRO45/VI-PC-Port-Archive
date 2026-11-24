@@ -1588,6 +1588,163 @@ mod tests {
         assert!(ok > 0 && err > 0);
     }
 
+    #[test]
+    fn zigzag_and_interleave_helpers() {
+        // zz: 0, -1, 1, -2, ... modulo 2^bits, one-to-one on each width.
+        for bits in [5u32, 6, 8] {
+            let mask = (1u32 << bits) - 1;
+            for (v, want) in [(0, 0), (1, mask), (2, 1), (3, mask - 1), (4, 2)] {
+                assert_eq!(u32::from(zz(v, bits)), want, "zz({v}, {bits})");
+            }
+            let mut seen = vec![false; 1 << bits];
+            for v in 0..=mask {
+                let z = usize::from(zz(v as u8, bits));
+                assert!(!seen[z], "zz({v}, {bits}) repeats");
+                seen[z] = true;
+            }
+        }
+
+        // interleave puts the first symbol on the even bits and is
+        // one-to-one; nibbles takes the halves back out, zigzag-decoded.
+        assert_eq!(interleave(0xf, 0), 0x55);
+        assert_eq!(interleave(0, 0xf), 0xaa);
+        assert_eq!(interleave(5, 0), 0x11);
+        let z = |u: u8| i16::from(u >> 1) ^ -i16::from(u & 1);
+        let mut seen = [false; 256];
+        for a in 0..16u8 {
+            for b in 0..16u8 {
+                let v = interleave(a, b);
+                assert!(!seen[usize::from(v)]);
+                seen[usize::from(v)] = true;
+                assert_eq!(nibbles(v, false), [z(a), z(b)]);
+                assert_eq!(nibbles(v, true), [z(b), z(a)]);
+            }
+        }
+        assert_eq!(nibbles(0x01, false), [-1, 0]);
+        assert_eq!(nibbles(0x0a, false), [0, -2]);
+    }
+
+    #[test]
+    fn references_and_picks() {
+        // The endpoint reference is the index reference plus a zigzag delta,
+        // wrapping in a byte.
+        assert_eq!(references(&[0, 5], false), (5, 5));
+        assert_eq!(references(&[1, 5], false), (4, 5));
+        assert_eq!(references(&[2, 5], false), (6, 5));
+        assert_eq!(references(&[3, 5], false), (3, 5));
+        assert_eq!(references(&[1, 0], false), (255, 0));
+        assert_eq!(references(&[0xfe, 0x80], false), (0xff, 0x80));
+        // Paired records interleave two 4-bit symbols for each reference.
+        assert_eq!(references(&[2, 0, 5, 0], true), (19, 17));
+        assert_eq!(references(&[0, 0, 0, 0xf], true), (0xaa, 0xaa));
+
+        let history: Vec<usize> = (0..HISTORY).map(|k| 1000 + k).collect();
+        let dictionary = [7, 8, 9];
+        let pick = |i, r| *pick(i, r, &history, &dictionary, &0);
+        assert_eq!(pick(5, 0), 0);
+        assert_eq!(pick(5, 1), 1004);
+        assert_eq!(pick(5, 5), 1000);
+        assert_eq!(pick(5, 6), 7);
+        assert_eq!(pick(5, 8), 9);
+        assert_eq!(pick(0, 1), 7);
+        // History is a ring of HISTORY blocks.
+        assert_eq!(pick(HISTORY + 3, 1), 1002);
+        assert_eq!(pick(HISTORY + 3, HISTORY), 1003);
+    }
+
+    #[test]
+    fn index_sums_and_block_bits() {
+        // Same widths: the sum wraps at the width and reads back signed.
+        assert_eq!(add_index(1, 3, 2, 3), 3);
+        assert_eq!(add_index(3, 3, 1, 3), -4);
+        assert_eq!(add_index(-1, 3, 1, 3), 0);
+        // A wider reference is cut to the residual's width, rounding down.
+        assert_eq!(add_index(1, 3, 3, 4), 2);
+        assert_eq!(add_index(0, 2, 15, 4), -1);
+        // A narrower reference is scaled up to the residual's width.
+        assert_eq!(add_index(0, 4, 1, 2), 4);
+        // No residual bits gives 0; a reference with no (or too many) bits
+        // adds nothing.
+        assert_eq!(add_index(5, 0, 5, 3), 0);
+        assert_eq!(add_index(7, 3, 5, 0), -1);
+        assert_eq!(add_index(2, 3, 5, 17), 2);
+
+        let mut w = Bits::default();
+        w.put(0xff, 4);
+        w.put(u64::MAX, 0);
+        w.put(0b10, 2);
+        assert_eq!((w.v, w.at), (0x2f, 6));
+        w.at = 127;
+        w.put(3, 2);
+        assert_eq!((w.v >> 127, w.at), (1, 129));
+        w.put(u64::MAX, 64);
+        assert_eq!((w.v, w.at), (1 << 127 | 0x2f, 193));
+    }
+
+    #[test]
+    fn bc7_and_bc6_mode_details() {
+        let pbit_modes: Vec<u16> = (0..8).filter(|&m| pbits(m)).collect();
+        assert_eq!(pbit_modes, [0, 1, 3, 6, 7]);
+
+        // Only modes 4 and 5 rotate.
+        for mode in 0..8u16 {
+            for rot in 0..4u16 {
+                let want = if matches!(mode, 4 | 5) {
+                    usize::from(rot)
+                } else {
+                    0
+                };
+                assert_eq!(
+                    rotation(mode | rot << 3),
+                    want,
+                    "mode {mode} rotation {rot}"
+                );
+            }
+        }
+
+        // The p-bit adds to red; rotation swaps alpha with a colour channel.
+        assert_eq!(bc7_precision(0), [5, 4, 4, 0]);
+        assert_eq!(bc7_precision(2), [5, 5, 5, 0]);
+        assert_eq!(bc7_precision(6), [8, 7, 7, 7]);
+        assert_eq!(bc7_precision(6 | 1 << 3), [8, 7, 7, 7]);
+        assert_eq!(bc7_precision(4), [5, 5, 5, 6]);
+        assert_eq!(bc7_precision(4 | 1 << 3), [6, 5, 5, 5]);
+        assert_eq!(bc7_precision(5 | 3 << 3), [7, 7, 8, 7]);
+
+        let index_bits: Vec<u8> = (0..=16).map(bc6_index_bits).collect();
+        assert_eq!(
+            index_bits,
+            [0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 0, 0]
+        );
+    }
+
+    #[test]
+    fn bc1_and_bc4_halves_pack_their_codes() {
+        // Indices run along the endpoint line; BC1 codes are 0, 2, 3, 1.
+        let mut out = [0u8; 8];
+        bc1_color(&[31, 63, 31, 0, 0, 0], &[0; 16], &mut out);
+        assert_eq!(out, [0xff, 0xff, 0, 0, 0, 0, 0, 0]);
+        bc1_color(&[1, 2, 3, 4, 5, 6], &[1; 16], &mut out);
+        assert_eq!(&out[..4], &[0x43, 0x08, 0xa6, 0x20]);
+        assert_eq!(&out[4..], &0xaaaa_aaaau32.to_le_bytes());
+        let mut ix = [0u8; 16];
+        ix[0] = 3;
+        ix[15] = 2;
+        bc1_color(&[0; 6], &ix, &mut out);
+        assert_eq!(&out[4..], &(1u32 | 3 << 30).to_le_bytes());
+
+        // BC4 endpoints are stored 128 above; codes are 0, 2..7, 1.
+        bc4_alpha(0x80, 0x7f, &[0; 16], &mut out);
+        assert_eq!(out, [0, 0xff, 0, 0, 0, 0, 0, 0]);
+        let mut ix = [0u8; 16];
+        ix[0] = 7;
+        ix[1] = 1;
+        ix[15] = 6;
+        bc4_alpha(0, 0, &ix, &mut out);
+        let want = 0x8080u64 | 1 << 16 | 2 << 19 | 7 << 61;
+        assert_eq!(out, want.to_le_bytes());
+    }
+
     /// Compares with reference outputs made outside the repository:
     /// `VICTORY_BCPACK_CASES`, a directory of `<name>.bc<n>` packed chunks
     /// with `<name>.out` beside them. The tables are the built-in ones unless
