@@ -1431,4 +1431,79 @@ mod tests {
             "buffer_load_dword v4, v0, s[8:11], s0 glc slc dlc"
         );
     }
+
+    /// The image flags past the cache bits each print once, in a fixed
+    /// order (r128 and unorm before the cache flags; a16, d16, tfe and lwe
+    /// after), and each reshapes the operands it governs: r128 halves the
+    /// resource, a16 packs the coordinates in pairs, and tfe or lwe (one or
+    /// both) add a single status dword to the data.
+    #[test]
+    fn image_flags_print_in_order_and_reshape_their_operands() {
+        // image_load v8, v0, s[16:23]: op 0, dmask 1, srsrc 4, vdata 8.
+        let load = |w0: u32, w1: u32| one(&[0xF000_0100 | w0, 0x0004_0800 | w1], true);
+        let (r128, unorm, tfe, lwe, dlc, glc, slc) =
+            (1 << 15, 1 << 12, 1 << 16, 1 << 17, 1 << 7, 1 << 13, 1 << 25);
+        let (a16, d16) = (1 << 30, 1 << 31);
+        let base = "image_load v8, v0, s[16:23] dim:SQ_RSRC_IMG_1D";
+        assert_eq!(load(0, 0), base);
+        assert_eq!(
+            load(r128, 0),
+            "image_load v8, v0, s[16:19] dim:SQ_RSRC_IMG_1D r128"
+        );
+        assert_eq!(load(unorm, 0), format!("{base} unorm"));
+        assert_eq!(load(0, a16), format!("{base} a16"));
+        assert_eq!(load(0, d16), format!("{base} d16"));
+        for (w0, text) in [(tfe, "tfe"), (lwe, "lwe"), (tfe | lwe, "tfe lwe")] {
+            assert_eq!(
+                load(w0, 0),
+                format!("image_load v[8:9], v0, s[16:23] dim:SQ_RSRC_IMG_1D {text}")
+            );
+        }
+        // A 2D address takes two VGPRs, or one with a16.
+        assert_eq!(
+            load(1 << 3, 0),
+            "image_load v8, v[0:1], s[16:23] dim:SQ_RSRC_IMG_2D"
+        );
+        assert_eq!(
+            load(1 << 3, a16),
+            "image_load v8, v0, s[16:23] dim:SQ_RSRC_IMG_2D a16"
+        );
+        // Every flag at once; d16 packs the one channel and tfe adds one.
+        assert_eq!(
+            load(r128 | unorm | tfe | lwe | dlc | glc | slc, a16 | d16),
+            "image_load v[8:9], v0, s[16:19] dim:SQ_RSRC_IMG_1D \
+             r128 unorm dlc glc slc a16 d16 tfe lwe"
+        );
+    }
+
+    /// VINTRP names the i/j VGPR, or for `v_interp_mov_f32` the parameter
+    /// (p10, p20, p0, and a raw `p?` for the unused code 3), then the
+    /// attribute channel. The VOP3 forms put the attribute last like VINTRP
+    /// and write its `high` half as a trailing flag.
+    #[test]
+    fn interpolation_names_the_parameter_and_puts_the_attribute_last() {
+        // v_interp_mov_f32 v2, <vsrc>, attr1.y
+        let mov = |vsrc: u32| one(&[0xC80A_0000 | 2 << 18 | 1 << 10 | 1 << 8 | vsrc], true);
+        for (vsrc, p) in [(0, "p10"), (1, "p20"), (2, "p0"), (3, "p?")] {
+            assert_eq!(mov(vsrc), format!("v_interp_mov_f32 v2, {p}, attr1.y"));
+        }
+        // v_interp_p1_f32 / v_interp_p2_f32 v2, v3, attr1.w
+        assert_eq!(
+            one(&[0xC808_0000 | 2 << 18 | 1 << 10 | 3 << 8 | 3], true),
+            "v_interp_p1_f32 v2, v3, attr1.w"
+        );
+        assert_eq!(
+            one(&[0xC809_0000 | 2 << 18 | 1 << 10 | 3 << 8 | 3], true),
+            "v_interp_p2_f32 v2, v3, attr1.w"
+        );
+        // VOP3 v_interp_p1ll_f16 v2, v3, attr1.z: src0 holds the attribute.
+        let p1ll = |high: u32| {
+            one(
+                &[0xD742_0002, (256 + 3) << 9 | high << 8 | 2 << 6 | 1],
+                true,
+            )
+        };
+        assert_eq!(p1ll(0), "v_interp_p1ll_f16 v2, v3, attr1.z");
+        assert_eq!(p1ll(1), "v_interp_p1ll_f16 v2, v3, attr1.z high");
+    }
 }
