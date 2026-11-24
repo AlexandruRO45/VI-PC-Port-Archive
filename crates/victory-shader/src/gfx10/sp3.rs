@@ -1534,4 +1534,70 @@ mod tests {
             );
         }
     }
+
+    /// SOPP instructions whose 16-bit field carries no operand print the
+    /// bare mnemonic, program ends included; every other SOPP that is not
+    /// a branch, wait or message prints the field as four hex digits.
+    #[test]
+    fn sopp_immediates_print_as_hex_unless_the_instruction_has_none() {
+        let sopp = |op: u32, imm: u32| 0xBF80_0000 | op << 16 | imm;
+        for (op, name) in [
+            (0x03, "s_wakeup"),
+            (0x0A, "s_barrier"),
+            (0x13, "s_icache_inv"),
+            (0x16, "s_ttracedata"),
+        ] {
+            assert_eq!(one(&[sopp(op, 0)], true), name);
+        }
+        // Program ends: decode stops at each, so read it on its own.
+        for (op, name) in [
+            (0x01, "s_endpgm"),
+            (0x1B, "s_endpgm_saved"),
+            (0x1E, "s_endpgm_ordered_ps_done"),
+            (0x1F, "s_code_end"),
+        ] {
+            let insts = decode(&sopp(op, 0).to_le_bytes()).unwrap();
+            assert_eq!(insts[0].text(true), name);
+        }
+        for (op, imm, text) in [
+            (0x00, 0, "s_nop 0x0000"),
+            (0x00, 7, "s_nop 0x0007"),
+            (0x00, 0xFFFF, "s_nop 0xffff"),
+            (0x0B, 1, "s_setkill 0x0001"),
+            (0x0D, 1, "s_sethalt 0x0001"),
+            (0x0E, 0x10, "s_sleep 0x0010"),
+            (0x0F, 3, "s_setprio 0x0003"),
+            (0x12, 2, "s_trap 0x0002"),
+            (0x14, 1, "s_incperflevel 0x0001"),
+            (0x20, 1, "s_inst_prefetch 0x0001"),
+            (0x24, 0xF, "s_round_mode 0x000f"),
+            (0x25, 0xF, "s_denorm_mode 0x000f"),
+            (0x28, 0x1234, "s_ttracedata_imm 0x1234"),
+        ] {
+            assert_eq!(one(&[sopp(op, imm)], true), text);
+        }
+    }
+
+    /// SOPK puts its register before the immediate, whether the register
+    /// is written (`s_movk_i32`) or only read (`s_cmpk_*`,
+    /// `s_waitcnt_vscnt`); `s_version` has no register, so its immediate
+    /// stands alone.
+    #[test]
+    fn sopk_registers_lead_the_immediate_and_s_version_has_none() {
+        let sopk = |op: u32, sdst: u32, imm: u32| 0xB000_0000 | op << 23 | sdst << 16 | imm;
+        assert_eq!(one(&[sopk(0x00, 3, 0x1234)], true), "s_movk_i32 s3, 0x1234");
+        assert_eq!(one(&[sopk(0x00, 3, 0)], true), "s_movk_i32 s3, 0x0000");
+        assert_eq!(
+            one(&[sopk(0x09, 3, 0xFFFF)], true),
+            "s_cmpk_eq_u32 s3, 0xffff"
+        );
+        assert_eq!(
+            one(&[sopk(0x17, 125, 0)], true),
+            "s_waitcnt_vscnt null, 0x0000"
+        );
+        // s_version's register field is ignored.
+        for sdst in [0, 125] {
+            assert_eq!(one(&[sopk(0x01, sdst, 4)], true), "s_version 0x0004");
+        }
+    }
 }
