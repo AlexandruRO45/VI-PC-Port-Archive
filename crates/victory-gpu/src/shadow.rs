@@ -468,6 +468,14 @@ static ALIGNED: Mutex<BTreeMap<(u64, u64), std::sync::Weak<Shadow>>> = Mutex::ne
 /// (`View::Placed`) starts at an offset that need not be a multiple of the
 /// view's stride. This copy starts at the view, and the slot that made it
 /// keeps it alive.
+///
+/// Its own refresh copies the 64 KiB pages the title wrote since they were
+/// last copied, straight from title memory: a submission's copy-back runs
+/// before the next submission prepares (`Host::execute` waits for the GPU
+/// before copying back), so by then title memory holds what the GPU wrote in
+/// any copy, and what shaders wrote in this one has gone back there. Copying
+/// from the buffer's copy instead would copy the view's whole range again on
+/// every submission.
 pub(crate) fn aligned(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if len == 0 {
         return None;
@@ -481,9 +489,8 @@ pub(crate) fn aligned(address: u64, len: u64) -> Option<Arc<Shadow>> {
     {
         return Some(copy);
     }
-    // Views hold hundreds of megabytes in the world, and the copy is readable
-    // by shaders and written by the CPU only, so system memory the CPU maps is
-    // enough.
+    // Views hold hundreds of megabytes in the world; made as a buffer's copy
+    // is, so that shaders may write it (unordered access).
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(64))?;
     crate::host::name(&buffer, || format!("aligned view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
@@ -508,25 +515,6 @@ pub(crate) fn aligned_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
         .unwrap_or_else(|e| e.into_inner())
         .get(&(address, len))
         .and_then(std::sync::Weak::upgrade)
-}
-
-/// `[address, address + len)` of the title is brought into the view's own copy
-/// by a refresh of that copy itself.
-///
-/// The copy is a host copy like any other, so its own refresh copies the 64
-/// KiB pages the title wrote since they were last copied, straight from title
-/// memory. The submission's copy-back runs before its lists are reset and
-/// before the next submission prepares (`Host::execute` waits for the GPU
-/// before copying back), so by then title memory holds what the GPU wrote and
-/// the aligned copy sees it. Copying from the buffer's copy instead would copy
-/// the view's whole range again on every submission.
-pub(crate) fn defer_align(aligned: &Arc<Shadow>, list: &HostList, address: u64, len: u64) {
-    // shortcut: the copy is made at submission preparation, from title memory,
-    // so it does not see what a shader of the same submission wrote in that
-    // range before this read. Getting that right needs every host buffer's
-    // state tracked across the submission (PR #334), so that the bytes can be
-    // copied on the GPU inside the list instead.
-    aligned.refresh(list, address, len);
 }
 
 /// How many bytes of `[address, address + len)` lie inside the copy that
@@ -613,5 +601,37 @@ mod tests {
         assert_eq!(inside(0x20f0, 0x20, 0x1000, 0x100), 0);
         // A size that would overflow does not.
         assert_eq!(inside(u64::MAX - 8, 16, 0, 16), 0);
+    }
+
+    /// What a shader writes in a view's own copy, which starts off a page and
+    /// off its buffer's elements, goes back to title memory after the
+    /// submission, and a byte the title wrote meanwhile is kept.
+    #[test]
+    fn writes_in_a_views_own_copy_go_back_to_title_memory() {
+        // Title memory, reached only through this pointer.
+        let mut memory = vec![1u8; 4096];
+        let title = memory.as_mut_ptr();
+        // Four 56-byte elements, 48 bytes in.
+        let (address, len) = (title as usize + 48, 4 * 56);
+        let Some(copy) = aligned(address as u64, len as u64) else {
+            return; // no host GPU
+        };
+        // As the submission's refresh and write declaration leave it.
+        copy.copy(address, address + len);
+        copy.writing(address, len);
+        // The GPU writes the third element; the title writes the view's first
+        // byte while it runs.
+        // SAFETY: inside the copy's mapping and the title memory.
+        unsafe {
+            std::ptr::write_bytes(copy.data.add(112), 7, 56);
+            title.add(48).write(9);
+        }
+        assert!(copy.copy_back(address, len) > 0);
+        // SAFETY: the title memory, no longer written.
+        let after = unsafe { std::slice::from_raw_parts(title, 4096) };
+        assert!(after[160..216].iter().all(|&b| b == 7), "the GPU's element");
+        assert_eq!(after[48], 9, "the title's own write");
+        assert!(after[..48].iter().chain(&after[216..]).all(|&b| b == 1));
+        drop(memory);
     }
 }

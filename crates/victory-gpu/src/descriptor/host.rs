@@ -472,32 +472,51 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
-    let (base, words): (u64, &[u32; 10]) = match view {
-        View::Shader(r, Some(desc)) => (
-            crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
-            desc,
-        ),
-        View::Placed(false, resource, desc) if resource[0] == 1 => (
-            u64::from(desc[10]) | u64::from(desc[11]) << 32,
-            desc[..10].try_into().ok()?,
-        ),
-        View::Unordered(r, _, Some(desc)) => {
-            let base = crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64;
-            return unordered_range(base, desc);
-        }
-        View::Placed(true, resource, desc) if resource[0] == 1 => {
-            let base = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            return unordered_range(base, desc[..10].try_into().ok()?);
-        }
-        _ => return None,
-    };
-    let desc = srv_desc(words);
-    Some(view_range_of(base, &desc))
+    let (address, _, unordered, words) = buffer_parts(view)?;
+    let (from, bytes, _) = extent(address, unordered, words);
+    Some((from, bytes))
 }
 
-/// [`buffer_range`] of an unordered access view of memory at `base`.
-fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
-    let desc = uav_desc(words);
+/// A buffer view as [`make`] takes it: where its resource's memory starts and
+/// how long it is (its host copy is found by these), whether it is unordered
+/// access, and its descriptor's words.
+fn buffer_parts(view: &View) -> Option<(u64, u64, bool, &[u32; 10])> {
+    let registered = |r: usize| {
+        crate::resource::buffer_bytes(r as crate::object::This)
+            .map(|(data, len)| (data as u64, len))
+    };
+    match view {
+        View::Shader(r, Some(desc)) => registered(*r).map(|(at, len)| (at, len, false, desc)),
+        View::Unordered(r, _, Some(desc)) => registered(*r).map(|(at, len)| (at, len, true, desc)),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => Some((
+            u64::from(desc[10]) | u64::from(desc[11]) << 32,
+            // The resource description's width, after the alignment.
+            u64::from(resource[4]) | u64::from(resource[5]) << 32,
+            *unordered,
+            desc[..10].try_into().ok()?,
+        )),
+        _ => None,
+    }
+}
+
+/// A buffer view's own range in the resource at `address` and the bytes of
+/// one of its elements (0 for a format of unknown size).
+fn extent(address: u64, unordered: bool, words: &[u32; 10]) -> (u64, u64, u64) {
+    if unordered {
+        unordered_extent(address, &uav_desc(words))
+    } else {
+        shader_extent(address, &srv_desc(words))
+    }
+}
+
+/// [`extent`] of a shader view.
+fn shader_extent(address: u64, desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> (u64, u64, u64) {
+    let (from, bytes) = view_range_of(address, desc);
+    (from, bytes, element_size(desc))
+}
+
+/// [`extent`] of an unordered access view.
+fn unordered_extent(address: u64, desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> (u64, u64, u64) {
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -505,12 +524,25 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
         4
     } else {
-        crate::resource::element(desc.Format.0 as u32)?.0
+        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     };
-    Some((
-        base + buffer.FirstElement * element,
+    (
+        address.saturating_add(buffer.FirstElement * element),
         u64::from(buffer.NumElements) * element,
-    ))
+        element,
+    )
+}
+
+/// Whether [`make`] gave this buffer view a copy of just its bytes, because it
+/// starts off an element of its buffer's copy: the copy `readable` brings up
+/// to date for it, and the one its writes go back from.
+pub(crate) fn off_element(view: &View) -> bool {
+    let Some((address, len, unordered, words)) = buffer_parts(view) else {
+        return false;
+    };
+    let (from, bytes, element) = extent(address, unordered, words);
+    crate::shadow::find(address, len)
+        .is_some_and(|buffer| matches!(plan(bytes, element, buffer.offset(from)), Copy::OwnBytes))
 }
 
 /// What a slot made by [`make`] views keeps alive.
@@ -538,24 +570,25 @@ fn view_range_of(address: u64, desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> (u64, 
     )
 }
 
-/// The host copy a buffer shader view reads, the element its start is, and
-/// whether that copy holds only the view's bytes.
+/// The host copy a buffer view of the resource at `address` (`len` bytes)
+/// uses, the element its start is, and whether that copy holds only the
+/// view's bytes. `extent` is the view's range and element size.
 ///
 /// [`Copy::OwnBytes`] is for a view of memory the title placed inside another
 /// object (`View::Placed`: methods 0x230 and 0x238), whose start need not be a
 /// multiple of its stride. Its copy is a host copy like any other, so its own
-/// refresh brings it up to date from title memory, and a shader sees what the
-/// rest of the pipeline sees.
-fn shader_copy(
+/// refresh brings it up to date from title memory, what shaders write in it
+/// goes back there after the submission, and a shader sees what the rest of
+/// the pipeline sees.
+fn view_copy(
     address: u64,
     len: u64,
-    desc: &D3D12_SHADER_RESOURCE_VIEW_DESC,
+    (from, bytes, element): (u64, u64, u64),
 ) -> Result<(std::sync::Arc<crate::shadow::Shadow>, u64, bool), &'static str> {
-    // The view's own range, which is also the key `aligned` caches it by (the
+    // The view's own range is also the key `aligned` caches its copy by (the
     // one `buffer_range` gives `readable`).
-    let (from, bytes) = view_range_of(address, desc);
     let buffer = crate::shadow::find(address, len).ok_or("no host copy of its buffer")?;
-    match plan(bytes, element_size(desc), buffer.offset(from)) {
+    match plan(bytes, element, buffer.offset(from)) {
         Copy::Element { first } => Ok((buffer, first, false)),
         Copy::OwnBytes => {
             let copy = crate::shadow::aligned(from, bytes).ok_or("no copy of the view")?;
@@ -658,7 +691,7 @@ fn buffer_srv(
         );
         return None;
     }
-    let (shadow, first, own) = shader_copy(address, len, &desc)
+    let (shadow, first, own) = view_copy(address, len, shader_extent(address, &desc))
         .map_err(|why| {
             once!(
                 view = kind(placed),
@@ -671,8 +704,6 @@ fn buffer_srv(
             );
         })
         .ok()?;
-    // A view reading its own copy has no record to keep for a submission's
-    // writes: see the shortcut in `shadow::aligned`.
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     // `first` is the element the view's own start is from the copy's start,
@@ -700,17 +731,29 @@ fn kind(placed: bool) -> &'static str {
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
-/// bytes) on its host copy, as [`buffer_srv`]; false if the copy cannot be
-/// written by shaders (upload memory).
-/// shortcut: what shaders write stays in the host copy; title memory (and
-/// so the CPU, and copies run on the CPU) does not see it.
+/// bytes) on its host copy, as [`buffer_srv`]; none if the copy cannot be
+/// written by shaders (upload memory). What shaders write goes back to title
+/// memory after the submission (`readable` declares the view's range).
 fn buffer_uav(
     address: u64,
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    placed: bool,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let extent = unordered_extent(address, &desc);
+    let (shadow, first, own) = view_copy(address, len, extent)
+        .map_err(|why| {
+            once!(
+                view = kind(placed),
+                address = format_args!("{address:#x}"),
+                len,
+                element = extent.2,
+                why,
+                "an unordered buffer view left null"
+            );
+        })
+        .ok()?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -719,19 +762,8 @@ fn buffer_uav(
     }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
-        u64::from(buffer.StructureByteStride)
-    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
-        4
-    } else {
-        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
-    };
-    let offset = shadow.offset(address);
-    if element == 0 || offset % element != 0 {
-        once!(offset, element, "unordered buffer view not on an element of its host copy");
-        return None;
-    }
-    buffer.FirstElement += offset / element;
+    // As for a shader view: the element the view starts at in the copy.
+    buffer.FirstElement = if own { 0 } else { first };
     buffer.CounterOffsetInBytes = 0;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -741,7 +773,7 @@ fn buffer_uav(
     };
     Some(Kept::Resource {
         resource: shadow.buffer.clone(),
-        copy: None,
+        copy: own.then(|| shadow.clone()),
     })
 }
 
@@ -859,7 +891,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let Some(texture) = crate::resource::host_resource(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at)
+                        buffer_uav(data as u64, len, uav_desc(desc), at, false)
                     }
                     _ => None,
                 };
@@ -915,10 +947,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
+            // The view names its own start: it can land off an element.
             if *unordered {
-                buffer_uav(address, len, uav_desc(words), at)
+                buffer_uav(address, len, uav_desc(words), at, true)
             } else {
-                // The view names its own start: it can land off an element.
                 buffer_srv(address, len, srv_desc(words), at, true)
             }
         }
@@ -1188,6 +1220,63 @@ mod tests {
         assert!(matches!(plan(0, 56, 48), Copy::None { .. }));
     }
 
+    /// An unordered view off an element of its buffer's copy writes a copy of
+    /// just its bytes, which a shader view of the same bytes shares; one on
+    /// an element writes the buffer's copy. The device takes all of them.
+    #[test]
+    fn an_unordered_view_off_an_element_writes_its_own_copy() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        // A title buffer the views' memory lies in (its copy is made on the
+        // host; title memory is not read).
+        let (address, len) = (0x7d00_0000_0000_u64, 0x1_0000_u64);
+        crate::shadow::register(usize::MAX - 2, address, len);
+        // Memory placed `start` bytes into it, of four 56-byte elements.
+        let placed = |unordered: bool, start: u64| {
+            let mut resource = [0u32; 14];
+            resource[0] = 1; // a buffer
+            resource[4] = 4 * 56;
+            let mut desc = [0u32; 16];
+            desc[1] = 1; // buffer dimension
+            if unordered {
+                // NumElements, StructureByteStride
+                (desc[4], desc[5]) = (4, 56);
+            } else {
+                desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                (desc[6], desc[7]) = (4, 56);
+            }
+            let at = address + start;
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            View::Placed(unordered, resource, desc)
+        };
+        let made = |index: usize| heap.kept.lock().unwrap()[index].is_some();
+        let copy = |index: usize| heap.kept_copy.lock().unwrap()[index].clone();
+        heap.make_at(0, &placed(true, 112));
+        assert!(
+            made(0) && copy(0).is_none(),
+            "on an element: the buffer's copy"
+        );
+        assert!(!off_element(&placed(true, 112)));
+        // The hit-detection offset: 48 bytes in.
+        heap.make_at(1, &placed(true, 48));
+        heap.make_at(2, &placed(false, 48));
+        let uav = copy(1).expect("an unordered view off an element: its own copy");
+        let srv = copy(2).expect("a shader view off an element: its own copy");
+        assert!(
+            std::sync::Arc::ptr_eq(&uav, &srv),
+            "one copy of the same bytes"
+        );
+        assert!(off_element(&placed(true, 48)) && off_element(&placed(false, 48)));
+        // SAFETY: a plain device query.
+        let removed = unsafe { host.device.GetDeviceRemovedReason() };
+        assert!(removed.is_ok(), "device removed: {removed:?}");
+        crate::shadow::unregister(usize::MAX - 2, address);
+    }
+
     /// A nulled-stride list parses decimal and hex, and ignores junk.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -1199,7 +1288,7 @@ mod tests {
 
     /// A view's range is its own elements where its descriptor puts them, and
     /// `buffer_range` (what `readable` refreshes) gives the same one, so the
-    /// copy `buffer_srv` makes is found again for the refresh.
+    /// copy `buffer_srv` or `buffer_uav` makes is found again for the refresh.
     #[test]
     fn a_views_range_is_the_one_its_copy_is_keyed_by() {
         // Whatever the words mean, both paths read them the same way: the
@@ -1214,10 +1303,14 @@ mod tests {
             let mut placed = [0u32; 16];
             placed[..10].copy_from_slice(&words);
             placed[10] = 0x1000;
-            let view = View::Placed(false, resource, placed);
+            let range = |(from, bytes, _): (u64, u64, u64)| Some((from, bytes));
             assert_eq!(
-                buffer_range(&view),
-                Some(view_range_of(0x1000, &srv_desc(&words)))
+                buffer_range(&View::Placed(false, resource, placed)),
+                range(shader_extent(0x1000, &srv_desc(&words)))
+            );
+            assert_eq!(
+                buffer_range(&View::Placed(true, resource, placed)),
+                range(unordered_extent(0x1000, &uav_desc(&words)))
             );
         }
     }
