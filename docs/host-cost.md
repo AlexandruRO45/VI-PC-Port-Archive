@@ -12,7 +12,38 @@ creation, descriptor or barrier churn) all show up as *GPU* time, and GPU
 time is the small share. They are worth killing on those grounds before
 anyone spends a day on them.
 
+## The adopted base's bill is one lock (2026-11-24, `eb6d3a3`)
+
+Read this before the table: the table below is the pre-adoption tree. On the
+adopted base the same log line says something else.
+
+    7,379.8 ms/frame (7,131.8 preparing: copies 76.9 ms 130.6 MB, textures 6,950.0 ms 150.0 MB; 86.9 GPU; ...)
+    texture refreshes per frame: 6,949.9 ms ... 6,896.6 waiting for title memory to hold still (the runtime remapping it)
+
+**Textures are 94 % of that frame, and 99.2 % of the texture time is a wait, not
+work.** The wait is `waited(2, crate::watch::title_memory_reading)` in
+`crates/victory-gpu/src/texture.rs`, taken once per sampled texture: it waits for
+the read half of the `MAPPING` lock, which the runtime holds while it remaps
+title memory. Per byte that is **46 ms/MB** for textures against **0.59 ms/MB**
+for copies — eighty times — and copies are 76.9 ms, about 1 % of the frame.
+Residual texture work (read, hash, detile of 150 MB) is about 48 ms, 0.32 ms/MB,
+which is the documented cost of an in-place read.
+
+So a large `textures` field in a frame line does not say copying is the problem,
+and a change that halves copy cost cannot move a frame that is waiting. The
+count of waits (uploaded 165 → 7,801, waiting 19,480–27,159, ~28,000 textures
+wanted) explains how many holds are taken, not how long each one lasts.
+
+The fix under test takes `title_memory_reading` **once per submission** and
+refreshes every sampled texture under that single hold — about a hundred
+acquisitions down to one — with `VICTORY_TEXTURE_NO_WAIT=1` (a kernel read at
+about 0.6 ms/MB, giving up the in-place guarantee) as the fallback to compare
+against. Neither is in this tree yet.
+
 ## The table
+
+**Superseded for the adopted base** — these are pre-adoption numbers, kept because
+the shapes still hold; the lock section above is what the adopted base costs.
 
 World windows only (frames with 100 or more draws, so the frame log is past
 the menus and the account picker). Windows and their source logs:
