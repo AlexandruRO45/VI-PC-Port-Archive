@@ -994,9 +994,12 @@ fn transition(
 
 /// A view in the heap for [`Host::dispatch`].
 #[cfg(test)]
+#[derive(Clone, Copy)]
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// An R32_FLOAT texture SRV, suitable for comparison sampling.
+    ComparisonTexture(u32, u32, &'a [f32]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
@@ -1105,20 +1108,15 @@ impl Host {
                 Flags: flags,
                 ..Default::default()
             };
-            // Texel words: 4 for RGBA32F, 1 for R32_UINT.
             let footprint_as =
-                |r: &ID3D12Resource, w: u32, h: u32, words: u32| D3D12_TEXTURE_COPY_LOCATION {
+                |r: &ID3D12Resource, w: u32, h: u32, words: u32, format| D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(r),
                     Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                     Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                         PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                             Offset: 0,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: if words == 1 {
-                                    DXGI_FORMAT_R32_UINT
-                                } else {
-                                    DXGI_FORMAT_R32G32B32A32_FLOAT
-                                },
+                                Format: format,
                                 Width: w,
                                 Height: h,
                                 Depth: 1,
@@ -1127,7 +1125,6 @@ impl Host {
                         },
                     },
                 };
-            let footprint = |r: &ID3D12Resource, w: u32, h: u32| footprint_as(r, w, h, 4);
             let subresource = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(r),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -1172,20 +1169,26 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
-                    View::Texture(..) | View::Cube(..) => {
-                        let (w, h, texels, faces) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1),
-                            View::Cube(n, t) => (n, n, t, 6),
+                    View::Texture(..) | View::ComparisonTexture(..) | View::Cube(..) => {
+                        let (w, h, texels, faces, words, format) = match *v {
+                            View::Texture(w, h, t) => {
+                                (w, h, t.as_flattened(), 1, 4, DXGI_FORMAT_R32G32B32A32_FLOAT)
+                            }
+                            View::ComparisonTexture(w, h, t) => (w, h, t, 1, 1, DXGI_FORMAT_R32_FLOAT),
+                            View::Cube(n, t) => {
+                                (n, n, t.as_flattened(), 6, 4, DXGI_FORMAT_R32G32B32A32_FLOAT)
+                            }
                             _ => unreachable!(),
                         };
-                        let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
+                        let mut desc = texture_as(w, h, D3D12_RESOURCE_FLAG_NONE, format);
                         desc.DepthOrArraySize = faces as u16;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        let pitch = (w as usize * 16).next_multiple_of(256);
+                        let row_words = (w * words) as usize;
+                        let pitch = (row_words * size_of::<f32>()).next_multiple_of(256);
                         for face in 0..faces as usize {
                             let upload = make(
                                 D3D12_HEAP_TYPE_UPLOAD,
@@ -1194,13 +1197,13 @@ impl Host {
                             )?;
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            let texels = &texels[face * (w * h) as usize..];
+                            let texels = &texels[face * row_words * h as usize..];
                             for y in 0..h as usize {
-                                let row = &texels[y * w as usize..(y + 1) * w as usize];
+                                let row = &texels[y * row_words..(y + 1) * row_words];
                                 std::ptr::copy_nonoverlapping(
                                     row.as_ptr().cast::<u8>(),
                                     p.cast::<u8>().add(y * pitch),
-                                    row.len() * 16,
+                                    std::mem::size_of_val(row),
                                 );
                             }
                             upload.Unmap(0, None);
@@ -1211,7 +1214,7 @@ impl Host {
                                 0,
                                 0,
                                 0,
-                                &footprint(&upload, w, h),
+                                &footprint_as(&upload, w, h, words, format),
                                 None,
                             );
                             keep.push(upload);
@@ -1418,7 +1421,13 @@ impl Host {
                 )]);
                 match size {
                     Some((w, h)) => list.CopyTextureRegion(
-                        &footprint_as(rb, *w, *h, *n),
+                        &footprint_as(
+                            rb,
+                            *w,
+                            *h,
+                            *n,
+                            if *n == 1 { DXGI_FORMAT_R32_UINT } else { DXGI_FORMAT_R32G32B32A32_FLOAT },
+                        ),
                         0,
                         0,
                         0,

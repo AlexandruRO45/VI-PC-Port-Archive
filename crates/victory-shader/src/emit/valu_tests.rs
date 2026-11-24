@@ -1680,7 +1680,7 @@ fn build_sample_cs(body: &[u32]) -> HostShader {
 
 fn run_sample_cases(
     shader: &HostShader,
-    texels: &[[f32; 4]],
+    texture: View<'_>,
     sampler: windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC,
     cases: &[([u32; 4], [f32; 4])],
 ) {
@@ -1709,7 +1709,7 @@ fn run_sample_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::Texture(4, 4, texels), View::RawUav(4)],
+                        views: &[texture, View::RawUav(4)],
                         samplers: &[sampler],
                         groups: [1, 1, 1],
                     },
@@ -1732,13 +1732,8 @@ fn run_sample_cases(
 fn image_gather4_c_lz_and_offset_match_d3d12() {
     use windows::Win32::Graphics::Direct3D12::*;
 
-    let mut texels = [[0.0f32; 4]; 16];
-    for y in 0..4usize {
-        for x in 0..4usize {
-            let v = (y * 4 + x) as f32;
-            texels[y * 4 + x] = [v, 100.0 + v, 200.0 + v, 300.0 + v];
-        }
-    }
+    let depth: [f32; 16] = std::array::from_fn(|i| i as f32);
+    let texture = View::ComparisonTexture(4, 4, &depth);
     let cmp_sampler = D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -1755,7 +1750,7 @@ fn image_gather4_c_lz_and_offset_match_d3d12() {
     let gather_r = build_sample_cs(&mimg_sample(0x04f, 0x1, 1, 8, 1, 16, 12));
     run_sample_cases(
         &gather_r,
-        &texels,
+        texture,
         cmp_sampler,
         &[
             ([f(3.5), f(0.25), f(0.25), 0], [1.0, 1.0, 0.0, 0.0]),
@@ -1763,8 +1758,8 @@ fn image_gather4_c_lz_and_offset_match_d3d12() {
         ],
     );
 
-    // Non-red channel gather-cmp (dmask:0x2 -> channel 1): validate DXIL and
-    // pipeline creation (WARP compares channel 0 on RGBA32F for GatherCmp).
+    // Validate the non-red selector and create its pipeline. The supported
+    // comparison texture used for GPU readback has only a red channel.
     let gather_g = build_sample_cs(&mimg_sample(0x04f, 0x2, 1, 8, 1, 16, 12));
     {
         let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -1777,7 +1772,7 @@ fn image_gather4_c_lz_and_offset_match_d3d12() {
     let gather_o = build_sample_cs(&mimg_sample(0x05f, 0x1, 1, 8, 1, 16, 12));
     run_sample_cases(
         &gather_o,
-        &texels,
+        texture,
         cmp_sampler,
         &[
             ([0x0000_0102, f(8.5), f(0.25), f(0.25)], [1.0, 1.0, 0.0, 0.0]),
@@ -1813,6 +1808,7 @@ fn image_sample_offset_variants_match_d3d12() {
         ComparisonFunc: D3D12_COMPARISON_FUNC_LESS,
         ..point_sampler
     };
+    let depth = texels.map(|pixel| pixel[0]);
     let f = f32::to_bits;
 
     // image_sample_l_o (0x034): v5 = imm offset (-1, +2), v6 = u, v7 = v, v8 = lod; dmask = 0x3.
@@ -1829,7 +1825,7 @@ fn image_sample_offset_variants_match_d3d12() {
     ]);
     run_sample_cases(
         &sample_l_o,
-        &texels,
+        View::Texture(4, 4, &texels),
         point_sampler,
         &[([f(0.375), f(0.125), f(0.0), 0], [8.0, 108.0, 0.0, 0.0])],
     );
@@ -1849,7 +1845,7 @@ fn image_sample_offset_variants_match_d3d12() {
     ]);
     run_sample_cases(
         &sample_c_lz_o,
-        &texels,
+        View::ComparisonTexture(4, 4, &depth),
         cmp_sampler,
         &[
             ([f(8.5), f(0.125), f(0.125), 0], [1.0, 0.0, 0.0, 0.0]),
@@ -1876,7 +1872,7 @@ fn image_sample_offset_variants_match_d3d12() {
     ]);
     run_sample_cases(
         &sample_d_o,
-        &texels,
+        View::Texture(4, 4, &texels),
         point_sampler,
         &[([f(0.125), f(0.125), 0, 0], [5.0, 0.0, 0.0, 0.0])],
     );
