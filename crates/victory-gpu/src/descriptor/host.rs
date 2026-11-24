@@ -216,7 +216,9 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            // The heap's last slot stays null for good: a shader sends a heap
+            // index past the heap there (see `image_data`).
+            next: Mutex::new((0, (0..extra).map(|i| i + 1 == extra).collect())),
             image_data: OnceLock::new(),
             title_memory: Mutex::new(None),
         };
@@ -382,11 +384,16 @@ impl HostHeap {
             return Some((data.buffer.clone(), data.handle));
         }
         let host = host()?;
-        let elements = self.count.checked_mul(4)?;
+        // Four dwords for every slot of the host heap, dynamic ones too: the
+        // buffer's size is how a shader learns the heap's real slot count, to
+        // keep an index read from title memory inside it.
+        let elements = self.count.checked_add(self.dynamic)?.checked_mul(4)?;
         let (buffer, mapped) = host.upload_buffer(u64::from(elements) * 4)?;
         if mapped.is_null() || !valid_raw_srv(&buffer, u64::from(elements) * 4) {
             return None;
         }
+        // SAFETY: the mapping spans the whole buffer.
+        unsafe { std::ptr::write_bytes(mapped, 0, elements as usize * 4) };
         let slot = self.dynamic(1)?;
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,

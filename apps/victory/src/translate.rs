@@ -375,6 +375,42 @@ fn local_shader_baseline(
                                     },
                                     Err(e) => {
                                         let mut reason = e.to_string();
+                                        if std::env::var_os("VICTORY_LOCAL_PARTS").is_some() {
+                                            match Container::parse(input) {
+                                                Ok(c) => {
+                                                    let parts: Vec<String> = c
+                                                        .parts
+                                                        .iter()
+                                                        .map(|p| format!("{:?}@{:#x}+{}", p.fourcc, p.offset, p.data.len()))
+                                                        .collect();
+                                                    reason.push_str(&format!("\tparts {} len {} ver {:?}", parts.join(","), input.len(), c.version));
+                                                    for p in c.parts.iter().filter(|p| &p.fourcc.0 == b"RTS0" || &p.fourcc.0 == b"PSV0") {
+                                                        let hex: String = p.data.iter().map(|b| format!("{b:02x}")).collect();
+                                                        reason.push_str(&format!("\n  {:?} {hex}", p.fourcc));
+                                                    }
+                                                    if let Some(p) = c.parts.iter().find(|p| &p.fourcc.0 == b"ACCC") {
+                                                        let n: usize = std::env::var("VICTORY_LOCAL_PARTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                                                        let hex: String = p.data.iter().take(n).map(|b| format!("{b:02x}")).collect();
+                                                        reason.push_str(&format!("\n  ACCC {hex}"));
+                                                    }
+                                                }
+                                                Err(e) => reason.push_str(&format!("\tnot a container: {e}")),
+                                            }
+                                        }
+                                        if std::env::var_os("VICTORY_LOCAL_DISASM").is_some()
+                                            && let Ok(c) = Container::parse(input)
+                                            && let Some(d) = c.part(FourCC::DXIL)
+                                            && let Ok(ns) = native_programs(d.data)
+                                        {
+                                            for n in ns {
+                                                reason.push_str(&format!("\n  {:?} wave64={} vgprs={}", n.stage, n.wave64, n.vgprs));
+                                                for p in &n.layout { reason.push_str(&format!("\n    {p:?}")); }
+                                                for u in &n.used { reason.push_str(&format!("\n    {u:?}")); }
+                                                if let Ok(insts) = victory_shader::gfx10::decode(&n.code) {
+                                                    for i in &insts { reason.push_str(&format!("\n{}", crate::shader::format_instruction(i, n.wave64))); }
+                                                }
+                                            }
+                                        }
                                         if std::env::var_os("VICTORY_LOCAL_SHADER_DIAG").is_some()
                                             && let ShaderError::Unsupported { offset, what } = e
                                             && let Some(diag) = local_shader_diag(input, offset, what)

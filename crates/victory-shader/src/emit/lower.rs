@@ -4134,7 +4134,8 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+        let index = self.s.m.bin(c, Bin::LShr, at, shift);
+        Ok(if sampler { index } else { self.in_view_heap(index) })
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -4174,7 +4175,37 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        if sampler || a.dynamic.is_none() {
+            return Ok(index);
+        }
+        Ok(self.in_view_heap(index))
+    }
+
+    /// index, a view heap index computed from title memory, kept inside
+    /// the host heap. A descriptor address read from stale or unwritten
+    /// memory (0xa92ac000 in the world) indexes the heap tens of millions of
+    /// slots past its end: a GPU page fault, the device removed. The host's
+    /// descriptor data buffer has four dwords for each slot of the host heap
+    /// (title and dynamic), so its size gives the slot count; the heap's last
+    /// slot is never given out and stays null (HostHeap), and takes the
+    /// indices past the others.
+    fn in_view_heap(&mut self, index: V) -> V {
+        let h = self.s.root_srv_handle(DESCRIPTOR_DATA_SLOT);
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let unused = self.s.m.undef(i32t);
+        let size = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, unused]);
+        let bytes = self.s.m.extract(c, size, 0);
+        let four = self.s.m.i32(4);
+        let slots = self.s.m.bin(c, Bin::LShr, bytes, four);
+        let one = self.s.m.i32(1);
+        let null = self.s.m.bin(c, Bin::Sub, slots, one);
+        let valid = self.s.m.cmp(c, pred::IULT, index, null);
+        self.s.m.select(c, valid, index, null)
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -8523,6 +8554,50 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_heap_index_read_from_title_memory_is_kept_inside_the_host_heap() {
+        let words = [
+            0xBE84_0301, // s_mov_b32 s4, s1
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0302,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], null
+            0xF420_0046,
+            0xFA00_0000, // s_buffer_load_dword s1, s[12:15], null
+            0x8F02_8501, // s_lshl_b32 s2, s1, 5
+            0x8002_0200, // s_add_u32 s2, s0, s2
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0201,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], null
+            0xE030_1000,
+            0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 offen
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        let layout = vec![
+            root(RootType::ResourceHeap, 0, 0),
+            root(RootType::Table, 1, 1),
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 1,
+            dwords: 4,
+            user_data: 1,
+            slot: 1,
+        }];
+        let mut lowered = lower_with(&words, layout, used).unwrap();
+        // The host heap's slot count comes from the descriptor data buffer.
+        assert_eq!(lowered.root_srvs, [super::DESCRIPTOR_DATA_SLOT]);
+        if let Ok(mut validator) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            validator.validate(&mut lowered.dxil).unwrap();
+        }
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
