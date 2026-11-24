@@ -308,6 +308,15 @@ impl Module {
         }
     }
 
+    /// Whether the module contains an `i32` constant with bit pattern `v`.
+    #[cfg(test)]
+    pub(crate) fn has_i32(&self, v: u32) -> bool {
+        let target = i64::from(v as i32);
+        self.consts
+            .iter()
+            .any(|(_, c)| matches!(c, Const::Int(x) if *x == target))
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {
