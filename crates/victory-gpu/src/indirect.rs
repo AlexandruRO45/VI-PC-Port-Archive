@@ -8,6 +8,15 @@
 //! shader with its root signature inside), leaving the title's argument and
 //! count buffers untouched.
 //!
+//! The scratch buffer is left readable as indirect arguments after a clamp
+//! and stays so until the next clamp into it, which moves it straight back
+//! to unordered access; it goes back to the common state once, when the
+//! list closes. The executions that read it record no barrier of their
+//! own, so draws that read records clamped together (`crate::draw`'s
+//! windows) follow each other with nothing between them. Before, each
+//! execution was followed by a move of the scratch buffer back to the
+//! common state, which drivers may treat as a full wait.
+//!
 //! When a count buffer is given, threads at or past `min(max, count)` return
 //! immediately without charging the list's budget or reading uninitialized
 //! tail slots. Each list has a budget (2^27 vertex instances or threads,
@@ -241,9 +250,11 @@ fn validate_layout(
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
 /// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
 /// by the 32-bit count in `count` when given) into a device-local scratch
-/// buffer, leaving that scratch buffer in `INDIRECT_ARGUMENT` at offset `0`.
-/// Replaces the list's compute root signature and pipeline (callers bind
-/// theirs after). `None` if the clamp or alignment is not available.
+/// buffer, at offset `0`. The scratch buffer is left in `INDIRECT_ARGUMENT`
+/// until the next clamp into it: executions read it with no barrier of
+/// their own. Replaces the list's compute root signature and pipeline
+/// (callers bind theirs after). `None` if the clamp or alignment is not
+/// available.
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
@@ -252,7 +263,7 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -272,28 +283,41 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
-fn record_clamp(
+/// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
+/// the list left it in; afterwards the list knows it is readable as
+/// indirect arguments.
+#[allow(clippy::too_many_arguments)]
+fn clamp_into(
+    list: &HostList,
     c: &Clamp,
-    l: &ID3D12GraphicsCommandList,
     dst: &ID3D12Resource,
     budget: u64,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
+    ahead: bool,
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
+    let before = list.indirect_state(dst);
+    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    if recorded {
+        list.indirect_readable(dst);
+    }
+    recorded
 }
 
-/// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
-/// their draws ([`bound_ahead`]).
+/// Records the clamp into `dst`, which is in state `before` (common, or
+/// indirect arguments after an earlier clamp into it), and leaves `dst` in
+/// `INDIRECT_ARGUMENT`. `ahead`: the records are a window clamped ahead of
+/// their draws ([`bound_ahead`]). False, with nothing recorded, if the
+/// layout or the addresses do not fit the clamp.
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
-    dst: &ID3D12Resource,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
@@ -347,7 +371,9 @@ fn record_clamp_as(
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
-    // transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
+    // transitions `before -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`. Moving
+    // it out of `INDIRECT_ARGUMENT` orders this clamp's writes after every
+    // earlier execution's reads of the scratch buffer; nothing else writes it.
     // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the two
     // waits for every earlier shader write out (the state changes stay).
     #[cfg(feature = "diagnostics")]
@@ -358,11 +384,7 @@ fn record_clamp_as(
     let waits = true;
     let first = [
         uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        ),
+        transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
     let second = [
         uav_barrier(),
@@ -389,23 +411,6 @@ fn record_clamp_as(
         l.ResourceBarrier(&second[skip..]);
     }
     true
-}
-
-/// After indirect execution (or if preparation failed after [`bound`]):
-/// returns the scratch buffer to the common state for the next call.
-pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
-    done_on(&list.list, scratch);
-}
-
-fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
-    // SAFETY: an open list and a live scratch buffer in INDIRECT_ARGUMENT.
-    unsafe {
-        list.ResourceBarrier(&[transition(
-            scratch,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_COMMON,
-        )])
-    };
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -833,14 +838,15 @@ void main() {
         // Record Call #1 (`eff_count = 3` out of `MAX = 4096`), copy the first
         // 5 records of `dst_buf` out for inspection, then record Call #2
         // (`eff_count = 2` out of `MAX = 4096`) reusing `dst_buf` in the same list!
-        assert!(record_clamp(
+        assert!(record_clamp_as(
             &warp.clamp,
             &warp.list,
-            &dst_buf,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
             budget_gpu,
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
+            false,
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -856,15 +862,14 @@ void main() {
                 COUNT_OFFSET_1 as u64,
             );
         }
-        done_on(&warp.list, &dst_buf);
 
-        // Snapshot `dst_buf` after Call #1 (from `COMMON`, copy 5 * STRIDE bytes,
-        // then return `dst_buf` to `COMMON` before Call #2).
-        // SAFETY: open command list; `dst_buf` returned to `COMMON` by `done_on`.
+        // Snapshot `dst_buf` after Call #1 (copy 5 * STRIDE bytes, then leave
+        // `dst_buf` readable as arguments again, as the clamp left it).
+        // SAFETY: open command list; the clamp left `dst_buf` in `INDIRECT_ARGUMENT`.
         unsafe {
             warp.list.ResourceBarrier(&[transition(
                 &dst_buf,
-                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
             warp.list
@@ -872,20 +877,23 @@ void main() {
             warp.list.ResourceBarrier(&[transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
-                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             )]);
         }
 
         // Call #2 in the SAME command list (`eff_count = 2` -> records 0 and 1:
         // 6 + 5 = 11 groups). Would run empty if Call #1's tail blew `BUDGET`!
-        assert!(record_clamp(
+        // The scratch buffer goes straight from arguments back to unordered
+        // access.
+        assert!(record_clamp_as(
             &warp.clamp,
             &warp.list,
-            &dst_buf,
+            (&dst_buf, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
             budget_gpu,
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
+            false,
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -901,7 +909,6 @@ void main() {
                 COUNT_OFFSET_2 as u64,
             );
         }
-        done_on(&warp.list, &dst_buf);
 
         warp.submit_and_wait();
 
@@ -998,27 +1005,22 @@ void main() {
             assert!(record_clamp_as(
                 &warp.clamp,
                 &warp.list,
-                &dst_buf,
+                (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
                 budget_gpu,
                 (&src_buf, 0),
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
                 ahead,
             ));
-            done_on(&warp.list, &dst_buf);
-            // SAFETY: an open list; the scratch buffer is copied for the check.
+            // SAFETY: an open list; the scratch buffer, which the clamp left
+            // readable as arguments, is copied for the check.
             unsafe {
                 warp.list.ResourceBarrier(&[transition(
                     &dst_buf,
-                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 )]);
                 warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
-                warp.list.ResourceBarrier(&[transition(
-                    &dst_buf,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    D3D12_RESOURCE_STATE_COMMON,
-                )]);
             }
             warp.submit_and_wait();
             // SAFETY: the work is done; mapped buffers.
@@ -1088,31 +1090,27 @@ void main() {
             std::ptr::write_bytes(readback_ptr, 0, total_bytes);
         }
 
-        assert!(record_clamp(
+        assert!(record_clamp_as(
             &warp.clamp,
             &warp.list,
-            &dst_buf,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
             budget_gpu,
             (&src_buf, 0),
             None,
             (KIND_INDEXED, STRIDE, RECORDS),
+            false,
         ));
-        done_on(&warp.list, &dst_buf);
 
-        // SAFETY: open command list; copy clamped scratch buffer for verification.
+        // SAFETY: open command list; copy clamped scratch buffer (left
+        // readable as arguments) for verification.
         unsafe {
             warp.list.ResourceBarrier(&[transition(
                 &dst_buf,
-                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
             warp.list
                 .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total_bytes as u64);
-            warp.list.ResourceBarrier(&[transition(
-                &dst_buf,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-                D3D12_RESOURCE_STATE_COMMON,
-            )]);
         }
         warp.submit_and_wait();
 
@@ -1152,13 +1150,16 @@ void main() {
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
     }
 
-    /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
-    /// and `HostList::reset` end-to-end on the host device.
+    /// Exercises `HostList::indirect_scratch`, `bound`, the scratch buffer's
+    /// tracked state, `Host::execute`, and `HostList::reset` end-to-end on
+    /// the host device.
     #[test]
     fn host_list_reuses_and_grows_scratch_across_submissions() {
         let Some(host) = super::host() else {
             return;
         };
+        // What earlier tests left in the debug layer's queue, if it is on.
+        let _ = host.log_messages();
         let Ok(list) = host.new_list() else {
             return;
         };
@@ -1174,26 +1175,44 @@ void main() {
             (count_ptr as *mut u32).write_volatile(2);
         }
 
+        let args = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
         // First two calls fit inside the initial 64 KiB scratch buffer and
-        // must reuse the exact same `ID3D12Resource`.
+        // must reuse the exact same `ID3D12Resource`, which stays readable
+        // as arguments between them.
         let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
-        done(&list, &b1);
+        assert_eq!(
+            list.indirect_state(&b1),
+            args,
+            "a clamp leaves the scratch readable as arguments"
+        );
         let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
-        done(&list, &b2);
         assert_eq!(
             b1.as_raw(),
             b2.as_raw(),
             "scratch buffer within capacity must be reused"
         );
+        assert_eq!(list.indirect_state(&b2), args);
 
         // A call needing >64 KiB grows the scratch buffer mid-list while keeping
-        // `b1` alive until reset.
+        // `b1` alive until reset. The new buffer starts out common.
+        let grown = list.indirect_scratch(5000 * 20).unwrap();
+        assert_eq!(
+            list.indirect_state(&grown),
+            D3D12_RESOURCE_STATE_COMMON,
+            "a new scratch buffer is common"
+        );
         let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
-        done(&list, &b3);
+        assert_eq!(b3.as_raw(), grown.as_raw());
         assert_ne!(
             b3.as_raw(),
             b1.as_raw(),
             "larger request must grow scratch buffer"
+        );
+        assert_eq!(list.indirect_state(&b3), args);
+        assert_eq!(
+            list.indirect_state(&b1),
+            D3D12_RESOURCE_STATE_COMMON,
+            "the replaced buffer went back to common"
         );
 
         list.close();
@@ -1201,16 +1220,520 @@ void main() {
         list.reset();
 
         // After reset, requests up to the grown high-water mark reuse `b3` with
-        // zero new allocations.
+        // zero new allocations; the buffer decayed to common when the
+        // submission ran.
+        assert_eq!(
+            list.indirect_state(&b3),
+            D3D12_RESOURCE_STATE_COMMON,
+            "a reset list starts with a common scratch buffer"
+        );
         let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
-        done(&list, &b4);
         assert_eq!(
             b4.as_raw(),
             b3.as_raw(),
             "grown scratch buffer must persist across reset"
         );
+        assert_eq!(list.indirect_state(&b4), args);
         list.close();
         host.execute(&[&list]);
         list.reset();
+        // With the debug layer on (`VICTORY_D3D12_DEBUG=1`, diagnostics):
+        // every barrier named the state the buffer was really in.
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+    }
+
+    /// Records the dispatch records `groups` (three words each, `step`
+    /// bytes apart, the rest of each record ones) into a fresh mapped
+    /// buffer of `warp`'s device.
+    fn dispatch_records(warp: &WarpHarness, groups: &[u32], step: u32) -> ID3D12Resource {
+        let total = groups.len() * step as usize;
+        let (buffer, ptr, _) = warp.shared_buffer(total as u64);
+        let mut bytes = vec![0xffu8; total];
+        for (i, &g) in groups.iter().enumerate() {
+            for (w, word) in [g, 1, 1].into_iter().enumerate() {
+                let at = i * step as usize + w * 4;
+                bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        // SAFETY: the mapping holds `total` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, total) };
+        buffer
+    }
+
+    /// Two windows in one list, as `crate::draw` records them: each clamps
+    /// its records ahead, then one execution per record reads the scratch
+    /// buffer with no barrier between them; the second clamp moves the
+    /// scratch buffer straight from arguments back to unordered access.
+    /// Every record runs once, with the group count it asked for.
+    #[test]
+    fn warp_window_executions_read_their_records_with_no_barrier_between() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_DISPATCH: u32 = 2;
+        // The title names 12 bytes and keeps its records 32 apart.
+        const STRIDE: u32 = 12;
+        const STEP: u32 = 32;
+        let windows: [&[u32]; 2] = [&[1, 2, 3, 4], &[10, 11, 12, 13]];
+        let sources: Vec<ID3D12Resource> =
+            windows.iter().map(|g| dispatch_records(&warp, g, STEP)).collect();
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (_hits_buf, hits_ptr, hits_gpu) = warp.shared_buffer(256);
+        let dst_buf = warp.default_uav(u64::from(STEP) * 4);
+        let sig = warp.signature(KIND_DISPATCH, STRIDE);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(hits_ptr, 0, 256);
+        }
+        let mut state = D3D12_RESOURCE_STATE_COMMON;
+        for (groups, src) in windows.iter().zip(&sources) {
+            assert!(record_clamp_as(
+                &warp.clamp,
+                &warp.list,
+                (&dst_buf, state),
+                budget_gpu,
+                (src, 0),
+                None,
+                (KIND_DISPATCH, STEP, groups.len() as u32),
+                true,
+            ));
+            state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+            // SAFETY: an open list; the worker's root signature and
+            // pipeline; the scratch buffer is readable as arguments.
+            unsafe {
+                warp.list.SetComputeRootSignature(&warp.worker.root);
+                warp.list.SetPipelineState(&warp.worker.pso);
+                warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                for i in 0..groups.len() as u64 {
+                    warp.list.ExecuteIndirect(&sig, 1, &dst_buf, i * u64::from(STEP), None, 0);
+                }
+            }
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; mapped buffers.
+        let (hits, spent) = unsafe {
+            (
+                (hits_ptr as *const u32).read_volatile(),
+                (budget_ptr as *const u32).read_volatile(),
+            )
+        };
+        let expected: u32 = windows.iter().flat_map(|g| g.iter()).sum();
+        assert_eq!(hits, expected, "every record of both windows runs once");
+        assert_eq!(spent, expected * 64, "and is charged what it asked for");
+    }
+
+    /// The windows of `warp_window_executions_read_their_records_with_no_barrier_between`
+    /// through a host list (`bound_ahead`, the list's tracked scratch state,
+    /// `Host::execute`), twice: on the first recording the scratch buffer
+    /// starts common, on the second (after the reset) it starts common
+    /// again. With the debug layer on (`VICTORY_D3D12_DEBUG=1` in a
+    /// diagnostics build) no barrier names a state the buffer is not in.
+    #[test]
+    fn host_list_window_executions_need_no_barrier_of_their_own() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        // What earlier tests left in the debug layer's queue, if it is on.
+        let _ = host.log_messages();
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        const STEP: u32 = 32;
+        let signature = {
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE(KIND_DISPATCH as i32),
+                ..Default::default()
+            };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                ByteStride: STRIDE,
+                NumArgumentDescs: 1,
+                pArgumentDescs: &arg,
+                NodeMask: 0,
+            };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            // SAFETY: a valid single-argument command signature description.
+            unsafe {
+                host.device
+                    .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig)
+                    .unwrap();
+            }
+            sig.unwrap()
+        };
+        let windows: [&[u32]; 2] = [&[1, 2, 3, 4], &[10, 11, 12, 13]];
+        let mut sources = Vec::new();
+        for groups in windows {
+            let total = groups.len() * STEP as usize;
+            let Some((buffer, ptr)) = host.shared_buffer(total as u64) else {
+                return;
+            };
+            let mut bytes = vec![0xffu8; total];
+            for (i, &g) in groups.iter().enumerate() {
+                for (w, word) in [g, 1, 1].into_iter().enumerate() {
+                    let at = i * STEP as usize + w * 4;
+                    bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            }
+            // SAFETY: the mapping holds `total` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, total) };
+            sources.push(buffer);
+        }
+        let Some((hits_buf, hits_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        let expected: u32 = windows.iter().flat_map(|g| g.iter()).sum();
+        // SAFETY: a live buffer.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        for _ in 0..2 {
+            // SAFETY: the mapping holds 256 bytes; nothing runs.
+            unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
+            for (groups, src) in windows.iter().zip(&sources) {
+                let spec = (KIND_DISPATCH, STEP, groups.len() as u32);
+                let scratch = bound_ahead(&list, (src, 0), spec).unwrap();
+                assert_eq!(list.indirect_state(&scratch), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+                // SAFETY: an open list; the worker's root signature and
+                // pipeline; buffers the test holds until the list has run.
+                unsafe {
+                    list.list.SetComputeRootSignature(&worker.root);
+                    list.list.SetPipelineState(&worker.pso);
+                    list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                    for i in 0..groups.len() as u64 {
+                        let at = i * u64::from(STEP);
+                        list.list.ExecuteIndirect(&signature, 1, &scratch, at, None, 0);
+                    }
+                }
+            }
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the list has run; a mapped buffer.
+            let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+            assert_eq!(hits, expected, "every record of both windows runs once");
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        }
+    }
+}
+
+/// A frame's worth of one-record indirect draws, recorded with the scratch
+/// buffer's old barriers (back to the common state after every execution)
+/// and with the new ones (readable until the next clamp), clamped one at a
+/// time and in windows, on the host GPU. Ignored by default; run it with
+/// `cargo test -p victory-gpu --release --lib indirect::bench -- --ignored --nocapture`.
+/// It needs no title files: the draws are tiny triangles of ours.
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIFactory4};
+    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::core::{Interface, PCSTR};
+
+    /// Draws a frame (the title's gameplay frames hold about 3,200 indirect
+    /// executions, #107), records a window holds, and how far apart the
+    /// records are (the title keeps them 32 bytes apart).
+    const DRAWS: u32 = 3200;
+    const WINDOW: u32 = 32;
+    const STEP: u32 = 32;
+    const RUNS: usize = 9;
+
+    const SHADERS: &str = r#"
+#define RS "RootFlags(0)"
+[RootSignature(RS)]
+float4 vs(uint v : SV_VertexID, uint i : SV_InstanceID) : SV_Position {
+    float2 p = float2((v & 1) ? 0.05 : 0.0, (v & 2) ? 0.05 : 0.0) - 0.5;
+    return float4(p, 0.5, 1);
+}
+float4 ps() : SV_Target { return float4(1, 0.5, 0.25, 1); }
+"#;
+
+    fn compile(entry: &str, target: &str) -> Vec<u8> {
+        let entry = std::ffi::CString::new(entry).unwrap();
+        let target = std::ffi::CString::new(target).unwrap();
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names outlive the call.
+        unsafe {
+            D3DCompile(
+                SHADERS.as_ptr().cast(),
+                SHADERS.len(),
+                s!("bench"),
+                None,
+                None,
+                PCSTR(entry.as_ptr().cast()),
+                PCSTR(target.as_ptr().cast()),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+            let code = code.unwrap();
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+                .to_vec()
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Barriers {
+        /// Back to the common state after every execution (as before).
+        Old,
+        /// Readable as arguments until the next clamp, common at the end.
+        New,
+    }
+
+    #[test]
+    #[ignore = "benchmark; see the module notes"]
+    fn bench_indirect_draw_barriers() {
+        let Some(host) = super::host() else {
+            eprintln!("no host GPU");
+            return;
+        };
+        let device = &host.device;
+        let clamp = make_for(device).expect("the clamp");
+        // SAFETY: plain D3D12 object creation with valid descriptions; the
+        // objects outlive every list recorded and run below.
+        unsafe {
+            let adapter = {
+                let luid = device.GetAdapterLuid();
+                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                    .and_then(|f| f.EnumAdapterByLuid::<windows::Win32::Graphics::Dxgi::IDXGIAdapter1>(luid))
+                    .and_then(|a| a.GetDesc1())
+                    .map(|d| String::from_utf16_lossy(&d.Description).trim_end_matches('\0').to_owned())
+                    .unwrap_or_else(|_| "an unnamed adapter".to_owned())
+            };
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let allocator: ID3D12CommandAllocator =
+                device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .unwrap();
+            list.Close().unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            let frequency = queue.GetTimestampFrequency().unwrap() as f64;
+
+            // The pipeline: tiny triangles into a small target.
+            let (vs, ps) = (compile("vs", "vs_5_1"), compile("ps", "ps_5_1"));
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &vs).unwrap();
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr().cast(), BytecodeLength: vs.len() },
+                PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr().cast(), BytecodeLength: ps.len() },
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            let pso: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc).unwrap();
+            let target_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 256,
+                Height: 256,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let mut target: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &target_desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut target,
+                )
+                .unwrap();
+            let target = target.unwrap();
+            let rtvs: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            let rtv = rtvs.GetCPUDescriptorHandleForHeapStart();
+            device.CreateRenderTargetView(&target, None, rtv);
+
+            // The title's records: three vertices, one instance, 32 bytes apart.
+            let (src, src_ptr) = host.shared_buffer(u64::from(DRAWS * STEP)).unwrap();
+            for i in 0..DRAWS as usize {
+                let words = [3u32, 1, 0, 0];
+                std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), src_ptr.add(i * STEP as usize), 16);
+            }
+            let (budget, budget_ptr) = host.shared_buffer(256).unwrap();
+            let budget_gpu = budget.GetGPUVirtualAddress();
+            let scratch = host.uav_buffer(u64::from(WINDOW * STEP).max(64 << 10)).unwrap();
+            let signature = {
+                let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                    ..Default::default()
+                };
+                let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                    ByteStride: 16,
+                    NumArgumentDescs: 1,
+                    pArgumentDescs: &arg,
+                    NodeMask: 0,
+                };
+                let mut sig: Option<ID3D12CommandSignature> = None;
+                device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig).unwrap();
+                sig.unwrap()
+            };
+            let stamps: ID3D12QueryHeap = {
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                device
+                    .CreateQueryHeap(
+                        &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0 },
+                        &mut heap,
+                    )
+                    .unwrap();
+                heap.unwrap()
+            };
+            let mut back: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 16,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut back,
+                )
+                .unwrap();
+            let back = back.unwrap();
+            let mut submitted = 0u64;
+
+            // One frame's lists: GPU ms (timestamps around the list), CPU ms
+            // recording it, ms from submission to the end of its run.
+            let mut frame = |barriers: Barriers, window: u32| -> [f64; 3] {
+                allocator.Reset().unwrap();
+                list.Reset(&allocator, None).unwrap();
+                let recording = std::time::Instant::now();
+                list.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                list.OMSetRenderTargets(1, Some(&rtv), false, None);
+                list.RSSetViewports(&[D3D12_VIEWPORT { Width: 256.0, Height: 256.0, MaxDepth: 1.0, ..Default::default() }]);
+                list.RSSetScissorRects(&[RECT { left: 0, top: 0, right: 256, bottom: 256 }]);
+                list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                list.SetGraphicsRootSignature(&root);
+                let mut state = D3D12_RESOURCE_STATE_COMMON;
+                for first in (0..DRAWS).step_by(window as usize) {
+                    let records = window.min(DRAWS - first);
+                    assert!(record_clamp_as(
+                        &clamp,
+                        &list,
+                        (&scratch, state),
+                        budget_gpu,
+                        (&src, u64::from(first * STEP)),
+                        None,
+                        (0, STEP, records),
+                        window > 1,
+                    ));
+                    state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+                    list.SetPipelineState(&pso);
+                    for k in 0..records {
+                        list.ExecuteIndirect(&signature, 1, &scratch, u64::from(k * STEP), None, 0);
+                        if barriers == Barriers::Old {
+                            list.ResourceBarrier(&[transition(
+                                &scratch,
+                                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                                D3D12_RESOURCE_STATE_COMMON,
+                            )]);
+                            state = D3D12_RESOURCE_STATE_COMMON;
+                        }
+                    }
+                }
+                if state != D3D12_RESOURCE_STATE_COMMON {
+                    list.ResourceBarrier(&[transition(&scratch, state, D3D12_RESOURCE_STATE_COMMON)]);
+                }
+                list.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                list.ResolveQueryData(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &back, 0);
+                list.Close().unwrap();
+                let recorded = recording.elapsed().as_secs_f64() * 1e3;
+                let running = std::time::Instant::now();
+                queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+                submitted += 1;
+                queue.Signal(&fence, submitted).unwrap();
+                fence.SetEventOnCompletion(submitted, event).unwrap();
+                WaitForSingleObject(event, INFINITE);
+                let ran = running.elapsed().as_secs_f64() * 1e3;
+                let mut data = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut data)).unwrap();
+                let t = std::slice::from_raw_parts(data.cast::<u64>(), 2);
+                let gpu = t[1].saturating_sub(t[0]) as f64 / frequency * 1e3;
+                back.Unmap(0, None);
+                (budget_ptr as *mut u32).write_volatile(0);
+                [gpu, recorded, ran]
+            };
+
+            let cases = [
+                ("clamped one at a time", Barriers::Old, 1),
+                ("clamped one at a time", Barriers::New, 1),
+                ("windows of 32", Barriers::Old, WINDOW),
+                ("windows of 32", Barriers::New, WINDOW),
+            ];
+            // Warm up, then the cases in turn, so drift falls on all alike.
+            for &(_, barriers, window) in &cases {
+                frame(barriers, window);
+            }
+            let mut times: Vec<Vec<[f64; 3]>> = vec![Vec::new(); cases.len()];
+            for _ in 0..RUNS {
+                for (i, &(_, barriers, window)) in cases.iter().enumerate() {
+                    times[i].push(frame(barriers, window));
+                }
+            }
+            let median = |v: &[[f64; 3]], k: usize| {
+                let mut x: Vec<f64> = v.iter().map(|t| t[k]).collect();
+                x.sort_by(f64::total_cmp);
+                x[x.len() / 2]
+            };
+            eprintln!(
+                "indirect draw barriers on {adapter}: {DRAWS} one-record draws a frame, \
+                 medians of {RUNS} frames"
+            );
+            for (i, (name, barriers, _)) in cases.iter().enumerate() {
+                let gpu = median(&times[i], 0);
+                eprintln!(
+                    "  {name:<22} {:<3} GPU {gpu:7.2} ms ({:5.2} us a draw), recording {:6.2} ms, \
+                     submit to done {:7.2} ms",
+                    format!("{barriers:?}").to_lowercase(),
+                    gpu * 1e3 / f64::from(DRAWS),
+                    median(&times[i], 1),
+                    median(&times[i], 2),
+                );
+            }
+            for pair in [(0, 1), (2, 3)] {
+                let (old, new) = (median(&times[pair.0], 0), median(&times[pair.1], 0));
+                eprintln!("  {}: GPU time {:+.1} %", cases[pair.0].0, (new / old - 1.0) * 100.0);
+            }
+        }
     }
 }
