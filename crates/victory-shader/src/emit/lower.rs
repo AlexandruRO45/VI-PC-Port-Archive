@@ -2729,8 +2729,8 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
-        if self.scalar.get(&site).is_some_and(|a| self.in_constants(a)) {
-            return Err("a scalar load through an address in root constants");
+        if let Some(a) = self.scalar.get(&site).copied().filter(|a| self.in_constants(a)) {
+            return self.pair_smem(inst, a);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
@@ -3014,6 +3014,52 @@ impl<'a> Lower<'a> {
             let off = self.s.m.i32(4 * k);
             let at = self.s.m.bin(c, Bin::Add, addr, off);
             let x = self.code_dword(at)?;
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
+    /// `s_load_dword*` through an address in root constants: raw loads from
+    /// the root SRV at that address, as `s_buffer_load_dword*` on a
+    /// descriptor built around one.
+    fn pair_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar load through an address in root constants");
+        };
+        let count = match inst.name().strip_prefix("s_load_dword") {
+            Some("") => 1u32,
+            Some("x2") => 2,
+            Some("x4") => 4,
+            Some("x8") => 8,
+            Some("x16") => 16,
+            _ => return Err("a scalar load through an address in root constants"),
+        };
+        let h = self.address_srv(&a)?;
+        let c = self.cur;
+        let mut addr = self.s.m.i32(a.offset);
+        if let Some(d) = a.dynamic {
+            let d = self.i32_of(d)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, d);
+        }
+        for k in 0..count {
+            let off = self.s.m.i32(4 * k);
+            let at = self.s.m.bin(c, Bin::Add, addr, off);
+            let mask = self.s.m.i8(1);
+            let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, at, u, mask, al],
+            );
+            let x = self.s.m.extract(c, r, 0);
+            let x = self.as_int(x);
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -6786,7 +6832,12 @@ mod tests {
             0xFA00_0000, // s_buffer_load_dword s6, s[12:15], null
             0x7E00_0206, // v_mov_b32 v0, s6
         ]);
-        for body in [&global[..], &scalar] {
+        let scalar_load = [
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ];
+        for body in [&global[..], &scalar, &scalar_load] {
             let (views, root_srvs) = lowers_with_constants(body).unwrap();
             assert_eq!(views, [view]);
             assert!(root_srvs.is_empty());
@@ -6799,14 +6850,6 @@ mod tests {
             Err(crate::ShaderError::Unsupported { what, .. }) => what,
             other => panic!("{:?}", other.map(|_| ())),
         };
-        assert_eq!(
-            reason(&[
-                0xF400_0181,
-                0xFA00_0000, // s_load_dword s6, s[2:3], null
-                0x7E00_0206, // v_mov_b32 v0, s6
-            ]),
-            "a scalar load through an address in root constants"
-        );
         let mut typed = BUILT_ON_THE_PAIR.to_vec();
         typed.extend([
             0xE000_2000,
