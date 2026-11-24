@@ -1502,10 +1502,20 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+        // A shorter budget lets the title record its next draws sooner,
+        // at the cost of leaving more textures for later passes.
+        static SPAN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        let span = *SPAN.get_or_init(|| {
+            let ms = std::env::var("VICTORY_HEAP_TEXTURE_BUDGET_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|&ms| ms > 0)
+                .unwrap_or(250);
+            std::time::Duration::from_millis(ms)
+        });
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
+            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > span {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
