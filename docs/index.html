@@ -31,15 +31,13 @@
 }
 
 /* important links */
-.ilinks { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:14px; }
-@media (max-width:700px) { .ilinks { grid-template-columns:1fr; } }
-.ilink { display:flex; flex-direction:column; justify-content:space-between; gap:40px; min-height:200px; padding:24px; border:1px solid var(--ink); border-radius:14px; text-decoration:none; background:var(--panel); transition:background .15s, color .15s; }
-.ilink:hover { background:var(--ink); color:var(--bg); }
-.ilink:hover .label { color:inherit; opacity:.7; }
-.ilink .top { display:flex; justify-content:space-between; align-items:center; }
-.ilink .arrow { font-size:26px; line-height:1; transition:transform .15s; }
-.ilink:hover .arrow { transform:translate(3px, -3px); }
-.ilink .name { font-family:var(--display); font-weight:700; font-size:clamp(30px, 4.4vw, 52px); letter-spacing:-.03em; line-height:1; overflow-wrap:anywhere; }
+.ilinks { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
+@media (max-width:860px) { .ilinks { grid-template-columns:minmax(0, 1fr); } }
+.ilink { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 16px; border:1px solid var(--line); border-radius:10px; text-decoration:none; background:var(--panel); transition:border-color .15s, background .15s; min-width:0; }
+.ilink:hover { border-color:var(--ink); background:var(--soft); }
+.ilink .name { font-family:var(--display); font-weight:700; font-size:17px; letter-spacing:-.01em; overflow-wrap:anywhere; min-width:0; }
+.ilink .arrow { font-size:16px; line-height:1; color:var(--muted); transition:transform .15s; flex:none; }
+.ilink:hover .arrow { transform:translate(2px, -2px); color:var(--ink); }
 
 /* activity chart: small multiples, one row per project */
 .chart { position:relative; }
@@ -121,8 +119,8 @@ details.table summary { cursor:pointer; font-size:13.5px; font-weight:600; }
 <nav class="nav" aria-label="Site"><div class="wrap">
   <a class="brand" href="./"><i aria-hidden="true"><b></b><b></b><b></b><b></b></i><span>GTA6 PC Port Archive</span></a>
   <ul>
-    <li><a href="#links">Links</a></li><li><a href="#activity">Activity</a></li><li><a href="#projects">Projects</a></li>
-    <li><a href="#people">People</a></li><li><a href="#code">Get the code</a></li><li><a class="go" href="browse.html">Browse →</a></li>
+    <li><a href="#activity">Activity</a></li><li><a href="#projects">Projects</a></li>
+    <li><a href="#people">People</a></li><li><a href="#code">Get the code</a></li><li><a href="#links">Links</a></li><li><a class="go" href="browse.html">Browse →</a></li>
   </ul>
 </div></nav>
 
@@ -143,22 +141,8 @@ details.table summary { cursor:pointer; font-size:13.5px; font-weight:600; }
     </div>
   </header>
 
-  <section class="sec" id="links" aria-labelledby="links-h">
-    <div class="sec-head"><div class="label">01</div><div><h2 id="links-h">Important links</h2></div></div>
-    <div class="ilinks">
-      <a class="ilink" href="https://portwatch-vi.xyz" target="_blank" rel="noopener">
-        <div class="top"><span class="label">External site</span><span class="arrow" aria-hidden="true">↗</span></div>
-        <span class="name">portwatch-vi.xyz</span>
-      </a>
-      <a class="ilink" href="https://leonida.now" target="_blank" rel="noopener">
-        <div class="top"><span class="label">External site</span><span class="arrow" aria-hidden="true">↗</span></div>
-        <span class="name">leonida.now</span>
-      </a>
-    </div>
-  </section>
-
   <section class="sec" id="activity" aria-labelledby="act-h">
-    <div class="sec-head"><div class="label">02</div><div><h2 id="act-h">Commits per hour</h2>
+    <div class="sec-head"><div class="label">01</div><div><h2 id="act-h">Commits per hour</h2>
       <p id="act-sub">Every commit in each project's original history, by the hour it was written (UTC).</p></div></div>
     <div class="chart" id="chart"><p class="note">Loading…</p></div>
     <p class="note">Each row is scaled to its own busiest hour, so the shapes compare but the bar heights don't. The number under each name is that busiest hour.</p>
@@ -166,22 +150,31 @@ details.table summary { cursor:pointer; font-size:13.5px; font-weight:600; }
   </section>
 
   <section class="sec" id="projects" aria-labelledby="proj-h">
-    <div class="sec-head"><div class="label">03</div><div><h2 id="proj-h">The projects</h2>
+    <div class="sec-head"><div class="label">02</div><div><h2 id="proj-h">The projects</h2>
       <p>Each one is in its own folder on <code>main</code> and on its own branches with its original commit hashes. Each keeps its own license.</p></div></div>
     <div id="projlist"></div>
   </section>
 
   <section class="sec" id="people" aria-labelledby="people-h">
-    <div class="sec-head"><div class="label">04</div><div><h2 id="people-h">The people</h2>
+    <div class="sec-head"><div class="label">03</div><div><h2 id="people-h">The people</h2>
       <p id="people-sub">The 40 people with the most commits across all four projects.</p></div></div>
     <ol class="people" id="peoplelist"></ol>
     <div class="callout" id="why"></div>
   </section>
 
   <section class="sec" id="code" aria-labelledby="code-h">
-    <div class="sec-head"><div class="label">05</div><div><h2 id="code-h">Get the code</h2>
+    <div class="sec-head"><div class="label">04</div><div><h2 id="code-h">Get the code</h2>
       <p>Clone everything, or one project with only its own history.</p></div></div>
     <div class="cmds" id="cmds"></div>
+  </section>
+
+  <section class="sec" id="links" aria-labelledby="links-h">
+    <div class="sec-head"><div class="label">05</div><div><h2 id="links-h">Important links</h2></div></div>
+    <div class="ilinks">
+      <a class="ilink" href="https://portwatch-vi.xyz" target="_blank" rel="noopener"><span class="name">portwatch-vi.xyz</span><span class="arrow" aria-hidden="true">↗</span></a>
+      <a class="ilink" href="https://leonida.now" target="_blank" rel="noopener"><span class="name">leonida.now</span><span class="arrow" aria-hidden="true">↗</span></a>
+      <a class="ilink" href="https://fluxer.gg/YWOKODCW" target="_blank" rel="noopener"><span class="name">fluxer.gg/YWOKODCW</span><span class="arrow" aria-hidden="true">↗</span></a>
+    </div>
   </section>
 </main>
 
