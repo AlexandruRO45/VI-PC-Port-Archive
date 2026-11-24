@@ -841,7 +841,43 @@ fn ensure_data_outside_cache(cache_dir: &Path, data_dir: &Path, origins: &Origin
             origins.cache_dir
         );
     }
+    // Lexically apart, but a link on the way can still put one inside the
+    // other: `VICTORY_DATA_DIR=~/victory-saves` with `~/victory-saves` a
+    // link into the cache, or a cache set to a link to the folder that
+    // holds the data. Emptying the cache then takes the data with it, so
+    // compare again where the folders are on disk, as far as they exist.
+    let (real_cache, real_data) = (on_disk(cache_dir), on_disk(data_dir));
+    if is_within(&real_data, &real_cache, FOLD_CASE) {
+        anyhow::bail!(
+            "the data folder {} (from {}) is inside the cache folder {} (from {}) once links \
+             are followed ({} is inside {}), so it may be deleted with the cache at any time; \
+             set VICTORY_DATA_DIR or [paths].data_dir to a folder outside it",
+            data_dir.display(),
+            origins.data_dir,
+            cache_dir.display(),
+            origins.cache_dir,
+            real_data.display(),
+            real_cache.display()
+        );
+    }
     Ok(())
+}
+
+/// Where `path` is on disk: its deepest ancestor that is there with every
+/// link and `..` resolved ([`std::fs::canonicalize`]), and the names below
+/// it that are not there yet, folded with [`lexical`] (no links among
+/// them to follow). A path none of whose ancestors can be resolved (a link
+/// that leads nowhere, a folder without search permission) is kept as
+/// written; [`ensure_directory_path`] names those.
+fn on_disk(path: &Path) -> PathBuf {
+    let walk: PathBuf = path.components().collect();
+    for found in walk.ancestors() {
+        if let Ok(real) = std::fs::canonicalize(found) {
+            let rest = walk.strip_prefix(found).unwrap_or(Path::new(""));
+            return lexical(&real.join(rest));
+        }
+    }
+    lexical(path)
 }
 
 /// [`ensure_data_outside_cache`] for the user's whole cache, not only
@@ -5300,6 +5336,87 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("inside the cache folder"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn data_inside_the_cache_through_a_link_is_refused() {
+        // A scratch folder under the system temp folder, never the
+        // repository; removed at the end.
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-data-linked-into-cache-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let cache = scratch.join("cache");
+        std::fs::create_dir_all(cache.join("kept")).unwrap();
+        std::fs::create_dir_all(scratch.join("home").join("victory")).unwrap();
+        // `saves` leads into the cache; `quick` is the cache by another
+        // name, a link to the folder that holds `home/victory/data`.
+        std::os::unix::fs::symlink("cache/kept", scratch.join("saves")).unwrap();
+        std::os::unix::fs::symlink("home/victory", scratch.join("quick")).unwrap();
+        let with = |cache: PathBuf, data: PathBuf| {
+            move |k: &str| match k {
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let resolve = |cache: PathBuf, data: PathBuf| {
+            Config::resolve(FilePaths::default(), None, with(cache, data))
+        };
+        let real = std::fs::canonicalize(&scratch).unwrap();
+
+        // Data under a link into the cache, with the data folder itself not
+        // made yet: named with both settings and where each one is.
+        let data = scratch.join("saves").join("data");
+        let err = resolve(cache.clone(), data.clone())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "the data folder {} (from VICTORY_DATA_DIR) is inside the cache folder {} (from \
+                 VICTORY_CACHE_DIR) once links are followed ({} is inside {}), so it may be \
+                 deleted with the cache at any time; set VICTORY_DATA_DIR or [paths].data_dir \
+                 to a folder outside it",
+                data.display(),
+                cache.display(),
+                real.join("cache").join("kept").join("data").display(),
+                real.join("cache").display()
+            )
+        );
+        // The link itself as the data folder, and a cache that is a link
+        // to the folder holding the data (the other way round).
+        let err = resolve(cache.clone(), scratch.join("saves"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("once links are followed"), "{err}");
+        let err = resolve(
+            scratch.join("quick"),
+            scratch.join("home").join("victory").join("data"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("once links are followed"), "{err}");
+        // A `..` after a link climbs from where the link leads: `saves/..`
+        // is the cache, so `saves/../data` is inside it.
+        let err = resolve(cache.clone(), scratch.join("saves").join("..").join("data"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inside the cache folder"), "{err}");
+
+        // Siblings on disk stay allowed, through a link or not.
+        let cfg = resolve(
+            scratch.join("quick").join("cache"),
+            scratch.join("quick").join("data"),
+        )
+        .unwrap();
+        assert_eq!(cfg.data_dir, scratch.join("quick").join("data"));
+        assert!(resolve(cache.clone(), scratch.join("home").join("data")).is_ok());
+        // Nothing was made on the way.
+        assert!(!cache.join("kept").join("data").exists());
+        std::fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]
