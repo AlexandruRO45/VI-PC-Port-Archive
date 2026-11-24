@@ -692,6 +692,12 @@ impl<'a> Lower<'a> {
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                    || (n == "v_cndmask_b32"
+                        && matches!(&i.fields, Fields::Valu(v) if matches!(
+                            v.src.get(2),
+                            Some(&Operand::Scalar { code, .. })
+                                if code != NULL && i.read(Reg::S(code)).is_some_and(|m| !x.st.masks.contains_key(&m))
+                        )))
                     || reads_mask_as_data(x.st, i)
             }) || {
                 // Masks held as numbers or constant lane sets: the lane
@@ -2307,6 +2313,7 @@ impl<'a> Lower<'a> {
         let lane = if self.emulate_wave64 {
             self.console_lane()
         } else {
+            self.s.flags |= flags::WAVE_OPS;
             self.s.op(
                 at,
                 "waveGetLaneIndex",
@@ -5152,14 +5159,40 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                    _ => None,
+                let cond = match v.src.get(2) {
+                    Some(&Operand::Scalar { code, .. }) => {
+                        let m = inst.read(Reg::S(code));
+                        if let Some(m) = m.and_then(|m| self.x.st.masks.get(&m).copied()) {
+                            self.boolean(m, c)?
+                        } else if code != NULL {
+                            let lo = self.operand(inst, &v.src[2])?;
+                            let hi = if self.x.native.wave64 {
+                                Some(self.i32_of(
+                                    inst.read(Reg::S(code + 1))
+                                        .ok_or("a select on an untracked mask")?,
+                                )?)
+                            } else {
+                                None
+                            };
+                            self.lane_bit(c, lo, hi)
+                        } else {
+                            self.s.m.bool(false)
+                        }
+                    }
+                    Some(op) => {
+                        let v_mask = self.operand(inst, op)?;
+                        match self.s.m.int_value(v_mask) {
+                            Some(0) => self.s.m.bool(false),
+                            Some(k) if k as u32 == u32::MAX => self.s.m.bool(true),
+                            Some(_) => {
+                                let hi = self.x.native.wave64.then_some(v_mask);
+                                self.lane_bit(c, v_mask, hi)
+                            }
+                            None => return Err("a select on an untracked mask"),
+                        }
+                    }
+                    None => return Err("a select on an untracked mask"),
                 };
-                let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
-                    .ok_or("a select on an untracked mask")?;
-                let cond = self.boolean(m, c)?;
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
                     let r = self.s.m.select(c, cond, bb, a);
@@ -6784,14 +6817,16 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let (op, sample) = match name {
-            "image_sample" | "image_sample_o" => (60, true),
+            "image_sample" | "image_sample_o" | "image_sample_cl" | "image_sample_cl_o" => {
+                (60, true)
+            }
             "image_sample_lz" | "image_sample_l" => (62, true),
-            "image_sample_b" => (61, true),
+            "image_sample_b" | "image_sample_b_cl" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
-            "image_sample_c" if self.s.pixel => (64, true),
+            "image_sample_c" | "image_sample_c_cl" if self.s.pixel => (64, true),
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
@@ -6853,8 +6888,8 @@ impl<'a> Lower<'a> {
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
-            let first =
-                usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
+            let bias = name.starts_with("image_sample_b");
+            let first = usize::from(offset_word) + usize::from(bias) + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
@@ -6873,6 +6908,12 @@ impl<'a> Lower<'a> {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
+            let clamp = if name.contains("_cl") {
+                let x = addr_val(self, first + grads + coords)?;
+                to_float(self, x)
+            } else {
+                fu
+            };
             if kind == 5 {
                 if *unorm || op == 63 || op == 81 {
                     return Err("a cube sample with texel coordinates, gradients or a level query");
@@ -6949,15 +6990,15 @@ impl<'a> Lower<'a> {
                         }
                     }
                     args.extend(&os);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    let bias = addr_val(self, 0)?;
+                    let bias = addr_val(self, usize::from(offset_word))?;
                     let bias = self.as_float(bias);
                     args.extend(&os);
-                    args.extend([bias, fu]);
+                    args.extend([bias, clamp]);
                     self.s.op(
                         c,
                         "sampleBias.f32",
@@ -6977,7 +7018,7 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
@@ -6993,7 +7034,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.push(reference);
                     let name = if op == 64 {
-                        args.push(fu);
+                        args.push(clamp);
                         "sampleCmp.f32"
                     } else {
                         "sampleCmpLevelZero.f32"

@@ -2043,3 +2043,247 @@ fn table_descriptor_read_only_as_data_returns_buffer_num_records() {
         assert_eq!(out[0][1], 28, "{label}: raw buffer byte count mismatch");
     }
 }
+
+#[test]
+fn image_sample_d_cl_lowers_and_runs_with_clamp() {
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    // s0: view table (slot 0: RawUav(1), slot 1: Texture 2D RGBA32F), s1: sampler table.
+    // Reads clamp/coords from root constants? No, simpler: v0 = dx = 0, v1 = dy = 0,
+    // v2 = u = 0.5, v3 = v = 0.5, v4 = clamp = 0.0 -> image_sample_d_cl (2D, dmask 1).
+    let mut words = Vec::new();
+    words.push(s_mov_b32(1, 0x80)); // view table s[0:1] high = 0
+    words.push(s_mov_b32(3, 0x80)); // sampler table s[2:3] high = 0
+    words.extend_from_slice(&s_load_dwordx4(8, 0)); // UAV @ byte 0 -> s[8:11]
+    // Load Texture2D descriptor @ byte 32 = 0x20 -> s[16:23] (s_load_dwordx8 op=0x03)
+    words.push(0x3D << 26 | 0x03 << 18 | 16 << 6);
+    words.push(125 << 25 | 0x20);
+    words.extend_from_slice(&s_load_dwordx4(24, 2)); // Sampler descriptor @ 0 -> s[24:27]
+    // v1 = dx = 0.0, v2 = dy = 0.0, v3 = u = 0.5 (0x3F00_0000), v4 = v = 0.5, v5 = clamp = 0.0
+    words.push(vop1(0x001, 1, 0x80)); // dx = 0
+    words.push(vop1(0x001, 2, 0x80)); // dy = 0
+    words.push(vop1(0x001, 3, 0xF0)); // 0xF0 = 0.5f inline constant
+    words.push(vop1(0x001, 4, 0xF0)); // v = 0.5f
+    words.push(vop1(0x001, 5, 0x80)); // clamp = 0.0f
+    // MIMG: image_sample_d_cl (op=0x023), dmask=0x1, dim=1 (2D), vdst=v0, vaddr=v1..v5, srsrc=s16 (16>>2=4), ssamp=s24 (24>>2=6).
+    words.push(0x3C << 26 | 0x023 << 18 | 0x1 << 8 | 1 << 3);
+    words.push((6 << 21) | (4 << 16) | 1); // vdst=v0, vaddr=v1
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+
+    let layout = vec![
+        RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        },
+        RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 2,
+            slot: 1,
+        },
+    ];
+    let used = vec![
+        UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        },
+        UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        },
+        UsedResource {
+            kind: ResourceType::Sampler,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 2,
+            slot: 1,
+        },
+    ];
+    let shader = lower_synthetic_cs(&words, layout, used, 3);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let texel = [0.25f32, 0.5, 0.75, 1.0];
+        let sampler = D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxLOD: f32::MAX,
+            ..Default::default()
+        };
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                    views: &[View::RawUav(1), View::Texture(1, 1, &[texel])],
+                    samplers: &[sampler],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0][0], 0.25f32.to_bits(), "{label}: image_sample_d_cl mismatch");
+    }
+}
+
+#[test]
+fn v_cndmask_b32_with_untracked_mask_selects_per_lane() {
+    // Runs both native wave32 (32 threads) and emulated wave64 on wave32 (64 threads).
+    // s0 = mask_lo (root constant), s1 = mask_hi (root constant), s[2:3] = view table (s2=0).
+    for (wave64, total_threads, max_wave) in [(false, 32u32, 64u32), (true, 64u32, 32u32)] {
+        let mut words = Vec::new();
+        words.push(s_mov_b32(3, 0x80)); // s3 = 0
+        words.extend_from_slice(&s_load_dwordx4(8, 2)); // UAV @ byte 0 -> s[8:11]
+        // Compute untracked scalar mask in s[12:13] from root constants s0..s1.
+        words.push(sop2(0x00, 12, 0, 0x80)); // s_add_u32 s12, s0, 0
+        words.push(sop2(0x00, 13, 1, 0x80)); // s_add_u32 s13, s1, 0
+        words.push(vop1(0x001, 1, 0x8A)); // v1 = 10
+        words.push(vop1(0x001, 2, 0x94)); // v2 = 20
+        // v_cndmask_b32 v3, v1, v2, s[12:13] (VOP3 op 0x101)
+        words.extend_from_slice(&vop3(0x101, 3, vgpr(1), vgpr(2), sgpr(12)));
+        // addr = v0 * 4 (MUBUF vaddr at v4): v_lshlrev_b32 v4, 2, v0
+        words.push((0x1A << 25) | (4 << 17) | 0x82);
+        // buffer_store_dword v3, v4, s[8:11], 0 offen
+        words.push(0x38 << 26 | 0x1C << 18 | (1 << 12));
+        words.push(0x80 << 24 | (8 >> 2) << 16 | (3 << 8) | 4);
+        words.push(S_ENDPGM);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 2,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 2,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 3 << 1,
+                threads: [total_threads, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
+        let io = io::raise(&p, &native).expect("io");
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            max_wave,
+        })
+        .expect("lower");
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+        };
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let mask: u64 = 0xA5A5_5A5A_0F0F_1234;
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+                // Skip WaveSize(32) on adapters that do not support it (if any)
+                continue;
+            };
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot, u.dword) {
+                    (RootType::Constants, 0, 0) => mask as u32,
+                    (RootType::Constants, 0, 1) => (mask >> 32) as u32,
+                    (RootType::Table, 1, _) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(total_threads)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            for lane in 0..total_threads {
+                let want = if (mask >> lane) & 1 != 0 { 20 } else { 10 };
+                assert_eq!(out[0][lane as usize], want, "{label}: wave64={wave64} lane {lane}");
+            }
+        }
+    }
+}
