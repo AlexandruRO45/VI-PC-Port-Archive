@@ -77,6 +77,12 @@ pub fn run(
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
     }
 
+    // The decoder a title's movies are decoded with is the title's own DLL,
+    // so it is not ours to change: `bink` wraps five of its imports to record
+    // the frame buffers and what the decoder writes there
+    // (`VICTORY_BINK_TRACE=1`). Nothing is wrapped without the switch.
+    victory_hle::bink::attach(&dlls);
+
     let policy = match unimplemented {
         Unimplemented::Trap => UnimplementedPolicy::Trap,
         Unimplemented::Zero => UnimplementedPolicy::ReturnZero,

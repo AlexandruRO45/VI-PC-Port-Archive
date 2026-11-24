@@ -510,6 +510,24 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
+    #[cfg(feature = "diagnostics")]
+    if crate::movie::on() {
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        if d.Format.0 == 61 || (d.Width >= 1024 && d.Height >= 1024) {
+            let memory = crate::resource::texture_memory(resource);
+            let len = memory
+                .as_ref()
+                .and_then(|(_, desc)| crate::resource::texture_layout(desc))
+                .map_or(0, |t| t.planes[0].layout.size as usize);
+            let at = memory.map_or(0, |(at, _)| at as usize);
+            let of = format!(
+                "{}x{}x{} f{} mips {}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels
+            );
+            crate::movie::said(resource as usize, &of, at, len, host_written);
+        }
+    }
     if host_written || !list.first_use(resource as usize) {
         return;
     }
@@ -525,11 +543,17 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+        crate::movie::verdict("left out: uploaded before, nothing new since", staging.memory().0, staging.memory().1, || {
+            String::from("its refresh found no write and no change")
+        });
         list.defer_texture(staging);
         return;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    crate::movie::verdict("uploaded from title memory", staging.memory().0, staging.memory().1, || {
+        format!("{} subresources detiled into the staging buffer", staging.footprints.len())
+    });
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
@@ -641,6 +665,14 @@ impl Staging {
         let last = &mut *last;
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                crate::movie::verdict("write-watch says unwritten", start, size, || {
+                    format!(
+                        "asked {now}, last wrote at {}: {} pages of {}",
+                        last.asked,
+                        written.len(),
+                        size.div_ceil(64 << 10)
+                    )
+                });
                 return 0;
             }
             last.asked = now;
@@ -673,6 +705,9 @@ impl Staging {
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
             if unwritten && !turn {
+                crate::movie::verdict("guarded view, no write seen, not its hash turn", start, size, || {
+                    format!("asked {now}, last wrote at {}, one hash in {HASH_EVERY} frames", last.asked)
+                });
                 return 0;
             }
         }
@@ -1055,6 +1090,25 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
         )
     });
+    // A movie's picture is decoded into buffers the title registered with
+    // its Bink decoder, and this is where such memory becomes a texture the
+    // movie's shader samples (`movie`). Said once per texture, because the
+    // interesting facts are all about the first read: where the memory is,
+    // how much of it the console layout covers, and whether it is there at
+    // all right now.
+    if let Some(plane) = crate::movie::overlaps(memory as usize, layout.size as usize) {
+        tracing::info!(
+            ?desc,
+            memory = format_args!("{memory:p}"),
+            layout = layout.size,
+            total,
+            plane = plane.name,
+            plane_at = format_args!("{:#x}", plane.at),
+            plane_size = plane.size,
+            committed = committed(memory, layout.size as usize),
+            "movie surface: a texture reads the decoder's buffer"
+        );
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
