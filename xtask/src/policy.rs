@@ -217,6 +217,11 @@ const REPOSITORY_ENV: &[&str] = &[
 /// what it stages. The checkout itself keeps all of that, since a global
 /// excludes file is how files that will never be added (`.DS_Store`) stay
 /// out of the full check.
+///
+/// Nor are they made from the environment's choices: `GIT_TEMPLATE_DIR`
+/// copies its `info/exclude` and hooks into every `git init`, and
+/// `GIT_DEFAULT_HASH=sha256` makes repositories that the SHA-1 object ids
+/// tests stage are refused by.
 pub(crate) fn git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(root);
@@ -231,7 +236,10 @@ pub(crate) fn git_command(root: &Path) -> Command {
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_ATTR_NOSYSTEM", "1")
-                .env("XDG_CONFIG_HOME", NO_XDG_CONFIG);
+                .env("XDG_CONFIG_HOME", NO_XDG_CONFIG)
+                // Empty: `git init` copies no template at all, silently.
+                .env("GIT_TEMPLATE_DIR", "")
+                .env_remove("GIT_DEFAULT_HASH");
         }
     }
     command
@@ -939,6 +947,52 @@ mod tests {
             checkout
                 .get_envs()
                 .all(|(key, _)| key != "XDG_CONFIG_HOME" && key != "GIT_ATTR_NOSYSTEM"),
+        );
+    }
+
+    /// `GIT_TEMPLATE_DIR` and `GIT_DEFAULT_HASH` reach `git init` from the
+    /// environment: a template's `info/exclude` hid the files the temporary
+    /// repositories stage, its hooks ran in them (`--no-verify` skips only
+    /// some), and a SHA-256 repository refused the SHA-1 ids tests stage.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_repositories_are_made_without_template_or_hash_choice() {
+        let template = tempdir();
+        std::fs::create_dir_all(template.path().join("info")).unwrap();
+        std::fs::write(template.path().join("info/exclude"), "*.rs\n").unwrap();
+        let tmp = tempdir();
+        let root = tmp.path();
+        let made = super::git_command(root)
+            .args(["init", "-q"])
+            .env("GIT_TEMPLATE_DIR", template.path())
+            .env("GIT_DEFAULT_HASH", "sha256")
+            .output()
+            .unwrap();
+        assert!(made.status.success());
+        // Handed both choices, as the environment used to: both apply.
+        let format = git_str(root, &["rev-parse", "--show-object-format"]);
+        assert_eq!(format, b"sha256\n");
+        assert!(root.join(".git/info/exclude").exists());
+
+        let command = super::git_command(root);
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(envs.contains(&("GIT_TEMPLATE_DIR".as_ref(), Some("".as_ref()))));
+        assert!(envs.contains(&("GIT_DEFAULT_HASH".as_ref(), None)));
+
+        let tmp = tempdir();
+        let root = tmp.path();
+        git_str(root, &["init", "-q"]);
+        let format = git_str(root, &["rev-parse", "--show-object-format"]);
+        assert_eq!(format, b"sha1\n");
+        assert!(!root.join(".git/info/exclude").exists());
+        assert!(!root.join(".git/hooks").exists());
+
+        // The checkout is never initialised here and keeps its environment.
+        let checkout = super::git_command(&crate::workspace_root());
+        assert!(
+            checkout
+                .get_envs()
+                .all(|(key, _)| key != "GIT_TEMPLATE_DIR" && key != "GIT_DEFAULT_HASH"),
         );
     }
 
