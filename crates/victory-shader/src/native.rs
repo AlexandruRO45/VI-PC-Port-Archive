@@ -3759,4 +3759,160 @@ mod tests {
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
+
+    #[test]
+    fn semantic_entries_decode_usage_flags_and_low_mask_bits() {
+        // A pixel input: clip distance, the mask's high nibble set, flags
+        // linear (bit 1, not read), fp16 and packed with its pair in row 4.
+        let mut ps = fssm(&[(HwStage::Ps, &PS_CODE)]);
+        let e = stage_data_at(&ps, HwStage::Ps);
+        ps[e + PS_INPUTS..][..8].copy_from_slice(&[7, 2, 0xF3, 5, 0, 4, 0, 0x1A]);
+        ps[e + PS_INPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&ps))])).unwrap()[0];
+        let StageIo::Ps { inputs, .. } = &p.io else {
+            panic!("{:?}", p.io)
+        };
+        assert_eq!(
+            inputs[..],
+            [PsInput {
+                usage: Usage::ClipDistance,
+                row: 2,
+                mask: 3,
+                attr: 5,
+                flat: false,
+                fp16: true,
+                pack2: true,
+                row2: 4,
+            }]
+        );
+
+        // A vertex input of a usage not named (kept as its byte) with the
+        // mask's high nibble set, and a clip-distance output of two packed
+        // 16-bit values per dword.
+        let mut vs = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let e = stage_data_at(&vs, HwStage::Vs);
+        vs[e + VS_INPUTS..][..5].copy_from_slice(&[0x2A, 1, 0xF1, 4, 0]);
+        vs[e + VS_INPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+        vs[e + VS_OUTPUTS..][..6].copy_from_slice(&[7, 3, 2, 3, 0, 3]);
+        vs[e + VS_OUTPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&vs))])).unwrap()[0];
+        assert_eq!(
+            p.io,
+            StageIo::Vs {
+                inputs: vec![VsInput {
+                    usage: Usage::Other(0x2A),
+                    row: 1,
+                    mask: 1,
+                    vgpr: 4,
+                }],
+                outputs: vec![VsOutput {
+                    usage: Usage::ClipDistance,
+                    row: 3,
+                    param: 2,
+                    fp16: true,
+                    pack2: true,
+                }],
+            }
+        );
+        // Only the low nibble loads: the high bits of 0xF1 name no VGPR, so
+        // an input at the last VGPR still fits.
+        let regs = e - RECORD_SIZE as usize + RECORD_REGS;
+        vs[regs..][..4].copy_from_slice(&5u32.to_le_bytes());
+        assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&vs))])).is_ok());
+    }
+
+    #[test]
+    fn merged_stages_read_no_stage_data() {
+        // Merged stages keep their stage data in another layout: bytes that
+        // would be refused as vertex or pixel data are not read at all.
+        for stage in [HwStage::Ls, HwStage::Hs, HwStage::Es, HwStage::Gs] {
+            let mut blob = fssm(&[(stage, &VS_CODE)]);
+            let e = stage_data_at(&blob, stage);
+            blob[e..e + STAGE_DATA].fill(0xFF);
+            let p = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap();
+            assert_eq!((p[0].stage, &p[0].io), (stage, &StageIo::None));
+            assert_eq!(p[0].code, VS_CODE);
+        }
+        // The same bytes in a vertex program are read, and refused.
+        let mut blob = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Vs);
+        blob[e..e + STAGE_DATA].fill(0xFF);
+        assert_eq!(refused_blob(&xbch(&blob)), "implausible semantic count");
+    }
+
+    #[test]
+    fn patched_code_writes_every_mrt_and_keeps_the_stored_code() {
+        let code = [0xBF80_0000u32; 6]; // s_nop
+        let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut blob = fssm(&[(HwStage::Ps, &bytes)]);
+        let e = stage_data_at(&blob, HwStage::Ps);
+        blob[e + PS_PATCH_SIZE..][..4].copy_from_slice(&2u32.to_le_bytes());
+        // MRT0 at dword 4 (the last two), MRT7 at dword 0; each variant other
+        // than the full one is filled with a marker that must not be used.
+        for (mrt, offset, word) in [(0, 4u32, 0xAAAA_0000u32), (7, 0, 0x7777_0000)] {
+            let at = e + PS_PATCHES + mrt * PATCH_BYTES;
+            blob[at..][..4].copy_from_slice(&offset.to_le_bytes());
+            blob[at + 4..at + PATCH_BYTES].fill(0xEE);
+            let full = at + 4 + PATCH_FULL * PATCH_SLOT_DWORDS * 4;
+            for i in 0..2 {
+                blob[full + 4 * i..][..4].copy_from_slice(&(word + i as u32).to_le_bytes());
+            }
+        }
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
+        assert_eq!(p.code, bytes, "the stored code is kept as read");
+        let StageIo::Ps { patches, .. } = &p.io else {
+            panic!("{:?}", p.io)
+        };
+        assert_eq!(
+            patches[..],
+            [
+                ExportPatch {
+                    mrt: 0,
+                    offset: 4,
+                    code: vec![0xAAAA_0000, 0xAAAA_0001],
+                },
+                ExportPatch {
+                    mrt: 7,
+                    offset: 0,
+                    code: vec![0x7777_0000, 0x7777_0001],
+                },
+            ]
+        );
+        let words: Vec<u32> = p
+            .patched_code()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect();
+        assert_eq!(
+            words,
+            [
+                0x7777_0000,
+                0x7777_0001,
+                0xBF80_0000,
+                0xBF80_0000,
+                0xAAAA_0000,
+                0xAAAA_0001,
+            ]
+        );
+
+        // An empty patch is still a patch, and changes nothing.
+        blob[e + PS_PATCH_SIZE..][..4].copy_from_slice(&0u32.to_le_bytes());
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
+        let StageIo::Ps { patches, .. } = &p.io else {
+            panic!("{:?}", p.io)
+        };
+        assert!(patches.iter().all(|p| p.code.is_empty()));
+        assert_eq!(patches.len(), 2);
+        assert_eq!(p.patched_code(), bytes);
+
+        // Other stages have no patches to apply.
+        let vs = &native_programs(&part(&[(
+            KIND_NATIVE,
+            &xbch(&fssm(&[(HwStage::Vs, &VS_CODE)])),
+        )]))
+        .unwrap()[0];
+        assert_eq!(vs.patched_code(), VS_CODE);
+    }
 }
