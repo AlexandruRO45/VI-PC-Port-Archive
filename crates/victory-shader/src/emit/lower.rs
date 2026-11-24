@@ -40,6 +40,9 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// Prefix min/max scans lowered (test builds only).
+    #[cfg(test)]
+    pub prefix_scans: u32,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -772,25 +775,11 @@ impl<'a> Lower<'a> {
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
-            (
-                Op::AddU
-                | Op::AddF
-                | Op::MinU
-                | Op::MaxU
-                | Op::MinI
-                | Op::MaxI
-                | Op::MinF
-                | Op::MaxF,
-                Some(inclusive),
-            ) => {
-                // The reduction's kind and signedness, as the active one.
-                let (kind, sop) = match op {
-                    Op::AddU => (0, 1),
-                    Op::AddF => (0, 0),
-                    Op::MinU => (2, 1),
-                    Op::MaxU => (3, 1),
-                    Op::MinI | Op::MinF => (2, 0),
-                    _ => (3, 0),
+            (Op::AddU | Op::AddF, Some(inclusive)) => {
+                let (kind, sop) = if matches!(op, Op::AddU) {
+                    (0, 1)
+                } else {
+                    (0, 0)
                 };
                 let (k0, k1) = (self.s.m.i8(kind), self.s.m.i8(sop));
                 let r = self.s.op(
@@ -801,26 +790,20 @@ impl<'a> Lower<'a> {
                     121,
                     &[arg, k0, k1],
                 );
-                if !inclusive {
-                    r
-                } else if matches!(op, Op::AddU | Op::AddF) {
+                if inclusive {
                     self.s.m.bin(c, Bin::Add, r, arg)
-                } else if matches!(op, Op::MinF | Op::MaxF) {
-                    // FMin/FMax keep the non-NaN operand, as `v_min_f32` does:
-                    // a compare and select would keep the NaN one when this
-                    // lane's own term is the NaN.
-                    self.max_min(matches!(op, Op::MaxF), r, arg)
                 } else {
-                    // The prefix is exclusive of the lane's own term, so an
-                    // inclusive one folds it back in.
-                    let p = match op {
-                        Op::MinU => self.s.m.cmp(c, pred::IULT, r, arg),
-                        Op::MaxU => self.s.m.cmp(c, pred::IUGT, r, arg),
-                        Op::MinI => self.s.m.cmp(c, pred::SLT, r, arg),
-                        _ => self.s.m.cmp(c, pred::SGT, r, arg),
-                    };
-                    self.s.m.select(c, p, r, arg)
+                    r
                 }
+            }
+            (Op::MinU | Op::MaxU | Op::MinI | Op::MaxI | Op::MinF | Op::MaxF, Some(inclusive)) => {
+                // `wavePrefixOp` kinds 2 and 3 are what HLSL uses for a min or
+                // max prefix, and no driver implements them: NVIDIA returns the
+                // unsigned prefix for the signed kinds and refuses to create a
+                // pipeline for the float ones, and AMD returns unrelated values
+                // (PR #470, hardware readback). Scan with `waveReadLaneAt`
+                // instead, which both vendors implement for every type.
+                self.wave_prefix_scan(op, arg, id, inclusive)
             }
             (_, Some(_)) => return Err("a wave prefix of a bitwise operation"),
             (Op::Or | Op::And | Op::Xor, None) => {
@@ -942,6 +925,8 @@ impl<'a> Lower<'a> {
             root_srvs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            prefix_scans: self.s.prefix_scans,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -1413,6 +1398,75 @@ impl<'a> Lower<'a> {
             op,
             &[a, b],
         )
+    }
+
+    /// The prefix of a min or max over the lanes below this one (and its own
+    /// term when `inclusive`), as a Hillis-Steele scan: at each step the lane
+    /// merges the value `step` lanes below, and keeps its own value where the
+    /// step would read off the bottom of the wave. An exclusive prefix is the
+    /// inclusive one read one lane down, with the identity in lane 0.
+    ///
+    /// The merges are the same ones the translator emits for `v_min_u32` and
+    /// friends, so a float prefix folds with `max_min` (FMin/FMax) and keeps
+    /// the non-NaN operand, as the console does.
+    fn wave_prefix_scan(&mut self, op: super::wave::Op, arg: V, id: V, inclusive: bool) -> V {
+        use super::wave::Op;
+        self.s.prefix_scans += 1;
+        let c = self.cur;
+        let float = matches!(op, Op::MinF | Op::MaxF);
+        let lane = self.lane_index();
+        let zero = self.s.m.i32(0);
+        let mut r = arg;
+        let mut step = 1u32;
+        while step < self.wave() {
+            let k = self.s.m.i32(step);
+            // The lane this step reads, and whether it exists for this lane.
+            let enough = self.s.m.cmp(c, pred::IUGE, lane, k);
+            let under = self.s.m.bin(c, Bin::Sub, lane, k);
+            // Clamp the source lane: a step below the bottom of the wave reads
+            // lane 0, and its result is discarded, rather than an index out of
+            // range.
+            let below = self.s.m.select(c, enough, under, zero);
+            let bits = if float { self.as_int(r) } else { r };
+            let raw = self.read_lane(bits, below);
+            let other = if float { self.as_float(raw) } else { raw };
+            let merged = match op {
+                Op::MinU => {
+                    let p = self.s.m.cmp(c, pred::IULT, r, other);
+                    self.s.m.select(c, p, r, other)
+                }
+                Op::MaxU => {
+                    let p = self.s.m.cmp(c, pred::IUGT, r, other);
+                    self.s.m.select(c, p, r, other)
+                }
+                Op::MinI => {
+                    let p = self.s.m.cmp(c, pred::SLT, r, other);
+                    self.s.m.select(c, p, r, other)
+                }
+                Op::MaxI => {
+                    let p = self.s.m.cmp(c, pred::SGT, r, other);
+                    self.s.m.select(c, p, r, other)
+                }
+                Op::MinF => self.max_min(false, r, other),
+                _ => self.max_min(true, r, other),
+            };
+            r = self.s.m.select(c, enough, merged, r);
+            step *= 2;
+        }
+        if inclusive {
+            return r;
+        }
+        // The prefix stops below this lane: read the inclusive one a lane down,
+        // and put the identity in lane 0.
+        let one = self.s.m.i32(1);
+        let nonzero = self.s.m.cmp(c, pred::IUGT, lane, zero);
+        let under = self.s.m.bin(c, Bin::Sub, lane, one);
+        let below = self.s.m.select(c, nonzero, under, zero);
+        let bits = if float { self.as_int(r) } else { r };
+        let raw = self.read_lane(bits, below);
+        let other = if float { self.as_float(raw) } else { raw };
+        let id = if float { self.as_float(id) } else { id };
+        self.s.m.select(c, nonzero, other, id)
     }
 
     /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
@@ -7418,12 +7472,14 @@ mod tests {
             0x0000_0100,
             S_ENDPGM,
         ];
-        lowers(&words, 1 << 15).unwrap();
-        // No compiler emits `wavePrefixOp` kind 2, so dxil.dll, where there is
-        // one, is the only check that the module is well formed.
+        let out = lowered(&words, 1 << 15).unwrap();
+        // Drivers do not implement `wavePrefixOp` kinds 2 and 3 (hardware
+        // readback on PR #470), so the min prefix must lower to a
+        // `WaveReadLaneAt` scan instead.
+        assert_eq!(out.prefix_scans, 1, "a min prefix must scan, not prefix-op");
+        // dxil.dll, where there is one, checks the scan's module too.
         #[cfg(windows)]
         {
-            let out = lowered(&words, 1 << 15).unwrap();
             if let Ok(mut v) = super::super::validator::Validator::load(
                 super::super::validator::Validator::default_path().as_deref(),
             ) {
