@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -43,6 +43,8 @@ pub(crate) struct Shadow {
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// The buffer's current host D3D12 resource state (`0`: `COMMON`).
+    pub(crate) state: AtomicU32,
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -83,6 +85,14 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+impl Drop for Shadow {
+    fn drop(&mut self) {
+        // Defer releasing the underlying GPU buffer across subsequent frames
+        // so directly-indexed descriptors referencing it cannot page-fault.
+        crate::host::retire_resource(self.buffer.clone());
+    }
+}
+
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
@@ -118,6 +128,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
+            state: AtomicU32::new(0),
         }
     }
 
@@ -125,7 +136,7 @@ impl Shadow {
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let from = address.clamp(start, end);
-        (from - start, (address + len).clamp(from, end) - start)
+        (from - start, address.saturating_add(len).clamp(from, end) - start)
     }
 
     /// Shaders of `list` may write `[address, address + len)` of the copy
@@ -198,39 +209,64 @@ impl Shadow {
             && from < to
         {
             let before = &before[from - taken..to - taken];
-            // By 64 KiB piece: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
+            // By 64 KiB piece: stage each piece out of write-combined GPU
+            // memory into cached RAM once using reusable thread-local scratch
+            // buffers so comparison and byte merging never stall on repeated
+            // byte-wise WC reads/writes or per-call 128 KiB heap allocations.
             const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
-            let mut synced = Vec::new();
-            let mut at = from;
-            while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
-                }
-                at += n;
+            thread_local! {
+                static SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<u8>)> = const {
+                    std::cell::RefCell::new((Vec::new(), Vec::new()))
+                };
             }
+            let mut synced = Vec::new();
+            SCRATCH.with(|cell| {
+                let mut pair = cell.borrow_mut();
+                if pair.0.len() < PIECE {
+                    pair.0.resize(PIECE, 0);
+                }
+                if pair.1.len() < PIECE {
+                    pair.1.resize(PIECE, 0);
+                }
+                let (title_buf, host_buf) = &mut *pair;
+                let mut at = from;
+                while at < to {
+                    let n = (PIECE - (start + at) % PIECE).min(to - at);
+                    // SAFETY: inside the mapping; only the submitting thread
+                    // accesses it.
+                    let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    let old = &before[at - from..at - from + n];
+                    let host_ram = &mut host_buf[..n];
+                    host_ram.copy_from_slice(host);
+                    let title = &mut title_buf[..n];
+                    if host_ram != old && crate::host::read_into((start + at) as *const u8, title) {
+                        // Title memory with the GPU's bytes put in; write back
+                        // to the host shadow buffer only if title had newer
+                        // bytes the GPU did not overwrite.
+                        let mut title_changed = false;
+                        let mut host_changed = false;
+                        for ((t, h), &o) in title.iter_mut().zip(host_ram.iter_mut()).zip(old) {
+                            if *h != o && *t != *h {
+                                *t = *h;
+                                title_changed = true;
+                            } else if *h != *t {
+                                *h = *t;
+                                host_changed = true;
+                            }
+                        }
+                        if title_changed {
+                            crate::watch::writing(start + at, n);
+                            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                            written += n;
+                        }
+                        if host_changed {
+                            host.copy_from_slice(host_ram);
+                        }
+                        synced.push((start + at) / PAGE);
+                    }
+                    at += n;
+                }
+            });
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).

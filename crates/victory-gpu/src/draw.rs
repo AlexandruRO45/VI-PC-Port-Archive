@@ -8,6 +8,7 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
@@ -74,17 +75,6 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
-    }
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -129,19 +119,45 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+#[derive(Clone, Copy)]
+enum RootViewKind {
+    Cbv,
+    Srv,
+    Uav,
+}
+
+const BUFFER_READ: u32 = D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32;
+const BUFFER_UAV: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+fn root_view(
+    list: &HostList,
+    address: u64,
+    kind: RootViewKind,
+    uav_buffers: &mut Vec<usize>,
+) -> Option<u64> {
     let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
-        .left(address)
-        .min(if srv { 1 << 20 } else { 1 << 16 });
+    let len = shadow.left(address).min(match kind {
+        RootViewKind::Cbv => 1 << 16,
+        RootViewKind::Srv | RootViewKind::Uav => 1 << 20,
+    });
     let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
+    if !matches!(kind, RootViewKind::Cbv) || gpu.is_multiple_of(256) {
         shadow.refresh(list, address, len);
+        let key = Arc::as_ptr(&shadow) as usize;
+        if matches!(kind, RootViewKind::Uav) {
+            shadow.gpu_writes(list, address, len);
+            if !uav_buffers.contains(&key) {
+                uav_buffers.push(key);
+            }
+            list.ensure_buffer(&shadow, BUFFER_UAV);
+        } else if !uav_buffers.contains(&key) {
+            list.ensure_buffer(&shadow, BUFFER_READ);
+        }
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -242,6 +258,14 @@ impl State {
         }
     }
 
+    pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
+        for i in 0..count as usize {
+            if let Some(slot) = self.vertex.get_mut(start as usize + i) {
+                *slot = VertexView::default();
+            }
+        }
+    }
+
     pub(crate) fn set_index_buffer(&mut self, view: Option<&IndexView>) {
         self.index = view.copied().unwrap_or_default();
     }
@@ -288,9 +312,43 @@ impl State {
         };
     }
 
+    /// The host byte length of a bound root view for `slot` (0 if unset or
+    /// outside shadow memory), matching [`root_view`]'s 64 KiB CBV / 1 MiB
+    /// SRV/UAV cap so shaders never read or write past the host mapping.
+    fn root_view_bytes(
+        &self,
+        stage: &crate::pipeline::host::Stage,
+        compute: bool,
+        slot: u8,
+    ) -> u32 {
+        let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return 0;
+        };
+        let Some(shadow) = crate::shadow::find(*address, 1) else {
+            return 0;
+        };
+        let cap = if stage.root_cbvs.iter().any(|&(s, _)| s == slot) {
+            1u64 << 16
+        } else {
+            1u64 << 20
+        };
+        shadow.left(*address).min(cap) as u32
+    }
+
     /// The user-data value of a root argument, as translated shaders read
-    /// it: a table's byte offset in its heap, a constant's value.
-    fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
+    /// it: a table's byte offset in its heap, a constant's value, or a root
+    /// view's bound byte size.
+    fn user_value(
+        &self,
+        stage: &crate::pipeline::host::Stage,
+        compute: bool,
+        slot: u8,
+        root: RootType,
+        dword: u32,
+    ) -> u32 {
+        if root == RootType::Descriptor {
+            return self.root_view_bytes(stage, compute, slot);
+        }
         match (self.roots_ref(compute).get(usize::from(slot)), root) {
             (Some(Root::Table(handle)), RootType::Table) => match self.heap_of(*handle) {
                 Some(heap) => (handle - heap.start) as u32,
@@ -344,7 +402,7 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
-        self.bind(list, p, false);
+        let uav_buffers = self.bind(list, p, false);
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -361,6 +419,9 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            if !uav_buffers.contains(&(Arc::as_ptr(&shadow) as usize)) {
+                list.ensure_buffer(&shadow, BUFFER_READ);
+            }
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -379,6 +440,9 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            if !uav_buffers.contains(&(Arc::as_ptr(&shadow) as usize)) {
+                list.ensure_buffer(&shadow, BUFFER_READ);
+            }
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -402,8 +466,11 @@ impl State {
     /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    /// descriptors its tables hold. Returns shadow-buffer pointers bound as
+    /// UAVs by this operation so callers do not transition them away from
+    /// `UNORDERED_ACCESS`.
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> Vec<usize> {
+        let mut uav_buffers = Vec::new();
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -446,8 +513,12 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            let made = self.tables(list, &t.used, compute);
-            if let Some((param, dwords)) = stage.user_data {
+            let made = self.tables(list, &t.used, compute, &mut uav_buffers);
+            if let Some(binding) = stage.user_data {
+                let dwords = match binding {
+                    crate::pipeline::host::UserDataBinding::Constants { dwords, .. }
+                    | crate::pipeline::host::UserDataBinding::RootCbv { dwords, .. } => dwords,
+                };
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
                     let fresh = made
@@ -455,40 +526,149 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
+                        None => self.user_value(stage, compute, u.slot, u.root, u.dword),
                     };
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                match binding {
+                    crate::pipeline::host::UserDataBinding::Constants { param, dwords } => {
+                        // SAFETY: an open list; `values` covers the parameter.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRoot32BitConstants(
+                                    param,
+                                    dwords,
+                                    values.as_ptr().cast(),
+                                    0,
+                                );
+                            } else {
+                                l.SetGraphicsRoot32BitConstants(
+                                    param,
+                                    dwords,
+                                    values.as_ptr().cast(),
+                                    0,
+                                );
+                            }
+                        }
+                    }
+                    crate::pipeline::host::UserDataBinding::RootCbv { param, dwords } => {
+                        let byte_len = (dwords as usize) * 4;
+                        let padded = u64::from(dwords * 4).next_multiple_of(256);
+                        if let Some((gpu, to)) = list.scratch(padded) {
+                            // SAFETY: `to` points to `padded >= byte_len` writable bytes of
+                            // the list's upload ring; `values` is `byte_len` valid bytes.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    values.as_ptr().cast::<u8>(),
+                                    to,
+                                    byte_len,
+                                );
+                                if compute {
+                                    l.SetComputeRootConstantBufferView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootConstantBufferView(param, gpu);
+                                }
+                            }
+                        } else {
+                            once!(param, "no scratch upload memory for spilled user-data CBV");
+                        }
                     }
                 }
             }
-            for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+            for (views, kind) in [
+                (&stage.root_cbvs, RootViewKind::Cbv),
+                (&stage.root_srvs, RootViewKind::Srv),
+                (&stage.root_uavs, RootViewKind::Uav),
+            ] {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    let Some(gpu) = root_view(list, *address, kind, &mut uav_buffers) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                        match (compute, kind) {
+                            (false, RootViewKind::Cbv) => {
+                                l.SetGraphicsRootConstantBufferView(param, gpu)
+                            }
+                            (false, RootViewKind::Srv) => {
+                                l.SetGraphicsRootShaderResourceView(param, gpu)
+                            }
+                            (false, RootViewKind::Uav) => {
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu)
+                            }
+                            (true, RootViewKind::Cbv) => {
+                                l.SetComputeRootConstantBufferView(param, gpu)
+                            }
+                            (true, RootViewKind::Srv) => {
+                                l.SetComputeRootShaderResourceView(param, gpu)
+                            }
+                            (true, RootViewKind::Uav) => {
+                                l.SetComputeRootUnorderedAccessView(param, gpu)
+                            }
+                        }
+                    }
+                }
+            }
+            for (views, kind) in [
+                (&stage.const_cbvs, RootViewKind::Cbv),
+                (&stage.const_srvs, RootViewKind::Srv),
+                (&stage.const_uavs, RootViewKind::Uav),
+            ] {
+                for &(slot, dword, param) in views {
+                    let Some(Root::Constants(c)) = self.roots_ref(compute).get(usize::from(slot))
+                    else {
+                        once!(
+                            slot,
+                            "a shader reads a constant-pair root view the title did not set"
+                        );
+                        continue;
+                    };
+                    let (Some(&lo), Some(&hi)) = (
+                        c.get(dword as usize),
+                        c.get((dword as usize).saturating_add(1)),
+                    ) else {
+                        once!(
+                            slot,
+                            dword,
+                            "a constant-pair root view reads past the set root constants"
+                        );
+                        continue;
+                    };
+                    let address = u64::from(lo) | (u64::from(hi) << 32);
+                    let Some(gpu) = root_view(list, address, kind, &mut uav_buffers) else {
+                        continue;
+                    };
+                    // SAFETY: an open list; the address is in live memory.
+                    unsafe {
+                        match (compute, kind) {
+                            (false, RootViewKind::Cbv) => {
+                                l.SetGraphicsRootConstantBufferView(param, gpu)
+                            }
+                            (false, RootViewKind::Srv) => {
+                                l.SetGraphicsRootShaderResourceView(param, gpu)
+                            }
+                            (false, RootViewKind::Uav) => {
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu)
+                            }
+                            (true, RootViewKind::Cbv) => {
+                                l.SetComputeRootConstantBufferView(param, gpu)
+                            }
+                            (true, RootViewKind::Srv) => {
+                                l.SetComputeRootShaderResourceView(param, gpu)
+                            }
+                            (true, RootViewKind::Uav) => {
+                                l.SetComputeRootUnorderedAccessView(param, gpu)
+                            }
                         }
                     }
                 }
             }
         }
+        uav_buffers
     }
 
     /// Runs a dispatch on the host.
@@ -513,7 +693,7 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        self.bind(list, p, true);
+        let _ = self.bind(list, p, true);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -539,14 +719,19 @@ impl State {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
-                let v = self.user_value(compute, u.slot, u.root, u.dword);
+                let v = self.user_value(stage, compute, u.slot, u.root, u.dword);
                 let _ = write!(text, " u{}={v:#x}", u.index);
                 let index = if u.root == RootType::Table { v / 32 } else { v };
                 if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            for &(slot, _) in stage
+                .root_cbvs
+                .iter()
+                .chain(&stage.root_srvs)
+                .chain(&stage.root_uavs)
+            {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
@@ -590,7 +775,13 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(
+        &self,
+        list: &HostList,
+        u: &UsedResource,
+        compute: bool,
+        uav_buffers: &mut Vec<usize>,
+    ) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -601,8 +792,8 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view);
+        if let Some(view) = host.mirror_for(index, handle, true, u.kind, u.dwords) {
+            readable(list, u, &view, uav_buffers);
         }
     }
 
@@ -617,7 +808,13 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        compute: bool,
+        uav_buffers: &mut Vec<usize>,
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -650,7 +847,7 @@ impl State {
         fresh.dedup();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+                self.table_entry(list, u, compute, uav_buffers);
             }
         }
         let mut made = Vec::new();
@@ -689,18 +886,34 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                        readable(list, u, &view, uav_buffers);
                     }
                 }
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let heap_ptr = std::ptr::from_ref(heap) as usize;
+            let Some(first) = host.dynamic(n).or_else(|| {
+                let reclaimed = crate::host::reclaim_dynamic_slots(heap_ptr);
+                if reclaimed > 0 {
+                    tracing::debug!(
+                        reclaimed,
+                        needed = n,
+                        "reclaimed dynamic descriptor slots from executed lists"
+                    );
+                    host.dynamic(n)
+                } else {
+                    None
+                }
+            }) else {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(n, "no free dynamic descriptor slots: a table is not made")
+                });
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            list.record_dynamic(heap_ptr, first, n);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -709,7 +922,7 @@ impl State {
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
+                            host.make_null_for(index, ResourceType::Cbv, 4);
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
@@ -718,13 +931,15 @@ impl State {
                     Some(view) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
-                            readable(list, u, &view);
+                            readable(list, u, &view, uav_buffers);
                         }
                     }
                     None => {
-                        host.make_null(index);
-                        if used.is_some() {
+                        if let Some(u) = used {
+                            host.make_null_for(index, u.kind, u.dwords);
                             once!(slot, "a table entry without a view");
+                        } else {
+                            host.make_null(index);
                         }
                     }
                 }
@@ -853,20 +1068,20 @@ impl State {
                 continue;
             }
             let v = self.vertex[slot as usize];
-            let stride = u64::from(v.stride);
-            let from = v.address + u64::from(first) * stride;
-            if v.address == 0
-                || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
-            {
+            let Some((from, src_bytes, dst_bytes)) =
+                rect_vertex_range(v.address, v.size, v.stride, first, count)
+            else {
+                once!(slot, "rectangle vertices outside their buffer");
+                return false;
+            };
+            if crate::shadow::find(from, src_bytes).is_none() {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
             }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+            let Some((gpu, to)) = list.scratch(u64::from(dst_bytes)) else {
                 return false;
             };
-            let (from, to, stride) = (from as usize, to as usize, stride as usize);
+            let (from, to, stride) = (from as usize, to as usize, v.stride as usize);
             let n = rects as usize;
             list.defer_host(move || {
                 // SAFETY: the vertices lie in a title buffer (checked when
@@ -881,7 +1096,7 @@ impl State {
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
+                SizeInBytes: dst_bytes,
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
@@ -977,10 +1192,14 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        // Bounded first: the clamp binds a compute pipeline of its own, and
+        // leaves `args` in `GENERIC_READ`.
+        if !crate::indirect::bound(list, &args, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
+        }
+        if let Some((s, _)) = &counter {
+            list.ensure_buffer(s, BUFFER_READ);
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
@@ -989,7 +1208,7 @@ impl State {
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => {
-                    self.bind(list, p, true);
+                    let _ = self.bind(list, p, true);
                     true
                 }
                 _ => false,
@@ -997,13 +1216,19 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
                 Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
             }
             return false;
+        }
+        // Ensure indirect argument and count buffers stay in `GENERIC_READ`
+        // (includes `INDIRECT_ARGUMENT`) even if `bind` touched the same
+        // backing shadow buffer.
+        list.ensure_buffer(&args, BUFFER_READ);
+        if let Some((s, _)) = &counter {
+            list.ensure_buffer(s, BUFFER_READ);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
@@ -1021,7 +1246,6 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1070,8 +1294,8 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
-/// copied, textures moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View) {
+/// copied, textures and buffers moved to the state they need.
+fn readable(list: &HostList, u: &UsedResource, view: &View, uav_buffers: &mut Vec<usize>) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -1083,8 +1307,15 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         && let Some(shadow) = crate::shadow::find(address, len)
     {
         shadow.refresh(list, address, len);
+        let key = Arc::as_ptr(&shadow) as usize;
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+            if !uav_buffers.contains(&key) {
+                uav_buffers.push(key);
+            }
+            list.ensure_buffer(&shadow, BUFFER_UAV);
+        } else if !uav_buffers.contains(&key) {
+            list.ensure_buffer(&shadow, BUFFER_READ);
         }
     }
     match (view, u.kind) {
@@ -1179,4 +1410,56 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    if crate::host::host().is_some_and(crate::host::Host::depth_bounds)
+        && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
+    {
+        // SAFETY: an open list on a host supporting depth bounds.
+        unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+/// Validates and computes `(from_address, src_bytes, dst_bytes)` for expanding
+/// `count / 3` console rectangles starting at vertex `first` into triangles.
+fn rect_vertex_range(
+    address: u64,
+    size: u32,
+    stride: u32,
+    first: u32,
+    count: u32,
+) -> Option<(u64, u64, u32)> {
+    if address == 0 || stride == 0 {
+        return None;
+    }
+    let stride = u64::from(stride);
+    let end_vertex = u64::from(first).checked_add(u64::from(count))?;
+    if end_vertex.checked_mul(stride)? > u64::from(size) {
+        return None;
+    }
+    let from = address.checked_add(u64::from(first).checked_mul(stride)?)?;
+    let rects = u64::from(count / 3);
+    let src_bytes = rects.checked_mul(3)?.checked_mul(stride)?;
+    let dst_bytes = u32::try_from(rects.checked_mul(6)?.checked_mul(stride)?).ok()?;
+    Some((from, src_bytes, dst_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rect_vertex_range;
+
+    #[test]
+    fn rect_vertex_range_rejects_overflow_and_out_of_bounds() {
+        assert_eq!(rect_vertex_range(0x1000, 96, 16, 0, 6), Some((0x1000, 96, 192)));
+        assert_eq!(rect_vertex_range(0x1000, 96, 16, 3, 3), Some((0x1030, 48, 96)));
+        // `first + count` wraps u32 if not widened to u64.
+        assert_eq!(rect_vertex_range(0x1000, u32::MAX, 16, u32::MAX - 2, 3), None);
+        // Zero address or stride or past buffer size.
+        assert_eq!(rect_vertex_range(0, 96, 16, 0, 3), None);
+        assert_eq!(rect_vertex_range(0x1000, 96, 0, 0, 3), None);
+        assert_eq!(rect_vertex_range(0x1000, 47, 16, 0, 3), None);
+        // Expanded triangle buffer would exceed u32 `SizeInBytes`.
+        assert_eq!(rect_vertex_range(0x1000, u32::MAX, 16, 0, (1 << 28) - 1), None);
+    }
 }

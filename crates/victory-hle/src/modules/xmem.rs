@@ -384,7 +384,36 @@ fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// `count` is in and out (pages wanted, pages given); all or nothing here.
+/// Allocates up to `wanted` pages by asking `create` for sections of `chunk`
+/// pages at a time: tries `wanted` in one section first, and on failure
+/// halves the chunk size down to `min_chunk` so a host with tight commit
+/// headroom still returns as many pages as it can.
+fn alloc_sections<T>(
+    wanted: usize,
+    min_chunk: usize,
+    mut create: impl FnMut(usize) -> Option<T>,
+) -> Vec<(T, usize)> {
+    let mut sections = Vec::new();
+    let mut left = wanted;
+    let mut chunk = wanted;
+    let floor = min_chunk.max(1);
+    while left > 0 {
+        let ask = chunk.min(left);
+        if let Some(section) = create(ask) {
+            sections.push((section, ask));
+            left -= ask;
+        } else if ask > floor {
+            chunk = (ask / 2).max(floor);
+        } else {
+            break;
+        }
+    }
+    sections
+}
+
+/// `count` is in and out (pages wanted, pages given). Tries one section for
+/// the whole request first, and on commit failure falls back to smaller
+/// chunks (returning a partial count if the host hits its commit limit).
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
     count: *mut usize,
@@ -395,52 +424,85 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n.checked_mul(PAGE).filter(|&s| s > 0).is_none() {
         return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
+    }
+    // Under Wine a committed section is a sparse file, free until touched,
+    // and committing a reserved one page by page costs a wineserver request
+    // each that scans every range committed so far: commit it whole there.
+    let section_flags = PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE };
+    // Fall back down to 64 MiB (1024 x 64 KiB pages) chunks when the host
+    // cannot satisfy a multi-GiB request in a single section.
+    const MIN_CHUNK_PAGES: usize = (64 << 20) / PAGE;
+    let mut last_error = None;
+    let sections = alloc_sections(n, MIN_CHUNK_PAGES, |ask| {
+        let size = ask.checked_mul(PAGE)?;
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                section_flags,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            last_error = Some(std::io::Error::last_os_error());
+            None
+        } else {
+            Some(Arc::new(Section(handle)))
+        }
+    });
+    let got: usize = sections.iter().map(|&(_, c)| c).sum();
+    if got == 0 {
+        let error = last_error.unwrap_or_else(std::io::Error::last_os_error);
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
         // SAFETY: checked non-null.
         unsafe { count.write(0) };
         return 0;
     }
-    tracing::debug!(
-        n,
-        flags = format_args!("{flags:#x}"),
-        "XMemAllocatePhysicalPages"
-    );
-    let section = Arc::new(Section(handle));
+    if got < n {
+        tracing::warn!(
+            wanted = n,
+            got,
+            chunks = sections.len(),
+            flags = format_args!("{flags:#x}"),
+            "XMemAllocatePhysicalPages: partial allocation"
+        );
+    } else if sections.len() > 1 {
+        tracing::info!(
+            n = got,
+            chunks = sections.len(),
+            flags = format_args!("{flags:#x}"),
+            "XMemAllocatePhysicalPages: satisfied in chunks"
+        );
+    } else {
+        tracing::debug!(
+            n = got,
+            flags = format_args!("{flags:#x}"),
+            "XMemAllocatePhysicalPages"
+        );
+    }
+    // SAFETY: checked non-null; report the actual count allocated.
+    unsafe { count.write(got) };
     let mut physical = physical();
     let first = physical.next_page;
-    physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+    physical.next_page += got * FRAMES;
+    let mut out = 0usize;
+    for (section, chunk_pages) in sections {
+        for index in 0..chunk_pages {
+            let slice = Slice {
+                section: section.clone(),
+                index,
+            };
+            let number = first + out * FRAMES;
+            physical.pages.insert(number, slice);
+            // SAFETY: the title passes room for `n >= got` page numbers.
+            unsafe { pages.add(out).write(number) };
+            out += 1;
+        }
     }
     1
 }
@@ -539,19 +601,37 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
 /// costs a map, a commit and an unmap (which flushes every core's TLB).
 /// False if a page is unknown or the host fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
-    let Some(runs) = runs(pages, offset, data.len()) else {
-        return false;
+    let Ok(ok) = write_physical_with::<std::convert::Infallible>(pages, offset, data.len(), |at, dst| {
+        dst.copy_from_slice(&data[at..at + dst.len()]);
+        Ok(())
+    });
+    ok
+}
+
+/// Maps each run of consecutive physical pages behind `[offset, offset + len)`
+/// once and invokes `fill(byte_offset, run_bytes)` directly on the mapped view.
+/// Avoids intermediate multi-MiB staging allocations and double copies when
+/// DirectStorage writes raw data into non-consecutive physical pages.
+pub(crate) fn write_physical_with<E>(
+    pages: &[usize],
+    offset: usize,
+    len: usize,
+    mut fill: impl FnMut(usize, &mut [u8]) -> Result<(), E>,
+) -> Result<bool, E> {
+    let Some(runs) = runs(pages, offset, len) else {
+        return Ok(false);
     };
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
-            return false;
+            return Ok(false);
         };
-        let k = (n * PAGE - within).min(data.len() - done);
-        view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        let k = (n * PAGE - within).min(len - done);
+        fill(done, &mut view.bytes()[within..within + k])?;
         (within, done) = (0, done + k);
     }
-    true
+    victory_gpu::physical_memory_written();
+    Ok(true)
 }
 
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
@@ -561,6 +641,12 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        victory_gpu::physical_memory_written();
+    }
 }
 
 impl PageWindow {
@@ -743,8 +829,10 @@ fn commit(base: usize, len: usize) -> bool {
     }
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
-        let mut info = PERFORMANCE_INFORMATION::default();
-        info.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
+    let mut info = PERFORMANCE_INFORMATION {
+        cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
         // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
         let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
         victory_loader::log_crash(&commit_limit_message(len, &error, queried.then_some(&info)));
@@ -1188,5 +1276,25 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn alloc_sections_halves_and_returns_partial_on_commit_limit() {
+        // Host caps individual sections at 4 pages and total budget at 7 pages.
+        let mut budget = 7usize;
+        let got = alloc_sections(10, 2, |ask| {
+            if ask <= 4 && ask <= budget {
+                budget -= ask;
+                Some(ask)
+            } else {
+                None
+            }
+        });
+        assert_eq!(got, vec![(2, 2), (2, 2), (2, 2)]);
+        assert_eq!(got.iter().map(|&(_, c)| c).sum::<usize>(), 6);
+
+        // Full request fits in one section: single call, no splitting.
+        let one = alloc_sections(8, 2, Some);
+        assert_eq!(one, vec![(8, 8)]);
     }
 }

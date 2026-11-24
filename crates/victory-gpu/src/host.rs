@@ -17,6 +17,110 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+/// Completed host presents and submissions, used to retire released GPU
+/// resources only after multi-list and indirect frames referencing them have
+/// finished running.
+static COMPLETED_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COMPLETED_SUBMISSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RETIRED_RESOURCES: Mutex<Vec<(u64, u64, ID3D12Resource)>> = Mutex::new(Vec::new());
+
+/// Dynamic descriptor-slot allocations belonging to lists that have already
+/// finished executing on the host GPU, kept reclaimable if a descriptor heap
+/// runs short before those lists are reset.
+type DynamicSlotList = std::sync::Arc<Mutex<Vec<(usize, u32, u32)>>>;
+static EXECUTED_DYNAMIC: Mutex<Vec<std::sync::Weak<Mutex<Vec<(usize, u32, u32)>>>>> =
+    Mutex::new(Vec::new());
+
+/// Reclaims dynamic descriptor slots for `target_heap` held by command lists
+/// that have already completed execution, returning the total slots freed.
+pub(crate) fn reclaim_dynamic_slots(target_heap: usize) -> usize {
+    let mut to_release = Vec::new();
+    {
+        let mut reg = EXECUTED_DYNAMIC.lock().unwrap_or_else(|e| e.into_inner());
+        reg.retain(|weak| {
+            let Some(list_slots) = weak.upgrade() else {
+                return false;
+            };
+            let mut slots = list_slots.lock().unwrap_or_else(|e| e.into_inner());
+            let mut i = 0;
+            while i < slots.len() {
+                if slots[i].0 == target_heap {
+                    to_release.push(slots.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            !slots.is_empty()
+        });
+    }
+    let mut reclaimed = 0usize;
+    for (heap, first, n) in to_release {
+        crate::descriptor::release_dynamic(heap, first, n);
+        reclaimed += n as usize;
+    }
+    reclaimed
+}
+
+/// Keeps a released host GPU resource alive until several presented frames
+/// (or many completed submissions during loading) have elapsed, so indirect
+/// draws and directly-indexed heap reads from earlier frames cannot fault on
+/// a freed streaming texture or shadow buffer.
+pub(crate) fn retire_resource(resource: ID3D12Resource) {
+    let frame = COMPLETED_FRAMES.load(Ordering::Relaxed);
+    let sub = COMPLETED_SUBMISSIONS.load(Ordering::Relaxed);
+    RETIRED_RESOURCES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((frame, sub, resource));
+}
+
+/// Drops retired GPU resources old enough that no live command list or
+/// multi-list indirect frame can still reference them.
+fn drain_retired(frame_lag: u64, submission_lag: u64) {
+    let frame = COMPLETED_FRAMES.load(Ordering::Relaxed);
+    let sub = COMPLETED_SUBMISSIONS.load(Ordering::Relaxed);
+    let mut retired = RETIRED_RESOURCES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if retired.is_empty() {
+        return;
+    }
+    let mut drop_now = Vec::new();
+    let mut i = 0;
+    while i < retired.len() {
+        let (rf, rs, _) = &retired[i];
+        if frame.saturating_sub(*rf) >= frame_lag || sub.saturating_sub(*rs) >= submission_lag {
+            drop_now.push(retired.swap_remove(i).2);
+        } else {
+            i += 1;
+        }
+    }
+    drop(retired);
+    drop(drop_now);
+}
+
+/// Whether a diagnostics environment switch is enabled: unset, empty, and
+/// `0`/`false`/`no`/`off` (ASCII case-insensitive) are off; anything else is
+/// on.
+pub(crate) fn env_flag(name: &str) -> bool {
+    parse_env_flag(std::env::var_os(name).as_deref())
+}
+
+fn parse_env_flag(value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(v) = value else {
+        return false;
+    };
+    let Some(s) = v.to_str() else {
+        return !v.is_empty();
+    };
+    let trimmed = s.trim();
+    !trimmed.is_empty()
+        && !trimmed.eq_ignore_ascii_case("0")
+        && !trimmed.eq_ignore_ascii_case("false")
+        && !trimmed.eq_ignore_ascii_case("no")
+        && !trimmed.eq_ignore_ascii_case("off")
+}
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -135,8 +239,7 @@ fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
-        let debug =
-            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+        let debug = cfg!(feature = "diagnostics") && env_flag("VICTORY_D3D12_DEBUG");
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
@@ -147,7 +250,7 @@ fn create() -> windows::core::Result<Host> {
             // descriptor heap indices and the like become messages naming
             // the command instead of page faults. Without state tracking
             // (directly indexed textures are not transitioned).
-            if std::env::var_os("VICTORY_D3D12_GBV").is_some()
+            if env_flag("VICTORY_D3D12_GBV")
                 && let Some(l) = &layer
             {
                 if let Ok(d1) = l.cast::<ID3D12Debug1>() {
@@ -176,7 +279,7 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if cfg!(feature = "diagnostics") && env_flag("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -248,6 +351,12 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+impl Drop for HostList {
+    fn drop(&mut self) {
+        self.release_dynamic_slots();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +401,9 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Host buffer states the list assumes, by shadow buffer: at its start
+    /// and at its end, reconciled with each buffer's real state in `prelude`.
+    buffer_states: Mutex<BufferStates>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -299,6 +411,10 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Dynamic descriptor slots `(title_heap, first, count)` allocated for
+    /// this list; released on reset/drop or reclaimed once executed if a heap
+    /// runs short.
+    dynamic_slots: DynamicSlotList,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -322,13 +438,14 @@ type States = std::collections::HashMap<
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
 
+type BufferStates =
+    std::collections::HashMap<usize, (u32, u32, std::sync::Arc<crate::shadow::Shadow>)>;
+
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
-    })
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && env_flag("VICTORY_D3D12_DRED"))
 }
 
 /// Whether each list of a submission runs and is timed on its own, slow
@@ -337,7 +454,7 @@ pub(crate) fn dred_on() -> bool {
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+    *ON.get_or_init(|| env_flag("VICTORY_GPU_TIMING"))
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -387,6 +504,81 @@ enum Step {
     Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
+/// A 64-bit memory wait recorded on a command list and satisfied before the
+/// list executes on the host GPU.
+#[derive(Debug, Clone, Copy)]
+struct MemoryWait {
+    address: usize,
+    comparison: u32,
+    reference: u64,
+}
+
+/// Evaluates a D3D12 `D3D12_COMPARISON_FUNC` (`1..=8`) against `current` and
+/// `reference`. Unknown/zero codes and `NEVER` return `true` so a malformed
+/// comparison never hangs submission.
+fn memory_wait_satisfied(current: u64, comparison: u32, reference: u64) -> bool {
+    match comparison {
+        2 => current < reference,
+        3 => current == reference,
+        4 => current <= reference,
+        5 => current > reference,
+        6 => current != reference,
+        7 => current >= reference,
+        _ => true,
+    }
+}
+
+/// Waits outside the submission mutex for `waits` to become satisfied by
+/// another queue or the CPU, with a bounded timeout so a dead producer logs
+/// once rather than deadlocking forever.
+fn wait_for_memory(waits: &[MemoryWait]) {
+    if waits.is_empty() {
+        return;
+    }
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let read_u64 = |addr: usize| -> u64 {
+        let val = if addr.is_multiple_of(8) {
+            // SAFETY: title memory address recorded by the command list.
+            unsafe { (*(addr as *const std::sync::atomic::AtomicU64)).load(Ordering::Acquire) }
+        } else {
+            // SAFETY: title memory address recorded by the command list.
+            let v = unsafe { (addr as *const u64).read_unaligned() };
+            std::sync::atomic::fence(Ordering::Acquire);
+            v
+        };
+        val
+    };
+    let satisfied = |w: &MemoryWait| memory_wait_satisfied(read_u64(w.address), w.comparison, w.reference);
+    if waits.iter().all(satisfied) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let mut spins = 0u32;
+    while !waits.iter().all(satisfied) {
+        if started.elapsed() >= TIMEOUT {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                let first = waits[0];
+                let current = read_u64(first.address);
+                tracing::warn!(
+                    address = format_args!("{:#x}", first.address),
+                    comparison = first.comparison,
+                    reference = first.reference,
+                    current,
+                    "command-list 64-bit memory wait timed out; continuing"
+                );
+            });
+            return;
+        }
+        spins += 1;
+        if spins <= 64 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -404,9 +596,15 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// 64-bit memory waits that must be satisfied before the list runs.
+    waits: Vec<MemoryWait>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Post-execution callbacks run right after the GPU finishes (e.g.
+    /// copying resolved query readback data into title memory), before
+    /// bottom-of-pipe writes signal completion.
+    after: Vec<Box<dyn Fn() + Send>>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -447,6 +645,116 @@ impl Host {
         })
     }
 
+    /// Whether the host supports depth-bounds testing (`OMSetDepthBounds`
+    /// and `D3D12_DEPTH_STENCIL_DESC1`).
+    pub(crate) fn depth_bounds(&self) -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+            // SAFETY: query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS2,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let supported = ok && options.DepthBoundsTestSupported.as_bool();
+            tracing::info!(supported, "host depth bounds test support");
+            supported
+        })
+    }
+
+    /// Maximum shader wave lane count supported by the host GPU (`32` on
+    /// NVIDIA/Intel, `64` on AMD RDNA/GCN).
+    pub(crate) fn wave_lane_count_max(&self) -> u32 {
+        static MAX_LANES: OnceLock<u32> = OnceLock::new();
+        *MAX_LANES.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let max = if ok && options.WaveLaneCountMax > 0 {
+                options.WaveLaneCountMax
+            } else {
+                32
+            };
+            tracing::info!(
+                min = options.WaveLaneCountMin,
+                max,
+                wave_ops = options.WaveOps.as_bool(),
+                "host GPU wave lane count"
+            );
+            max
+        })
+    }
+
+    /// Host GPU direct queue timestamp frequency in ticks per second.
+    pub(crate) fn timestamp_frequency(&self) -> Option<u64> {
+        static FREQ: OnceLock<Option<u64>> = OnceLock::new();
+        *FREQ.get_or_init(|| {
+            // SAFETY: plain query on our live direct command queue.
+            let freq = unsafe { self.queue.GetTimestampFrequency() }.ok()?;
+            (freq > 0).then_some(freq)
+        })
+    }
+
+    /// A mapped buffer in the readback heap (`D3D12_RESOURCE_STATE_COPY_DEST`)
+    /// for GPU-to-CPU readbacks such as `ResolveQueryData`.
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and persistent mapping of a readback buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no readback buffer");
+                None
+            }
+        }
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -476,9 +784,11 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                buffer_states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                dynamic_slots: std::sync::Arc::new(Mutex::new(Vec::new())),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -487,8 +797,25 @@ impl Host {
         }
     }
 
-    /// Runs closed lists and waits for them.
+    /// Runs closed lists and waits for them. Splits before any list carrying
+    /// a 64-bit memory wait so earlier lists in the same submission flush
+    /// their writes first, and waits outside `self.submitted` so concurrent
+    /// producer queues can satisfy the wait without deadlocking.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        let mut start = 0;
+        while start < runs.len() {
+            let waits = runs[start].deferred().waits.clone();
+            wait_for_memory(&waits);
+            let mut end = start + 1;
+            while end < runs.len() && runs[end].deferred().waits.is_empty() {
+                end += 1;
+            }
+            self.execute_batch(&runs[start..end]);
+            start = end;
+        }
+    }
+
+    fn execute_batch(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -551,6 +878,11 @@ impl Host {
             }
             let _ = (i, started);
         }
+        COMPLETED_SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
+        // During long loading screens without presents, reclaim resources
+        // retired more than 128 completed (fence-waited) submissions ago so
+        // VRAM stays bounded while still outliving multi-list work.
+        drain_retired(4, 128);
         let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
@@ -597,10 +929,28 @@ impl Host {
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
+            for work in &list.deferred().after {
+                work();
+            }
+        }
+        for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
         }
+        // These lists have completed execution on the host GPU; register
+        // their dynamic descriptor slots as reclaimable under heap pressure.
+        let mut reg = EXECUTED_DYNAMIC.lock().unwrap_or_else(|e| e.into_inner());
+        reg.retain(|w| w.strong_count() > 0);
+        for list in runs {
+            if !list.dynamic_slots.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                let weak = std::sync::Arc::downgrade(&list.dynamic_slots);
+                if !reg.iter().any(|existing| existing.ptr_eq(&weak)) {
+                    reg.push(weak);
+                }
+            }
+        }
+        drop(reg);
         self.log_messages();
     }
 
@@ -878,8 +1228,13 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.release_dynamic_slots();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.buffer_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -923,12 +1278,51 @@ impl HostList {
         }
     }
 
-    /// At submission: the list that moves each texture this list uses from
-    /// its real state to the one the list starts with; the textures' real
+    /// Moves a title buffer's host copy to `wanted` (a host buffer state) in
+    /// this list. The list's first use of a buffer records nothing: its
+    /// prelude brings the buffer there at submission.
+    pub(crate) fn ensure_buffer(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        wanted: u32,
+    ) {
+        let before = {
+            let mut states = self
+                .buffer_states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match states.entry(std::sync::Arc::as_ptr(shadow) as usize) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert((wanted, wanted, shadow.clone()));
+                    None
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    let prev = std::mem::replace(&mut o.get_mut().1, wanted);
+                    (prev != wanted).then_some(prev)
+                }
+            }
+        };
+        if let Some(before) = before {
+            let barrier = transition(
+                &shadow.buffer,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(wanted as i32),
+            );
+            // SAFETY: an open list; `buffer_states` keeps the buffer alive.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+
+    /// At submission: the list that moves each texture and buffer this list
+    /// uses from its real state to the one the list starts with; their real
     /// states become those the list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
+        let buffer_states = self
+            .buffer_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
                 let real = copy.state.swap(*last, Ordering::Relaxed);
@@ -941,6 +1335,16 @@ impl HostList {
                 })
             })
             .collect();
+        barriers.extend(buffer_states.values().filter_map(|(first, last, shadow)| {
+            let real = shadow.state.swap(*last, Ordering::Relaxed);
+            (real != *first).then(|| {
+                transition(
+                    &shadow.buffer,
+                    D3D12_RESOURCE_STATES(real as i32),
+                    D3D12_RESOURCE_STATES(*first as i32),
+                )
+            })
+        }));
         if barriers.is_empty() {
             return None;
         }
@@ -1063,6 +1467,33 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
+    /// Waits for `*(address as *const u64)` to satisfy `comparison` against
+    /// `reference` before this list executes on the host GPU.
+    pub(crate) fn defer_wait(&self, address: u64, comparison: u32, reference: u64) {
+        self.deferred().waits.push(MemoryWait {
+            address: address as usize,
+            comparison,
+            reference,
+        });
+    }
+
+    /// Tracks dynamic descriptor slots allocated while recording this list.
+    pub(crate) fn record_dynamic(&self, heap: usize, first: u32, n: u32) {
+        self.dynamic_slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((heap, first, n));
+    }
+
+    fn release_dynamic_slots(&self) {
+        let slots = std::mem::take(
+            &mut *self.dynamic_slots.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        for (heap, first, n) in slots {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+    }
+
     /// A mapped upload buffer of `size` bytes, alive until the list is
     /// reset.
     ///
@@ -1151,6 +1582,12 @@ impl HostList {
     /// As [`HostList::defer`], for work that writes only host memory.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
+    }
+
+    /// Runs `work` right after the list's GPU submission completes, before
+    /// bottom-of-pipe writes signal completion (used for query readbacks).
+    pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().after.push(Box::new(work));
     }
 
     /// Brings a texture's staging buffer up to date when the list is
@@ -1437,6 +1874,227 @@ impl Host {
     }
 }
 
+/// Host display HDR capability and luminance bounds, queried once from DXGI
+/// (`IDXGIOutput6::GetDesc1`) with optional `VICTORY_HDR` override.
+pub fn hdr_info() -> crate::HdrInfo {
+    static INFO: OnceLock<crate::HdrInfo> = OnceLock::new();
+    *INFO.get_or_init(|| {
+        if let Some(raw) = std::env::var_os("VICTORY_HDR") {
+            if !parse_env_flag(Some(&raw)) {
+                return crate::HdrInfo::default();
+            }
+            return crate::HdrInfo {
+                supported: true,
+                min_nits: 0.005,
+                max_nits: 1000.0,
+                max_full_frame_nits: 400.0,
+            };
+        }
+        detect_hdr_output().unwrap_or_default()
+    })
+}
+
+fn detect_hdr_output() -> Option<crate::HdrInfo> {
+    // SAFETY: read-only DXGI adapter/output enumeration.
+    unsafe {
+        let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter = factory.EnumAdapters1(0).ok()?;
+        let output = adapter.EnumOutputs(0).ok()?;
+        let output6: IDXGIOutput6 = output.cast().ok()?;
+        let desc = output6.GetDesc1().ok()?;
+        let supported = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        let info = crate::HdrInfo {
+            supported,
+            min_nits: desc.MinLuminance.max(0.0),
+            max_nits: if desc.MaxLuminance > 0.0 {
+                desc.MaxLuminance
+            } else {
+                1000.0
+            },
+            max_full_frame_nits: if desc.MaxFullFrameLuminance > 0.0 {
+                desc.MaxFullFrameLuminance
+            } else {
+                400.0
+            },
+        };
+        tracing::info!(?info, color_space = desc.ColorSpace.0, "host display HDR probe");
+        Some(info)
+    }
+}
+
+/// Maps a presented texture format to a concrete SRV format usable by the
+/// present-scaling blitter (resolving typeless and sRGB swapchain formats).
+fn present_srv_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+    Some(match format.0 {
+        27 | 28 => DXGI_FORMAT_R8G8B8A8_UNORM,
+        29 => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        87 | 90 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        91 => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        23 | 24 => DXGI_FORMAT_R10G10B10A2_UNORM,
+        9 | 10 => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        _ => return None,
+    })
+}
+
+/// Swap chain color space matching the presented back-buffer format.
+fn swap_color_space(format: DXGI_FORMAT, hdr: bool) -> DXGI_COLOR_SPACE_TYPE {
+    match format {
+        DXGI_FORMAT_R10G10B10A2_UNORM if hdr => DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+        DXGI_FORMAT_R16G16B16A16_FLOAT => DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
+        _ => DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+    }
+}
+
+/// Fullscreen bilinear scaling & format-conversion blit pipeline used when
+/// presenting a texture whose resolution or format differs from the swap chain.
+struct Blitter {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    pso_format: DXGI_FORMAT,
+    srv_heap: ID3D12DescriptorHeap,
+}
+
+impl Blitter {
+    fn new(device: &ID3D12Device, rtv_format: DXGI_FORMAT) -> windows::core::Result<Self> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::PCSTR;
+
+        const HLSL: &[u8] = b"\
+Texture2D<float4> src : register(t0);
+SamplerState lin : register(s0);
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+VSOut vs(uint id : SV_VertexID) {
+    VSOut o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.uv = uv;
+    o.pos = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    return o;
+}
+float4 ps(VSOut i) : SV_Target {
+    return src.Sample(lin, i.uv);
+}
+";
+        let compile = |entry: &std::ffi::CStr, target: &std::ffi::CStr| -> windows::core::Result<ID3DBlob> {
+            let mut blob: Option<ID3DBlob> = None;
+            // SAFETY: compiling static HLSL source via `d3dcompiler_47.dll`.
+            unsafe {
+                D3DCompile(
+                    HLSL.as_ptr().cast(),
+                    HLSL.len(),
+                    PCSTR::null(),
+                    None,
+                    None,
+                    PCSTR(entry.as_ptr().cast()),
+                    PCSTR(target.as_ptr().cast()),
+                    0,
+                    0,
+                    &mut blob,
+                    None,
+                )?;
+            }
+            blob.ok_or_else(windows::core::Error::empty)
+        };
+        let vs = compile(c"vs", c"vs_5_0")?;
+        let ps = compile(c"ps", c"ps_5_0")?;
+
+        let range = D3D12_DESCRIPTOR_RANGE1 {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let param = D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: &range,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        };
+        let sampler = D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+            MaxLOD: f32::MAX,
+            ShaderRegister: 0,
+            RegisterSpace: 0,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            ..Default::default()
+        };
+        let rs_desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                    NumParameters: 1,
+                    pParameters: &param,
+                    NumStaticSamplers: 1,
+                    pStaticSamplers: &sampler,
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+                },
+            },
+        };
+        let mut rs_blob: Option<ID3DBlob> = None;
+        // SAFETY: serializing valid root signature description and creating root signature + PSO + heap.
+        unsafe {
+            D3D12SerializeVersionedRootSignature(&rs_desc, &mut rs_blob, None)?;
+            let rs_blob = rs_blob.ok_or_else(windows::core::Error::empty)?;
+            let rs_bytes = std::slice::from_raw_parts(
+                rs_blob.GetBufferPointer().cast::<u8>(),
+                rs_blob.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, rs_bytes)?;
+
+            let mut pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: vs.GetBufferPointer(),
+                    BytecodeLength: vs.GetBufferSize(),
+                },
+                PS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: ps.GetBufferPointer(),
+                    BytecodeLength: ps.GetBufferSize(),
+                },
+                SampleMask: u32::MAX,
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+                D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            pso_desc.RTVFormats[0] = rtv_format;
+            let pso: ID3D12PipelineState = device.CreateGraphicsPipelineState(&pso_desc)?;
+
+            let srv_heap: ID3D12DescriptorHeap =
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })?;
+
+            Ok(Self {
+                root,
+                pso,
+                pso_format: rtv_format,
+                srv_heap,
+            })
+        }
+    }
+}
+
 /// The swap chain formats a presented texture can be copied into: its own
 /// family's.
 fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
@@ -1456,9 +2114,11 @@ struct Presenter {
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
+    color_space: DXGI_COLOR_SPACE_TYPE,
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    blitter: Option<Blitter>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -1584,10 +2244,10 @@ impl Host {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        let (tex_width, tex_height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
+            *presenter = match self.presenter(tex_width, tex_height, format) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     tracing::warn!(error = %e, "no swap chain");
@@ -1596,6 +2256,29 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        // Track the window's client size so presented frames scale cleanly to
+        // resized windows or dynamic render resolutions.
+        let (target_width, target_height) = {
+            let mut rect = RECT::default();
+            // SAFETY: live window handle.
+            let ok = unsafe { GetClientRect(p.hwnd, &mut rect) }.is_ok();
+            let cw = rect.right.saturating_sub(rect.left) as u32;
+            let ch = rect.bottom.saturating_sub(rect.top) as u32;
+            if ok && cw > 0 && ch > 0 {
+                (cw, ch)
+            } else {
+                (tex_width, tex_height)
+            }
+        };
+        let can_scale = desc.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
+            && present_srv_format(desc.Format).is_some();
+        let (width, height) = if can_scale {
+            (target_width, target_height)
+        } else {
+            (tex_width, tex_height)
+        };
+        let hdr = hdr_info().supported;
+        let desired_space = swap_color_space(format, hdr);
         if (p.width, p.height, p.format) != (width, height, format) {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
@@ -1610,6 +2293,31 @@ impl Host {
                 }
             }
         }
+        if p.color_space != desired_space {
+            // SAFETY: live swap chain; ignore unsupported color spaces gracefully.
+            if unsafe { p.swap_chain.SetColorSpace1(desired_space) }.is_ok() {
+                p.color_space = desired_space;
+                tracing::info!(
+                    format = format.0,
+                    color_space = desired_space.0,
+                    "swap chain color space updated"
+                );
+            }
+        }
+        let need_blit = (tex_width, tex_height) != (width, height);
+        if need_blit
+            && p.blitter
+                .as_ref()
+                .is_none_or(|b| b.pso_format != format)
+        {
+            p.blitter = match Blitter::new(&self.device, format) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    tracing::warn!(error = %e, "present scaling blitter unavailable");
+                    None
+                }
+            };
+        }
         let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
@@ -1619,38 +2327,160 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            let used_blit = if need_blit
+                && let Some(blitter) = &p.blitter
+                && let Some(srv_fmt) = present_srv_format(desc.Format)
+            {
+                let rtv = self.rtv(&back, None);
+                let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: srv_fmt,
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_SRV {
+                            MipLevels: 1,
+                            ..Default::default()
+                        },
+                    },
+                };
+                self.device.CreateShaderResourceView(
+                    texture,
+                    Some(&srv_desc),
+                    blitter.srv_heap.GetCPUDescriptorHandleForHeapStart(),
+                );
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    ),
+                ]);
+                let vp = D3D12_VIEWPORT {
+                    TopLeftX: 0.0,
+                    TopLeftY: 0.0,
+                    Width: width as f32,
+                    Height: height as f32,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                };
+                let scissor = RECT {
+                    left: 0,
+                    top: 0,
+                    right: width as i32,
+                    bottom: height as i32,
+                };
+                list.OMSetRenderTargets(1, Some(&rtv), false, None);
+                list.RSSetViewports(&[vp]);
+                list.RSSetScissorRects(&[scissor]);
+                list.IASetPrimitiveTopology(
+                    windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                );
+                list.SetGraphicsRootSignature(&blitter.root);
+                list.SetPipelineState(&blitter.pso);
+                list.SetDescriptorHeaps(&[Some(blitter.srv_heap.clone())]);
+                list.SetGraphicsRootDescriptorTable(
+                    0,
+                    blitter.srv_heap.GetGPUDescriptorHandleForHeapStart(),
+                );
+                list.DrawInstanced(3, 1, 0, 0);
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
+                true
+            } else {
+                false
+            };
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
+            let mut capture = None;
             #[cfg(feature = "diagnostics")]
-            let probe = crate::capture::probe(&self.device, list, texture);
+            let mut probe = None;
+            if !used_blit {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ]);
+                if (tex_width, tex_height) == (width, height) {
+                    list.CopyResource(&back, texture);
+                } else {
+                    let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(texture),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: 0,
+                        },
+                    };
+                    let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&back),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: 0,
+                        },
+                    };
+                    let copy_box = D3D12_BOX {
+                        left: 0,
+                        top: 0,
+                        front: 0,
+                        right: tex_width.min(width),
+                        bottom: tex_height.min(height),
+                        back: 1,
+                    };
+                    list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, Some(&copy_box));
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    capture = crate::capture::wanted(frame)
+                        .then(|| crate::capture::read_back(&self.device, list, texture))
+                        .flatten();
+                    probe = crate::capture::probe(&self.device, list, texture);
+                }
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
+            } else {
+                #[cfg(feature = "diagnostics")]
+                {
+                    list.ResourceBarrier(&[transition(
+                        texture,
+                        state,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    capture = crate::capture::wanted(frame)
+                        .then(|| crate::capture::read_back(&self.device, list, texture))
+                        .flatten();
+                    probe = crate::capture::probe(&self.device, list, texture);
+                    list.ResourceBarrier(&[transition(
+                        texture,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        state,
+                    )]);
+                }
+            }
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
-            if let Some((buffer, footprint)) = capture {
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+            if let Some((buffer, footprint, total)) = capture {
+                crate::capture::save_read_back(frame, &buffer, &footprint, total);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            COMPLETED_FRAMES.fetch_add(1, Ordering::Relaxed);
+            drain_retired(4, 128);
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -1688,17 +2518,28 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            let hdr = hdr_info().supported;
+            let color_space = swap_color_space(format, hdr);
+            let _ = swap_chain.SetColorSpace1(color_space);
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(
+                width,
+                height,
+                format = format.0,
+                color_space = color_space.0,
+                "presenting to a window"
+            );
             Ok(Presenter {
                 swap_chain,
                 width,
                 height,
                 format,
+                color_space,
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                blitter: None,
             })
         }
     }
@@ -2041,5 +2882,45 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn env_flag_respects_falsy_values() {
+        use std::ffi::OsStr;
+        for off in [None, Some(""), Some("   "), Some("0"), Some("false"), Some("FALSE"), Some("no"), Some("Off")] {
+            assert!(!super::parse_env_flag(off.map(OsStr::new)), "expected off for {off:?}");
+        }
+        for on in ["1", "true", "yes", "on", "anything"] {
+            assert!(super::parse_env_flag(Some(OsStr::new(on))), "expected on for {on:?}");
+        }
+    }
+
+    #[test]
+    fn memory_wait_comparisons_and_producer_wakeup() {
+        assert!(super::memory_wait_satisfied(1, 2, 2)); // LESS
+        assert!(!super::memory_wait_satisfied(2, 2, 2));
+        assert!(super::memory_wait_satisfied(5, 3, 5)); // EQUAL
+        assert!(!super::memory_wait_satisfied(4, 3, 5));
+        assert!(super::memory_wait_satisfied(5, 4, 5)); // LESS_EQUAL
+        assert!(super::memory_wait_satisfied(6, 5, 5)); // GREATER
+        assert!(super::memory_wait_satisfied(4, 6, 5)); // NOT_EQUAL
+        assert!(super::memory_wait_satisfied(5, 7, 5)); // GREATER_EQUAL
+        assert!(!super::memory_wait_satisfied(4, 7, 5));
+        assert!(super::memory_wait_satisfied(0, 8, 99)); // ALWAYS
+
+        let cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let producer = cell.clone();
+        let addr = std::sync::Arc::as_ptr(&cell) as usize;
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            producer.store(42, std::sync::atomic::Ordering::Release);
+        });
+        super::wait_for_memory(&[super::MemoryWait {
+            address: addr,
+            comparison: 7, // GREATER_EQUAL
+            reference: 42,
+        }]);
+        t.join().unwrap();
+        assert_eq!(cell.load(std::sync::atomic::Ordering::Acquire), 42);
     }
 }

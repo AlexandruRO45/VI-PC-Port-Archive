@@ -136,6 +136,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        max_wave_size: 64,
     })
     .expect("lower");
 
@@ -147,6 +148,11 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        const_cbvs: lowered.const_cbvs,
+        const_srvs: lowered.const_srvs,
+        const_uavs: lowered.const_uavs,
+        wave_size: lowered.wave_size,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -181,6 +187,7 @@ fn run_cases(
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
                     (RootType::Table, 1) => 0,
+                    (RootType::Descriptor, _) => 1 << 20,
                     other => panic!("unexpected user data {other:?}"),
                 };
             }

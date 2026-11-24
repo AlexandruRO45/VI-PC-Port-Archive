@@ -156,16 +156,19 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         l if l & !0xff == 0x100 => Swizzle(l & 0xff),
         _ => return None,
     };
-    texture::Texture::new(&TextureDesc {
-        dimension,
-        width: u32::try_from(desc.width).ok()?,
-        height: desc.height,
-        depth_or_array: u32::from(desc.depth_or_array_size),
-        mips: u32::from(desc.mip_levels),
-        format: desc.format,
-        samples: desc.sample_count.max(1),
-        swizzle,
-    })
+    texture::Texture::with_metadata(
+        &TextureDesc {
+            dimension,
+            width: u32::try_from(desc.width).ok()?,
+            height: desc.height,
+            depth_or_array: u32::from(desc.depth_or_array_size),
+            mips: u32::from(desc.mip_levels),
+            format: desc.format,
+            samples: desc.sample_count.max(1),
+            swizzle,
+        },
+        texture::MetadataFlags::from_d3d12_flags(desc.flags),
+    )
     .ok()
 }
 
@@ -763,6 +766,16 @@ pub(crate) struct HostTexture {
     pub(crate) state: std::sync::atomic::AtomicU32,
 }
 
+#[cfg(windows)]
+impl Drop for HostTexture {
+    fn drop(&mut self) {
+        // Keep the underlying D3D12 resource alive across subsequent frames
+        // so directly-indexed or indirect GPU commands referencing its heap
+        // descriptor cannot page-fault on a freed streaming texture.
+        crate::host::retire_resource(self.texture.clone());
+    }
+}
+
 /// Moves the host texture to `wanted` (a host texture state); the host
 /// resource and the state it leaves, if that is a change.
 #[cfg(windows)]
@@ -834,6 +847,11 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // 16-bit BGRA formats (`B5G6R5_UNORM`, `B5G5R5A1_UNORM`, `B4G4R4A4_UNORM`)
+    // have no typeless family and do not support UAV creation on PC D3D12.
+    if d.flags & UNORDERED != 0 && matches!(d.format, 85 | 86 | 115) {
+        d.flags &= !UNORDERED;
+    }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
@@ -846,25 +864,52 @@ fn host_texture(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
-    let mut texture: Option<ID3D12Resource> = None;
-    // SAFETY: the description has the host layout (checked size, same
-    // fields); the out pointer is ours.
-    let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
-            // The same layout: format, then color or depth and stencil.
-            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-            &mut texture,
-        )
+    let try_create = |desc: &ResourceDesc| -> windows::core::Result<ID3D12Resource> {
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: the description has the host layout (checked size, same
+        // fields); the out pointer is ours.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                std::ptr::from_ref(desc).cast(),
+                D3D12_RESOURCE_STATES(
+                    crate::host::legal_for(desc.flags, crate::host::texture_state(state)) as i32,
+                ),
+                // The same layout: format, then color or depth and stencil.
+                clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+                &mut texture,
+            )?;
+        }
+        texture.ok_or_else(windows::core::Error::empty)
     };
-    if let Err(e) = made {
-        tracing::warn!(error = %e, desc = ?d, "no host texture");
-    }
+    let texture = match try_create(&d) {
+        Ok(t) => Some(t),
+        Err(e) if d.flags & UNORDERED != 0 => {
+            // Retry without `ALLOW_UNORDERED_ACCESS` for formats the host
+            // driver refuses as UAVs (such as block-compressed or narrow
+            // packed formats) so SRV/RTV use still gets a host texture.
+            d.flags &= !UNORDERED;
+            match try_create(&d) {
+                Ok(t) => {
+                    tracing::debug!(
+                        error = %e,
+                        format = d.format,
+                        "host texture created without ALLOW_UNORDERED_ACCESS"
+                    );
+                    Some(t)
+                }
+                Err(e2) => {
+                    tracing::warn!(error = %e2, desc = ?d, "no host texture");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, desc = ?d, "no host texture");
+            None
+        }
+    };
     if let Some(t) = &texture {
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)

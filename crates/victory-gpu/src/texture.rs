@@ -34,8 +34,7 @@ macro_rules! once {
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
-    /// Its bytes.
-    #[cfg(feature = "diagnostics")]
+    /// Its bytes (`GetCopyableFootprints` total).
     size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -48,11 +47,13 @@ pub(crate) struct Staging {
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into.
+/// (memory not watched) along with the physical-pool write epoch at that hash,
+/// or the write-watch asking it was detiled after, with room to read the
+/// memory into.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
+    epoch: u64,
     asked: u64,
     read: Vec<u8>,
 }
@@ -201,26 +202,38 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
-        if !committed(self.memory, size) {
+        // Fast path: if no physical-page writes or remappings occurred since
+        // this texture was last hashed, its contents cannot have changed.
+        let epoch = crate::watch::physical_epoch();
+        if last.hash.is_some() && last.epoch == epoch {
+            return 0;
+        }
+        // Streamed textures mapped via physical-page section views may be only
+        // partially resident (for example, mip tail resident while top mips
+        // are still `MEM_RESERVE`). Read every committed region safely into
+        // `last.read` (zeroing uncommitted gaps) so resident mips upload
+        // instead of leaving the whole texture black and eliminating TOCTOU
+        // faults against concurrent unmaps.
+        last.read.resize(size, 0);
+        if !read_resident(self.memory, &mut last.read) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
                 size,
                 desc = ?self.layout.desc,
-                "a sampled texture's memory is not committed"
+                "a sampled texture's memory has no committed pages"
             );
             return 0;
         }
-        // SAFETY: committed memory of the texture's layout size.
-        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = blake3::hash(&last.read);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        last.epoch = epoch;
         if last.hash == Some(hash) {
             return size;
         }
         last.hash = Some(hash);
-        self.detile(tiled);
+        self.detile(&last.read);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -240,8 +253,12 @@ impl Staging {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            let Some(len) = footprint_slice_len(self.size, footprint.Offset, f.RowPitch, rows, f.Depth)
+            else {
+                tracing::warn!(mip, slice, offset = footprint.Offset, size = self.size, "staging footprint out of bounds");
+                return;
+            };
+            // SAFETY: `footprint.Offset + len <= self.size` inside the mapped staging buffer.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
@@ -254,6 +271,67 @@ impl Staging {
             }
         }
     }
+}
+
+/// Byte length of one placed subresource slice inside a staging buffer of
+/// `total` bytes. `GetCopyableFootprints` omits trailing alignment padding on
+/// the final row, so `RowPitch * rows * depth` can exceed `total - offset`.
+fn footprint_slice_len(
+    total: u64,
+    offset: u64,
+    row_pitch: u32,
+    rows: u32,
+    depth: u32,
+) -> Option<usize> {
+    let avail = usize::try_from(total.checked_sub(offset)?).ok()?;
+    let full = (row_pitch as usize)
+        .checked_mul(rows as usize)?
+        .checked_mul(depth as usize)?;
+    Some(full.min(avail))
+}
+
+/// Copies all committed regions of `[at, at + dst.len())` into `dst`, zeroing
+/// uncommitted gaps. Returns `true` if at least one byte was committed.
+fn read_resident(at: *const u8, dst: &mut [u8]) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let base = at as usize;
+    let total = dst.len();
+    let end = base + total;
+    let mut p = base;
+    let mut any = false;
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.RegionSize == 0 {
+            dst[p - base..].fill(0);
+            break;
+        }
+        let region_end = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .min(end);
+        let len = region_end.saturating_sub(p);
+        if len == 0 {
+            break;
+        }
+        let off = p - base;
+        if info.State == MEM_COMMIT {
+            any = true;
+            // `copy_mapped` tolerates a page unmapped concurrently between
+            // `VirtualQuery` and the copy, zero-filling any faulting page.
+            crate::host::copy_mapped(
+                dst[off..off + len].as_mut_ptr(),
+                p as *const u8,
+                len,
+                false,
+            );
+        } else {
+            dst[off..off + len].fill(0);
+        }
+        p = region_end;
+    }
+    any
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -329,7 +407,6 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let s = Arc::new(Staging {
         buffer,
-        #[cfg(feature = "diagnostics")]
         size: total,
         data,
         footprints,
@@ -341,4 +418,19 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::footprint_slice_len;
+
+    #[test]
+    fn footprint_slice_is_capped_to_staging_total() {
+        // 4x4 RGBA8: RowPitch is 256, 4 rows, total = 3*256 + 16 = 784 < 1024.
+        assert_eq!(footprint_slice_len(784, 0, 256, 4, 1), Some(784));
+        // Subresource at offset 512 in a 1000-byte buffer.
+        assert_eq!(footprint_slice_len(1000, 512, 256, 4, 1), Some(488));
+        // Offset past the buffer end is rejected.
+        assert_eq!(footprint_slice_len(784, 800, 256, 4, 1), None);
+    }
 }

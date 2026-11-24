@@ -446,6 +446,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if crate::texture::title_written(from) {
+                crate::texture::upload(list, src, from);
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -535,6 +538,9 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::texture::title_written(texture) {
+                crate::texture::upload(list, src.resource, texture);
+            }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
@@ -630,7 +636,11 @@ extern "system" fn resolve(
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = DXGI_FORMAT(format as i32);
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            let dst_mip = dst_sub % u32::from(a.MipLevels.max(1));
+            let src_mip = src_sub % u32::from(b.MipLevels.max(1));
+            let (aw, ah) = ((a.Width >> dst_mip).max(1), (a.Height >> dst_mip).max(1));
+            let (bw, bh) = ((b.Width >> src_mip).max(1), (b.Height >> src_mip).max(1));
+            if (aw, ah) == (bw, bh) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
@@ -638,8 +648,8 @@ extern "system" fn resolve(
                 let rect = RECT {
                     left: 0,
                     top: 0,
-                    right: a.Width.min(b.Width) as i32,
-                    bottom: a.Height.min(b.Height) as i32,
+                    right: aw.min(bw) as i32,
+                    bottom: ah.min(bh) as i32,
                 };
                 list1.ResolveSubresourceRegion(
                     to,
@@ -793,33 +803,107 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     }
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// `BeginQuery(heap, type, index)`: forwards to the host `ID3D12QueryHeap`
+/// when available.
+extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let Some((host_heap, count)) = crate::query::host_heap(heap)
+        && let Some((host_kind, _)) = crate::query::query_type_info(kind)
+        && index < count
+    {
+        use windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE;
+        // SAFETY: open host command list and live query heap with in-bounds index.
+        unsafe {
+            list.list
+                .BeginQuery(&host_heap, D3D12_QUERY_TYPE(host_kind), index)
+        };
+        list.keep(&host_heap);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
 
-/// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
-/// each query's result into the buffer once the list has run. Timestamps
-/// (type 2) are the GPU clock then; occlusion counts (0) say a million
-/// samples passed and binary occlusion (1) visible, so nothing is culled
-/// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
+/// `EndQuery(heap, type, index)`: forwards to the host `ID3D12QueryHeap`
+/// when available.
+extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let Some((host_heap, count)) = crate::query::host_heap(heap)
+        && let Some((host_kind, _)) = crate::query::query_type_info(kind)
+        && index < count
+    {
+        use windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE;
+        // SAFETY: open host command list and live query heap with in-bounds index.
+        unsafe {
+            list.list
+                .EndQuery(&host_heap, D3D12_QUERY_TYPE(host_kind), index)
+        };
+        list.keep(&host_heap);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
+
+/// `ResolveQueryData(heap, type, first, count, buffer, offset)`: resolves real
+/// GPU query results from the host `ID3D12QueryHeap` into a readback buffer
+/// and copies them into title memory once the submission completes, falling
+/// back to plausible synthetic values when headless or for unsupported query
+/// types.
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
 ) {
+    let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
+        return;
+    };
+    if count == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let Some(host) = crate::host::host()
+        && let Some((host_heap, heap_count)) = crate::query::host_heap(heap)
+        && let Some((host_kind, stride)) = crate::query::query_type_info(kind)
+        && first.checked_add(count).is_some_and(|end| end <= heap_count)
+        && let Some(total) = u64::from(count).checked_mul(stride)
+        && offset.checked_add(total).is_some_and(|end| end <= size)
+        && let Some((rb_buf, rb_ptr)) = host.readback_buffer(total)
+    {
+        use windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE;
+        // SAFETY: open list, live query heap, and readback buffer large enough for `total` bytes.
+        unsafe {
+            list.list.ResolveQueryData(
+                &host_heap,
+                D3D12_QUERY_TYPE(host_kind),
+                first,
+                count,
+                &rb_buf,
+                0,
+            );
+        }
+        list.keep(&host_heap);
+        list.keep(&rb_buf);
+        let dst = data as usize + offset as usize;
+        let src = rb_ptr as usize;
+        let len = total as usize;
+        list.defer_after(move || {
+            crate::watch::writing(dst, len);
+            crate::host::write_mapped(dst as *mut u8, src as *const u8, len);
+        });
+        return;
+    }
+    #[cfg(not(windows))]
+    let _ = (heap, first);
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
     const PIPELINE_STATISTICS: u32 = 3;
-    let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
-        return;
-    };
     let (what, bytes) = match kind {
         OCCLUSION => (Written::Value(1 << 20), 8),
         BINARY => (Written::Value(1), 8),
@@ -947,6 +1031,11 @@ mod state {
             crate::draw::stencil_ref(list, reference);
         }
     }
+    pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+        if let Some(list) = host_list(this) {
+            crate::draw::depth_bounds(list, min, max);
+        }
+    }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
     }
@@ -1007,7 +1096,11 @@ mod state {
         views: *const VertexView,
     ) {
         with_state(this, |_, s| {
-            s.set_vertex_buffers(start, items(views, count))
+            if views.is_null() {
+                s.clear_vertex_buffers(start, count);
+            } else {
+                s.set_vertex_buffers(start, items(views, count));
+            }
         });
     }
     /// `(count, handles, one range, depth)`: with one range, the handles
@@ -1102,6 +1195,7 @@ mod state {
     pub(super) use super::ignored_state as compute_constants;
     pub(super) use super::ignored_state as compute_table;
     pub(super) use super::ignored_state as compute_view;
+    pub(super) use super::ignored_state as depth_bounds;
     pub(super) use super::ignored_state as graphics_constant;
     pub(super) use super::ignored_state as graphics_constants;
     pub(super) use super::ignored_state as graphics_table;
@@ -1212,29 +1306,121 @@ pub(crate) fn take_counts() -> (u64, u64) {
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
 }
 
-/// A GPU wait for a memory value `(address, comparison, reference, ...)`.
-/// Lists run one after another and to completion, so a value another queue
-/// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+/// A GPU wait for a 64-bit memory value `(address, comparison, reference)`:
+/// recorded on the list and awaited at submission time before the list's
+/// host work runs, so cross-queue and CPU producers can satisfy it first.
+extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
+    if address == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.defer_wait(address, comparison, reference);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, address, comparison, reference);
+}
 
-/// The enhanced barriers `(group count, groups)`: buffer, texture and
-/// global barriers with layouts instead of states. Every host use of a
-/// title texture (clears, copies) moves its host copy to the state it needs
-/// first, so only their ordering matters: one barrier on every shader
-/// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+#[cfg(windows)]
+#[repr(C)]
+struct BarrierGroup {
+    kind: u32,
+    count: u32,
+    barriers: *const c_void,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct TextureBarrier {
+    sync_before: u32,
+    sync_after: u32,
+    access_before: u32,
+    access_after: u32,
+    layout_before: i32,
+    layout_after: i32,
+    resource: This,
+    subresources: [u32; 6],
+    flags: u32,
+}
+
+/// Maps an enhanced-barrier `D3D12_BARRIER_LAYOUT` to the equivalent legacy
+/// host `D3D12_RESOURCE_STATES` mask (`None` for `UNDEFINED` or unknown).
+#[cfg(any(windows, test))]
+fn enhanced_layout_state(layout: i32) -> Option<u32> {
+    Some(match layout {
+        0 | 18 | 24 => 0,            // COMMON / PRESENT
+        1 | 19 | 25 => 0x8C0,        // GENERIC_READ (SRV + COPY_SOURCE)
+        2 => 0x4,                    // RENDER_TARGET
+        3 | 20 | 26 => 0x8,          // UNORDERED_ACCESS
+        4 => 0x10,                   // DEPTH_STENCIL_WRITE
+        5 => 0x20,                   // DEPTH_STENCIL_READ
+        6 | 21 | 27 => 0xC0,         // SHADER_RESOURCE (PS | NON_PS)
+        7 | 22 | 28 => 0x800,        // COPY_SOURCE
+        8 | 23 | 29 => 0x400,        // COPY_DEST
+        9 => 0x2000,                 // RESOLVE_SOURCE
+        10 => 0x1000,                // RESOLVE_DEST
+        11 => 0x0100_0000,           // SHADING_RATE_SOURCE
+        _ => return None,
+    })
+}
+
+/// The enhanced barriers `(group count, groups)`: translates texture layout
+/// transitions through [`ensure_state`] so host textures stay in the right
+/// state for direct-indexed reads and cross-list `prelude` tracking, and emits
+/// a global UAV barrier for global/buffer/UAV groups.
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        const GLOBAL: u32 = 0;
+        const TEXTURE: u32 = 1;
+        const BUFFER: u32 = 2;
+        const ACCESS_UAV: u32 = 0x80;
+        let mut need_uav = groups.is_null();
+        if !groups.is_null() {
+            // SAFETY: the title passes `count` contiguous `D3D12_BARRIER_GROUP` entries.
+            let slice = unsafe { std::slice::from_raw_parts(groups.cast::<BarrierGroup>(), count as usize) };
+            for group in slice {
+                match group.kind {
+                    TEXTURE if !group.barriers.is_null() && group.count > 0 => {
+                        // SAFETY: the group points at `group.count` texture barriers.
+                        let textures = unsafe {
+                            std::slice::from_raw_parts(
+                                group.barriers.cast::<TextureBarrier>(),
+                                group.count as usize,
+                            )
+                        };
+                        for tb in textures {
+                            if !tb.resource.is_null()
+                                && let Some(state) = enhanced_layout_state(tb.layout_after)
+                            {
+                                ensure_state(list, tb.resource, state);
+                            }
+                            if (tb.access_before | tb.access_after) & ACCESS_UAV != 0
+                                || matches!(tb.layout_before, 3 | 20 | 26)
+                                || matches!(tb.layout_after, 3 | 20 | 26)
+                            {
+                                need_uav = true;
+                            }
+                        }
+                    }
+                    GLOBAL | BUFFER => need_uav = true,
+                    _ => need_uav = true,
+                }
+            }
+        }
+        if need_uav {
+            // SAFETY: the same layout; no resource named.
+            let barrier =
+                unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -1315,7 +1501,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (52, clear_rtv as *const ()),                 // 0x1a0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits
@@ -1328,8 +1514,8 @@ const METHODS: [(usize, *const ()); 52] = [
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
 const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
+    (28, begin_query as *const ()),            // 0xe0 BeginQuery
+    (29, end_query as *const ()),              // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
@@ -1433,5 +1619,20 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn enhanced_barrier_layouts_map_to_legacy_states() {
+        assert_eq!(enhanced_layout_state(0), Some(0)); // COMMON
+        assert_eq!(enhanced_layout_state(2), Some(0x4)); // RENDER_TARGET
+        assert_eq!(enhanced_layout_state(3), Some(0x8)); // UNORDERED_ACCESS
+        assert_eq!(enhanced_layout_state(4), Some(0x10)); // DEPTH_STENCIL_WRITE
+        assert_eq!(enhanced_layout_state(5), Some(0x20)); // DEPTH_STENCIL_READ
+        assert_eq!(enhanced_layout_state(6), Some(0xC0)); // SHADER_RESOURCE
+        assert_eq!(enhanced_layout_state(7), Some(0x800)); // COPY_SOURCE
+        assert_eq!(enhanced_layout_state(8), Some(0x400)); // COPY_DEST
+        assert_eq!(enhanced_layout_state(21), Some(0xC0)); // DIRECT_QUEUE_SHADER_RESOURCE
+        assert_eq!(enhanced_layout_state(26), Some(0x8)); // COMPUTE_QUEUE_UNORDERED_ACCESS
+        assert_eq!(enhanced_layout_state(-1), None); // UNDEFINED
     }
 }

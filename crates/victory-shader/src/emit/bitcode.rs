@@ -103,6 +103,9 @@ pub(crate) mod pred {
     pub const OGE: u8 = 3;
     pub const OLT: u8 = 4;
     pub const OLE: u8 = 5;
+    // Kept for predicate completeness; AMD D3D12 miscompiles `fcmp one` as
+    // unordered, so `v_cmp_lg` lowers as `OLT | OGT` instead.
+    #[allow(dead_code)]
     pub const ONE: u8 = 6;
     pub const ORD: u8 = 7;
     pub const UNO: u8 = 8;
@@ -259,6 +262,14 @@ impl Module {
 
     pub fn int_const(&mut self, ty: Ty, v: i64) -> V {
         self.constant(ty, Const::Int(v))
+    }
+    /// The integer value of `v`, if it is an integer constant.
+    pub fn int_value(&self, v: V) -> Option<i64> {
+        let V::Const(i) = v else { return None };
+        match self.consts.get(i as usize) {
+            Some(&(_, Const::Int(x))) => Some(x),
+            _ => None,
+        }
     }
     pub fn i32(&mut self, v: u32) -> V {
         let t = self.int(32);
