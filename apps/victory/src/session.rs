@@ -61,23 +61,44 @@ impl Drop for Session {
     }
 }
 
-/// The refusal a second session prints, with the live sessions to act on: the
+/// A session someone else holds: its pid, image, and whether it looks alive or
+/// left over (its parent is gone, which is what a crash or a restart leaves).
+struct Other {
+    pid: u32,
+    name: String,
+    alive: bool,
+}
+
+/// The refusal a second session prints, with the sessions to act on: the
 /// object itself names no process. Pure, so the wording is testable without a
 /// second process.
-fn refusal(others: &[(u32, String)]) -> String {
-    let who = if others.is_empty() {
-        String::new()
-    } else {
-        let list: Vec<String> = others
-            .iter()
-            .map(|(pid, name)| format!("{name} (pid {pid})"))
-            .collect();
-        format!(" Live title processes: {}.", list.join(", "))
-    };
+///
+/// An alive session and a corpse need opposite reactions — wait for the first,
+/// end the second — so the line says which each looks like.
+fn refusal(others: &[Other]) -> String {
+    let mut running = Vec::new();
+    let mut corpses = Vec::new();
+    for other in others {
+        let entry = format!("{} (pid {})", other.name, other.pid);
+        if other.alive {
+            running.push(entry);
+        } else {
+            corpses.push(entry);
+        }
+    }
+    let mut who = String::new();
+    if !running.is_empty() {
+        who.push_str(&format!(" Running title sessions: {}.", running.join(", ")));
+    }
+    if !corpses.is_empty() {
+        who.push_str(&format!(
+            " Left over with no parent, which is what a crash or a restart leaves: {}. Ending one \
+             is safe, it is not running a title.",
+            corpses.join(", ")
+        ));
+    }
     format!(
-        "another title session is running, so this one stops here without touching the GPU: two \
-         sessions share one GPU, one save folder and one shader cache. Wait for it to end, or end \
-         it and try again.{who}"
+        "another title session is running, so this one stops here without touching the GPU: two sessions share one GPU, one save folder and one shader cache.{who}"
     )
 }
 
@@ -154,8 +175,9 @@ mod imp {
         Ok((name, handle))
     }
 
-    /// Other processes whose executable looks like ours, without this one.
-    fn others() -> Vec<(u32, String)> {
+    /// Other processes whose executable looks like ours, without this one, each
+    /// with whether its parent is still alive.
+    fn others() -> Vec<super::Other> {
         // SAFETY: a plain query of our own pid.
         let me = unsafe { GetCurrentProcessId() };
         let mut found = Vec::new();
@@ -164,6 +186,10 @@ mod imp {
         if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
             return found;
         }
+        // Everything alive in one pass, to tell a session that is running from
+        // one whose parent is gone.
+        let mut live = std::collections::HashSet::new();
+        let mut ours = Vec::new();
         let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
         entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
         // SAFETY: a live snapshot and a structure of the size it was told.
@@ -175,16 +201,23 @@ mod imp {
                 .position(|&c| c == 0)
                 .unwrap_or(entry.szExeFile.len());
             let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            live.insert(entry.th32ProcessID);
             // Our own image only: a session may start renamed children (the
             // shader workers) that are not sessions themselves.
             if entry.th32ProcessID != me && name.eq_ignore_ascii_case("victory.exe") {
-                found.push((entry.th32ProcessID, name));
+                ours.push((entry.th32ProcessID, entry.th32ParentProcessID, name));
             }
             // SAFETY: as above.
             more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
         }
         // SAFETY: our snapshot.
         unsafe { CloseHandle(snapshot) };
+        for (pid, parent, name) in ours {
+            // A launcher that is still running means a session someone drives;
+            // a parent that is gone is what a crash or a restart leaves behind.
+            let alive = parent != 0 && live.contains(&parent);
+            found.push(super::Other { pid, name, alive });
+        }
         found
     }
 }
@@ -203,14 +236,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_refusal_names_the_live_sessions() {
-        let text = refusal(&[(4312, "victory.exe".to_owned())]);
-        assert!(text.contains("victory.exe (pid 4312)"), "{text}");
+    fn the_refusal_tells_a_running_session_from_a_corpse() {
+        let running = [Other {
+            pid: 4312,
+            name: "victory.exe".to_owned(),
+            alive: true,
+        }];
+        let text = refusal(&running);
+        assert!(
+            text.contains("Running title sessions: victory.exe (pid 4312)"),
+            "{text}"
+        );
         assert!(text.contains("without touching the GPU"), "{text}");
+        assert!(!text.contains("No parent"), "{text}");
+
+        // A corpse says it is safe to end, which is the reaction it needs.
+        let text = refusal(&[Other {
+            pid: 77,
+            name: "victory.exe".to_owned(),
+            alive: false,
+        }]);
+        assert!(text.contains("no parent"), "{text}");
+        assert!(text.contains("Ending one is safe"), "{text}");
+        assert!(!text.contains("Running title sessions"), "{text}");
+
+        // Both at once, each named for what it is.
+        let text = refusal(&[
+            Other {
+                pid: 1,
+                name: "victory.exe".to_owned(),
+                alive: true,
+            },
+            Other {
+                pid: 2,
+                name: "victory.exe".to_owned(),
+                alive: false,
+            },
+        ]);
+        assert!(text.contains("Running title sessions: victory.exe (pid 1)"), "{text}");
+        assert!(text.contains("victory.exe (pid 2)"), "{text}");
+
         // Without a visible holder it still says the session is taken.
         let text = refusal(&[]);
         assert!(text.contains("another title session is running"), "{text}");
-        assert!(!text.contains("Live title processes"), "{text}");
+        assert!(!text.contains("Running title sessions"), "{text}");
     }
 
     #[test]
