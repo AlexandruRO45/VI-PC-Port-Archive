@@ -580,3 +580,122 @@ fn rejects_pe32_images() {
     put16(&mut d, OPT, 0x10B);
     assert!(matches!(ImageInfo::parse(&d), Err(PeError::Unsupported(_))));
 }
+
+#[test]
+fn import_symbols_display_as_their_name_or_ordinal() {
+    let info = ImageInfo::parse(&image()).unwrap();
+    let shown: Vec<_> = info.imports[0]
+        .entries
+        .iter()
+        .map(|e| e.symbol.to_string())
+        .collect();
+    assert_eq!(shown, ["ExitProcess", "#5"]);
+}
+
+#[test]
+fn tls_callbacks_are_capped() {
+    // Grow the section so a 1100-entry callback array, with no terminator,
+    // fits after the existing contents.
+    const SIZE: u32 = 0x3000;
+    const ARRAY: u32 = 0x1400;
+    const COUNT: usize = 1100;
+    let mut d = image();
+    d.resize((SECTION_FILE_OFFSET + SIZE) as usize, 0);
+    let sec = OPT + 240;
+    put32(&mut d, sec + 8, SIZE);
+    put32(&mut d, sec + 16, SIZE);
+    put32(&mut d, OPT + 56, SECTION_RVA + SIZE);
+    put64(
+        &mut d,
+        at(TLS_DIRECTORY) + layout::TLS64_ADDRESS_OF_CALLBACKS,
+        IMAGE_BASE + u64::from(ARRAY),
+    );
+    for i in 0..COUNT {
+        put64(&mut d, at(ARRAY) + i * 8, IMAGE_BASE + 0x1000 + i as u64);
+    }
+    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
+    assert_eq!(tls.callback_rvas.len(), 1024);
+    assert_eq!(tls.callback_rvas[0], 0x1000);
+    assert_eq!(tls.callback_rvas[1023], 0x1000 + 1023);
+}
+
+#[test]
+fn reads_exports_without_a_name() {
+    // Only two names: the export at ordinal 1 (`local`) is by ordinal only.
+    let mut d = image();
+    add_exports(&mut d);
+    put32(&mut d, at(EXPORT_DIRECTORY) + 24, 2);
+    let info = ImageInfo::parse(&d).unwrap();
+    let mut exports: Vec<_> = info
+        .exports
+        .iter()
+        .map(|e| (e.ordinal, e.name.as_deref(), e.rva, e.forward.as_deref()))
+        .collect();
+    exports.sort();
+    assert_eq!(
+        exports,
+        [
+            (1, None, Some(ENTRY), None),
+            (2, Some("fwdname"), None, Some("NTDLL.RtlFoo")),
+            (3, Some("fwdord"), None, Some("NTDLL.#7")),
+        ]
+    );
+}
+
+#[test]
+fn reads_delay_imports_by_ordinal() {
+    let mut d = image();
+    add_delay_import(&mut d);
+    put64(&mut d, at(DELAY_NAME_TABLE), (1 << 63) | 9);
+    let info = ImageInfo::parse(&d).unwrap();
+    let user32 = &info.delay_imports[0];
+    assert_eq!(user32.entries.len(), 1);
+    assert_eq!(user32.entries[0].symbol, ImportSymbol::Ordinal(9));
+    assert_eq!(user32.entries[0].symbol.to_string(), "#9");
+    assert_eq!(user32.entries[0].iat_slot_rva, DELAY_IAT);
+}
+
+#[test]
+fn rva_to_file_offset_picks_the_section_that_holds_the_rva() {
+    // A second section, `.data` at RVA 0x2000 and file offset 0x600, with a
+    // virtual size of 0: its raw size is then its size in memory.
+    const DATA_RVA: u32 = 0x2000;
+    const DATA_FILE_OFFSET: u32 = SECTION_FILE_OFFSET + SECTION_SIZE;
+    const DATA_SIZE: u32 = 0x200;
+    let mut d = image();
+    d.resize((DATA_FILE_OFFSET + DATA_SIZE) as usize, 0);
+    put16(&mut d, 0x46, 2);
+    put32(&mut d, OPT + 56, DATA_RVA + 0x1000);
+    let sec = OPT + 240 + 40;
+    d[sec..sec + 5].copy_from_slice(b".data");
+    put32(&mut d, sec + 12, DATA_RVA);
+    put32(&mut d, sec + 16, DATA_SIZE);
+    put32(&mut d, sec + 20, DATA_FILE_OFFSET);
+    put32(&mut d, sec + 36, 0xC000_0040); // initialised data, read, write
+
+    let info = ImageInfo::parse(&d).unwrap();
+    let sections: Vec<_> = info
+        .sections
+        .iter()
+        .map(|s| (s.name.trim_end_matches('\0'), s.rva, s.virtual_size))
+        .collect();
+    assert_eq!(
+        sections,
+        [(".text", SECTION_RVA, SECTION_SIZE), (".data", DATA_RVA, 0)]
+    );
+    assert_eq!(
+        info.rva_to_file_offset(HINT_NAME),
+        Some(at(HINT_NAME) as u32)
+    );
+    assert_eq!(info.rva_to_file_offset(DATA_RVA), Some(DATA_FILE_OFFSET));
+    assert_eq!(
+        info.rva_to_file_offset(DATA_RVA + DATA_SIZE - 1),
+        Some(DATA_FILE_OFFSET + DATA_SIZE - 1)
+    );
+    // The gap between the sections and the end of `.data` map nowhere.
+    assert_eq!(
+        info.rva_to_file_offset(SECTION_RVA + SECTION_SIZE + 0x10),
+        None
+    );
+    assert_eq!(info.rva_to_file_offset(DATA_RVA + DATA_SIZE), None);
+}
