@@ -702,6 +702,11 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     n: usize,
     pages: *const usize,
 ) -> BOOL {
+    #[cfg(feature = "diagnostics")]
+    {
+        use victory_gpu::stats::{C, add};
+        add(C::Scatter, 1);
+    }
     if addresses.is_null() {
         return 0;
     }
@@ -741,7 +746,6 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         #[cfg(feature = "diagnostics")]
         {
             use victory_gpu::stats::{C, add};
-            add(C::Scatter, 1);
             add(C::ScatterPages, run as u64);
             add(C::ScatterMaps, 1);
         }
@@ -758,13 +762,14 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
                     // SAFETY: `k < i + run <= n` page numbers were passed.
                     _ => unsafe { pages.add(k) },
                 };
-                if XMemMapPhysicalPages(address as *mut c_void, 1, page).is_null() {
-                    return 0;
-                }
+                // Counted before the check: a failed attempt is a call too.
                 #[cfg(feature = "diagnostics")]
                 {
                     use victory_gpu::stats::{C, add};
                     add(C::ScatterMaps, 1);
+                }
+                if XMemMapPhysicalPages(address as *mut c_void, 1, page).is_null() {
+                    return 0;
                 }
             }
         }
@@ -1324,7 +1329,7 @@ mod tests {
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { at(2).cast::<u8>().read() }, b'1');
 
-        // Three consecutive addresses without pages unmap as one run.
+        // Two consecutive addresses without pages unmap as one run.
         assert_eq!(
             XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, std::ptr::null()),
             1
