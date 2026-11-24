@@ -516,6 +516,16 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         }) {
             return Err(Malformed("root parameter outside the SGPRs"));
         }
+        // The SGPRs a parameter takes are filled from the stage's user-data
+        // registers, of which GFX10 has 32 per graphics stage and 16 for
+        // compute (`COMPUTE_USER_DATA_0..15`). Lowering declares the stage's
+        // user data up to the last dword read and the host makes it root
+        // constants, so a parameter at, say, user-data dword 90 would ask
+        // for a root signature past D3D12's 64 dwords, which the device
+        // refuses to create.
+        if !params_in_user_data(stage, &layout) {
+            return Err(Malformed("root parameter past the user data"));
+        }
         // A table or heap parameter is one 32-bit address. Resource tracking
         // maps each SGPR it states to the parameter (`resource::param_of`),
         // and the host fills every dword of a table with that address
@@ -661,6 +671,28 @@ fn sgpr_span(stage: HwStage, p: &RootParam) -> (u32, u32) {
         _ => p.sgprs.max(1),
     };
     (first, span)
+}
+
+/// User-data registers a stage has: `SPI_SHADER_USER_DATA_*_0..31` for the
+/// graphics stages, `COMPUTE_USER_DATA_0..15` for compute.
+fn user_data_dwords(stage: HwStage) -> u32 {
+    match stage {
+        HwStage::Cs => 16,
+        _ => 32,
+    }
+}
+
+/// Whether every SGPR a root parameter states (a root descriptor's high
+/// half included) is one of the stage's user-data registers. A parameter
+/// stating no SGPRs (a fixed sampler) takes none.
+fn params_in_user_data(stage: HwStage, layout: &[RootParam]) -> bool {
+    layout.iter().all(|p| {
+        let span = match p.root {
+            RootType::Descriptor => p.sgprs.max(2),
+            _ => p.sgprs,
+        };
+        span == 0 || u64::from(p.user_data) + u64::from(span) <= u64::from(user_data_dwords(stage))
+    })
 }
 
 /// Whether no SGPR holds two root parameters: each covers its stated
@@ -1199,17 +1231,26 @@ mod tests {
             }]
         );
 
-        // Parameters must sit in SGPRs the program can address: s9 plus 97
-        // dwords ends at s105, one more is past it, and so is a user-data
-        // byte past the SGPR file. (Constants: a table takes one SGPR, and
-        // the read is then not a table's.)
+        // Parameters must sit in SGPRs the program can address: s9 plus 98
+        // dwords is past s105, and so is a user-data byte past the SGPR
+        // file. They must also sit in the stage's 32 user-data dwords: from
+        // dword 9, 23 end at dword 31 and 24 are past it. (Constants: a
+        // table takes one SGPR, and the read is then not a table's.)
         let entry = FSSM_HEADER + tables as usize;
         let layout = |blob: &[u8]| native_programs(&part(&[(KIND_NATIVE, &xbch(blob))]));
         let mut wide = blob.clone();
         wide[entry..entry + 4].copy_from_slice(&0u32.to_le_bytes());
         wide[entry + ENTRY_SIZE as usize + 1] = 0;
-        wide[entry + 8..entry + 12].copy_from_slice(&97u32.to_le_bytes());
-        assert_eq!(layout(&wide).unwrap()[0].layout[0].sgprs, 97);
+        wide[entry + 8..entry + 12].copy_from_slice(&23u32.to_le_bytes());
+        assert_eq!(layout(&wide).unwrap()[0].layout[0].sgprs, 23);
+        for sgprs in [24u32, 97] {
+            wide[entry + 8..entry + 12].copy_from_slice(&sgprs.to_le_bytes());
+            assert_eq!(
+                refused_blob(&xbch(&wide)),
+                "root parameter past the user data",
+                "{sgprs}"
+            );
+        }
         wide[entry + 8..entry + 12].copy_from_slice(&98u32.to_le_bytes());
         assert_eq!(
             refused_blob(&xbch(&wide)),
@@ -1223,19 +1264,26 @@ mod tests {
         );
 
         // A root descriptor's high half is the SGPR after its first, even
-        // when the record states fewer than two: one in s104 fits (s104,
-        // s105), one in s105 would take VCC_LO as its high half.
+        // when the record states fewer than two: one at user-data dword 30
+        // fits (30, 31), one at 31 would take dword 32 as its high half,
+        // and one in s105 would take VCC_LO.
         for sgprs in [0u32, 1, 2] {
             let mut desc = blob.clone();
             desc[entry..entry + 4].copy_from_slice(&1u32.to_le_bytes());
             // The SRV read through it is then a root descriptor's.
             desc[entry + ENTRY_SIZE as usize + 1] = 1;
             desc[entry + 8..entry + 12].copy_from_slice(&sgprs.to_le_bytes());
-            desc[entry + 16] = 104;
-            desc[entry + ENTRY_SIZE as usize + 17] = 104;
+            desc[entry + 16] = 30;
+            desc[entry + ENTRY_SIZE as usize + 17] = 30;
             assert_eq!(
                 layout(&desc).unwrap()[0].layout[0].root,
                 RootType::Descriptor
+            );
+            desc[entry + 16] = 31;
+            desc[entry + ENTRY_SIZE as usize + 17] = 31;
+            assert_eq!(
+                refused_blob(&xbch(&desc)),
+                "root parameter past the user data"
             );
             desc[entry + 16] = 105;
             desc[entry + ENTRY_SIZE as usize + 17] = 105;
@@ -1243,7 +1291,9 @@ mod tests {
                 refused_blob(&xbch(&desc)),
                 "root parameter outside the SGPRs"
             );
-            // Other kinds of parameter still take one SGPR there.
+            // Other kinds of parameter still take one SGPR at dword 31.
+            desc[entry + 16] = 31;
+            desc[entry + ENTRY_SIZE as usize + 17] = 31;
             desc[entry..entry + 4].copy_from_slice(&3u32.to_le_bytes());
             desc[entry + ENTRY_SIZE as usize + 1] = 3;
             if sgprs <= 1 {
@@ -1450,6 +1500,24 @@ mod tests {
         assert!(program(rsrc2, constants, 1, 7).is_ok());
         // With no group ids or info enabled, s4 is free.
         assert!(program(4 << 1, constants, 1, 4).is_ok());
+        // Compute has 16 user-data dwords: constants may end at dword 15,
+        // and a descriptor's high half may be it, but neither may pass it.
+        assert!(program(0, constants, 16, 0).is_ok());
+        assert!(program(0, descriptor, 2, 14).is_ok());
+        for (root, sgprs, user_data, what) in [
+            (constants, 17, 0, "seventeen dwords"),
+            (constants, 1, 16, "constants at dword 16"),
+            (descriptor, 1, 15, "a descriptor's high half at dword 16"),
+            (table, 1, 40, "a table at dword 40"),
+        ] {
+            assert!(
+                matches!(
+                    program(0, root, sgprs, user_data),
+                    Err(Malformed("root parameter past the user data"))
+                ),
+                "{what}"
+            );
+        }
         for (root, sgprs, user_data, what) in [
             (constants, 5, 0, "five dwords from s0 reach group id x"),
             (descriptor, 1, 3, "a descriptor's high half in s4"),
