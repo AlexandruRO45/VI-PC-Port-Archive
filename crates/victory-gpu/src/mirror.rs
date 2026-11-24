@@ -43,6 +43,10 @@ struct Pages {
 pub(crate) struct Mirror {
     pub(crate) buffer: ID3D12Resource,
     pub(crate) va: u64,
+    /// One reserved buffer per title memory view (`VIEW_BYTES` each), mapped on the same heap
+    /// tiles as `buffer`: the host refuses a raw view that ends at or past 4 GiB of its resource.
+    /// Empty if they could not be made (no views then).
+    views: Vec<ID3D12Resource>,
     pages: Mutex<Pages>,
 }
 
@@ -87,6 +91,45 @@ fn buffer_desc(width: u64) -> D3D12_RESOURCE_DESC {
     }
 }
 
+/// Bytes of title memory one view (and its buffer) covers.
+const VIEW_BYTES: u64 = 1 << TITLE_MEMORY_VIEW_SHIFT;
+/// Tiles per view.
+const VIEW_TILES: u64 = VIEW_BYTES / TILE;
+/// Raw views must end below this offset of their resource.
+pub(crate) const VIEW_END_LIMIT: u64 = 1 << 32;
+
+/// The view buffer of title page `page` and the page's tile in it.
+fn view_tile(page: u64) -> (usize, u32) {
+    ((page / VIEW_TILES) as usize, (page % VIEW_TILES) as u32)
+}
+
+/// Whether a raw view over bytes `[start, start + len)` of a resource is one the host accepts.
+pub(crate) fn view_fits(start: u64, len: u64) -> bool {
+    start.checked_add(len).is_some_and(|end| end < VIEW_END_LIMIT)
+}
+
+fn make_views(device: &ID3D12Device) -> Vec<ID3D12Resource> {
+    let mut views = Vec::with_capacity(TITLE_MEMORY_VIEWS as usize);
+    for index in 0..TITLE_MEMORY_VIEWS {
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a reserved buffer.
+        let made = unsafe {
+            device.CreateReservedResource(&buffer_desc(VIEW_BYTES), D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+        };
+        match (made, buffer) {
+            (Ok(()), Some(buffer)) => {
+                note_range(&buffer, format!("title memory view {index}"));
+                views.push(buffer);
+            }
+            (e, _) => {
+                tracing::warn!(error = ?e.err(), index, "no title memory view buffers");
+                return Vec::new();
+            }
+        }
+    }
+    views
+}
+
 /// The mirror, made on first use; `None` if it is off or the host refuses it.
 pub(crate) fn get() -> Option<&'static Mirror> {
     static MIRROR: OnceLock<Option<Mirror>> = OnceLock::new();
@@ -107,7 +150,8 @@ pub(crate) fn get() -> Option<&'static Mirror> {
                     let va = unsafe { buffer.GetGPUVirtualAddress() };
                     crate::host::name(&buffer, || "title memory mirror".into());
                     tracing::info!(gib = BYTES >> 30, va = format_args!("{va:#x}"), "title memory mirrored on the GPU");
-                    Some(Mirror { buffer, va, pages: Mutex::new(Pages { map: HashMap::new(), chunks: Vec::new() }) })
+                    let views = make_views(&host.device);
+                    Some(Mirror { buffer, va, views, pages: Mutex::new(Pages { map: HashMap::new(), chunks: Vec::new() }) })
                 }
                 (e, _) => {
                     tracing::warn!(error = ?e.err(), "no title memory mirror: separate copies");
@@ -146,9 +190,11 @@ impl Mirror {
         let elements = 1 << (TITLE_MEMORY_VIEW_SHIFT - 2);
         let size = u64::from(elements) * 4 * u64::from(TITLE_MEMORY_VIEWS);
         if size != BYTES
+            || self.views.len() != TITLE_MEMORY_VIEWS as usize
+            || !view_fits(0, VIEW_BYTES)
             || first.ptr == 0
             || step == 0
-            || !crate::descriptor::host::valid_raw_srv(&self.buffer, size)
+            || !crate::descriptor::host::valid_raw_srv(&self.views[0], VIEW_BYTES)
         {
             return None;
         }
@@ -159,7 +205,7 @@ impl Mirror {
                 Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                 Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                     Buffer: D3D12_BUFFER_SRV {
-                        FirstElement: u64::from(index) * u64::from(elements),
+                        FirstElement: 0,
                         NumElements: elements,
                         Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                         ..Default::default()
@@ -170,7 +216,7 @@ impl Mirror {
                 ptr: first.ptr + (index * step) as usize,
             };
             // SAFETY: the caller reserved this range in a live view heap.
-            unsafe { host.device.CreateShaderResourceView(&self.buffer, Some(&desc), slot) };
+            unsafe { host.device.CreateShaderResourceView(&self.views[index as usize], Some(&desc), slot) };
         }
         Some(())
     }
@@ -211,6 +257,20 @@ impl Mirror {
         }
         for (k, (tiles, heap_tiles)) in new {
             host.map_tiles(&self.buffer, &tiles, &p.chunks[k].heap, &heap_tiles);
+            if self.views.is_empty() {
+                continue;
+            }
+            // the same tiles in each view buffer
+            let mut by_view: HashMap<usize, (Vec<u32>, Vec<u32>)> = HashMap::new();
+            for (&page, &tile) in tiles.iter().zip(&heap_tiles) {
+                let (view, in_view) = view_tile(u64::from(page));
+                let e = by_view.entry(view).or_default();
+                e.0.push(in_view);
+                e.1.push(tile);
+            }
+            for (view, (in_view, heap_tiles)) in by_view {
+                host.map_tiles(&self.views[view], &in_view, &p.chunks[k].heap, &heap_tiles);
+            }
         }
         Some(out)
     }
@@ -297,5 +357,28 @@ fn new_chunk(device: &ID3D12Device) -> Option<Chunk> {
         note_range(&view, "mirror page chunk view".into());
         view.Map(0, None, Some(&mut cpu)).ok()?;
         Some(Chunk { heap, _view: view, cpu: cpu as usize, used: 0 })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn view_tiles_split_pages() {
+        assert_eq!(VIEW_TILES, 8192);
+        assert_eq!(view_tile(0), (0, 0));
+        assert_eq!(view_tile(8191), (0, 8191));
+        assert_eq!(view_tile(8192), (1, 0));
+        assert_eq!(view_tile((BYTES / TILE) - 1), (255, 8191));
+    }
+
+    #[test]
+    fn views_end_below_four_gib() {
+        assert!(view_fits(0, VIEW_BYTES));
+        assert!(view_fits(0, (4 << 30) - 4));
+        assert!(!view_fits(0, 4 << 30));
+        assert!(!view_fits(3 << 30, 1 << 30));
+        assert!(!view_fits(u64::MAX, 4));
     }
 }

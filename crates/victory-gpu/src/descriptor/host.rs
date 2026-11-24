@@ -1174,6 +1174,7 @@ fn buffer_view_start(
     let offset = base.checked_add(first.checked_mul(element)?)?;
     if !offset.is_multiple_of(element)
         || offset.checked_add(u64::from(count).checked_mul(element)?)? > desc.Width
+        || !crate::mirror::view_fits(offset, u64::from(count) * element)
         || kind == 11
             && !gpu
                 .checked_add(offset)?
