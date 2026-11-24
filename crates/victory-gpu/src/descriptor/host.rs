@@ -1571,7 +1571,7 @@ mod tests {
         assert!(buffer_srv(addr, backing.len() as u64, srv, heap.cpu(0)).is_none());
         assert!(buffer_uav(addr, backing.len() as u64, uav, heap.cpu(1)).is_none());
         // SAFETY: live device.
-        assert_eq!(unsafe { host.device.GetDeviceRemovedReason() }.0, 0);
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     #[test]

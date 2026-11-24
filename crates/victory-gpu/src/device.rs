@@ -239,7 +239,10 @@ extern "system" fn device_removed_reason(_: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // SAFETY: live host device.
-        return unsafe { host.device.GetDeviceRemovedReason() }.0;
+        return match unsafe { host.device.GetDeviceRemovedReason() } {
+            Ok(()) => S_OK,
+            Err(e) => e.code().0,
+        };
     }
     S_OK
 }
