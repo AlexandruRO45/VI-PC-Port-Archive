@@ -186,7 +186,7 @@ pub(crate) fn restored_scalar<'a>(
     found
 }
 
-fn scalar_immediate(op: Operand) -> Option<u32> {
+pub(crate) fn scalar_immediate(op: Operand) -> Option<u32> {
     match op {
         Operand::Scalar {
             code: gfx10::NULL, ..

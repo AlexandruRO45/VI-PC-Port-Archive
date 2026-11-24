@@ -345,6 +345,21 @@ fn shader_root_bindings(t: &HostShader) -> Result<Vec<RootBinding>, &'static str
         }
         words |= bit;
     }
+    for a in &t.buffer_addresses {
+        if a.index >= D3D12_MAX_ROOT_COST || !a.byte_offset.is_multiple_of(32) {
+            return Err("invalid translated buffer address constant");
+        }
+        let bit = 1 << a.index;
+        if words & bit != 0 {
+            return Err("duplicate translated root constant");
+        }
+        if !t.descriptor_bindings.iter().any(|d| {
+            d.table == Some(a.table) && d.byte_offset == a.byte_offset && d.properties == (11, 0)
+        }) {
+            return Err("missing raw SRV binding for buffer address constant");
+        }
+        words |= bit;
+    }
     if words != 0 {
         roots.push(RootBinding::Constants(t.user_data_dwords()));
     }
@@ -798,7 +813,7 @@ fn root_cost(params: &[D3D12_ROOT_PARAMETER1]) -> u64 {
 #[cfg(test)]
 mod root_binding_tests {
     use super::*;
-    use victory_shader::emit::UserData;
+    use victory_shader::emit::{BufferAddress, DescriptorBinding, UserData};
 
     fn shader() -> HostShader {
         HostShader {
@@ -811,6 +826,7 @@ mod root_binding_tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             descriptor_bindings: Vec::new(),
+            buffer_addresses: Vec::new(),
         }
     }
 
@@ -869,6 +885,36 @@ mod root_binding_tests {
             .parameter(visibility),
         );
         assert!(root_cost(&params) > u64::from(D3D12_MAX_ROOT_COST));
+    }
+
+    #[test]
+    fn buffer_address_constants_require_a_checked_raw_srv() {
+        let mut shader = shader();
+        shader.buffer_addresses.push(BufferAddress {
+            index: 60,
+            table: 1,
+            byte_offset: 32,
+            high: true,
+        });
+        assert!(shader_root_bindings(&shader).is_err());
+        shader.descriptor_bindings.push(DescriptorBinding {
+            table: Some(1),
+            byte_offset: 32,
+            properties: (11, 0),
+        });
+        assert_eq!(
+            shader_root_bindings(&shader).unwrap(),
+            [RootBinding::Constants(64)]
+        );
+        shader.user_data.push(UserData {
+            index: 60,
+            slot: 2,
+            root: RootType::Constants,
+            dword: 0,
+        });
+        assert!(shader_root_bindings(&shader).is_err());
+        shader.buffer_addresses[0].index = 64;
+        assert!(shader_root_bindings(&shader).is_err());
     }
 
     #[test]

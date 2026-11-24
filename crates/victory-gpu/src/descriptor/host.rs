@@ -986,6 +986,16 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     ))
 }
 
+/// The RDNA2 buffer SRD uses a 48-bit base in dwords 0 and 1.
+pub(crate) fn buffer_address_word(view: &View, high: bool) -> Option<u32> {
+    validate_binding(view, (11, 0)).ok()?;
+    let (base, len) = buffer_range(view)?;
+    if base == 0 || !base.is_multiple_of(4) || base >= 1 << 48 || len == 0 {
+        return None;
+    }
+    Some(if high { (base >> 32) as u32 } else { base as u32 })
+}
+
 /// [`buffer_range`] of an unordered access view of memory at `base`.
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
@@ -1654,6 +1664,38 @@ mod tests {
 #[cfg(test)]
 mod binding_tests {
     use super::*;
+
+    #[test]
+    fn raw_srv_address_uses_the_title_view_and_its_first_element() {
+        let mut resource = [0; 14];
+        resource[0] = D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
+        let mut words = [0; 16];
+        words[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+        words[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        words[4] = 2; // FirstElement carries into the high address dword.
+        words[6] = 16;
+        words[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+        words[10] = 0xffff_fffc;
+        words[11] = 0x1234;
+        let view = View::Placed(false, resource, words);
+        assert_eq!(buffer_address_word(&view, false), Some(4));
+        assert_eq!(buffer_address_word(&view, true), Some(0x1235));
+        words[11] = 0xffff;
+        assert_eq!(
+            buffer_address_word(&View::Placed(false, resource, words), true),
+            None
+        );
+        words[11] = 0;
+        assert_eq!(
+            buffer_address_word(&View::Placed(true, resource, words), false),
+            None
+        );
+        words[10] = 1;
+        assert_eq!(
+            buffer_address_word(&View::Placed(false, resource, words), false),
+            None
+        );
+    }
 
     #[test]
     fn indexed_views_must_match_the_shader_annotation() {

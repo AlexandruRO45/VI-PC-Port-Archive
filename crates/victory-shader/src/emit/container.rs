@@ -71,7 +71,8 @@ pub(crate) fn signature(elements: &[SigElement], input: bool, dedup_names: bool)
     out.extend(8u32.to_le_bytes());
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs. Validator 1.7 and
-    // later share all equal names. Rows remain sorted by register.
+    // later share all equal names. The validator orders rows by register
+    // and then by semantic name offset when elements share a register.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -93,7 +94,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool, dedup_names: bool)
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -389,6 +390,36 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_signature_rows_follow_semantic_offsets() {
+        let first = SigElement {
+            name: "FIRST".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(1),
+            col: 3,
+            cols: 1,
+            usage: 1,
+            half: false,
+        };
+        let second = SigElement {
+            name: "SECOND".into(),
+            col: 0,
+            ..first.clone()
+        };
+        let earlier = SigElement {
+            name: "EARLIER".into(),
+            row: Some(0),
+            col: 0,
+            ..first.clone()
+        };
+        let bytes = signature(&[first, second, earlier], false, false);
+        let masks: Vec<_> = bytes[8..104].chunks_exact(32).map(|row| row[24]).collect();
+        assert_eq!(masks, [1, 8, 1]);
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {
