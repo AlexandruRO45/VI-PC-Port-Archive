@@ -26,7 +26,7 @@ use windows_sys::Win32::System::LibraryLoader::{
     GetModuleFileNameW, GetModuleHandleExW,
 };
 
-use crate::unwind::unwind;
+use crate::unwind::{locate_unwinder, recover_unwind_fault, unwind};
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 
@@ -186,8 +186,11 @@ pub fn report_crashes() {
             && std::env::var_os("VICTORY_CRASH_BREAKPOINTS").is_some_and(|value| value == "1"),
         Ordering::Relaxed,
     );
-    // SAFETY: registers handlers that only read the exception they are
-    // given; the title's own filter, once it sets one, takes the place of
+    locate_unwinder();
+    // SAFETY: registers handlers that read the exception they are given and,
+    // for an instruction emulated or a fault inside a guarded unwind,
+    // rewrite that thread's context, which belongs to the dispatch for its
+    // duration; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
     unsafe {
         AddVectoredExceptionHandler(0, Some(handler));
@@ -538,8 +541,8 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
-    // SAFETY: the system passes valid exception pointers.
-    if unsafe { emulate_amd_only(info) } {
+    // SAFETY: the system passes valid exception pointers, for this thread.
+    if unsafe { recover_unwind_fault(info) || emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
@@ -681,8 +684,12 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         context.R14,
         context.R15
     ));
-    for (i, pc) in unwind(*context).into_iter().enumerate() {
+    let (frames, walked) = unwind(*context);
+    for (i, pc) in frames.into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
+    }
+    if let Err(fault) = walked {
+        line(format!("  walk ended: {fault}"));
     }
     if to_file {
         let end = report_end();

@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::crash::locate;
-use crate::unwind::{MAX_FRAMES, tib_stack, unwind_into};
+use crate::unwind::{MAX_FRAMES, UnwindFault, tib_stack, unwind_into};
 
 /// Reads `VICTORY_STACKS` and, if set, starts a thread that prints every
 /// thread's stack at each listed time (seconds from now).
@@ -136,7 +136,7 @@ pub fn dump_stacks() {
         if thread.is_null() {
             continue;
         }
-        let (frames, (priority, base)) = frames_of(thread);
+        let (frames, walked, (priority, base)) = frames_of(thread);
         eprintln!(
             "  thread {id} \"{}\" start {} priority {priority} (base {base})",
             name_of(thread),
@@ -145,42 +145,52 @@ pub fn dump_stacks() {
         for (i, pc) in frames.into_iter().enumerate() {
             eprintln!("    #{i:<2} {}", locate(pc as usize));
         }
+        if let Err(fault) = walked {
+            eprintln!("    walk ended: {fault}");
+        }
         // SAFETY: we opened it.
         unsafe { CloseHandle(thread) };
     }
 }
 
-/// The thread's frames and its current and base scheduling priority (0-31).
-fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
+/// The thread's frames, why the walk ended early if it did, and its current
+/// and base scheduling priority (0-31).
+fn frames_of(thread: HANDLE) -> (Vec<u64>, Result<(), UnwindFault>, (i32, i32)) {
     let mut frames = Vec::with_capacity(MAX_FRAMES);
     // Suspended first: a running thread may exit and free its TEB between
     // the query and the read below.
     // SAFETY: a thread of this process that is not this one.
     if unsafe { SuspendThread(thread) } == u32::MAX {
-        return (frames, (0, 0));
+        return (frames, Ok(()), (0, 0));
     }
     let Some(info) = BasicInfo::of(thread) else {
         // SAFETY: suspended above.
         unsafe { ResumeThread(thread) };
-        return (frames, (0, 0));
+        return (frames, Ok(()), (0, 0));
     };
+    let mut walked = Ok(());
     // SAFETY: zeroed is a valid CONTEXT.
     let mut context = Aligned(unsafe { std::mem::zeroed() });
     context.0.ContextFlags = CONTEXT_FULL_AMD64;
     // SAFETY: reads and resumes the thread suspended above; nothing until
-    // the resume allocates or takes a lock the thread could hold besides
-    // the unwinder's own. Its committed stack is read from its TEB, which
+    // the resume allocates, and nothing of ours takes a lock the thread
+    // could hold besides the unwinder's own. A fault the walk recovers is
+    // dispatched by Windows, which takes the vectored handler list's lock
+    // for short spans between handlers: a thread suspended inside its own
+    // dispatch in such a span holds it, and the dump then hangs with that
+    // thread suspended. Accepted for this diagnostics-only aid. Its
+    // committed stack is read from its TEB, which
     // starts with its NT_TIB, only after `GetThreadContext` returns for it,
     // when its suspension is known complete, so the TEB stays mapped (a
     // suspended thread's does unless something terminates it).
     unsafe {
         if GetThreadContext(thread, &mut context.0) != 0 {
             let stack = tib_stack(info.teb);
-            unwind_into(context.0, stack.start, stack.end, &mut frames);
+            walked = unwind_into(context.0, stack.start, stack.end, &mut frames);
         }
         ResumeThread(thread);
     }
-    (frames, (info.priority, info.base_priority))
+    (frames, walked, (info.priority, info.base_priority))
 }
 
 fn start_of(thread: HANDLE) -> usize {
@@ -235,7 +245,8 @@ mod tests {
             )
         };
         assert!(!thread.is_null());
-        let (frames, _) = frames_of(thread);
+        let (frames, walked, _) = frames_of(thread);
+        assert_eq!(walked, Ok(()));
         // Waiting in the kernel, several frames down from the thread start.
         assert!(frames.len() >= 3, "{frames:?}");
         assert!(start_of(thread) != 0);
