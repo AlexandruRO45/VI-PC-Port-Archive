@@ -3045,9 +3045,12 @@ mod tests {
         reading_named(&named)
     }
 
+    /// A read's (kind, root type, table offset, user data, slot).
+    type Read = (u8, u8, u32, u8, u8);
+
     /// As [`reading`], with each read's (kind, root type, table offset,
     /// user data, slot) stated in full.
-    fn reading_named(reads: &[(u8, u8, u32, u8, u8)]) -> Result<Vec<NativeProgram>, ShaderError> {
+    fn reading_named(reads: &[Read]) -> Result<Vec<NativeProgram>, ShaderError> {
         let mut blob = fssm(&[(HwStage::Ps, &PS_CODE)]);
         let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Ps)).unwrap() as usize;
         let tables = (blob.len() - FSSM_HEADER) as u64;
@@ -3204,7 +3207,7 @@ mod tests {
         // The reads breaking each rule, in the order the rules are checked.
         // Each row below holds the reads breaking its rule and every later
         // one, the first-checked rule's read listed last.
-        let rules: [(&[(u8, u8, u32, u8, u8)], &str); 7] = [
+        let rules: [(&[Read], &str); 7] = [
             (&[(4, table, 0, 4, 2)], "used descriptor of unknown kind"),
             (
                 &[(srv, unknown, 0, 4, 2)],
