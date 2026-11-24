@@ -776,6 +776,14 @@ pub(crate) mod host;
 mod dump;
 #[cfg(windows)]
 mod library;
+mod poison;
+
+/// The key a poison list is written for (this executable's own hash), for the
+/// prober that writes one.
+pub fn poison_key() -> Option<String> {
+    poison::build_key()
+}
+
 #[cfg(windows)]
 mod make;
 /// `victory precompile`: a pipeline library built from a dump instead of a

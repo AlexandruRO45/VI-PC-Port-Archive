@@ -6,6 +6,7 @@
 mod census;
 mod inspect;
 #[cfg(windows)]
+mod poison;
 mod precompile;
 mod run;
 mod session;
@@ -119,6 +120,22 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Find the modules this build's driver compiler faults on, by creating each
+    /// one in a child process, and write the list the runtime refuses them by.
+    Poison {
+        /// A pipeline dump: one line per host pipeline, as the title wrote it.
+        dump: PathBuf,
+        /// Where the `<hash>.<stage>.cdxil` containers are (default: the dump's
+        /// directory).
+        #[arg(long)]
+        shaders: Option<PathBuf>,
+        /// The list to write (default: the cache's `poisoned-modules.txt`).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Probe only these modules: `stage hash` per line.
+        #[arg(long)]
+        modules: Option<PathBuf>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -196,6 +213,22 @@ fn main() -> Result<()> {
                 victory_shader::emit::set_host_max_wave(n);
             }
             translate::run(paths, validate, pipelines, list, jobs)
+        }
+        Command::Poison {
+            dump,
+            shaders,
+            out,
+            modules,
+        } => {
+            #[cfg(windows)]
+            {
+                poison::run(dump, shaders, out, modules)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (dump, shaders, out, modules);
+                anyhow::bail!("poison needs a Windows host")
+            }
         }
         Command::Precompile {
             dump,
