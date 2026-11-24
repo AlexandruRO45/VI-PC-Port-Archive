@@ -10,7 +10,8 @@
 //!    allocates its static TLS and registers its unwind tables, but runs
 //!    none of its code and resolves none of its imports;
 //! 2. load that copy as a real module (debuggers, profilers, crash dumps
-//!    and stack walks all see it); this step is Windows-only;
+//!    and stack walks all see it); on Linux, [`linux::image`] maps the
+//!    original image itself instead, and steps 1 and 2 are one;
 //! 3. map the DLLs the title ships beside it the same way
 //!    (`load_title_dlls`);
 //! 4. bind every import ourselves through an [`ImportResolver`], our
@@ -31,7 +32,7 @@ pub mod resolve;
 mod stacks;
 #[cfg(windows)]
 mod threads;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 mod thunks;
 #[cfg(windows)]
 mod tls;
@@ -50,7 +51,14 @@ pub use resolve::{ImportResolver, Provenance, Resolution};
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
 #[cfg(windows)]
 pub use threads::disable_thread_calls;
-#[cfg(windows)]
+#[cfg(target_os = "linux")]
+pub use linux::image::{
+    BindReport, LoadedImage, MissingImport, WithTitleDlls, load, load_file, load_title_dll,
+    load_title_dlls,
+};
+#[cfg(target_os = "linux")]
+pub use linux::thread::disable_thread_calls;
+#[cfg(any(windows, target_os = "linux"))]
 pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
 #[cfg(windows)]
 pub use windows::{

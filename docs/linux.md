@@ -78,7 +78,7 @@ calling convention; check before you bind.
 |------|-------|
 | Workspace builds and tests on Linux | done |
 | Title-facing ABI is `win64` | done |
-| PE mapper, TEB, guest threads, TLS, entry | not started |
+| PE mapper, TEB, guest threads, TLS, entry | done; `run --execute` stops in `vcruntime140`'s `DllMain` on kernel32 |
 | SEH, signals, unwinding | not started |
 | kernel32/ntdll: handles, sync, threads, memory, heap, time, system | not started |
 | UCRT | not started |
