@@ -4,7 +4,7 @@
 //! `PRELUDE_MEM`). Accesses of disabled lanes are real branches.
 
 use super::lower::{err, Dst, LResult, Lw, VAR_VGPR};
-use super::module::{BinOp, Pred, RmwOp, Value};
+use super::module::{BinOp, Block, Pred, RmwOp, Value};
 use super::ops::AtomicOp;
 use super::shader::RawUav;
 use crate::gpu::rdna2::{self, Decoded};
@@ -115,56 +115,58 @@ enum At {
 
 impl Lw {
     /// Runs `f` on the memory window the last `window` selected (`mem`, `mem1`.. at u2..):
-    /// a switch over the windows when the program may address several, as the HLSL kernel's
-    /// `xcl_m*` accessors; returns `f`'s value (i32 or i64).
-    fn with_mem(&mut self, f: &mut dyn FnMut(&mut Lw, RawUav) -> Option<Value>) -> Option<Value> {
+    /// a `switch` over the windows when the program may address several; `f` must return the
+    /// same number (and types) of values from every arm and must not write SSA registers.
+    fn with_mem_n(&mut self, f: &mut dyn FnMut(&mut Lw, RawUav) -> Vec<Value>) -> Vec<Value> {
         if self.mems.len() <= 1 {
             let m = self.mems[0];
             return f(self, m);
         }
         let w = self.rd(super::lower::VAR_WIN);
-        let (tl, th) = (self.tmp_var(), self.tmp_var());
-        let z = self.c(0);
-        self.wr(tl, z);
-        self.wr(th, z);
-        let mut kind = 0u8; // 0 none, 1 i32, 2 i64
+        if let Some(c) = self.s.m.const_u64(w) {
+            let k = if (1..self.mems.len() as u64).contains(&c) { c as usize } else { 0 };
+            let m = self.mems[k];
+            return f(self, m);
+        }
+        let from = self.cur();
         let mems = self.mems.clone();
-        for (k, &m) in mems.iter().enumerate() {
-            // window 0 is the default (`switch` default: any value but 1..)
-            let is = if k == 0 {
-                let mut any = self.b(false);
-                for j in 1..mems.len() as u32 {
-                    let e = self.cmpc(Pred::Eq, w, j);
-                    any = self.lor(any, e);
-                }
-                self.lnot(any)
-            } else {
-                self.cmpc(Pred::Eq, w, k as u32)
-            };
-            let _ = self.guarded(is, &mut |lw| {
-                if let Some(v) = f(lw, m) {
-                    let t = lw.s.m.type_of(v);
-                    if t == lw.s.m.i64() {
-                        let (l, h) = lw.unpack64(v);
-                        lw.wr(tl, l);
-                        lw.wr(th, h);
-                        kind = 2;
-                    } else {
-                        lw.wr(tl, v);
-                        kind = 1;
-                    }
-                }
-                Ok(())
-            });
+        let arms: Vec<Block> = (0..mems.len()).map(|_| self.block(Some(1))).collect();
+        let join = self.block(None);
+        let cases: Vec<(Value, Block)> = (1..arms.len()).map(|k| (self.c(k as u32), arms[k])).collect();
+        self.s.m.switch(w, arms[0], &cases);
+        for &arm in &arms {
+            self.edge(from, arm);
         }
-        match kind {
-            0 => None,
-            1 => Some(self.rd(tl)),
-            _ => {
-                let (l, h) = (self.rd(tl), self.rd(th));
-                Some(self.pack64(l, h))
+        let mut arm_outs = Vec::with_capacity(mems.len());
+        for (&arm, &m) in arms.iter().zip(&mems) {
+            self.s.m.set_block(arm);
+            self.ssa.begin_log();
+            let vals = f(self, m);
+            let written = self.ssa.end_log();
+            debug_assert!(written.is_empty(), "with_mem_n body must not write SSA registers");
+            let end = self.cur();
+            // Module-only branch to keep Ssa::read walking straight through `from`.
+            self.s.m.br(join);
+            arm_outs.push((end, vals));
+        }
+        self.ssa.seal_region_join(join, from, from, Vec::new());
+        self.s.m.set_block(join);
+        let n = arm_outs[0].1.len();
+        let mut out = Vec::with_capacity(n);
+        for slot in 0..n {
+            let ty = self.s.m.type_of(arm_outs[0].1[slot]);
+            let phi = self.s.m.phi_at(join, ty);
+            for &(end, ref vals) in &arm_outs {
+                self.s.m.add_incoming(phi, vals[slot], end);
             }
+            out.push(phi);
         }
+        out
+    }
+
+    /// Runs `f` on the selected memory window, returning its optional `i32`/`i64` result.
+    fn with_mem(&mut self, f: &mut dyn FnMut(&mut Lw, RawUav) -> Option<Value>) -> Option<Value> {
+        self.with_mem_n(&mut |lw, m| f(lw, m).into_iter().collect()).into_iter().next()
     }
     /// `xcl_w = hi & 3` (several memory windows only).
     pub fn window(&mut self, hi: Value) {
@@ -179,18 +181,52 @@ impl Lw {
     fn mraw_cmpxchg(&mut self, a: Value, c: Value, n: Value) -> Value {
         self.with_mem(&mut |lw, m| Some(lw.s.raw_cmpxchg(m, a, c, n))).expect("cmpxchg value")
     }
+    /// `count` contiguous dwords starting at `(a & ~3)` in chunks of up to 4 via `rawBufferLoad`.
+    pub fn mem_ld_n(&mut self, a: Value, count: u32) -> Vec<Value> {
+        let a = self.andc(a, !3);
+        let mut offs = Vec::with_capacity(count.div_ceil(4) as usize);
+        let mut rem = count;
+        let mut cur = 0u32;
+        while rem > 0 {
+            let chunk = rem.min(4);
+            let at = if cur == 0 { a } else { self.addc(a, 4 * cur) };
+            offs.push((at, (1u8 << chunk) - 1));
+            cur += chunk;
+            rem -= chunk;
+        }
+        self.with_mem_n(&mut |lw, m| {
+            let mut out = Vec::with_capacity(count as usize);
+            for &(at, mask) in &offs {
+                out.extend(lw.s.raw_load(m, at, mask));
+            }
+            out
+        })
+    }
     /// `mem.Load(a & ~3)`
     pub fn mem_ld(&mut self, a: Value) -> Value {
+        self.mem_ld_n(a, 1)[0]
+    }
+    /// Store contiguous dwords starting at `(a & ~3)` in chunks of up to 4 via `rawBufferStore`.
+    pub fn mem_st_n(&mut self, a: Value, vals: &[Value]) {
         let a = self.andc(a, !3);
-        self.with_mem(&mut |lw, m| Some(lw.s.raw_load(m, a, 1)[0])).expect("load value")
+        let mut offs = Vec::with_capacity(vals.len().div_ceil(4));
+        let mut cur = 0usize;
+        while cur < vals.len() {
+            let end = (cur + 4).min(vals.len());
+            let at = if cur == 0 { a } else { self.addc(a, 4 * cur as u32) };
+            offs.push((at, cur, end));
+            cur = end;
+        }
+        self.with_mem_n(&mut |lw, m| {
+            for &(at, start, end) in &offs {
+                lw.s.raw_store(m, at, &vals[start..end]);
+            }
+            Vec::new()
+        });
     }
     /// `mem.Store(a & ~3, v)`
     pub fn mem_st(&mut self, a: Value, v: Value) {
-        let a = self.andc(a, !3);
-        self.with_mem(&mut |lw, m| {
-            lw.s.raw_store(m, a, &[v]);
-            None
-        });
+        self.mem_st_n(a, &[v]);
     }
 
     /// `ld_raw`: four dwords from an unaligned byte address.
@@ -198,11 +234,7 @@ impl Lw {
         let b = self.andc(a, !3);
         let s = self.andc(a, 3);
         let s = self.shlc(s, 3);
-        let mut w = Vec::new();
-        for k in 0..5 {
-            let at = self.addc(b, 4 * k);
-            w.push(self.mem_ld(at));
-        }
+        let w = self.mem_ld_n(b, 5);
         let k32 = self.c(32);
         let inv = self.sub(k32, s);
         let inv = self.andc(inv, 31);
@@ -667,12 +699,19 @@ impl Lw {
             let sz = self.cmpc(Pred::Eq, st, 0);
             let lim = self.mul(d2, st);
             let lim = self.sel(sz, d2, lim);
+            let z = self.c(0);
+            let mut oks = Vec::with_capacity(count as usize);
+            let mut ats = Vec::with_capacity(count as usize);
             for i in 0..count {
                 let o = self.addc(off, 4 * i);
                 let ok = self.cmp(Pred::ULt, o, lim);
-                let a = self.add(d0, o);
-                let v = self.mem_ld(a);
-                let z = self.c(0);
+                let sum = self.add(d0, o);
+                let a = self.andc(sum, !3);
+                oks.push(ok);
+                ats.push(self.sel(ok, a, z));
+            }
+            let loaded = self.with_mem_n(&mut |lw, m| ats.iter().map(|&at| lw.s.raw_load(m, at, 1)[0]).collect());
+            for (v, ok) in loaded.into_iter().zip(oks) {
                 vals.push(self.sel(ok, v, z));
             }
         } else {
@@ -683,10 +722,7 @@ impl Lw {
             let k = self.c(imm);
             let a = self.add(b, k);
             let a = self.add(a, soff);
-            for i in 0..count {
-                let at = self.addc(a, 4 * i);
-                vals.push(self.mem_ld(at));
-            }
+            vals = self.mem_ld_n(a, count);
         }
         let coherent = ["GLC", "DLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
         if self.split && coherent {
@@ -804,12 +840,18 @@ impl Lw {
                     in_range(self, b)
                 }).collect();
                 self.guarded(act, &mut |lw| {
-                    for i in 0..count {
-                        let at = lw.addc(a, 4 * i as u32);
-                        let v = lw.mem_ld(at);
-                        let z = lw.c(0);
-                        let v = lw.sel(oks[i as usize], v, z);
-                        lw.vset(vdata + i, v);
+                    let z = lw.c(0);
+                    let ats: Vec<Value> = (0..count)
+                        .map(|i| {
+                            let at = if i == 0 { a } else { lw.addc(a, 4 * i as u32) };
+                            let at = lw.andc(at, !3);
+                            lw.sel(oks[i as usize], at, z)
+                        })
+                        .collect();
+                    let loaded = lw.with_mem_n(&mut |lw, m| ats.iter().map(|&at| lw.s.raw_load(m, at, 1)[0]).collect());
+                    for (i, v) in loaded.into_iter().enumerate() {
+                        let v = lw.sel(oks[i], v, z);
+                        lw.vset(vdata + i as u64, v);
                     }
                     Ok(())
                 })
@@ -820,17 +862,25 @@ impl Lw {
                     let b = self.c(4 * i as u32 + 4);
                     in_range(self, b)
                 }).collect();
-                self.guarded(act, &mut |lw| {
-                    for i in 0..count as usize {
-                        let at = lw.addc(a, 4 * i as u32);
-                        let v = vals[i];
-                        lw.guarded(oks[i], &mut |lw| {
-                            lw.mem_st(at, v);
-                            Ok(())
-                        })?;
-                    }
-                    Ok(())
-                })
+                if count == 1 {
+                    let c = self.land(act, oks[0]);
+                    self.guarded(c, &mut |lw| {
+                        lw.mem_st(a, vals[0]);
+                        Ok(())
+                    })
+                } else {
+                    self.guarded(act, &mut |lw| {
+                        for i in 0..count as usize {
+                            let at = lw.addc(a, 4 * i as u32);
+                            let v = vals[i];
+                            lw.guarded(oks[i], &mut |lw| {
+                                lw.mem_st(at, v);
+                                Ok(())
+                            })?;
+                        }
+                        Ok(())
+                    })
+                }
             }
             BufKind::FormatLoad => {
                 let fmt = if d.enc.name == "ENC_MTBUF" {
@@ -1345,19 +1395,14 @@ impl Lw {
         if store {
             let vals: Vec<Value> = (0..count).map(|i| self.vreg(Self::fv(d, "DATA") + i)).collect();
             self.guarded(act, &mut |lw| {
-                for (i, &v) in vals.iter().enumerate() {
-                    let at = lw.addc(a, 4 * i as u32);
-                    lw.mem_st(at, v);
-                }
+                lw.mem_st_n(a, &vals);
                 Ok(())
             })
         } else {
             let vd = Self::fv(d, "VDST");
             self.guarded(act, &mut |lw| {
-                for i in 0..count {
-                    let at = lw.addc(a, 4 * i as u32);
-                    let v = lw.mem_ld(at);
-                    lw.vset(vd + i, v);
+                for (i, v) in lw.mem_ld_n(a, count as u32).into_iter().enumerate() {
+                    lw.vset(vd + i as u64, v);
                 }
                 Ok(())
             })

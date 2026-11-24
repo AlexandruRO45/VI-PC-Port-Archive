@@ -177,3 +177,153 @@ fn blocks_are_written_in_reverse_post_order() {
     let want: Vec<u32> = (0..64).map(|l| ((l as u32) << 2) + 7 + sgpr[l]).collect();
     assert_eq!(&r.raw[..64], &want[..]);
 }
+
+/// Multi-window accesses lower through one `switch` per instruction (not four diamond
+/// branches) and contiguous multi-dword SMEM / FLAT / `ld_raw` accesses vectorize into
+/// 4-wide `rawBufferLoad` / `rawBufferStore` ops.
+#[test]
+fn multi_window_accesses_emit_one_switch_and_wide_raw_ops() {
+    if crate::gpu::recomp::dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let enc = |n: &'static str, e: &'static str, f: &[(&str, u64)]| crate::gpu::rdna2::encode(n, e, f, None).unwrap();
+    let mut code = Vec::new();
+    code.extend(enc("S_LOAD_DWORDX8", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 1), ("OFFSET", 0), ("SOFFSET", 125)]));
+    code.extend(enc("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)]));
+    code.extend(enc("GLOBAL_LOAD_DWORDX4", "ENC_FLAT_GLBL", &[("VDST", 4), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0)]));
+    code.extend(enc("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 2), ("DATA", 4), ("SADDR", 0x7D), ("OFFSET", 0)]));
+    code.extend(enc("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 8), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)]));
+    code.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+
+    let dxil = super::kernel::translate(
+        &code,
+        super::kernel::KernelOptions { wave64: true, split: false, mem_windows: 4, sampler_base: 0 },
+    )
+    .expect("translate");
+    validate::validate(&dxil).expect("valid DXIL");
+    let dis = validate::disassemble(&dxil).expect("disassembly");
+    assert_eq!(dis.matches("switch i32").count(), 5, "one switch per multi-dword instruction:\n{dis}");
+    assert!(dis.contains("@dx.op.rawBufferLoad.i32") && dis.contains("i8 15"), "expected 4-wide rawBufferLoad:\n{dis}");
+    assert!(dis.contains("@dx.op.rawBufferStore.i32") && dis.contains("i8 15"), "expected 4-wide rawBufferStore:\n{dis}");
+}
+
+/// Multi-window vectorized SMEM, MUBUF, `ld_raw`, GLOBAL load/store, and 64-bit atomic
+/// (merging `i64` directly through `switch` phis) execute accurately across windows on GPU.
+#[test]
+fn multi_window_vector_loads_stores_and_atomics_run_on_the_gpu() {
+    if crate::gpu::recomp::dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let split = match (runner::wave64_supported(), runner::wave32_supported()) {
+        (Ok(true), _) => false,
+        (_, Ok(true)) => true,
+        (Err(e), _) => return runner::skip_test(&e),
+        _ => return runner::skip_test("neither wave64 nor wave32 support"),
+    };
+    let Some(arena) = crate::gpu::uma::Uma::with_windows(2, 1 << 20) else {
+        return runner::skip_test("no UMA arena");
+    };
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    assert_eq!(w1 - w0, 1 << 32);
+    let hi = |a: u64| (a >> 32) as u32;
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+
+    for i in 0..8u64 {
+        *word(w1 + 0x1000 + 4 * i) = 0x1000_0000 + i as u32;
+    }
+    for i in 0..4u64 {
+        *word(w1 + 0x2000 + 4 * i) = 0x2000_0000 + i as u32;
+    }
+    for i in 0..70u64 {
+        *word(w1 + 0x2100 + 4 * i) = 0x3000_0000 + i as u32;
+    }
+    // 5 dwords in w1 + 0x3000 for unaligned (+1 byte) BUFFER_LOAD_FORMAT_XYZW (32_32_32_32_UINT)
+    for i in 0..5u64 {
+        *word(w1 + 0x3000 + 4 * i) = u32::from_le_bytes([
+            (0x10 + 4 * i) as u8,
+            (0x11 + 4 * i) as u8,
+            (0x12 + 4 * i) as u8,
+            (0x13 + 4 * i) as u8,
+        ]);
+    }
+    for l in 0..64u64 {
+        for k in 0..4u64 {
+            *word(w1 + 0x4000 + 16 * l + 4 * k) = 0x4000_0000 + (4 * l + k) as u32;
+        }
+    }
+
+    let enc = |n: &'static str, e: &'static str, f: &[(&str, u64)]| crate::gpu::rdna2::encode(n, e, f, None).unwrap();
+    let mut code = Vec::new();
+    code.extend(enc("S_LOAD_DWORDX8", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 1), ("OFFSET", 0), ("SOFFSET", 125)]));
+    code.extend(enc("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)]));
+    code.extend(enc("BUFFER_LOAD_DWORDX3", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 30), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1)]));
+    code.extend(enc("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 14), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 1)]));
+    code.extend(enc("GLOBAL_LOAD_DWORDX4", "ENC_FLAT_GLBL", &[("VDST", 20), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0)]));
+    code.extend(enc("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 2), ("DATA", 20), ("SADDR", 0x7D), ("OFFSET", 0)]));
+    code.extend(enc("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 4), ("DATA", 20), ("SADDR", 0x7D), ("OFFSET", 0)]));
+    code.extend(enc("GLOBAL_ATOMIC_ADD_X2", "ENC_FLAT_GLBL", &[("VDST", 24), ("ADDR", 6), ("DATA", 8), ("SADDR", 0x7D), ("OFFSET", 0), ("GLC", 1)]));
+    code.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+
+    let dxil = super::kernel::translate(
+        &code,
+        super::kernel::KernelOptions { wave64: true, split, mem_windows: 2, sampler_base: 0 },
+    )
+    .expect("translate");
+
+    let ident = 4 | (5 << 3) | (6 << 6) | (7 << 9);
+    let mut st = runner::KernelState::default();
+    st.sgpr[2..4].copy_from_slice(&[(w1 + 0x1000) as u32, hi(w1)]);
+    st.sgpr[4..8].copy_from_slice(&[(w1 + 0x2000) as u32, hi(w1) & 0xFFFF, 12, 0]);
+    st.sgpr[8..12].copy_from_slice(&[(w1 + 0x2100) as u32, hi(w1) & 0xFFFF, 0x104, 0]);
+    st.sgpr[12..16].copy_from_slice(&[(w1 + 0x3000) as u32, hi(w1) & 0xFFFF, 64, ident | (75 << 12)]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l = l as u64;
+        r[0] = (w1 + 0x4000 + 16 * l) as u32;
+        r[1] = hi(w1);
+        r[2] = (w0 + 0x5000 + 16 * l) as u32;
+        r[3] = hi(w0);
+        r[4] = (w1 + 0x6000 + 16 * l) as u32;
+        r[5] = hi(w1);
+        r[6] = (w1 + 0x7000) as u32;
+        r[7] = hi(w1);
+        r[8] = 1;
+        r[9] = 1;
+        r[30] = 8 * l as u32;
+        r[10] = 0xDEAD;
+        r[11] = 0xDEAD;
+        r[12] = 0xDEAD;
+    }
+
+    let r = match runner::run_in_arena(&dxil, &st, &arena) {
+        Ok(r) => r,
+        Err(e) if e.contains("OpenExistingHeapFromAddress") => return runner::skip_test(&e),
+        Err(e) => panic!("arena run: {e}"),
+    };
+    for i in 0..8 {
+        assert_eq!(r.sgpr[20 + i], 0x1000_0000 + i as u32, "s_load_dwordx8[{i}]");
+    }
+    assert_eq!(r.sgpr[28..32], [0x2000_0000, 0x2000_0001, 0x2000_0002, 0], "s_buffer_load_dwordx4 straddling num_records");
+    for l in 0..64usize {
+        for k in 0..3usize {
+            let off = 8 * l + 4 * k;
+            let want = if off + 4 <= 0x104 { 0x3000_0000 + (off / 4) as u32 } else { 0 };
+            assert_eq!(r.vgpr[l][10 + k], want, "lane {l} buffer_load_dwordx3[{k}]");
+        }
+        for k in 0..4usize {
+            let b0 = 0x10 + 4 * k;
+            let want_fmt = u32::from_le_bytes([(b0 + 1) as u8, (b0 + 2) as u8, (b0 + 3) as u8, (b0 + 4) as u8]);
+            assert_eq!(r.vgpr[l][14 + k], want_fmt, "lane {l} unaligned ld_raw[{k}]");
+            let want_g = 0x4000_0000 + (4 * l + k) as u32;
+            assert_eq!(r.vgpr[l][20 + k], want_g, "lane {l} global_load_dwordx4[{k}]");
+            assert_eq!(*word(w0 + 0x5000 + 16 * l as u64 + 4 * k as u64), want_g, "lane {l} global_store w0[{k}]");
+            assert_eq!(*word(w1 + 0x6000 + 16 * l as u64 + 4 * k as u64), want_g, "lane {l} global_store w1[{k}]");
+        }
+    }
+    let final64 = (*word(w1 + 0x7000) as u64) | ((*word(w1 + 0x7004) as u64) << 32);
+    assert_eq!(final64, 64 * 0x1_0000_0001u64, "global_atomic_add_x2 in window 1");
+    assert_eq!((*word(w0 + 0x7000), *word(w0 + 0x7004)), (0, 0), "window 0 untouched by atomic");
+    let old_sum: u64 = (0..64)
+        .map(|l| (r.vgpr[l][24] as u64) | ((r.vgpr[l][25] as u64) << 32))
+        .sum();
+    assert_eq!(old_sum, (0..64u64).map(|k| k * 0x1_0000_0001u64).sum::<u64>(), "64-bit GLC old values across 64 lanes");
+}
