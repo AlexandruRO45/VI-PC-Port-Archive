@@ -118,15 +118,33 @@ impl HostHeap {
         } else {
             match make(count + MIN_DYNAMIC) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
                 Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
+                    // Multi-tiered fallback for GPUs/drivers with tighter
+                    // shader-visible heap caps (#902).
+                    let mut fallback = None;
+                    for cap in [PORTABLE_VIEWS, 500_000, 250_000, MIN_DYNAMIC] {
+                        if let Ok(heap) = make(cap) {
+                            let static_count = cap.saturating_sub(MIN_DYNAMIC);
+                            let extra = cap - static_count;
+                            tracing::warn!(
+                                error = %e,
+                                count,
+                                cap,
+                                static_count,
+                                extra,
+                                "host view heap capped at {cap}"
+                            );
+                            fallback = Some((heap, static_count, extra));
+                            break;
+                        }
+                    }
+                    match fallback {
+                        Some(pair) => pair,
+                        None => {
+                            tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                            return None;
+                        }
+                    }
                 }
             }
         };
@@ -265,6 +283,30 @@ impl HostHeap {
         taken[first..first + n].fill(true);
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// Emergency fallback when the dynamic descriptor region is exhausted
+    /// mid-frame: clears the dynamic allocation bitmap and hands out slots from
+    /// the start of the dynamic region so draws/dispatches continue instead of
+    /// silently dropping (#902).
+    pub(crate) fn recycle_dynamic(&self, n: u32) -> Option<u32> {
+        if self.sampler || n == 0 || n > self.dynamic {
+            return None;
+        }
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let (next, taken) = &mut *guard;
+        taken.fill(false);
+        taken[..n as usize].fill(true);
+        *next = n % self.dynamic;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                dynamic = self.dynamic,
+                needed = n,
+                "dynamic descriptor heap exhausted; recycling slots"
+            );
+        });
+        Some(self.count)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -420,9 +462,13 @@ impl HostHeap {
         kind: ResourceType,
         dwords: u8,
     ) -> Option<View> {
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
+            // host heap seen so far. Still return the decoded view so callers
+            // can mirror it into a dynamic slot (#902).
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
                 tracing::warn!(
@@ -432,14 +478,11 @@ impl HostHeap {
                     "title slot past the host heap"
                 );
             }
-            return None;
+            return view;
         }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): ensure the slot carries a matching null view.
@@ -516,69 +559,74 @@ pub(crate) fn texture_uav_desc(
 ) -> Option<Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>> {
     let mut desc = match desc {
         Some(words) => Some(uav_desc(words)),
-        None => crate::resource::view_format(resource).and_then(|fmt| {
+        None => {
             // SAFETY: a live texture.
             let d = unsafe { texture.GetDesc() };
-            let format = DXGI_FORMAT(crate::resource::pc_format(fmt) as i32);
-            match d.Dimension {
-                D3D12_RESOURCE_DIMENSION_TEXTURE1D if d.DepthOrArraySize > 1 => {
-                    Some(D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                        Format: format,
-                        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1DARRAY,
-                        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                            Texture1DArray: D3D12_TEX1D_ARRAY_UAV {
-                                MipSlice: 0,
-                                FirstArraySlice: 0,
-                                ArraySize: u32::from(d.DepthOrArraySize),
+            let resolved = crate::resource::view_format(resource)
+                .map(crate::resource::pc_format)
+                .or_else(|| crate::resource::resolve_typeless_view(d.Format.0 as u32, true));
+            resolved.and_then(|fmt| {
+                let format = DXGI_FORMAT(fmt as i32);
+                match d.Dimension {
+                    D3D12_RESOURCE_DIMENSION_TEXTURE1D if d.DepthOrArraySize > 1 => {
+                        Some(D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1DARRAY,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Texture1DArray: D3D12_TEX1D_ARRAY_UAV {
+                                    MipSlice: 0,
+                                    FirstArraySlice: 0,
+                                    ArraySize: u32::from(d.DepthOrArraySize),
+                                },
                             },
-                        },
-                    })
-                }
-                D3D12_RESOURCE_DIMENSION_TEXTURE1D => Some(D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1D,
-                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                        Texture1D: D3D12_TEX1D_UAV { MipSlice: 0 },
-                    },
-                }),
-                D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.DepthOrArraySize > 1 => {
-                    Some(D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        })
+                    }
+                    D3D12_RESOURCE_DIMENSION_TEXTURE1D => Some(D3D12_UNORDERED_ACCESS_VIEW_DESC {
                         Format: format,
-                        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1D,
                         Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                            Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                            Texture1D: D3D12_TEX1D_UAV { MipSlice: 0 },
+                        },
+                    }),
+                    D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.DepthOrArraySize > 1 => {
+                        Some(D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                                    MipSlice: 0,
+                                    FirstArraySlice: 0,
+                                    ArraySize: u32::from(d.DepthOrArraySize),
+                                    PlaneSlice: 0,
+                                },
+                            },
+                        })
+                    }
+                    D3D12_RESOURCE_DIMENSION_TEXTURE2D => Some(D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_UAV {
                                 MipSlice: 0,
-                                FirstArraySlice: 0,
-                                ArraySize: u32::from(d.DepthOrArraySize),
                                 PlaneSlice: 0,
                             },
                         },
-                    })
+                    }),
+                    D3D12_RESOURCE_DIMENSION_TEXTURE3D => Some(D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE3D,
+                        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Texture3D: D3D12_TEX3D_UAV {
+                                MipSlice: 0,
+                                FirstWSlice: 0,
+                                WSize: u32::MAX,
+                            },
+                        },
+                    }),
+                    _ => None,
                 }
-                D3D12_RESOURCE_DIMENSION_TEXTURE2D => Some(D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
-                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                        Texture2D: D3D12_TEX2D_UAV {
-                            MipSlice: 0,
-                            PlaneSlice: 0,
-                        },
-                    },
-                }),
-                D3D12_RESOURCE_DIMENSION_TEXTURE3D => Some(D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D12_UAV_DIMENSION_TEXTURE3D,
-                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                        Texture3D: D3D12_TEX3D_UAV {
-                            MipSlice: 0,
-                            FirstWSlice: 0,
-                            WSize: u32::MAX,
-                        },
-                    },
-                }),
-                _ => None,
-            }
-        }),
+            })
+        }
     };
     if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
         return None;
@@ -786,7 +834,7 @@ fn buffer_uav(
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
-    use crate::resource::{DEPTH_FORMATS, family};
+    use crate::resource::{DEPTH_FORMATS, family, is_typeless, resolve_typeless_view};
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     let allowed = if unordered {
@@ -804,8 +852,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         );
         return false;
     }
-    // Every family has more than one format, its typeless one first.
-    let typeless = family(own) == own && family(own + 1) == own;
+    let typeless = is_typeless(own);
     if let Some(format) = format.as_deref_mut()
         && unordered
         && let Some(&(_, linear)) = crate::resource::SRGB
@@ -815,8 +862,28 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // DSV-only formats (D32_FLOAT_S8X24_UINT, D32_FLOAT, D24_UNORM_S8_UINT,
+    // D16_UNORM) are never valid SRV/UAV formats on D3D12 (#882).
+    if matches!(view, 20 | 40 | 45 | 55) {
+        if let Some(f) = format
+            && let Some(resolved) = resolve_typeless_view(own, unordered)
+        {
+            f.0 = resolved as i32;
+            return true;
+        }
+        return false;
+    }
     if view == 0 {
-        return !typeless;
+        if !typeless {
+            return true;
+        }
+        if let Some(f) = format
+            && let Some(resolved) = resolve_typeless_view(own, unordered)
+        {
+            f.0 = resolved as i32;
+            return true;
+        }
+        return false;
     }
     // Packed 16-bit textures (`B5G6R5_UNORM`, `B5G5R5A1_UNORM`, `B4G4R4A4_UNORM`)
     // that were widened to `R8G8B8A8_UNORM` (`28`) for RTV/UAV compatibility (#797).
@@ -830,12 +897,100 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         once!(view, own, "view format of another family");
         return false;
     }
+    if typeless && is_typeless(view) {
+        // Viewing a typeless texture with a typeless view format triggers
+        // D3D12 device removal; resolve to a concrete format (#876).
+        let Some(resolved) = resolve_typeless_view(own, unordered) else {
+            return false;
+        };
+        let Some(f) = format else {
+            return false;
+        };
+        f.0 = resolved as i32;
+        return true;
+    }
     if let Some(format) = format
         && !typeless
     {
         *format = d.Format;
     }
     true
+}
+
+/// Builds a default SRV description for a typeless host texture when the title
+/// supplied a null `D3D12_SHADER_RESOURCE_VIEW_DESC` (#876, #882).
+fn default_srv_desc(
+    texture: &ID3D12Resource,
+    format: DXGI_FORMAT,
+) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    // SAFETY: a live texture.
+    let d = unsafe { texture.GetDesc() };
+    let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if d.DepthOrArraySize > 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+            desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV {
+                MostDetailedMip: 0,
+                MipLevels: u32::MAX,
+                FirstArraySlice: 0,
+                ArraySize: u32::from(d.DepthOrArraySize),
+                ResourceMinLODClamp: 0.0,
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+            desc.Anonymous.Texture1D = D3D12_TEX1D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: u32::MAX,
+                ResourceMinLODClamp: 0.0,
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.SampleDesc.Count > 1 && d.DepthOrArraySize > 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+            desc.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV {
+                FirstArraySlice: 0,
+                ArraySize: u32::from(d.DepthOrArraySize),
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.SampleDesc.Count > 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+            desc.Anonymous.Texture2DMS = D3D12_TEX2DMS_SRV::default();
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.DepthOrArraySize > 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                MostDetailedMip: 0,
+                MipLevels: u32::MAX,
+                FirstArraySlice: 0,
+                ArraySize: u32::from(d.DepthOrArraySize),
+                PlaneSlice: 0,
+                ResourceMinLODClamp: 0.0,
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: u32::MAX,
+                PlaneSlice: 0,
+                ResourceMinLODClamp: 0.0,
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: u32::MAX,
+                ResourceMinLODClamp: 0.0,
+            };
+        }
+        _ => return None,
+    }
+    Some(desc)
 }
 
 /// Converts a depth/stencil SRV format to its readable host DXGI format and
@@ -916,10 +1071,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
-                let mut desc = desc.as_ref().map(srv_desc);
+                // SAFETY: a live texture.
+                let own = unsafe { texture.GetDesc() }.Format.0 as u32;
+                let mut desc = match desc.as_ref() {
+                    Some(words) => Some(srv_desc(words)),
+                    None if crate::resource::is_typeless(own) => {
+                        let resolved = crate::resource::view_format(resource)
+                            .map(crate::resource::pc_format)
+                            .or_else(|| crate::resource::resolve_typeless_view(own, false))?;
+                        default_srv_desc(texture, DXGI_FORMAT(resolved as i32))
+                    }
+                    None => None,
+                };
                 if let Some(d) = desc.as_mut() {
-                    // SAFETY: a live texture.
-                    let own = unsafe { texture.GetDesc() }.Format.0 as u32;
                     fix_depth_stencil_srv(own, d);
                 }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
@@ -1006,19 +1170,25 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A shader or unordered-access view of a texture the title placed in memory
+/// itself, as a view of the host resource made for that memory (on first use,
+/// #921).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let texture = crate::resource::texture_at(address, resource, *unordered)?;
+    let words: Option<[u32; 10]> = desc[..10].try_into().ok();
+    Some(if *unordered {
+        View::Unordered(texture as usize, 0, words)
+    } else {
+        View::Shader(texture as usize, words)
+    })
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -1336,5 +1506,83 @@ mod tests {
         assert_eq!(stencil.Format.0, 47);
         // SAFETY: `ViewDimension` is `TEXTURE2DARRAY`.
         assert_eq!(unsafe { stencil.Anonymous.Texture2DArray.PlaneSlice }, 1);
+    }
+
+    #[test]
+    fn typeless_resolution_covers_color_depth_and_uav_rules() {
+        use crate::resource::{is_typeless, resolve_typeless_view};
+        assert!(is_typeless(27));
+        assert!(is_typeless(90));
+        assert!(is_typeless(19));
+        assert!(!is_typeless(28));
+        // Color typeless resolves to concrete SRV and UAV formats.
+        assert_eq!(resolve_typeless_view(27, false), Some(28));
+        assert_eq!(resolve_typeless_view(27, true), Some(28));
+        assert_eq!(resolve_typeless_view(90, false), Some(87));
+        assert_eq!(resolve_typeless_view(90, true), Some(87));
+        assert_eq!(resolve_typeless_view(92, false), Some(88));
+        assert_eq!(resolve_typeless_view(92, true), None);
+        // Depth-stencil typeless resolves to readable depth SRVs, never DSV or UAV.
+        assert_eq!(resolve_typeless_view(19, false), Some(21));
+        assert_eq!(resolve_typeless_view(19, true), None);
+        assert_eq!(resolve_typeless_view(44, false), Some(46));
+        assert_eq!(resolve_typeless_view(44, true), None);
+        // R32 / R16 typeless resolve to concrete formats, never DSV 40 / 55.
+        assert_eq!(resolve_typeless_view(39, false), Some(41));
+        assert_eq!(resolve_typeless_view(53, false), Some(56));
+    }
+
+    #[test]
+    fn buffer_views_of_no_elements_are_null() {
+        let Some(host) = host() else { return };
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return;
+        };
+        let mut backing = vec![0u8; 4096];
+        let addr = backing.as_mut_ptr() as u64;
+        // Zero-element SRV and UAV must return None without provoking D3D12
+        // device removal (#912).
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 0,
+                    NumElements: 0,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: 0,
+                    NumElements: 0,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        assert!(buffer_srv(addr, backing.len() as u64, srv, heap.cpu(0)).is_none());
+        assert!(buffer_uav(addr, backing.len() as u64, uav, heap.cpu(1)).is_none());
+        // SAFETY: live device.
+        assert_eq!(unsafe { host.device.GetDeviceRemovedReason() }.0, 0);
+    }
+
+    #[test]
+    fn recycle_dynamic_recovers_exhausted_heap() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let d = heap.dynamic;
+        assert_eq!(heap.dynamic(d), Some(4));
+        assert_eq!(heap.dynamic(1), None);
+        assert_eq!(heap.recycle_dynamic(8), Some(4));
+        assert_eq!(heap.dynamic(4), Some(12));
     }
 }

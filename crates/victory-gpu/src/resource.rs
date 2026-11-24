@@ -276,6 +276,47 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
+/// Whether DXGI format `format` is typeless and therefore cannot be bound
+/// directly to an SRV or UAV on D3D12 without resolving a typed format (#876).
+pub(crate) fn is_typeless(format: u32) -> bool {
+    matches!(
+        format,
+        1 | 5 | 9 | 15 | 19 | 23 | 27 | 33 | 39 | 44 | 48 | 53 | 60 | 70 | 73 | 76 | 79 | 82 | 90 | 92 | 94 | 97
+    )
+}
+
+/// Default concrete DXGI format for viewing a typeless host texture as an SRV
+/// (`unordered = false`) or UAV (`unordered = true`). Never returns a typeless
+/// format or a DSV-only format (`20`, `40`, `45`, `55`), and rejects depth/BC
+/// formats for UAVs (#876, #882).
+pub(crate) fn resolve_typeless_view(typeless: u32, unordered: bool) -> Option<u32> {
+    match typeless {
+        1 => Some(2),                  // R32G32B32A32_FLOAT
+        5 => Some(6),                  // R32G32B32_FLOAT
+        9 => Some(10),                 // R16G16B16A16_FLOAT
+        15 => Some(16),                // R32G32_FLOAT
+        19 if !unordered => Some(21),  // R32_FLOAT_X8X24_TYPELESS
+        23 => Some(24),                // R10G10B10A2_UNORM
+        27 => Some(28),                // R8G8B8A8_UNORM
+        33 => Some(34),                // R16G16_FLOAT
+        39 => Some(41),                // R32_FLOAT
+        44 if !unordered => Some(46),  // R24_UNORM_X8_TYPELESS
+        48 => Some(49),                // R8G8_UNORM
+        53 => Some(56),                // R16_UNORM
+        60 => Some(61),                // R8_UNORM
+        70 if !unordered => Some(71),  // BC1_UNORM
+        73 if !unordered => Some(74),  // BC2_UNORM
+        76 if !unordered => Some(77),  // BC3_UNORM
+        79 if !unordered => Some(80),  // BC4_UNORM
+        82 if !unordered => Some(83),  // BC5_UNORM
+        90 => Some(87),                // B8G8R8A8_UNORM
+        92 if !unordered => Some(88),  // B8G8R8X8_UNORM
+        94 if !unordered => Some(95),  // BC6H_UF16
+        97 if !unordered => Some(98),  // BC7_UNORM
+        _ => None,
+    }
+}
+
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
@@ -1260,17 +1301,34 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
+/// description `desc` (as words), made on first use. When `unordered` is true,
+/// ensures the host texture carries `ALLOW_UNORDERED_ACCESS` and marks it
+/// host-written so UAV outputs are not overwritten by stale CPU staging (#921).
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14], unordered: bool) -> Option<This> {
+    const ALLOW_UAV: u32 = 0x4;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&r) = map.get(&(address, *desc)) {
-        return Some(r as This);
+        let this = r as This;
+        if !unordered {
+            return Some(this);
+        }
+        if let Some(t) = host_resource(this) {
+            // SAFETY: a live host texture.
+            let flags = unsafe { t.GetDesc() }.Flags.0 as u32;
+            if flags & ALLOW_UAV != 0 {
+                crate::texture::host_written(this);
+                return Some(this);
+            }
+        }
     }
     // SAFETY: 56 bytes in the description's layout.
-    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let mut d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
         return None;
+    }
+    if unordered {
+        d.flags |= ALLOW_UAV;
     }
     let mut out = std::ptr::null();
     let made = create_at_address(
@@ -1285,8 +1343,14 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
+    if resource(out).host.is_none() {
+        return None;
+    }
+    if unordered {
+        crate::texture::host_written(out);
+    }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    Some(out)
 }
 
 pub(crate) extern "system" fn create_placed(

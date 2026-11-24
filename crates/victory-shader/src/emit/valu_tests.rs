@@ -1081,3 +1081,49 @@ fn sdwa_word0_unused_sext_sign_extends_16bit_result() {
         );
     });
 }
+
+#[test]
+fn v_mov_and_cndmask_abs_neg_preserve_subnormals_and_snan() {
+    // v_mov_b32_e64 v0, -|v1| (VOP3 opcode 0x181, abs[0]=1, neg[0]=1)
+    let [mut mov_w0, mut mov_w1] = vop3(0x181, 0, vgpr(1), 0, 0);
+    mov_w0 |= 1 << 8; // abs[0]
+    mov_w1 |= 1 << 29; // neg[0]
+    let mov_neg_abs = build_valu_cs(&[mov_w0, mov_w1]);
+
+    // v_cmp_ne_u32_e64 s6, v3, 0; v_cndmask_b32_e64 v0, |v1|, -v2, s6
+    let [cmp_w0, cmp_w1] = vop3(0x0cd, 6, vgpr(3), 0x80, 0);
+    let [mut cnd_w0, mut cnd_w1] = vop3(0x101, 0, vgpr(1), vgpr(2), sgpr(6));
+    cnd_w0 |= 1 << 8; // abs[0] on v1
+    cnd_w1 |= 1 << 30; // neg[1] on v2
+    let cnd_abs_neg = build_valu_cs(&[cmp_w0, cmp_w1, cnd_w0, cnd_w1]);
+
+    let mov_cases: &[([u32; 4], u32)] = &[
+        ([0x0000_0001, 0, 0, 0], 0x8000_0001), // +subnormal -> -subnormal
+        ([0x8000_0001, 0, 0, 0], 0x8000_0001), // -subnormal -> -subnormal
+        ([0x7F80_0001, 0, 0, 0], 0xFF80_0001), // +sNaN -> -sNaN (unquieted)
+        ([0x0000_0000, 0, 0, 0], 0x8000_0000), // +0.0 -> -0.0
+    ];
+    let mov_in: Vec<[u32; 4]> = mov_cases.iter().map(|c| c.0).collect();
+    run_cases(&mov_neg_abs, &mov_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, mov_cases[i].1,
+            "{backend}: v_mov_b32 -|{:#010x}| = {got:#010x}, want {:#010x}",
+            inp[0], mov_cases[i].1,
+        );
+    });
+
+    let cnd_cases: &[([u32; 4], u32)] = &[
+        ([0x8000_0001, 0x0000_0002, 0, 0], 0x0000_0001), // cond=0 -> |v1| = +subnormal
+        ([0x0000_0001, 0x7F80_0001, 1, 0], 0xFF80_0001), // cond=1 -> -v2 = -sNaN
+        ([0xFF80_0001, 0x8000_0001, 0, 0], 0x7F80_0001), // cond=0 -> |-sNaN| = +sNaN
+        ([0x0000_0001, 0x8000_0001, 1, 0], 0x0000_0001), // cond=1 -> --subnormal = +subnormal
+    ];
+    let cnd_in: Vec<[u32; 4]> = cnd_cases.iter().map(|c| c.0).collect();
+    run_cases(&cnd_abs_neg, &cnd_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, cnd_cases[i].1,
+            "{backend}: v_cndmask_b32({:#010x}, {:#010x}, {}) = {got:#010x}, want {:#010x}",
+            inp[0], inp[1], inp[2], cnd_cases[i].1,
+        );
+    });
+}

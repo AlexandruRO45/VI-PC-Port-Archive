@@ -294,8 +294,9 @@ pub fn emit_for(
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,
             // Constant, as DXC declares it (the AMD compiler crashed on a
-            // front face without a mode).
-            (13, _) => 1,
+            // front face without a mode; SV_RenderTargetArrayIndex and
+            // SV_ViewportArrayIndex are likewise constant, #914).
+            (4 | 5 | 13, _) => 1,
             (0 | 6 | 7, 9) => 2,
             (0, _) => 1,
             _ => 0,
@@ -816,5 +817,252 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    #[test]
+    fn pixel_readfirstlane_guards_helper_lanes_and_validates() {
+        // v_mov_b32 v0, 0x3f800000; v_readfirstlane_b32 s0, v0;
+        // v_mov_b32 v0, s0; exp mrt0 v0, v0, v0, v0 done; s_endpgm
+        let words = [
+            0x7E00_02FFu32,
+            0x3F80_0000,
+            0x7E00_0500, // v_readfirstlane_b32 s0, v0
+            0x7E00_0200, // v_mov_b32 v0, s0
+            0xF800_080F, // exp mrt0 en:0xf done
+            0x0000_0000, // v0, v0, v0, v0
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: super::StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = super::container::signature(
+            &[SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            }],
+            false,
+        );
+        let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn image_store_partial_contiguous_dmasks_validate_and_reject_sparse() {
+        use crate::native::{ComputeIo, ResourceType, RootParam, RootType, UsedResource};
+        let emit_store = |dmask: u8, d16: bool| {
+            let store_w0 = 0xF020_0008u32 | (u32::from(dmask) << 8);
+            let store_w1 = 4u32 | (1 << 16) | (u32::from(d16) << 31);
+            let words = [
+                0xF40C_0101u32,
+                0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], 0x0
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0x7E02_0281, // v_mov_b32 v1, 1
+                0x7E04_0282, // v_mov_b32 v2, 2
+                0x7E06_0283, // v_mov_b32 v3, 3
+                0x7E08_0280, // v_mov_b32 v4, 0 (x)
+                0x7E0A_0280, // v_mov_b32 v5, 0 (y)
+                store_w0,
+                store_w1,
+                0xBF81_0000, // s_endpgm
+            ];
+            let native = super::NativeProgram {
+                stage: super::HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 2,
+                    slot: 0,
+                }],
+                used: vec![UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 8,
+                    user_data: 2,
+                    slot: 0,
+                }],
+                io: super::StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let bytes = crate::dxbc::build(&[]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res =
+                crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            super::emit(&c, &native, &p, &st, &io, &res)
+        };
+
+        for (dmask, d16) in [
+            (0x0, false),
+            (0x1, false),
+            (0x3, false),
+            (0x7, false),
+            (0xF, false),
+            (0x1, true),
+            (0x3, true),
+            (0x7, true),
+        ] {
+            let out = emit_store(dmask, d16)
+                .unwrap_or_else(|e| panic!("dmask={dmask:#x} d16={d16}: {e}"));
+            #[cfg(windows)]
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone())
+                    .unwrap_or_else(|e| panic!("dmask={dmask:#x} d16={d16} validation: {e}"));
+            }
+        }
+        assert!(
+            emit_store(0x5, false).is_err(),
+            "sparse dmask 0x5 must be rejected"
+        );
+    }
+
+    #[test]
+    fn vs_rt_and_viewport_array_index_and_shifted_clip_distance_validate() {
+        // v_mov_b32 v0..v4; exp pos0 v0..v0; exp pos1 v1,v1,v2,v1; exp pos2 v3,v3,v3,v3 done; s_endpgm
+        let words = [
+            0x7E00_02FFu32,
+            0x3F80_0000, // v0 = 1.0
+            0x7E02_0280, // v1 = 0
+            0x7E04_02FF,
+            0x0003_0002, // v2 = (vp=3 << 16) | rt=2
+            0x7E06_02FF,
+            0x3F00_0000, // v3 = 0.5 (clip distance)
+            0xF800_00CF, // exp pos0 (target=12) en:0xf
+            0x0000_0000, // v0, v0, v0, v0
+            0xF800_00D4, // exp pos1 (target=13) en:0x4 (z)
+            0x0102_0101, // v1, v1, v2, v1
+            0xF800_08E1, // exp pos2 (target=14) en:0x1 done
+            0x0303_0303, // v3, v3, v3, v3
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Vs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: super::StageIo::Vs {
+                inputs: vec![],
+                outputs: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = super::container::signature(
+            &[
+                SigElement {
+                    name: "SV_Position".into(),
+                    index: 0,
+                    kind: 3,
+                    comp: 9,
+                    interp: 0,
+                    row: Some(0),
+                    col: 0,
+                    cols: 4,
+                    usage: 0xF,
+                    half: false,
+                },
+                SigElement {
+                    name: "SV_RenderTargetArrayIndex".into(),
+                    index: 0,
+                    kind: 4,
+                    comp: 5,
+                    interp: 0,
+                    row: Some(1),
+                    col: 0,
+                    cols: 1,
+                    usage: 1,
+                    half: false,
+                },
+                SigElement {
+                    name: "SV_ViewportArrayIndex".into(),
+                    index: 0,
+                    kind: 5,
+                    comp: 5,
+                    interp: 0,
+                    row: Some(2),
+                    col: 0,
+                    cols: 1,
+                    usage: 1,
+                    half: false,
+                },
+                SigElement {
+                    name: "SV_ClipDistance".into(),
+                    index: 0,
+                    kind: 6,
+                    comp: 9,
+                    interp: 0,
+                    row: Some(3),
+                    col: 0,
+                    cols: 1,
+                    usage: 1,
+                    half: false,
+                },
+            ],
+            false,
+        );
+        let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let host = super::Container::parse(&out.dxil).unwrap();
+        let sfi0 = host.part(super::FourCC::SFI0).unwrap().data;
+        let features = u64::from_le_bytes(sfi0[..8].try_into().unwrap());
+        assert_ne!(
+            features & 0x2000,
+            0,
+            "SFI0 must declare ViewportAndRTArrayIndexFromAnyShaderFeedingRasterizer"
+        );
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
     }
 }

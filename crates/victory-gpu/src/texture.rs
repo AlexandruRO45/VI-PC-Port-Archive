@@ -46,15 +46,19 @@ pub(crate) struct Staging {
     last: Mutex<Last>,
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched) along with the physical-pool write epoch at that hash,
-/// or the write-watch asking it was detiled after, with room to read the
-/// memory into.
+/// What a texture's staging buffer holds: the 128-bit digest of the memory
+/// detiled (memory not watched) along with the physical-pool write epoch at
+/// that digest, or the write-watch asking it was detiled after, with room to
+/// read the memory into.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    digest: Option<[u64; 2]>,
     epoch: u64,
     asked: u64,
+    /// Cached `true` once `GetWriteWatch` failed on committed physical-page
+    /// memory so later submissions skip the global journal lock and kernel
+    /// `GetWriteWatch` call (#916).
+    not_watched: bool,
     read: Vec<u8>,
 }
 
@@ -186,9 +190,14 @@ impl Staging {
     fn refresh_now(&self) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
+        let Some(end) = start.checked_add(size) else {
+            return 0;
+        };
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
+        if !last.not_watched
+            && let Some((now, written)) = crate::watch::writes(start, end, false)
+        {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -203,9 +212,9 @@ impl Staging {
             return size;
         }
         // Fast path: if no physical-page writes or remappings occurred since
-        // this texture was last hashed, its contents cannot have changed.
+        // this texture was last digested, its contents cannot have changed.
         let epoch = crate::watch::physical_epoch();
-        if last.hash.is_some() && last.epoch == epoch {
+        if last.digest.is_some() && last.epoch == epoch {
             return 0;
         }
         // Streamed textures mapped via physical-page section views may be only
@@ -225,14 +234,17 @@ impl Staging {
             );
             return 0;
         }
-        let hash = blake3::hash(&last.read);
+        // Memory is committed and not write-watched (physical-page view): skip
+        // future `GetWriteWatch` kernel calls on this texture (#916).
+        last.not_watched = true;
+        let digest = fast_digest_128(&last.read);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         last.epoch = epoch;
-        if last.hash == Some(hash) {
+        if last.digest == Some(digest) {
             return size;
         }
-        last.hash = Some(hash);
+        last.digest = Some(digest);
         self.detile(&last.read);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -290,13 +302,63 @@ fn footprint_slice_len(
     Some(full.min(avail))
 }
 
+/// Fast non-cryptographic 128-bit digest for change detection on streamed
+/// texture pools (#916): 4-lane unrolled 64-bit mixing runs at memory
+/// bandwidth instead of full cryptographic blake3.
+fn fast_digest_128(data: &[u8]) -> [u64; 2] {
+    const K0: u64 = 0x9E37_79B9_7F4A_7C15;
+    const K1: u64 = 0xBF58_476D_1CE4_E5B9;
+    const K2: u64 = 0x94D0_49BB_1331_11EB;
+    const K3: u64 = 0xD6E8_FEB8_6659_FD93;
+    let mut s0 = K0 ^ (data.len() as u64);
+    let mut s1 = K1;
+    let mut s2 = K2;
+    let mut s3 = K3;
+    let mut chunks = data.chunks_exact(32);
+    for c in &mut chunks {
+        let a = u64::from_le_bytes(c[0..8].try_into().unwrap());
+        let b = u64::from_le_bytes(c[8..16].try_into().unwrap());
+        let x = u64::from_le_bytes(c[16..24].try_into().unwrap());
+        let y = u64::from_le_bytes(c[24..32].try_into().unwrap());
+        s0 = (s0 ^ a).wrapping_mul(K1).rotate_left(27);
+        s1 = (s1 ^ b).wrapping_mul(K2).rotate_left(31);
+        s2 = (s2 ^ x).wrapping_mul(K3).rotate_left(23);
+        s3 = (s3 ^ y).wrapping_mul(K0).rotate_left(29);
+    }
+    let rem = chunks.remainder();
+    let mut tail = rem.chunks_exact(8);
+    for t in &mut tail {
+        let w = u64::from_le_bytes(t.try_into().unwrap());
+        s0 = (s0 ^ w).wrapping_mul(K1).rotate_left(27);
+        std::mem::swap(&mut s0, &mut s1);
+    }
+    let mut last = 0u64;
+    for (i, &b) in tail.remainder().iter().enumerate() {
+        last |= u64::from(b) << (i * 8);
+    }
+    if !tail.remainder().is_empty() {
+        s2 = (s2 ^ last).wrapping_mul(K2).rotate_left(23);
+    }
+    let mix = |mut x: u64| {
+        x = (x ^ (x >> 30)).wrapping_mul(K1);
+        x = (x ^ (x >> 27)).wrapping_mul(K2);
+        x ^ (x >> 31)
+    };
+    let lo = mix(s0 ^ s2.rotate_left(17) ^ (data.len() as u64));
+    let hi = mix(s1 ^ s3.rotate_left(13) ^ lo);
+    [lo, hi]
+}
+
 /// Copies all committed regions of `[at, at + dst.len())` into `dst`, zeroing
 /// uncommitted gaps. Returns `true` if at least one byte was committed.
 fn read_resident(at: *const u8, dst: &mut [u8]) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let base = at as usize;
     let total = dst.len();
-    let end = base + total;
+    let Some(end) = base.checked_add(total) else {
+        dst.fill(0);
+        return false;
+    };
     let mut p = base;
     let mut any = false;
     while p < end {
@@ -335,20 +397,28 @@ fn read_resident(at: *const u8, dst: &mut [u8]) -> bool {
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
-/// unmapped until their pages arrive).
+/// unmapped until their pages arrive). Rejects overflowing spans (#935).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut p = at as usize;
-    let end = p + len;
+    let Some(end) = p.checked_add(len) else {
+        return false;
+    };
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
+        if n == 0 || info.State != MEM_COMMIT || info.RegionSize == 0 {
             return false;
         }
-        p = info.BaseAddress as usize + info.RegionSize;
+        let Some(next) = (info.BaseAddress as usize).checked_add(info.RegionSize) else {
+            return true;
+        };
+        if next <= p {
+            return false;
+        }
+        p = next;
     }
     true
 }
@@ -422,7 +492,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod tests {
-    use super::footprint_slice_len;
+    use super::{committed, fast_digest_128, footprint_slice_len};
 
     #[test]
     fn footprint_slice_is_capped_to_staging_total() {
@@ -432,5 +502,30 @@ mod tests {
         assert_eq!(footprint_slice_len(1000, 512, 256, 4, 1), Some(488));
         // Offset past the buffer end is rejected.
         assert_eq!(footprint_slice_len(784, 800, 256, 4, 1), None);
+    }
+
+    #[test]
+    fn committed_rejects_overflowing_spans() {
+        let buf = [0u8; 64];
+        assert!(committed(buf.as_ptr(), buf.len()));
+        assert!(!committed(usize::MAX as *const u8, 16));
+        assert!(!committed((usize::MAX - 8) as *const u8, 64));
+    }
+
+    #[test]
+    fn fast_digest_128_detects_single_bit_and_length_changes() {
+        let mut a = vec![0x5Au8; 100];
+        let d0 = fast_digest_128(&a);
+        assert_eq!(d0, fast_digest_128(&a));
+        // Flip one bit in the middle and one bit in the tail.
+        a[41] ^= 1;
+        let d1 = fast_digest_128(&a);
+        assert_ne!(d0, d1);
+        a[41] ^= 1;
+        a[99] ^= 0x80;
+        let d2 = fast_digest_128(&a);
+        assert_ne!(d0, d2);
+        // Different length with same prefix must differ.
+        assert_ne!(d0, fast_digest_128(&a[..99]));
     }
 }

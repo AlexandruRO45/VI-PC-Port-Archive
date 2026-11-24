@@ -1631,6 +1631,35 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// A raw 32-bit source with bitwise `abs`/`neg` modifiers on bit 31
+    /// (`& 0x7FFF_FFFF` / `^ 0x8000_0000`), preserving subnormals and sNaN
+    /// payloads for typeless `_b32` instructions (`v_mov_b32`, `v_cndmask_b32`).
+    fn src_bits(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let mut x = match self.src0 {
+            Some(x) if k == 0 => x,
+            _ => {
+                let x = self.operand(inst, &op)?;
+                match Self::sdwa_src(inst, k) {
+                    Some((sel, sext)) => self.select_bits(x, sel, sext),
+                    None => x,
+                }
+            }
+        };
+        if v.abs >> k & 1 != 0 {
+            let mask = self.s.m.i32(0x7FFF_FFFF);
+            x = self.s.m.bin(self.cur, Bin::And, x, mask);
+        }
+        if v.neg >> k & 1 != 0 {
+            let sign = self.s.m.i32(0x8000_0000);
+            x = self.s.m.bin(self.cur, Bin::Xor, x, sign);
+        }
+        Ok(x)
+    }
+
     fn unary(&mut self, op: u32, f: V) -> V {
         self.s.op(
             self.cur,
@@ -2269,6 +2298,22 @@ impl<'a> Lower<'a> {
 
     fn lane_index(&mut self) -> V {
         if self.s.mesh.is_some() {
+            // Mesh shaders cannot declare WaveSize, so on a 32-lane host a
+            // wave64 mesh program runs as two 32-lane waves whose host ballots
+            // carry bits only for lanes 0..31. Numbering lanes by the host
+            // lane lets masks and lane indices agree within each 32-lane half
+            // so world geometry reaches the G-buffer on NVIDIA GPUs (#940).
+            if self.x.native.wave64 && self.x.max_wave_size < 64 {
+                self.s.flags |= flags::WAVE_OPS;
+                return self.s.op(
+                    self.cur,
+                    "waveGetLaneIndex",
+                    Attr::ReadOnly,
+                    self.s.t.i32,
+                    111,
+                    &[],
+                );
+            }
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.
             let f = self.mesh_thread();
@@ -3947,14 +3992,28 @@ impl<'a> Lower<'a> {
                         base,
                         local,
                     )?;
-                    self.s.op(
+                    self.s.flags |= flags::WAVE_OPS;
+                    let first = self.s.op(
                         self.cur,
                         "waveReadLaneFirst.i32",
                         Attr::ReadNone,
                         self.s.t.i32,
                         118,
                         &[x],
-                    )
+                    );
+                    if self.s.pixel {
+                        let helper = self.s.op(
+                            self.cur,
+                            "isHelperLane.i1",
+                            Attr::ReadOnly,
+                            self.s.t.i1,
+                            221,
+                            &[],
+                        );
+                        self.s.m.select(self.cur, helper, x, first)
+                    } else {
+                        first
+                    }
                 }
                 "v_readlane_b32" => {
                     let x = self.rel_operand(
@@ -4757,11 +4816,13 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_mov_b32" => {
-                if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
-                    let a = f(self, 0)?;
-                    return float(self, a);
+                // Typeless `_b32` abs/neg flip bit 31 without flushing
+                // subnormals or quieting sNaNs (#883).
+                let a = self.src_bits(inst, 0)?;
+                if v.clamp || v.omod != 0 {
+                    let af = self.as_float(a);
+                    return float(self, af);
                 }
-                let a = s(self, 0)?;
                 int(self, a)
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
@@ -5029,13 +5090,13 @@ impl<'a> Lower<'a> {
                     .and_then(|m| self.x.st.masks.get(&m).copied())
                     .ok_or("a select on an untracked mask")?;
                 let cond = self.boolean(m, c)?;
-                if v.abs != 0 || v.neg != 0 {
-                    let (a, bb) = (f(self, 0)?, f(self, 1)?);
-                    let r = self.s.m.select(c, cond, bb, a);
-                    return float(self, r);
-                }
-                let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                // Typeless `_b32` abs/neg operate bitwise on bit 31 (#883).
+                let (a, bb) = (self.src_bits(inst, 0)?, self.src_bits(inst, 1)?);
                 let r = self.s.m.select(c, cond, bb, a);
+                if v.clamp || v.omod != 0 {
+                    let rf = self.as_float(r);
+                    return float(self, rf);
+                }
                 int(self, r)
             }
             "v_add_co_u32" | "v_sub_co_u32" | "v_subrev_co_u32" | "v_add_co_ci_u32"
@@ -5166,6 +5227,19 @@ impl<'a> Lower<'a> {
                         118,
                         &[a],
                     )
+                };
+                // On the host, wave ops skip pixel helper lanes (DXIL without
+                // WaveOpsIncludeHelperLanes), so a helper lane left alone in a
+                // readfirstlane waterfall loop would never match and would spin
+                // to LOOP_LIMIT (DEVICE_HUNG, #908). Return the helper lane's
+                // own value so it exits on the first pass.
+                let r = if self.s.pixel {
+                    let helper = self
+                        .s
+                        .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+                    self.s.m.select(c, helper, a, r)
+                } else {
+                    r
                 };
                 int(self, r)
             }
@@ -6572,8 +6646,13 @@ impl<'a> Lower<'a> {
         if *a16 && name.ends_with("_o") && name.starts_with("image_sample") {
             return Err("a 16-bit image sample with texel offset");
         }
-        // A load or sample with no channel enabled returns the first.
-        let dmask = if *dmask == 0 { &1 } else { dmask };
+        // A load or sample with no channel enabled returns the first; a store
+        // with dmask == 0 writes nothing (#920).
+        let dmask = if *dmask == 0 && !name.starts_with("image_store") {
+            &1
+        } else {
+            dmask
+        };
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
@@ -6782,11 +6861,20 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
+            if *dmask == 0 {
+                return Ok(());
             }
+            // Contiguous low-channel masks (0x1, 0x3, 0x7, 0xF) lower to
+            // DXIL typed UAV stores (which require mask 0xF and four defined
+            // values; extra channels are zero-padded and discarded by 1/2/3-
+            // channel UAV formats, #920). Sparse masks are still rejected.
+            let channels = match *dmask {
+                0x1 => 1u8,
+                0x3 => 2,
+                0x7 => 3,
+                0xF => 4,
+                _ => return Err("an image store of some channels"),
+            };
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -6795,8 +6883,13 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
-            let mut vals = Vec::new();
+            let zero_f = self.s.m.f32(0);
+            let mut vals = Vec::with_capacity(4);
             for k in 0..4u8 {
+                if k >= channels {
+                    vals.push(zero_f);
+                    continue;
+                }
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
@@ -7793,9 +7886,17 @@ impl<'a> Lower<'a> {
             Usage::Other(0) if mesh => self.unnamed_row(),
             _ => Some(row),
         };
-        // (output element, channel) per exported channel; per-primitive
-        // outputs are elements of `prims`.
-        let mut stores = Vec::new();
+        #[derive(Clone, Copy)]
+        enum ExportTransform {
+            None,
+            Half(bool),
+            Low16,
+            High16,
+        }
+        // (output element, channel, value, transform) per exported channel;
+        // per-primitive outputs are elements of `prims`.
+        let mut stores: Vec<(usize, u8, Value, ExportTransform)> = Vec::new();
+        let mut mark_rt_vp = false;
         let primitive = matches!(e.target, Target::PrimitiveParam { .. });
         let outputs = if primitive {
             &self.s.prims
@@ -7803,6 +7904,7 @@ impl<'a> Lower<'a> {
             &self.s.outputs
         };
         let by_kind = |kind: u8| outputs.iter().position(|o| o.kind == kind);
+        let has_misc = outputs.iter().any(|o| matches!(o.kind, 4 | 5));
         // 16-bit vertex outputs: the halves each dword carries, as (output
         // element, channel, high half) per channel.
         let halves = match e.target {
@@ -7830,7 +7932,7 @@ impl<'a> Lower<'a> {
                     });
                     if let Some(id) = found {
                         let col = src.expect("found").1 - outputs[id].col;
-                        stores.push((id, col, value, Some(high)));
+                        stores.push((id, col, value, ExportTransform::Half(high)));
                     }
                 }
             }
@@ -7869,13 +7971,24 @@ impl<'a> Lower<'a> {
                         .map(|id| (id, ch - outputs[id].col))
                 }
                 Target::Null | Target::Unread => None,
-                Target::Position(n @ 1..=2) => {
-                    // shortcut: without the misc vector (point size, render
-                    // target or viewport index) pos1 and pos2 carry the clip
-                    // then cull distances, in semantic order.
-                    if outputs.iter().any(|o| matches!(o.kind, 4 | 5)) {
-                        return Err("render-target or viewport index exports");
+                Target::Position(1) if has_misc => {
+                    // RDNA2 misc vector (`exp pos1`): `z` packs
+                    // `SV_RenderTargetArrayIndex` (bits 0..16) and
+                    // `SV_ViewportArrayIndex` (bits 16..32) (#914).
+                    if ch == 2 {
+                        if let Some(id) = by_kind(4) {
+                            stores.push((id, 0, value, ExportTransform::Low16));
+                            mark_rt_vp = true;
+                        }
+                        if let Some(id) = by_kind(5) {
+                            stores.push((id, 0, value, ExportTransform::High16));
+                            mark_rt_vp = true;
+                        }
                     }
+                    None
+                }
+                Target::Position(n) if (!has_misc && (1..=2).contains(&n)) || (has_misc && (2..=3).contains(&n)) => {
+                    let base = if has_misc { 2 } else { 1 };
                     let mut dists: Vec<usize> = (0..outputs.len())
                         .filter(|&i| matches!(outputs[i].kind, 6 | 7))
                         .collect();
@@ -7886,15 +7999,18 @@ impl<'a> Lower<'a> {
                         .collect();
                     // Channels past the distances the signature declares are
                     // ones the clipper does not enable (`PA_CL_VS_OUT_CNTL`).
-                    let k = usize::from(n - 1) * 4 + usize::from(ch);
+                    let k = usize::from(n - base) * 4 + usize::from(ch);
                     flat.get(k).copied()
                 }
                 Target::Position(_) => return Err("clip, cull or point-size exports"),
                 Target::Primitive => return Err("a primitive export"),
             };
             if let Some((id, col)) = found {
-                stores.push((id, col, value, None));
+                stores.push((id, col, value, ExportTransform::None));
             }
+        }
+        if mark_rt_vp && !mesh {
+            self.s.flags |= flags::VIEWPORT_RT_INDEX;
         }
         fn elements<'l>(l: &'l mut Lower, primitive: bool) -> &'l mut Vec<SigElement> {
             if primitive {
@@ -7905,7 +8021,7 @@ impl<'a> Lower<'a> {
         }
         if stores
             .iter()
-            .any(|s| s.3.is_none() && elements(self, primitive)[s.0].half)
+            .any(|s| matches!(s.3, ExportTransform::None) && elements(self, primitive)[s.0].half)
         {
             return Err("a 16-bit output the stage data does not mark");
         }
@@ -7920,25 +8036,37 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
-        for (id, col, value, half) in stores {
+        for (id, col, value, transform) in stores {
             let mut x = self.i32_of(value)?;
-            if let Some(high) = half {
-                // An f16 half, declared a 32-bit float on the host.
-                let c = self.cur;
-                if high {
-                    let k16 = self.s.m.i32(16);
-                    x = self.s.m.bin(c, Bin::LShr, x, k16);
+            let is_half = matches!(transform, ExportTransform::Half(_));
+            match transform {
+                ExportTransform::Half(high) => {
+                    // An f16 half, declared a 32-bit float on the host.
+                    let c = self.cur;
+                    if high {
+                        let k16 = self.s.m.i32(16);
+                        x = self.s.m.bin(c, Bin::LShr, x, k16);
+                    }
+                    let f32t = self.s.t.f32;
+                    let f = self
+                        .s
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                    x = self.as_int(f);
                 }
-                let f32t = self.s.t.f32;
-                let f = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                x = self.as_int(f);
+                ExportTransform::Low16 => {
+                    let mask = self.s.m.i32(0xFFFF);
+                    x = self.s.m.bin(self.cur, Bin::And, x, mask);
+                }
+                ExportTransform::High16 => {
+                    let k16 = self.s.m.i32(16);
+                    x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
+                }
+                ExportTransform::None => {}
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
             let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
+                9 if is_half => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
                         Some(&f) => f,

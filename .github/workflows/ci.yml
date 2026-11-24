@@ -25,9 +25,33 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        shell: bash
+        run: |
+          set +e
+          cargo clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee clippy.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            grep -E "^(error|warning)" clippy.log | head -n 9 | while IFS= read -r line; do echo "::error::$line"; done
+            exit "$rc"
+          fi
       - name: Clippy, diagnostics build
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        shell: bash
+        run: |
+          set +e
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings 2>&1 | tee clippy-diag.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            grep -E "^(error|warning)" clippy-diag.log | head -n 9 | while IFS= read -r line; do echo "::error::$line"; done
+            exit "$rc"
+          fi
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
-        run: cargo test --workspace --locked
+        shell: bash
+        run: |
+          set +e
+          cargo test --workspace --locked 2>&1 | tee test.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            awk '/^failures:/,/^test result: FAILED/' test.log | grep -v '^$' | head -n 9 | while IFS= read -r line; do echo "::error::$line"; done
+            exit "$rc"
+          fi

@@ -65,7 +65,24 @@ impl Cache {
             .open(&tmp)?;
         let written = file.write_all(&output);
         drop(file);
-        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
+        let published = written.and_then(|()| {
+            match std::fs::rename(&tmp, &path) {
+                Ok(()) => Ok(()),
+                // On Windows, concurrent publication of the same
+                // content-addressed key races on `rename` when the winning
+                // file already exists or is open for reading (#890).
+                Err(e) if path.is_file() => {
+                    tracing::trace!(
+                        error = %e,
+                        path = %path.display(),
+                        "cache entry published concurrently"
+                    );
+                    let _ = std::fs::remove_file(&tmp);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        });
         if published.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
@@ -155,5 +172,33 @@ mod tests {
     fn refuses_cache_inside_repo() {
         let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("cache");
         assert!(Cache::open(inside).is_err());
+    }
+
+    #[test]
+    fn concurrent_publication_succeeds_without_leaving_temp_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = std::sync::Arc::new(Cache::open(tmp.path().join("cache")).unwrap());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = std::sync::Arc::clone(&cache);
+            handles.push(std::thread::spawn(move || {
+                let conv = Upper {
+                    version: 1,
+                    runs: AtomicUsize::new(0),
+                };
+                let p = cache.get_or_convert(&conv, b"race-payload").unwrap();
+                assert_eq!(std::fs::read(&p).unwrap(), b"RACE-PAYLOAD");
+                p
+            }));
+        }
+        let path = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .next()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
     }
 }

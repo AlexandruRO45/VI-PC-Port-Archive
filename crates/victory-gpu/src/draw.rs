@@ -136,16 +136,24 @@ const BUFFER_UAV: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
 /// copy in upload memory.
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
+/// Maximum reach refreshed for a root SRV binding (32 MiB so mesh/geometry
+/// shaders indexing megabytes past a root SRV do not fault, #951).
+const ROOT_SRV_REACH: u64 = 32 << 20;
+
 fn root_view(
     list: &HostList,
     address: u64,
     kind: RootViewKind,
     uav_buffers: &mut Vec<usize>,
 ) -> Option<u64> {
-    let shadow = crate::shadow::find(address, 1)?;
+    let shadow = match kind {
+        RootViewKind::Srv => crate::shadow::find_wide(address, ROOT_SRV_REACH)?,
+        RootViewKind::Cbv | RootViewKind::Uav => crate::shadow::find(address, 1)?,
+    };
     let len = shadow.left(address).min(match kind {
         RootViewKind::Cbv => 1 << 16,
-        RootViewKind::Srv | RootViewKind::Uav => 1 << 20,
+        RootViewKind::Srv => ROOT_SRV_REACH,
+        RootViewKind::Uav => 1 << 20,
     });
     let gpu = shadow.gpu(address);
     if !matches!(kind, RootViewKind::Cbv) || gpu.is_multiple_of(256) {
@@ -339,11 +347,19 @@ impl State {
         let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
             return 0;
         };
-        let Some(shadow) = crate::shadow::find(*address, 1) else {
+        let is_cbv = stage.root_cbvs.iter().any(|&(s, _)| s == slot);
+        let is_srv = stage.root_srvs.iter().any(|&(s, _)| s == slot);
+        let Some(shadow) = (if is_srv {
+            crate::shadow::find_wide(*address, ROOT_SRV_REACH)
+        } else {
+            crate::shadow::find(*address, 1)
+        }) else {
             return 0;
         };
-        let cap = if stage.root_cbvs.iter().any(|&(s, _)| s == slot) {
+        let cap = if is_cbv {
             1u64 << 16
+        } else if is_srv {
+            ROOT_SRV_REACH
         } else {
             1u64 << 20
         };
@@ -934,6 +950,8 @@ impl State {
             }
         }
         let mut made = Vec::new();
+        let mut reserved: Vec<(&crate::descriptor::host::HostHeap, usize, (u64, u64), u32, u32)> =
+            Vec::new();
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
@@ -974,35 +992,39 @@ impl State {
                 continue;
             }
             let heap_ptr = std::ptr::from_ref(heap) as usize;
-            let Some(first) = host.dynamic(n).or_else(|| {
-                let reclaimed = crate::host::reclaim_dynamic_slots(heap_ptr);
-                if reclaimed > 0 {
-                    tracing::debug!(
-                        reclaimed,
-                        needed = n,
-                        "reclaimed dynamic descriptor slots from executed lists"
-                    );
-                    host.dynamic(n)
-                } else {
-                    None
-                }
-            }) else {
+            let Some(first) = host
+                .dynamic(n)
+                .or_else(|| {
+                    let reclaimed = crate::host::reclaim_dynamic_slots(heap_ptr);
+                    if reclaimed > 0 {
+                        tracing::debug!(
+                            reclaimed,
+                            needed = n,
+                            "reclaimed dynamic descriptor slots from executed lists"
+                        );
+                        host.dynamic(n)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| host.recycle_dynamic(n))
+            else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
-                // view: drop the draw or dispatch instead of faulting (#59).
+                // view: roll back slots reserved by this draw and drop (#59, #911).
                 self.table_failed = true;
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     tracing::warn!(n, "no free dynamic descriptor slots: a table is not made")
                 });
-                continue;
+                break;
             };
             // `first >= host.count() >= base`, so `first - base` never underflows
             // and shifting the shader's base back by `base` lands `base + offset`
             // directly on dynamic slot `first + offset`.
             let table_base = first - base;
             self.fresh_tables.insert(key, table_base);
-            list.record_dynamic(heap_ptr, first, n);
+            reserved.push((host, heap_ptr, key, first, n));
             // The whole range from the first used entry to the last: a shader may
             // index across intermediate entries (descriptor arrays).
             for offset in 0..n {
@@ -1035,6 +1057,17 @@ impl State {
                 }
             }
             made.push((slot, table_base * 32));
+        }
+        if self.table_failed {
+            for (host, _, key, first, n) in reserved {
+                self.fresh_tables.remove(&key);
+                host.release(first, n);
+            }
+            made.clear();
+        } else {
+            for (_, heap_ptr, _, first, n) in reserved {
+                list.record_dynamic(heap_ptr, first, n);
+            }
         }
         made
     }
@@ -1427,6 +1460,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, uav_buffers: &mut Ve
             }
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
+            crate::texture::host_written(*resource as This);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
@@ -1464,12 +1498,21 @@ fn describe(view: Option<&View>) -> String {
             u64::from(d[10]) | u64::from(d[11]) << 32
         ),
         // The first four values, as a colour rectangle's constants are.
-        Some(View::Constant(address, size))
-            if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
-        {
-            // SAFETY: 16 committed bytes of title memory.
-            let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
-            format!("Constant({address:#x}, {size}) {v:?}")
+        // Read via `host::read_into` (kernel-checked) to avoid TOCTOU races
+        // against unmapping/guard pages (#913).
+        Some(View::Constant(address, size)) if *size >= 16 => {
+            let mut bytes = [0u8; 16];
+            if crate::host::read_into(*address as *const u8, &mut bytes) {
+                let v = [
+                    f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                    f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+                    f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+                    f32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+                ];
+                format!("Constant({address:#x}, {size}) {v:?}")
+            } else {
+                format!("Constant({address:#x}, {size})")
+            }
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }
