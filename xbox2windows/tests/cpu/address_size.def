@@ -1,0 +1,5 @@
+EXPORTS
+    lea_sum32
+    lea_scaled32
+    load32
+    store32

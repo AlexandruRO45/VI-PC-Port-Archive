@@ -1,0 +1,16 @@
+/out/
+/game-files/
+/.vs/
+/CMakeUserPresets.json
+__pycache__/
+*.py[cod]
+*.user
+*.exe
+*.dll
+*.pdb
+*.obj
+*.cso
+*.rpf
+*.xvc
+*.xvd
+*.torrent

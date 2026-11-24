@@ -1,0 +1,10 @@
+EXPORTS
+    shl_zero
+    shr_zero
+    sar_zero
+    shl_masked32
+    shl_masked64
+    shl_three
+    sar_three
+    carry_zero
+    flags_zero
