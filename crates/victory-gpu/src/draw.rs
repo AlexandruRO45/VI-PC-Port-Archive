@@ -2443,6 +2443,8 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        report_records(&args, arguments, (kind, stride, max));
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
@@ -2469,6 +2471,52 @@ impl State {
         }
         true
     }
+}
+
+/// Diagnostics: the record an indirect execution is about to read
+/// (`VICTORY_INDIRECT_RECORD=1`) — the words the title left, the count and
+/// thread count they name, and whether their range fits the buffer. The clamp
+/// rewrites these words on the GPU, so this is the title's own record, which
+/// is the one question worth asking of it: did the title write it at all.
+#[cfg(feature = "diagnostics")]
+fn report_records(args: &std::sync::Arc<crate::shadow::Shadow>, at: u64, (kind, stride, records): (u32, u32, u32)) {
+    use std::sync::atomic::AtomicU64;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_RECORD").is_some()) {
+        return;
+    }
+    let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 64 && n % 256 != 0 {
+        return;
+    }
+    let len = u64::from(stride) * u64::from(records);
+    let left = args.left(at);
+    let words = args.words(at, len.min(64));
+    let word = |i: usize| words.get(i).copied().unwrap_or_default();
+    let (counts, threads) = match kind {
+        2 | 10 => {
+            let (x, y, z) = (word(0), word(1), word(2));
+            ((x, y, z), u64::from(x) * u64::from(y) * u64::from(z))
+        }
+        _ => {
+            let (a, b, c) = (word(0), word(1), word(2));
+            ((a, b, c), u64::from(a) * u64::from(b))
+        }
+    };
+    tracing::warn!(
+        n,
+        kind,
+        stride,
+        records,
+        at = %format!("{at:#x}"),
+        fits = records == 0 || len <= left,
+        left,
+        words = ?&words[..words.len().min(8)],
+        counts = ?counts,
+        threads,
+        "indirect record"
+    );
 }
 
 /// The host command signature for one argument of `kind` with records
