@@ -1289,37 +1289,28 @@ fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host:
     #[cfg(feature = "diagnostics")]
     let mut requested = 0usize;
     crate::descriptor::with_live_views(|live| {
-        let mut pending: Option<(&Arc<crate::shadow::Shadow>, usize, usize)> = None;
+        // Merged ranges of every host copy, brought up to date by address
+        // (see `refresh_by_address`).
+        let mut all: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for (key, range) in &ranges {
             if !live(*key) || range.address == range.end {
                 continue;
             }
-            if let Some((shadow, _, end)) = &mut pending
+            if let Some((shadow, _, end)) = all.last_mut()
                 && Arc::ptr_eq(shadow, &range.shadow)
                 && range.address <= *end
             {
                 *end = (*end).max(range.end);
                 continue;
             }
-            if let Some((shadow, start, end)) =
-                pending.replace((&range.shadow, range.address, range.end))
-            {
-                copied += shadow.update(start, end - start);
-                merged_count += 1;
-                #[cfg(feature = "diagnostics")]
-                {
-                    requested += end - start;
-                }
-            }
+            all.push((range.shadow.clone(), range.address, range.end));
         }
-        if let Some((shadow, start, end)) = pending {
-            copied += shadow.update(start, end - start);
-            merged_count += 1;
-            #[cfg(feature = "diagnostics")]
-            {
-                requested += end - start;
-            }
+        merged_count = all.len() as u64;
+        #[cfg(feature = "diagnostics")]
+        {
+            requested = all.iter().map(|(_, a, e)| e - a).sum();
         }
+        copied += refresh_by_address(&mut all);
     });
     let elapsed = started.elapsed().as_micros() as u64;
     #[cfg(feature = "diagnostics")]
@@ -1334,6 +1325,63 @@ fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host:
     PREPARING[0].fetch_add(elapsed, Ordering::Relaxed);
     PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     ranges
+}
+
+/// Brings host copies' ranges up to date, asking for the written pages
+/// once per span of title memory rather than once per range: the world has
+/// hundreds of thousands of directly indexed SRV ranges per frame, mostly in
+/// different (small) host copies but close together in title memory, and
+/// each question is a system call (under Wine, several). The written pages
+/// go to the shared journal, so every host copy over them sees them.
+/// Ranges closer than `SPAN_GAP` share a question; farther apart, the pages
+/// between them are not worth asking about.
+fn refresh_by_address(all: &mut [(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) -> usize {
+    const SPAN_GAP: usize = 1 << 20;
+    #[cfg(feature = "diagnostics")]
+    if {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OFF.get_or_init(|| std::env::var_os("VICTORY_NO_SPAN_QUESTIONS").is_some())
+    } {
+        // One question per range, as before.
+        return all.iter().map(|(s, a, e)| s.update(*a, e - a)).sum();
+    }
+    all.sort_unstable_by_key(|&(_, a, _)| a);
+    let mut copied = 0;
+    let mut at = 0;
+    while at < all.len() {
+        let (lo, mut hi) = (all[at].1, all[at].2);
+        let mut next = at + 1;
+        while next < all.len() && all[next].1 <= hi + SPAN_GAP {
+            hi = hi.max(all[next].2);
+            next += 1;
+        }
+        // Not guarded: guarding view memory makes it read-only on the
+        // promise that the caller copies it now, and a span also covers
+        // memory between the ranges that nobody copies here. Ranges in
+        // memory the kernel cannot answer for go through `update`, which
+        // guards only what it copies.
+        let (now, written, unwatched) = crate::watch::writes_split(lo, hi, false);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::SpanAsks, 1);
+            add(C::SpanPartial, u64::from(!unwatched.is_empty()));
+        }
+        for (shadow, a, e) in &all[at..next] {
+            let (a, e) = (*a, *e);
+            let first = a / crate::watch::PAGE;
+            let last = (e - 1) / crate::watch::PAGE;
+            let i = written.partition_point(|&(p, _)| p < first);
+            let j = written.partition_point(|&(p, _)| p <= last);
+            if unwatched.iter().any(|&(u, v)| u < e && v > a) {
+                copied += shadow.update(a, e - a);
+            } else {
+                copied += shadow.update_answered(&[(a, e)], now, &written[i..j], &[]);
+            }
+        }
+        at = next;
+    }
+    copied
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the

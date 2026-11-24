@@ -123,6 +123,104 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ))
 }
 
+/// [`writes`] for a span that may mix watched memory with memory that is
+/// not: the pages of `[start, end)` (whole pages) as last written, this
+/// asking's number, and the parts the kernel could not answer for (copy
+/// them whole). Asked once over the span if the kernel takes it, else
+/// allocation by allocation; guarded views (with `guarded`) are guarded.
+pub(crate) fn writes_split(
+    start: usize,
+    end: usize,
+    guarded: bool,
+) -> (u64, Vec<(usize, u64)>, Vec<(usize, usize)>) {
+    use windows_sys::Win32::System::Memory::{
+        GetWriteWatch, MEM_COMMIT, MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let query = |at: usize| {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a query about an address; nothing is dereferenced.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        (n != 0).then_some(info)
+    };
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    let (mut pages, mut unwatched, mut at) = (Vec::new(), Vec::new(), first * PAGE);
+    let stop = last * PAGE;
+    // The whole span first: one question when the kernel takes it.
+    {
+        let mut count = (stop - at) / KERNEL_PAGE;
+        j.found.resize(count.max(j.found.len()), 0);
+        let mut granularity = 0;
+        // SAFETY: the answer buffer holds `count` entries.
+        let whole = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                at as *const _,
+                stop - at,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } == 0;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Watches, 1);
+        if whole {
+            pages.extend(j.found[..count].iter().map(|&a| a / PAGE));
+            at = stop;
+        }
+    }
+    while at < stop {
+        let Some(info) = query(at) else {
+            unwatched.push((at, stop));
+            break;
+        };
+        let base = info.AllocationBase as usize;
+        let mut committed = info.State == MEM_COMMIT;
+        let mut to = (info.BaseAddress as usize + info.RegionSize).min(stop);
+        while info.State != MEM_FREE && to < stop {
+            let Some(next) = query(to) else { break };
+            if next.State == MEM_FREE || next.AllocationBase as usize != base {
+                break;
+            }
+            committed |= next.State == MEM_COMMIT;
+            to = (next.BaseAddress as usize + next.RegionSize).min(stop);
+        }
+        if committed {
+            let mut count = (to - at) / KERNEL_PAGE;
+            j.found.resize(count.max(j.found.len()), 0);
+            let mut granularity = 0;
+            // SAFETY: the answer buffer holds `count` entries.
+            let failed = unsafe {
+                GetWriteWatch(
+                    WRITE_WATCH_FLAG_RESET,
+                    at as *const _,
+                    to - at,
+                    j.found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            } != 0;
+            if !failed {
+                pages.extend(j.found[..count].iter().map(|&a| a / PAGE));
+            } else if let Some(g) = guarded.then(|| guard(at, to)).flatten() {
+                pages.extend(g);
+            } else {
+                unwatched.push((at, to));
+            }
+        }
+        at = to;
+    }
+    j.asked += 1;
+    let now = j.asked;
+    for page in pages {
+        j.written.insert(page, now);
+    }
+    let written = j.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+    (now, written, unwatched)
+}
+
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 

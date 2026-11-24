@@ -403,6 +403,65 @@ fn directly_indexed_srv_sees_producer_in_same_submission() {
     assert_eq!(read(mapped), 77);
 }
 
+/// Views into separate title buffers next to each other in one
+/// write-watched allocation (as the world's are: many small buffers, each
+/// with its own host copy) are brought up to date with one question for the
+/// written pages per submission, and each reads the title's latest value.
+#[cfg(feature = "diagnostics")]
+#[test]
+fn directly_indexed_srvs_of_neighbouring_buffers_ask_once_per_submission() {
+    let Some((host, dxc)) = test_host() else {
+        return;
+    };
+    use crate::copystat::{C, read as counter};
+    const BUFFERS: u32 = 8;
+    const SIZE: u64 = 65536;
+    let pipeline = pipeline(host, &dxc);
+    let title = TitleBuffer::watched(u64::from(BUFFERS) * SIZE);
+    // The allocation is registered as one buffer; register the others inside
+    // it, each its own resource and host copy.
+    let bases: Vec<u64> = (1..BUFFERS).map(|i| title.base + u64::from(i) * SIZE).collect();
+    for &base in &bases {
+        crate::shadow::register(base as usize, base, SIZE);
+    }
+    let heap = TestHeap::new(64);
+    let view = |handle: u64, address: u64| {
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        resource[4] = SIZE as u32;
+        let mut desc = [0; 16];
+        desc[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+        desc[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc[6] = 4;
+        desc[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+        desc[10] = address as u32;
+        desc[11] = (address >> 32) as u32;
+        create_placed_srv(std::ptr::null(), &resource, &desc, handle);
+    };
+    view(heap.handle(0), title.base);
+    for (i, &base) in bases.iter().enumerate() {
+        view(heap.handle(i as u32 + 1), base);
+    }
+    let (output, mapped) = host.shared_buffer(4).unwrap();
+    for round in 0..2u32 {
+        for i in [0, BUFFERS - 1] {
+            title.set(u64::from(i) * SIZE, 1000 * round + 100 + i);
+            let list = host.new_list().unwrap();
+            record(&list, heap.0, &pipeline, i, &output);
+            list.close();
+            let (watches, ranges) = (counter(C::Watches), counter(C::DirectRanges));
+            host.execute(&[&list]);
+            assert_eq!(counter(C::DirectRanges) - ranges, u64::from(BUFFERS));
+            assert_eq!(counter(C::Watches) - watches, 1);
+            assert_eq!(read(mapped), 1000 * round + 100 + i);
+        }
+    }
+    for &base in &bases {
+        crate::shadow::unregister(base as usize, base);
+    }
+}
+
 #[cfg(feature = "diagnostics")]
 #[test]
 fn directly_indexed_srv_unwatched_range_preserves_watched_refreshes() {

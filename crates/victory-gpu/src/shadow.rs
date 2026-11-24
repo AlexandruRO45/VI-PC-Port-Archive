@@ -308,6 +308,101 @@ impl Shadow {
         self.update_free(from, to)
     }
 
+    /// [`Shadow::update`] of ranges (in address order) from an answer for
+    /// the written pages already asked over a span covering them
+    /// ([`crate::watch::writes_split`]): `written` as last written by page,
+    /// `now` that asking, `unwatched` the parts to copy whole.
+    pub(crate) fn update_answered(
+        &self,
+        ranges: &[(usize, usize)],
+        now: u64,
+        written: &[(usize, u64)],
+        unwatched: &[(usize, usize)],
+    ) -> usize {
+        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return ranges.iter().map(|&(a, e)| self.update(a, e.saturating_sub(a))).sum();
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        self.watched.store(WATCHED, Ordering::Relaxed);
+        let pending: Vec<(usize, usize)> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut bytes = 0;
+        for &(a, e) in ranges {
+            let (from, to) = (a.max(start), e.min(end));
+            if from >= to {
+                continue;
+            }
+            // Around ranges shaders are writing, as in `update`.
+            let mut busy: Vec<(usize, usize)> = pending
+                .iter()
+                .copied()
+                .filter(|&(p, q)| p < to && q > from)
+                .collect();
+            busy.sort_unstable();
+            let (mut at, mut gaps) = (from, Vec::new());
+            for (p, q) in busy {
+                if p > at {
+                    gaps.push((at, p));
+                }
+                at = at.max(q);
+            }
+            if at < to {
+                gaps.push((at, to));
+            }
+            // Parts the kernel could not answer for are copied whole (and
+            // asked about again by a later watched request, as in
+            // `update_free`); the rest from the answer.
+            let mut parts = Vec::new();
+            for (from, to) in gaps {
+                let mut at = from;
+                for &(u, v) in unwatched.iter().filter(|&&(u, v)| u < to && v > from) {
+                    if u > at {
+                        parts.push((at, u, true));
+                    }
+                    parts.push((u.max(at), v.min(to), false));
+                    at = at.max(v);
+                }
+                if at < to {
+                    parts.push((at, to, true));
+                }
+            }
+            for (from, to, watched) in parts {
+                if from >= to {
+                    continue;
+                }
+                if !watched {
+                    let base = start / PAGE;
+                    self.copied.lock().unwrap_or_else(|e| e.into_inner())
+                        [from / PAGE - base..=(to - 1) / PAGE - base]
+                        .fill(0);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::UnwatchedRanges, 1);
+                        add(C::UnwatchedBytes, (to - from) as u64);
+                    }
+                    self.copy(from, to);
+                    bytes += to - from;
+                    continue;
+                }
+                let (first, last) = (from / PAGE, (to - 1) / PAGE);
+                let i = written.partition_point(|&(p, _)| p < first);
+                let j = written.partition_point(|&(p, _)| p <= last);
+                let copied = self.copy_stale(from, to, now, &written[i..j]);
+                #[cfg(feature = "diagnostics")]
+                {
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                    add(C::WatchBytes, copied as u64);
+                }
+                bytes += copied;
+            }
+        }
+        bytes
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
