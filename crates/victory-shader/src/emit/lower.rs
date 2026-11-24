@@ -4268,18 +4268,43 @@ impl<'a> Lower<'a> {
         let src2 = *v.src.get(2).ok_or("a missing operand")?;
         let (add_lo, add_hi) = self.mad64_addend(inst, src2, signed)?;
         let c = self.cur;
-        let i32t = self.s.t.i32;
-        let ret = self.s.m.named_struct("dx.types.twoi32", vec![i32t; 2]);
-        let op = if signed { 41 } else { 42 }; // IMul/UMul return {high, low}.
-        let product = self
-            .s
-            .op(c, "binaryWithTwoOuts.i32", Attr::ReadNone, ret, op, &[a, b]);
-        let mul_hi = self.s.m.extract(c, product, 0);
-        let mul_lo = self.s.m.extract(c, product, 1);
+        let (zero, one, k16, mask16, hi_bit) = (
+            self.s.m.i32(0),
+            self.s.m.i32(1),
+            self.s.m.i32(16),
+            self.s.m.i32(0xFFFF),
+            self.s.m.i32(0x1_0000),
+        );
+        // Exact 32x32->64 multiply via 16-bit partial products in pure i32 LLVM
+        // ops (avoids INT64 and passes strict dxil.dll validation).
+        let a_lo = self.s.m.bin(c, Bin::And, a, mask16);
+        let a_hi = self.s.m.bin(c, Bin::LShr, a, k16);
+        let b_lo = self.s.m.bin(c, Bin::And, b, mask16);
+        let b_hi = self.s.m.bin(c, Bin::LShr, b, k16);
+        let ll = self.s.m.bin(c, Bin::Mul, a_lo, b_lo);
+        let lh = self.s.m.bin(c, Bin::Mul, a_lo, b_hi);
+        let hl = self.s.m.bin(c, Bin::Mul, a_hi, b_lo);
+        let hh = self.s.m.bin(c, Bin::Mul, a_hi, b_hi);
+        let (mid, mid_carry) = self.add_sub_carry(c, true, lh, hl, None);
+        let mid_lo = self.s.m.bin(c, Bin::Shl, mid, k16);
+        let (mul_lo, lo_carry) = self.add_sub_carry(c, true, ll, mid_lo, None);
+        let mid_hi = self.s.m.bin(c, Bin::LShr, mid, k16);
+        let mid_c = self.s.m.select(c, mid_carry, hi_bit, zero);
+        let lo_c = self.s.m.select(c, lo_carry, one, zero);
+        let mul_hi = self.s.m.bin(c, Bin::Add, hh, mid_hi);
+        let mul_hi = self.s.m.bin(c, Bin::Add, mul_hi, mid_c);
+        let mut mul_hi = self.s.m.bin(c, Bin::Add, mul_hi, lo_c);
+        if signed {
+            let a_neg = self.s.m.cmp(c, pred::SLT, a, zero);
+            let b_neg = self.s.m.cmp(c, pred::SLT, b, zero);
+            let adj_a = self.s.m.select(c, a_neg, b, zero);
+            let adj_b = self.s.m.select(c, b_neg, a, zero);
+            mul_hi = self.s.m.bin(c, Bin::Sub, mul_hi, adj_a);
+            mul_hi = self.s.m.bin(c, Bin::Sub, mul_hi, adj_b);
+        }
         let (mut lo, carry_lo) = self.add_sub_carry(c, true, mul_lo, add_lo, None);
         let (mut hi, carry_hi) = self.add_sub_carry(c, true, mul_hi, add_hi, Some(carry_lo));
 
-        let zero = self.s.m.i32(0);
         let bit64 = if signed {
             // RDNA2 ISA §12.12 concatenates SDST and the 64-bit sum. Bit 64
             // adds the sign extensions of the two terms and the dword carry.
