@@ -177,10 +177,12 @@ fn clean_path(input: &str) -> PathBuf {
     if let Some(rest) = s.strip_prefix('&') {
         s = rest.trim();
     }
-    for q in ['"', '\''] {
-        if s.len() >= 2 && s.starts_with(q) && s.ends_with(q) {
-            s = &s[1..s.len() - 1];
-        }
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        return PathBuf::from(&s[1..s.len() - 1]);
+    }
+    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        // PowerShell doubles an apostrophe inside single quotes.
+        return PathBuf::from(s[1..s.len() - 1].replace("''", "'"));
     }
     PathBuf::from(s)
 }
@@ -870,6 +872,11 @@ mod tests {
         ] {
             assert_eq!(clean_path(input), want, "{input:?}");
         }
+        // PowerShell's drag of a path with an apostrophe doubles it.
+        let tom = PathBuf::from(r"D:\Games\Tom's Game\title.exe");
+        assert_eq!(clean_path("& 'D:\\Games\\Tom''s Game\\title.exe'\r\n"), tom);
+        // In double quotes (cmd), an apostrophe is kept as it is.
+        assert_eq!(clean_path("\"D:\\Games\\Tom's Game\\title.exe\""), tom);
     }
 
     #[test]
