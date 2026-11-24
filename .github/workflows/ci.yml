@@ -35,10 +35,12 @@ jobs:
           CARGO_TERM_COLOR: never
         run: |
           set +e
-          set -o pipefail
-          cargo test --workspace --locked 2>&1 | tee /tmp/test.log
-          rc=$?
-          if [ "$rc" -ne 0 ]; then
-            awk '/^failures:/{flag=1} flag && NF{print "::error::" $0}' /tmp/test.log | head -n 10
-            exit "$rc"
-          fi
+          echo "::error::git_ver=$(git --version)"
+          echo "::error::pwd=$(pwd)"
+          echo "::error::check_ignore=$(git check-ignore -v target/CACHEDIR.TAG 2>&1 || true)"
+          echo "::error::gitignore_head=$(head -n 15 .gitignore | tr '\n' '|')"
+          echo "::error::ls_target=$(ls -ld target target/CACHEDIR.TAG 2>&1 || true)"
+          echo "::error::git_ls=$(git ls-files --others --exclude-standard | head -n 5 | tr '\n' '|')"
+          echo "::error::git_status=$(git status --short | head -n 5 | tr '\n' '|')"
+          cargo test -p xtask --locked
+          exit 1
