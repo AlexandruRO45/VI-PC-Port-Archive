@@ -4603,6 +4603,49 @@ mod tests {
     }
 
     #[test]
+    fn a_mesh_program_keeps_no_vertex_inputs() {
+        // A mesh program has no fetch shader: the input table it shares with
+        // a vertex program's layout is bounded by its count, but no entry is
+        // kept or checked against the VGPRs.
+        let ms = fssm(&[(HwStage::Ms, &VS_CODE)]);
+        let e = stage_data_at(&ms, HwStage::Ms);
+        let vs = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let ve = stage_data_at(&vs, HwStage::Vs);
+        // Inputs a vertex program refuses: x-w over the vertex id in v0,
+        // x-w of v4 twice, and w of v27 past the program's 28 VGPRs.
+        for (entries, why) in [
+            (vec![[0, 0, 0xf, 0, 0]], "vertex input over a system VGPR"),
+            (
+                vec![[0, 0, 0xf, 4, 0], [0, 1, 0xf, 4, 0]],
+                "vertex inputs overlap",
+            ),
+            (vec![[0, 0, 0xf, 27, 0]], "vertex input outside the VGPRs"),
+        ] {
+            let count = (entries.len() as u32).to_le_bytes();
+            let mut mesh = ms.clone();
+            mesh[e + VS_INPUT_COUNT..][..4].copy_from_slice(&count);
+            mesh[e + VS_INPUTS..][..5 * entries.len()].copy_from_slice(entries.as_flattened());
+            let p = native_programs(&part(&[(KIND_NATIVE, &xbch(&mesh))])).unwrap();
+            assert!(
+                matches!(&p[0].io, StageIo::Ms(m) if m.outputs.is_empty()),
+                "{why}"
+            );
+
+            let mut vertex = vs.clone();
+            vertex[ve + VS_INPUT_COUNT..][..4].copy_from_slice(&count);
+            vertex[ve + VS_INPUTS..][..5 * entries.len()].copy_from_slice(entries.as_flattened());
+            assert_eq!(refused_blob(&xbch(&vertex)), why);
+        }
+        // The count is still the semantic table's: 32 entries are read, and
+        // one more is refused as it is for a vertex program.
+        let mut mesh = ms.clone();
+        mesh[e + VS_INPUT_COUNT..][..4].copy_from_slice(&MAX_SEMANTICS.to_le_bytes());
+        assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&mesh))])).is_ok());
+        mesh[e + VS_INPUT_COUNT..][..4].copy_from_slice(&(MAX_SEMANTICS + 1).to_le_bytes());
+        assert_eq!(refused_blob(&xbch(&mesh)), "implausible semantic count");
+    }
+
+    #[test]
     fn an_empty_export_patch_is_still_bounded_by_the_code() {
         // Seven bytes: one whole dword and three more, so the code ends at
         // dword 1 for a patch.
