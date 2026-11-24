@@ -639,8 +639,8 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         let stage_data = &payload[(start + RECORD_SIZE) as usize..];
         let io = match stage {
             HwStage::Ps => ps_io(stage_data, code.len())?,
-            HwStage::Vs => vs_outputs_per_vertex(vs_inputs_fit(vs_io(stage_data)?)?)?,
-            HwStage::Cs => StageIo::Cs(compute_io(stage_data, &layout)?),
+            HwStage::Vs => vs_outputs_per_vertex(vs_inputs_fit(vs_io(stage_data)?, vgprs)?)?,
+            HwStage::Cs => StageIo::Cs(compute_io(stage_data, &layout, vgprs)?),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
             _ => StageIo::None,
         };
@@ -665,14 +665,21 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
 /// The group ids and group info arrive in the SGPRs after the user SGPRs
 /// (`ComputeIo::system_sgprs`), and raising labels them there. A root
 /// parameter covering one of those SGPRs would make the same register both a
-/// root parameter and a group id, so such a layout is refused.
-fn compute_io(data: &[u8], layout: &[RootParam]) -> Result<ComputeIo, ShaderError> {
+/// root parameter and a group id, so such a layout is refused. The thread
+/// ids arrive in v0 on, which must be among the program's VGPRs.
+fn compute_io(data: &[u8], layout: &[RootParam], vgprs: u16) -> Result<ComputeIo, ShaderError> {
     let cs = ComputeIo {
         rsrc2: u32_at(data, CS_RSRC2)?,
         threads: group_size(data)?,
     };
     if cs.lds_bytes() > MAX_LDS_BYTES {
         return Err(Malformed("implausible LDS size"));
+    }
+    // Raising labels v0 up to the thread-id count as the thread id in the
+    // group (`io::raise`), so each of those must be one of the program's
+    // VGPRs, as a vertex input must.
+    if u16::from(cs.thread_id_vgprs()) > vgprs {
+        return Err(Malformed("thread ids outside the VGPRs"));
     }
     let (ids, info) = cs.system_sgprs();
     // The layout was checked first, so `first + span` stays below `SGPRS`.
@@ -960,14 +967,18 @@ fn distinct(bytes: impl IntoIterator<Item = u8>) -> bool {
 /// id in.
 const VS_SYSTEM_VGPRS: [u32; 3] = [0, 2, 3];
 
-/// Raising loads a vertex input's channel `c` from `v[vgpr + c]`, an 8-bit
-/// register number: every enabled channel must land on a VGPR.
-fn vs_inputs_fit(io: StageIo) -> Result<StageIo, ShaderError> {
+/// Raising loads a vertex input's channel `c` from `v[vgpr + c]`: every
+/// enabled channel must land on one of the program's `vgprs` registers (at
+/// most 256, so within the 8-bit register number too). The fetch fills only
+/// the VGPRs the wave is given, and relative VGPR reads (`ir::build`) treat
+/// those past `vgprs` as absent, so an input past them would be labeled in a
+/// register the program never has.
+fn vs_inputs_fit(io: StageIo, vgprs: u16) -> Result<StageIo, ShaderError> {
     if let StageIo::Vs { inputs, .. } = &io
         && inputs.iter().any(|i| {
             i.mask
                 .checked_ilog2()
-                .is_some_and(|last| u32::from(i.vgpr) + last > u32::from(u8::MAX))
+                .is_some_and(|last| u32::from(i.vgpr) + last >= u32::from(vgprs))
         })
     {
         return Err(Malformed("vertex input outside the VGPRs"));
@@ -1573,6 +1584,35 @@ mod tests {
     }
 
     #[test]
+    fn thread_ids_stay_inside_the_vgprs() {
+        let cs = fssm(&[(HwStage::Cs, &VS_CODE)]);
+        let record = FSSM_HEADER + u64_at(&cs, FSSM_HEADER + slot(HwStage::Cs)).unwrap() as usize;
+        let e = stage_data_at(&cs, HwStage::Cs);
+        // `count` thread id components (field 0-3) in a program of `vgprs`.
+        let program = |vgprs: u32, count: u32| {
+            let mut blob = cs.clone();
+            blob[record + RECORD_REGS..][..4].copy_from_slice(&vgprs.to_le_bytes());
+            blob[e + CS_RSRC2..][..4].copy_from_slice(&(count << 11).to_le_bytes());
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        for (vgprs, count) in [(1, 0), (2, 1), (3, 2), (3, 3), (VGPRS, 2)] {
+            assert!(
+                program(vgprs, count).is_ok(),
+                "{vgprs} VGPRs, field {count}"
+            );
+        }
+        for (vgprs, count) in [(0, 0), (1, 1), (2, 2), (2, 3)] {
+            assert!(
+                matches!(
+                    program(vgprs, count),
+                    Err(Malformed("thread ids outside the VGPRs"))
+                ),
+                "{vgprs} VGPRs, field {count}"
+            );
+        }
+    }
+
+    #[test]
     fn reads_every_native_blob() {
         let es = xbch(&fssm(&[(HwStage::Es, &VS_CODE)]));
         let vs = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
@@ -1757,24 +1797,37 @@ mod tests {
             blob[e + count_at..][..4].copy_from_slice(&(MAX_SEMANTICS + 1).to_le_bytes());
             assert_eq!(refused_blob(&xbch(&blob)), "implausible semantic count");
         }
-        // One input in v252 or v253: x-w of v252 end at v255 and fit; from
-        // v253, w would be v256.
-        let input = |vgpr: u8, mask: u8| {
+        // One input in a program of `vgprs` VGPRs. With all 256, x-w of
+        // v252 end at v255 and fit; from v253, w would be v256.
+        let record = FSSM_HEADER + u64_at(&vs, FSSM_HEADER + slot(HwStage::Vs)).unwrap() as usize;
+        let input_of = |vgprs: u32, vgpr: u8, mask: u8| {
             let mut blob = vs.clone();
+            blob[record + RECORD_REGS..][..4].copy_from_slice(&vgprs.to_le_bytes());
             blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
             blob[e + VS_INPUTS..][..5].copy_from_slice(&[0, 0, mask, vgpr, 0]);
             native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
         };
+        let input = |vgpr: u8, mask: u8| input_of(256, vgpr, mask);
         assert!(input(252, 0xf).is_ok());
         assert!(input(255, 0x1).is_ok());
         assert!(input(255, 0).is_ok(), "no channel is loaded");
-        for (vgpr, mask) in [(253, 0xf), (255, 0x2)] {
+        // With 28, x-w of v24 end at v27 and fit; w of v25 would be v28.
+        assert!(input_of(VGPRS, 24, 0xf).is_ok());
+        assert!(input_of(VGPRS, 200, 0).is_ok(), "no channel is loaded");
+        for (vgprs, vgpr, mask) in [
+            (256, 253, 0xf),
+            (256, 255, 0x2),
+            (VGPRS, 25, 0xf),
+            (VGPRS, 28, 0x1),
+            (VGPRS, 252, 0xf),
+            (0, 4, 0x1),
+        ] {
             assert!(
                 matches!(
-                    input(vgpr, mask),
+                    input_of(vgprs, vgpr, mask),
                     Err(Malformed("vertex input outside the VGPRs"))
                 ),
-                "v{vgpr} mask {mask:#x}"
+                "{vgprs} VGPRs: v{vgpr} mask {mask:#x}"
             );
         }
         // v1 and v4 up hold no id: x in v1 and x-w from v4 load. Any channel
