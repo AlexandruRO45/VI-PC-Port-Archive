@@ -31,25 +31,49 @@ These links go stale as PRs land; check their state before relying on them.
   It can rebase onto #235.
 - [#191](https://github.com/Marvisak/VIctory/pull/191) (open): a Linux
   launcher and smoke test for Proton. It replaced #195.
+- [#241](https://github.com/Marvisak/VIctory/pull/241) (open): where
+  `victory-core` keeps files on a non-Windows host (cache in
+  `$XDG_CACHE_HOME/victory`, data in `$XDG_DATA_HOME/victory`), config-file
+  paths relative to the file, `~` expansion, and a warning for a
+  `VICTORY_LOG` that does not parse. See
+  [Native tools and #241](#native-tools-and-241).
 
 ## Host tests
 
-On current `main`, these crates build and test natively on Linux. This is
-the set #232's CI job runs:
+On current `main`, these crates build, test and are clippy-clean natively on
+Linux. These are the commands #232's CI job runs:
 
 ```sh
 cargo xtask policy
-cargo check --all-targets -p victory-core -p victory-pe -p victory-formats \
-  -p victory-pipeline -p victory-game -p victory-shader -p victory-loader
-cargo test -p victory-core -p victory-formats -p victory-pipeline \
-  -p victory-game -p victory-shader
+L="-p victory-core -p victory-pe -p victory-formats -p victory-pipeline \
+   -p victory-game -p victory-loader -p xtask"
+cargo clippy --all-targets --locked $L -- -D warnings
+cargo clippy --lib --locked -p victory-shader -- -D warnings
+cargo test --locked $L -p victory-shader -- --exact \
+  --skip image::tests::parses_own_test_binary \
+  --skip image::tests::rva_to_file_offset_maps_entry_point \
+  --skip image::tests::rva_to_file_offset_rejects_offsets_past_4_gib \
+  --skip image::tests::rejects_iat_outside_image \
+  --skip prepare::tests::patches_own_test_binary \
+  --skip prepare::tests::keeps_iat_slots_when_import_size_excludes_the_terminator \
+  --skip prepare::tests::file_name_is_stable_per_build
 cargo xtask install-hooks       # asset-policy check on every commit
 ```
 
+The skipped `victory-pe` and `victory-loader` tests parse the test
+executable itself as a PE image, which is an ELF on Linux; they still run
+on Windows. `victory-shader`'s test target has a helper only the Windows
+tests use, so only its library is linted.
+
+Keep `TMPDIR` outside the checkout. `victory-core`'s policy tests make
+temporary folders and expect them to be outside the repository, so with
+`TMPDIR` under the checkout `policy::tests::accepts_unrelated_directories`
+fails with `InsideRepo`.
+
 `victory-gpu`, `victory-hle` and `apps/victory` need #235's gates. Until it
-is merged, run `gh pr checkout 235` and then `cargo test --workspace`. Some
-`victory-pe` and `victory-loader` tests parse the test binary itself as a PE
-image, so they only pass on Windows; #235 gates them to Windows.
+is merged, run `gh pr checkout 235` and then `cargo test --workspace`. #235
+also gates the PE self-parsing tests to Windows, so the `--skip` flags
+above become no-ops there.
 
 To run the Windows test binaries under Wine/Proton, cross-build them with
 `cargo xwin test --target x86_64-pc-windows-msvc --no-run` (or the
@@ -68,6 +92,31 @@ unavailable off Windows.
 `victory run` is different: running the title needs D3D12 and the rest of
 the Windows runtime, so it stays the cross-built `victory.exe` under
 Proton, as described below.
+
+## Native tools and #241
+
+On `main`, without `LOCALAPPDATA` (a native Linux build of the tools), the
+default data folder ends up under the cache base (`~/.cache/victory/data`),
+and an empty or relative `XDG_CACHE_HOME` makes the cache relative to the
+working directory, which the asset policy then refuses. Set
+`VICTORY_CACHE_DIR` and `VICTORY_DATA_DIR` to absolute paths outside the
+checkout, or use #241, which changes that to:
+
+- cache: `$XDG_CACHE_HOME/victory`, else `~/.cache/victory`;
+  data: `$XDG_DATA_HOME/victory`, else `~/.local/share/victory`. Empty or
+  relative base variables are skipped. A data folder inside the cache is
+  refused.
+- relative `[paths]` values in `victory.toml` are relative to the file, and
+  a leading `~` in them or in the `VICTORY_*` path variables is the home
+  directory. A Windows drive path such as the example file's
+  `D:\victory-data\game` is refused on Linux instead of being anchored
+  next to the file.
+- `victory config` prints each path and where it came from (variable,
+  file or default).
+
+None of this changes `victory.exe` under Proton: there it is a Windows
+program, `LOCALAPPDATA` is the prefix's, and the `Z:` paths below still
+apply.
 
 ## Cross-building victory.exe
 
