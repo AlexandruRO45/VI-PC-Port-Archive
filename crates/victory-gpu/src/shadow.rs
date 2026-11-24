@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -40,6 +40,9 @@ pub(crate) struct Shadow {
     copied: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
+    /// The host buffer's last transitioned state: a barrier has to name the
+    /// state it leaves, and an explicit transition does not decay.
+    state: AtomicU32,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -160,6 +163,16 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// The state the host buffer was last transitioned to.
+    pub(crate) fn state(&self) -> u32 {
+        self.state.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Records that the host buffer moved to `state`.
+    pub(crate) fn set_state(&self, state: u32) {
+        self.state.store(state, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -192,6 +205,7 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
+            state: AtomicU32::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
         }

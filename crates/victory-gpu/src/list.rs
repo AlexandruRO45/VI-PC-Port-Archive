@@ -433,7 +433,9 @@ fn texture_to_buffer(
     z: u32,
     source_box: *const [u32; 6],
 ) {
-    use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_BOX, D3D12_RESOURCE_STATES, D3D12_TEXTURE_COPY_LOCATION,
+    };
     use windows::core::Interface;
     const FOOTPRINT: u32 = 1;
     let miss = || {
@@ -481,10 +483,20 @@ fn texture_to_buffer(
     }
     ensure_state(list, src.resource, COPY_SOURCE);
     from.resource = texture.as_raw().cast_const().cast();
-    // shortcut: this host's hardware tolerates a buffer in any state for a
-    // copy, and D3D12 names COPY_DEST as the destination state, so a buffer
-    // left in UNORDERED_ACCESS by `indirect` copies without a barrier rather
-    // than through one that would have to guess its before-state.
+    // D3D12 names COPY_DEST as a copy's destination state, and an explicit
+    // transition does not decay, so the barrier leaves the state the buffer
+    // was last put in rather than a guessed one.
+    let before = shadow.state();
+    if before != COPY_DEST {
+        let to_copy = crate::host::transition(
+            &shadow.buffer,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(COPY_DEST as i32),
+        );
+        // SAFETY: an open list and a live buffer.
+        unsafe { list.list.ResourceBarrier(&[to_copy]) };
+        shadow.set_state(COPY_DEST);
+    }
     // The destination buffer reads title memory; what the copy writes there
     // goes back to it once the list has run.
     shadow.refresh(list, at, bytes);
@@ -673,7 +685,9 @@ extern "system" fn copy_texture_region(
 ) {
     #[cfg(windows)]
     {
-        use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
+        use windows::Win32::Graphics::Direct3D12::{
+        D3D12_BOX, D3D12_RESOURCE_STATES, D3D12_TEXTURE_COPY_LOCATION,
+    };
         use windows::core::Interface;
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).

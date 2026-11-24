@@ -224,6 +224,7 @@ fn make() -> windows::core::Result<Clamp> {
 /// after). False if the clamp is not available.
 pub(crate) fn bound(
     list: &HostList,
+    shadow: &crate::shadow::Shadow,
     buffer: &ID3D12Resource,
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
@@ -273,7 +274,8 @@ pub(crate) fn mesh_groups(x: u32) -> u32 {
 
 /// After the execution: the buffer back to unordered access, where the
 /// title's passes keep using it.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
+pub(crate) fn done(list: &HostList, shadow: &crate::shadow::Shadow, buffer: &ID3D12Resource) {
+    shadow.set_state(D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
     // SAFETY: an open list and a live buffer.
     unsafe {
         list.list.ResourceBarrier(&[transition(
