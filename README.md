@@ -135,6 +135,35 @@ Negative results on this machine (do not use):
   500-700 ms/frame: the optimizer is written for victory-fork's different emitter
   and is unusable on this base in any combination.
 
+### A four-idea latency plan, tried and measured (2026-11-25)
+
+The frame is **latency-bound, not throughput-bound** (CPU/GPU usage low): a full
+scene is ~172 ms GPU rendering + ~64 ms CPU prep on the critical path, with the
+~86 ms GPU→CPU read-back fetch overlapped by `RELAY=1`. Four ideas from a faster
+reference were implemented behind switches and A/B tested in the same scene:
+
+- **VRAM residency** (`VICTORY_SCRATCH_VRAM=1`, kept, default off): CPU-written
+  scratch in CPU-visible VRAM via Resizable BAR (`Host::gpu_upload_buffer`,
+  CUSTOM + WRITE_COMBINE + L1, probed by `Host::rebar`, budget-guarded).
+  **Inactive on this box — the ReBAR probe is false** (Win10/RTX 3080); needs
+  Resizable BAR enabled. Falls back to system-RAM scratch cleanly.
+- **Batched indirect barriers** (`VICTORY_INDIRECT_BATCH`): the existing
+  `VICTORY_INDIRECT_WINDOW` alone gives no gain (260 ms), and deferring the
+  per-command return-to-COMMON barrier across window hits dropped world
+  geometry. The per-command barriers are not on this title's critical path;
+  abandoned.
+- **Parallel CPU prep** (`VICTORY_WIDE_PREP`): parallel `GetWriteWatch` over
+  disjoint runs (local journals, single asking-number merge under the held
+  lock) dropped world geometry — concurrent kernel write-watch RESET calls race
+  and miss writes. Reverted.
+- **CPU/GPU pipelining** (serve the title's GPU-memory reads card-side so frame
+  N+1 overlaps N): the safe forms already exist (`late_met`, `relay_exact`);
+  the full form is the `VICTORY_INPLACE` class that breaks RT lighting, so not
+  attempted enabled.
+
+Net: the safe ceiling on this machine is ~230 ms (`RELAY=1` + mip-drop=1). The
+reference's 45-90 ms relies on the pipelining bypass and a ReBAR-enabled host.
+
 The intro pre-rendered video logo jitters in every mode (a frame-token pacing
 issue in `frame.rs`, not the relay or the shaders); the world itself presents in
 order with `RELAY=1`.
