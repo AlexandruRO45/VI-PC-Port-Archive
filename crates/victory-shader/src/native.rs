@@ -128,6 +128,10 @@ const MS_CLIP_CNTL: usize = 0x194;
 const MS_INFO: usize = 0x448;
 /// The LDS a GFX10 thread group can address.
 const MAX_LDS_BYTES: u32 = 64 << 10;
+/// D3D12's mesh limits: at most 128 threads in the group, and at most 256
+/// vertices and 256 primitives out.
+const MAX_MESH_THREADS: u32 = 128;
+const MAX_MESH_OUTPUTS: u32 = 256;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
 
@@ -936,9 +940,24 @@ fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
     // The group's lanes become the DXIL `numthreads` x and, for containers
     // without the HLSL count, the stride of the group id: an empty group
     // would emit `numthreads(0, 1, 1)` and give every group id 0.
+    // A group past 128 lanes is one no mesh shader can declare (the lanes
+    // are the HLSL group rounded up to waves, and 128 is a whole number of
+    // either), so it would emit a `numthreads` the validator rejects.
     let threads = half(0);
-    if threads == 0 {
+    if threads == 0 || threads > MAX_MESH_THREADS {
         return Err(Malformed("implausible thread-group size"));
+    }
+    // Lowering writes the vertex and primitive limits and the topology as
+    // the DXIL mesh state and the PSV mesh info as they are (the limits as
+    // 16-bit values): past 256 outputs, or a topology neither lines (1) nor
+    // triangles (2), the emitted shader is one D3D12 refuses to create.
+    let (max_vertices, max_primitives) = (half(2), half(4));
+    if max_vertices > MAX_MESH_OUTPUTS || max_primitives > MAX_MESH_OUTPUTS {
+        return Err(Malformed("implausible mesh output count"));
+    }
+    let topology = info[7];
+    if !matches!(topology, 1 | 2) {
+        return Err(Malformed("unknown mesh topology"));
     }
     // Lowering declares the LDS as `lds_bytes.div_ceil(4)` dwords and states
     // it again in bytes (`lds_dwords * 4`), a u32 product that overflows for
@@ -950,9 +969,9 @@ fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
         outputs,
         clip_cntl: u32_at(data, MS_CLIP_CNTL)?,
         threads,
-        max_vertices: half(2),
-        max_primitives: half(4),
-        topology: info[7],
+        max_vertices,
+        max_primitives,
+        topology,
         lds_bytes,
     }))
 }
@@ -1025,8 +1044,11 @@ mod tests {
                     data[CS_THREADS + 4 * k..][..4].copy_from_slice(&1u32.to_le_bytes());
                 }
             }
+            // One lane drawing triangles: a mesh group is never empty and
+            // always names a topology.
             if stage == HwStage::Ms {
                 data[MS_INFO..][..2].copy_from_slice(&1u16.to_le_bytes());
+                data[MS_INFO + 7] = 2;
             }
             payload.extend_from_slice(&data);
             payload.extend_from_slice(code);
@@ -1763,6 +1785,53 @@ mod tests {
         let mut blob = ms.clone();
         blob[e + MS_INFO..][..2].copy_from_slice(&0u16.to_le_bytes());
         assert_eq!(refused_blob(&xbch(&blob)), "implausible thread-group size");
+
+        // Mesh limits: 128 lanes and 256 vertices and primitives fit, with
+        // lines or triangles; a lane, an output past them, or another
+        // topology does not.
+        let info = |bytes: [u8; 8]| {
+            let mut blob = ms.clone();
+            blob[e + MS_INFO..][..8].copy_from_slice(&bytes);
+            xbch(&blob)
+        };
+        for topology in [1, 2] {
+            let p = native_programs(&part(&[(
+                KIND_NATIVE,
+                &info([128, 0, 0, 1, 0, 1, 0, topology]),
+            )]))
+            .unwrap();
+            assert!(matches!(
+                &p[0].io,
+                StageIo::Ms(m) if (m.threads, m.max_vertices, m.max_primitives, m.topology)
+                    == (128, 256, 256, topology)
+            ));
+        }
+        assert_eq!(
+            refused_blob(&info([129, 0, 1, 0, 1, 0, 0, 2])),
+            "implausible thread-group size"
+        );
+        assert_eq!(
+            refused_blob(&info([0xff, 0xff, 1, 0, 1, 0, 0, 2])),
+            "implausible thread-group size"
+        );
+        for bad in [
+            [1, 0, 1, 1, 1, 0, 0, 2],
+            [1, 0, 1, 0, 1, 1, 0, 2],
+            [1, 0, 0xff, 0xff, 1, 0, 0, 2],
+        ] {
+            assert_eq!(
+                refused_blob(&info(bad)),
+                "implausible mesh output count",
+                "{bad:?}"
+            );
+        }
+        for topology in [0, 3, 0xff] {
+            assert_eq!(
+                refused_blob(&info([1, 0, 1, 0, 1, 0, 0, topology])),
+                "unknown mesh topology",
+                "{topology}"
+            );
+        }
 
         // A mesh group's LDS: 64 KiB fits; a byte more, or u32::MAX, does not.
         let lds = |bytes: u32| {
