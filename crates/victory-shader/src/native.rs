@@ -5710,4 +5710,128 @@ mod tests {
         }
         assert!(matches!(&read(0xFF, 0)[0].io, StageIo::Ms(m) if m.clip_cntl == 0));
     }
+
+    #[test]
+    fn descriptor_bounds_strides_and_sizes_are_carried_whole_and_unchecked() {
+        let (srv, cbv) = (0u8, 2u8);
+        let (descriptor, table) = (1u8, 3u8);
+        // A table in s4 (slot 2) and a root descriptor in s6 (slot 3), each
+        // read once; then every field no check reads is set to a value no
+        // shipped layout states, byte by byte distinct so a field read from
+        // its neighbour's bytes, or narrowed, would show.
+        let mut blob = fssm(&[(HwStage::Ps, &PS_CODE)]);
+        set_stage_reads(
+            &mut blob,
+            HwStage::Ps,
+            &[(3, 1, 4, 2), (1, 2, 6, 3)],
+            &[(srv, table, 0x0012_3456, 4, 2), (cbv, descriptor, 0, 6, 3)],
+        );
+        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Ps)).unwrap() as usize;
+        let layout = FSSM_HEADER + u64_at(&blob, record + RECORD_LAYOUT).unwrap() as usize;
+        let used = FSSM_HEADER + u64_at(&blob, record + RECORD_USED).unwrap() as usize;
+        let set = |blob: &mut Vec<u8>, at: usize, v: u32| {
+            blob[at..][..4].copy_from_slice(&v.to_le_bytes())
+        };
+        let entry = ENTRY_SIZE as usize;
+        // The table's range offset and base register, and the descriptor's.
+        set(&mut blob, layout + 4, u32::MAX);
+        set(&mut blob, layout + 12, 0xA1B2_C3D4);
+        set(&mut blob, layout + entry + 4, 0x0102_0304);
+        set(&mut blob, layout + entry + 12, u32::MAX);
+        // The table read's lower bound, stride and size; the root
+        // descriptor's offset, which indexes no table, at its furthest.
+        set(&mut blob, used + 8, u32::MAX);
+        set(&mut blob, used + 12, 0x5566_7788);
+        blob[used + 16] = 0xFF;
+        set(&mut blob, used + entry + 4, u32::MAX);
+        set(&mut blob, used + entry + 8, 0x1122_3344);
+        set(&mut blob, used + entry + 12, 0);
+        blob[used + entry + 16] = 0;
+        let read = |blob: &[u8]| native_programs(&part(&[(KIND_NATIVE, &xbch(blob))]));
+        let p = &read(&blob).unwrap()[0];
+        assert_eq!(
+            p.layout,
+            [
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: u32::MAX,
+                    sgprs: 1,
+                    base_register: 0xA1B2_C3D4,
+                    user_data: 4,
+                    slot: 2
+                },
+                RootParam {
+                    root: RootType::Descriptor,
+                    table_offset_dwords: 0x0102_0304,
+                    sgprs: 2,
+                    base_register: u32::MAX,
+                    user_data: 6,
+                    slot: 3
+                },
+            ]
+        );
+        assert_eq!(
+            p.used,
+            [
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0x0012_3456,
+                    lower_bound: u32::MAX,
+                    stride: 0x5566_7788,
+                    dwords: 0xFF,
+                    user_data: 4,
+                    slot: 2
+                },
+                UsedResource {
+                    kind: ResourceType::Cbv,
+                    root: RootType::Descriptor,
+                    table_offset_dwords: u32::MAX,
+                    lower_bound: 0x1122_3344,
+                    stride: 0,
+                    dwords: 0,
+                    user_data: 6,
+                    slot: 3
+                },
+            ]
+        );
+        // Of all these, only a table read's own offset is bounded: moved to
+        // the heap's end it is refused, though its parameter's range offset
+        // at `u32::MAX` was not.
+        let mut past = blob.clone();
+        set(&mut past, used + 4, MAX_TABLE_DWORDS);
+        assert_eq!(why_refused(read(&past)), "used descriptor past any heap");
+        // Two reads of one descriptor as one kind are one way, however
+        // their bounds, strides and sizes differ.
+        let mut twice = fssm(&[(HwStage::Ps, &PS_CODE)]);
+        set_stage_reads(
+            &mut twice,
+            HwStage::Ps,
+            &[(3, 1, 4, 2), (1, 2, 6, 3)],
+            &[
+                (srv, table, 8, 4, 2),
+                (srv, table, 8, 4, 2),
+                (cbv, descriptor, 0, 6, 3),
+                (cbv, descriptor, 0, 6, 3),
+            ],
+        );
+        let used = FSSM_HEADER + u64_at(&twice, record + RECORD_USED).unwrap() as usize;
+        for (k, (bound, stride, dwords)) in [(0, 4, 4), (u32::MAX, 0, 8), (7, 16, 0), (0, 0, 0xFF)]
+            .into_iter()
+            .enumerate()
+        {
+            let at = used + k * entry;
+            set(&mut twice, at + 8, bound);
+            set(&mut twice, at + 12, stride);
+            twice[at + 16] = dwords;
+        }
+        let p = &read(&twice).unwrap()[0];
+        assert_eq!(
+            p.used
+                .iter()
+                .map(|u| (u.lower_bound, u.stride, u.dwords))
+                .collect::<Vec<_>>(),
+            [(0, 4, 4), (u32::MAX, 0, 8), (7, 16, 0), (0, 0, 0xFF)]
+        );
+    }
 }
