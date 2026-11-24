@@ -459,7 +459,7 @@ fn changed_pieces(shadow: &Shadow, before: usize, start: usize, from: usize, to:
         at += n;
     }
     let pieces: Vec<(usize, usize, usize)> = pieces.iter().map(|&(at, n)| (at, n, shadow.ptr(at) as usize)).collect();
-    let differs = |&(at, n, host): &(usize, usize, usize)| {
+    let differs = move |&(at, n, host): &(usize, usize, usize)| -> bool {
         // SAFETY: inside the copy (one page) and the snapshot.
         let host = unsafe { std::slice::from_raw_parts(host as *const u8, n) };
         let old = unsafe { std::slice::from_raw_parts((before + at - from) as *const u8, n) };
@@ -469,14 +469,9 @@ fn changed_pieces(shadow: &Shadow, before: usize, start: usize, from: usize, to:
     if pieces.len() < 128 || threads < 2 {
         return pieces.iter().filter(|p| differs(p)).map(|p| p.0).collect();
     }
-    let chunk = pieces.len().div_ceil(threads);
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = pieces
-            .chunks(chunk)
-            .map(|part| scope.spawn(move || part.iter().filter(|p| differs(p)).map(|p| p.0).collect::<Vec<_>>()))
-            .collect();
-        handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
-    })
+    // Use the persistent pool to avoid OS thread spawn overhead.
+    let results = crate::host::pool_foreach_bool(&pieces, differs);
+    pieces.iter().zip(results).filter_map(|(p, diff)| diff.then_some(p.0)).collect()
 }
 
 struct Entry {
