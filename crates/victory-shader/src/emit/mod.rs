@@ -52,8 +52,12 @@
 //!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the
-//!   host's view at that index must be an R32 integer view (64-bit atomics
-//!   stop the translation). Global loads from a root SRV read it raw.
+//!   host's view at that index must be an R32 integer view. 64-bit atomics
+//!   (added 2026-11-24) are two data dwords of the same instruction (a
+//!   `dmask` of 3, or of 0xF for `cmpswap`): one i64 atomic the host's view
+//!   of that index must be an R32G32 integer view for (SM 6.6, the
+//!   `AtomicInt64OnTypedResource` and `AtomicInt64OnHeapResource` flags).
+//!   Global loads from a root SRV read it raw.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
