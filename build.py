@@ -282,6 +282,7 @@ def build_target(tools, target, dxc, d3d12_reference=None):
             ("affine", "main", "cs_6_0", "affine", "affine_dxil"),
             ("affine", "accumulate", "cs_6_0", "affine_accumulate", "accumulate_dxil"),
             ("table", "main", "cs_6_0", "table", "table_dxil"),
+            ("root_cbv", "main", "cs_6_0", "root_cbv", "root_cbv_dxil"),
             ("triangle", "VSMain", "vs_6_0", "triangle_vs", "triangle_vs"),
             ("triangle", "VSFromBuffer", "vs_6_0", "triangle_input_vs", "triangle_input_vs"),
             ("triangle", "PSMain", "ps_6_0", "triangle_ps", "triangle_ps"),
@@ -295,7 +296,7 @@ def build_target(tools, target, dxc, d3d12_reference=None):
             payload = ["-DWITH_PAYLOAD=1"] if header == "mesh_ms_payload" else []
             subprocess.run([dxc, "-T", profile, "-E", entry, "-O3", *payload, "-Fh", f"{header}.h",
                             "-Vn", variable, str(src / f"{shader}.hlsl")], cwd=out, check=True)
-        for name, source in (("tables", "table_guest.cpp"), ("indirect", "indirect_guest.cpp"),
+        for name, source in (("tables", "table_guest.cpp"), ("root-cbv", "root_cbv_guest.cpp"), ("indirect", "indirect_guest.cpp"),
                              ("draw", "graphics_guest.cpp"), ("mesh", "mesh_guest.cpp"),
                              ("null-usage", "null_usage_guest.cpp")):
             obj = tools.compile(src / source, out, "/W4", "/WX", f"/I{out}")

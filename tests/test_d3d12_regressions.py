@@ -60,3 +60,14 @@ class D3D12RegressionTests(unittest.TestCase):
         self.assertFalse(validate("alias-deferred","10de:2704",0,output.replace("ms=0","ms=1999"))[0])
         self.assertFalse(validate("alias-deferred","10de:2704",0,output.replace(line,"unrelated",1))[0])
         self.assertFalse(validate("alias-deferred","10de:2704",0,output+"\nFailed to signal event")[0])
+
+    def test_root_cbv_requires_full_imports_and_real_pipeline(self):
+        receipt="d3d12-root-cbv PASS pci=10de:2704 slots=41,45 windows=4 words=16/16 guards=8"
+        logs=[receipt]+[f"TuxBox d3d12_xs: buffer backing path=imported count={i} source=view bytes={size}"
+            for i,size in enumerate((131072,65536,65536,131072),1)]
+        output="\n".join(logs)
+        self.assertTrue(validate("root-cbv","10de:2704",0,output)[0])
+        self.assertFalse(validate("root-cbv","10de:2704",0,"\n".join(logs[:-1]))[0])
+        self.assertFalse(validate("root-cbv","10de:2704",0,output.replace("131072","65536",1))[0])
+        for bad in ("has no mapped 64 KiB window","substituted null compute pipeline","null usage rank ","buffer backing path=device_standin"):
+            self.assertFalse(validate("root-cbv","10de:2704",0,output+"\n"+bad)[0])

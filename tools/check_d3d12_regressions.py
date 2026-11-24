@@ -15,6 +15,7 @@ from tempfile import TemporaryDirectory
 from time import monotonic
 
 CASES = {
+    "root-cbv": ("d3d12-root-cbv", (), "d3d12-root-cbv", ("slots=41,45", "windows=4", "words=16/16", "guards=8")),
     "tables": ("d3d12-tables", (), "d3d12-tables", ("words=16/16", "placed-srv=16/16")),
     "heaps": ("d3d12-heaps", (), "d3d12-heaps", ("words=256/256", "volume=45/45")),
     "alias-deferred": ("d3d12-copy-resource", ("--alias-deferred",), "d3d12-alias-deferred", ("overlaps=2", "old=verified", "refreshed=verified", "no_cpu_wait=1")),
@@ -31,7 +32,7 @@ CASES = {
     "buffer-import-reject": ("d3d12-buffer-import", ("--reject",), "d3d12-buffer-import-reject", ("rejected=1",)),
     "null-usage": ("d3d12-null-usage", (), "d3d12-null-usage", ("words=64/64", "recorded=64", "valid=2")),
 }
-DEFAULT = tuple(name for name in CASES if name not in ("alias-deferred", "copy-resource", "indirect-scarlett", "mesh", "buffer-import", "buffer-import-reject", "buffer-layout", "buffer-remap"))
+DEFAULT = tuple(name for name in CASES if name not in ("root-cbv", "alias-deferred", "copy-resource", "indirect-scarlett", "mesh", "buffer-import", "buffer-import-reject", "buffer-layout", "buffer-remap"))
 DIGEST = hashlib.sha256(bytes.fromhex("78563412efcdab90")).hexdigest()
 
 
@@ -46,6 +47,16 @@ def validate(case, adapter, status, output):
     passes = [line for line in output.splitlines() if line.lower().startswith(prefix.lower())]
     if status or len(passes) != 1 or any(marker not in passes[0].split() for marker in markers):
         return False, None
+    if case == "root-cbv":
+        if any(marker in output for marker in ("has no mapped 64 KiB window",
+                "substituted null ", "null usage rank ", "buffer backing path=device_standin")):
+            return False, passes[0]
+        imports = re.findall(r"(?m)^(?:TuxBox d3d12_xs: )?buffer backing path=imported "
+                             r"count=([0-9]+) source=view bytes=([0-9]+)$", output)
+        # Raw guest addresses are not registered as resources beforehand.
+        # Each fresh list imports the full window rounded to 64 KiB pages.
+        if imports != [("1","131072"),("2","65536"),("3","65536"),("4","131072")]:
+            return False, passes[0]
     if case in ("buffer-import","buffer-import-reject"):
         # Proton may insert another diagnostic between the provider prefix
         # and its message. Accept an exact complete body, optionally prefixed.
@@ -149,7 +160,8 @@ def main(argv=None):
             env={"WINEPREFIX":trial/"prefix","WINESERVER":files/"bin/wineserver",
                  "WINEDEBUG":"-all","VKD3D_DEBUG":"warn","WINEDLLOVERRIDES":"d3d12,d3d12core,dxgi=n,b",
                  "XDG_CACHE_HOME":trial/"cache","XDG_RUNTIME_DIR":trial/"runtime","TMPDIR":trial/"tmp",
-                 "VKD3D_SHADER_CACHE_PATH":trial,"TUXBOX_LOG":"stderr","TUXBOX_TRACE_PRESENT":"1", "TUXBOX_REQUIRE_BUFFER_IMPORT":"1" if case.startswith("buffer-") else "0", "TUXBOX_TRACE_BUFFER_BACKING":"1" if case.startswith("buffer-") else "0"}
+                 "VKD3D_SHADER_CACHE_PATH":trial,"TUXBOX_LOG":"stderr","TUXBOX_TRACE_PRESENT":"1", "TUXBOX_REQUIRE_BUFFER_IMPORT":"1" if case.startswith("buffer-") else "0", "TUXBOX_TRACE_BUFFER_BACKING":"1" if case.startswith("buffer-") or case=="root-cbv" else "0"}
+            if case=="root-cbv": env["TUXBOX_NULL_PIPELINES"]="0"
             cmd=["bwrap","--die-with-parent","--unshare-pid","--unshare-net","--ro-bind","/","/",
                  "--dev-bind","/dev","/dev","--proc","/proc","--tmpfs","/tmp","--bind",str(trial),str(trial),
                  "--unsetenv","WAYLAND_DISPLAY","--chdir",str(trial)]
