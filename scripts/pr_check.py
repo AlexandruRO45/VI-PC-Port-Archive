@@ -39,19 +39,21 @@ def smoke_blocks(body):
     return out
 
 
-def filled(body, section):
-    """Whether `body` has a `**section**` heading, on a line of its own, with something written
-    under it before the next heading, which is a line of its own too. Comments are taken out
-    first, so a heading or a result inside one is not there; list markers with nothing after
-    them are not something."""
-    # an unclosed comment hides the rest of the description on GitHub, so it takes it here too
+def section_texts(body, section):
+    """What is written under each `**section**` heading of `body`, up to the next heading. A
+    heading is a line of its own. Comments are taken out first, so a heading or a line inside
+    one is not there; an unclosed comment hides the rest of the description, as on GitHub."""
     body = re.sub(r"<!--.*?(?:-->|\Z)", "", body, flags=re.S)
     end = r"(?=\n[ \t]*\*\*(?:" + "|".join(HEADINGS) + r")\*\*[ \t]*(?:\n|\Z)|\Z)"
     start = r"(?:^|\n)[ \t]*\*\*" + section + r"\*\*[ \t]*(?=\n)"
-    for m in re.finditer(start + r"(.*?)" + end, body, re.S):
-        if re.sub(r"^[ \t]*[-*+][ \t]*$", "", m.group(1), flags=re.M).strip():
-            return True
-    return False
+    return [m.group(1) for m in re.finditer(start + r"(.*?)" + end, body, re.S)]
+
+
+def filled(body, section):
+    """Whether `body` has a `**section**` heading with something written under it: list markers
+    with nothing after them are not something."""
+    return any(re.sub(r"^[ \t]*[-*+][ \t]*$", "", text, flags=re.M).strip()
+               for text in section_texts(body, section))
 
 
 def number(s):
@@ -73,8 +75,8 @@ def check(body, head, files, is_main_ancestor):
         if not filled(body, section):
             problems.append(f"the **{section}** section is missing or empty")
 
-    ai = re.search(r"\*\*AI use\*\*(.*?)(\n\*\*|\Z)", body, re.S)
-    banned = re.findall(BANNED_MODELS, ai.group(1), re.I) if ai else []
+    # the same text the section check reads: what a reader of the description sees under AI use
+    banned = re.findall(BANNED_MODELS, "\n".join(section_texts(body, "AI use")), re.I)
     if banned:
         problems.append("**AI use** names a model this repository does not accept for code ("
                         + ", ".join(sorted({b.lower() for b in banned})) + "): see CONTRIBUTING.md")

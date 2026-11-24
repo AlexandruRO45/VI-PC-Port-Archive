@@ -106,5 +106,38 @@ class Sections(unittest.TestCase):
         self.assertEqual(problems(body), [])
 
 
+def banned(*models):
+    return ("**AI use** names a model this repository does not accept for code ("
+            + ", ".join(models) + "): see CONTRIBUTING.md")
+
+
+class BannedModels(unittest.TestCase):
+    QWEN = FILLED.replace("- none\n", "- Qwen3-Coder wrote the code\n")
+
+    def test_model_under_ai_use_is_refused(self):
+        self.assertEqual(problems(self.QWEN), [banned("qwen")])
+        self.assertEqual(problems(FILLED), [])
+
+    def test_section_name_elsewhere_does_not_hide_the_section(self):
+        # in a comment at the top, or in a sentence of another section
+        body = "<!-- see **AI use** at the end -->\n" + self.QWEN
+        self.assertEqual(problems(body), [banned("qwen")])
+        body = self.QWEN.replace("- `scripts/example.py`: the change\n",
+                                 "- the **AI use** section is short\n")
+        self.assertEqual(problems(body), [banned("qwen")])
+
+    def test_bold_line_does_not_end_the_section(self):
+        body = FILLED.replace("- none\n", "- Claude Code\n**also** Qwen3 for the tests\n")
+        self.assertEqual(problems(body), [banned("qwen")])
+
+    def test_comment_is_not_what_was_used(self):
+        body = FILLED.replace("- none\n", "<!-- not qwen or llama -->\n- Claude Code\n")
+        self.assertEqual(problems(body), [])
+
+    def test_model_in_another_section_is_not_ai_use(self):
+        body = FILLED.replace("- Windows\n", "- nothing with Llama\n")
+        self.assertEqual(problems(body), [])
+
+
 if __name__ == "__main__":
     unittest.main()
