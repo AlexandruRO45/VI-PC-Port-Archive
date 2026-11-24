@@ -260,4 +260,57 @@ mod tests {
             }
         }
     }
+
+    /// The minimum and maximum reductions sit beside every point and linear
+    /// filter combination unchanged, as they do beside the anisotropic one.
+    #[test]
+    fn the_reduction_keeps_every_filter_combination() {
+        let filter = |w0: u32, w2: u32| StaticSampler::from_words([w0, 0, w2, 0]).filter;
+        for (field, reduction) in [(1u32, 2u32), (2, 3)] {
+            for mag in 0..2u32 {
+                for min in 0..2u32 {
+                    for mip in 0..3u32 {
+                        let w2 = mag << 20 | min << 22 | mip << 26;
+                        let base = filter(0, w2);
+                        assert_eq!(
+                            filter(field << 29, w2),
+                            base | reduction << 7,
+                            "reduction {field} mag {mag} min {min} mip {mip}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The fourth mip mode is no linear mip filter, but it is a mip filter:
+    /// the LOD range is read as for point.
+    #[test]
+    fn the_fourth_mip_mode_is_point_with_its_lod_range() {
+        let s = |mip: u32| StaticSampler::from_words([0, 0x0054_0100, mip << 26, 0]);
+        let fourth = s(3);
+        assert_eq!(fourth, s(1));
+        assert_eq!(fourth.filter, 0);
+        assert_eq!((fourth.min_lod, fourth.max_lod), (1.0, 5.25));
+        // The LOD fields' top value is 15.996, not the full 4.8 range of 16.
+        let top = StaticSampler::from_words([0, 0x00FF_FFFF, 1 << 26, 0]);
+        assert_eq!((top.min_lod, top.max_lod), (4095.0 / 256.0, 4095.0 / 256.0));
+    }
+
+    /// Bits of words 1 and 2 outside the LOD, bias and filter fields change
+    /// nothing, with a mip filter set so the LOD fields are read.
+    #[test]
+    fn undecoded_bits_of_words_1_and_2_are_ignored() {
+        let (w1, w2) = (0x0054_0100, 0x0850_0080);
+        let base = StaticSampler::from_words([0, w1, w2, 0]);
+        let unused_w1 = 0xFF00_0000;
+        // 14-19 between the bias and the filters, 24-25 between the
+        // minification and mip filters, 28-31 past the mip filter.
+        let unused_w2 = 0x000F_C000 | 0x0300_0000 | 0xF000_0000;
+        assert_eq!(
+            StaticSampler::from_words([0, w1 | unused_w1, w2 | unused_w2, 0]),
+            base
+        );
+        assert_eq!((base.filter, base.mip_lod_bias), (0x15, 0.5));
+    }
 }
