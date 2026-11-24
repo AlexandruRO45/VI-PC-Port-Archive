@@ -64,15 +64,26 @@ fn probe_dll() -> Option<PathBuf> {
     let root = workspace_root();
     let manifest = root.join("tests/fixtures/hle-probe/Cargo.toml");
     let target = root.join("target/fixtures");
+    // Name the target: a `CARGO_BUILD_TARGET` or `build.target` from the
+    // environment or a user config would otherwise move the output under a
+    // triple directory the path below does not expect. The fixture's build
+    // script passes MSVC linker flags, hence `-msvc`.
+    let triple = format!("{}-pc-windows-msvc", std::env::consts::ARCH);
     let status = Command::new(env!("CARGO"))
-        .args(["build", "--quiet", "--manifest-path"])
+        .args(["build", "--quiet", "--locked", "--manifest-path"])
         .arg(&manifest)
-        .arg("--target-dir")
+        .args(["--target", &triple, "--target-dir"])
         .arg(&target)
         .status()
         .expect("running cargo");
     assert!(status.success(), "building hle-probe failed");
-    Some(target.join("debug").join("hle_probe.dll"))
+    let dll = target.join(&triple).join("debug").join("hle_probe.dll");
+    assert!(
+        dll.is_file(),
+        "hle-probe built, but {} is missing",
+        dll.display()
+    );
+    Some(dll)
 }
 
 extern "system" fn fake_xgameruntime_initialize() -> i32 {
