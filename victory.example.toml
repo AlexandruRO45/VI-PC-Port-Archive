@@ -13,7 +13,8 @@ game_dir = 'D:\victory-data\game'
 # (Linux) $XDG_CACHE_HOME/victory, else ~/.cache/victory.   env: VICTORY_CACHE_DIR
 # cache_dir = 'D:\victory-data\cache'
 
-# What titles save (persistent local storage), kept apart from the cache.
+# What titles save (persistent local storage), kept apart from the cache:
+# it must not be inside cache_dir, which may be deleted at any time.
 # Default: %LOCALAPPDATA%\victory\data, or without LOCALAPPDATA (Linux)
 # $XDG_DATA_HOME/victory, else ~/.local/share/victory.   env: VICTORY_DATA_DIR
 # data_dir = 'D:\victory-data\data'

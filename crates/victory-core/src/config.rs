@@ -122,6 +122,7 @@ impl Config {
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
             .map_or_else(|| default_dir(Kind::Data, &env), Ok)?;
+        ensure_data_outside_cache(&cache_dir, &data_dir)?;
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
@@ -177,6 +178,23 @@ fn config_file(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
         "VICTORY_CONFIG points at {}, which does not exist",
         path.display()
     );
+}
+
+/// The data folder holds what titles must keep and the cache may be deleted
+/// at any time, so data inside (or equal to) the cache would be lost with it.
+/// Easy to set up by accident, e.g. `VICTORY_CACHE_DIR=~/victory` with
+/// `VICTORY_DATA_DIR=~/victory/data`. Compared as written (no symlinks
+/// followed): the folders need not exist yet.
+fn ensure_data_outside_cache(cache_dir: &Path, data_dir: &Path) -> Result<()> {
+    if data_dir.starts_with(cache_dir) {
+        anyhow::bail!(
+            "the data folder {} is inside the cache folder {}, which may be deleted at any \
+             time; set VICTORY_DATA_DIR or [paths].data_dir to a folder outside it",
+            data_dir.display(),
+            cache_dir.display()
+        );
+    }
+    Ok(())
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -436,7 +454,7 @@ mod tests {
         let titles = format!("~/one{sep}~/two");
         let env = |k: &str| match k {
             "VICTORY_GAME_DIR" => Some(OsString::from("~/games/gta")),
-            "VICTORY_CACHE_DIR" => Some(OsString::from("~")),
+            "VICTORY_CACHE_DIR" => Some(OsString::from("~/cache")),
             "VICTORY_TEST_TITLES" => Some(OsString::from(&titles)),
             "HOME" => Some(abs("home")),
             _ => None,
@@ -444,7 +462,7 @@ mod tests {
         let cfg = Config::resolve(FilePaths::default(), None, env).unwrap();
         let home = PathBuf::from(abs("home"));
         assert_eq!(cfg.game_dir.unwrap(), home.join("games/gta"));
-        assert_eq!(cfg.cache_dir, home);
+        assert_eq!(cfg.cache_dir, home.join("cache"));
         assert_eq!(cfg.test_titles, vec![home.join("one"), home.join("two")]);
     }
 
@@ -480,6 +498,41 @@ mod tests {
         let err = config_file(Some(missing)).unwrap_err().to_string();
         assert!(err.contains("does not exist"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn data_inside_the_cache_is_refused() {
+        let env = |k: &str| match k {
+            "VICTORY_CACHE_DIR" => Some(abs("v")),
+            "VICTORY_DATA_DIR" => Some(PathBuf::from(abs("v")).join("data").into()),
+            _ => None,
+        };
+        let err = Config::resolve(FilePaths::default(), None, env)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inside the cache folder"), "{err}");
+
+        // The same folder for both counts as inside.
+        let same = |k: &str| match k {
+            "VICTORY_CACHE_DIR" | "VICTORY_DATA_DIR" => Some(abs("v")),
+            _ => None,
+        };
+        assert!(Config::resolve(FilePaths::default(), None, same).is_err());
+
+        // A sibling whose name merely starts with the cache's is fine, and so
+        // is the cache inside the data folder.
+        let sibling = |k: &str| match k {
+            "VICTORY_CACHE_DIR" => Some(abs("v")),
+            "VICTORY_DATA_DIR" => Some(abs("v-data")),
+            _ => None,
+        };
+        assert!(Config::resolve(FilePaths::default(), None, sibling).is_ok());
+        let cache_in_data = |k: &str| match k {
+            "VICTORY_CACHE_DIR" => Some(PathBuf::from(abs("v")).join("cache").into()),
+            "VICTORY_DATA_DIR" => Some(abs("v")),
+            _ => None,
+        };
+        assert!(Config::resolve(FilePaths::default(), None, cache_in_data).is_ok());
     }
 
     #[test]
