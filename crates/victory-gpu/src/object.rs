@@ -61,6 +61,33 @@ impl Object {
 
 pub(crate) type This = *const Object;
 
+/// One reference to an object held by queued work.
+pub(crate) struct Held(This);
+
+// SAFETY: the objects queued here (fences and resources) have atomic
+// reference counts and support calls from multiple threads.
+unsafe impl Send for Held {}
+
+impl Held {
+    pub(crate) fn new(this: This) -> Self {
+        add_ref(this);
+        Self(this)
+    }
+
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        // SAFETY: a live object of ours; slot 2 is its Release method.
+        let release: extern "system" fn(This) -> u32 =
+            unsafe { std::mem::transmute(*(*self.0).functions.add(2)) };
+        release(self.0);
+    }
+}
+
 #[repr(transparent)]
 pub(crate) struct Table<const N: usize>(pub [*const (); N]);
 // SAFETY: function addresses only.

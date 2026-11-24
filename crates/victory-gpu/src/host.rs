@@ -521,9 +521,17 @@ enum Step {
     Memory(usize),
 }
 
-/// What a list does on the CPU when it is submitted: copies between host
-/// memory regions (title buffers, upload buffers and buffer copies), and
-/// the upload buffers its GPU commands read, kept until the list is reset.
+type PipeWrite = (usize, crate::queue::Written, usize);
+pub(crate) type Gate = (usize, u32, u64, u8, Vec<PipeWrite>);
+
+/// A D3D12 object kept only for its lifetime, never for its methods.
+struct Kept(#[allow(dead_code)] windows::core::IUnknown);
+
+// SAFETY: constructed only from Send interfaces. Casting to IUnknown keeps
+// the same object's thread-safe reference count; only Release is ever used.
+unsafe impl Send for Kept {}
+
+/// CPU-side submission work and resources kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
     /// Destination, source, bytes.
@@ -532,7 +540,7 @@ struct Deferred {
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
-    kept: Vec<windows::core::IUnknown>,
+    kept: Vec<Kept>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -540,7 +548,11 @@ struct Deferred {
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
-    writes: Vec<(usize, crate::queue::Written, usize)>,
+    writes: Vec<PipeWrite>,
+    // Memory waits gate the whole host list; `before` counts prior writes.
+    waits: Vec<(usize, u32, u64, u8, usize)>,
+    // Set only when the title resets/releases a still-queued recording.
+    retained: Option<(Vec<crate::list::Upload>, crate::draw::State)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
@@ -892,9 +904,12 @@ impl Host {
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
+        let mut woken = crate::fence::Woken::default();
         for list in runs {
-            for &(at, what, bytes) in &list.deferred().writes {
-                what.write(at as *mut u8, bytes);
+            let deferred = list.deferred();
+            let before = deferred.waits.last().map_or(0, |w| w.4);
+            for &(at, what, bytes) in &deferred.writes[before..] {
+                woken.add(what.write(at as *mut u8, bytes));
             }
         }
         // Only the successful fence path releases the old references.
@@ -917,7 +932,12 @@ impl Host {
                 }
             }
             crate::capture::dump_submission(sub, &targets);
+            woken.run();
+            return;
         }
+        // Woken queues may call execute themselves.
+        drop(submitted);
+        woken.run();
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1549,6 +1569,35 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
+    pub(crate) fn retain_recording(&self, uploads: Vec<crate::list::Upload>, state: crate::draw::State) {
+        self.deferred().retained = Some((uploads, state));
+    }
+
+    pub(crate) fn defer_wait(&self, addr: usize, cmp: u32, value: u64, width: u8) {
+        let mut deferred = self.deferred();
+        // We don't split host command lists. Keep the original port's
+        // exception for same-list producers: do not gate the recording
+        // on its own bottom-of-pipe write.
+        if deferred.writes.iter().any(|&(at, _, bytes)| {
+            at < addr.saturating_add(usize::from(width)) && at.saturating_add(bytes) > addr
+        }) {
+            return;
+        }
+        let before = deferred.writes.len();
+        deferred.waits.push((addr, cmp, value, width, before));
+    }
+
+    /// Snapshot, not drain: a closed list can be submitted again.
+    pub(crate) fn gates(&self) -> Vec<Gate> {
+        let deferred = self.deferred();
+        let mut from = 0;
+        deferred.waits.iter().map(|&(addr, cmp, value, width, before)| {
+            let writes = deferred.writes[from..before].to_vec();
+            from = before;
+            (addr, cmp, value, width, writes)
+        }).collect()
+    }
+
     /// A mapped upload buffer of `size` bytes, alive until the list is
     /// reset.
     ///
@@ -1656,9 +1705,9 @@ impl HostList {
     }
 
     /// Keeps `object` alive until the list is reset.
-    pub(crate) fn keep(&self, object: &impl Interface) {
+    pub(crate) fn keep(&self, object: &(impl Interface + Send)) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
+            self.deferred().kept.push(Kept(object));
         }
     }
 

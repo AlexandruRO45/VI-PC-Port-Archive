@@ -116,7 +116,7 @@ struct List {
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Upload>>,
     #[cfg(windows)]
-    host: Option<crate::host::HostList>,
+    host: std::sync::Mutex<Option<std::sync::Arc<crate::host::HostList>>>,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
@@ -126,12 +126,20 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 #[cfg(windows)]
 impl Drop for List {
     fn drop(&mut self) {
-        // Current upstream queues borrow host lists only for a synchronous
-        // submission. A deferred queue must keep the owning List alive.
-        if let Some(list) = self.host.take()
-            && let Some(host) = crate::host::host()
-        {
-            host.recycle_list(list);
+        let Some(list) = self.host.get_mut().unwrap_or_else(|e| e.into_inner()).take() else { return };
+        match std::sync::Arc::try_unwrap(list) {
+            Ok(list) => {
+                if let Some(host) = crate::host::host() {
+                    host.recycle_list(list);
+                }
+            }
+            Err(pending) => {
+                // A deferred queue still owns this recording. Keep uploads
+                // and descriptor slots until its host list is released.
+                let uploads = std::mem::take(self.uploads.get_mut().unwrap_or_else(|e| e.into_inner()));
+                let state = std::mem::take(self.state.get_mut().unwrap_or_else(|e| e.into_inner()));
+                pending.retain_recording(uploads, state);
+            }
         }
     }
 }
@@ -143,17 +151,15 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    f(&list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
-pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
-    if this.is_null() {
-        return None;
-    }
-    // SAFETY: the title passes one of our lists.
-    unsafe { (*this.cast::<List>()).host.as_ref() }
+pub(crate) fn host_list(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
+    // SAFETY: if non-null, the title passes one of our lists.
+    let list = unsafe { this.cast::<List>().as_ref() }?;
+    list.host.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -229,13 +235,13 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
+        host: std::sync::Mutex::new(crate::host::host().and_then(|h| match h.new_list() {
+            Ok(list) => Some(std::sync::Arc::new(list)),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
                 None
             }
-        }),
+        })),
         #[cfg(windows)]
         state: Default::default(),
     });
@@ -275,17 +281,37 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // Every submission of the list has run (submissions are waited for).
-    // SAFETY: the title passes one of our lists.
-    let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    // SAFETY: the title passes one of our lists and does not record on it
+    // concurrently with Reset.
+    let list = unsafe { &*this.cast::<List>() };
+    let mut uploads = list.uploads.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
+    {
+        let mut host = list.host.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(old) = host.as_ref() {
+            if std::sync::Arc::strong_count(old) > 1 {
+                // The queue may still run this recording. Keep its upload
+                // memory and descriptor slots along with the host commands.
+                let fresh = crate::host::host().expect("host list without a host").new_list();
+                let fresh = match fresh {
+                    Ok(fresh) => fresh,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not replace a pending host list");
+                        return error.code().0;
+                    }
+                };
+                old.retain_recording(std::mem::take(&mut *uploads), std::mem::take(&mut *state));
+                *host = Some(std::sync::Arc::new(fresh));
+            } else {
+                old.reset();
+            }
+        }
         state.reset(pipeline);
-    });
+    }
+    uploads.clear();
     #[cfg(not(windows))]
-    let _ = (this, pipeline);
+    let _ = pipeline;
     S_OK
 }
 
@@ -372,7 +398,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = barriers
             .iter()
-            .filter_map(|b| host_barrier(list, b))
+            .filter_map(|b| host_barrier(&list, b))
             .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
@@ -460,10 +486,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(src),
         ) {
             if crate::texture::title_written(from) {
-                crate::texture::upload(list, src, from);
+                crate::texture::upload(&list, src, from);
             }
-            ensure_state(list, dst, COPY_DEST);
-            ensure_state(list, src, COPY_SOURCE);
+            ensure_state(&list, dst, COPY_DEST);
+            ensure_state(&list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
@@ -554,12 +580,12 @@ extern "system" fn copy_texture_region(
                 return;
             };
             if crate::texture::title_written(texture) {
-                crate::texture::upload(list, src.resource, texture);
+                crate::texture::upload(&list, src.resource, texture);
             }
-            ensure_state(list, src.resource, COPY_SOURCE);
+            ensure_state(&list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
-        ensure_state(list, dst.resource, COPY_DEST);
+        ensure_state(&list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
@@ -642,8 +668,8 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
-        ensure_state(list, dst, RESOLVE_DEST);
-        ensure_state(list, src, RESOLVE_SOURCE);
+        ensure_state(&list, dst, RESOLVE_DEST);
+        ensure_state(&list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
@@ -763,7 +789,7 @@ extern "system" fn clear_dsv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const DEPTH_WRITE: u32 = 0x10;
-        ensure_state(list, record.resource, DEPTH_WRITE);
+        ensure_state(&list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
@@ -925,7 +951,7 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 /// find title memory by address (`crate::memory`; the console's GPU
 /// addresses have 40 bits), and is a buffer of its own to the host copies
 /// (`crate::shadow`), so its copy is exactly it.
-struct Upload {
+pub(crate) struct Upload {
     #[cfg(windows)]
     at: usize,
     #[cfg(windows)]
@@ -1034,23 +1060,23 @@ mod state {
         viewports: *const D3D12_VIEWPORT,
     ) {
         if let Some(list) = host_list(this) {
-            crate::draw::viewports(list, items(viewports, count));
+            crate::draw::viewports(&list, items(viewports, count));
         }
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
         if let Some(list) = host_list(this) {
-            crate::draw::scissors(list, items(rects, count));
+            crate::draw::scissors(&list, items(rects, count));
         }
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
         if let Some(list) = host_list(this) {
             // SAFETY: the title passes four floats or null.
-            crate::draw::blend_factor(list, unsafe { factor.as_ref() });
+            crate::draw::blend_factor(&list, unsafe { factor.as_ref() });
         }
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
         if let Some(list) = host_list(this) {
-            crate::draw::stencil_ref(list, reference);
+            crate::draw::stencil_ref(&list, reference);
         }
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
@@ -1358,10 +1384,35 @@ pub(crate) fn take_counts() -> (u64, u64) {
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
 }
 
-/// A GPU wait for a memory value `(address, comparison, reference, ...)`.
-/// Lists run one after another and to completion, so a value another queue
-/// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+/// A GPU wait for a memory value `(address, comparison, reference, flags)`.
+/// Tested when the queue reaches the list, not while it is being recorded.
+extern "system" fn wait32(this: This, address: u64, cmp: u32, reference: u32, flags: u32) {
+    wait_memory(this, address, cmp, u64::from(reference), flags, 4);
+}
+
+extern "system" fn wait64(this: This, address: u64, cmp: u32, reference: u64, flags: u32) {
+    wait_memory(this, address, cmp, reference, flags, 8);
+}
+
+fn wait_memory(this: This, address: u64, cmp: u32, value: u64, flags: u32, width: u8) {
+    if cmp == 8 {
+        return; // ALWAYS
+    }
+    if cmp == 1 || crate::fence::compare_u64(cmp, 0, 0).is_none() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(cmp, "unsupported list wait_value comparison"));
+        return;
+    }
+    #[cfg(windows)]
+    if let Ok(addr) = usize::try_from(address)
+        && let Some(list) = host_list(this)
+    {
+        tracing::debug!(target: "victory_gpu::xsync", list = ?this, address = format_args!("{addr:#x}"), cmp, value, flags, width, "list wait_value recorded");
+        list.defer_wait(addr, cmp, value, width);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, address, value, flags, width);
+}
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
@@ -1411,7 +1462,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     }
     let _ = this;
     // Without a host GPU nothing runs later: write now.
-    what.write(address as *mut u8, bytes);
+    what.write(address as *mut u8, bytes).run();
 }
 
 /// The list methods by their slot in older titles' lists (the 2020-era
@@ -1464,8 +1515,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (68, ignored_state as *const ()),             // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
-    (71, wait_value as *const ()),                // 0x238, 32 bits
-    (72, wait_value as *const ()),                // 0x240, 64 bits
+    (71, wait32 as *const ()),                     // 0x238, 32 bits
+    (72, wait64 as *const ()),                     // 0x240, 64 bits
     (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0
@@ -1554,6 +1605,40 @@ mod tests {
             );
             assert_eq!(table.0[0x1b8 / 8], ignored_state as *const ());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn memory_wait_slots_record_width_and_survive_reset_of_pending_list() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        let mut list = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        if let Some(old) = host_list(list) {
+            let at = allocate_upload(list, 16, 16);
+            assert!(!at.is_null());
+            // SAFETY: the first field of our live list is its vtable pointer.
+            let table = unsafe { *list.cast::<*const *const ()>() };
+            let newer = table == NEWER_LIST_FUNCTIONS.0.as_ptr();
+            let offset = |n| (if newer { newer_slot(n) } else { n }) * 8;
+            let wait32 = slot::<extern "system" fn(This, u64, u32, u32, u32)>(list, offset(71));
+            let wait64 = slot::<extern "system" fn(This, u64, u32, u64, u32)>(list, offset(72));
+            wait32(list, at as u64, 3, 17, 0);
+            wait64(list, at as u64 + 8, 7, 0x1_0000_0019, 0);
+            assert_eq!(close(list), S_OK);
+            assert_eq!(reset(list, allocator, null), S_OK);
+            let fresh = host_list(list).unwrap();
+            assert!(!std::sync::Arc::ptr_eq(&old, &fresh));
+            assert!(fresh.gates().is_empty());
+            let gates = old.gates();
+            assert_eq!(gates.len(), 2);
+            assert_eq!((gates[0].0, gates[0].1, gates[0].2, gates[0].3), (at as usize, 3, 17, 4));
+            assert_eq!((gates[1].0, gates[1].1, gates[1].2, gates[1].3), (at as usize + 8, 7, 0x1_0000_0019, 8));
+            assert_eq!(crate::fence::read_cell(at as usize, 4), Some(0));
+        }
+        assert_eq!(list_release(list), 0);
+        assert_eq!(allocator_release(allocator), 0);
     }
 
     #[test]
