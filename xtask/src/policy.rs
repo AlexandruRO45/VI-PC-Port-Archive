@@ -1651,6 +1651,134 @@ mod tests {
         assert_eq!(names_built_by(&plain, &exe), ["a.rs"]);
     }
 
+    /// The checkout reached by another spelling (through a symlink, or a
+    /// path through `..`) finds the same build directory: `build_dir_in`
+    /// compares canonical paths but answers relative to the checkout, so
+    /// git's listing and the walk, both made from the spelling given, pass
+    /// it over alike. A program reached by another spelling is the same
+    /// program, too.
+    #[cfg(unix)]
+    #[test]
+    fn a_build_directory_is_found_however_the_checkout_is_reached() {
+        let outer = tempdir();
+        let links = tempdir();
+        for repository in [true, false] {
+            let name = if repository { "repo" } else { "plain" };
+            let real = outer.path().join(name);
+            std::fs::create_dir(&real).unwrap();
+            if repository {
+                git_str(&real, &["init", "-q"]);
+            }
+            std::fs::create_dir(real.join("src")).unwrap();
+            std::fs::write(real.join("src/a.rs"), b"fn a() {}\n").unwrap();
+            let exe = fake_build_dir(&real.join("build-out"));
+            let link = links.path().join(name);
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let dotted = real.join("src").join("..");
+            let exe_via_link = link.join("build-out/debug/deps/xtask-0123");
+
+            for root in [&real, &link, &dotted] {
+                for exe in [&exe, &exe_via_link] {
+                    assert_eq!(
+                        super::build_dir_in(root, exe).as_deref(),
+                        Some(&b"build-out"[..]),
+                        "{} {}",
+                        root.display(),
+                        exe.display()
+                    );
+                    assert_eq!(
+                        names_built_by(root, exe),
+                        ["src/a.rs"],
+                        "{} {}",
+                        root.display(),
+                        exe.display()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A CARGO_TARGET_DIR whose name merely contains a `.git` or `target`
+    /// component spelled otherwise (`.git-build`, `target2`) is not skipped
+    /// by those names: outside a repository the walk passes over only the
+    /// running build directory, and a sibling build directory still has its
+    /// object files read.
+    #[cfg(unix)]
+    #[test]
+    fn build_directories_are_not_matched_by_name_alone() {
+        let outer = tempdir();
+        let plain = outer.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join("a.rs"), b"fn a() {}\n").unwrap();
+        let exe = fake_build_dir(&plain.join(".git-build"));
+        fake_build_dir(&plain.join("target2"));
+        fake_build_dir(&plain.join("x/target"));
+
+        let listed = names_built_by(&plain, &exe);
+        assert!(
+            !listed.iter().any(|n| n.starts_with(".git-build/")),
+            "{listed:?}"
+        );
+        assert!(listed.contains(&"a.rs".to_owned()), "{listed:?}");
+        assert!(
+            listed.contains(&"target2/debug/main.o".to_owned()),
+            "{listed:?}"
+        );
+        // A directory named `target`, at any depth, is skipped by the walk.
+        assert!(!listed.iter().any(|n| n.starts_with("x/")), "{listed:?}");
+    }
+
+    /// A TMPDIR that is unset to nothing, missing, or a dangling symlink is
+    /// passed over for the next candidate, not panicked on, and nothing is
+    /// made in its place.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_pass_over_missing_candidates() {
+        let outer = tempdir();
+        let missing = outer.path().join("missing");
+        let dangling = outer.path().join("dangling");
+        std::os::unix::fs::symlink(outer.path().join("gone"), &dangling).unwrap();
+        let plain = outer.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+
+        let tmp = tempdir_in_first(
+            &crate::workspace_root(),
+            [
+                std::path::PathBuf::new(),
+                missing.clone(),
+                dangling.clone(),
+                plain.clone(),
+            ],
+        );
+        assert!(tmp.path().starts_with(plain.canonicalize().unwrap()));
+        assert!(!missing.exists());
+        assert!(!outer.path().join("gone").exists());
+    }
+
+    /// Git passes over any entry named `.git`, not only the repository's
+    /// own: a TMPDIR kept under an empty `sub/.git` (left behind by a
+    /// half-made clone, say) is unseen by the full check, as
+    /// `unseen_by_full_check` assumes, and is not a nested repository.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_may_live_in_any_git_directory() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        let visible = root.join("sub/visible");
+        let scratch = root.join("sub/.git/scratch");
+        std::fs::create_dir_all(&visible).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(root.join("sub/a.rs"), b"fn a() {}\n").unwrap();
+
+        let tmp = tempdir_in_first(root, [visible.clone(), scratch.clone()]);
+        assert_eq!(tmp.path().parent(), Some(scratch.as_path()));
+        assert_eq!(std::fs::read_dir(&visible).unwrap().count(), 0);
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        assert_eq!(names(root, false), ["sub/a.rs"]);
+        super::run(root, false).unwrap();
+    }
+
     /// `path` quoted for `sh`, for the scripts tests write: a TMPDIR holding
     /// `'` made the hook and filter commands built from it shell syntax
     /// errors, and the git commands running them failed.
