@@ -209,9 +209,14 @@ const REPOSITORY_ENV: &[&str] = &[
 ///
 /// Temporary repositories also read no global or system configuration: a
 /// developer's `core.excludesFile` would hide the files a test stages, and
-/// their `core.hooksPath` would run their hooks inside it. The checkout
-/// itself keeps that configuration, since a global excludes file is how
-/// files that will never be added (`.DS_Store`) stay out of the full check.
+/// their `core.hooksPath` would run their hooks inside it. Nor do they read
+/// the ignore and attributes files git looks for without any configuration
+/// (`$XDG_CONFIG_HOME/git/ignore`, else `~/.config/git/ignore`, the same for
+/// `attributes`, and the system gitattributes): a `*.rs` there hides what a
+/// test stages just as an excludes file would, and a `filter=` there changes
+/// what it stages. The checkout itself keeps all of that, since a global
+/// excludes file is how files that will never be added (`.DS_Store`) stay
+/// out of the full check.
 pub(crate) fn git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(root);
@@ -224,11 +229,23 @@ pub(crate) fn git_command(root: &Path) -> Command {
             // Git for Windows opens "/dev/null" as NUL.
             command
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1");
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_ATTR_NOSYSTEM", "1")
+                .env("XDG_CONFIG_HOME", NO_XDG_CONFIG);
         }
     }
     command
 }
+
+/// A configuration directory that never exists, so git finds no `git/ignore`
+/// or `git/attributes` in it. Relative paths would resolve against each
+/// temporary repository, where a test could create them.
+#[cfg(test)]
+const NO_XDG_CONFIG: &str = if cfg!(windows) {
+    "NUL:/victory-policy-tests"
+} else {
+    "/dev/null/victory-policy-tests"
+};
 
 /// Splits NUL-terminated git output; each field is returned raw.
 fn git_z(root: &Path, args: &[&str]) -> Result<Option<Vec<Vec<u8>>>> {
@@ -761,8 +778,6 @@ mod tests {
         assert!(super::run(root, false).is_err());
     }
 
-    /// Git's own settings can hide a submodule from `git diff`; the staged
-    /// check must see it anyway.
     /// An untracked repository inside the checkout is listed as one
     /// directory; it is refused as what it is, not as a tracked directory.
     #[cfg(unix)]
@@ -782,6 +797,8 @@ mod tests {
         assert!(super::run(root, false).is_err());
     }
 
+    /// Git's own settings can hide a submodule from `git diff`; the staged
+    /// check must see it anyway.
     #[cfg(unix)]
     #[test]
     fn staged_submodules_are_seen_whatever_git_ignores() {
@@ -869,6 +886,59 @@ mod tests {
                 .get_envs()
                 .all(|(key, _)| key != "GIT_CONFIG_GLOBAL"),
             "the checkout's own check must keep the developer's excludes"
+        );
+    }
+
+    /// Git reads `~/.config/git/ignore` and `~/.config/git/attributes` with
+    /// no configuration naming them, so emptying the global config left them
+    /// in force: a developer's `*.rs` there made `git add` refuse every file
+    /// the temporary repositories stage, and a `filter=` would rewrite them.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_repositories_read_no_default_ignore_or_attributes() {
+        let home = tempdir();
+        let config = home.path().join(".config/git");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("ignore"), "*.rs\n").unwrap();
+        std::fs::write(config.join("attributes"), "*.rs filter=lfs\n").unwrap();
+        let tmp = tempdir();
+        let root = tmp.path();
+        git_str(root, &["init", "-q"]);
+        let probe = |command: &mut std::process::Command, args: &[&str]| {
+            let out = command
+                .args(args)
+                .env("HOME", home.path())
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+
+        // Plain git in the same place, as the tests ran before: the files
+        // under that HOME apply.
+        let mut plain = std::process::Command::new("git");
+        plain.current_dir(root).env_remove("XDG_CONFIG_HOME");
+        for var in super::REPOSITORY_ENV {
+            plain.env_remove(var);
+        }
+        plain
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        assert_eq!(probe(&mut plain, &["check-ignore", "a.rs"]), "a.rs\n");
+
+        let ignored = probe(&mut super::git_command(root), &["check-ignore", "a.rs"]);
+        assert_eq!(ignored, "", "the default ignore file is read");
+        let filter = probe(
+            &mut super::git_command(root),
+            &["check-attr", "filter", "--", "a.rs"],
+        );
+        assert_eq!(filter, "a.rs: filter: unspecified\n");
+
+        // The checkout keeps the developer's own files.
+        let checkout = super::git_command(&crate::workspace_root());
+        assert!(
+            checkout
+                .get_envs()
+                .all(|(key, _)| key != "XDG_CONFIG_HOME" && key != "GIT_ATTR_NOSYSTEM"),
         );
     }
 
