@@ -3064,6 +3064,93 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn folder_setting_links_with_relative_targets_resolve_from_the_link() {
+        // `ln -s ../real nested/up` and friends: a relative target is read
+        // from the link's own folder, never the working directory, and a
+        // link that leads nowhere is reported with its target as written.
+        // A scratch folder under the system temp folder, never the
+        // repository; removed at the end.
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-relative-link-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(scratch.join("real")).unwrap();
+        std::fs::create_dir_all(scratch.join("nested")).unwrap();
+        std::fs::write(scratch.join("default.xex"), b"").unwrap();
+        let good = scratch.join("good");
+        std::os::unix::fs::symlink("real", &good).unwrap();
+        // `../real` from the working directory is not there; from `nested`
+        // it is the real folder.
+        let up = scratch.join("nested").join("up");
+        std::os::unix::fs::symlink("../real", &up).unwrap();
+        let dangling = scratch.join("dangling");
+        std::os::unix::fs::symlink("moved-away", &dangling).unwrap();
+        // A relative chain: `chained` -> `dangling` -> `moved-away`.
+        let chained = scratch.join("chained");
+        std::os::unix::fs::symlink("dangling", &chained).unwrap();
+        let to_file = scratch.join("nested").join("to-file");
+        std::os::unix::fs::symlink("../default.xex", &to_file).unwrap();
+        let resolve = |cache: PathBuf| {
+            let data = scratch.join("data");
+            Config::resolve(FilePaths::default(), None, move |key: &str| match key {
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            })
+        };
+
+        // Links to the real folder, at the leaf or above a missing folder.
+        for cache in [
+            good.clone(),
+            good.join("cache"),
+            up.clone(),
+            up.join("cache"),
+        ] {
+            let cfg = resolve(cache.clone()).unwrap();
+            assert_eq!(cfg.cache_dir, cache);
+        }
+
+        // The target is named as the link holds it, not made absolute.
+        let err = resolve(dangling.clone()).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!(
+                "the cache folder {} (from VICTORY_CACHE_DIR) is a link to moved-away that leads \
+                 nowhere",
+                dangling.display()
+            )),
+            "{err}"
+        );
+        let below = chained.join("cache");
+        let err = resolve(below.clone()).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!(
+                "the cache folder {} (from VICTORY_CACHE_DIR) cannot be a folder because {} is a \
+                 link to dangling that leads nowhere",
+                below.display(),
+                chained.display()
+            )),
+            "{err}"
+        );
+
+        // A relative link to a file is a file, at the leaf or above.
+        let err = resolve(to_file.clone()).unwrap_err().to_string();
+        assert!(err.contains("is a file, not a folder"), "{err}");
+        let err = resolve(to_file.join("cache")).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("because {} is not a directory", to_file.display())),
+            "{err}"
+        );
+
+        // Nothing was created in place of the links or through them.
+        assert!(!scratch.join("moved-away").exists());
+        assert!(!scratch.join("real").join("cache").exists());
+        assert!(!scratch.join("data").exists());
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
     fn cache_or_data_at_the_root_or_home_is_refused() {
         let home = PathBuf::from(abs("home")).join("me");
         let root = PathBuf::from(abs("x")).parent().unwrap().to_path_buf();
