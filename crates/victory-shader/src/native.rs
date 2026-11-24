@@ -544,10 +544,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         let io = match stage {
             HwStage::Ps => ps_io(stage_data, code.len())?,
             HwStage::Vs => vs_inputs_fit(vs_io(stage_data)?)?,
-            HwStage::Cs => StageIo::Cs(ComputeIo {
-                rsrc2: u32_at(stage_data, CS_RSRC2)?,
-                threads: group_size(stage_data)?,
-            }),
+            HwStage::Cs => StageIo::Cs(compute_io(stage_data)?),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
             _ => StageIo::None,
         };
@@ -562,6 +559,21 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         });
     }
     Ok(out)
+}
+
+/// A compute program's dispatch settings. `COMPUTE_PGM_RSRC2.LDS_SIZE` is a
+/// 9-bit count of 512-byte granules, so it can state up to 255.5 KiB, which
+/// lowering would declare as the group's shared memory; like a mesh group's,
+/// a compute group's LDS can't exceed 64 KiB.
+fn compute_io(data: &[u8]) -> Result<ComputeIo, ShaderError> {
+    let cs = ComputeIo {
+        rsrc2: u32_at(data, CS_RSRC2)?,
+        threads: group_size(data)?,
+    };
+    if cs.lds_bytes() > MAX_LDS_BYTES {
+        return Err(Malformed("implausible LDS size"));
+    }
+    Ok(cs)
 }
 
 /// A compute program's thread-group size. Lowering multiplies the
@@ -1374,6 +1386,20 @@ mod tests {
                 matches!(group(bad), Err(Malformed("implausible thread-group size"))),
                 "{bad:?}"
             );
+        }
+
+        // A compute group's LDS (512-byte granules in RSRC2 bits 15-23):
+        // 128 granules is 64 KiB and fits; one more, or the field's maximum
+        // of 511, does not.
+        let cs_lds = |granules: u32| {
+            let mut blob = cs.clone();
+            blob[e + CS_RSRC2..][..4].copy_from_slice(&(granules << 15).to_le_bytes());
+            xbch(&blob)
+        };
+        let p = native_programs(&part(&[(KIND_NATIVE, &cs_lds(128))])).unwrap();
+        assert!(matches!(p[0].io, StageIo::Cs(c) if c.lds_bytes() == MAX_LDS_BYTES));
+        for bad in [129, 0x1FF] {
+            assert_eq!(refused_blob(&cs_lds(bad)), "implausible LDS size", "{bad}");
         }
 
         // A mesh group of one lane fits; an empty one does not.
