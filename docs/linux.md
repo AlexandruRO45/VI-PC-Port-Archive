@@ -83,5 +83,5 @@ calling convention; check before you bind.
 | kernel32/ntdll: handles, sync, threads, memory, heap, time, system | not started |
 | UCRT | not started |
 | GPU, window, input | not started |
-| Audio, network (offline), crypto, COM and the other host DLLs | not started |
+| Audio, network (offline), crypto, COM and the other host DLLs | done: every import of these DLLs resolves. Sound through PulseAudio/PipeWire (`libpulse-simple`, loaded at run time): the game's Spatial Audio stream (`mmdevapi.rs`) and Bink's XAudio2 (`xaudio2.rs`); loopback-only Winsock, WinHTTP that cannot connect, Media Foundation without sources, an empty registry |
 | Windows-only `victory-hle` modules (files, xmem, lifecycle, ...) | not started |
