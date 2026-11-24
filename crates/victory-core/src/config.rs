@@ -914,18 +914,43 @@ fn ensure_titles_distinct(
 /// per file, with "Not a directory". The same goes for each entry of
 /// `VICTORY_TEST_TITLES` / `[paths].test_titles`, which is also a dump.
 /// For the cache or data folder `create_dir_all` would fail on first use
-/// with "File exists", naming neither the setting nor the fix. A path that
+/// with "File exists", naming neither the setting nor the fix; the same goes
+/// for a link (the folder or one above it) whose target was moved or deleted,
+/// or that loops, so it is refused too. A path that
 /// does not exist yet is fine: the cache and data folders are created when
 /// needed. `what` is the folder ("game folder", "cache folder", "data
 /// folder", "test title") and `setting` the variable and key that set it.
 fn ensure_directory_path(what: &str, dir: &Path, origin: Origin, setting: &str) -> Result<()> {
     // A missing leaf can be created later, but only if its first existing
-    // ancestor is a directory. Follow symlinks just as create_dir_all does.
-    let existing = dir
-        .ancestors()
-        .find_map(|p| std::fs::metadata(p).ok().map(|m| (p, m)));
-    let Some((path, metadata)) = existing else {
-        return Ok(());
+    // ancestor is a directory. Follow symlinks just as create_dir_all does,
+    // but stop at a link that leads nowhere (its target moved or deleted, or
+    // a loop): it is there, so create_dir_all cannot make a folder in its
+    // place and would fail with "File exists" on first use.
+    let existing = dir.ancestors().find_map(|p| match std::fs::metadata(p) {
+        Ok(m) => Some(Ok((p, m))),
+        Err(_) => std::fs::symlink_metadata(p)
+            .is_ok_and(|m| m.file_type().is_symlink())
+            .then_some(Err(p)),
+    });
+    let (path, metadata) = match existing {
+        None => return Ok(()),
+        Some(Ok(found)) => found,
+        Some(Err(link)) => {
+            let target = std::fs::read_link(link)
+                .map(|t| format!(" to {}", t.display()))
+                .unwrap_or_default();
+            let place = if link == dir {
+                String::new()
+            } else {
+                format!(" cannot be a folder because {}", link.display())
+            };
+            anyhow::bail!(
+                "the {what} {} (from {origin}){place} is a link{target} that leads nowhere \
+                 (its target was moved or deleted, or the link loops); \
+                 fix or remove the link, or set {setting} elsewhere",
+                dir.display()
+            );
+        }
     };
     if metadata.is_dir() {
         return Ok(());
@@ -2713,6 +2738,89 @@ mod tests {
             err.contains("/dev/null (from VICTORY_DATA_DIR) is not a directory"),
             "{err}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_folder_setting_through_a_link_that_leads_nowhere_is_refused() {
+        // A scratch folder under the system temp folder, never the
+        // repository; removed at the end.
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-dangling-folder-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(scratch.join("real")).unwrap();
+        let gone = scratch.join("moved-away");
+        let dangling = scratch.join("dangling");
+        std::os::unix::fs::symlink(&gone, &dangling).unwrap();
+        let looped = scratch.join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        let good = scratch.join("good");
+        std::os::unix::fs::symlink(scratch.join("real"), &good).unwrap();
+        let env = |cache: PathBuf, data: PathBuf| {
+            move |key: &str| match key {
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let resolve = |cache: PathBuf, data: PathBuf| {
+            Config::resolve(FilePaths::default(), None, env(cache, data))
+        };
+
+        // A link to a folder is followed, as create_dir_all would, and a
+        // missing folder under it is fine.
+        let cfg = resolve(good.join("cache"), good.join("data")).unwrap();
+        assert_eq!(cfg.cache_dir, good.join("cache"));
+        assert!(resolve(good.clone(), scratch.join("data")).is_ok());
+
+        // The folder itself is a link whose target is gone: named with its
+        // target and setting, not passed over as a folder still to create.
+        let err = resolve(dangling.clone(), scratch.join("data"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "the cache folder {} (from VICTORY_CACHE_DIR) is a link to {} that leads nowhere",
+                dangling.display(),
+                gone.display()
+            )),
+            "{err}"
+        );
+        assert!(err.contains("set VICTORY_CACHE_DIR or"), "{err}");
+
+        // A dangling link further up blocks the folder below it.
+        let below = dangling.join("victory").join("data");
+        let err = resolve(scratch.join("cache"), below.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "the data folder {} (from VICTORY_DATA_DIR) cannot be a folder because {} is a link",
+                below.display(),
+                dangling.display()
+            )),
+            "{err}"
+        );
+
+        // A link to itself is refused the same way, not skipped.
+        let err = resolve(looped.clone(), scratch.join("data"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("leads nowhere"), "{err}");
+        assert!(err.contains("loops"), "{err}");
+
+        // Nothing was created in place of the links.
+        assert!(!gone.exists());
+        assert!(
+            dangling
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]
