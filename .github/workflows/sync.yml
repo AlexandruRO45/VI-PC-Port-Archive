@@ -3,28 +3,35 @@
 name: Sync projects
 
 on:
+  # GitHub's hourly timer has not been starting this workflow, so each run also queues the next one (last step).
+  # The timer stays as a backup: if the chain ever breaks, the next timer run starts it again.
   schedule:
-    # GitHub may start scheduled runs late, and skips them while a run is still going (concurrency below)
     - cron: "7 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
   issues: write
+  actions: write  # to queue the next run
 
+# one run at a time; a run waiting behind it replaces any older waiting run
 concurrency:
   group: sync
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 55  # under an hour, so a stuck run never holds up the next one
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v5
 
       - name: Sync
+        timeout-minutes: 50
         env:
           GH_TOKEN: ${{ github.token }}
+          # give up on a fetch or push that moves less than 1 KB/s for a minute instead of hanging
+          GIT_HTTP_LOW_SPEED_LIMIT: "1000"
+          GIT_HTTP_LOW_SPEED_TIME: "60"
         run: |
           # commit as the repo owner so no bot shows up as a contributor
           git config user.name Guernica4u
@@ -39,3 +46,16 @@ jobs:
             git push origin HEAD:main
           fi
           exit $status
+
+      - name: Queue the next run
+        if: always()
+        timeout-minutes: 75
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # wait until 7 minutes past the next hour, then start the next run unless one is already waiting
+          now=$(date +%s); next=$(( (now / 3600 + 1) * 3600 + 420 ))
+          echo "next run at $(date -u -d @$next '+%H:%M') UTC"
+          sleep $(( next - now ))
+          waiting=$(gh run list --workflow sync.yml --json status --jq '[.[] | select(.status == "queued" or .status == "pending" or .status == "waiting")] | length')
+          if [ "$waiting" = "0" ]; then gh workflow run sync.yml --ref main; else echo "a run is already waiting"; fi

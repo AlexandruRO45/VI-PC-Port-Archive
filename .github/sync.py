@@ -7,7 +7,7 @@ made private) is skipped and its archived copy stays as it is.
 --push also pushes each project's branches to origin (<p>/main, <p>/pr/<n>, <p>/branch/<name>, <p>/github-export)
 and opens an issue when the README part the site's progress steps come from has changed.
 Committing main is left to the caller (.github/workflows/sync.yml)."""
-import datetime, gzip, json, os, re, subprocess, sys
+import datetime, gzip, json, os, re, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # folder: (GitHub repo, README line where its "how far it gets" part starts)
@@ -19,6 +19,7 @@ PROJECTS = {
     "tuxbox": ("brcly/TuxBox", r"\*\*GTA VI \(ProjectScarlett\)\*\*"),
     "victory-gta6": ("fxceless/victory-gta6", r"## Status of this fork"),
 }
+PUSH_BUDGET = 300  # seconds of branch pushing per project per run; the rest waits for the next run
 TODAY = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
 
@@ -117,18 +118,24 @@ def push(p, repo, default):
         sha, ref = line.split("\t")
         have[ref[len("refs/heads/"):]] = sha
     specs = [f"+{sha}:refs/heads/{b}" for b, sha in sorted(want.items()) if have.get(b) != sha]
+    print(f"{p}: pushing {len(specs)} changed branches", flush=True)
+    deadline = time.monotonic() + PUSH_BUDGET
     def rejected(*s):
-        # a push can hang on GitHub's side; give up after 5 minutes and report it like a timeout, retried next run
+        # GitHub sometimes never answers a push; stop waiting at the project's deadline, the next run tries again
+        left = deadline - time.monotonic()
+        if left < 10:
+            return [f"!\t{x.lstrip('+')}\t[skipped] (out of time this run)" for x in s]
         try:
             out = subprocess.run(["git", "-C", ROOT, "push", "--no-tags", "--porcelain", "origin", *s],
-                                 capture_output=True, text=True, encoding="utf-8", timeout=300).stdout
+                                 capture_output=True, text=True, encoding="utf-8", timeout=min(180, left)).stdout
         except subprocess.TimeoutExpired:
-            return [f"!\t{x.lstrip('+')}\t[remote rejected] (timed out after 5 minutes)" for x in s]
+            return [f"!\t{x.lstrip('+')}\t[skipped] (no answer from GitHub)" for x in s]
         return [l for l in out.splitlines() if l.startswith("!")]
     refused = []
     for i in range(0, len(specs), 20):  # GitHub's workflow-file check times out on pushes with many branches
         for line in rejected(*specs[i:i + 20]):
-            refused += rejected("+" + line.split("\t")[1]) if "timed out" in line.lower() or "timeout" in line.lower() else [line]
+            # GitHub's own "timed out" refusals usually pass when the branch is pushed alone
+            refused += rejected("+" + line.split("\t")[1]) if "timed out" in line.lower() else [line]
     return refused
 
 
@@ -173,7 +180,9 @@ if __name__ == "__main__":
             new = git("show", f"{src}:README.md", check=False).stdout
             refresh(p, src)
             synced.append(p)
+            print(f"{p}: fetched", flush=True)
             export(p)
+            print(f"{p}: issues exported", flush=True)
             if pushing:
                 # GitHub refuses branches that edit .github/workflows files (the workflow's token may not touch those)
                 # and sometimes times out; both are retried next run, so they're warnings, not failures
