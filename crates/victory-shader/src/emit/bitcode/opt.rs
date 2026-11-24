@@ -213,6 +213,18 @@ pub(super) enum Effect {
     /// Nothing, and the result depends on the arguments alone for the whole
     /// run of the shader (arithmetic, handles, inputs, constant buffers,
     /// resource sizes).
+    ///
+    /// Every pass here may merge or drop a caller in this class, so a callee
+    /// belongs in it only when its result is a **value**. A call that gives a
+    /// value an identity is not one: a resource handle, and the
+    /// `annotateHandle` that types it, are equal arguments with unequal
+    /// meaning, and merging them hands one the other's resource type (see
+    /// [`NEVER_COMMON`]). `VICTORY_SHADER_CENSUS_OPS` writes every callee a
+    /// module calls with the class it was given, which is how the rest of the
+    /// class was audited: on the title's own modules the only identity-carrying
+    /// callees are the four handle operations, and every other `Pure` one —
+    /// `binary`/`tertiary`/`unary`, `cbufferLoadLegacy`, `getDimensions`, the
+    /// thread and group ids — is a function of its arguments alone.
     Pure,
     /// Nothing, but the result depends on memory a store may change
     /// (buffer and texture reads).

@@ -533,10 +533,12 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
 }
 
 /// `VICTORY_SHADER_CENSUS_OPS=<file>`: one line per emitted program, appended:
-/// its label and every `dx.op` its host module calls, by the callee's name.
+/// its label and every `dx.op` its host module calls, by the callee's name and
+/// what the callee does besides returning a result (`P` pure, `R` reads,
+/// `L` lanes, `W` writes).
 /// The fine form of the `KINDS` counts, for telling the constructs of one
 /// module from another's.
-fn ops_line(label: &str, ops: &[(String, u32)]) {
+fn ops_line(label: &str, ops: &[(String, u32, char)]) {
     use std::io::Write;
     static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     let Some(out) = OUT.get_or_init(|| {
@@ -547,8 +549,8 @@ fn ops_line(label: &str, ops: &[(String, u32)]) {
         return;
     };
     let mut line = label.to_owned();
-    for (name, n) in ops {
-        line.push_str(&format!("\t{name}={n}"));
+    for (name, n, class) in ops {
+        line.push_str(&format!("\t{name}={n}/{class}"));
     }
     line.push('\n');
     let _ = lock(out).write_all(line.as_bytes());
