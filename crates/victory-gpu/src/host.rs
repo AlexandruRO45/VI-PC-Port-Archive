@@ -125,7 +125,7 @@ impl UnifiedArena {
                     &heap,
                     0,
                     &resource_desc,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COMMON,
                     None,
                     &mut resource,
                 )
@@ -511,10 +511,17 @@ void main() {
                 }),
             },
         };
-        // SAFETY: this is the first use of the placed resource; the aliasing
-        // barrier activates it before the compute shader accesses the arena.
+        let to_uav = transition(
+            &source.resource,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        // SAFETY: this is the first use of the placed resource. Activate its
+        // placed allocation, then explicitly transition COMMON to UAV before
+        // the compute shader accesses the arena.
         unsafe {
             list.list.ResourceBarrier(&[activation]);
+            list.list.ResourceBarrier(&[to_uav]);
             list.list.SetComputeRootSignature(&root);
             list.list.SetPipelineState(&pso);
             list.list.SetComputeRootUnorderedAccessView(0, source.gpu);
