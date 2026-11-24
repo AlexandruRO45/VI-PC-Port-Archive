@@ -134,9 +134,23 @@ class QsadTests(unittest.TestCase):
                          "v_qsad_pk_u16_u8 v[0:1], s[2:3], v4, 1"])
         self.assertEqual(got, ref("v_qsad_pk_u16_u8", 0x0807060504030201, 0x04030201, 1))
 
-    def test_clamp_is_rejected_not_guessed(self):
-        with self.assertRaises(rdna2spirv.Unsupported):
-            run_lines(["v_qsad_pk_u16_u8 v[0:1], v[2:3], v4, v[6:7] clamp"])
+    def test_clamp_saturates_per_u16_lane(self):
+        # Each packed u16 lane saturates independently to 0xFFFF under VOP3 clamp (measured on gfx1036).
+        got_qsad = run_lines([
+            "v_mov_b32 v2, 0xffffffff", "v_mov_b32 v3, 0xffffffff",
+            "v_mov_b32 v4, 0x00000000",
+            "v_mov_b32 v6, 0xff00fff0", "v_mov_b32 v7, 0xfff00001",
+            "v_qsad_pk_u16_u8 v[0:1], v[2:3], v4, v[6:7] clamp",
+        ])
+        self.assertEqual(got_qsad, (0xFFFF03FD << 32) | 0xFFFFFFFF)
+
+        got_mqsad = run_lines([
+            "v_mov_b32 v2, 0x00000000", "v_mov_b32 v3, 0x00000000",
+            "v_mov_b32 v4, 0xff00ff00",
+            "v_mov_b32 v6, 0xff00fff0", "v_mov_b32 v7, 0xfff00001",
+            "v_mqsad_pk_u16_u8 v[0:1], v[2:3], v4, v[6:7] clamp",
+        ])
+        self.assertEqual(got_mqsad, (0xFFFF01FF << 32) | 0xFFFFFFFF)
 
 
 if __name__ == "__main__":

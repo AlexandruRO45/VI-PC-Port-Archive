@@ -9509,9 +9509,9 @@ class Gen:
             self._finish_f16_minmax_out(a[0], r, mods, dhi, all_nan, h0_mod)  # opsel-capable VOP3: keeps the other half
         elif op in ("v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8"):
             # Four byte-SADs packed as u16 (RDNA ISA pseudocode): for k = 0..3, D.u16[k] = (S2.u16[k] + SAD of the
-            # 32-bit window S0[8k+31 : 8k] of the 64-bit S0 against S1) & 0xFFFF. The m form is masked: a byte where
-            # S1's byte is 0 is skipped (as v_msad_u8). clamp is not modelled: rejected rather than guessed.
-            if a[0].get("n") != 2 or "clamp" in mods:
+            # 32-bit window S0[8k+31 : 8k] of the 64-bit S0 against S1) & 0xFFFF (or saturated to 0xFFFF under VOP3
+            # clamp, measured natively on gfx1036). The m form is masked: a byte where S1's byte is 0 is skipped.
+            if a[0].get("n") != 2:
                 raise Unsupported(op + " operands")
 
             x_lo, x_hi = self.src64_data(a[1], op, allow_vgpr=True)
@@ -9543,7 +9543,10 @@ class Gen:
                     self.emit(f"{t} = OpIAdd %uint {total} {d}")
                     total = t
                 w = self.tmp()
-                self.emit(f"{w} = OpBitwiseAnd %uint {total} {self.cu(0xFFFF)}")
+                if "clamp" in mods:
+                    self.emit(f"{w} = OpExtInst %uint %glsl UMin {total} {self.cu(0xFFFF)}")
+                else:
+                    self.emit(f"{w} = OpBitwiseAnd %uint {total} {self.cu(0xFFFF)}")
                 words.append(w)
             out = []
             for lo16, hi16 in ((words[0], words[1]), (words[2], words[3])):
@@ -9597,9 +9600,9 @@ class Gen:
         elif op == "v_mqsad_u32_u8":
             # Four masked byte-SADs with full 32-bit accumulators (RDNA ISA pseudocode): for k = 0..3,
             # D[k] = S2[k] + v_msad_u8 of the 32-bit window S0[8k+31 : 8k] of the 64-bit S0 against S1, wrapping at
-            # 32 bits; a byte where S1's byte is 0 adds nothing. S2 and D are 128-bit (four VGPRs).
-            # clamp is not modelled: rejected rather than guessed.
-            if a[0].get("n") != 4 or "clamp" in mods:
+            # 32 bits (or saturating to 0xFFFFFFFF under VOP3 clamp, measured natively on gfx1036); a byte where S1's
+            # byte is 0 adds nothing. S2 and D are 128-bit (four VGPRs).
+            if a[0].get("n") != 4:
                 raise Unsupported(op + " operands")
             s0, s2 = a[1], a[3]
             x_lo, x_hi = self.src64_data(s0, op, allow_vgpr=True)
@@ -9617,17 +9620,30 @@ class Gen:
                     self.emit(f"{t1} = OpShiftRightLogical %uint {x_lo} {self.cu(8 * k)}")
                     self.emit(f"{t2} = OpShiftLeftLogical %uint {x_hi} {self.cu(32 - 8 * k)}")
                     self.emit(f"{win} = OpBitwiseOr %uint {t1} {t2}")
-                total = accs[k]
+                sad = None
                 for off in (0, 8, 16, 24):
-                    xb, yb, hi_, lo_, d, md, t = (self.tmp() for _ in range(7))
+                    xb, yb, hi_, lo_, d, md = (self.tmp() for _ in range(6))
                     self.emit(f"{xb} = OpBitFieldUExtract %uint {win} {self.cu(off)} {self.cu(8)}")
                     self.emit(f"{yb} = OpBitFieldUExtract %uint {y} {self.cu(off)} {self.cu(8)}")
                     self.emit(f"{hi_} = OpExtInst %uint %glsl UMax {xb} {yb}")
                     self.emit(f"{lo_} = OpExtInst %uint %glsl UMin {xb} {yb}")
                     self.emit(f"{d} = OpISub %uint {hi_} {lo_}")
                     self.emit(f"{md} = OpSelect %uint {self.tmp_bool_nz(yb)} {d} {self.cu(0)}")
-                    self.emit(f"{t} = OpIAdd %uint {total} {md}")
-                    total = t
+                    if sad is None:
+                        sad = md
+                    else:
+                        t = self.tmp()
+                        self.emit(f"{t} = OpIAdd %uint {sad} {md}")
+                        sad = t
+                if "clamp" in mods:
+                    pair, s_sum, s_carry, total = (self.tmp() for _ in range(4))
+                    self.emit(f"{pair} = OpIAddCarry %umul {accs[k]} {sad}")
+                    self.emit(f"{s_sum} = OpCompositeExtract %uint {pair} 0")
+                    self.emit(f"{s_carry} = OpCompositeExtract %uint {pair} 1")
+                    self.emit(f"{total} = OpSelect %uint {self.tmp_bool_nz(s_carry)} {self.cu(0xFFFFFFFF)} {s_sum}")
+                else:
+                    total = self.tmp()
+                    self.emit(f"{total} = OpIAdd %uint {accs[k]} {sad}")
                 outs.append(total)
             for k in range(4):               # every source is read before the first write
                 self.dst({"k": "vgpr", "r": a[0]["r"] + k, "n": 1}, outs[k])
