@@ -4096,4 +4096,91 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn remembered_stream_markers_answer_as_a_fresh_scan_would() {
+        // `Streams` remembers how far it has looked and the first marker it
+        // found starting a stream; a question from anywhere, in any order,
+        // must get the answer a fresh scan of `lo..hi` gives: whether a
+        // marker wholly inside it starts a record whose packed bytes are (or,
+        // cut off, start) a deflate stream (`hi` within the file, as
+        // [`covers_a_record`] asks). The file mixes real records,
+        // markers that are noise (sizes that disagree, a reserved block) and
+        // a record cut off by the end of the file.
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("PS_a", 0x32, b"first"));
+        for v in [20_u32, 0x000D_DCE7, 21, 8] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&[0x5A; 7]);
+        file.extend(record_bytes("PS_b", 0x41, &[7; 300]));
+        file.extend_from_slice(b"\x05PS_n\0\x32");
+        for v in [16_u32, 0x000D_DCE7, 16, 4] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&[0x07, 0, 0, 0]); // reserved block type
+        file.extend(record_bytes("PS_c", 0x3c, b"third"));
+        let cut = record_bytes("PS_cut", 0x32, &[3; 2000]);
+        file.extend_from_slice(&cut[..cut.len() - 3]);
+
+        let fresh = |lo: usize, hi: usize| {
+            memchr::memmem::find_iter(&file, &MARKER)
+                .filter(|&m| m >= lo && m + MARKER.len() <= hi)
+                .any(|m| match record(&file[m - 6..], 6) {
+                    Found::Record(r) => r.is_stream(),
+                    Found::Truncated => true,
+                    Found::Nothing => false,
+                })
+        };
+        let markers: Vec<_> = memchr::memmem::find_iter(&file, &MARKER).collect();
+        assert_eq!(markers.len(), 6, "planted markers");
+        let streams = markers.iter().filter(|&&m| fresh(m, m + 4)).count();
+        assert_eq!(streams, 4, "three whole records and the cut-off one");
+
+        // Every edge: a marker's first byte and one past, its last byte.
+        let mut edges = vec![6, file.len()];
+        for &m in &markers {
+            edges.extend([m - 1, m, m + 1, m + 3, m + 4, m + 5]);
+        }
+        // Its caller never asks past the end of the file.
+        edges.retain(|&e| e <= file.len());
+        let mut x = 0x2545_F491_u32;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as usize
+        };
+        for round in 0..400 {
+            let mut cache = Streams::default();
+            for q in 0..12 {
+                let lo = edges[next() % edges.len()].max(6);
+                let hi = match next() % 3 {
+                    0 => (lo + next() % 64).min(file.len()),
+                    1 => edges[next() % edges.len()].max(lo),
+                    _ => file.len(),
+                };
+                assert_eq!(
+                    cache.any_in(&file, lo, hi),
+                    fresh(lo, hi),
+                    "round {round}, question {q}: {lo}..{hi}"
+                );
+            }
+        }
+
+        // The patterns `records` asks in: moving forward over the same
+        // window, a hit just past `hi` remembered for the next question,
+        // and a question from before what was remembered.
+        let first = markers[0];
+        let mut cache = Streams::default();
+        assert!(!cache.any_in(&file, 6, first + 3), "marker one byte short");
+        assert!(cache.any_in(&file, 6, first + 4), "now wholly inside");
+        assert!(cache.any_in(&file, first, first + 4), "same hit, later lo");
+        assert!(
+            !cache.any_in(&file, first + 1, markers[1] + 4),
+            "noise only"
+        );
+        assert!(cache.any_in(&file, first + 1, markers[2] + 4));
+        assert!(cache.any_in(&file, 6, first + 4), "back before: rescanned");
+    }
 }
