@@ -414,6 +414,8 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Changes whenever recorded CPU work can write title bytes.
+    title_write_version: usize,
     uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -1036,7 +1038,12 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
+        deferred.title_write_version += 1;
         deferred.refreshed.clear();
+    }
+
+    pub(crate) fn title_write_version(&self) -> usize {
+        self.deferred().title_write_version
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1164,8 +1171,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.title_write_version += 1;
+        deferred.refreshed.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.

@@ -78,3 +78,12 @@ unmeasured.
 
 The current rebuilt title CBV path exposes neither a sealed upload
 version nor deferred native slot binding.
+
+
+## Same-list upload versions
+
+The production table builder also has to distinguish the same CBV record before and after ordered title-memory writes in one recording. The cache now records the title-write version for rebuilt tables that contain a CBV. A new version receives a new descriptor range and staged upload. The list still owns its previous range because already-recorded draws reference it. Tables without CBVs keep their existing cache behavior.
+
+Set `VICTORY_CBV_SNAPSHOT_WIDTH` to 1, 16, 178, or 256 and run the exact test in a fresh process per width and adapter. Width 1 is CBV-only. The other cases use an original mixed table with the CBV in the first slot and an actual raw placed SRV in the last. The shader checks both CBV words and reads the SRV value (881). The fixture replays the same recordings with different title bytes. The first two lists and the two versions in the single-list case hold four ranges, which occupy 4, 64, 712, or 1,024 slots across the respective widths.
+
+All 12 adapter and width combinations passed on AMD Radeon Graphics, RTX 5070 Laptop, and WARP with full D3D12 GPU-based validation. The WARP width-178 mutation bypassing the version check reproduced a late result of [101, 102, 881] instead of [201, 202, 881]. This test exercises version correctness. Cross-list mixed-table sharing and the cost at title-scale pressure remain open.

@@ -2,22 +2,29 @@
 //! table builder and submission loop supply each list's snapshot.
 
 use super::*;
-use crate::descriptor::{HEAP_IIDS, HeapDesc, Placement, create_cbv, create_heap, heap, release};
+use crate::descriptor::{
+    HEAP_IIDS, HeapDesc, Placement, create_cbv, create_heap, create_placed_srv, heap, release,
+};
 use crate::draw::State;
 use crate::host::{HostList, PREPARING, install_test_device};
 use crate::object::{S_OK, This};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 const HLSL: &str = r#"
-#define RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), RootConstants(num32BitConstants=2, b0), UAV(u0)"
-cbuffer Bindings : register(b0) { uint slot, index; };
+#define RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), RootConstants(num32BitConstants=3, b0), UAV(u0)"
+cbuffer Bindings : register(b0) { uint slot, index, tail; };
 RWByteAddressBuffer output : register(u0);
 struct Values { uint4 rows[16]; };
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
     ConstantBuffer<Values> values = ResourceDescriptorHeap[slot];
-    output.Store2(index * 8, uint2(values.rows[0].x, values.rows[15].w));
+    uint word = 0;
+    if (tail != 0) {
+        ByteAddressBuffer input = ResourceDescriptorHeap[slot + tail];
+        word = input.Load(0);
+    }
+    output.Store3(index * 12, uint3(values.rows[0].x, values.rows[15].w, word));
 }
 "#;
 
@@ -33,16 +40,46 @@ impl Payload {
     }
 }
 
-struct TitleHeap(This);
+struct PlacedInput(Box<Payload>);
+
+impl PlacedInput {
+    fn new(tail_slot: u64) -> Self {
+        let input = Self(Box::new(Payload::from_pair([881, 0])));
+        let address = input.0.0.as_ptr() as u64;
+        crate::shadow::register(address as usize, address, 256);
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        resource[4] = 256;
+        let mut view = [0; 16];
+        view[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+        view[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        view[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view[6] = 64;
+        view[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+        view[10] = address as u32;
+        view[11] = (address >> 32) as u32;
+        create_placed_srv(std::ptr::null(), &resource, &view, tail_slot);
+        input
+    }
+}
+
+impl Drop for PlacedInput {
+    fn drop(&mut self) {
+        let address = self.0.0.as_ptr() as u64;
+        crate::shadow::unregister(address as usize, address);
+    }
+}
+
+struct TitleHeap(This, u32);
 
 impl TitleHeap {
-    fn new() -> Self {
+    fn new(width: u32) -> Self {
         #[repr(C)]
         struct Extended(HeapDesc, Placement);
         let desc = Extended(
             HeapDesc {
                 kind: 0,
-                count: 8,
+                count: width,
                 flags: 1,
                 nodes: 0,
             },
@@ -56,13 +93,13 @@ impl TitleHeap {
             create_heap(std::ptr::null(), &desc.0, &HEAP_IIDS[0], &mut object),
             S_OK
         );
-        Self(object)
+        Self(object, width)
     }
 
     fn cbv_slot(&self, state: &mut State, list: &HostList) -> u32 {
         state.set_heaps(&[self.0]);
         state.set_table(true, 0, heap(self.0).start);
-        let used = [UsedResource {
+        let cbv = UsedResource {
             kind: ResourceType::Cbv,
             root: RootType::Table,
             table_offset_dwords: 0,
@@ -71,8 +108,15 @@ impl TitleHeap {
             dwords: 4,
             user_data: 0,
             slot: 0,
-        }];
-        let slots = state.test_compute_tables(list, &used);
+        };
+        let srv = UsedResource {
+            kind: ResourceType::Srv,
+            table_offset_dwords: (self.1 - 1) * 8,
+            dwords: 8,
+            ..cbv
+        };
+        let used = [cbv, srv];
+        let slots = state.test_compute_tables(list, &used[..if self.1 == 1 { 1 } else { 2 }]);
         let [(0, offset)] = slots.as_slice() else {
             panic!("no rebuilt CBV table")
         };
@@ -100,7 +144,13 @@ fn repeated_cbv_records_require_separate_submit_time_snapshots() {
     let mut replacement = Box::new(Payload::from_pair([13, 14]));
     let title_ptr = (&raw mut title.0).cast::<u8>();
     let replacement_ptr = (&raw mut replacement.0).cast::<u8>();
-    let descriptors = TitleHeap::new();
+    let width =
+        std::env::var("VICTORY_CBV_SNAPSHOT_WIDTH").map_or(1, |width| width.parse().unwrap());
+    assert!([1, 16, 178, 256].contains(&width));
+    let descriptors = TitleHeap::new(width);
+    let tail = width - 1;
+    let _input =
+        (tail != 0).then(|| PlacedInput::new(heap(descriptors.0).start + u64::from(tail) * 32));
     let source = title_ptr as u64;
     create_cbv(
         std::ptr::null(),
@@ -112,6 +162,7 @@ fn repeated_cbv_records_require_separate_submit_time_snapshots() {
     let first = host.new_list().unwrap();
     let second = host.new_list().unwrap();
     let readback = host.new_list().unwrap();
+    let single = host.new_list().unwrap();
     let mut first_state = State::default();
     let mut second_state = State::default();
     let first_slot = descriptors.cbv_slot(&mut first_state, &first);
@@ -119,7 +170,14 @@ fn repeated_cbv_records_require_separate_submit_time_snapshots() {
     let second_slot = descriptors.cbv_slot(&mut second_state, &second);
     assert_ne!(first_slot, second_slot, "separate native table slots");
 
-    const RESULT_BYTES: u64 = 3 * 8;
+    let mut single_state = State::default();
+    let early_slot = descriptors.cbv_slot(&mut single_state, &single);
+    single.defer_copy(title_ptr, replacement_ptr, size);
+    // Also exercise the ordered callback path without changing title bytes.
+    single.defer(|| {});
+    let late_slot = descriptors.cbv_slot(&mut single_state, &single);
+
+    const RESULT_BYTES: u64 = 5 * 12;
     let output = resource(
         &device,
         D3D12_HEAP_TYPE_DEFAULT,
@@ -140,9 +198,9 @@ fn repeated_cbv_records_require_separate_submit_time_snapshots() {
             list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
             list.list.SetComputeRootSignature(&root);
             list.list.SetPipelineState(&pipeline);
-            let data = [table_slot, index];
+            let data = [table_slot, index, tail];
             list.list
-                .SetComputeRoot32BitConstants(0, 2, data.as_ptr().cast(), 0);
+                .SetComputeRoot32BitConstants(0, 3, data.as_ptr().cast(), 0);
             list.list
                 .SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
             list.list.Dispatch(1, 1, 1);
@@ -168,6 +226,9 @@ fn repeated_cbv_records_require_separate_submit_time_snapshots() {
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         )]);
         readback.close();
+        record(&single, early_slot, 3);
+        record(&single, late_slot, 4);
+        single.close();
 
         for (round, a, b) in [
             ("distinct", [101, 102], [201, 202]),
@@ -183,14 +244,22 @@ fn repeated_cbv_records_require_separate_submit_time_snapshots() {
             let before = PREPARING[1].load(std::sync::atomic::Ordering::Relaxed);
             host.execute(&[&first, &second, &readback]);
             let copied = PREPARING[1].load(std::sync::atomic::Ordering::Relaxed) - before;
-            assert_eq!(copied, (3 * size) as u64);
+            if tail == 0 {
+                assert_eq!(copied, (3 * size) as u64);
+            }
+            // Same CBV record, same list, and two different submit-time contents.
+            title_ptr.cast::<Payload>().write(Payload::from_pair(a));
+            host.execute(&[&single, &readback]);
             let mut data = std::ptr::null_mut();
             back.Map(0, None, Some(&mut data)).unwrap();
-            let results = std::slice::from_raw_parts(data.cast::<[u32; 2]>(), 3);
-            assert_eq!(results, &[a, b, a]);
+            let results = std::slice::from_raw_parts(data.cast::<[u32; 3]>(), 5);
+            let raw = if tail == 0 { 0 } else { 881 };
+            let expected = [a, b, a, a, b].map(|[lo, hi]| [lo, hi, raw]);
+            assert_eq!(results, &expected);
             assert_eq!(results[2] == results[1], a == b);
             eprintln!(
-                "{name} {round}: identical CBV records=2 slots=2 fills={} bytes; ordered copy={size} bytes; native={results:?}",
+                "{name} {round}: width={width} separate same-list versions=2 total reserved slots={} fills={} bytes; ordered copy={size} bytes; native={results:?}",
+                4 * width,
                 2 * size
             );
             back.Unmap(0, Some(&D3D12_RANGE::default()));
