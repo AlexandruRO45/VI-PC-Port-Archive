@@ -1399,4 +1399,108 @@ mod tests {
             "{why:?}"
         );
     }
+
+    /// One `ISG1`/`OSG1` row: stream, semantic index, system value,
+    /// component type, register, mask and minimum precision as the title's
+    /// part has them.
+    fn row(stream: u32, system: u32, comp: u32, min_precision: u32) -> Vec<u8> {
+        let mut p = Vec::new();
+        for w in [1, 8, stream, 40, 0, system, comp, 0, 0x01, min_precision] {
+            p.extend_from_slice(&u32::to_le_bytes(w));
+        }
+        p.extend_from_slice(b"ATTR\0");
+        p
+    }
+
+    /// A row's component type is a raw `u32` of the title's part. 32-bit
+    /// types keep their kind, 16-bit ones are declared 32-bit with `half`
+    /// set, and a type without a 32-bit form is refused rather than
+    /// declared as something else.
+    #[test]
+    fn a_signature_component_type_maps_or_is_refused() {
+        // (raw type, declared type, half): uint, int, float in 32 and 16 bits.
+        for (raw, comp, half) in [
+            (1, 5, false),
+            (2, 4, false),
+            (3, 9, false),
+            (4, 5, true),
+            (5, 4, true),
+            (6, 9, true),
+        ] {
+            let rows = signature(&row(0, 0, raw, 0)).expect("a 32- or 16-bit type");
+            assert_eq!((rows[0].comp, rows[0].half), (comp, half), "type {raw}");
+        }
+        let unsupported = |what| ShaderError::Unsupported { offset: 0, what };
+        assert_eq!(
+            signature(&row(0, 0, 0, 0)).unwrap_err(),
+            unsupported("a signature element of unknown type")
+        );
+        for raw in [7, 8, 9, 0xFF, u32::MAX] {
+            assert_eq!(
+                signature(&row(0, 0, raw, 0)).unwrap_err(),
+                unsupported("a 64-bit signature element"),
+                "type {raw:#x}"
+            );
+        }
+        // The front face is declared a uint whatever type the row gives,
+        // the unknown one included (DXIL's validator insists).
+        for raw in [0, 1, 3, 6, 7] {
+            let rows = signature(&row(0, 9, raw, 0)).expect("a front face");
+            assert_eq!((rows[0].kind, rows[0].comp), (13, 5), "type {raw}");
+        }
+    }
+
+    /// Rows of another geometry stream, of minimum precision, or naming a
+    /// system value lowering does not know are refused, not linked as an
+    /// ordinary attribute.
+    #[test]
+    fn a_signature_row_lowering_cannot_link_is_refused() {
+        let unsupported = |what| ShaderError::Unsupported { offset: 0, what };
+        for stream in [1, 3, u32::MAX] {
+            assert_eq!(
+                signature(&row(stream, 0, 3, 0)).unwrap_err(),
+                unsupported("a signature element of another stream"),
+                "stream {stream:#x}"
+            );
+        }
+        for precision in [1, 2, 8, u32::MAX] {
+            assert_eq!(
+                signature(&row(0, 0, 3, precision)).unwrap_err(),
+                unsupported("a minimum-precision signature element"),
+                "precision {precision:#x}"
+            );
+        }
+        for system in [11, 24, 26, 63, 71, u32::MAX] {
+            assert_eq!(
+                signature(&row(0, system, 3, 0)).unwrap_err(),
+                unsupported("a system value in the signature"),
+                "system value {system:#x}"
+            );
+        }
+        // Each known system value maps to its DXIL kind.
+        for (system, kind) in [
+            (0, 0),
+            (1, 3),
+            (2, 6),
+            (3, 7),
+            (4, 4),
+            (5, 5),
+            (6, 1),
+            (7, 10),
+            (8, 2),
+            (9, 13),
+            (10, 12),
+            (25, 30),
+            (64, 16),
+            (65, 17),
+            (66, 14),
+            (67, 19),
+            (68, 18),
+            (69, 20),
+            (70, 15),
+        ] {
+            let rows = signature(&row(0, system, 3, 0)).expect("a known system value");
+            assert_eq!(rows[0].kind, kind, "system value {system}");
+        }
+    }
 }
