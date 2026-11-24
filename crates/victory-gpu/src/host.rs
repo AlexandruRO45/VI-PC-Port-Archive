@@ -496,47 +496,38 @@ impl Host {
         }
     }
 
-    /// Runs closed lists and waits for them.
+    /// Runs closed lists in order and waits for each before preparing the next.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::Submissions, 1);
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
+        crate::copystat::add(crate::copystat::C::Submissions, runs.len() as u64);
+
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
-            }
-            lists.push(list.list.cast().ok());
         }
         batch.flush();
         let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
-        for (i, group) in groups.iter().enumerate() {
+
+        // A run's prelude must be recorded immediately before that run is
+        // submitted. Preparing all preludes up front is incorrect when two
+        // runs use the same shadow: the later prelude would assume a state
+        // transition that the earlier command list has not executed yet.
+        for list in runs {
+            let mut group: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2);
+            if let Some(prelude) = list.prelude() {
+                group.push(Some(prelude));
+            }
+            group.push(list.list.cast().ok());
+
             *submitted += 1;
-            let started = std::time::Instant::now();
+            let list_started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                self.queue.ExecuteCommandLists(&group);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -544,30 +535,22 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         WaitForSingleObject(self.event, INFINITE);
-                        if groups.len() > 1 {
-                            runs[i].decay_shadows();
-                        } else {
-                            for list in runs {
-                                list.decay_shadows();
-                            }
-                        }
+                        list.decay_shadows();
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if runs.len() > 1 && list_started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
+                let commands = list.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                tracing::warn!(ms = list_started.elapsed().as_millis(), commands, "slow host list");
+                for (ms, op) in list.slowest(frequency, 6) {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
-            let _ = (i, started);
         }
-        let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
