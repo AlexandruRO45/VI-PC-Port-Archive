@@ -140,23 +140,57 @@ impl Predicate {
         }
     }
 
-    fn reached(self) -> bool {
-        if self.comparison == 1 {
-            return false;
-        }
-        // SAFETY: the guest keeps the naturally aligned operand mapped until
-        // completion. Serialize with emulated writes using MEMORY, including
-        // mixed-width writes that overlap this operand.
-        let value = unsafe {
-            match self.operand {
-                Operand::Dword(_) => u64::from(
-                    (&*(self.address as *const std::sync::atomic::AtomicU32))
-                        .load(Ordering::Acquire),
-                ),
-                Operand::Qword => (&*(self.address as *const AtomicU64)).load(Ordering::Acquire),
-            }
+    /// The reachable masked values are exactly the subsets of the mask.
+    /// Classify only predicates for which no possible word can satisfy the wait.
+    fn can_match(self) -> bool {
+        let max = match self.operand {
+            Operand::Dword(mask) => u64::from(mask),
+            Operand::Qword => u64::MAX,
         };
-        self.matches(value)
+        match self.comparison {
+            1 => false,
+            2 => self.reference > 0,
+            3 => self.reference & !max == 0,
+            4 | 8 => true,
+            5 => max > self.reference,
+            6 => max != 0 || self.reference != 0,
+            7 => max >= self.reference,
+            _ => unreachable!("comparison validated at record time"),
+        }
+    }
+
+    fn reached(self) -> bool {
+        #[cfg(windows)]
+        {
+            // The title may unmap a pending operand. Read through the OS, as
+            // AndyLatimer did in a9a7985, while preserving the wait's width.
+            let mut bytes = [0; 8];
+            crate::host::read_into(
+                self.address as *const u8,
+                &mut bytes[..self.operand.bytes()],
+            ) && self.matches(u64::from_le_bytes(bytes))
+        }
+        #[cfg(all(not(windows), test))]
+        {
+            // Non-Windows has no GPU list producer. The unit tests use live,
+            // naturally aligned atomic words until their wait completes.
+            let value = unsafe {
+                match self.operand {
+                    Operand::Dword(_) => u64::from(
+                        (&*(self.address as *const std::sync::atomic::AtomicU32))
+                            .load(Ordering::Acquire),
+                    ),
+                    Operand::Qword => {
+                        (&*(self.address as *const AtomicU64)).load(Ordering::Acquire)
+                    }
+                }
+            };
+            self.matches(value)
+        }
+        #[cfg(all(not(windows), not(test)))]
+        {
+            false
+        }
     }
 }
 
@@ -166,11 +200,11 @@ pub(crate) struct MemoryWait {
     observed: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
-/// Submitted work outlives the guest queue handle. NEVER has no possible
+/// Submitted work outlives the guest queue handle. An impossible predicate has no possible
 /// producer, so only its diagnostic needs to follow the queue's lifetime.
 enum WaitingQueue {
     Reachable(Arc<Timeline>),
-    Never(Weak<Timeline>),
+    Impossible(Weak<Timeline>),
 }
 
 struct Pending {
@@ -196,7 +230,8 @@ impl MemoryWait {
             return observed.load(Ordering::Acquire);
         }
         let mut pending = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
-        if self.predicate.reached() {
+        let possible = self.predicate.can_match();
+        if possible && self.predicate.reached() {
             return true;
         }
         let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -204,10 +239,10 @@ impl MemoryWait {
         pending.push(Pending {
             predicate: self.predicate,
             observed,
-            queue: if self.predicate.comparison == 1 {
-                WaitingQueue::Never(Arc::downgrade(queue))
-            } else {
+            queue: if possible {
                 WaitingQueue::Reachable(queue.clone())
+            } else {
+                WaitingQueue::Impossible(Arc::downgrade(queue))
             },
             since: Instant::now(),
             warned: false,
@@ -228,7 +263,7 @@ fn scan_memory(
         let overlaps = range.as_ref().is_none_or(|r| {
             r.start < wait.address.saturating_add(wait.operand.bytes()) && wait.address < r.end
         });
-        if let WaitingQueue::Never(queue) = &entry.queue
+        if let WaitingQueue::Impossible(queue) = &entry.queue
             && queue.strong_count() == 0
         {
             return false;
@@ -395,10 +430,11 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let fence = fence(this);
-    let waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-    fence.value.store(value, Ordering::Release);
-    let queues = wake(fence, waiters);
-    run_held(queues);
+    let at = fence.value.as_ptr() as usize;
+    write_and_collect(at, size_of::<u64>(), || {
+        fence.value.store(value, Ordering::Release)
+    })
+    .run();
     S_OK
 }
 
@@ -513,21 +549,15 @@ pub(crate) fn write_and_collect(at: usize, bytes: usize, store: impl FnOnce()) -
     store();
     let (mut ready, _) = scan_memory(&mut pending, Some(at..end));
     drop(pending);
-    let Some((&value_at, &fence)) = live.range(..end).next_back() else {
-        return Woken(ready);
-    };
-    if value_at + size_of::<u64>() <= at {
-        return Woken(ready);
+    // A copied range may cover more than one fence.
+    for (_, &ptr) in live.range(at.saturating_sub(size_of::<u64>() - 1)..end) {
+        // SAFETY: the LIVE lock prevents deregistration during collection.
+        let fence = unsafe { &*(ptr as *const Fence) };
+        ready.extend(wake(
+            fence,
+            fence.waiters.lock().unwrap_or_else(|e| e.into_inner()),
+        ));
     }
-    // SAFETY: registered fences are alive until their drop, which takes
-    // the registry lock we hold.
-    let fence = unsafe { &*(fence as *const Fence) };
-    let queues = wake(
-        fence,
-        fence.waiters.lock().unwrap_or_else(|e| e.into_inner()),
-    );
-    drop(live);
-    ready.extend(queues);
     Woken(ready)
 }
 
@@ -626,6 +656,137 @@ mod tests {
         drop(timeline);
         assert!(weak.upgrade().is_none());
         assert!(!scan_memory(&mut isolated, None).1);
+    }
+
+    #[test]
+    fn impossibility_depends_only_on_the_mask_and_unsigned_domain() {
+        for mask in 0..16 {
+            for reference in 0..=16 {
+                for comparison in 1..=8 {
+                    let p = Predicate {
+                        operand: Operand::Dword(mask),
+                        reference,
+                        comparison,
+                        address: 0,
+                    };
+                    assert_eq!(p.can_match(), (0..16).any(|value| p.matches(value)));
+                }
+            }
+        }
+        let p = Predicate {
+            operand: Operand::Qword,
+            reference: u64::MAX,
+            comparison: 5,
+            address: 0,
+        };
+        assert!(!p.can_match());
+        assert!(
+            Predicate {
+                reference: u64::MAX - 1,
+                ..p
+            }
+            .can_match()
+        );
+        assert!(
+            !Predicate {
+                comparison: 2,
+                reference: 0,
+                ..p
+            }
+            .can_match()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_operand_stays_pending_until_remapped() {
+        use crate::timeline::Op;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        // SAFETY: we own this reservation throughout the test.
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!page.is_null());
+        let p = Predicate {
+            address: page as usize,
+            operand: Operand::Qword,
+            comparison: 3,
+            reference: 1,
+        };
+        let q = Arc::new(Timeline::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        q.submit_batch([
+            Op::Memory(MemoryWait::new(p)),
+            Op::Run(Box::new(move || tx.send(()).unwrap())),
+        ]);
+        // SAFETY: decommit keeps the same address reserved.
+        assert_ne!(unsafe { VirtualFree(page, 4096, MEM_DECOMMIT) }, 0);
+        for operand in [Operand::Dword(u32::MAX), Operand::Qword] {
+            assert!(
+                !Predicate {
+                    operand,
+                    reference: 0,
+                    ..p
+                }
+                .reached()
+            );
+        }
+        assert!(rx.try_recv().is_err());
+        // SAFETY: recommit our own reserved page before writing it.
+        assert_eq!(
+            unsafe { VirtualAlloc(page, 4096, MEM_COMMIT, PAGE_READWRITE) },
+            page
+        );
+        crate::queue::Written::Value(1).write(page.cast(), 8).run();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // SAFETY: the wait has completed and no thread reads this reservation.
+        assert_ne!(unsafe { VirtualFree(page, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cpu_and_queue_signals_latch_address_waits_and_allow_reentry() {
+        use crate::timeline::Op;
+        for queued in [false, true] {
+            let f = new_fence(0);
+            let (producer, signal_slot) = crate::queue::test_queue();
+            let consumer = Arc::new(Timeline::default());
+            let again = Held::new(f);
+            let (tx, rx) = std::sync::mpsc::channel();
+            consumer.submit_batch([
+                Op::Memory(MemoryWait::new(Predicate {
+                    address: address(f),
+                    operand: Operand::Qword,
+                    comparison: 3,
+                    reference: 1,
+                })),
+                Op::Run(Box::new(move || {
+                    again.signal(2);
+                    tx.send(()).unwrap();
+                })),
+            ]);
+            if queued {
+                let signal =
+                    slot::<extern "system" fn(This, This, u64) -> HRESULT>(producer, signal_slot);
+                assert_eq!(signal(producer, f, 1), S_OK);
+                assert_eq!(signal(producer, f, 3), S_OK);
+            } else {
+                assert_eq!(signal(f, 1), S_OK);
+                assert_eq!(signal(f, 3), S_OK);
+            }
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("missed fence signal");
+            slot::<extern "system" fn(This) -> u32>(producer, 0x10)(producer);
+            release_fence(f);
+        }
     }
 
     #[test]

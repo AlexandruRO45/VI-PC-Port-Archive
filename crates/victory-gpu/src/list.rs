@@ -855,7 +855,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
-        list.defer(move || {
+        list.defer(dst as usize, len, move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {
@@ -1880,6 +1880,62 @@ mod tests {
         );
         assert_eq!((counter, payload), (publish, 0x5a55a11c));
         assert_eq!(result, payload, "producer_first={producer_first}");
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn deferred_copy_latches_a_wait_before_a_later_overwrite() {
+        use crate::fence::{MemoryWait, Operand, Predicate};
+        use crate::timeline::{Op, Timeline};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        crate::host::host().expect("D3D12");
+        for memory_to_memory in [false, true] {
+            let (queue, _) = crate::queue::test_queue();
+            let null = std::ptr::null();
+            let (mut allocator, mut list) = (null, null);
+            assert_eq!(
+                create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+                S_OK
+            );
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            let word = AtomicU64::new(0);
+            let first = AtomicU64::new(1);
+            let second = AtomicU64::new(2);
+            let consumer = Arc::new(Timeline::default());
+            let (tx, rx) = std::sync::mpsc::channel();
+            consumer.submit_batch([
+                Op::Memory(MemoryWait::new(Predicate {
+                    address: word.as_ptr() as usize,
+                    operand: Operand::Qword,
+                    comparison: 3,
+                    reference: 1,
+                })),
+                Op::Run(Box::new(move || tx.send(()).unwrap())),
+            ]);
+            for src in [&first, &second] {
+                if memory_to_memory {
+                    copy_memory(list, word.as_ptr() as u64, src.as_ptr() as u64, 8, 0);
+                } else {
+                    host_list(list).unwrap().defer_copy(
+                        word.as_ptr().cast(),
+                        src.as_ptr().cast(),
+                        8,
+                    );
+                }
+            }
+            assert_eq!(close(list), S_OK);
+            slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+            assert_eq!(word.load(Ordering::Acquire), 2);
+            rx.recv_timeout(std::time::Duration::from_secs(2))
+                .expect("copy lost EQ(1)");
+            for o in [list, allocator, queue] {
+                slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+            }
+        }
     }
 
     #[test]
