@@ -1795,4 +1795,68 @@ mod tests {
             assert_eq!(found[0].unpack().as_deref(), Some(&b"unprintable"[..]));
         }
     }
+
+    #[test]
+    fn a_name_is_not_read_from_before_the_magic_or_from_the_previous_record() {
+        // A record whose name has no length byte of its own. The byte that
+        // would state it lies before the magic, or in the previous record's
+        // padding past its stream: both belong to something else, so the
+        // name is not read across them. Read whole, it would be
+        // `SGD5PS_x` or `ABPS_x`.
+        let tail = |name: &[u8], payload: &[u8]| {
+            let packed = miniz_oxide::deflate::compress_to_vec(payload, 6);
+            let n = (packed.len() + 12) as u32;
+            let mut out = name.to_vec();
+            out.extend_from_slice(&[0, 0x32]);
+            for v in [n, 0x000D_DCE7, n, payload.len() as u32] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&packed);
+            out
+        };
+        let mut file = vec![0x09];
+        file.extend_from_slice(MAGIC);
+        file.extend(tail(b"PS_x", b"after the magic"));
+        let found: Vec<_> = records(&file).collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, None);
+        assert_eq!(found[0].unpack().as_deref(), Some(&b"after the magic"[..]));
+
+        // The previous record, padded past its stream with `07 'A' 'B'`.
+        let payload = b"padded";
+        let mut packed = miniz_oxide::deflate::compress_to_vec(payload, 6);
+        packed.extend_from_slice(b"\x07AB");
+        let n = (packed.len() + 12) as u32;
+        let mut file = MAGIC.to_vec();
+        file.extend_from_slice(b"\x0aPS_padded\0\x32");
+        for v in [n, 0x000D_DCE7, n, payload.len() as u32] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&packed);
+        file.extend(tail(b"PS_x", b"after a record"));
+        let found: Vec<_> = records(&file).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_padded"), None]);
+        assert_eq!(found[0].unpack().as_deref(), Some(&payload[..]));
+        assert_eq!(found[1].unpack().as_deref(), Some(&b"after a record"[..]));
+    }
+
+    #[test]
+    fn every_kind_byte_is_reported_as_it_is() {
+        // The kind is not checked to find a record: any byte, even one that
+        // reads as a NUL, a length byte or part of the marker, is reported
+        // as it is, and the name before it is still read.
+        let kinds = [0x00, 0x01, 0x09, 0x0D, 0x32, 0x7F, 0xDC, 0xE7, 0xFF];
+        let mut file = MAGIC.to_vec();
+        for &kind in &kinds {
+            file.extend(record_bytes("PS_kind", kind, &[kind; 40]));
+        }
+        let found: Vec<_> = records(&file).collect();
+        assert_eq!(found.len(), kinds.len());
+        for (r, &kind) in found.iter().zip(&kinds) {
+            assert_eq!(r.kind, kind);
+            assert_eq!(r.name, Some("PS_kind"), "kind {kind:#x}");
+            assert_eq!(r.unpack(), Some(vec![kind; 40]), "kind {kind:#x}");
+        }
+    }
 }
