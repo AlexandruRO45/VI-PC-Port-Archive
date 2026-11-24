@@ -1945,4 +1945,83 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn containers_packed_at_every_level_are_records() {
+        // The same containers packed at every level (0, stored blocks, to
+        // 10), sized around the probe and a stored block's 65535 bytes: all
+        // are records, with their names, and unpack whole.
+        let sizes = [0, 1, PROBE - 1, PROBE, PROBE + 1, 65_535, 65_536, 70_000];
+        let mut file = MAGIC.to_vec();
+        let mut want = Vec::new();
+        for (i, &size) in sizes.iter().enumerate() {
+            let container: Vec<u8> = (0..size as u32)
+                .map(|j| (j.wrapping_mul(2_654_435_761) >> (i + 9)) as u8)
+                .collect();
+            for level in 0..=10u8 {
+                let packed = miniz_oxide::deflate::compress_to_vec(&container, level);
+                let n = (packed.len() + 12) as u32;
+                let name = format!("PS_{size}_{level}");
+                file.push(name.len() as u8 + 1);
+                file.extend_from_slice(name.as_bytes());
+                file.extend_from_slice(&[0, 0x32]);
+                for v in [n, 0x000D_DCE7, n, size as u32] {
+                    file.extend_from_slice(&v.to_le_bytes());
+                }
+                file.extend_from_slice(&packed);
+                want.push((name, container.clone()));
+            }
+        }
+        let found: Vec<_> = records(&file).collect();
+        assert_eq!(found.len(), want.len());
+        for (r, (name, container)) in found.iter().zip(&want) {
+            assert_eq!(r.name, Some(name.as_str()));
+            assert_eq!(r.unpack().as_ref(), Some(container), "{name}");
+        }
+    }
+
+    #[test]
+    fn whole_sgd5_file_stored_in_a_record_is_that_records() {
+        // A record whose container is, stored as is (level 0), a whole SGD5
+        // file: its magic and records are the outer record's bytes, so the
+        // search neither restarts at that magic nor yields the records; each
+        // lies inside the outer record, whose container holds them all.
+        let mut inner = MAGIC.to_vec();
+        inner.extend(record_bytes("PS_inner_a", 0x32, b"first inside"));
+        inner.extend(bare_record(0, 0x3c, b"nameless inside"));
+        inner.extend(record_bytes("PS_inner_c", 0x41, &[9; 200]));
+        let inside: Vec<_> = records(&inner).map(|r| (r.offset, r.name)).collect();
+        assert_eq!(inside.len(), 3);
+
+        let packed = miniz_oxide::deflate::compress_to_vec(&inner, 0);
+        let stored = memchr::memmem::find(&packed, &inner).expect("stored as is");
+        let n = (packed.len() + 12) as u32;
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("PS_before", 0x32, b"before"));
+        // The marker follows the name, NUL, kind and `n`.
+        let outer = file.len() + 13 + 4;
+        file.extend_from_slice(b"\x0bPS_archive\0\x32");
+        for v in [n, 0x000D_DCE7, n, inner.len() as u32] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&packed);
+        file.extend(record_bytes("PS_after", 0x32, b"after"));
+
+        let found: Vec<_> = records(&file).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(
+            names,
+            [Some("PS_before"), Some("PS_archive"), Some("PS_after")]
+        );
+        assert_eq!(found[1].offset, outer);
+        let container = found[1].unpack().expect("the stored file");
+        assert_eq!(container, inner);
+        let base = outer + 12 + stored;
+        assert!(in_record(&found, base), "the stored magic");
+        for &(offset, _) in &inside {
+            assert!(in_record(&found, base + offset));
+        }
+        let again: Vec<_> = records(&container).map(|r| (r.offset, r.name)).collect();
+        assert_eq!(again, inside);
+    }
 }
