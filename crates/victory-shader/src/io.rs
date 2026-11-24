@@ -1099,6 +1099,38 @@ mod tests {
         assert_eq!(io([0xF000_1100, 0x0002_0105]), per_lane);
     }
 
+    /// A VGPR range covers v5 only from its first register to its last: a
+    /// pair ending at v4 or starting at v6 reads no group input, while one
+    /// starting at v5 does. A `ds_write2`'s second data and a three-source
+    /// VALU's third source are sources like the first; v5 as only the
+    /// destination of a three-source VALU is no per-lane read.
+    #[test]
+    fn vgpr_ranges_and_later_sources_name_the_mesh_group_exactly() {
+        let per_lane = Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "the mesh group input read per lane",
+        });
+        let io = |w: [u32; 2]| mesh_io(&[w[0], w[1], S_ENDPGM]);
+        // ds_write_b64 v0, v[3:4] and v0, v[6:7]: both miss v5.
+        assert!(io([0xD934_0000, 0x0000_0300]).is_ok());
+        assert!(io([0xD934_0000, 0x0000_0600]).is_ok());
+        // ds_write_b64 v0, v[5:6]: v5 as the pair's low dword.
+        assert_eq!(io([0xD934_0000, 0x0000_0500]), per_lane);
+        // global_store_dword v[3:4], v1, off and v[6:7], v1, off.
+        assert!(io([0xDC70_8000, 0x007D_0103]).is_ok());
+        assert!(io([0xDC70_8000, 0x007D_0106]).is_ok());
+        // global_store_dwordx2 v[0:1], v[4:5], off: the data's high dword.
+        assert_eq!(io([0xDC74_8000, 0x007D_0400]), per_lane);
+        // ds_write2_b32 v0, v1, v5 offset1:1: the second data.
+        assert_eq!(io([0xD838_0100, 0x0005_0100]), per_lane);
+        // v_mad_u32_u24 v1, v0, v1, v5: the third source.
+        assert_eq!(io([0xD543_0001, 0x0416_0300]), per_lane);
+        // v_mad_u32_u24 v5, v0, v1, v2: v5 only written.
+        assert!(io([0xD543_0005, 0x040A_0300]).is_ok());
+        // v_mad_u32_u24 v5, v0, v1, v5: written and read.
+        assert_eq!(io([0xD543_0005, 0x0416_0300]), per_lane);
+    }
+
     fn vertex(inputs: Vec<crate::native::VsInput>) -> NativeProgram {
         NativeProgram {
             stage: HwStage::Vs,
