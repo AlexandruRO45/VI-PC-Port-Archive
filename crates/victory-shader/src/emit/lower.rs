@@ -4251,6 +4251,23 @@ impl<'a> Lower<'a> {
                     118,
                     &[a],
                 );
+                // The host's wave operations leave helper lanes out; the
+                // console's include them. In a loop that serves one value
+                // per pass (sampling with a per-lane descriptor), a helper
+                // lane whose value no live lane shares is then never served
+                // and runs until the loop limit, a GPU hang on NVIDIA. A
+                // helper lane takes its own value: what the console gives it
+                // on the pass that serves it, and the same as the wave's for
+                // a value all lanes share.
+                let r = if self.s.pixel && !super::helper_lane_waves() {
+                    let i1 = self.s.t.i1;
+                    let helper = self
+                        .s
+                        .op(c, "isHelperLane.i1", Attr::ReadOnly, i1, 221, &[]);
+                    self.s.m.select(c, helper, a, r)
+                } else {
+                    r
+                };
                 int(self, r)
             }
             _ => {
