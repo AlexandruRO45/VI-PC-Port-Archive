@@ -620,13 +620,6 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         );
         return false;
     }
-    // A widened host copy (see `widened`) is viewed in its own format.
-    if own == crate::resource::WIDE
-        && let Some(format) = format.as_deref_mut()
-        && crate::resource::target_format(format.0 as u32) == own
-    {
-        format.0 = own as i32;
-    }
     // Every family has more than one format, its typeless one first.
     let typeless = family(own) == own && family(own + 1) == own;
     if let Some(format) = format.as_deref_mut()
