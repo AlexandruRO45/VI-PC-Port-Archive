@@ -90,7 +90,9 @@ fn give_back(v: Vec<u8>) {
     }
 }
 
+const WATCHED: u8 = 1;
 const NOT_WATCHED: u8 = 2;
+const GUARDED: u8 = 3;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
@@ -354,9 +356,22 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
-                self.watched.store(1, Ordering::Relaxed);
+        use crate::watch::Kind;
+        let mode = self.watched.load(Ordering::Relaxed);
+        if mode != NOT_WATCHED {
+            let known = match mode {
+                WATCHED => Some(Kind::Watched),
+                GUARDED => Some(Kind::Guarded),
+                _ => None,
+            };
+            if let Some((kind, (now, written))) = crate::watch::writes_kind(from, to, known) {
+                let next = match kind {
+                    Kind::Watched => WATCHED,
+                    Kind::Guarded => GUARDED,
+                };
+                if next != mode {
+                    self.watched.store(next, Ordering::Relaxed);
+                }
                 let copied = self.copy_stale(from, to, now, &written);
                 #[cfg(feature = "diagnostics")]
                 {
