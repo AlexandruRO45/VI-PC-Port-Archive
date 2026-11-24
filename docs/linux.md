@@ -78,11 +78,11 @@ calling convention; check before you bind.
 |------|-------|
 | Workspace builds and tests on Linux | done |
 | Title-facing ABI is `win64` | done |
-| PE mapper, TEB, guest threads, TLS, entry | done; `run --execute` stops in `vcruntime140`'s `DllMain` on kernel32 |
+| PE mapper, TEB, guest threads, TLS, entry | done |
 | SEH, signals, unwinding | not started |
 | kernel32: handles, waits, sync objects and locks, threads, TLS/FLS, thread pool, time, system, process | done (`victory-hle/src/linux/handles.rs`, `kernel32_*.rs`; SuspendThread uses `SIGRTMIN+6`) |
 | kernel32/ntdll: memory, heap | not started |
-| UCRT | not started |
+| UCRT | every import the title and its DLLs take (`ucrt_*.rs`); C locale only |
 | GPU, window, input | not started |
 | Audio, network (offline), crypto, COM and the other host DLLs | not started |
 | Windows-only `victory-hle` modules (files, xmem, lifecycle, ...) | not started |
