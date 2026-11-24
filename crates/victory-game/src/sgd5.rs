@@ -3512,4 +3512,113 @@ mod tests {
             miniz_oxide::inflate::decompress_to_vec(&literal_then_coded_copy(285, 0)).ok()
         );
     }
+
+    /// A non-final fixed-code block of the literal `A`, then a final stored
+    /// block of `BC`. Its header ends mid-byte: `aligned` pads the rest of
+    /// that byte with `pad` (its bits from low to high) before LEN, as
+    /// deflate does; otherwise LEN follows the header's last bit at once.
+    fn coded_then_stored(aligned: bool, pad: u32) -> Vec<u8> {
+        let mut bits = Bits::default();
+        bits.put(0, 1); // BFINAL 0
+        bits.put(1, 2); // fixed codes
+        bits.code(0x30 + u32::from(b'A'), 8); // literals 0-143: 8 bits from 0x30
+        bits.code(0, 7); // end of block (256)
+        bits.put(1, 1); // BFINAL
+        bits.put(0, 2); // stored
+        assert_eq!(bits.used, 21);
+        if aligned {
+            bits.put(pad, 3);
+        }
+        for v in [2, !2] {
+            bits.put(u32::from(v as u16), 16);
+        }
+        for b in *b"BC" {
+            bits.put(u32::from(b), 8);
+        }
+        bits.out
+    }
+
+    #[test]
+    fn stored_block_after_a_coded_one_starts_at_the_next_byte_whatever_the_padding() {
+        // A stored block's LEN starts at a byte: the bits left in the byte
+        // its header ends in are skipped, whatever they hold. A stored block
+        // after a fixed-code one is a stream with that padding zeros or
+        // ones; the same LEN, NLEN and bytes written with no padding are
+        // read shifted, NLEN no longer LEN's complement, and the stream
+        // breaks. Such a broken record covers no other, so it is yielded
+        // and does not unpack, and the record after it is found either way.
+        let want = b"ABC".to_vec();
+        for (aligned, pad) in [(true, 0b000), (true, 0b101), (true, 0b111), (false, 0)] {
+            let what = format!("aligned {aligned}, padding {pad:03b}");
+            let packed = coded_then_stored(aligned, pad);
+            assert_eq!(packed.len(), 3 + 4 + 2, "{what}");
+            assert_eq!(
+                miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                aligned.then(|| want.clone()),
+                "{what}"
+            );
+            assert_eq!(starts_stream(&packed, want.len()), aligned, "{what}");
+
+            let (file, marker) = outer_then_after(&packed, want.len());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            assert_eq!(found[0].unpack(), aligned.then(|| want.clone()), "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "{what}");
+        }
+    }
+
+    #[test]
+    fn copy_from_the_farthest_distance_is_told_only_by_unpacking() {
+        // Distance code 29 with every extra bit set reaches 32768 bytes
+        // back, the farthest deflate states. After 32768 stored bytes that
+        // copy is a stream; after one byte fewer it reaches before the
+        // container's start and breaks it. Both breaks lie far past the
+        // probe, which reads only stored bytes either way: both records are
+        // taken as streams, so each is yielded with the span its sizes
+        // state, the broken one does not unpack, and the record after it is
+        // found.
+        let far = far_distance(29, 8191) as usize;
+        assert_eq!(far, 32_768);
+        for stored in [far, far - 1] {
+            let what = format!("{stored} stored bytes");
+            let before: Vec<u8> = (0..stored).map(|i| (i % 251) as u8).collect();
+            let packed = stored_then_far_copy(&before, 29, 8191);
+            assert!(packed.len() > PROBE, "{what}");
+            assert!(memchr::memmem::find(&packed, &MARKER).is_none(), "{what}");
+            let valid = stored == far;
+            let want = valid.then(|| {
+                let mut out = before.clone();
+                for _ in 0..3 {
+                    out.push(out[out.len() - far]);
+                }
+                out
+            });
+            assert_eq!(
+                miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                want,
+                "{what}"
+            );
+            assert!(starts_stream(&packed, stored + 3), "{what}");
+
+            let (file, marker) = outer_then_after(&packed, stored + 3);
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            assert_eq!(found[0].unpack(), want, "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "{what}");
+        }
+    }
 }
