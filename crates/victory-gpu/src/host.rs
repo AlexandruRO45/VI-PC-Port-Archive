@@ -259,6 +259,33 @@ pub(crate) mod crumbs {
     /// Records one operation on the host's ring.
     pub(crate) fn record(op: u16, a: u64, b: u32) {
         RING.record(op, a, b);
+        #[cfg(all(windows, feature = "diagnostics"))]
+        check(op, a, b);
+    }
+
+    /// With `VICTORY_GPU_CHECK` set (diagnostics): asks the device after
+    /// every recorded operation whether it has been removed, so the first
+    /// operation after which it has names itself instead of waiting for
+    /// the next call to report it.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn check(op: u16, a: u64, b: u32) {
+        use windows::Win32::Graphics::Direct3D12::ID3D12Device;
+        static DEVICE: std::sync::OnceLock<Option<ID3D12Device>> = std::sync::OnceLock::new();
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_GPU_CHECK").is_some()) {
+            return;
+        }
+        let device = DEVICE.get_or_init(|| crate::host::host().map(|h| h.device.clone()));
+        let Some(device) = device.as_ref() else {
+            return;
+        };
+        // SAFETY: a plain query on a live or removed device.
+        if let Err(e) = unsafe { device.GetDeviceRemovedReason() } {
+            crate::host::fail(format_args!(
+                "the device was removed right after op={} a={a:#x} b={b} ({e})",
+                op_name(op)
+            ));
+        }
     }
 
     /// The newest `newest` operations the host recorded, oldest first.
@@ -684,6 +711,42 @@ struct Deferred {
     budget_zeroed: bool,
 }
 
+/// Whether `resource` was made with the flag a view of it needs: a view
+/// created without it removes the device.
+fn allows(resource: &ID3D12Resource, flag: D3D12_RESOURCE_FLAGS) -> bool {
+    // SAFETY: a plain query on a live resource.
+    unsafe { resource.GetDesc() }.Flags.0 & flag.0 != 0
+}
+
+/// Whether `resource` can take a render target view: a clear of one it cannot
+/// take is an invalid call, not a no-op.
+pub(crate) fn clears_render_target(resource: &ID3D12Resource) -> bool {
+    allows(resource, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+}
+
+/// Whether `resource` can take a depth view, as [`clears_render_target`].
+pub(crate) fn clears_depth(resource: &ID3D12Resource) -> bool {
+    allows(resource, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+}
+
+/// Says once for each kind which view was made null for lack of permission.
+fn once_render(resource: &ID3D12Resource, kind: &'static str) {
+    static ONCE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
+        std::sync::OnceLock::new();
+    let said = ONCE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let first = said.lock().map(|mut s| s.insert(kind)).unwrap_or(false);
+    if first {
+        // SAFETY: a plain query on a live resource.
+        let desc = unsafe { resource.GetDesc() };
+        tracing::warn!(
+            kind,
+            flags = desc.Flags.0,
+            format = desc.Format.0,
+            "a view of a resource without the permission for it is null: what it draws is lost"
+        );
+    }
+}
+
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
@@ -1082,6 +1145,18 @@ impl Host {
         unsafe {
             let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
             handle.ptr += (slot * self.rtv_size) as usize;
+            // A view of a resource without the permission removes the device,
+            // and the host copy of a console texture can lose it: the title
+            // makes NV12 and B4G4R4A4_UNORM textures both render targets and
+            // UAVs, and PC D3D12 refuses that combination for those formats,
+            // so the copy is created without the flag. A null view draws
+            // nothing: its draws and clears are lost, rather than taking the
+            // device down with them.
+            if !allows(resource, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
+                once_render(resource, "render target");
+                self.device.CreateRenderTargetView(None, None, handle);
+                return handle;
+            }
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
             handle
@@ -1099,6 +1174,13 @@ impl Host {
         unsafe {
             let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
             handle.ptr += (slot * self.dsv_size) as usize;
+            // As `rtv`: a depth view of a resource without the permission
+            // removes the device.
+            if !allows(resource, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) {
+                once_render(resource, "depth");
+                self.device.CreateDepthStencilView(None, None, handle);
+                return handle;
+            }
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
             handle

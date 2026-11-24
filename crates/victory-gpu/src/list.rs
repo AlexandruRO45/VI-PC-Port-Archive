@@ -481,6 +481,9 @@ fn texture_to_buffer(
     }
     ensure_state(list, src.resource, COPY_SOURCE);
     from.resource = texture.as_raw().cast_const().cast();
+    // A buffer has no state a copy has to move it out of: a transition here
+    // would name a before-state we do not know, and D3D12 ignores a buffer's
+    // state for a copy anyway.
     // The destination buffer reads title memory; what the copy writes there
     // goes back to it once the list has run.
     shadow.refresh(list, at, bytes);
@@ -917,6 +920,13 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
+        // A clear of a resource that cannot take a render target view is an
+        // invalid call: the console's texture was both a render target and a
+        // UAV, and its host copy lost the permission. Nothing to clear.
+        if !crate::host::clears_render_target(texture) {
+            crumbs::record(crumbs::CLEAR_RTV, record.resource as u64, 1);
+            return;
+        }
         let rtv = host.rtv(texture, record.desc().as_ref());
         crumbs::record(crumbs::CLEAR_RTV, record.resource as u64, 0);
         // SAFETY: an open list, a fresh view of a live texture.
@@ -965,6 +975,12 @@ extern "system" fn clear_dsv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const DEPTH_WRITE: u32 = 0x10;
+        // As `clear_rtv`: a clear of a resource that cannot take a depth view
+        // is an invalid call.
+        if !crate::host::clears_depth(texture) {
+            crumbs::record(crumbs::CLEAR_DSV, record.resource as u64, 1);
+            return;
+        }
         ensure_state(list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         crumbs::record(crumbs::CLEAR_DSV, record.resource as u64, 0);
