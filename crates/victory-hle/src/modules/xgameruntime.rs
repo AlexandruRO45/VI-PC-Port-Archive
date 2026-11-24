@@ -379,4 +379,30 @@ mod tests {
             assert!(!GetProcAddress(kernel32, c"GetTickCount".as_ptr().cast()).is_null());
         }
     }
+
+    #[test]
+    fn every_runtime_object_answers_iunknown_query() {
+        type Query = extern "system" fn(*mut Object, *const Guid, *mut *mut c_void) -> HRESULT;
+        let unsupported = Guid::new(1, 2, 3, [4; 8]);
+        for &(_, _, object) in AREAS.iter().flat_map(|area| area.iter()) {
+            let query = method::<Query>(object, 0);
+            let this = std::ptr::from_ref(object).cast_mut();
+            let mut out = std::ptr::dangling_mut::<c_void>();
+            assert_eq!(
+                query(this, &IID_IUNKNOWN, &mut out),
+                S_OK,
+                "{} answers IUnknown",
+                object.area
+            );
+            assert_eq!(out, this.cast());
+            out = std::ptr::dangling_mut::<c_void>();
+            assert_eq!(
+                query(this, &unsupported, &mut out),
+                E_NOINTERFACE,
+                "{} refuses an unknown interface",
+                object.area
+            );
+            assert!(out.is_null(), "{} clears the output", object.area);
+        }
+    }
 }
