@@ -25,36 +25,9 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        shell: bash
-        run: |
-          set +e
-          CARGO_TERM_COLOR=never cargo clippy --workspace --all-targets --locked --message-format=short -- -D warnings > /tmp/clippy.log 2>&1
-          code=$?
-          cat /tmp/clippy.log
-          if [ $code -ne 0 ]; then
-            grep -E '(error|warning)' /tmp/clippy.log | head -n 40 | while IFS= read -r line; do echo "::error::$line"; done
-            exit $code
-          fi
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
-        shell: bash
-        run: |
-          set +e
-          CARGO_TERM_COLOR=never cargo clippy --workspace --all-targets --all-features --locked --message-format=short -- -D warnings > /tmp/clippy_diag.log 2>&1
-          code=$?
-          cat /tmp/clippy_diag.log
-          if [ $code -ne 0 ]; then
-            grep -E '(error|warning)' /tmp/clippy_diag.log | head -n 40 | while IFS= read -r line; do echo "::error::$line"; done
-            exit $code
-          fi
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
-        shell: bash
-        run: |
-          set +e
-          CARGO_TERM_COLOR=never cargo test --workspace --locked > /tmp/test.log 2>&1
-          code=$?
-          cat /tmp/test.log
-          if [ $code -ne 0 ]; then
-            awk '/^failures:/,/^test result: FAILED/' /tmp/test.log | grep -v '^$' | head -n 10 | while IFS= read -r line; do echo "::error::$line"; done
-            exit $code
-          fi
+        run: cargo test --workspace --locked

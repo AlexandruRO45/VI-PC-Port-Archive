@@ -106,6 +106,13 @@ fn build_expecting(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader 
 /// hardware GPU and on WARP (each skipped without a device) and returns,
 /// per one that ran, the UAV's 32 dwords.
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
+    run_with_kind(shader, views)
+        .into_iter()
+        .map(|(label, _, words)| (label, words))
+        .collect()
+}
+
+fn run_with_kind(shader: &HostShader, views: &[View]) -> Vec<(&'static str, bool, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -149,7 +156,7 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
                 },
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        out.push((label, words[0].clone()));
+        out.push((label, host.software, words[0].clone()));
     }
     out
 }
@@ -269,17 +276,25 @@ fn lanes_query_size_in_a_separate_waterfall_loop() {
         View::Texture(1, 3, &second),
         View::RawUav(32),
     ];
-    let results = run(&shader, &views);
+    let results = run_with_kind(&shader, &views);
     assert!(!results.is_empty());
-    let mut errs = Vec::new();
-    for (label, words) in results {
+    // Even lanes: 1x5 red=1.0 -> 1.0 + (5 - 1) = 5.0.
+    // Odd lanes:  1x3 red=2.0 -> 2.0 + (3 - 1) = 4.0.
+    let want: Vec<f32> = (0..32).map(|l| if l & 1 == 0 { 5.0 } else { 4.0 }).collect();
+    // Windows inbox WARP (e.g. 10.0.26100.9818) has a driver bug (also
+    // reproduced with plain DXC HLSL) where non-uniform `GetDimensions` returns
+    // lane 0's dimensions to every lane (1.0 + 4 = 5.0, 2.0 + 4 = 6.0), whereas
+    // hardware GPUs and packaged WARP 1.0.22+ return per-lane dimensions.
+    let inbox_warp_want: Vec<f32> = (0..32).map(|l| if l & 1 == 0 { 5.0 } else { 6.0 }).collect();
+    for (label, software, words) in results {
         let got: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
-        // Even lanes: 1x5 red=1.0 -> 1.0 + (5 - 1) = 5.0.
-        // Odd lanes:  1x3 red=2.0 -> 2.0 + (3 - 1) = 4.0.
-        let want: Vec<f32> = (0..32).map(|l| if l & 1 == 0 { 5.0 } else { 4.0 }).collect();
-        if got != want {
-            errs.push(format!("{label}: got[0..4]={:?} want[0..4]={:?}", &got[..4], &want[..4]));
+        if software {
+            assert!(
+                got == want || got == inbox_warp_want,
+                "{label} (software): got {got:?}, want {want:?} (or inbox-WARP {inbox_warp_want:?})"
+            );
+        } else {
+            assert_eq!(got, want, "{label}");
         }
     }
-    assert!(errs.is_empty(), "waterfall size mismatch: {}", errs.join(" | "));
 }
