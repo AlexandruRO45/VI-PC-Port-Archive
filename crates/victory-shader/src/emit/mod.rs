@@ -577,6 +577,13 @@ fn emit_program(
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
+    let next_row = inputs
+        .iter()
+        .chain(&outputs)
+        .filter_map(|e| e.row)
+        .map(|r| r + 1)
+        .max()
+        .unwrap_or(0);
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
@@ -600,6 +607,7 @@ fn emit_program(
             e.interp = 5;
         }
     }
+    unpack_system_values(if pixel { &mut inputs } else { &mut outputs }, next_row);
     // Per-primitive outputs are constant. The console never exports a
     // primitive id or cull flag a mesh shader writes (it culls with the
     // primitive export), so those rows are left out.
@@ -660,6 +668,75 @@ fn emit_program(
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
+}
+
+/// A system value in a row a user semantic occupies moves to a row of its
+/// own, after the last row in use.
+///
+/// The console packs one into a free component (`SV_IsFrontFace` beside a
+/// `TEXCOORD`), which no host signature allows: a row carries one
+/// interpolation mode, and a system value has none. The user semantics keep
+/// the register and the mode they had, so only a row whose modes differ
+/// moves. This runs before the program is lowered, so a read of the moved
+/// element follows its new row and component.
+fn unpack_system_values(elements: &mut [container::SigElement], next_row: u32) {
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    let mut next = next_row;
+    for row in rows {
+        let modes: Vec<u8> = elements
+            .iter()
+            .filter(|e| e.row == Some(row))
+            .map(|e| e.interp)
+            .collect();
+        if modes.len() < 2 || modes.iter().all(|&m| m == modes[0]) {
+            continue;
+        }
+        for e in elements.iter_mut().filter(|e| e.row == Some(row)) {
+            if e.kind == 0 {
+                continue;
+            }
+            e.row = Some(next);
+            e.col = 0;
+            next += 1;
+        }
+    }
+}
+
+/// One interpolation mode per signature row, as DXIL requires.
+///
+/// Reads settle an element's mode while the program is lowered, so this runs
+/// on the finished signature: a row of user semantics takes the mode the
+/// stage interpolates with, and a row that mixes an integer with a float
+/// component takes constant, the one mode the validator allows for both.
+pub(crate) fn one_mode_per_row(elements: &mut [container::SigElement]) {
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    for row in rows {
+        let modes: Vec<u8> = elements
+            .iter()
+            .filter(|e| e.row == Some(row))
+            .map(|e| e.interp)
+            .collect();
+        if modes.len() < 2 || modes.iter().all(|&m| m == modes[0]) {
+            continue;
+        }
+        let mut integer = elements
+            .iter()
+            .filter(|e| e.row == Some(row))
+            .map(|e| matches!(e.comp, 1 | 4 | 5));
+        let mixed = integer.next().is_some_and(|first| integer.any(|k| k != first));
+        let mode = if mixed {
+            1
+        } else {
+            modes.iter().copied().find(|&m| m > 1).unwrap_or(1)
+        };
+        for e in elements.iter_mut().filter(|e| e.row == Some(row)) {
+            e.interp = mode;
+        }
+    }
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -1503,6 +1580,75 @@ mod barycentric_tests {
             usage: 0,
             half: false,
         }
+    }
+
+    /// An element of a row, as the console packed it: `comp` 9 is f32, 5 u32.
+    fn packed(name: &str, kind: u8, comp: u8, row: u32, col: u8, cols: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp: 0,
+            row: Some(row),
+            col,
+            cols,
+            usage: 1 << cols - 1,
+            half: false,
+        }
+    }
+
+    /// The console packs `SV_IsFrontFace` into the free component of a
+    /// `TEXCOORD` row, which DXIL refuses: one mode per row, and the flag is
+    /// not interpolated. The system value moves to a row of its own and the
+    /// semantic keeps its register.
+    #[test]
+    fn a_system_value_leaves_the_row_it_shares() {
+        let mut els = vec![
+            packed("TEXCOORD", 0, 9, 7, 0, 1),
+            packed("SV_IsFrontFace", 13, 1, 7, 1, 1),
+        ];
+        for (e, mode) in els.iter_mut().zip([2, 1]) {
+            e.interp = mode;
+        }
+        unpack_system_values(&mut els, 8);
+        assert_eq!((els[0].row, els[0].col, els[0].interp), (Some(7), 0, 2));
+        assert_eq!((els[1].row, els[1].col, els[1].interp), (Some(8), 0, 1));
+    }
+
+    /// A row whose elements already agree on a mode is left exactly as it
+    /// was: the row and the component of every element.
+    #[test]
+    fn one_mode_rows_are_untouched() {
+        let mut els = vec![
+            packed("TEXCOORD", 0, 9, 3, 0, 2),
+            packed("TEXCOORD", 0, 9, 3, 2, 2),
+        ];
+        for e in &mut els {
+            e.interp = 2;
+        }
+        let before = els.clone();
+        one_mode_per_row(&mut els);
+        assert_eq!(els, before);
+    }
+
+    /// An integer component cannot carry a float mode and a row carries one
+    /// mode, so a row of both takes constant, which the validator allows for
+    /// either.
+    #[test]
+    fn a_row_of_an_integer_and_a_float_takes_constant() {
+        let mut els = vec![
+            packed("COLOR", 0, 5, 3, 0, 1),
+            packed("COLOR", 0, 9, 3, 1, 3),
+        ];
+        for (e, mode) in els.iter_mut().zip([1, 2]) {
+            e.interp = mode;
+        }
+        one_mode_per_row(&mut els);
+        assert_eq!(els.iter().map(|e| (e.row, e.interp)).collect::<Vec<_>>(), [
+            (Some(3), 1),
+            (Some(3), 1)
+        ]);
     }
 
     /// Translates a pixel program with the input VGPRs `input_addr`
