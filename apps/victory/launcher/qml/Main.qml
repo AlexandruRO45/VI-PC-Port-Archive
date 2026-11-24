@@ -17,7 +17,7 @@ ApplicationWindow {
     readonly property color paper: "#f2eee8"
     readonly property color muted: "#a09b94"
     readonly property color accent: "#d83b4f"
-    readonly property color surface: "#15171b"
+    readonly property color surface: "#c715171b"
     readonly property color edge: "#2a2d32"
 
     ColumnLayout {
@@ -162,11 +162,43 @@ ApplicationWindow {
                 }
             }
 
-            StackLayout {
-                id: pages
+            Item {
+                id: desktopStage
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                currentIndex: window.pageIndex
+                clip: true
+
+                Image {
+                    anchors.fill: parent
+                    source: launcher.wallpaperSource
+                    fillMode: Image.PreserveAspectCrop
+                    sourceSize.width: 3840
+                    sourceSize.height: 2160
+                    asynchronous: true
+                    smooth: true
+                    opacity: 0.62
+                }
+                Rectangle {
+                    anchors.fill: parent
+                    gradient: Gradient {
+                        orientation: Gradient.Horizontal
+                        GradientStop { position: 0.0; color: "#bd0b0d12" }
+                        GradientStop { position: 0.52; color: "#990b0d12" }
+                        GradientStop { position: 1.0; color: "#650b0d12" }
+                    }
+                }
+                Rectangle {
+                    anchors.fill: parent
+                    gradient: Gradient {
+                        GradientStop { position: 0.0; color: "#2607090d" }
+                        GradientStop { position: 1.0; color: "#a007090d" }
+                    }
+                }
+
+                StackLayout {
+                    id: pages
+                    anchors.fill: parent
+                    currentIndex: window.pageIndex
 
                 Item {
                     Flickable {
@@ -217,9 +249,9 @@ ApplicationWindow {
                             Rectangle {
                                 id: featureCard
                                 Layout.fillWidth: true
-                                Layout.preferredHeight: 374
+                                Layout.preferredHeight: 420
                                 radius: 12
-                                color: "#17191d"
+                                color: "#d917191d"
                                 border.color: "#33363a"
                                 border.width: 1
                                 clip: true
@@ -230,7 +262,7 @@ ApplicationWindow {
                                     Item {
                                         Layout.fillWidth: true
                                         Layout.fillHeight: true
-                                        Layout.preferredWidth: featureCard.width * 0.59
+                                        Layout.preferredWidth: featureCard.width * 0.68
                                         Layout.minimumWidth: 300
                                         clip: true
                                         Image {
@@ -300,9 +332,9 @@ ApplicationWindow {
                                     Rectangle {
                                         Layout.fillHeight: true
                                         Layout.fillWidth: true
-                                        Layout.preferredWidth: featureCard.width * 0.41
+                                        Layout.preferredWidth: featureCard.width * 0.32
                                         Layout.minimumWidth: 270
-                                        color: "#17191d"
+                                        color: "#d917191d"
                                         ColumnLayout {
                                             anchors.fill: parent
                                             anchors.leftMargin: 24
@@ -889,6 +921,7 @@ ApplicationWindow {
                         }
                     }
                 }
+            }
             }
         }
     }
