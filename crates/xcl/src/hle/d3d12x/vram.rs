@@ -66,12 +66,16 @@ impl<H: Clone> Arenas<H> {
     /// it at an offset `align` allows, else a new arena of its size, `make(size, align)`.
     /// (heap, offset, arena id); None: no heap.
     fn take(&mut self, va: usize, bytes: usize, align: usize, now: std::time::Instant, make: impl FnOnce(usize, usize) -> Option<H>) -> Option<(H, usize, u64)> {
+        if align == 0 {
+            return None;
+        }
+        let end = va.checked_add(bytes)?;
         self.sweep(now);
-        let fits = |a: &Arena<H>| a.align >= align && a.base <= va && va + bytes <= a.base + a.size && (va - a.base) % align == 0;
+        let fits = |a: &Arena<H>| a.align >= align && a.base <= va && a.base.checked_add(a.size).is_some_and(|a_end| end <= a_end) && (va - a.base) % align == 0;
         let i = match self.list.iter().rposition(fits) {
             Some(i) => i,
             None => {
-                let size = bytes.div_ceil(align) * align;
+                let size = bytes.checked_next_multiple_of(align)?;
                 let heap = make(size, align)?;
                 self.next_id += 1;
                 self.list.push(Arena { base: va, size, align, heap, users: 0, idle_since: None, id: self.next_id });
@@ -281,12 +285,17 @@ impl Pages {
         sweep_idle(&mut self.idle, &mut self.pages, &mut self.extra_pages, &mut self.cooling, now);
     }
 
-    unsafe fn take_tile(&mut self, dev: &ID3D12Device) -> Option<Tile> {
-        if let Some(t) = self.free.pop() {
+    unsafe fn take_tile_from(
+        free: &mut Vec<Tile>,
+        cooling: &mut std::collections::VecDeque<(Tile, std::time::Instant)>,
+        pools: &mut Vec<ID3D12Heap>,
+        dev: &ID3D12Device,
+    ) -> Option<Tile> {
+        if let Some(t) = free.pop() {
             return Some(t);
         }
-        if self.cooling.front().is_some_and(|(_, at)| at.elapsed() >= COOL) {
-            return self.cooling.pop_front().map(|(t, _)| t);
+        if cooling.front().is_some_and(|(_, at)| at.elapsed() >= COOL) {
+            return cooling.pop_front().map(|(t, _)| t);
         }
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
@@ -300,9 +309,9 @@ impl Pages {
             crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
             return None;
         }
-        self.pools.push(heap?);
-        let h = self.pools.len() as u32 - 1;
-        self.free.extend((1..POOL_PAGES).rev().map(|t| (h, t)));
+        pools.push(heap?);
+        let h = pools.len() as u32 - 1;
+        free.extend((1..POOL_PAGES).rev().map(|t| (h, t)));
         Some((h, 0))
     }
 
@@ -395,53 +404,122 @@ impl Pages {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
-        let mut tiles = Vec::with_capacity(total as usize);
-        let mut used = Vec::with_capacity(own);
-        let mut used_extra = Vec::new();
-        for i in 0..total as usize {
-            let tile = if i < own {
-                let a = first + i * PAGE;
-                let tile = match self.pages.get_mut(&a) {
-                    Some(p) => {
-                        p.users += 1;
-                        p.idle_since = None;
-                        Some(p.tile)
-                    }
-                    None => self.take_tile(dev).inspect(|&t| {
-                        self.pages.insert(a, Page { tile: t, users: 1, idle_since: None });
-                    }),
-                };
-                if tile.is_some() {
-                    used.push(a);
-                }
-                tile
-            } else {
-                let k = (va, i);
-                let tile = match self.extra_pages.get_mut(&k) {
-                    Some(p) => {
-                        p.users += 1;
-                        p.idle_since = None;
-                        Some(p.tile)
-                    }
-                    None => self.take_tile(dev).inspect(|&t| {
-                        self.extra_pages.insert(k, Page { tile: t, users: 1, idle_since: None });
-                    }),
-                };
-                if tile.is_some() {
-                    used_extra.push(k);
-                }
-                tile
-            };
-            let Some(t) = tile else { break };
-            tiles.push(t);
-        }
-        if tiles.len() < total as usize {
-            self.release_tiles(used, used_extra, now, true);
-            return None;
-        }
+        let (tiles, used, used_extra) = match acquire_tiles(
+            &mut self.pages,
+            &mut self.extra_pages,
+            va,
+            first,
+            own,
+            total as usize,
+            || Self::take_tile_from(&mut self.free, &mut self.cooling, &mut self.pools, dev),
+        ) {
+            Ok(ok) => ok,
+            Err(rolled_back) => {
+                self.free.extend(rolled_back);
+                return None;
+            }
+        };
         self.map(res, &tiles);
         Some((used, used_extra))
     }
+}
+
+/// Acquire or share `total` tiles (`own` 64 KiB owned pages starting at `first`, plus `total - own`
+/// extra tiles keyed by `(va, i)`). On allocation failure, restores every pre-existing page's
+/// `users` and `idle_since` intact and removes only newly created pages, returning their tiles in
+/// `Err(...)` so the caller can put them back on the free list.
+fn acquire_tiles(
+    pages: &mut std::collections::HashMap<usize, Page>,
+    extra_pages: &mut std::collections::HashMap<(usize, usize), Page>,
+    va: usize,
+    first: usize,
+    own: usize,
+    total: usize,
+    mut take_tile: impl FnMut() -> Option<Tile>,
+) -> Result<(Vec<Tile>, Vec<usize>, Vec<(usize, usize)>), Vec<Tile>> {
+    let mut tiles = Vec::with_capacity(total);
+    let mut used = Vec::with_capacity(own);
+    let mut used_extra = Vec::new();
+    // (key, Some(prev_idle) if pre-existing else None if freshly created)
+    let mut acquired: Vec<(PageKey, Option<Option<std::time::Instant>>)> = Vec::with_capacity(total);
+    for i in 0..total {
+        let tile = if i < own {
+            let Some(a) = i.checked_mul(PAGE).and_then(|off| first.checked_add(off)) else { break };
+            let tile = match pages.get_mut(&a) {
+                Some(p) => {
+                    let prev_idle = p.idle_since;
+                    p.users += 1;
+                    p.idle_since = None;
+                    acquired.push((PageKey::Own(a), Some(prev_idle)));
+                    Some(p.tile)
+                }
+                None => take_tile().inspect(|&t| {
+                    pages.insert(a, Page { tile: t, users: 1, idle_since: None });
+                    acquired.push((PageKey::Own(a), None));
+                }),
+            };
+            if tile.is_some() {
+                used.push(a);
+            }
+            tile
+        } else {
+            let k = (va, i);
+            let tile = match extra_pages.get_mut(&k) {
+                Some(p) => {
+                    let prev_idle = p.idle_since;
+                    p.users += 1;
+                    p.idle_since = None;
+                    acquired.push((PageKey::Extra(va, i), Some(prev_idle)));
+                    Some(p.tile)
+                }
+                None => take_tile().inspect(|&t| {
+                    extra_pages.insert(k, Page { tile: t, users: 1, idle_since: None });
+                    acquired.push((PageKey::Extra(va, i), None));
+                }),
+            };
+            if tile.is_some() {
+                used_extra.push(k);
+            }
+            tile
+        };
+        let Some(t) = tile else { break };
+        tiles.push(t);
+    }
+    if tiles.len() < total {
+        let mut returned = Vec::new();
+        for (key, prev) in acquired.into_iter().rev() {
+            match (key, prev) {
+                (PageKey::Own(a), Some(prev_idle)) => {
+                    if let Some(p) = pages.get_mut(&a) {
+                        p.users = p.users.saturating_sub(1);
+                        if p.users == 0 {
+                            p.idle_since = prev_idle;
+                        }
+                    }
+                }
+                (PageKey::Own(a), None) => {
+                    if let Some(p) = pages.remove(&a) {
+                        returned.push(p.tile);
+                    }
+                }
+                (PageKey::Extra(v, idx), Some(prev_idle)) => {
+                    if let Some(p) = extra_pages.get_mut(&(v, idx)) {
+                        p.users = p.users.saturating_sub(1);
+                        if p.users == 0 {
+                            p.idle_since = prev_idle;
+                        }
+                    }
+                }
+                (PageKey::Extra(v, idx), None) => {
+                    if let Some(p) = extra_pages.remove(&(v, idx)) {
+                        returned.push(p.tile);
+                    }
+                }
+            }
+        }
+        return Err(returned);
+    }
+    Ok((tiles, used, used_extra))
 }
 
 /// The ranges of one UpdateTileMappings call for pool heap `heap` over a resource whose overall
@@ -1031,5 +1109,41 @@ mod tests {
             assert_eq!(arena_bytes().0 - arenas0, small_size.next_multiple_of(PAGE));
             drop(last);
         }
+    }
+
+    #[test]
+    fn arenas_take_rejects_zero_align_and_overflow() {
+        let now = Instant::now();
+        let mut a: Arenas<u32> = Arenas::new();
+        assert!(a.take(0x1_0000, PAGE, 0, now, |_, _| Some(1)).is_none());
+        assert!(a.take(usize::MAX - 0x100, PAGE, PAGE, now, |_, _| Some(1)).is_none());
+        assert!(a.take(0x1_0000, usize::MAX - 0x10, PAGE, now, |_, _| Some(1)).is_none());
+    }
+
+    #[test]
+    fn acquire_tiles_oom_preserves_preexisting_idle_pages_and_returns_new_tiles() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(50);
+        let va = 0x10_0000usize;
+        let mut pages = std::collections::HashMap::from([
+            (va, Page { tile: (0, 1), users: 0, idle_since: Some(t0) }),
+            (va + PAGE, Page { tile: (0, 2), users: 2, idle_since: None }),
+        ]);
+        let mut extra = std::collections::HashMap::from([
+            ((va, 3), Page { tile: (0, 3), users: 0, idle_since: Some(t1) }),
+        ]);
+        // Only 1 new tile is available: tile index 2 succeeds, tile index 4 hits OOM.
+        let mut free_tiles = vec![(0, 99)];
+        let res = acquire_tiles(&mut pages, &mut extra, va, va, 3, 5, || free_tiles.pop());
+        assert_eq!(res, Err(vec![(0, 99)]), "only the newly allocated tile should be returned");
+
+        let p0 = pages.get(&va).expect("pre-existing idle page must not be evicted on OOM rollback");
+        assert_eq!((p0.tile, p0.users, p0.idle_since), ((0, 1), 0, Some(t0)));
+        let p1 = pages.get(&(va + PAGE)).expect("pre-existing active page must stay");
+        assert_eq!((p1.tile, p1.users, p1.idle_since), ((0, 2), 2, None));
+        assert!(!pages.contains_key(&(va + 2 * PAGE)), "freshly inserted page must be removed");
+
+        let e3 = extra.get(&(va, 3)).expect("pre-existing idle extra page must not be evicted");
+        assert_eq!((e3.tile, e3.users, e3.idle_since), ((0, 3), 0, Some(t1)));
     }
 }
