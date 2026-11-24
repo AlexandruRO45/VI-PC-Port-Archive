@@ -61,6 +61,7 @@ extern "system" fn text_entry_async(
     max_length: u32,
 ) -> HRESULT {
     let [title, description, default] = [title, description, default].map(|t| text(t).unwrap_or_default());
+    let max_length = text_limit(max_length);
     tracing::info!(title, description, max_length, "text entry");
     xasync::pending_with(block, (&raw const TEXT).cast(), move || {
         match ask(&title, &description, &default, max_length) {
@@ -102,12 +103,16 @@ extern "system" fn text_entry_result(
     put(used, written as u32)
 }
 
-/// At most `max` characters (0: no limit).
+/// The GDK defines `maxTextLength=0` as a limit of 1024: normalize at the
+/// entry, so the dialog's edit control and the result trimming both use the
+/// effective limit.
+fn text_limit(max_length: u32) -> u32 {
+    if max_length == 0 { 1024 } else { max_length }
+}
+
+/// At most `max` characters.
 fn limit(typed: &str, max: u32) -> String {
-    match max {
-        0 => typed.to_owned(),
-        max => typed.chars().take(max as usize).collect(),
-    }
+    typed.chars().take(max as usize).collect()
 }
 
 /// Asks the user in a modal host dialog; `None` if dismissed.
@@ -316,6 +321,22 @@ mod tests {
         let result = method::<Result_>(&OBJECT, 0x98);
         assert_eq!(result(this, &mut b, 7, out.as_mut_ptr(), &mut used), S_OK);
         assert_eq!((text(out.as_ptr()).as_deref(), used), (Some("abctyp"), 7));
+        // Zero means the GDK's 1024 default: a longer text is cut there.
+        let mut b = block();
+        let long: String = "x".repeat(1030);
+        let default = std::ffi::CString::new(long).unwrap();
+        assert_eq!(entry(this, &mut b, c"Type".as_ptr(), null, default.as_ptr(), 0, 0), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        let mut size = 0;
+        assert_eq!(method::<Size>(&OBJECT, 0x90)(this, &mut b, &mut size), S_OK);
+        assert_eq!(size, 1025);
+        let mut out = [0 as c_char; 1025];
+        let mut used = 0;
+        let result = method::<Result_>(&OBJECT, 0x98);
+        assert_eq!(result(this, &mut b, 1025, out.as_mut_ptr(), &mut used), S_OK);
+        assert_eq!(text(out.as_ptr()).as_deref().map(str::len), Some(1024));
+        // An explicit limit still cuts there.
         assert_eq!(limit("\u{e9}t\u{e9}s", 3), "\u{e9}t\u{e9}");
+        assert_eq!(limit(&"x".repeat(1025), text_limit(0)).len(), 1024);
     }
 }
