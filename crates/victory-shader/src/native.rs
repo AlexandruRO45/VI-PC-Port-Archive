@@ -2064,6 +2064,68 @@ mod tests {
     }
 
     #[test]
+    fn several_native_entries_are_read_in_index_order() {
+        let vs = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
+        let ps_cs = xbch(&fssm(&[(HwStage::Ps, &PS_CODE), (HwStage::Cs, &VS_CODE)]));
+        let stages = |data: &[u8]| -> Vec<HwStage> {
+            native_programs(data)
+                .unwrap()
+                .iter()
+                .map(|p| p.stage)
+                .collect()
+        };
+        // Each entry's programs follow the last entry's, other kinds between
+        // them adding none.
+        let data = part(&[(KIND_NATIVE, &ps_cs), (0x0a, b"xbop"), (KIND_NATIVE, &vs)]);
+        assert_eq!(stages(&data), [HwStage::Ps, HwStage::Cs, HwStage::Vs]);
+        let data = part(&[(KIND_NATIVE, &vs), (KIND_NATIVE, &ps_cs)]);
+        assert_eq!(stages(&data), [HwStage::Vs, HwStage::Ps, HwStage::Cs]);
+        // The same blob named twice is read twice.
+        let data = part(&[(KIND_NATIVE, &vs), (KIND_NATIVE, &vs)]);
+        assert_eq!(stages(&data), [HwStage::Vs, HwStage::Vs]);
+
+        // A part with no entries, or none native, has no programs.
+        assert!(native_programs(&part(&[])).unwrap().is_empty());
+        assert!(stages(&part(&[(0x0a, b"xbop"), (0x0e, b"tbl.")])).is_empty());
+    }
+
+    #[test]
+    fn one_bad_native_entry_refuses_the_whole_part() {
+        let good = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
+        let mut bad = good.clone();
+        bad[0..4].copy_from_slice(b"XBCX");
+        // Wherever the bad entry sits, nothing from the good ones is kept.
+        for data in [
+            part(&[(KIND_NATIVE, &good), (KIND_NATIVE, &bad)]),
+            part(&[(KIND_NATIVE, &bad), (KIND_NATIVE, &good)]),
+            part(&[(KIND_NATIVE, &good), (0x0a, b"xbop"), (KIND_NATIVE, &bad)]),
+        ] {
+            assert_eq!(refused(&data), "native blob lacks XBCH magic");
+        }
+    }
+
+    #[test]
+    fn xdat_entry_counts_up_to_the_limit_are_read() {
+        // The most entries a part may state, all of another kind: read, and
+        // none of them native.
+        let others: Vec<(u32, &[u8])> = vec![(0x0a, b"xbop"); MAX_XDAT_ENTRIES];
+        assert!(native_programs(&part(&others)).unwrap().is_empty());
+        // The last of them native is still found.
+        let native = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
+        let mut entries = others.clone();
+        entries[MAX_XDAT_ENTRIES - 1] = (KIND_NATIVE, &native);
+        assert_eq!(native_programs(&part(&entries)).unwrap().len(), 1);
+
+        // An index stating more entries than the part holds is cut short,
+        // even when every entry it does hold is of another kind.
+        let mut data = part(&[(0x0a, b"xbop")]);
+        data[XDAT_OFFSET + 4..][..4].copy_from_slice(&(MAX_XDAT_ENTRIES as u32).to_le_bytes());
+        assert_eq!(refused(&data), "truncated");
+        // An index cut inside its count.
+        assert_eq!(refused(&data[..XDAT_OFFSET + 6]), "truncated");
+    }
+
+    #[test]
     fn names_each_xbch_refusal() {
         let good = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
         let with = |at: usize, value: &[u8]| {
