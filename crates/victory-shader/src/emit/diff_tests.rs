@@ -1218,7 +1218,7 @@ fn translated_compute_matches_pc() {
             .iter()
             .map(|&s| (u16::from(s), false))
             .collect();
-        root_views.extend(cs_c.root_srvs.iter().map(|&s| (s, true)));
+        root_views.extend(cs_c.root_srvs.iter().map(|&s| (u16::from(s), true)));
         root_views.sort_unstable();
         for (n, (reg, srv)) in root_views.into_iter().enumerate() {
             // Existing cases keep the plain registers the PC signature has;
