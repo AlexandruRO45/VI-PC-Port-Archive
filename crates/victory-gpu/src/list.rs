@@ -507,6 +507,35 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
+            // The destination is a buffer: a read back through a placed
+            // footprint, whose rows go into the buffer's own memory.
+            if dst.kind == FOOTPRINT
+                && src.kind != FOOTPRINT
+                && let Some(texture) = crate::resource::host_resource(src.resource)
+            {
+                let (width, height, depth, pitch) = dst.footprint.shape();
+                let bytes =
+                    u64::from(pitch) * u64::from(height) * u64::from(depth);
+                let at = buffer_range(dst.resource, dst.footprint.offset, bytes);
+                // SAFETY: the box is the title's, when there is one.
+                let box_ = unsafe { source_box.as_ref() }.map(|b| b.map(u64::from));
+                let full = [0, 0, 0, u64::from(width), u64::from(height), u64::from(depth)];
+                if let Some(at) = at {
+                    ensure_state(list, src.resource, COPY_SOURCE);
+                    if crate::texture::download(
+                        list,
+                        src.resource,
+                        texture,
+                        src.footprint.offset as u32,
+                        box_.unwrap_or(full),
+                        at,
+                        pitch,
+                        bytes,
+                    ) {
+                        return;
+                    }
+                }
+            }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;

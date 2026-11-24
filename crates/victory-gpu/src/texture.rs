@@ -169,6 +169,71 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging);
 }
 
+/// Copies a title-written texture's texels out of title memory into a
+/// buffer's memory, rows laid out as the destination's footprint asks:
+/// `box` is (x, y, z, width, height, depth) in the subresource's texels,
+/// and a box that is not the whole row is refused (a row-at-a-time copy
+/// does not need it).
+pub(crate) fn download(
+    list: &HostList,
+    resource: This,
+    texture: &ID3D12Resource,
+    subresource: u32,
+    [bx, by, bz, bw, bh, bd]: [u64; 6],
+    dst: *mut u8,
+    dst_pitch: u32,
+    dst_bytes: u64,
+) -> bool {
+    if !title_written(texture) {
+        return false;
+    }
+    let Some(staging) = staging(resource, texture) else {
+        return false;
+    };
+    let Some(footprint) = staging.footprints.get(subresource as usize).copied() else {
+        return false;
+    };
+    let f = footprint.Footprint;
+    let (width, height, depth) = (
+        u64::from(f.Width),
+        u64::from(f.Height),
+        u64::from(f.Depth),
+    );
+    if bx != 0 || bw != width || by + bh > height || bz + bd > depth {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!("a copy out of part of a texture row is not implemented"));
+        return false;
+    }
+    let row = u64::from(f.RowPitch).min(u64::from(dst_pitch));
+    if row * bh * bd > dst_bytes {
+        return false;
+    }
+    // The detiling that fills the staging buffer runs at submission, before
+    // the write below it in the list's steps.
+    list.defer_texture(staging.clone());
+    let base = staging.data as usize + footprint.Offset as usize;
+    let (src_pitch, dst_pitch, row) =
+        (f.RowPitch as usize, dst_pitch as usize, row as usize);
+    let (height, by, bz) = (height as usize, by as usize, bz as usize);
+    let (rows, layers) = (bh as usize, bd as usize);
+    let dst = dst as usize;
+    list.defer(move || {
+        for z in 0..layers {
+            for y in 0..rows {
+                // SAFETY: the staging buffer's mapping holds this
+                // subresource's footprint and stays up while the list does;
+                // the destination was checked to hold these rows.
+                unsafe {
+                    let from = base + src_pitch * (height * (bz + z) + by + y);
+                    let to = (dst as *mut u8).add(dst_pitch * (rows * z + y));
+                    std::ptr::copy_nonoverlapping(from as *const u8, to, row);
+                }
+            }
+        }
+    });
+    true
+}
+
 impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).

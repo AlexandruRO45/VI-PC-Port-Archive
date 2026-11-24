@@ -83,6 +83,26 @@ pub enum Barycentric {
     LinearCentroid,
 }
 
+impl Barycentric {
+    /// DXIL's interpolation mode for the host system value this kind reads,
+    /// or `None` for the pull model (DXIL has no barycentrics for it).
+    ///
+    /// The console's pair is the triangle's own interpolation: attribute =
+    /// v0 + i (v1 - v0) + j (v2 - v0). The host's `SV_Barycentrics` is the
+    /// three weights that sum to 1, so i is its y and j its z.
+    pub fn interp(self) -> Option<u8> {
+        Some(match self {
+            Barycentric::PerspectiveCenter => 2,
+            Barycentric::PerspectiveCentroid => 3,
+            Barycentric::LinearCenter => 4,
+            Barycentric::LinearCentroid => 5,
+            Barycentric::PerspectiveSample => 6,
+            Barycentric::LinearSample => 7,
+            Barycentric::PerspectivePullModel => return None,
+        })
+    }
+}
+
 /// The pixel input VGPRs in hardware order: one entry per
 /// `SPI_PS_INPUT_ADDR` bit.
 const PS_VGPRS: [(u8, Option<Barycentric>); 16] = [

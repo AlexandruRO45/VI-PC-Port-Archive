@@ -353,6 +353,10 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Masks (low dwords) that are the complement of another mask: the
+    /// complement's lanes are the ones left over, which need not run where
+    /// it is read, but the whole-wave number still follows from the base.
+    pub complement: HashMap<Value, Value>,
 }
 
 impl Structured {
@@ -363,6 +367,13 @@ impl Structured {
         }
         .copied()
     }
+}
+
+/// `inst` is `name` with no input or output modifiers.
+fn plain_lane_op(inst: &Inst, name: &str) -> bool {
+    inst.name() == name
+        && matches!(&inst.fields, Fields::Valu(v)
+            if v.abs == 0 && v.neg == 0 && v.opsel == 0 && v.sdwa.is_none() && v.dpp.is_none())
 }
 
 /// Builds the per-lane form of `program`.
@@ -413,6 +424,10 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// See [`Structured::complement`].
+    complement: HashMap<Value, Value>,
+    /// Immediate dominator per block.
+    idom: Vec<usize>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -460,8 +475,10 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
+        let idom = crate::ir::idoms(blocks, &order, &index);
         Ok(Lanes {
             p,
+            idom,
             order,
             index,
             incoming,
@@ -476,6 +493,7 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            complement: HashMap::new(),
         })
     }
 
@@ -632,8 +650,13 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks: if self.p.wave64 {
+                self.masks
+            } else {
+                Map::default()
+            },
             active: self.active,
+            complement: self.complement,
             bools: self.b,
             exits,
             guards,
@@ -674,6 +697,10 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
+        if let Some(m) = self.restored(k) {
+            self.masks.insert(k, m);
+            return (m, true);
+        }
         let p = self.p;
         let (m, derived) = match self.join(k) {
             Some(join) => join,
@@ -707,6 +734,20 @@ impl<'a> Lanes<'a> {
             &mut self.other
         };
         cache.insert(k, m);
+        // A mask reached through the lookup rather than its own write still
+        // holds lanes that run where it is written, when that block's EXEC
+        // implies it: the ballot there then gives the mask exactly.
+        let p = self.p;
+        if derived
+            && !self.active.contains(&k.0)
+            && let Some(&(b, i)) = self.defs.get(&k.0)
+        {
+            let inst = &p.blocks[b].insts[i];
+            let e = self.exec(inst);
+            if self.b.implies(m, e) {
+                self.active.insert(k.0);
+            }
+        }
         (m, derived)
     }
 
@@ -872,6 +913,103 @@ impl<'a> Lanes<'a> {
         })
     }
 
+    /// A mask the compiler spilled to VGPR lanes (`v_writelane_b32`, one
+    /// lane per dword) and `k` reads back (`v_readlane_b32` of the same
+    /// lanes): each lane's bit is the one it had when spilled.
+    fn restored(&self, k: Key) -> Option<Bool> {
+        let lo = self.spilled(k.0)?;
+        let hi = if self.p.wave64 {
+            self.spilled(k.1)?
+        } else {
+            lo
+        };
+        self.masks.get(&(lo, hi)).copied()
+    }
+
+    /// The scalar value a `v_readlane_b32` of a constant lane reads back
+    /// from a `v_writelane_b32` of that lane, where it dominates the read.
+    fn spilled(&self, v: Value) -> Option<Value> {
+        let &(b, i) = self.defs.get(&v)?;
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Valu(r) = &inst.fields else {
+            return None;
+        };
+        let (true, [Operand::Vector { reg, .. }, at]) =
+            (plain_lane_op(inst, "v_readlane_b32"), &r.src[..])
+        else {
+            return None;
+        };
+        let lane = self.const_lane(*at)?;
+        let s = self
+            .lane_write(inst.read(Reg::V(*reg))?, lane, &mut Vec::new())
+            .ok()??;
+        let born = self.defs.get(&s).map_or(self.order[0], |d| d.0);
+        self.dominates(born, b).then_some(s)
+    }
+
+    /// The scalar value written to `lane` of the VGPR value `v`, through
+    /// writes of other lanes and joins that agree on it (none on a cycle).
+    fn lane_write(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Value>, ()> {
+        if let Some(&(b, i)) = self.phis.get(&v) {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &arg in &self.p.blocks[b].phis[i].args {
+                if let Some(s) = self.lane_write(arg, lane, seen)? {
+                    if found.is_some_and(|f| f != s) {
+                        return Err(());
+                    }
+                    found = Some(s);
+                }
+            }
+            return Ok(found);
+        }
+        let &(b, i) = self.defs.get(&v).ok_or(())?;
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Valu(w) = &inst.fields else {
+            return Err(());
+        };
+        let (true, Some(Operand::Vector { reg, .. }), [value, at]) =
+            (plain_lane_op(inst, "v_writelane_b32"), w.dst, &w.src[..])
+        else {
+            return Err(());
+        };
+        if self.const_lane(*at).ok_or(())? != lane {
+            return self.lane_write(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        }
+        match *value {
+            Operand::Scalar { code, .. } if code != NULL => {
+                inst.read(Reg::S(code)).map(Some).ok_or(())
+            }
+            _ => Err(()),
+        }
+    }
+
+    fn const_lane(&self, op: Operand) -> Option<u32> {
+        let raw = match op {
+            Operand::Const(c) => crate::resource::inline(c)?,
+            Operand::Literal(x) => x,
+            _ => return None,
+        };
+        Some(raw & if self.p.wave64 { 63 } else { 31 })
+    }
+
+    fn dominates(&self, a: usize, mut b: usize) -> bool {
+        if self.index[a] == usize::MAX || self.index[b] == usize::MAX {
+            return false;
+        }
+        while b != a {
+            let d = self.idom[b];
+            if d == b || d == usize::MAX {
+                return false;
+            }
+            b = d;
+        }
+        true
+    }
+
     fn combine(&mut self, f: &str, a: Bool, c: Bool) -> Option<Bool> {
         let b = &mut self.b;
         Some(match f {
@@ -910,6 +1048,35 @@ impl<'a> Lanes<'a> {
         })
     }
 
+    /// The mask an `s_not` or an `s_xor` with all ones complements: (~M)'s
+    /// lanes are the wave's lanes outside M, so its number follows from M's
+    /// ballot over the whole wave.
+    fn complement_of(&mut self, inst: &Inst) -> Option<Value> {
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let ones = |o: &Operand| {
+            matches!(o, Operand::Const(c) if crate::resource::inline(*c) == Some(u32::MAX))
+        };
+        let name = inst.name();
+        let operand = if name.starts_with("s_not_") {
+            *src.first()?
+        } else if name.starts_with("s_xor_") {
+            match (src.first()?, src.get(1)?) {
+                (a, c) if ones(a) => *c,
+                (a, c) if ones(c) => *a,
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
+        let Operand::Scalar { code, .. } = operand else {
+            return None;
+        };
+        let k = self.key(|r| inst.read(r), code)?;
+        self.masks.contains_key(&k).then_some(k.0)
+    }
+
     /// Records the masks `inst` defines; `exec` is EXEC there, if known.
     fn step(&mut self, inst: &Inst, exec: Option<Bool>) {
         let name = inst.name();
@@ -922,7 +1089,9 @@ impl<'a> Lanes<'a> {
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
                         let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
-                        takes_mask |= self.masks.contains_key(&k) || phi && self.mask(k).1;
+                        takes_mask |= self.masks.contains_key(&k)
+                            || phi && self.mask(k).1
+                            || self.restored(k).is_some();
                     }
                 }
                 let touches_exec =
@@ -930,6 +1099,7 @@ impl<'a> Lanes<'a> {
                 if (takes_mask || touches_exec)
                     && let Some(r) = self.sop(inst).filter(|r| r.derived)
                 {
+                    let complement = self.complement_of(inst);
                     for (k, m) in r.dst.into_iter().chain(r.exec) {
                         self.masks.insert(k, m);
                         // EXEC itself holds the lanes that run here.
@@ -937,6 +1107,9 @@ impl<'a> Lanes<'a> {
                             || exec.is_some_and(|e| self.b.implies(m, e))
                         {
                             self.active.insert(k.0);
+                        }
+                        if let Some(base) = complement {
+                            self.complement.insert(k.0, base);
                         }
                     }
                     if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {

@@ -324,6 +324,13 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// Width, height, depth and row pitch in texels and bytes.
+    pub(crate) fn shape(&self) -> (u32, u32, u32, u32) {
+        (self.width, self.height, self.depth, self.row_pitch)
+    }
+}
+
+impl PlacedFootprint {
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;

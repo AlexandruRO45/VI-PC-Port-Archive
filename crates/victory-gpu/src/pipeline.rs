@@ -116,17 +116,44 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(dir) = failed_dump_dir() {
+                            let path = dir.join(format!("{}-{}.dxbc", self.stage, self.hash));
+                            if let Err(e) = std::fs::write(&path, &self.container) {
+                                tracing::warn!(path = %path.display(), error = %e, "VICTORY_DUMP_FAILED: not written");
+                            }
+                        }
+                    }
                 }
                 done.ok()
             })
             .as_ref()
     }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn failed_dump_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_DUMP_FAILED")?);
+        if let Err(e) = victory_core::ensure_outside_repo(&dir) {
+            tracing::warn!(error = %e, "VICTORY_DUMP_FAILED: refused, nothing is dumped");
+            return None;
+        }
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(dir = %dir.display(), error = %e, "VICTORY_DUMP_FAILED: no folder, nothing is dumped");
+            return None;
+        }
+        Some(dir)
+    })
+    .as_deref()
 }
 
 #[cfg(windows)]
@@ -275,7 +302,10 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
