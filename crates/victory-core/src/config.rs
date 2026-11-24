@@ -87,10 +87,10 @@ impl Config {
         };
         let cache_dir = env_path("VICTORY_CACHE_DIR")
             .or(file.cache_dir)
-            .map_or_else(|| default_dir("cache"), Ok)?;
+            .map_or_else(|| default_dir_from("cache", &env), Ok)?;
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
-            .map_or_else(|| default_dir("data"), Ok)?;
+            .map_or_else(|| default_dir_from("data", &env), Ok)?;
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
@@ -126,13 +126,28 @@ fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// `%LOCALAPPDATA%/victory/<name>` (elsewhere the XDG or home cache).
+/// `%LOCALAPPDATA%/victory/<name>` (elsewhere the XDG data/cache or home).
 fn default_dir(name: &str) -> Result<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")?;
+    default_dir_from(name, |k| std::env::var_os(k))
+}
+
+fn default_dir_from(
+    name: &str,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    if let Some(local) = env("LOCALAPPDATA") {
+        return Ok(PathBuf::from(local).join("victory").join(name));
+    }
+    let base = if name == "data" {
+        env("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+    } else {
+        env("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".cache")))
+    }
+    .context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")?;
     Ok(base.join("victory").join(name))
 }
 
@@ -180,5 +195,18 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.cache_subdir("x").is_err());
+    }
+
+    #[test]
+    fn xdg_data_home_used_for_data_dir() {
+        let file = FilePaths::default();
+        let env = |k: &str| match k {
+            "XDG_DATA_HOME" => Some(OsString::from("/custom/share")),
+            "XDG_CACHE_HOME" => Some(OsString::from("/custom/cache")),
+            _ => None,
+        };
+        let cfg = Config::resolve(file, None, env).unwrap();
+        assert_eq!(cfg.cache_dir, PathBuf::from("/custom/cache/victory/cache"));
+        assert_eq!(cfg.data_dir, PathBuf::from("/custom/share/victory/data"));
     }
 }
