@@ -160,6 +160,10 @@ pub fn run(
     jobs: Option<usize>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    // A fault inside the driver's compiler ends the process with no word from
+    // us otherwise; report it the way a title run does, so the faulting frame
+    // is named rather than the exit code standing alone.
+    victory_loader::report_crashes();
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
     if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {

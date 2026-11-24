@@ -26,6 +26,10 @@ pub fn run(
         .or_else(|| dump.parent().map(|dir| dir.to_path_buf()))
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or_else(|| PathBuf::from("."));
+    // A create that faults inside the driver ends the process with no word from
+    // us otherwise; report it the way a title run does, so the frame is named
+    // and the module that killed the batch can be read out of the log.
+    victory_loader::report_crashes();
     let summary = victory_gpu::pipeline::precompile::Dump::read(&dump, &shaders)
         .with_context(|| format!("reading {}", dump.display()))?;
     println!("dump           {}", dump.display());
@@ -74,5 +78,18 @@ pub fn run(
         "library bytes  {} -> {}",
         report.before, report.after
     );
+    // The title's own early list is the job: a boot asks for these first, so how
+    // many of them the library now holds is the number that decides whether that
+    // boot still has to compile.
+    let early = std::fs::read_to_string(cache.join("early-pipelines.txt")).unwrap_or_default();
+    let early = early.lines().filter(|line| !line.trim().is_empty()).count();
+    if early > 0 {
+        let held = report.early_loaded;
+        println!(
+            "early list     {early} names, {held} held of {} replayed ({:.1} % of the list)",
+            report.early_asked,
+            100.0 * held as f64 / early as f64
+        );
+    }
     Ok(())
 }

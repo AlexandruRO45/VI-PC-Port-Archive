@@ -108,6 +108,12 @@ pub struct Report {
     pub made: usize,
     /// Pipelines the host refused to create.
     pub refused: usize,
+    /// Lines naming a pipeline on the title's own early list
+    /// (`early-pipelines.txt` beside the library): the set a boot asks for
+    /// first, so replaying all of them is the whole job.
+    pub early_asked: usize,
+    /// Of those, the ones the library already held.
+    pub early_loaded: usize,
     /// Bytes the library held when the run started and ended.
     pub before: u64,
     pub after: u64,
@@ -135,11 +141,33 @@ pub fn precompile(
     // long, and the runtime itself makes pipelines on several threads, so one
     // line at a time would take two hours over the world's ~1,950.
     let reports = std::sync::Mutex::new(Vec::new());
+    let replayed = std::sync::atomic::AtomicUsize::new(0);
+    let save_at = std::sync::atomic::AtomicUsize::new(save_every.max(1));
     replay_all(jobs, lines.len(), |at| {
         let mut report = Report::default();
         replay(lines[at], shaders, &mut report);
         reports.lock().unwrap_or_else(|e| e.into_inner()).push(report);
+        // Exactly one worker crosses each threshold: 1,950 pipelines are more
+        // session than one run's driver time, and a run that is killed must keep
+        // what it stored.
+        let n = replayed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let threshold = save_at.load(std::sync::atomic::Ordering::Relaxed);
+        if n >= threshold
+            && save_at
+                .compare_exchange(
+                    threshold,
+                    threshold + save_every.max(1),
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            library::save(true);
+        }
     });
+    // What the last workers stored is in memory until this call: a run that
+    // finished must not leave its tail behind.
+    library::save(true);
     let mut report = Report {
         before,
         after: library::BLOB.load(std::sync::atomic::Ordering::Relaxed),
@@ -154,6 +182,8 @@ pub fn precompile(
         report.loaded += one.loaded;
         report.made += one.made;
         report.refused += one.refused;
+        report.early_asked += one.early_asked;
+        report.early_loaded += one.early_loaded;
     }
     Ok(report)
 }
@@ -224,9 +254,19 @@ fn replay(line: &str, shaders: &Path, report: &mut Report) {
     let loaded = library::LOADED.load(std::sync::atomic::Ordering::Relaxed);
     let made = library::MADE.load(std::sync::atomic::Ordering::Relaxed);
     match HostPipeline::new(&built, state.as_deref()) {
-        Some(_) => {
+        Some(pipeline) => {
+            // Coverage is asked of the title's own list, not of a count of
+            // makes: whether a name the next boot asks for is in there is the
+            // only thing that decides if that boot has to compile.
+            let early = library::wanted_early(&pipeline.name);
+            if early {
+                report.early_asked += 1;
+            }
             if library::LOADED.load(std::sync::atomic::Ordering::Relaxed) > loaded {
                 report.loaded += 1;
+                if early {
+                    report.early_loaded += 1;
+                }
             } else if library::MADE.load(std::sync::atomic::Ordering::Relaxed) > made {
                 report.made += 1;
             }
