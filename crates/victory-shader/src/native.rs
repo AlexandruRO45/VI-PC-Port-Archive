@@ -2646,21 +2646,7 @@ mod tests {
     /// A pixel program with these (root type, SGPRs, user data, slot)
     /// parameters.
     fn program(params: &[(u32, u32, u8, u8)]) -> Result<Vec<NativeProgram>, ShaderError> {
-        let mut blob = fssm(&[(HwStage::Ps, &PS_CODE)]);
-        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Ps)).unwrap() as usize;
-        let table = (blob.len() - FSSM_HEADER) as u64;
-        for &(root, sgprs, user_data, slot) in params {
-            for v in [root, 0, sgprs, 0] {
-                blob.extend_from_slice(&v.to_le_bytes());
-            }
-            blob.extend_from_slice(&[user_data, slot, 0, 0]);
-        }
-        let payload = (blob.len() - FSSM_HEADER) as u64;
-        blob[8..16].copy_from_slice(&payload.to_le_bytes());
-        blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
-        let count = params.len() as u64;
-        blob[record + RECORD_COUNTS..][..8].copy_from_slice(&count.to_le_bytes());
-        native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        stage_layout(HwStage::Ps, params)
     }
 
     #[test]
@@ -2930,7 +2916,12 @@ mod tests {
             &VS_CODE
         };
         let mut blob = fssm(&[(stage, code)]);
-        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(stage)).unwrap() as usize;
+        set_stage_layout(&mut blob, stage, params);
+        native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+    }
+
+    fn set_stage_layout(blob: &mut Vec<u8>, stage: HwStage, params: &[(u32, u32, u8, u8)]) {
+        let record = FSSM_HEADER + u64_at(blob, FSSM_HEADER + slot(stage)).unwrap() as usize;
         let table = (blob.len() - FSSM_HEADER) as u64;
         for &(root, sgprs, user_data, slot) in params {
             for v in [root, 0, sgprs, 0] {
@@ -2941,9 +2932,58 @@ mod tests {
         let payload = (blob.len() - FSSM_HEADER) as u64;
         blob[8..16].copy_from_slice(&payload.to_le_bytes());
         blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
-        let count = params.len() as u64;
-        blob[record + RECORD_COUNTS..][..8].copy_from_slice(&count.to_le_bytes());
-        native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        let count = params.len() as u32;
+        blob[record + RECORD_COUNTS..][..4].copy_from_slice(&count.to_le_bytes());
+    }
+
+    #[test]
+    fn root_layouts_are_local_to_each_stage_record() {
+        let (cs, ps) = (HwStage::Cs, HwStage::Ps);
+        let (descriptor, table) = (1, 3);
+        let parse = |cs_start, ps_start| {
+            let mut blob = fssm(&[(cs, &VS_CODE), (ps, &PS_CODE)]);
+            set_stage_layout(&mut blob, cs, &[(descriptor, 1, cs_start, 0)]);
+            set_stage_layout(
+                &mut blob,
+                ps,
+                &[(table, 1, 15, 1), (descriptor, 1, ps_start, 0)],
+            );
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+
+        // The compute descriptor uses s14 and s15. Pixel can reuse s15 for
+        // its table and put its own descriptor at the end of its 32 dwords.
+        let programs = parse(14, 30).unwrap();
+        let [pixel, compute] = programs.as_slice() else {
+            panic!("expected pixel and compute records");
+        };
+        assert_eq!((pixel.stage, pixel.layout.len()), (ps, 2));
+        assert_eq!((compute.stage, compute.layout.len()), (cs, 1));
+        assert_eq!(pixel.layout[1].user_data, 30);
+        assert_eq!(compute.layout[0].user_data, 14);
+
+        assert_eq!(
+            why_refused(parse(15, 30)),
+            "root parameter past the user data"
+        );
+        assert_eq!(
+            why_refused(parse(14, 31)),
+            "root parameter past the user data"
+        );
+        assert_eq!(why_refused(parse(14, 14)), "root parameters share an SGPR");
+    }
+
+    #[test]
+    fn root_sgpr_span_keeps_the_full_width_of_the_count() {
+        // At dword 1 this count would wrap its exclusive end to zero in u32.
+        // In a merged stage the eight system SGPRs also contribute to the end.
+        for stage in [HwStage::Vs, HwStage::Gs] {
+            assert_eq!(
+                why_refused(stage_layout(stage, &[(0, u32::MAX, 1, 0)])),
+                "root parameter outside the SGPRs",
+                "{stage:?}"
+            );
+        }
     }
 
     #[test]
