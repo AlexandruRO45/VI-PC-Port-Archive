@@ -66,24 +66,16 @@ pub use watch::{
 };
 
 /// Total installed physical RAM in bytes, queried once from the OS.
+#[cfg(windows)]
 pub(crate) fn total_system_ram_bytes() -> Option<u64> {
     static TOTAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *TOTAL.get_or_init(|| {
-        #[cfg(windows)]
-        {
-            use windows_sys::Win32::System::SystemInformation::{
-                GlobalMemoryStatusEx, MEMORYSTATUSEX,
-            };
-            // SAFETY: plain data the call fills in.
-            let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-            m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-            // SAFETY: a sized structure.
-            let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-            (ok && m.ullTotalPhys > 0).then_some(m.ullTotalPhys)
-        }
-        #[cfg(not(windows))]
-        {
-            None
-        }
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: plain data the call fills in.
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: a sized structure.
+        let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+        (ok && m.ullTotalPhys > 0).then_some(m.ullTotalPhys)
     })
 }

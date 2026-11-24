@@ -1308,7 +1308,9 @@ fn spare_most(total_ram_bytes: Option<u64>) -> u64 {
     const GIB: u64 = 1 << 30;
     match total_ram_bytes {
         Some(ram) if ram <= 16 * GIB => 64 << 20,
-        Some(ram) if ram >= 32 * GIB => 256 << 20,
+        // 32 GB Windows systems typically report ~31.7–31.9 GiB in
+        // `ullTotalPhys` after firmware/hardware reservations.
+        Some(ram) if ram >= 30 * GIB => 256 << 20,
         _ => 128 << 20,
     }
 }
@@ -6458,6 +6460,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(super::spare_most(Some(8 * GIB)), 64 * MIB);
         assert_eq!(super::spare_most(Some(16 * GIB)), 64 * MIB);
         assert_eq!(super::spare_most(Some(24 * GIB)), 128 * MIB);
+        assert_eq!(super::spare_most(Some(31 * GIB)), 256 * MIB);
         assert_eq!(super::spare_most(Some(32 * GIB)), 256 * MIB);
         assert_eq!(super::spare_most(Some(64 * GIB)), 256 * MIB);
     }

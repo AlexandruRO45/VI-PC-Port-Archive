@@ -228,7 +228,9 @@ fn idle_most(total_ram_bytes: Option<u64>, cores: usize) -> (usize, u64) {
     let lists = cores.saturating_mul(16).clamp(64, 256);
     let bytes = match total_ram_bytes {
         Some(ram) if ram <= 16 * GIB => 128 << 20,
-        Some(ram) if ram >= 32 * GIB => 512 << 20,
+        // 32 GB Windows systems typically report ~31.7–31.9 GiB in
+        // `ullTotalPhys` after firmware/hardware reservations.
+        Some(ram) if ram >= 30 * GIB => 512 << 20,
         _ => 256 << 20,
     };
     (lists, bytes)
@@ -2246,6 +2248,7 @@ mod tests {
         assert_eq!(idle_most(Some(8 * GIB), 4), (64, 128 * MIB));
         assert_eq!(idle_most(Some(16 * GIB), 8), (128, 128 * MIB));
         assert_eq!(idle_most(Some(24 * GIB), 12), (192, 256 * MIB));
+        assert_eq!(idle_most(Some(31 * GIB), 16), (256, 512 * MIB));
         assert_eq!(idle_most(Some(32 * GIB), 16), (256, 512 * MIB));
         assert_eq!(idle_most(Some(64 * GIB), 32), (256, 512 * MIB));
     }
