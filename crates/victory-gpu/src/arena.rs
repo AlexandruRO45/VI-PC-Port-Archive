@@ -1,0 +1,654 @@
+//! Arenas (the in-place design's Stage 1, `VICTORY_INPLACE=3`): title
+//! memory the GPU reaches, opened once as a host heap with one buffer
+//! placed over all of it, so that every title buffer and window in it is
+//! that buffer at an offset (`arena.gpu + (addr - arena.base)`) instead of
+//! a copy, or a heap of its own per buffer (`inplace::place_part`).
+//!
+//! Two kinds:
+//!
+//! - **parts** of private title memory (`XMemVirtualAlloc`'s, reported by
+//!   the runtime as committed: [`title_memory_committed`]), opened with
+//!   `OpenExistingHeapFromAddress1`. The runtime refuses a part of 4 GiB or
+//!   more (probe P1 on the card and on the software adapter: "pAddress must
+//!   point to a memory region that is 4GiB or less"), so a part is at most
+//!   [`PART`] bytes, and a bigger region has parts every [`STRIDE`] bytes
+//!   that overlap (P5: overlapping parts open and see each other's writes);
+//!   anything up to `PART - STRIDE` bytes lies wholly in one of them, the
+//!   lowest that holds it is taken. Opening locks every page (P2: 1 GiB in
+//!   173 ms, 4 GiB in 695 ms, all of it in the working set), so a part is
+//!   opened on the first GPU use, on a thread of its own when it is bigger
+//!   than [`sync_bytes`]; until it is open that memory gets copies as
+//!   before;
+//! - **sections** of the physical page pool made with `SEC_COMMIT`
+//!   (`VICTORY_INPLACE_POOL=1` in the runtime; a section made reserved is
+//!   refused), opened with `OpenExistingHeapFromFileMapping`. The heap is
+//!   the section: views come and go under it. View memory is in place where
+//!   the range is one run of one section (`inplace::Cover::Run`); the GPU
+//!   then reads the section's pages, never through a tile mapping (into an
+//!   opened heap one removes the device: probe "tiles"). A section must be
+//!   below 4 GiB too (P1, P7).
+//!
+//! shortcut: while a part is open the title cannot decommit, release or
+//! protect its pages (error 87, probe R9). [`title_memory_released`] (the
+//! runtime's wrappers of the title's `VirtualFree`/`VirtualProtect` call
+//! it first) retires every part over the range and lets go of what is in
+//! place in all of it; a list still in the air that holds the arena's
+//! buffer keeps the pages locked until it is reset, and the call then
+//! fails as before (the R9 line counts failures).
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use windows::Win32::Graphics::Direct3D12::{ID3D12Device, ID3D12Heap, ID3D12Resource};
+
+use crate::inplace::{Cover, From, K64, cover, open, place, private_whole};
+
+/// The most a part or a section heap holds: the runtime's limit is "4 GiB
+/// or less" and the heap is cut on 64 KiB.
+pub(crate) const PART: u64 = (4 << 30) - K64 as u64;
+/// Parts of a bigger region begin this far apart.
+pub(crate) const STRIDE: u64 = 2 << 30;
+
+/// Where a title range is for the GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// Private title memory in place (a part).
+    InPlace,
+    /// View memory in place: a run of a committed section.
+    Section,
+}
+
+/// One opened heap and the buffer over all of it.
+pub(crate) struct Arena {
+    /// The title address of the buffer's first byte (a section: none, 0).
+    pub(crate) base: u64,
+    pub(crate) bytes: u64,
+    pub(crate) heap: ID3D12Heap,
+    pub(crate) buffer: ID3D12Resource,
+    pub(crate) gpu: u64,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Arena {}
+// SAFETY: as above.
+unsafe impl Sync for Arena {}
+
+/// What [`resolve`] gives for a title range.
+pub(crate) struct Resolved {
+    pub(crate) resource: ID3D12Resource,
+    pub(crate) heap: ID3D12Heap,
+    /// The range's first byte in `resource`.
+    pub(crate) offset: u64,
+    /// Its host GPU address.
+    pub(crate) gpu: u64,
+    /// Bytes from it to the arena's end.
+    pub(crate) left: u64,
+    pub(crate) kind: Kind,
+}
+
+enum Slot {
+    /// Being opened on the arenas' thread.
+    Opening,
+    Open(Arc<Arena>),
+    /// The host refused it, it is not committed whole, or over the budget:
+    /// copies, as before.
+    Refused,
+}
+
+#[derive(Default)]
+pub(crate) struct Arenas {
+    /// Committed private title memory by address: bytes.
+    regions: BTreeMap<u64, u64>,
+    /// Parts by (start, bytes).
+    parts: BTreeMap<(u64, u64), Slot>,
+    /// Section heaps by the section's handle.
+    sections: HashMap<usize, Slot>,
+    /// Bytes of open parts and sections.
+    locked: u64,
+}
+
+/// Since the start: parts and sections opened, refused, retired; their
+/// bytes opened; ranges resolved in place.
+pub(crate) static ARENA_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+impl Arenas {
+    /// Committed private title memory `[at, at + len)`, joined with what
+    /// it continues or overlaps.
+    pub(crate) fn committed(&mut self, at: u64, len: u64) {
+        let (mut from, mut to) = (at & !(K64 as u64 - 1), (at + len).next_multiple_of(4096));
+        let touching: Vec<u64> = self.regions.range(..=to).filter(|&(&b, &n)| b + n >= from).map(|(&b, _)| b).collect();
+        for base in touching {
+            if let Some(n) = self.regions.remove(&base) {
+                from = from.min(base);
+                to = to.max(base + n);
+            }
+        }
+        self.regions.insert(from, to - from);
+    }
+
+    /// `[at, at + len)` is no longer committed private title memory (or is
+    /// about to be protected): the regions forget it, every part over it is
+    /// retired. Returns the parts' ranges (what is in place there must go).
+    pub(crate) fn released(&mut self, at: u64, len: u64) -> Vec<(u64, u64)> {
+        let end = at.saturating_add(len.max(1));
+        let hit: Vec<(u64, u64)> = self.regions.range(..end).filter(|&(&b, &n)| b + n > at).map(|(&b, &n)| (b, n)).collect();
+        for (base, n) in hit {
+            self.regions.remove(&base);
+            if base < at {
+                self.regions.insert(base, at - base);
+            }
+            if base + n > end {
+                self.regions.insert(end, base + n - end);
+            }
+        }
+        let parts: Vec<(u64, u64)> = self.parts.keys().filter(|&&(s, n)| s < end && s + n > at).copied().collect();
+        for key in &parts {
+            if let Some(Slot::Open(arena)) = self.parts.remove(key) {
+                self.locked -= arena.bytes;
+                ARENA_STATS[2].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        parts
+    }
+
+    /// The part a range `[at, end)` of private title memory lies in: the
+    /// lowest of its region's parts that holds it whole.
+    fn part_for(&self, at: u64, end: u64) -> Option<(u64, u64)> {
+        let (&base, &n) = self.regions.range(..=at).next_back()?;
+        if end > base + n {
+            return None;
+        }
+        let mut start = base;
+        while start <= at {
+            let bytes = (n - (start - base)).min(PART) & !(K64 as u64 - 1);
+            if bytes > 0 && end <= start + bytes {
+                return Some((start, bytes));
+            }
+            start += STRIDE;
+        }
+        None
+    }
+
+    /// An open part that holds `[at, end)`, if one is open.
+    fn open_part(&self, at: u64, end: u64) -> Option<Arc<Arena>> {
+        self.parts.range((at.saturating_sub(PART), 0)..=(at, u64::MAX)).find_map(|(&(s, n), slot)| match slot {
+            Slot::Open(arena) if s <= at && end <= s + n => Some(arena.clone()),
+            _ => None,
+        })
+    }
+
+    /// Where title memory `[at, at + len)` is in place, if it is: an open
+    /// part or section. A part or section not open yet is opened now if it
+    /// is at most `sync` bytes, else `request` is given it to open (and the
+    /// answer is `None` until it is).
+    pub(crate) fn resolve_with(
+        &mut self,
+        device: &ID3D12Device,
+        at: u64,
+        len: u64,
+        sync: u64,
+        most: u64,
+        request: &mut dyn FnMut(Request),
+    ) -> Option<Resolved> {
+        let end = at.checked_add(len.max(1))?;
+        // View memory: one run of a committed section.
+        if let Cover::Run(section, offset) = cover(at as usize, len.max(1) as usize) {
+            let bytes = crate::inplace::section_bytes(section)?;
+            let arena = match self.sections.get(&section) {
+                Some(Slot::Open(arena)) => arena.clone(),
+                Some(_) => return None,
+                None if bytes > sync => {
+                    self.sections.insert(section, Slot::Opening);
+                    request(Request::Section(section, bytes));
+                    return None;
+                }
+                None => {
+                    let slot = self.open_section(device, section, bytes, most);
+                    let arena = match &slot {
+                        Slot::Open(arena) => Some(arena.clone()),
+                        _ => None,
+                    };
+                    self.sections.insert(section, slot);
+                    arena?
+                }
+            };
+            if offset + len > arena.bytes {
+                return None;
+            }
+            ARENA_STATS[6].fetch_add(1, Ordering::Relaxed);
+            return Some(Resolved {
+                resource: arena.buffer.clone(),
+                heap: arena.heap.clone(),
+                offset,
+                gpu: arena.gpu + offset,
+                left: arena.bytes - offset,
+                kind: Kind::Section,
+            });
+        }
+        let arena = match self.open_part(at, end) {
+            Some(arena) => arena,
+            None => {
+                let key = self.part_for(at, end)?;
+                match self.parts.get(&key) {
+                    Some(_) => return None,
+                    None if key.1 > sync => {
+                        self.parts.insert(key, Slot::Opening);
+                        request(Request::Part(key.0, key.1));
+                        return None;
+                    }
+                    None => {
+                        let slot = self.open_part_now(device, key, most);
+                        let arena = match &slot {
+                            Slot::Open(arena) => Some(arena.clone()),
+                            _ => None,
+                        };
+                        self.parts.insert(key, slot);
+                        arena?
+                    }
+                }
+            }
+        };
+        ARENA_STATS[6].fetch_add(1, Ordering::Relaxed);
+        let offset = at - arena.base;
+        Some(Resolved {
+            resource: arena.buffer.clone(),
+            heap: arena.heap.clone(),
+            offset,
+            gpu: arena.gpu + offset,
+            left: arena.bytes - offset,
+            kind: Kind::InPlace,
+        })
+    }
+
+    fn open_part_now(&mut self, device: &ID3D12Device, (start, bytes): (u64, u64), most: u64) -> Slot {
+        let slot = open_part(device, start, bytes, self.locked, most);
+        self.opened(&slot);
+        slot
+    }
+
+    fn open_section(&mut self, device: &ID3D12Device, section: usize, bytes: u64, most: u64) -> Slot {
+        let slot = open_section(device, section, bytes, self.locked, most);
+        self.opened(&slot);
+        slot
+    }
+
+    fn opened(&mut self, slot: &Slot) {
+        match slot {
+            Slot::Open(arena) => {
+                self.locked += arena.bytes;
+                ARENA_STATS[0].fetch_add(1, Ordering::Relaxed);
+                ARENA_STATS[3].fetch_add(arena.bytes, Ordering::Relaxed);
+            }
+            _ => {
+                ARENA_STATS[1].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// What the arenas' thread opened.
+    fn landed(&mut self, request: Request, slot: Slot) {
+        // A part retired while it was being opened stays closed.
+        match request {
+            Request::Part(start, bytes) => {
+                if matches!(self.parts.get(&(start, bytes)), Some(Slot::Opening)) {
+                    self.opened(&slot);
+                    self.parts.insert((start, bytes), slot);
+                }
+            }
+            Request::Section(section, _) => {
+                if matches!(self.sections.get(&section), Some(Slot::Opening)) {
+                    self.opened(&slot);
+                    self.sections.insert(section, slot);
+                }
+            }
+        }
+    }
+
+    /// The section is gone: its heap goes when what is in place in it does.
+    pub(crate) fn section_gone(&mut self, section: usize) {
+        if let Some(Slot::Open(arena)) = self.sections.remove(&section) {
+            self.locked -= arena.bytes;
+            ARENA_STATS[2].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether `[at, at + len)` would resolve in place now, without
+    /// opening anything.
+    pub(crate) fn ready(&self, at: u64, len: u64) -> bool {
+        let end = at.saturating_add(len.max(1));
+        if let Cover::Run(section, _) = cover(at as usize, len.max(1) as usize) {
+            return matches!(self.sections.get(&section), Some(Slot::Open(_)));
+        }
+        self.open_part(at, end).is_some()
+    }
+
+    /// Open parts and sections, and their bytes.
+    pub(crate) fn census(&self) -> (u64, u64, u64) {
+        let parts = self.parts.values().filter(|s| matches!(s, Slot::Open(_))).count() as u64;
+        let sections = self.sections.values().filter(|s| matches!(s, Slot::Open(_))).count() as u64;
+        (parts, sections, self.locked)
+    }
+}
+
+/// What the arenas' thread is asked to open.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Request {
+    Part(u64, u64),
+    Section(usize, u64),
+}
+
+fn open_part(device: &ID3D12Device, start: u64, bytes: u64, locked: u64, most: u64) -> Slot {
+    if locked + bytes > most {
+        note_refused(format_args!("part {start:#x}+{bytes:#x}: over the budget ({} MB locked of {} MB)", locked >> 20, most >> 20));
+        return Slot::Refused;
+    }
+    if !private_whole(start as usize, bytes as usize) {
+        note_refused(format_args!("part {start:#x}+{bytes:#x}: not private memory committed whole and read-write"));
+        return Slot::Refused;
+    }
+    let started = std::time::Instant::now();
+    let made = open(device, From::Part(start as usize, bytes as usize)).and_then(|heap| place(device, &heap, 0, bytes).map(|b| (heap, b)));
+    match made {
+        Ok((heap, buffer)) => {
+            crate::host::name(&buffer, || format!("arena: title memory {start:#x}+{bytes:#x} in place"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            tracing::info!(
+                start = format_args!("{start:#x}"),
+                mb = bytes >> 20,
+                ms = format_args!("{:.1}", started.elapsed().as_secs_f64() * 1000.0),
+                "arena: a part of the title's private memory opened in place"
+            );
+            Slot::Open(Arc::new(Arena { base: start, bytes, heap, buffer, gpu }))
+        }
+        Err(e) => {
+            note_refused(format_args!("part {start:#x}+{bytes:#x}: the host refused ({e})"));
+            Slot::Refused
+        }
+    }
+}
+
+fn open_section(device: &ID3D12Device, section: usize, bytes: u64, locked: u64, most: u64) -> Slot {
+    let bytes = bytes & !(K64 as u64 - 1);
+    if bytes > PART {
+        note_refused(format_args!("section of {} MB: 4 GiB or more cannot be opened (VICTORY_POOL_SECTION_MB)", bytes >> 20));
+        return Slot::Refused;
+    }
+    if locked + bytes > most {
+        note_refused(format_args!("section of {} MB: over the budget ({} MB locked of {} MB)", bytes >> 20, locked >> 20, most >> 20));
+        return Slot::Refused;
+    }
+    let started = std::time::Instant::now();
+    let made = open(device, From::Section(section)).and_then(|heap| place(device, &heap, 0, bytes).map(|b| (heap, b)));
+    match made {
+        Ok((heap, buffer)) => {
+            crate::host::name(&buffer, || format!("arena: a section of physical pages, {} MB", bytes >> 20));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            tracing::info!(
+                mb = bytes >> 20,
+                ms = format_args!("{:.1}", started.elapsed().as_secs_f64() * 1000.0),
+                "arena: a section of the title's physical pages opened in place"
+            );
+            Slot::Open(Arc::new(Arena { base: 0, bytes, heap, buffer, gpu }))
+        }
+        Err(e) => {
+            note_refused(format_args!("section of {} MB: the host refused ({e}; a section made reserved is refused: VICTORY_INPLACE_POOL=1)", bytes >> 20));
+            Slot::Refused
+        }
+    }
+}
+
+fn note_refused(what: std::fmt::Arguments) {
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) < 16 {
+        tracing::warn!("arena not opened: {what}; copies there, as before");
+    }
+}
+
+static ARENAS: Mutex<Option<Arenas>> = Mutex::new(None);
+
+fn with<T>(f: impl FnOnce(&mut Arenas) -> T) -> T {
+    let mut guard = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(Arenas::default))
+}
+
+/// The most bytes of arenas open at once (`VICTORY_INPLACE_MB`; by
+/// default a quarter of the PC's memory): opening locks every page.
+pub(crate) fn most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_INPLACE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mb| mb << 20)
+            .unwrap_or_else(|| crate::inplace_probes::commit_mb().2 << 20 >> 2)
+    })
+}
+
+/// Parts and sections up to this size are opened on the thread that asks
+/// (`VICTORY_ARENA_SYNC_MB`, 64: about 11 ms for private memory), bigger
+/// ones on the arenas' thread.
+fn sync_bytes() -> u64 {
+    static SYNC: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SYNC.get_or_init(|| std::env::var("VICTORY_ARENA_SYNC_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64) << 20)
+}
+
+/// The arenas' thread: opens what [`resolve`] asked for.
+fn worker() -> &'static std::sync::mpsc::Sender<Request> {
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::Sender<Request>> = std::sync::OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<Request>();
+        let _ = std::thread::Builder::new().name("victory-arenas".into()).spawn(move || {
+            for request in receiver {
+                let Some(host) = crate::host::host() else {
+                    continue;
+                };
+                let locked = with(|a| a.locked);
+                let slot = match request {
+                    Request::Part(start, bytes) => open_part(&host.device, start, bytes, locked, most()),
+                    Request::Section(section, bytes) => open_section(&host.device, section, bytes, locked, most()),
+                };
+                with(|a| a.landed(request, slot));
+            }
+        });
+        sender
+    })
+}
+
+/// Title memory `[at, at + len)` in place in an arena, if it can be
+/// (`VICTORY_INPLACE=3`).
+pub(crate) fn resolve(at: u64, len: u64) -> Option<Resolved> {
+    let host = crate::host::host()?;
+    let mut asked = Vec::new();
+    let resolved = with(|a| a.resolve_with(&host.device, at, len, sync_bytes(), most(), &mut |r| asked.push(r)));
+    for request in asked {
+        let _ = worker().send(request);
+    }
+    resolved
+}
+
+/// Whether `[at, at + len)` is in an open arena now.
+pub(crate) fn ready(at: u64, len: u64) -> bool {
+    with(|a| a.ready(at, len))
+}
+
+/// Open parts, open sections, bytes locked.
+pub(crate) fn census() -> (u64, u64, u64) {
+    with(|a| a.census())
+}
+
+/// The runtime committed private title memory `[at, at + len)` that the
+/// GPU may use (`XMemVirtualAlloc`): it may be opened as an arena on first
+/// GPU use. Only memory told here is ever opened as a part.
+pub fn title_memory_committed(at: usize, len: usize) {
+    if crate::inplace::level() < 3 || len == 0 {
+        return;
+    }
+    with(|a| a.committed(at as u64, len as u64));
+}
+
+/// The title is about to decommit, release or protect `[at, at + len)`
+/// (the runtime's wrappers of its own calls): the parts over it are
+/// retired and what is in place in all of them is let go, so that the
+/// pages are no longer locked when the call is made (unless a list still
+/// holds an arena's buffer).
+pub fn title_memory_released(at: usize, len: usize) {
+    if crate::inplace::level() < 3 {
+        return;
+    }
+    let parts = with(|a| a.released(at as u64, len as u64));
+    let mut gone = 0;
+    for (start, bytes) in parts {
+        gone += crate::shadow::in_place_let_go(start, bytes);
+    }
+    crate::inplace::let_go_counted(gone);
+}
+
+/// The runtime closed a section of physical pages.
+pub fn title_memory_section_gone(section: usize) {
+    with(|a| a.section_gone(section));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::Interface;
+    use windows_sys::Win32::System::Memory as mem;
+
+    const G: u64 = 1 << 30;
+
+    /// The parts of a region: one up to 4 GiB - 64 KiB; beyond, every 2 GiB,
+    /// and a range takes the lowest part that holds it whole.
+    #[test]
+    fn a_range_takes_the_lowest_part_that_holds_it() {
+        let mut a = Arenas::default();
+        let base = 0x10_0000_0000u64;
+        a.committed(base, 64 << 20);
+        assert_eq!(a.part_for(base + 0x1000, base + 0x2000), Some((base, 64 << 20)));
+        assert_eq!(a.part_for(base + (63 << 20), base + (65 << 20)), None, "past the region");
+        // Committed next to it: one region.
+        a.committed(base + (64 << 20), 64 << 20);
+        assert_eq!(a.part_for(base + (63 << 20), base + (65 << 20)), Some((base, 128 << 20)));
+        // A region of 9 GiB: parts at 0, 2, 4, 6 GiB.
+        let big = 0x20_0000_0000u64;
+        a.committed(big, 9 * G);
+        assert_eq!(a.part_for(big + G, big + 3 * G), Some((big, PART)));
+        assert_eq!(a.part_for(big + 3 * G, big + 5 * G), Some((big + 2 * G, PART)));
+        assert_eq!(a.part_for(big + 7 * G, big + 9 * G), Some((big + 6 * G, 3 * G)));
+        // Any range of 2 GiB - 64 KiB lies in one.
+        for k in 0..64u64 {
+            let at = big + k * (7 * G / 64);
+            let end = (at + STRIDE - K64 as u64).min(big + 9 * G);
+            let (s, n) = a.part_for(at, end).unwrap_or_else(|| panic!("no part for {at:#x}"));
+            assert!(s <= at && end <= s + n && n <= PART);
+        }
+        // Released in the middle: the region is cut in two.
+        let parts = a.released(big + 4 * G, G);
+        assert!(parts.is_empty(), "none open");
+        assert_eq!(a.part_for(big + 4 * G + 10, big + 4 * G + 20), None);
+        assert_eq!(a.part_for(big + 3 * G, big + 3 * G + 10), Some((big, PART)), "the region below is 4 GiB: its first part");
+        assert_eq!(a.part_for(big + 4 * G - 16, big + 4 * G - 8), Some((big + 2 * G, 2 * G)), "past the first part");
+        assert_eq!(a.part_for(big + 5 * G, big + 5 * G + 10), Some((big + 5 * G, PART)));
+    }
+
+    /// On the software adapter: a region opened as one arena; two title
+    /// buffers in it resolve to the same buffer at their offsets; the GPU
+    /// reads and writes the title's bytes through it; released, it is
+    /// retired and the title can decommit the pages again.
+    #[test]
+    fn warp_title_buffers_read_and_write_their_bytes_through_one_arena() {
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        through_one_arena(&device);
+    }
+
+    /// The same on this PC's card (`cargo test -p victory-gpu --
+    /// --ignored arena_on_hardware`).
+    #[test]
+    #[ignore = "opens a device on the card"]
+    fn arena_on_hardware() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device creation on the default adapter.
+        unsafe { windows::Win32::Graphics::Direct3D12::D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap() };
+        through_one_arena(&device.unwrap());
+    }
+
+    fn through_one_arena(device: &ID3D12Device) {
+        let device = device.clone();
+        if device.cast::<windows::Win32::Graphics::Direct3D12::ID3D12Device13>().is_err() {
+            return;
+        }
+        // SAFETY: an allocation of the test's own.
+        unsafe {
+            let bytes = 16 * K64;
+            let base = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE | mem::MEM_COMMIT | crate::inplace::MEM_WRITE_WATCH, mem::PAGE_READWRITE).cast::<u8>();
+            let b = base as u64;
+            let mut a = Arenas::default();
+            let mut asked = Vec::new();
+            assert!(a.resolve_with(&device, b + 0x100, 0x100, u64::MAX, u64::MAX, &mut |r| asked.push(r)).is_none(), "not committed: not the title's");
+            a.committed(b, bytes as u64);
+            let one = a.resolve_with(&device, b + 0x1234, 0x2000, u64::MAX, u64::MAX, &mut |r| asked.push(r)).expect("in place");
+            let two = a.resolve_with(&device, b + 5 * K64 as u64 + 8, 0x100, u64::MAX, u64::MAX, &mut |r| asked.push(r)).expect("in place");
+            assert!(asked.is_empty(), "opened at once under the size limit");
+            assert_eq!(one.resource.as_raw(), two.resource.as_raw(), "one buffer for the region");
+            assert_eq!((one.offset, two.offset), (0x1234, 5 * K64 as u64 + 8));
+            assert_eq!(one.gpu + (two.offset - one.offset), two.gpu);
+            assert_eq!(one.left, bytes as u64 - 0x1234);
+            assert_eq!(one.kind, Kind::InPlace);
+            assert_eq!(a.census(), (1, 0, bytes as u64));
+            let mut rig = crate::inplace::Rig::new(&device).unwrap();
+            crate::inplace::fill(base.add(0x1234), 0x2000, 5);
+            let got = rig.fetch(&one.resource, one.offset, 0x2000).unwrap();
+            assert!(crate::inplace::same(base.add(0x1234), &got), "the GPU reads the title's bytes");
+            rig.store(&two.resource, two.offset, &[0xc3; 256]).unwrap();
+            assert!(crate::inplace::same(base.add(5 * K64 + 8), &[0xc3; 256]), "the GPU's write is at the title's address");
+            // Locked while open (R9), free again once retired and let go.
+            assert_eq!(mem::VirtualFree(base.add(9 * K64).cast(), K64, mem::MEM_DECOMMIT), 0, "locked");
+            assert_eq!(a.released(b + 9 * K64 as u64, K64 as u64), [(b, bytes as u64)]);
+            assert_eq!(a.census(), (0, 0, 0));
+            drop((one, two));
+            assert_ne!(mem::VirtualFree(base.add(9 * K64).cast(), K64, mem::MEM_DECOMMIT), 0, "free again");
+            assert!(a.resolve_with(&device, b + 9 * K64 as u64, 16, u64::MAX, u64::MAX, &mut |_| ()).is_none(), "decommitted: no longer the title's");
+            // Over the size limit for opening at once: asked of the thread.
+            let mut later = Vec::new();
+            assert!(a.resolve_with(&device, b + 0x10, 16, 0, u64::MAX, &mut |r| later.push(r)).is_none());
+            assert!(matches!(later.as_slice(), [Request::Part(s, n)] if *s == b && *n == 9 * K64 as u64));
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// On the software adapter: view memory that is one run of a committed
+    /// section resolves into the section's arena at the section offset, and
+    /// the GPU's write shows through the view.
+    #[test]
+    fn warp_a_run_of_a_committed_section_is_in_place() {
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        // SAFETY: the section, placeholder and view of the test's own.
+        unsafe {
+            let size = 8 * K64;
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, size as u32, std::ptr::null());
+            assert!(!handle.is_null());
+            let view = mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, (2 * K64) as u32, 4 * K64);
+            let at = view.Value as usize;
+            crate::inplace::title_memory_section(handle as usize, size as u64, true);
+            crate::inplace::title_memory_view(at, 4 * K64, handle as usize, 2 * K64 as u64);
+            let mut a = Arenas::default();
+            let r = a.resolve_with(&device, at as u64 + 0x40, 0x1000, u64::MAX, u64::MAX, &mut |_| ()).expect("in place");
+            assert_eq!(r.kind, Kind::Section);
+            assert_eq!(r.offset, 2 * K64 as u64 + 0x40);
+            let mut rig = crate::inplace::Rig::new(&device).unwrap();
+            rig.store(&r.resource, r.offset, &[0x7e; 64]).unwrap();
+            assert!(crate::inplace::same((at + 0x40) as *const u8, &[0x7e; 64]));
+            assert_eq!(a.census().1, 1);
+            a.section_gone(handle as usize);
+            assert_eq!(a.census().1, 0);
+            drop(r);
+            crate::inplace::views_gone(at, 4 * K64);
+            mem::UnmapViewOfFile(view);
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+    }
+}

@@ -70,7 +70,12 @@ pub(crate) fn probe_level() -> u8 {
 /// buffers that lies in private memory committed whole is not copied: a
 /// part of the title's allocation is opened as a host heap and the window
 /// is a buffer placed over it ([`place_for`]). 2: title buffers too,
-/// except the big ones in the card's memory.
+/// except the big ones in the card's memory. 3: as 2, but each is a view
+/// into a shared arena (`crate::arena`: one heap per region of private
+/// memory the runtime reported committed, parts of at most 4 GiB - 64 KiB
+/// every 2 GiB; and one per committed section of physical pages, for view
+/// memory that is one run of a section), not a heap of its own; the
+/// budget is the arenas' bytes ([`crate::arena::most`]).
 ///
 /// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
 /// memory (the page pool) is turned down here: its section is made
@@ -147,6 +152,19 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
+    if level() >= 3 {
+        // A view into the arena that holds it (`crate::arena`): private
+        // memory the runtime reported committed, or a run of a committed
+        // section; no heap of its own.
+        let Some(r) = crate::arena::resolve(start, len).filter(|r| r.left >= len) else {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let kind = if r.kind == crate::arena::Kind::Section { 5 } else { 4 };
+        crate::arena::ARENA_STATS[kind].fetch_add(len, Ordering::Relaxed);
+        counted(window, len);
+        return Some(Placed { buffer: r.resource, heap: r.heap, gpu: r.gpu, bias: r.offset });
+    }
     // View memory: known from the runtime without asking Windows.
     if cover(start as usize, len as usize) != Cover::None {
         STATS[4].fetch_add(1, Ordering::Relaxed);
@@ -173,6 +191,16 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             None
         }
     }
+}
+
+/// Things in place let go because their memory changed, counted.
+pub(crate) fn let_go_counted(n: u64) {
+    STATS[7].fetch_add(n, Ordering::Relaxed);
+}
+
+/// The bytes of a section the runtime made committed, if it did.
+pub(crate) fn section_bytes(section: usize) -> Option<u64> {
+    views().sections.iter().find(|s| s.0 == section && s.2).map(|s| s.1)
 }
 
 /// What is in place now counts one more (undone by [`gone`]).
@@ -212,6 +240,23 @@ fn say() {
         return;
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    if level() >= 3 {
+        let (parts, sections, locked) = crate::arena::census();
+        let a: Vec<u64> = crate::arena::ARENA_STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+        tracing::info!(
+            "title memory in place, arenas: {parts} parts of private memory and {sections} sections open, {:.2} GiB locked (budget {:.1} GiB); \
+             since the start {} opened ({} MB), {} refused, {} retired, {} ranges resolved; buffers and windows placed in them: {} MB of private memory, {} MB of view memory",
+            locked as f64 / f64::from(1u32 << 30),
+            crate::arena::most() as f64 / f64::from(1u32 << 30),
+            a[0],
+            a[3] >> 20,
+            a[1],
+            a[2],
+            a[6],
+            a[4] >> 20,
+            a[5] >> 20
+        );
+    }
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
          {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
@@ -444,6 +489,34 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
         reached += bytes;
     }
     if one { Cover::Run(first.0, first.1) } else { Cover::Scattered }
+}
+
+/// Where the run of one section that holds `at` ends, at most at
+/// `most`: views that continue each other in the section are one run.
+/// `None` if no view holds `at`.
+fn run_end_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, most: usize) -> Option<usize> {
+    let (&base, &(bytes, section, offset)) = views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at)?;
+    let mut reached = base + bytes;
+    while reached < most {
+        match views.get(&reached) {
+            Some(&(n, s, o)) if s == section && o == offset + (reached - base) as u64 => reached += n,
+            _ => break,
+        }
+    }
+    Some(reached.min(most))
+}
+
+/// For a window outside buffers over view memory (`VICTORY_INPLACE=3`):
+/// the range `[start, start + len)` of whole 64 KiB pages around the ask
+/// `[at, end)` that is one run of one section, if the ask lies in one;
+/// for an ask without a length (it reads to the window's end), the run
+/// from the ask's page to where the run ends in its 4 MiB cell.
+pub(crate) fn run_window(at: u64, end: u64, unsized_ask: bool) -> Option<(u64, u64)> {
+    const CELL: u64 = 4 << 20;
+    let start = at & !(K64 as u64 - 1);
+    let most = if unsized_ask { (at & !(CELL - 1)) + CELL } else { end.next_multiple_of(K64 as u64) };
+    let reached = run_end_in(&views().views, start as usize, most as usize)? as u64;
+    (reached >= end.max(at + 1)).then_some((start, reached - start))
 }
 
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
@@ -1176,6 +1249,36 @@ pub(crate) mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+    }
+
+    /// A window over view memory with arenas is the run of one section
+    /// around the ask: as far as the views continue each other, within the
+    /// ask (with a length) or the ask's 4 MiB cell (without).
+    #[test]
+    fn a_window_over_views_is_the_run_around_the_ask() {
+        let mut views = BTreeMap::new();
+        let at = 0x7_c000_0000usize;
+        // Pages 0..3 continue each other in section 4; page 3 is from
+        // elsewhere; page 5 is unmapped.
+        for k in 0..3 {
+            views.insert(at + k * K64, (K64, 4, ((10 + k) * K64) as u64));
+        }
+        views.insert(at + 3 * K64, (K64, 4, 2 * K64 as u64));
+        views.insert(at + 4 * K64, (K64, 4, 3 * K64 as u64));
+        assert_eq!(run_end_in(&views, at, at + (4 << 20)), Some(at + 3 * K64));
+        assert_eq!(run_end_in(&views, at + 3 * K64, at + (4 << 20)), Some(at + 5 * K64));
+        assert_eq!(run_end_in(&views, at + K64, at + 2 * K64), Some(at + 2 * K64), "at most what is asked");
+        assert_eq!(run_end_in(&views, at + 5 * K64, at + (4 << 20)), None);
+        let base = 0x7_d000_0000usize;
+        for k in 0..3 {
+            title_memory_view(base + k * K64, K64, 4, ((10 + k) * K64) as u64);
+        }
+        let b = base as u64;
+        assert_eq!(run_window(b + 0x10, b + 0x20, false), Some((b, K64 as u64)));
+        assert_eq!(run_window(b + 0x10, b + K64 as u64 + 0x20, false), Some((b, 2 * K64 as u64)));
+        assert_eq!(run_window(b + K64 as u64 + 8, 0, true), Some((b + K64 as u64, 2 * K64 as u64)), "to the run's end");
+        assert_eq!(run_window(b + 0x10, b + 4 * K64 as u64, false), None, "past the run");
+        views_gone(base, 3 * K64);
     }
 
     /// What the runtime forgets when memory is mapped anew.

@@ -2019,6 +2019,7 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    in_place_upgrade();
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -3281,6 +3282,48 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     n
 }
 
+/// With arenas (`VICTORY_INPLACE=3`): a title buffer whose first use came
+/// before its arena was open got a copy, kept for the run. Once the arena
+/// is open such a copy is let go when nothing holds it (no list, no slot,
+/// no range in the air), as `let_go_idle` lets windows go; the next ask
+/// finds the buffer in place. Not the big ones `cards` puts in the card's
+/// memory (never in place). Returns how many.
+fn in_place_upgrade() -> u64 {
+    if crate::inplace::level() < 3 {
+        return 0;
+    }
+    let big = |len: u64| cards() && len.next_multiple_of(1 << 16) >= card_limits().0;
+    let gone: Vec<Arc<Shadow>> = {
+        let mut map = buffers();
+        let mut gone = Vec::new();
+        for (key, entry) in map.iter_mut() {
+            let len = entry.end - key.0;
+            let Some(s) = &entry.shadow else { continue };
+            if s.place.is_some()
+                || s.card.is_some()
+                || big(len)
+                || Arc::strong_count(s) != 1
+                || crate::host::references(&s.buffer) != 1
+                || s.writes_pending()
+                || !crate::arena::ready(key.0, len)
+            {
+                continue;
+            }
+            gone.extend(entry.shadow.take());
+        }
+        gone
+    };
+    let n = gone.len() as u64;
+    if n > 0 {
+        let bytes: u64 = gone.iter().map(|s| s.len).sum();
+        crate::host::trail(|| format!("sweep: {n} copies of title buffers let go for their arenas ({} KiB)", bytes >> 10));
+    }
+    for shadow in gone {
+        crate::host::retire(shadow);
+    }
+    n
+}
+
 /// For the in-place census (`crate::inplace`): the title buffers (start,
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
@@ -3563,6 +3606,25 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());
+    }
+    // With arenas, over view memory: a 4 MiB window is rarely one run of a
+    // section (the census: 1,948 MB of windows over views have unmapped
+    // pages), the ask itself often is. The window is then that run, in
+    // place in its section's arena; nothing is copied, so windows that
+    // overlap show the same bytes.
+    if crate::inplace::level() >= 3
+        && let Some((run, bytes)) = crate::inplace::run_window(address, end, unsized_ask)
+    {
+        if let Some(shadow) = map.get(&(run, bytes)) {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+        if let Some(placed) = crate::inplace::place_for(run, bytes, true) {
+            let shadow = Arc::new(Shadow::placed(placed, run, bytes, true));
+            note(&shadow);
+            map.insert((run, bytes), shadow.clone());
+            return Some(shadow);
+        }
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
