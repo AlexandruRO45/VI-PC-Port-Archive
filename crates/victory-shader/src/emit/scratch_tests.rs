@@ -195,6 +195,11 @@ fn run(
     cases: &[[u32; 4]],
     want: impl Fn([u32; 4], u32) -> Vec<u32>,
 ) {
+    // Share the device lock with the VALU and waterfall tests. Concurrent
+    // dispatches on WARP can terminate the test process.
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
