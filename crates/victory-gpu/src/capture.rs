@@ -389,18 +389,16 @@ fn dump_one(
     d: &D3D12_RESOURCE_DESC,
 ) {
     let Ok(list) = host.new_list() else { return };
-    let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
-    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    let state = crate::host::legal_state(texture, state);
+    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
     // SAFETY: an open list of ours and a live texture.
     let read = unsafe {
-        if state != copy {
-            list.list
-                .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
+        if let Some(into) = crate::host::transition_from(texture, Some(state), copy) {
+            list.list.ResourceBarrier(&[into]);
         }
         let read = read_back(&host.device, &list.list, texture);
-        if state != copy {
-            list.list
-                .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
+        if let Some(back) = crate::host::transition_from(texture, Some(copy), state) {
+            list.list.ResourceBarrier(&[back]);
         }
         read
     };
