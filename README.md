@@ -1,199 +1,235 @@
-# victory-gta6
+# VIctory — the Yeetbot159 fork
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the
-compatibility layer that runs the Xbox Series build of Grand Theft Auto VI
-natively on Windows from files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files the
+user supplies.
+
+The title's x86-64 code runs unchanged inside our process; VIctory supplies the
+platform underneath it and converts the title's data, ahead of time where it can
+and on first use where it must (shaders). See [docs/architecture.md](docs/architecture.md).
 
 **This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by Rockstar Games or
-Take-Two Interactive.
+copy of the game. Nothing here is affiliated with or endorsed by Rockstar Games
+or Take-Two Interactive, and nothing in the repository is derived from the
+title's content: `docs/asset-policy.md` is the rule, `cargo xtask policy` is the
+check, and `.githooks/pre-commit` runs that check on every commit once
+`cargo xtask install-hooks` has pointed git at it.
 
-## Credits
+## The three repositories this stands on
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors is the base of everything here: the loader, the runtime
-  services, the Direct3D 12 back end and the shader recompiler. Licensed
-  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
-  the single commit that carries this fork's changes.
-- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
-  (GPL-2.0-only) was used as a reference for how the same title behaves under
-  another layer. Fixes inspired by it were written anew in VIctory's code.
-- This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+| Repository | What it is | Licence |
+|---|---|---|
+| [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (`origin`) | upstream: the loader, runtime services, Direct3D 12 back end and shader recompiler | GPL-3.0-or-later |
+| [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) (`fxceless`) | the fork this one now follows as its base: the rendering and submission work that gets the world to draw | GPL-3.0-or-later |
+| this repository (`fork`, Yeetbot159/VIctory) | one person's fork of the second, carrying its own fixes and instruments | GPL-3.0-or-later |
 
-## Status of this fork (2026-11-25)
+All three share upstream commit `ffe310e` as their common ancestor, so their
+histories merge rather than being grafted: this fork's commit log contains
+fxceless's own commits and upstream's, unsquashed. See
+[Sources and attribution](#sources-and-attribution) for what came from where.
 
-**Not playable yet: 2 to 4 frames per second, and shadowed areas are black.**
-Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
-32 GB RAM. The Series X profile is used throughout.
+## Status (2026-11-24)
 
-| Stage | State in this fork |
-|-------|--------------------|
-| Boot, menus, start screen | works, 30 fps (as upstream) |
-| Opening cutscene | plays from start to finish, in order, lit: title cards, credits cards, night and dusk shots |
-| Saves | the game autosaves a checkpoint and loads it again |
-| First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
-| Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
-| Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
+**Not playable.** The menus work; a rendered world frame has never come out of
+this tree. The base this fork adopted reports a cutscene and a prologue on an
+NVIDIA card, which is why it was adopted; those numbers are the base's, on the
+base's machine, and this tree has not reproduced them yet.
 
-### What this fork changed (summary)
+| Stage | State | Produced by |
+|---|---|---|
+| Boot, first-boot screens, start screen, menus | works at the title's own 30 fps | this PC's card (AMD RX 6700 XT), upstream code, in the menus |
+| The opening cutscene window (frames 1,280–1,300) | the presented image is a moving, composed colour field; the 3840x2160 `f19` depth target reads **exactly zero** at all five captured frames | WARP, diagnostics build, keyed pad-A soak, offscreen — **not** a rendered 3D frame |
+| The world, first frame | every run on this PC ends here: access violation at `victory-image-…+0x8f92a`, read of `0x17`, rax all-ones — a descriptor slot holding `-1` used as a pointer. Runs end between frames 1,250 and 1,650, or not at all | this PC's card, in the world's first frame |
+| The world, the base's claim | the opening cutscene plays start to finish and the prologue renders characters, textures, sky, HUD and pause menu at **2–4 fps** | fxceless/victory-gta6, RTX 4070 12 GB / i7-14700KF, Series X profile, in the world |
+| The world, this tree | **never rendered a frame** | — |
+| Frame rate | 30 fps in the menus; 0.5–1.8 s per world frame | this PC's card, in the world, before the world-frame crash |
+| Frame rate, the base's numbers | 420–450 ms per frame by default; 240–350 ms with `VICTORY_RELAY=2` or with `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024` | fxceless/victory-gta6, RTX 4070, in the world |
 
-Rendering:
-- Meshlet culling read its scene buffers as the wrong kind of view, so the world drew almost nothing; fixed.
-- Per-draw descriptor tables could run out, after which draws used slots never made for them and the card hung; fixed.
-- Light packed by the game's compute shaders was read back through empty copies (sky, probes, fog); fixed for every mip level and layer.
-- The fog reconstruction, shadow-mask, hair, blend-shape skinning, fire and several material programs did not translate; fixed.
-- Gathers at a named mip level (with and without an offset) read level 0; fixed.
-- Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
-- Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
-- Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
+Every number here says what produced it: which tree, which adapter, and
+whether the run was in the menus or in the world. Offline numbers — a
+translation result, a validation count, a set of emitted DXIL — say that
+instead, because no adapter touched them. A number that says none of this is a
+number nobody can reproduce, and this file does not carry those.
 
-Speed and memory:
-- Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
-- Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
-- Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
-- Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
-- The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
-- An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
+Three statements this fork can stand behind today:
 
-Most of the newer speed changes sit behind environment switches that are off
-by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
-`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
-Each is described in a comment where it is read.
+- **The cutscene window draws something, and it is not geometry.** Captured
+  frames 1,280, 1,290, 1,292, 1,295 and 1,300 of a keyed WARP run have real
+  moving structure in colour (a 6x4 mean grid slides 100,80,97 → 70,58,68 →
+  61,52,62 over the window, 63–64 distinct colours in an 8x8 downscale) while
+  the same frames' `f19` depth target has one unique value, zero. Geometry that
+  writes colour and never depth does not exist in this title, so what is on
+  screen is composited by something else while nothing depth-tests.
+- **No world frame has rendered in this tree.** The window above is the title's
+  cutscene, and the run ends at the first world frame with the `-1` descriptor
+  fault, every time, at a frame number that moves between 1,250 and 1,650.
+- **The frame rate belongs to a tree and a machine.** The 30 fps above is the
+  menus on an RX 6700 XT; the 2–4 fps above is the base's prologue on an RTX
+  4070. Neither number describes the merged tree, which has not been measured.
 
-### Known problems
+## Known problems
 
-- Everything in shadow is black (see above).
-- The interior of the first gameplay room is sometimes not drawn after the cutscene hands over to gameplay.
-- Around 24 GB of memory is in use during play.
-- A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
-- Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
+- **Anything the sun does not hit directly is black** in the base's tree: the
+  title's ray-traced bounce light and its lamp and sun shadows are not lit yet.
+  The scaffold is in [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md), is off
+  by default, and by that document nothing is lit by it.
+- **The first world frame crashes.** A descriptor slot holds `-1` and the title
+  dereferences it, at a frame number that moves between 1,250 and 1,650 or
+  does not come at all. It stands between this tree and any rendering
+  measurement, and it is the one thing worth fixing first.
+- **Entering the world on a real GPU can hang the card**, and Windows then
+  resets the display driver (every monitor goes black for a moment, and one
+  2026-11-24 hang needed a restart). Use `VICTORY_D3D12_WARP=1` for anything
+  long or unattended, and a wall-clock watchdog — 120 s, 180 s at most — for
+  anything on the card.
+- **The D3D12 debug layer, GPU-based validation and DRED are unavailable on the
+  reference PC**: Windows' Graphics Tools optional feature is not installed, so
+  `VICTORY_D3D12_DEBUG`, `VICTORY_D3D12_GBV` and `VICTORY_D3D12_DRED` report
+  `no D3D12 debug layer` rather than doing anything. The in-host instruments in
+  [Debugging](#debugging) exist because of that.
+- **Zeroed measurements taken in the menus are not measurements of the world.**
+  The title stops at an Xbox-style account picker and draws nothing 3D until a
+  profile is chosen. A zeroed depth target read there has already misled one
+  investigation.
+- Around 24 GB of memory is in use during play in the base's tree.
+- On this PC the Rockstar boot movie was reported at 15 fps with broken audio in
+  one 2026-11-24 build, while our own baseline measured 30 fps with
+  sample-identical audio at `b77a938`; that bisect is open. Read it as a
+  regression in one build, not as a property of the layer.
 
-Everything below this line is upstream VIctory's own README, unchanged; its
-status section describes upstream, not this fork.
+## Sources and attribution
 
----
+### Marvisak/VIctory — GPL-3.0-or-later
 
-# VIctory
+The origin of everything structural: the loader that prepares, maps and binds
+the title's image, the runtime services (`victory-hle`) that implement the
+console's APIs, the Direct3D 12 back end (`victory-gpu`), and the shader
+recompiler (`victory-shader`) that turns the console's GPU code into DXIL. Both
+downstream forks keep upstream's history intact below their own commits.
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+### ivall/xcl — GPL-2.0-only
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
+The project is now at [xcl-dev/xcl](https://github.com/xcl-dev/xcl);
+`ivall/xcl` redirects there.
 
-## This fork (2026-11-24)
+A reference for how this title behaves under another compatibility layer: it
+runs console game code natively, reimplements the console's system libraries and
+recompiles RDNA2 shaders to DXIL, which are the same problems this layer has.
+Fixes it inspired were written anew in VIctory's code. **No code from XCL is in
+this repository**, and none may be added: it is GPL-2.0-only, which does not
+combine with this repository's GPL-3.0-or-later. That distinction is why this
+section says "reference" rather than "source".
 
-A working fork of upstream that folds in the shader and GPU fixes still open
-as pull requests there, plus a few of its own, and measures what they change
-in a real run. Everything below is measured, not projected.
+### fxceless/victory-gta6 — GPL-3.0-or-later
 
-What it adds on top of upstream `ffe310e`:
+The base this fork now follows. Its commits are merged, not copied, so each one
+can be read in the log. What came from it:
 
-| Change | Effect |
-|--------|--------|
-| 30 upstream PRs merged (wave64 wave size, stranded-SGPR refusal, waterfall table offsets, dead mask dwords, heap UAV inference, cube and array image lowering, mip-drop under memory pressure, view-memory caching, writes-only tracking, …) | Shader coverage and GPU lifetime the fork needs; without them the run dies far earlier |
-| Lane masks read as numbers after a complement (`s_xor m, -1`) | The number is the base mask's ballot over the whole wave, so six compute programs stop failing on it |
-| Texture to buffer copies (a read back through a placed footprint) | Replaces a silent drop that left streamed data stale |
-| Descriptor dwords nothing reads as a number keep a stand-in | A load whose only consumers hold host handles no longer stops the program |
-| Root UAV views bounded by their buffer | One class of invalid view, and the device removal it caused |
-| A clear value only on a texture that can take one | The title's NV12 and B4G4R4A4 textures were never created: three creation failures per run, and the title then died at frame 1,479 reading `0xffffffffffffffff`. Both are gone |
-| A view needs its resource's permission, and a clear is skipped when it cannot take one | The device removal the operation check named (`op=clear_rtv`): a console texture that is both a render target and a UAV loses the render-target flag on its host copy, so its views are null and its clears are skipped instead of being handed to the driver |
-| Bindless pointer chasing, with its host half | A descriptor behind a pointer the shader computes is followed through the root constants and the pointed buffer is bound. A pointer not on 16 bytes is left unbound rather than bound into an invalid call |
-| Bounded mesh output | The console's `exp prim` carries 10-bit vertex indices, so a primitive can name vertex 1023 while 128 exist: those are culled, lanes past the declared outputs store nothing, and group counts are clamped |
-| A short DirectStorage stream fills its destination | A stream shorter than its block left the tail holding `-1` and reported success — the only true member of the `-1` family a host audit found |
-| Host breadcrumbs, and `VICTORY_GPU_CHECK` | Every host operation leaves a crumb in a lock-free ring, and a removal dumps the newest 64; the check asks the device after each one, which turns "the application made a call that is invalid" into `op=clear_rtv a=0x…`. The check costs one COM call per operation and is very slow: never compare frame times with it on |
+| Area | What it changed | Where |
+|---|---|---|
+| Rendering | meshlet culling read its scene buffers as the wrong kind of view, so the world drew almost nothing | `crates/victory-gpu/src/draw.rs`, `descriptor/` |
+| Rendering | per-draw descriptor tables could run out, after which draws used slots never made for them and the card hung | `crates/victory-gpu/src/descriptor/host.rs` |
+| Rendering | light packed by the game's compute shaders was read back through empty copies (sky, probes, fog), per mip and per layer; gathers at a named mip read level 0 | `crates/victory-gpu/src/shadow.rs` |
+| Rendering | the material-program translations: fog reconstruction, shadow mask, hair, blend-shape skinning, fire, and the implicit-level samples that made compute modules invalid | `crates/victory-shader/src/emit/lower.rs`, `resource.rs` |
+| Submission | submissions sent ahead of the card's wait (`VICTORY_LATE_WAIT`) with a relay thread landing results as the card finishes (`VICTORY_RELAY`) | `crates/victory-gpu/src/host.rs` |
+| Submission | title memory opened as a graphics heap so buffers are used in place instead of copied (`VICTORY_INPLACE`) | `crates/victory-gpu/src/inplace.rs` |
+| Ray tracing | the scaffold: builder programs translate, shader reads of title memory by raw address, and the hardware ray/box and ray/triangle test emulated in DXIL and checked against a Rust reference on the GPU | `crates/victory-shader/src/bvh.rs`, `emit/intersect.rs`, [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md) |
+| Stability | the hang the wave64 update introduced: its barrier form for 64-lane programs is off unless `VICTORY_WAVE_WIDE=1` | `crates/victory-shader/src/emit/wave.rs` |
+| Stability | an intermittent device loss from the pipeline library file being replaced while mapped | `crates/victory-gpu/src/pipeline/library.rs` |
 
-Where a session gets to, and where it stops:
+Its own README states the conditions on its numbers: one machine (Windows 11,
+i7-14700KF, RTX 4070 12 GB, 32 GB RAM), Series X profile, and its commits were
+developed with Claude Code.
 
-| Measurement | Value |
-|-------------|-------|
-| Frames before the run ends | 1,290–1,320 on this branch (upstream baseline: 853) |
-| Presented image at frame 1,024 and 1,500 | holds content (mean 120/255 at 1,500, every pixel non-zero) |
-| 3840x2160 `D32_FLOAT_S8X24` depth target | still all zeros at frames 1,100, 1,180, 1,240 and 1,500, with pad A pressed every four seconds: the title has not asked for a 3D frame |
-| Device removals | 0 in one run of 1,290 frames, one event in 1,320; the CPU-side invalid call the check names is fixed, a GPU-side removal after a render-target ping-pong remains |
-| Remaining translation failures | 28–45 per run, nearly all `an address not from a root parameter`: 38 programs across two dump sets whose descriptor address is read out of a buffer's contents, one hop beyond what the binder resolves |
+### What this fork's own crew added
 
-The remaining crash is understood and is the same defect as the missing
-geometry. The console lets a shader's UAV descriptor point at any dword, but a
-host raw view must start on 16 bytes: binding it at the console's address is
-refused with `DXGI_ERROR_INVALID_CALL` and takes the device down, while
-aligning it and dropping the write leaves the title reading stale memory and
-faulting on a `-1` index at frame ~1,180. The fix is to keep the view aligned
-and give the shader the missing `address & 15` as a runtime bias on that root
-UAV's accesses. Those same dropped writes are what the world's indirect draw
-arguments are built from, which is why the scene stays dark.
+Each row is a landed commit on `fork/main`, with the file it lives in, the test
+that pins it, and the measurement that justifies it. Where there is no number,
+the row says what it protects instead.
 
-## Status (2026-11-23)
+| Change | Where | Measurement, with its conditions |
+|---|---|---|
+| An optimized clear value only on a texture that can take one | `crates/victory-gpu/src/resource.rs` (`host_texture_desc` → `keep_clear`) | A WARP probe: D3D12 answers `E_INVALIDARG` (`0x80070057`) for a clear value on a resource whose render-target flag the format's rules removed. Before the fix, three `no host texture` failures a session for NV12 (format 86) at 1024x4096 and B4G4R4A4_UNORM (115) at 2560x1440 |
+| A view needs its resource's permission, and a clear it cannot serve is skipped | `crates/victory-gpu/src/host.rs` (`allows`, `once_render`, `clears_render_target`), `list.rs` (both clears) | The `op=clear_rtv` device removal at frame 1494, named by the breadcrumb ring (barrier, transition, resource_create, indirect, execute, dispatch, clear_rtv), is gone: a skipped clear records `b=1` instead of handing a null view to the runtime. Test: `a_depth_target_takes_no_unordered_view` |
+| Mesh shaders declare no wave size | `crates/victory-shader/src/emit/lower.rs`, `emit/shader.rs` (the `PSV0` header) | In the title, WARP, one keyed soak, one commit apart: mesh pipelines refused **545 → 0** with **338** mesh modules translated in both runs. Offline, `victory translate chunks/d010 --list --validate`: 0 of 450 mesh programs validated before, 448 of 450 after (the two left stop at a resource-layer refusal); `chunks/d011`: 0 of 427 → 427 of 427 |
+| Mesh output bounded by the program's declaration | `crates/victory-shader/src/emit/lower.rs` | The console's 10-bit `exp prim` indices reach 1023 while the program declares 128 vertices; a primitive naming a vertex past the declaration is culled, lanes past the declared outputs store nothing, and a group count past 65535 is clamped. Undefined behaviour on the card, so there is no failure count to quote |
+| A scalar a pixel program spills through a VGPR lane | `crates/victory-shader/src/emit/lower.rs` (`v_readlane_b32` before cross-lane work) | A pixel program refused an SGPR moved through a VGPR lane and read back at a constant lane as "a cross-lane operation outside compute" with nothing crossing lanes. The resolution is constant-lane only, phi arms must agree, and the write stays under the instruction's guard |
+| Bindless pointer chasing, with its host half | `crates/victory-gpu/src/draw.rs`, `crates/victory-shader/src/emit/lower.rs`, `resource.rs` | The register encodes `((dword + 1) << 8) \| slot`, so the decode is `at >> 8` after `checked_sub(256)`; an address not on 16 bytes stays unbound rather than bound into an invalid call. Lane measurement (emitted DXIL validity, not a drawn frame): dump set A 13/24 → 19/29, set B 0/15 → 6/20 |
+| Remembered buffer state on the shadow | `crates/victory-gpu/src/shadow.rs` (`state`), `indirect.rs`, `list.rs` | A barrier naming a before-state the buffer was not in. An explicit transition does not decay, so the indirect buffer's UNORDERED_ACCESS and the copy's COPY_DEST are states a later barrier must leave from. Found by review, pinned by `clamp_preserves_record_offsets_and_shared_budget`; no run measurement |
+| The instrument set | `host.rs` (`VICTORY_GPU_CHECK`, `VICTORY_D3D12_VALIDATE`, the crumb ring, the frame log), `draw.rs` (`VICTORY_INDIRECT_RECORD`), `pipeline/host.rs` (retry diagnostics) | What turned "the application made an invalid call" into `dispatch 1x1x1 [compute e30970f1727063fd]`, then into `submission=31371 list=0 of=1`, then into `op=resource_create a=0xb6456ee00 b=3 (invalid call, 0x887A0001)`. Each switch is in [Debugging](#debugging) with its cost |
+| The test gate | `host.rs` (`the_device_tests_have_a_device`), `shadow.rs` per-copy accounting, `frame.rs` (`waits_end_on_ticks_and_count_frames`) | A green `victory-gpu` suite where every device test early-returned is a suite that asserted nothing. The other two measured the machine rather than the code: one flip per tick against a 1.67 ms clock (4 of 20 parallel runs failed on unmodified `main`), and a process-global registry every other test writes (1 of 20) |
 
-**Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
+Two more are written and measured but **not in this tree yet**, so no row above
+claims them:
 
-| Stage | State |
-|-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
+- **Implicit-level samples outside the pixel stage.** `image_sample`,
+  `_o`, `_cl` and `_b` mapped to DXIL opcode 60/61 in every stage; outside a
+  pixel shader there are no neighbouring fragments, so `dxil.dll` refuses the
+  module with "features incompatible with the shader stage" and no pipeline is
+  created for it. Mapping them to a level-zero `sampleLevel` outside pixel
+  stages makes `015832d72477fb26` — one of the modules no run had ever bound —
+  validate and create. The change is uncommitted in the shader lane's worktree
+  as of this writing.
+- **A session guard.** One title session per machine, held as a named object by
+  the operating system rather than by a lock file, so a second launch leaves
+  before it touches the GPU and a child that outlives its parent still holds the
+  exclusion (`apps/victory/src/session.rs`, `VICTORY_SESSION_INHERITED`). Open
+  as a pull request on its own branch, not merged.
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+## Building and running
 
-> **Warning.** Entering the world on a real GPU can currently hang it, and
-> Windows then resets the display driver (every monitor goes black for a
-> moment). To look further, use a diagnostics build with
-> `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
+Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
+model 6.6 (and mesh shaders for the world), and Rust, pinned in
+`rust-toolchain.toml` (1.98.1, `x86_64-pc-windows-msvc`).
 
-What each part does today and what it still needs:
-
-| Subsystem | Today | Needs |
-|-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
-| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
-| Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
-| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
-
-## Getting started
-
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
-
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
+The title also needs several GiB of available Windows commit at startup — check
+**Committed** under **Task Manager → Performance → Memory**. If `crashes.log`
+reports Windows error 1455, close other applications or enlarge the paging file
+and retry.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
+cargo build --release -p victory
+cargo run -p victory -- config           # check the paths you just set
 ```
 
-Run the title:
+Point `victory.toml` at your own copy of the game, outside the repository — the
+tools refuse a path inside it. `VICTORY_GAME_DIR`, `VICTORY_CACHE_DIR`,
+`VICTORY_DATA_DIR` and `VICTORY_TEST_TITLES` override the file, and
+`VICTORY_CONFIG` selects a different file. Derived data goes to
+`%LOCALAPPDATA%\victory\cache` and the title's saves, settings and
+`crashes.log` to `%LOCALAPPDATA%\victory\data` (the log is under
+`<data>\<build id>\temp\`).
+
+Run the title, and give it a bound:
 
 ```powershell
-cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+target\release\victory.exe run "<game dir>\<the title's exe>" --execute
 ```
 
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
+`run` without `--execute` binds the imports and stops, which is the cheap check
+that your files and paths are right. `--unimplemented trap|zero` decides what an
+unimplemented import does when called, `--strict` disables host pass-through,
+`--console series-x|series-s` picks the profile the title sees, and everything
+after `--` goes to the title's command line. The window caption shows the
+framerate.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
+Tests need no game data and run in CI (`.github/workflows/ci.yml`: clippy with
+`-D warnings` on both feature sets, then the suite):
+
+```powershell
+cargo test --workspace
+cargo test --workspace -- --test-threads=1   # the result that gates a merge
+```
+
+Two assertions in `victory-gpu` have measured the clock and a process-global
+registry rather than the code (`frame::tests::waits_end_on_ticks_and_count_frames`
+and the shadow snapshot tests). Both were rewritten, and a serial run is what a
+merge decision reads: a compile error prints neither `FAILED` nor a
+`test result:` line, so green means a `test result: ok` you read for every crate,
+never the absence of a failure.
+
+Input is XInput pads. With none connected, the keyboard is a pad while the
 title's window has focus:
 
 | Keys | Pad |
@@ -205,7 +241,7 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
-## Commands
+Offline subcommands, none of which start the title or need a GPU session:
 
 ```
 victory inspect <exe|dll> [--imports] [--exports]
@@ -213,13 +249,8 @@ victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
 victory config
 ```
-
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
 
 ## Debugging
 
@@ -229,31 +260,88 @@ A release build has no debugging aids. Build them in with
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
 
+The switches are grouped by what you would reach for. Everything marked
+*diagnostics* exists only in that build, except `VICTORY_D3D12_VALIDATE`, whose
+code is compiled in either way.
+
+### What is on screen
+
 | Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_D3D12_VALIDATE=1` | one submission per list, each asked for the removal reason as it lands: the first that comes back removed is logged as `the submission that removed the device`, with the newest operations of that list. Slow, and it removes the overlap between lists — a removal that needs two lists in flight together will not reproduce under it, so take a removal it names as the guilty list and not as the whole story |
-| `VICTORY_INDIRECT_RECORD=1` | logs an indirect execution's record: kind, stride, count, the words, the thread count they name, and whether the range fits the buffer. The first 64 executions and then a sample of every 256th, so the log stays readable; it reads the host copy as uploaded, which is the record the dispatch ran, and does no copy-back of its own |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+|---|---|
+| `VICTORY_CAPTURE=<dir>` | *diagnostics.* Saves each presented frame whose number is a power of two as `frame-<n>.png`, at half size |
+| `VICTORY_CAPTURE_FRAMES=<n>,<n>` | *diagnostics.* Additional frames to save, and their draws traced at debug level |
+| `VICTORY_DUMP_TARGETS=1` | *diagnostics.* With a capture folder: every texture the listed `VICTORY_CAPTURE_FRAMES` frames render to or write, saved at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`. Floats are scaled by their largest value and depth by its range, so structure shows. Only the listed frames — a power-of-two frame alone dumps nothing |
+
+### What the GPU did
+
+| Variable | Effect |
+|---|---|
+| `VICTORY_GPU_CHECK=1` | *diagnostics.* Asks the device after every recorded host operation whether it has been removed, so the first operation after which it has names itself: `the device was removed right after op=clear_rtv a=… b=…`. One device query per operation, so it is very slow — never compare frame times with it on |
+| `VICTORY_D3D12_VALIDATE=1` | One submission per command list, each asked for the removal reason as it lands; the first that comes back removed is logged as the submission that removed the device with that list's newest operations. It removes the overlap between lists, so a removal needing two lists in flight will not reproduce under it: take the list it names as guilty, not the whole story |
+| `VICTORY_INDIRECT_RECORD=1` | *diagnostics.* Logs an indirect execution's record: kind, stride, count, the words the title left, the thread count or draw count they name, and whether the range fits the buffer. The first 64 executions and then every 256th, so the log stays readable |
+| `VICTORY_GPU_TIMING=1` | *diagnostics.* Runs and times each list of a submission on its own, and logs slow ones with their slowest commands |
+| `VICTORY_SKIP_PIPELINES=<hash>,…` | *diagnostics.* Omits draws and dispatches, indirect ones included, whose pipeline contains a listed 16-digit shader hash — the way to subtract a suspect pipeline and confirm cause rather than neighbour |
+| `VICTORY_D3D12_DRED=1` | *diagnostics.* Enables device-removed data: the allocation a fault hit and the commands in flight |
+| `VICTORY_D3D12_DEBUG=1` | *diagnostics.* The host debug layer (needs Windows' Graphics Tools) |
+| `VICTORY_D3D12_GBV=1` | *diagnostics.* With the debug layer: GPU-based validation without state tracking, so out-of-range descriptor indices become messages naming the command instead of page faults. Slow |
+| `VICTORY_D3D12_WARP=1` | *diagnostics.* The host device on the software adapter: a shader's wild access becomes an access violation in this process instead of a GPU fault and driver reset. Slow, and it cannot black the machine, which is why soaks and unattended runs use it |
+
+### What the shaders did
+
+| Variable | Effect |
+|---|---|
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | *diagnostics.* Translated loops stop after `n` iterations per lane (decimal or `0x` hex, at least 1) instead of 2^20. The value is part of the translation, so it takes its own cache entries. If a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_SKIP_PIPELINES=<hash>,…` | as above: omits work whose pipeline contains that shader |
+| `VICTORY_SERIAL_PIPELINES=1` | Creates compute pipelines one at a time, to tell a driver race from a description we build differently each run. A refusal that a later attempt at the same module survives is not a verdict on the module |
+
+### What the process did
+
+| Variable | Effect |
+|---|---|
+| `VICTORY_LOG=<target>=<level>,…` | Log filter, e.g. `VICTORY_LOG=victory_loader=trace,info`; falls back to `RUST_LOG`. A release build cannot log below info whatever the filter asks |
+| `VICTORY_STACKS=<s>,<s>` | Every thread's unwound stack as `module+rva`, that many seconds after start, to see what a title waits on |
+| `VICTORY_WATCH=<rva>,…` | Polls the u32 at each title address (hex) every 5 ms and logs it whenever it changes — an engine's state, say |
+| `VICTORY_CRASH_SAVE=<rva>:<len>,…` | Writes those title ranges (hex) to `crash-<rva>.bin` in the cache folder on a crash |
+| `VICTORY_KEYS=<second>:<key>,…` | *diagnostics.* Presses each key for 0.2 s at that second after input starts, focus or not. A key is a letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`. This is how the account picker gets answered without a person: cover the whole window, `VICTORY_KEYS=5:Enter,10:Enter,15:Enter,…` out to five minutes, because the picker can ask twice |
+| `VICTORY_AUDIO_CAPTURE=<file.wav>` | Records what the title plays, from our process only, as 48 kHz 16-bit stereo. It starts a child of the title to do the recording |
+| `VICTORY_XMA_DUMP=<dir>` | Saves the first 32 XMA voices' context and input |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
 
-## License
+### What a frame costs
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+These change what runs, not just what is logged. All are off by default unless
+the row says otherwise, and the base's README is where their measurements live
+(RTX 4070, in the world).
+
+| Variable | Effect |
+|---|---|
+| `VICTORY_PIPELINE_WAIT_MS=<n>` | The per-frame budget, over all threads, for waiting on background pipeline creation. Default 500 ms; a draw can be omitted until its pipeline is ready |
+| `VICTORY_LATE_WAIT=1\|2\|3` | Sends a queue's submissions without waiting for each, and settles them at the next point a title buffer, a fence or a present is observed. Off unless the value is exactly 1, 2 or 3, and forced off by `VICTORY_GPU_TIMING`, which has to wait for each list to time it |
+| `VICTORY_RELAY=<1\|2>` | A thread of its own lands finished flights as the card runs them, so the submitting thread never waits and copies back itself. `2` also waits only for the flights that declared a range, not for everything in the air |
+| `VICTORY_WIDE_BACK=1` | Takes a submission's shader-written snapshots together and compares everything declared after the card, cut into ~1 MiB pieces over a few threads, instead of range by range on one |
+| `VICTORY_CARD_BUFFERS=0` | Turns off card-side copies of large title buffers, which are on by default. `VICTORY_CARD_BUFFERS_MIN_MB` (16) is the smallest buffer that gets one and `VICTORY_CARD_BUFFERS_MB` (512) the most bytes spent on them |
+| `VICTORY_INPLACE=<1\|2>` | Opens the title's own memory as a graphics heap and places buffers over it, instead of copying. `1` covers private windows outside buffers, `2` title buffers too — and `2` must not be combined with late wait, since a flight's rules know shader writes only by declared ranges |
+| `VICTORY_BVH_BUILDER=1` | Lets the ray-tracing builder's stages run, which they do only while every builder pipeline the title created has a host pipeline. `VICTORY_BVH_QUARANTINE=1` also keeps the builder's stores out of title memory, for a first test. Nothing is lit by ray tracing yet |
+
+One session at a time is a rule of the work, not a switch: the title shares one
+GPU, one save folder and one shader cache, so two sessions at once is the one
+failure this project cannot recover from — it blacked the reference machine
+once. `translate`, `inspect`, `census`, `shader-info` and `lib-exports` are
+offline and take nothing.
+
+## Licence
+
+**GPL-3.0-or-later.** See [LICENSE](LICENSE).
+
+Everyone in the chain — upstream VIctory, fxceless/victory-gta6, and this fork —
+licenses under the same terms, and the merged history keeps each author's work
+identifiable by commit.
+
+Redistributing this, in source or as a binary, means: ship the complete
+corresponding source of the whole combined work under GPL-3.0-or-later, keep the
+licence text and the copyright notices, and add no further restriction on top of
+it. There is no warranty, and no game content is licensed here — the game stays
+the user's own copy, obtained by them, and none of it is distributed with this
+repository.
