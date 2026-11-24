@@ -937,7 +937,18 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then(|| (shadow.buffer.clone(), before))
+                if before != wanted {
+                    tracing::debug!(
+                        list = format_args!("{:#x}", self.list.as_raw() as usize),
+                        resource = format_args!("{:#x}", shadow.buffer.as_raw() as usize),
+                        before,
+                        wanted,
+                        "shadow state transition recorded"
+                    );
+                    Some((shadow.buffer.clone(), before))
+                } else {
+                    None
+                }
             }
         }
     }
@@ -951,16 +962,32 @@ impl HostList {
     ) {
         let mut states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let previous = states
+            .get(&key)
+            .map(|entry| entry.1);
         states
             .entry(key)
             .and_modify(|entry| entry.1 = state)
             .or_insert_with(|| (state, state, shadow.clone()));
+        tracing::debug!(
+            list = format_args!("{:#x}", self.list.as_raw() as usize),
+            resource = format_args!("{:#x}", shadow.buffer.as_raw() as usize),
+            previous,
+            state,
+            "shadow state set by helper"
+        );
     }
 
     /// Buffers decay to COMMON after a completed ExecuteCommandLists call.
     fn decay_shadows(&self) {
         let states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
-        for (_, (_, _, shadow)) in states.iter() {
+        for (_, (_, last, shadow)) in states.iter() {
+            tracing::debug!(
+                list = format_args!("{:#x}", self.list.as_raw() as usize),
+                resource = format_args!("{:#x}", shadow.buffer.as_raw() as usize),
+                last,
+                "shadow state decayed to COMMON"
+            );
             shadow.state.store(0, Ordering::Relaxed);
         }
     }
@@ -987,13 +1014,23 @@ impl HostList {
         let shadows = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
         barriers.extend(shadows.values().filter_map(|(first, last, shadow)| {
             let real = shadow.state.swap(*last, Ordering::Relaxed);
-            (real != *first).then(|| {
-                transition(
+            if real != *first {
+                tracing::debug!(
+                    list = format_args!("{:#x}", self.list.as_raw() as usize),
+                    resource = format_args!("{:#x}", shadow.buffer.as_raw() as usize),
+                    real,
+                    first,
+                    last,
+                    "shadow submission prelude transition"
+                );
+                Some(transition(
                     &shadow.buffer,
                     D3D12_RESOURCE_STATES(real as i32),
                     D3D12_RESOURCE_STATES(*first as i32),
-                )
-            })
+                ))
+            } else {
+                None
+            }
         }));
         if barriers.is_empty() {
             return None;
