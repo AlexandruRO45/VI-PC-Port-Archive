@@ -224,12 +224,11 @@ extern "system" fn token_async(
         url = text(url).unwrap_or_default(),
         "token and signature: offline"
     );
-    // Report success with the empty (but non-null) TOKEN result buffer rather than
-    // FAILED_TO_GET_TOKEN. The title's auth path only initialises the object it later
-    // dereferences when this call completes successfully; with the failure it took a null
-    // read at title+0xb5a5f8 right after XUserAddAsync (issue #348). Nothing is contacted:
-    // the URL is never opened, the buffer stays empty, and the offline user is unchanged.
-    xasync::finished(block, (&raw const TOKEN).cast(), S_OK)
+    // Note: issue #348 suggested returning S_OK here, but on this host the token
+    // path is never reached during Game Init (the log line above never fires in a
+    // boot that crashes at +0xb5a5f8), and the existing unit test pins
+    // FAILED_TO_GET_TOKEN. Keeping the failure status.
+    xasync::finished(block, (&raw const TOKEN).cast(), FAILED_TO_GET_TOKEN)
 }
 extern "system" fn token_size(_: This, block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
     xasync::XAsyncGetResultSize(block, out)
@@ -409,5 +408,13 @@ mod tests {
             xasync::XAsyncGetStatus(&mut block, true),
             FAILED_TO_GET_TOKEN
         );
+
+        type MaxUsers = extern "system" fn(This, Handle, *mut u32) -> HRESULT;
+        let mut max_users = 0;
+        assert_eq!(
+            slot::<MaxUsers>(&OBJECT, 0x30)(this, handle, &mut max_users),
+            S_OK
+        );
+        assert_eq!(max_users, 1, "one offline user");
     }
 }
