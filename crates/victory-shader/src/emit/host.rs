@@ -72,23 +72,21 @@ impl Host {
             let mut device: Option<ID3D12Device> = None;
             let factory: IDXGIFactory4 =
                 CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-            let software = if warp {
+            if warp {
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                let sw = adapter
-                    .cast::<IDXGIAdapter1>()
-                    .and_then(|a| a.GetDesc1())
-                    .is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-                sw
             } else {
-                let sw = factory
-                    .EnumAdapters1(0)
-                    .and_then(|a| a.GetDesc1())
-                    .is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-                sw
-            };
+            }
             let device = device.ok_or("no device")?;
+            let software = warp
+                || factory
+                    .EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid())
+                    .and_then(|a| a.GetDesc1())
+                    .is_ok_and(|d| {
+                        d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                            || (d.VendorId == 0x1414 && d.DeviceId == 0x008C)
+                    });
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
