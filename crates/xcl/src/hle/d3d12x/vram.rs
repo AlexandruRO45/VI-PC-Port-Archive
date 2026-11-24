@@ -28,6 +28,7 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 
 use windows::core::Interface;
+use windows::Win32::Foundation::E_INVALIDARG;
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::util::HRESULT;
@@ -226,6 +227,7 @@ struct Pages {
     /// signalled after each mapping; title queues wait for it before their next work
     fence: ID3D12Fence,
     value: u64,
+    pool_flags: D3D12_HEAP_FLAGS,
     pools: Vec<ID3D12Heap>,
     free: Vec<Tile>,
     /// tiles given back, reusable after `COOL`
@@ -249,6 +251,22 @@ unsafe impl Send for Pages {}
 /// device raw pointer → its pages (None inside: tiled tier < 2 on this device)
 static PAGES: Mutex<std::collections::BTreeMap<usize, Option<Pages>>> = Mutex::new(std::collections::BTreeMap::new());
 
+/// Prefer texture-only memory on hosts that accept it. Native runtimes can require the
+/// all-resource flag for a heap that backs both texture categories.
+fn create_page_pool<T>(
+    flags: &mut D3D12_HEAP_FLAGS,
+    mut create: impl FnMut(D3D12_HEAP_FLAGS) -> windows::core::Result<T>,
+) -> windows::core::Result<T> {
+    match create(*flags) {
+        Err(e) if *flags == D3D12_HEAP_FLAG_DENY_BUFFERS && e.code() == E_INVALIDARG => {
+            let heap = create(D3D12_HEAP_FLAG_NONE)?;
+            *flags = D3D12_HEAP_FLAG_NONE;
+            Ok(heap)
+        }
+        result => result,
+    }
+}
+
 impl Pages {
     unsafe fn new(dev: &ID3D12Device) -> Option<Pages> {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
@@ -265,6 +283,7 @@ impl Pages {
             queue,
             fence,
             value: 0,
+            pool_flags: D3D12_HEAP_FLAG_DENY_BUFFERS,
             pools: Vec::new(),
             free: Vec::new(),
             cooling: std::collections::VecDeque::new(),
@@ -288,20 +307,24 @@ impl Pages {
         if self.cooling.front().is_some_and(|(_, at)| at.elapsed() >= COOL) {
             return self.cooling.pop_front().map(|(t, _)| t);
         }
-        let desc = D3D12_HEAP_DESC {
-            SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
-            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
-            Alignment: 0,
-            // The pool maps every kind of texture. Excluding buffers lets the driver select
-            // memory types that support tiled textures even when they cannot back tiled buffers.
-            Flags: D3D12_HEAP_FLAG_DENY_BUFFERS,
-        };
-        let mut heap: Option<ID3D12Heap> = None;
-        if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
-            crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
-            return None;
+        let heap = create_page_pool(&mut self.pool_flags, |flags| {
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                Alignment: 0,
+                Flags: flags,
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap))?;
+            Ok(heap)
+        });
+        match heap {
+            Ok(heap) => self.pools.push(heap?),
+            Err(e) => {
+                crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
+                return None;
+            }
         }
-        self.pools.push(heap?);
         let h = self.pools.len() as u32 - 1;
         self.free.extend((1..POOL_PAGES).rev().map(|t| (h, t)));
         Some((h, 0))
@@ -721,7 +744,70 @@ mod tests {
     const MIB: usize = 1 << 20;
 
     #[test]
-    fn tiled_texture_pool_allows_both_texture_classes_and_denies_buffers() {
+    fn texture_page_pool_keeps_a_supported_texture_only_heap() {
+        let mut flags = D3D12_HEAP_FLAG_DENY_BUFFERS;
+        let mut attempts = Vec::new();
+        let heap = create_page_pool(&mut flags, |requested| {
+            attempts.push(requested);
+            Ok(7)
+        }).unwrap();
+        assert_eq!(heap, 7);
+        assert_eq!(attempts, [D3D12_HEAP_FLAG_DENY_BUFFERS]);
+        assert_eq!(flags, D3D12_HEAP_FLAG_DENY_BUFFERS);
+    }
+
+    #[test]
+    fn texture_page_pool_remembers_a_successful_all_resource_fallback() {
+        let mut flags = D3D12_HEAP_FLAG_DENY_BUFFERS;
+        let mut attempts = Vec::new();
+        let heap = create_page_pool(&mut flags, |requested| {
+            attempts.push(requested);
+            if requested == D3D12_HEAP_FLAG_DENY_BUFFERS {
+                Err(windows::core::Error::from_hresult(E_INVALIDARG))
+            } else {
+                Ok(7)
+            }
+        }).unwrap();
+        assert_eq!(heap, 7);
+        assert_eq!(attempts, [D3D12_HEAP_FLAG_DENY_BUFFERS, D3D12_HEAP_FLAG_NONE]);
+        assert_eq!(flags, D3D12_HEAP_FLAG_NONE);
+
+        attempts.clear();
+        create_page_pool(&mut flags, |requested| {
+            attempts.push(requested);
+            Ok(())
+        }).unwrap();
+        assert_eq!(attempts, [D3D12_HEAP_FLAG_NONE]);
+    }
+
+    #[test]
+    fn texture_page_pool_propagates_allocation_and_device_errors() {
+        use windows::Win32::Foundation::E_OUTOFMEMORY;
+        use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+
+        for code in [E_OUTOFMEMORY, DXGI_ERROR_DEVICE_REMOVED] {
+            let mut flags = D3D12_HEAP_FLAG_DENY_BUFFERS;
+            let mut attempts = Vec::new();
+            let error = create_page_pool(&mut flags, |requested| -> windows::core::Result<()> {
+                attempts.push(requested);
+                Err(windows::core::Error::from_hresult(code))
+            }).unwrap_err();
+            assert_eq!(error.code(), code);
+            assert_eq!(attempts, [D3D12_HEAP_FLAG_DENY_BUFFERS]);
+            assert_eq!(flags, D3D12_HEAP_FLAG_DENY_BUFFERS);
+        }
+
+        let mut flags = D3D12_HEAP_FLAG_DENY_BUFFERS;
+        let error = create_page_pool(&mut flags, |requested| -> windows::core::Result<()> {
+            let code = if requested == D3D12_HEAP_FLAG_DENY_BUFFERS { E_INVALIDARG } else { E_OUTOFMEMORY };
+            Err(windows::core::Error::from_hresult(code))
+        }).unwrap_err();
+        assert_eq!(error.code(), E_OUTOFMEMORY);
+        assert_eq!(flags, D3D12_HEAP_FLAG_DENY_BUFFERS);
+    }
+
+    #[test]
+    fn tiled_texture_pool_allows_both_texture_classes() {
         use crate::gpu::recomp::runner::skip_test;
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 
@@ -742,7 +828,8 @@ mod tests {
             let resource_flags = D3D12_HEAP_FLAG_DENY_BUFFERS
                 | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES
                 | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
-            assert_eq!(flags & resource_flags, D3D12_HEAP_FLAG_DENY_BUFFERS);
+            assert_eq!(flags & resource_flags, pages.pool_flags);
+            assert_eq!(flags & (D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES), D3D12_HEAP_FLAG_NONE);
         }
     }
 
