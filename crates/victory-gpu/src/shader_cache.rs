@@ -10,10 +10,10 @@
 //! are ignored anyway).
 //!
 //! A container this build cannot translate is cached too, as its error
-//! (marker, length, text: the length is what tells a cut-short entry from a
-//! shorter reason): translation depends only on the container and on what
-//! [`build`] hashes, so it would fail the same way again. Without that,
-//! every run translated the same few hundred refused programs again
+//! (marker, length, checksum, text: the length and checksum are what tell a
+//! damaged entry from a real one): translation depends only on the container
+//! and on what [`build`] hashes, so it would fail the same way again. Without
+//! that, every run translated the same few hundred refused programs again
 //! (seconds each for the large ones) while the title waited for them.
 
 use std::path::PathBuf;
@@ -120,9 +120,19 @@ fn cached(
         ran: AtomicBool::new(false),
     };
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
+        let path = match cache.get_or_convert(&converter, &input) {
+            Ok(path) => path,
+            Err(e) => {
+                // The cache is a convenience: a folder that cannot be
+                // written must not cost the reason a container is refused
+                // for. Answer from the translation itself.
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "shader cache entry not written; translating without it"
+                );
+                break;
+            }
+        };
         let entry = std::fs::read(&path)
             .ok()
             .and_then(|b| decode(&b).map(Ok).or_else(|| decode_failure(&b).map(Err)));
@@ -144,28 +154,37 @@ fn cached(
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
-/// The entry of a container that does not translate: this, then the text's
-/// length (little endian, 4 bytes), then the error's text (UTF-8).
-const FAILED: &[u8; 4] = b"VSF1";
-/// The bytes the payload's length takes, after [`FAILED`].
+/// A refusal's entry: this, then the text's length (little endian, 4 bytes),
+/// then a checksum of the text (4 bytes), then the error's text (UTF-8). The
+/// length tells a cut-short entry from a shorter error, and the checksum
+/// tells a changed byte in an entry of the right length: either is damage,
+/// and is translated again rather than served with a wrong reason.
+const FAILED: &[u8; 4] = b"VSF2";
+/// The bytes the payload's length and checksum take, after [`FAILED`].
 const LENGTH: usize = 4;
+const CHECK: usize = 4;
 
-/// A refusal's entry. The length is what tells a cut-short entry from a
-/// shorter error: text that is not exactly as long as it says is damage,
-/// and is translated again rather than served with a truncated reason.
+/// The first four bytes of the text's BLAKE3: enough to call a changed byte
+/// damage (this is not against an adversary, only against a torn write).
+fn checksum(text: &[u8]) -> [u8; 4] {
+    let h = blake3::hash(text);
+    h.as_bytes()[..CHECK].try_into().unwrap()
+}
+
 fn encode_failure(error: &str) -> Vec<u8> {
-    let mut entry = Vec::with_capacity(FAILED.len() + LENGTH + error.len());
+    let mut entry = Vec::with_capacity(FAILED.len() + LENGTH + CHECK + error.len());
     entry.extend_from_slice(FAILED);
     entry.extend_from_slice(&(error.len() as u32).to_le_bytes());
+    entry.extend_from_slice(&checksum(error.as_bytes()));
     entry.extend_from_slice(error.as_bytes());
     entry
 }
 
 fn decode_failure(bytes: &[u8]) -> Option<String> {
     let rest = bytes.strip_prefix(FAILED.as_slice())?;
-    let (length, text) = rest.split_at_checked(LENGTH)?;
-    let length = u32::from_le_bytes(length.try_into().ok()?) as usize;
-    if text.len() != length {
+    let (head, text) = rest.split_at_checked(LENGTH + CHECK)?;
+    let length = u32::from_le_bytes(head[..LENGTH].try_into().ok()?) as usize;
+    if text.len() != length || checksum(text) != head[LENGTH..] {
         return None;
     }
     String::from_utf8(text.to_vec()).ok()
@@ -425,6 +444,13 @@ mod tests {
         for n in [FAILED.len(), FAILED.len() + 4, full.len() - 1] {
             assert_eq!(decode_failure(&full[..n]), None, "cut to {n} bytes");
         }
+        // A byte changed in the text with the length left intact: damage,
+        // not an entry with a different (still valid) reason.
+        let mut flipped = full.clone();
+        let at = FAILED.len() + LENGTH + CHECK + 1;
+        assert!(flipped[at].is_ascii());
+        flipped[at] = if flipped[at] == b'a' { b'b' } else { b'a' };
+        assert_eq!(decode_failure(&flipped), None, "same length, changed byte");
         // Text that is not UTF-8, and a marker followed by text that is not
         // one (a shader entry's magic, say) are no entry either.
         assert_eq!(
@@ -432,6 +458,44 @@ mod tests {
             None
         );
         assert_eq!(decode_failure(b"VSH1a scalar memory read as data"), None);
+        // An entry of the previous layout (no checksum) is no entry: it is
+        // translated again rather than read with its text's first bytes as
+        // a checksum.
+        let old = [b"VSF1".as_slice(), &full[FAILED.len()..]].concat();
+        assert_eq!(decode_failure(&old), None);
+    }
+
+    /// A cache whose entry cannot be written (here: the entry's path is a
+    /// directory, so the rename onto it fails) must not turn a refusal into
+    /// an OS error: the reason is the answer, the cache is only a shortcut.
+    #[test]
+    fn a_cache_that_cannot_be_written_still_says_why() {
+        use victory_pipeline::CacheKey;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let container = b"a container that does not translate".as_slice();
+        let runs = AtomicU64::new(0);
+        let fail = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Err::<HostShader, _>("a scalar memory read as data".to_owned())
+        };
+        // Block the entry's own path with a directory before the first call.
+        let input = [&build[..], container].concat();
+        let key = CacheKey::new(
+            &Translate {
+                translate: fail,
+                ran: AtomicBool::new(false),
+            },
+            &input,
+        );
+        std::fs::create_dir_all(cache.path_for(&key)).unwrap();
+        assert_eq!(
+            cached(&cache, &build, container, fail),
+            Err("a scalar memory read as data".to_owned()),
+            "the reason, not the OS error"
+        );
+        assert!(runs.load(Ordering::Relaxed) >= 1);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
