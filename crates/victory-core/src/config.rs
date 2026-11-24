@@ -1603,6 +1603,52 @@ mod tests {
         );
     }
 
+    /// A literal `~` in a base variable (a quoted `Environment=` line, a
+    /// `.env` file or a Docker `ENV`, none of which expand it) is relative,
+    /// so it is skipped like any relative value: the defaults never become a
+    /// folder named `~` under the working directory. A trailing slash on a
+    /// base is harmless.
+    #[test]
+    fn a_literal_tilde_in_a_base_variable_is_skipped() {
+        let home = PathBuf::from(abs("home"));
+        let cfg = defaults(&[
+            ("LOCALAPPDATA", OsString::from("~/AppData/Local")),
+            ("XDG_CACHE_HOME", OsString::from("~/.cache")),
+            ("XDG_DATA_HOME", OsString::from("~")),
+            ("HOME", home.clone().into()),
+        ]);
+        assert_eq!(cfg.cache_dir, home.join(".cache").join("victory"));
+        assert_eq!(cfg.data_dir, home.join(".local/share").join("victory"));
+        for dir in [&cfg.cache_dir, &cfg.data_dir] {
+            assert!(dir.is_absolute(), "{}", dir.display());
+            assert!(
+                !dir.components().any(|c| c.as_os_str() == "~"),
+                "{}",
+                dir.display()
+            );
+        }
+
+        // `HOME=~` is no home either: with nothing else usable it is the
+        // usual error, not `./~/.cache/victory`.
+        let tilde_home = |k: &str| (k == "HOME").then(|| OsString::from("~"));
+        let err = default_dir(Kind::Cache, tilde_home)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("set VICTORY_CACHE_DIR and VICTORY_DATA_DIR"),
+            "{err}"
+        );
+        assert!(default_dir(Kind::Data, tilde_home).is_err());
+
+        let mut slash = abs("xc");
+        slash.push(std::path::MAIN_SEPARATOR_STR);
+        let trailing = |k: &str| (k == "XDG_CACHE_HOME").then(|| slash.clone());
+        assert_eq!(
+            default_dir(Kind::Cache, trailing).unwrap(),
+            PathBuf::from(abs("xc")).join("victory")
+        );
+    }
+
     #[test]
     fn a_tilde_with_extra_slashes_is_still_home() {
         // `~/` and `~//x` are what a trailing slash or a doubled separator
