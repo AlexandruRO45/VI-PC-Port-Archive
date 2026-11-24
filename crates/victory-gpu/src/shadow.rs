@@ -507,11 +507,11 @@ impl Shadow {
         // runs of pages still to look at, as byte ranges cut to [from, to)
         let mut runs: Vec<(usize, usize)> = Vec::new();
         {
-            let checked = lock_map(&MIRROR_CHECKED);
+            let tables = mirror_pages();
             for page in first..=last {
                 let (a, b) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
                 let whole = a == page * PAGE && b == (page + 1) * PAGE;
-                if whole && checked.get(&page) == Some(&sub) {
+                if whole && tables.get(page).0 == sub {
                     continue;
                 }
                 match runs.last_mut() {
@@ -531,12 +531,12 @@ impl Shadow {
     fn update_run(&self, from: usize, to: usize, sub: u64) -> usize {
         let whole_pages = || (from.div_ceil(PAGE)..to / PAGE);
         let mark = |copied_at: Option<u64>| {
-            let mut checked = lock_map(&MIRROR_CHECKED);
-            let mut copied = lock_map(&MIRROR_COPIED);
+            let mut tables = mirror_pages();
             for page in whole_pages() {
-                checked.insert(page, sub);
+                let e = tables.at(page);
+                e.0 = sub;
                 if let Some(now) = copied_at {
-                    copied.insert(page, now);
+                    e.1 = now;
                 }
             }
         };
@@ -546,7 +546,7 @@ impl Shadow {
             self.watched.store(1, Ordering::Relaxed);
             // pages written after their last copy (or never copied), as runs
             let stale: Vec<usize> = {
-                let copied = lock_map(&MIRROR_COPIED);
+                let tables = mirror_pages();
                 let mut writes = written.iter().peekable();
                 let mut out = Vec::new();
                 for page in from / PAGE..=(to - 1) / PAGE {
@@ -557,7 +557,7 @@ impl Shadow {
                         }
                         _ => 0,
                     };
-                    let at = copied.get(&page).copied().unwrap_or(0);
+                    let at = tables.get(page).1;
                     if at == 0 || write > at {
                         out.push(page);
                     }
@@ -636,8 +636,63 @@ fn changed_pieces(shadow: &Shadow, before: usize, start: usize, from: usize, to:
 /// page) the submission that last checked it whole and the write-watch asking it was last
 /// copied after (see `Shadow::update_mirrored`).
 static SUBMISSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-static MIRROR_CHECKED: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
-static MIRROR_COPIED: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
+/// (the two per-page numbers live in one flat table, `MIRROR_PAGES`)
+///
+/// Local build: a two-level table, 4,096 pages (256 MB of title memory) per chunk, of
+/// `(checked, copied)` per page. They were two `HashMap`s: ~85,000 lookups and inserts a frame.
+struct PageTable {
+    /// Indexed by chunk; the mirror covers 2M pages (512 chunks), so this stays small.
+    chunks: Vec<Option<Box<[(u64, u64); PAGE_CHUNK]>>>,
+}
+const PAGE_CHUNK: usize = 4096;
+
+impl PageTable {
+    fn get(&self, page: usize) -> (u64, u64) {
+        match self.chunks.get(page / PAGE_CHUNK) {
+            Some(Some(c)) => c[page % PAGE_CHUNK],
+            _ => (0, 0),
+        }
+    }
+    fn at(&mut self, page: usize) -> &mut (u64, u64) {
+        let k = page / PAGE_CHUNK;
+        if self.chunks.len() <= k {
+            self.chunks.resize_with(k + 1, || None);
+        }
+        let c = self.chunks[k].get_or_insert_with(|| Box::new([(0, 0); PAGE_CHUNK]));
+        &mut c[page % PAGE_CHUNK]
+    }
+    /// Forgets pages `[first, last]` (what is not in the table is already forgotten).
+    fn forget(&mut self, first: usize, last: usize) {
+        let hi = (last / PAGE_CHUNK).min(self.chunks.len().saturating_sub(1));
+        for k in first / PAGE_CHUNK..=hi {
+            if let Some(Some(c)) = self.chunks.get_mut(k) {
+                for page in (k * PAGE_CHUNK).max(first)..=((k + 1) * PAGE_CHUNK - 1).min(last) {
+                    c[page % PAGE_CHUNK] = (0, 0);
+                }
+            }
+        }
+    }
+}
+
+static MIRROR_PAGES: Mutex<Option<PageTable>> = Mutex::new(None);
+
+struct PagesLock(std::sync::MutexGuard<'static, Option<PageTable>>);
+impl std::ops::Deref for PagesLock {
+    type Target = PageTable;
+    fn deref(&self) -> &PageTable {
+        self.0.as_ref().expect("made")
+    }
+}
+impl std::ops::DerefMut for PagesLock {
+    fn deref_mut(&mut self) -> &mut PageTable {
+        self.0.as_mut().expect("made")
+    }
+}
+fn mirror_pages() -> PagesLock {
+    let mut g = MIRROR_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(|| PageTable { chunks: Vec::new() });
+    PagesLock(g)
+}
 
 /// Local build: brings title memory `[from, to)` up to date in the mirror's pages, for every
 /// copy covering it at once (`host`'s batch merges the copies' refreshes into such ranges).
@@ -666,34 +721,8 @@ pub(crate) fn next_submission() {
 
 /// Local build: title memory mapped anew: its pages are stale for every copy.
 pub(crate) fn mirror_pages_remapped(at: usize, len: usize) {
-    let (first, last) = (at / PAGE, (at + len.max(1) - 1) / PAGE);
-    // (always CHECKED before COPIED, as `update_run` takes them)
-    let mut checked = lock_map(&MIRROR_CHECKED);
-    let mut copied = lock_map(&MIRROR_COPIED);
-    for page in first..=last {
-        copied.remove(&page);
-        checked.remove(&page);
-    }
-}
-
-struct MapGuard<'a>(std::sync::MutexGuard<'a, Option<std::collections::HashMap<usize, u64>>>);
-impl std::ops::Deref for MapGuard<'_> {
-    type Target = std::collections::HashMap<usize, u64>;
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref().expect("made")
-    }
-}
-impl std::ops::DerefMut for MapGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_mut().expect("made")
-    }
-}
-fn lock_map(m: &'static Mutex<Option<std::collections::HashMap<usize, u64>>>) -> MapGuard<'static> {
-    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
-    if g.is_none() {
-        *g = Some(std::collections::HashMap::new());
-    }
-    MapGuard(g)
+    let (first, last) = (at / PAGE, at.saturating_add(len.max(1) - 1) / PAGE);
+    mirror_pages().forget(first, last);
 }
 
 struct Entry {
@@ -913,4 +942,62 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_table_remembers_and_forgets() {
+        let mut t = PageTable { chunks: Vec::new() };
+        assert_eq!(t.get(5), (0, 0));
+        *t.at(5) = (3, 4);
+        *t.at(9000) = (7, 8);
+        assert_eq!((t.get(5), t.get(9000), t.get(6)), ((3, 4), (7, 8), (0, 0)));
+        t.forget(0, 100);
+        assert_eq!((t.get(5), t.get(9000)), ((0, 0), (7, 8)));
+        t.forget(8000, usize::MAX / PAGE);
+        assert_eq!(t.get(9000), (0, 0));
+    }
+
+    /// The world's per-frame table traffic (~85,000 lookups and inserts): flat table against the
+    /// maps it replaced. `cargo test -p victory-gpu --lib page_table_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn page_table_cost() {
+        let pages: Vec<usize> = (0..2800).map(|i| 0x10000 + i).collect();
+        let t = std::time::Instant::now();
+        let mut a = std::collections::HashMap::new();
+        let mut b = std::collections::HashMap::new();
+        let mut n = 0u64;
+        for sub in 1..=15u64 {
+            for _ in 0..2 {
+                for p in &pages {
+                    n += u64::from(a.get(p) == Some(&sub));
+                    b.get(p);
+                }
+            }
+            for p in &pages {
+                a.insert(*p, sub);
+                b.insert(*p, sub);
+            }
+        }
+        let maps = t.elapsed();
+        let t = std::time::Instant::now();
+        let mut f = PageTable { chunks: Vec::new() };
+        for sub in 1..=15u64 {
+            for _ in 0..2 {
+                for p in &pages {
+                    n += u64::from(f.get(*p).0 == sub);
+                    f.get(*p);
+                }
+            }
+            for p in &pages {
+                let e = f.at(*p);
+                *e = (sub, sub);
+            }
+        }
+        eprintln!("page tables: hash maps {maps:?}, flat {:?} ({n})", t.elapsed());
+    }
 }

@@ -1614,7 +1614,7 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        batch.defer_texture(staging);
                     }
                     continue;
                 }
@@ -1638,6 +1638,15 @@ struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Local build: textures due, brought up to date together at the next flush, on the pool
+    /// (hashing and detiling a world frame's ~100 MB of them one after the other took ~50 ms).
+    textures_due: Vec<std::sync::Arc<crate::texture::Staging>>,
+}
+
+/// `VICTORY_TEX_PARALLEL=0`: textures are refreshed one by one as their steps come.
+fn texture_parallel() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TEX_PARALLEL").map_or(true, |v| v.trim() != "0"))
 }
 
 impl Batch {
@@ -1659,6 +1668,14 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
+    fn defer_texture(&mut self, staging: &std::sync::Arc<crate::texture::Staging>) {
+        if texture_parallel() {
+            self.textures_due.push(staging.clone());
+        } else {
+            staging.refresh();
+        }
+    }
+
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
@@ -1671,6 +1688,13 @@ impl Batch {
         // so the updates are independent and safe to run concurrently on the
         // persistent pool. For small counts (≤ 1) the pool fast-paths to the
         // calling thread to avoid lock overhead.
+        let due = std::mem::take(&mut self.textures_due);
+        if !due.is_empty() {
+            pool().scope(&due, |staging| -> bool {
+                staging.refresh();
+                true
+            });
+        }
         let all: Vec<_> = self.refreshes.drain(..).collect();
         // Local build: copies in the mirror share their pages: their refreshes are merged into
         // ranges of title memory, each checked and copied once (the world asked ~10,000
