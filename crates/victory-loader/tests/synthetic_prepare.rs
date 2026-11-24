@@ -1336,3 +1336,97 @@ fn a_relocation_table_that_runs_into_zero_fill_stops_there() {
     rebase(&mut mapped, delta);
     assert_eq!(layout::read_u64(&mapped, file(callbacks_field())), Some(0));
 }
+
+#[test]
+fn delay_imports_and_exports_are_left_for_the_title() {
+    // Free space in the section, past the relocations.
+    const DELAY: u32 = 0x1340; // one descriptor, then the null terminator
+    const DELAY_INT: u32 = 0x1380;
+    const DELAY_IAT: u32 = 0x1390;
+    const DELAY_DLL: u32 = 0x13A0;
+    const DELAY_HINT_NAME: u32 = 0x13B0;
+    const EXPORTS: u32 = 0x1210;
+    const EXPORTS_END: u32 = 0x1270;
+    const DIR_EXPORT: usize = 0;
+    const DIR_DELAY_IMPORT: usize = 13;
+    let mut original = image();
+
+    // Delay-loads USER32.dll!MessageBoxW (hint 9) with an RVA-based descriptor.
+    set_dir(&mut original, DIR_DELAY_IMPORT, DELAY, 64);
+    put32(&mut original, file(DELAY), 1); // attributes: RVA based
+    put32(&mut original, file(DELAY) + 4, DELAY_DLL);
+    put32(&mut original, file(DELAY) + 12, DELAY_IAT);
+    put32(&mut original, file(DELAY) + 16, DELAY_INT);
+    put64(&mut original, file(DELAY_INT), u64::from(DELAY_HINT_NAME));
+    put(&mut original, file(DELAY_DLL), b"USER32.dll\0");
+    put16(&mut original, file(DELAY_HINT_NAME), 9);
+    put(&mut original, file(DELAY_HINT_NAME) + 2, b"MessageBoxW\0");
+
+    // Exports ordinal 1 `Tick` at the code.
+    let (addresses, names, ordinals, dll, tick) = (0x1240, 0x1244, 0x1248, 0x1250, 0x1260);
+    set_dir(&mut original, DIR_EXPORT, EXPORTS, EXPORTS_END - EXPORTS);
+    put32(&mut original, file(EXPORTS) + 12, dll);
+    put32(&mut original, file(EXPORTS) + 16, 1); // ordinal base
+    put32(&mut original, file(EXPORTS) + 20, 1); // functions
+    put32(&mut original, file(EXPORTS) + 24, 1); // names
+    put32(&mut original, file(EXPORTS) + 28, addresses);
+    put32(&mut original, file(EXPORTS) + 32, names);
+    put32(&mut original, file(EXPORTS) + 36, ordinals);
+    put32(&mut original, file(addresses), CODE);
+    put32(&mut original, file(names), tick);
+    put16(&mut original, file(ordinals), 0);
+    put(&mut original, file(dll), b"t.exe\0");
+    put(&mut original, file(tick), b"Tick\0");
+
+    let prepared = prepare(&original).unwrap();
+    let patched = ImageInfo::parse(&prepared.bytes).unwrap();
+    // The delay-load stubs bind their own slots, so the copy keeps them.
+    for info in [&prepared.info, &patched] {
+        assert_eq!(info.delay_imports.len(), 1);
+        let user32 = &info.delay_imports[0];
+        assert_eq!(user32.dll, "USER32.dll");
+        assert_eq!(user32.entries.len(), 1);
+        assert_eq!(user32.entries[0].iat_slot_rva, DELAY_IAT);
+        assert_eq!(
+            user32.entries[0].symbol,
+            victory_pe::ImportSymbol::Name {
+                hint: 9,
+                name: "MessageBoxW".into()
+            }
+        );
+        assert_eq!(info.exports.len(), 1);
+        let export = &info.exports[0];
+        assert_eq!(
+            (export.name.as_deref(), export.ordinal, export.rva),
+            (Some("Tick"), 1, Some(CODE))
+        );
+    }
+    // Only the ordinary imports are unhooked.
+    assert!(patched.imports.is_empty());
+    assert_eq!(prepared.info.import_count(), 2);
+
+    let expected = expected_changes();
+    let unexpected: Vec<usize> = (0..original.len())
+        .filter(|&i| original[i] != prepared.bytes[i])
+        .filter(|i| !expected.iter().any(|r| r.contains(i)))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "unexpected bytes changed: {unexpected:#x?}"
+    );
+}
+
+#[test]
+fn builds_that_differ_only_in_their_checksum_prepare_to_the_same_bytes_under_different_names() {
+    let first = image();
+    let mut second = image();
+    put32(&mut second, OPT + layout::OPT_CHECKSUM, CHECKSUM + 1);
+    let (a, b) = (prepare(&first).unwrap(), prepare(&second).unwrap());
+    // The checksum is zeroed, so the copies are byte for byte the same...
+    assert_eq!(a.bytes, b.bytes);
+    // ...but each is still named after the build it came from.
+    assert_ne!(a.original_hash, b.original_hash);
+    assert_eq!(a.original_hash, blake3::hash(&first));
+    assert_eq!(b.original_hash, blake3::hash(&second));
+    assert_ne!(a.file_name(), b.file_name());
+}
