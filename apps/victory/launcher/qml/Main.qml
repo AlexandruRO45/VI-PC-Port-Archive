@@ -20,194 +20,9 @@ ApplicationWindow {
     readonly property color surface: "#15171b"
     readonly property color edge: "#2a2d32"
 
-    RowLayout {
+    ColumnLayout {
         anchors.fill: parent
         spacing: 0
-
-        Rectangle {
-            id: sidebar
-            Layout.preferredWidth: 232
-            Layout.fillHeight: true
-            color: "#101215"
-            border.color: "#24272b"
-            border.width: 1
-
-            ColumnLayout {
-                anchors.fill: parent
-                anchors.leftMargin: 18
-                anchors.rightMargin: 18
-                anchors.topMargin: 24
-                anchors.bottomMargin: 18
-                spacing: 0
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    Layout.bottomMargin: 22
-                    spacing: 12
-                    Rectangle {
-                        Layout.preferredWidth: 44
-                        Layout.preferredHeight: 44
-                        radius: 11
-                        color: "#282026"
-                        border.color: "#4b3039"
-                        Text {
-                            anchors.centerIn: parent
-                            text: "VI"
-                            color: "#f0d7c6"
-                            font.family: "Georgia"
-                            font.pixelSize: 19
-                            font.weight: Font.DemiBold
-                        }
-                    }
-                    ColumnLayout {
-                        Layout.fillWidth: true
-                        spacing: 2
-                        Text {
-                            text: "VICTORY"
-                            color: window.paper
-                            font.pixelSize: 14
-                            font.weight: Font.Bold
-                            font.letterSpacing: 1.7
-                        }
-                        Text {
-                            text: "ROCKSTAR COLLECTION"
-                            color: "#8c8984"
-                            font.pixelSize: 9
-                            font.weight: Font.DemiBold
-                            font.letterSpacing: 1.1
-                        }
-                    }
-                }
-
-                Rectangle { Layout.fillWidth: true; height: 1; color: "#292b2f" }
-                Text {
-                    Layout.topMargin: 22
-                    Layout.leftMargin: 10
-                    Layout.bottomMargin: 10
-                    text: "WORKSPACE"
-                    color: "#6f7276"
-                    font.pixelSize: 10
-                    font.weight: Font.Bold
-                    font.letterSpacing: 1.7
-                }
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: 5
-                    Repeater {
-                        model: [
-                            { label: "Game library", glyph: "▦", page: 0 },
-                            { label: "Launch activity", glyph: "◷", page: 1 },
-                            { label: "Settings", glyph: "⚙", page: 2 }
-                        ]
-                        delegate: Rectangle {
-                            required property var modelData
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: 46
-                            radius: 8
-                            color: window.pageIndex === modelData.page ? "#282025" : navMouse.containsMouse ? "#1a1d21" : "transparent"
-                            border.color: window.pageIndex === modelData.page ? "#49313b" : "transparent"
-                            RowLayout {
-                                anchors.fill: parent
-                                anchors.leftMargin: 12
-                                anchors.rightMargin: 12
-                                spacing: 12
-                                Rectangle {
-                                    Layout.preferredWidth: 28
-                                    Layout.preferredHeight: 28
-                                    radius: 7
-                                    color: window.pageIndex === modelData.page ? "#51313b" : "transparent"
-                                    Text {
-                                        anchors.centerIn: parent
-                                        text: modelData.glyph
-                                        color: window.pageIndex === modelData.page ? "#f0c6bb" : "#8b8e91"
-                                        font.pixelSize: 15
-                                    }
-                                }
-                                Text {
-                                    Layout.fillWidth: true
-                                    text: modelData.label
-                                    color: window.pageIndex === modelData.page ? "#f1e8e3" : "#a5a7a8"
-                                    font.pixelSize: 13
-                                    font.weight: window.pageIndex === modelData.page ? Font.DemiBold : Font.Normal
-                                }
-                                Rectangle {
-                                    visible: window.pageIndex === modelData.page
-                                    width: 5
-                                    height: 5
-                                    radius: 3
-                                    color: window.accent
-                                }
-                            }
-                            MouseArea {
-                                id: navMouse
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: window.pageIndex = modelData.page
-                            }
-                        }
-                    }
-                }
-
-                Item { Layout.fillHeight: true }
-
-                Rectangle {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 104
-                    radius: 10
-                    color: "#17191d"
-                    border.color: "#2d3035"
-                    ColumnLayout {
-                        anchors.fill: parent
-                        anchors.margins: 13
-                        spacing: 8
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Text {
-                                text: "ACTIVE PROFILE"
-                                color: "#85888c"
-                                font.pixelSize: 9
-                                font.weight: Font.Bold
-                                font.letterSpacing: 1.2
-                            }
-                            Item { Layout.fillWidth: true }
-                            Rectangle {
-                                width: 6
-                                height: 6
-                                radius: 3
-                                color: launcher.gameExists ? "#80bc8d" : "#d6a276"
-                            }
-                        }
-                        Text {
-                            text: launcher.consoleModel
-                            color: window.paper
-                            font.family: "Georgia"
-                            font.pixelSize: 18
-                        }
-                        Text {
-                            text: launcher.gameExists ? "GTA VI ready to launch" : "Choose your game files"
-                            color: window.muted
-                            font.pixelSize: 10
-                        }
-                    }
-                    MouseArea {
-                        anchors.fill: parent
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: window.pageIndex = 2
-                    }
-                }
-
-                Text {
-                    Layout.topMargin: 17
-                    Layout.leftMargin: 3
-                    text: "VICTORY FOR WINDOWS   ·   0.1"
-                    color: "#65686b"
-                    font.pixelSize: 9
-                    font.weight: Font.DemiBold
-                    font.letterSpacing: 0.6
-                }
-            }
-        }
 
         ColumnLayout {
             id: workspace
@@ -217,28 +32,89 @@ ApplicationWindow {
 
             Rectangle {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 68
+                Layout.preferredHeight: 70
                 color: "#0f1114"
                 border.color: "#25282c"
                 border.width: 1
                 RowLayout {
                     anchors.fill: parent
-                    anchors.leftMargin: 28
-                    anchors.rightMargin: 26
-                    spacing: 16
-                    ColumnLayout {
-                        spacing: 2
-                        Text {
-                            text: window.pageIndex === 0 ? "LIBRARY   /   GRAND THEFT AUTO VI" : window.pageIndex === 1 ? "LIBRARY   /   ACTIVITY" : "LIBRARY   /   SETTINGS"
-                            color: "#e5e0d9"
-                            font.pixelSize: 11
-                            font.weight: Font.Bold
-                            font.letterSpacing: 1.35
+                    anchors.leftMargin: 24
+                    anchors.rightMargin: 24
+                    spacing: 14
+                    RowLayout {
+                        Layout.preferredWidth: 190
+                        spacing: 10
+                        Rectangle {
+                            width: 36
+                            height: 36
+                            radius: 9
+                            color: "#282026"
+                            border.color: "#4b3039"
+                            Text {
+                                anchors.centerIn: parent
+                                text: "VI"
+                                color: "#f0d7c6"
+                                font.family: "Georgia"
+                                font.pixelSize: 16
+                            }
                         }
-                        Text {
-                            text: window.pageIndex === 0 ? "Vice City · State of Leonida" : window.pageIndex === 1 ? "Your recent sessions" : "Launcher preferences"
-                            color: "#777b7e"
-                            font.pixelSize: 10
+                        ColumnLayout {
+                            spacing: 1
+                            Text {
+                                text: "VICTORY"
+                                color: window.paper
+                                font.pixelSize: 12
+                                font.weight: Font.Bold
+                                font.letterSpacing: 1.5
+                            }
+                            Text {
+                                text: "ROCKSTAR COLLECTION"
+                                color: "#777b7e"
+                                font.pixelSize: 8
+                                font.weight: Font.DemiBold
+                                font.letterSpacing: 0.7
+                            }
+                        }
+                    }
+                    Rectangle { width: 1; height: 30; color: "#303338" }
+                    RowLayout {
+                        spacing: 5
+                        Repeater {
+                            model: [
+                                { label: "Library", page: 0 },
+                                { label: "Activity", page: 1 },
+                                { label: "Settings", page: 2 }
+                            ]
+                            delegate: Rectangle {
+                                required property var modelData
+                                Layout.preferredWidth: 94
+                                Layout.preferredHeight: 40
+                                radius: 7
+                                color: window.pageIndex === modelData.page ? "#242025" : topNavMouse.containsMouse ? "#191b1f" : "transparent"
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: modelData.label
+                                    color: window.pageIndex === modelData.page ? "#f0e6e0" : "#a0a2a4"
+                                    font.pixelSize: 12
+                                    font.weight: window.pageIndex === modelData.page ? Font.DemiBold : Font.Normal
+                                }
+                                Rectangle {
+                                    visible: window.pageIndex === modelData.page
+                                    width: 24
+                                    height: 2
+                                    radius: 1
+                                    color: window.accent
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    anchors.bottom: parent.bottom
+                                }
+                                MouseArea {
+                                    id: topNavMouse
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: window.pageIndex = modelData.page
+                                }
+                            }
                         }
                     }
                     Item { Layout.fillWidth: true }
