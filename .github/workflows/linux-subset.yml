@@ -34,14 +34,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # Nothing here pushes; keep the token out of .git/config.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # rustup is preinstalled; this installs the toolchain pinned in
       # rust-toolchain.toml (with clippy and rustfmt).
       - name: Install pinned toolchain
         run: rustup toolchain install
 
+      # Save the cache only from main: PR runs restore it but do not write
+      # their own entries, which would evict main's from the 10 GB quota.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Asset policy
         run: cargo xtask policy
@@ -57,9 +64,10 @@ jobs:
       # The skipped tests parse the test executable itself as a PE image, which
       # is an ELF on Linux. They still run on Windows. Once the workspace's
       # Linux gates land they are cfg(windows) and these --skip flags are no-ops.
+      # --no-fail-fast: report failures from every test binary, not the first.
       - name: cargo test
         run: >
-          cargo test --locked $LINUX_CRATES -p victory-shader
+          cargo test --locked --no-fail-fast $LINUX_CRATES -p victory-shader
           -- --exact
           --skip image::tests::parses_own_test_binary
           --skip image::tests::rva_to_file_offset_maps_entry_point
@@ -82,7 +90,10 @@ jobs:
       # implementation; nothing is linked here, so the choice has no effect.
       CARGO_FEATURE_PURE: "1"
     steps:
+      # Nothing here pushes; keep the token out of .git/config.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # rust-toolchain.toml already lists the x86_64-pc-windows-msvc target.
       - name: Install pinned toolchain
@@ -91,6 +102,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: windows-target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo check (workspace, all targets)
         run: cargo check --locked --workspace --all-targets --target x86_64-pc-windows-msvc
