@@ -590,8 +590,17 @@ impl State {
                     Some((a, s)) => {
                         let base = unsafe { s.buffer.GetGPUVirtualAddress() };
                         let offset = s.gpu(*a) - base;
-                        if offset.is_multiple_of(16) {
-                            let len = s.left(*a).min(ROOT_UAV_BYTES);
+                        // shortcut: a raw host view has to start on 16
+                        // bytes, but the console's UAV descriptor may point
+                        // at any dword: a view further in is dropped, and a
+                        // shader reading what it wrote sees the old bytes.
+                        // The view never runs past the buffer it names.
+                        let size = unsafe { s.buffer.GetDesc() }.Width;
+                        let len = s
+                            .left(*a)
+                            .min(ROOT_UAV_BYTES)
+                            .min(size.saturating_sub(offset));
+                        if offset.is_multiple_of(16) && len > 0 {
                             host.raw_uav_at(index, &s.buffer, offset, len);
                         } else {
                             once!(
