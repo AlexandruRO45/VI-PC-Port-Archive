@@ -3373,4 +3373,143 @@ mod tests {
             assert_eq!(found[1].span().end, file.len(), "{what}");
         }
     }
+
+    #[test]
+    fn incomplete_literal_length_code_is_noise_but_a_lone_one_bit_code_is_a_stream() {
+        // A dynamic block's literal/length code must be complete: lengths
+        // that leave some codes unassigned (`A` in 1 bit and the end of the
+        // block in 2, or three codes of 2 bits) break the stream, though
+        // every symbol the data sends has a code. The one exception is a
+        // lone code of 1 bit, the other half unassigned: a block holding
+        // only the end of the block that way is a stream of no bytes. Such a
+        // broken record covers no other, so it is yielded and does not
+        // unpack, and the record after it is found either way.
+        let a = u32::from(b'A');
+        let b = u32::from(b'B');
+        // Code-length code: 18 in 1 bit, 0 in 2, 1 and 2 in 3.
+        let mut clen = [0; 19];
+        (clen[18], clen[0], clen[1], clen[2]) = (1, 2, 3, 3);
+        let block = |codes: &[(u32, u32)], data: &[u32]| {
+            // 257 literal/length codes, one distance code of length 0.
+            let mut lengths = vec![0; 258];
+            for &(sym, len) in codes {
+                lengths[sym as usize] = len;
+            }
+            dynamic_block(&clen, &length_symbols(&lengths), &lengths[..257], data)
+        };
+        let aaaa = [a, a, a, a, 256];
+        for (what, packed, want, valid) in [
+            (
+                "complete: A and end in 1 bit",
+                block(&[(a, 1), (256, 1)], &aaaa),
+                &b"AAAA"[..],
+                true,
+            ),
+            (
+                "A in 1 bit, end in 2",
+                block(&[(a, 1), (256, 2)], &aaaa),
+                b"AAAA",
+                false,
+            ),
+            (
+                "three 2-bit codes",
+                block(&[(a, 2), (b, 2), (256, 2)], &aaaa),
+                b"AAAA",
+                false,
+            ),
+            (
+                "lone 1-bit end of block",
+                block(&[(256, 1)], &[256]),
+                b"",
+                true,
+            ),
+            (
+                "lone 2-bit end of block",
+                block(&[(256, 2)], &[256]),
+                b"",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                miniz_oxide::inflate::decompress_to_vec(&packed)
+                    .ok()
+                    .as_deref(),
+                valid.then_some(want),
+                "{what}"
+            );
+            assert_eq!(starts_stream(&packed, want.len()), valid, "{what}");
+
+            let (file, marker) = outer_then_after(&packed, want.len());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            assert_eq!(
+                found[0].unpack().as_deref(),
+                valid.then_some(want),
+                "{what}"
+            );
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "{what}");
+        }
+    }
+
+    /// One final fixed-code block: the literal `A`, then a copy coded by
+    /// length symbol 284 (227 bytes and up, 5 extra bits) with `extra` as
+    /// its extra bits, from 1 byte back, then the end of the block.
+    fn literal_then_copy_284(extra: u32) -> Vec<u8> {
+        let mut bits = Bits::default();
+        bits.put(1, 1); // BFINAL
+        bits.put(1, 2); // fixed codes
+        bits.code(0x30 + u32::from(b'A'), 8); // literals 0-143: 8 bits from 0x30
+        bits.code(0xC0 + 284 - 280, 8); // 280-287: 8 bits from 0xC0
+        bits.put(extra, 5);
+        bits.code(0, 5); // distance code 0: 1 back
+        bits.code(0, 7); // end of block (256)
+        bits.out
+    }
+
+    #[test]
+    fn length_284_with_every_extra_bit_set_is_a_258_byte_copy() {
+        // Length symbol 284 states 227 to 258 bytes by its 5 extra bits;
+        // deflate writers send 258 as symbol 285 instead, but 284 with all
+        // extra bits set states 258 too, and inflaters take it as that
+        // copy, unlike symbols 286 and 287, which mean nothing. Such a
+        // record is a stream at every extra value, unpacks, and covers no
+        // other; the record after it is found.
+        for extra in [0, 1, 30, 31] {
+            let what = format!("extra {extra}");
+            let packed = literal_then_copy_284(extra);
+            let want = vec![b'A'; 1 + 227 + extra as usize];
+            assert_eq!(
+                miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                Some(want.clone()),
+                "{what}"
+            );
+            assert!(starts_stream(&packed, want.len()), "{what}");
+            assert!(!starts_stream(&packed, want.len() + 1), "{what}");
+
+            let (file, marker) = outer_then_after(&packed, want.len());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            assert_eq!(found[0].unpack(), Some(want), "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "{what}");
+        }
+        // 284 with every extra bit set and 285 make the same container.
+        assert_eq!(
+            miniz_oxide::inflate::decompress_to_vec(&literal_then_copy_284(31)).ok(),
+            miniz_oxide::inflate::decompress_to_vec(&literal_then_coded_copy(285, 0)).ok()
+        );
+    }
 }
