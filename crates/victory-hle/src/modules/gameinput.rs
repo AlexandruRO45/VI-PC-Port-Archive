@@ -1318,15 +1318,31 @@ mod host {
                         return None;
                     }
                     let sym = |name: PCSTR| GetProcAddress(module, name);
+                    type FarProc = unsafe extern "system" fn() -> isize;
                     Some(Combase {
-                        ro_init: std::mem::transmute(sym(c"RoInitialize".as_ptr().cast())?),
-                        ro_uninit: std::mem::transmute(sym(c"RoUninitialize".as_ptr().cast())?),
-                        create_string_ref: std::mem::transmute(sym(
-                            c"WindowsCreateStringReference".as_ptr().cast(),
-                        )?),
-                        get_factory: std::mem::transmute(sym(
-                            c"RoGetActivationFactory".as_ptr().cast(),
-                        )?),
+                        ro_init: std::mem::transmute::<FarProc, unsafe extern "system" fn(i32) -> HRESULT>(
+                            sym(c"RoInitialize".as_ptr().cast())?,
+                        ),
+                        ro_uninit: std::mem::transmute::<FarProc, unsafe extern "system" fn()>(
+                            sym(c"RoUninitialize".as_ptr().cast())?,
+                        ),
+                        create_string_ref: std::mem::transmute::<
+                            FarProc,
+                            unsafe extern "system" fn(
+                                *const u16,
+                                u32,
+                                *mut HStringHeader,
+                                *mut *mut c_void,
+                            ) -> HRESULT,
+                        >(sym(c"WindowsCreateStringReference".as_ptr().cast())?),
+                        get_factory: std::mem::transmute::<
+                            FarProc,
+                            unsafe extern "system" fn(
+                                *mut c_void,
+                                *const Guid,
+                                *mut *mut c_void,
+                            ) -> HRESULT,
+                        >(sym(c"RoGetActivationFactory".as_ptr().cast())?),
                     })
                 }
             })

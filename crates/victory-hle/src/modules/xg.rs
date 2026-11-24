@@ -561,27 +561,30 @@ extern "system" fn tiling(
             let slices = if tail { l.slices.min(2) } else { l.slices };
             let total = standard.saturating_mul(slices);
             let wanted = total.saturating_sub(first).min(*n);
-            if standard > 0 {
-                for i in 0..wanted {
-                    let (slice, mip) = ((first + i) / standard, (first + i) % standard);
-                    let m = &l.mips[mip as usize];
-                    let entry = if tail && slice > 0 {
-                        SubresourceTiling {
-                            width: 0,
-                            height: 0,
-                            depth: 0,
-                            start: 0,
-                        }
-                    } else {
-                        SubresourceTiling {
-                            width: m.pitch / l.block[0],
-                            height: (m.rows / l.block[1]) as u16,
-                            depth: 1,
-                            start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
-                        }
-                    };
-                    out.add(i as usize).write(entry);
-                }
+            for i in 0..wanted {
+                let (Some(slice), Some(mip)) = (
+                    (first + i).checked_div(standard),
+                    (first + i).checked_rem(standard),
+                ) else {
+                    break;
+                };
+                let m = &l.mips[mip as usize];
+                let entry = if tail && slice > 0 {
+                    SubresourceTiling {
+                        width: 0,
+                        height: 0,
+                        depth: 0,
+                        start: 0,
+                    }
+                } else {
+                    SubresourceTiling {
+                        width: m.pitch / l.block[0],
+                        height: (m.rows / l.block[1]) as u16,
+                        depth: 1,
+                        start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
+                    }
+                };
+                out.add(i as usize).write(entry);
             }
             *n = wanted;
         }

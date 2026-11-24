@@ -81,7 +81,7 @@ fn resolve_hdr_mode(preference: u32, hdr: victory_gpu::HdrInfo) -> (u32, Option<
         min_tone_map_luminance: hdr.min_nits,
         max_tone_map_luminance: hdr.max_nits,
         max_full_frame_tone_map_luminance: hdr.max_full_frame_nits,
-        game_os_max_luminance: hdr.max_nits.min(1000.0).max(200.0),
+        game_os_max_luminance: hdr.max_nits.clamp(200.0, 1000.0),
     };
     (1, Some(info))
 }

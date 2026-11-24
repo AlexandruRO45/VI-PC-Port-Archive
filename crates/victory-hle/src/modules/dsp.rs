@@ -278,12 +278,12 @@ impl Reverb {
             }
         } else {
             let ch = &mut self.channels[0];
-            for i in 0..frames {
+            for (i, dst) in output.iter_mut().enumerate().take(frames) {
                 let x = input
                     .and_then(|inp| inp.get(i))
                     .map_or(0.0, |&s| flush_denormal(s) * INPUT_GAIN);
                 let y = ch.tick(x, fb, d1, d2) * g[0];
-                output[i] = y.tanh();
+                *dst = y.tanh();
             }
         }
     }

@@ -377,16 +377,33 @@ mod sapi {
                     return None;
                 }
                 let sym = |name: PCSTR| GetProcAddress(module, name);
+                type FarProc = unsafe extern "system" fn() -> isize;
                 Some(Ole32 {
-                    co_init: std::mem::transmute(sym(c"CoInitializeEx".as_ptr().cast())?),
-                    co_uninit: std::mem::transmute(sym(c"CoUninitialize".as_ptr().cast())?),
-                    co_create: std::mem::transmute(sym(c"CoCreateInstance".as_ptr().cast())?),
-                    create_stream: std::mem::transmute(sym(
-                        c"CreateStreamOnHGlobal".as_ptr().cast(),
-                    )?),
-                    get_hglobal: std::mem::transmute(sym(
-                        c"GetHGlobalFromStream".as_ptr().cast(),
-                    )?),
+                    co_init: std::mem::transmute::<
+                        FarProc,
+                        unsafe extern "system" fn(*const c_void, u32) -> HRESULT,
+                    >(sym(c"CoInitializeEx".as_ptr().cast())?),
+                    co_uninit: std::mem::transmute::<FarProc, unsafe extern "system" fn()>(
+                        sym(c"CoUninitialize".as_ptr().cast())?,
+                    ),
+                    co_create: std::mem::transmute::<
+                        FarProc,
+                        unsafe extern "system" fn(
+                            *const Guid,
+                            *mut c_void,
+                            u32,
+                            *const Guid,
+                            *mut *mut c_void,
+                        ) -> HRESULT,
+                    >(sym(c"CoCreateInstance".as_ptr().cast())?),
+                    create_stream: std::mem::transmute::<
+                        FarProc,
+                        unsafe extern "system" fn(*mut c_void, i32, *mut *mut c_void) -> HRESULT,
+                    >(sym(c"CreateStreamOnHGlobal".as_ptr().cast())?),
+                    get_hglobal: std::mem::transmute::<
+                        FarProc,
+                        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+                    >(sym(c"GetHGlobalFromStream".as_ptr().cast())?),
                 })
             }
         })
