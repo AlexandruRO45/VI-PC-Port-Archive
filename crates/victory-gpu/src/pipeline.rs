@@ -561,11 +561,34 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(windows)]
+mod hold_clock;
+#[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]
 mod make;
+
+/// Tracks actual title bind waits for the opt-in title sleep policy.
+#[cfg(windows)]
+pub fn track_pipeline_holds() {
+    hold_clock::CLOCK.get_or_init(hold_clock::HoldClock::default);
+}
+
+/// Waits a watchdog tick, extending it by at most `cap` for pipeline holds.
+#[cfg(windows)]
+pub fn sleep_with_pipeline_holds(
+    requested: std::time::Duration,
+    cap: std::time::Duration,
+) -> std::time::Duration {
+    hold_clock::CLOCK.get().map_or_else(
+        || {
+            std::thread::sleep(requested);
+            std::time::Duration::ZERO
+        },
+        |clock| clock.sleep(requested, cap),
+    )
+}
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.

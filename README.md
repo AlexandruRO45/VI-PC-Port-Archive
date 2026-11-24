@@ -136,6 +136,8 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
+| `VICTORY_NO_WATCHDOG=1` | opt-in diagnostic workaround for the title watchdog on build 1.0.2.1; may hide a real stall. Also works in release |
+| `VICTORY_SLEEP_HOLD=1` | build 1.0.2.1 only: give title watchdog ticks up to 500 ms of extra time for pending pipeline binds without disabling the watchdog. Also works in release |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |

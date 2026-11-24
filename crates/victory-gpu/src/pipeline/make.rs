@@ -24,6 +24,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
+use super::hold_clock::{CLOCK, HoldClock};
 use super::host::{GraphicsState, HostPipeline};
 
 /// What a host pipeline is made from, and the host pipeline once made.
@@ -226,16 +227,25 @@ fn wait(p: &Pending, frame: u64) {
     }
     let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
     let started = Instant::now();
+    wait_pending(p, started, left, CLOCK.get());
+    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+fn wait_pending(p: &Pending, started: Instant, left: Duration, clock: Option<&HoldClock>) {
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pipeline_hold = None;
     while p.made.get().is_none() {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
         }
+        if let Some(clock) = clock {
+            pipeline_hold.get_or_insert_with(|| clock.enter());
+        }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    drop(pipeline_hold);
 }
 
 /// Pipelines for the workers: those draws wait for, then those started
@@ -354,6 +364,21 @@ mod tests {
         assert_eq!(enqueue(&r, false), None);
         // Counted as waiting by `enqueue`, never handed to a worker.
         WAITING.fetch_sub(3, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn tracks_only_the_block_on_a_pending_pipeline() {
+        let pending = Pending::new(Vec::new(), None);
+        let clock = HoldClock::default();
+        wait_pending(&pending, Instant::now(), Duration::ZERO, Some(&clock));
+        assert!(clock.unoccupied(), "no budget left");
+        wait_pending(&pending, Instant::now(), Duration::from_millis(5), Some(&clock));
+        assert!(!clock.unoccupied(), "spent time waiting for a pending PSO");
+
+        assert!(pending.made.set(None).is_ok());
+        let clock = HoldClock::default();
+        wait_pending(&pending, Instant::now(), Duration::from_secs(1), Some(&clock));
+        assert!(clock.unoccupied(), "PSO already answered");
     }
 
     /// A first use queues the pipeline and, within the budget, gets the

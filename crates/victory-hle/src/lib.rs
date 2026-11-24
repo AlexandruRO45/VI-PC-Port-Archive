@@ -15,6 +15,8 @@ mod host;
 pub mod modules;
 mod registry;
 pub mod runtime;
+#[cfg(windows)]
+pub mod sleep_hold;
 
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
@@ -46,17 +48,27 @@ impl HleResolver {
 impl ImportResolver for HleResolver {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
         // Ordinal imports look up `#n`.
-        if let Some(address) = registry::lookup(dll, &symbol.to_string()) {
+        let name = symbol.to_string();
+        if let Some(address) = registry::lookup(dll, &name) {
             return Resolution::Found {
                 address,
                 provenance: Provenance::Hle,
             };
         }
         match self.host.resolve(dll, symbol) {
-            Some(address) => Resolution::Found {
-                address,
-                provenance: Provenance::Host,
-            },
+            Some(address) => {
+                #[cfg(windows)]
+                if let Some(address) = sleep_hold::resolve(dll, &name) {
+                    return Resolution::Found {
+                        address,
+                        provenance: Provenance::Hle,
+                    };
+                }
+                Resolution::Found {
+                    address,
+                    provenance: Provenance::Host,
+                }
+            }
             None => Resolution::Missing,
         }
     }
