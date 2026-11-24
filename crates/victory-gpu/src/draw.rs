@@ -111,7 +111,7 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     title_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
+    /// Tables made afresh in this list: (table, what it holds) â†’ first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
@@ -1066,8 +1066,8 @@ impl State {
         // Local build: the title memory table reads the mirror through resources of
         // their own (`Mirror::read_views`), and a buffer has no layout a read and a
         // write in one dispatch could disagree on (as on the console, which binds both):
-        // only `VICTORY_STRICT_ROOTS=1` drops reads and writes of the mirror together.
-        if mirror_reads && mirror_writes && strict_roots() {
+        // only `VICTORY_STRICT_MIRROR=1` drops reads and writes of the mirror together.
+        if mirror_reads && mirror_writes && std::env::var_os("VICTORY_STRICT_MIRROR").is_some() {
             once!(pipeline = %p.name, "draw or dispatch dropped: conflicting root access to the title memory mirror");
             return refuse(p, "conflicting root access to the title memory mirror");
         }
