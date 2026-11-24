@@ -55,6 +55,12 @@ impl Record<'_> {
             .filter(|out| out.len() == self.unpacked_size)
     }
 
+    /// Whether the packed bytes are a deflate stream of the stated size (or
+    /// its start: the stream's end is not checked).
+    fn is_stream(&self) -> bool {
+        starts_stream(self.packed, self.unpacked_size)
+    }
+
     /// The file bytes from the marker to the end of the packed stream.
     pub fn span(&self) -> std::ops::Range<usize> {
         self.offset..self.offset + 12 + self.packed.len()
@@ -85,10 +91,11 @@ pub fn is_sgd5(file: &[u8]) -> bool {
 /// whose packed bytes run past the end of the file (a truncated file) is not
 /// yielded, and ends the search: every byte after its marker is its own.
 /// Sizes that no deflate stream of the stated unpacked size could have (too
-/// many packed bytes, or too few) do
-/// not form a record, and neither do bytes running past the end that do not
-/// start a deflate stream, so such bytes neither end the search nor hide
-/// records.
+/// many packed bytes, or too few) do not form a record, and neither do bytes
+/// running past the end that do not start a deflate stream, nor bytes that
+/// are no deflate stream laid over a record that is one, so such bytes
+/// neither end the search nor hide records. A corrupt record that covers no
+/// other record is still yielded (its [`Record::unpack`] is `None`).
 pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     let finder = memchr::memmem::Finder::new(&MARKER);
     // Where the next record may start: after the magic, then after each
@@ -102,6 +109,12 @@ pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
             match record(&file[floor..], at - floor) {
                 Found::Record(r) => {
                     let r = Record { offset: at, ..r };
+                    if covers_a_record(file, &r) && !r.is_stream() {
+                        // Bytes that only look like a marker, laid over a
+                        // real record: the real one wins.
+                        from = at + 1;
+                        continue;
+                    }
                     floor = r.span().end;
                     from = floor + 6;
                     return Some(r);
@@ -162,6 +175,20 @@ fn record(file: &[u8], at: usize) -> Found<'_> {
         packed,
         unpacked_size,
     })
+}
+
+/// Whether a record whose packed bytes are a deflate stream starts (its
+/// header, 6 bytes before its marker) inside `r`'s span. Such a record inside
+/// a real one is that record's (stored deflate blocks); but if `r`'s own
+/// bytes are no deflate stream, `r` is bytes that look like a marker (in a
+/// container stored between records, say) and the record it covers is real.
+fn covers_a_record(file: &[u8], r: &Record<'_>) -> bool {
+    let span = r.span();
+    let lo = r.offset + 1;
+    // A marker from `span.end + 6` on has its header after the span.
+    let hi = file.len().min(span.end + 6 + MARKER.len() - 1);
+    memchr::memmem::find_iter(file.get(lo..hi).unwrap_or_default(), &MARKER)
+        .any(|m| matches!(record(&file[lo..], m), Found::Record(inner) if inner.is_stream()))
 }
 
 /// Whether `bytes` are the start of a deflate stream of `unpacked` bytes:
@@ -667,6 +694,50 @@ mod tests {
                 assert_eq!(found[0].unpack(), Some(payload), "len {len} level {level}");
             }
         }
+    }
+
+    #[test]
+    fn marker_without_a_stream_does_not_hide_the_record_it_covers() {
+        // Bytes between records that read as a marker with sizes that fit
+        // and stay inside the file, followed by bytes that are no deflate
+        // stream (block type 3 is reserved) and then a real record: taken
+        // for a record, its span covers the real record's header.
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("PS_first", 0x32, b"first"));
+        let after = record_bytes("PS_after", 0x32, b"after");
+        // PS_after's header (6 bytes before its marker) starts 16 + 13 bytes
+        // into the phantom's packed bytes: from 30 on they cover it.
+        for span in [30, 35, after.len(), after.len() + 31] {
+            let mut file = file.clone();
+            file.extend_from_slice(b"DXBC");
+            let n = (12 + span) as u32;
+            for v in [n, 0x000D_DCE7, n, 64] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            file.extend_from_slice(&[0x07; 16]);
+            file.extend(&after);
+            file.extend_from_slice(&[0x5A; 16]);
+            // Before: [PS_first, None] (the phantom hid PS_after).
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_first"), Some("PS_after")], "span {span}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+        }
+    }
+
+    #[test]
+    fn corrupt_record_is_still_a_record() {
+        // A real record whose stream is damaged covers no other record: it
+        // is yielded (and does not unpack), and so is the record after it.
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("CS_x", 0x3c, &[1; 64]));
+        file[31] = 0xFF;
+        file.extend(record_bytes("PS_after", 0x32, b"after"));
+        let found: Vec<_> = records(&file).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(names, [Some("CS_x"), Some("PS_after")]);
+        assert_eq!(found[0].unpack(), None);
+        assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
     }
 
     #[test]
