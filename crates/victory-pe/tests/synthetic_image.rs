@@ -223,3 +223,245 @@ fn rejects_truncated_images_without_panicking() {
         assert!(ImageInfo::parse(&d[..len]).is_err(), "{len} bytes");
     }
 }
+
+// Optional directories, each added to the image by the test that needs it.
+// They live in the free tail of the section (0x1280..0x1400).
+const DIR_EXPORT: usize = 0;
+const DIR_DEBUG: usize = 6;
+const DIR_DELAY_IMPORT: usize = 13;
+
+const DELAY_DESCRIPTORS: u32 = 0x1280;
+const DELAY_NAME_TABLE: u32 = 0x12C0;
+const DELAY_IAT: u32 = 0x12D0;
+const DELAY_DLL_NAME: u32 = 0x12E0;
+const DELAY_HINT_NAME: u32 = 0x12F0;
+const DEBUG_DIRECTORY: u32 = 0x1300;
+const CODEVIEW: u32 = 0x1320;
+const EXPORT_DIRECTORY: u32 = 0x1350;
+const EXPORT_DIRECTORY_END: u32 = 0x1400;
+
+fn put_bytes(d: &mut [u8], rva: u32, bytes: &[u8]) {
+    d[at(rva)..at(rva) + bytes.len()].copy_from_slice(bytes);
+}
+
+fn set_directory(d: &mut [u8], index: usize, rva: u32, size: u32) {
+    let entry = OPT + layout::OPT_DATA_DIRECTORY + index * layout::DATA_DIRECTORY_SIZE;
+    put32(d, entry, rva);
+    put32(d, entry + 4, size);
+}
+
+/// Delay-loads `USER32.dll!MessageBoxW` (hint 7) with an RVA-based descriptor.
+fn add_delay_import(d: &mut [u8]) {
+    set_directory(d, DIR_DELAY_IMPORT, DELAY_DESCRIPTORS, 64);
+    let desc = at(DELAY_DESCRIPTORS);
+    put32(d, desc, 1); // attributes: RVA based
+    put32(d, desc + 4, DELAY_DLL_NAME);
+    put32(d, desc + 12, DELAY_IAT);
+    put32(d, desc + 16, DELAY_NAME_TABLE);
+    put64(d, at(DELAY_NAME_TABLE), u64::from(DELAY_HINT_NAME));
+    put_bytes(d, DELAY_DLL_NAME, b"USER32.dll\0");
+    put16(d, at(DELAY_HINT_NAME), 7);
+    put_bytes(d, DELAY_HINT_NAME + 2, b"MessageBoxW\0");
+}
+
+/// A CodeView debug directory entry whose record has signature `sig`.
+fn add_codeview(d: &mut [u8], sig: &[u8; 4]) {
+    set_directory(d, DIR_DEBUG, DEBUG_DIRECTORY, 28);
+    let dbg = at(DEBUG_DIRECTORY);
+    put32(d, dbg + 12, 2); // IMAGE_DEBUG_TYPE_CODEVIEW
+    put32(d, dbg + 16, 4 + 16 + 4 + 6); // size of data
+    put32(d, dbg + 20, CODEVIEW);
+    put32(d, dbg + 24, at(CODEVIEW) as u32); // pointer to raw data
+    put_bytes(d, CODEVIEW, sig);
+    let guid: Vec<u8> = (0..16).collect();
+    put_bytes(d, CODEVIEW + 4, &guid);
+    put32(d, at(CODEVIEW) + 20, 0x2A); // age
+    put_bytes(d, CODEVIEW + 24, b"t.pdb\0");
+}
+
+/// Exports ordinal 1 `local` at the entry point, ordinal 2 `fwdname` forwarded
+/// to `NTDLL.RtlFoo` and ordinal 3 `fwdord` forwarded to `NTDLL.#7`.
+fn add_exports(d: &mut [u8]) {
+    set_directory(
+        d,
+        DIR_EXPORT,
+        EXPORT_DIRECTORY,
+        EXPORT_DIRECTORY_END - EXPORT_DIRECTORY,
+    );
+    let (addresses, names, ordinals) = (0x1378, 0x1384, 0x1390);
+    let (dll, local, fwdname, fwdord) = (0x1398, 0x13A0, 0x13A8, 0x13B0);
+    let (to_name, to_ordinal) = (0x13B8, 0x13C8);
+    let ed = at(EXPORT_DIRECTORY);
+    put32(d, ed + 12, dll);
+    put32(d, ed + 16, 1); // ordinal base
+    put32(d, ed + 20, 3); // functions
+    put32(d, ed + 24, 3); // names
+    put32(d, ed + 28, addresses);
+    put32(d, ed + 32, names);
+    put32(d, ed + 36, ordinals);
+    // A forwarder is an address inside the export directory.
+    for (i, rva) in [ENTRY, to_name, to_ordinal].into_iter().enumerate() {
+        put32(d, at(addresses) + i * 4, rva);
+    }
+    // The name pointer table is sorted; each name maps to its ordinal index.
+    for (i, (name, index)) in [(fwdname, 1u16), (fwdord, 2), (local, 0)]
+        .into_iter()
+        .enumerate()
+    {
+        put32(d, at(names) + i * 4, name);
+        put16(d, at(ordinals) + i * 2, index);
+    }
+    put_bytes(d, dll, b"t.dll\0");
+    put_bytes(d, local, b"local\0");
+    put_bytes(d, fwdname, b"fwdname\0");
+    put_bytes(d, fwdord, b"fwdord\0");
+    put_bytes(d, to_name, b"NTDLL.RtlFoo\0");
+    put_bytes(d, to_ordinal, b"NTDLL.#7\0");
+}
+
+#[test]
+fn reads_delay_imports_with_their_iat_slots() {
+    let mut d = image();
+    add_delay_import(&mut d);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.delay_imports.len(), 1);
+    let user32 = &info.delay_imports[0];
+    assert_eq!(user32.dll, "USER32.dll");
+    assert_eq!(user32.entries.len(), 1);
+    assert_eq!(
+        user32.entries[0].symbol,
+        ImportSymbol::Name {
+            hint: 7,
+            name: "MessageBoxW".into()
+        }
+    );
+    assert_eq!(user32.entries[0].iat_slot_rva, DELAY_IAT);
+    // Delay imports are kept apart from the ordinary imports.
+    assert_eq!(info.import_count(), 2);
+}
+
+#[test]
+fn rejects_delay_iat_outside_image() {
+    for iat in [SIZE_OF_IMAGE - 4, 0xFFFF_FFFC] {
+        let mut d = image();
+        add_delay_import(&mut d);
+        put32(&mut d, at(DELAY_DESCRIPTORS) + 12, iat);
+        assert!(
+            matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))),
+            "delay IAT at {iat:#x}"
+        );
+    }
+}
+
+#[test]
+fn reads_exports_and_forwarders() {
+    let mut d = image();
+    add_exports(&mut d);
+    let info = ImageInfo::parse(&d).unwrap();
+    let mut exports: Vec<_> = info
+        .exports
+        .iter()
+        .map(|e| (e.ordinal, e.name.as_deref(), e.rva, e.forward.as_deref()))
+        .collect();
+    exports.sort();
+    assert_eq!(
+        exports,
+        [
+            (1, Some("local"), Some(ENTRY), None),
+            (2, Some("fwdname"), None, Some("NTDLL.RtlFoo")),
+            (3, Some("fwdord"), None, Some("NTDLL.#7")),
+        ]
+    );
+}
+
+#[test]
+fn reads_codeview_record_and_symbol_key() {
+    let mut d = image();
+    add_codeview(&mut d, b"RSDS");
+    let cv = ImageInfo::parse(&d).unwrap().codeview.unwrap();
+    assert_eq!(cv.pdb_path, "t.pdb");
+    assert_eq!(cv.age, 0x2A);
+    let guid: Vec<u8> = (0..16).collect();
+    assert_eq!(cv.guid[..], guid[..]);
+    // The first three GUID fields are little endian; the age is hex, unpadded.
+    assert_eq!(cv.symbol_key(), "030201000504070608090A0B0C0D0E0F2A");
+}
+
+#[test]
+fn ignores_codeview_records_that_are_not_rsds() {
+    let mut d = image();
+    add_codeview(&mut d, b"NB10");
+    assert!(ImageInfo::parse(&d).unwrap().codeview.is_none());
+}
+
+#[test]
+fn reports_relocation_exception_and_load_config_directories() {
+    let mut d = image();
+    // Only the directory entries matter; their contents are not parsed.
+    set_directory(&mut d, dir::BASERELOC, 0x1380, 12);
+    set_directory(&mut d, dir::EXCEPTION, 0x1390, 12);
+    set_directory(&mut d, dir::LOAD_CONFIG, 0x13A0, 0x40);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert!(info.has_relocations);
+    assert!(info.has_exception_table);
+    assert!(info.has_load_config);
+
+    // Stripped relocations win over a leftover directory entry.
+    let fh = layout::file_header_offset(&d).unwrap();
+    let at_flags = fh + layout::FILE_HEADER_CHARACTERISTICS;
+    let flags = u16::from_le_bytes([d[at_flags], d[at_flags + 1]]);
+    put16(
+        &mut d,
+        at_flags,
+        flags | layout::file_flags::RELOCS_STRIPPED,
+    );
+    assert!(!ImageInfo::parse(&d).unwrap().has_relocations);
+
+    // An entry with an RVA but no size is absent.
+    set_directory(&mut d, dir::EXCEPTION, 0x1390, 0);
+    assert!(!ImageInfo::parse(&d).unwrap().has_exception_table);
+}
+
+#[test]
+fn names_subsystems_and_dll_flag() {
+    use layout::subsystem::*;
+    for (value, name) in [
+        (WINDOWS_GUI, "windows-gui"),
+        (WINDOWS_CUI, "windows-cui"),
+        (XBOX, "xbox"),
+        (XBOX_CODE_CATALOG, "xbox-code-catalog"),
+        (1, "other"),
+    ] {
+        let mut d = image();
+        put16(&mut d, OPT + 68, value);
+        let info = ImageInfo::parse(&d).unwrap();
+        assert_eq!((info.subsystem, info.subsystem_name()), (value, name));
+    }
+    let mut d = image();
+    put16(&mut d, 0x56, 0x0022 | layout::file_flags::DLL);
+    assert!(ImageInfo::parse(&d).unwrap().is_dll());
+}
+
+#[test]
+fn layout_offsets_match_the_image() {
+    let mut d = image();
+    assert_eq!(layout::file_header_offset(&d), Some(0x44));
+    assert_eq!(layout::optional_header_offset(&d), Some(OPT));
+    assert_eq!(
+        layout::data_directory_offset(&d, DIR_TLS),
+        Some(OPT + layout::OPT_DATA_DIRECTORY + DIR_TLS * layout::DATA_DIRECTORY_SIZE)
+    );
+    assert_eq!(layout::data_directory_offset(&d, 16), None);
+    let tls = layout::data_directory_offset(&d, DIR_TLS).unwrap();
+    assert_eq!(layout::read_u32(&d, tls), Some(TLS_DIRECTORY));
+
+    // Fewer directories than the index: none.
+    put32(&mut d, OPT + layout::OPT_NUMBER_OF_RVA_AND_SIZES, 2);
+    assert!(layout::data_directory_offset(&d, dir::IMPORT).is_some());
+    assert_eq!(layout::data_directory_offset(&d, DIR_TLS), None);
+
+    // Headers that point past the data, or nowhere at all, give None.
+    assert_eq!(layout::file_header_offset(&d[..0x3C]), None);
+    put32(&mut d, layout::DOS_E_LFANEW, u32::MAX);
+    assert_eq!(layout::data_directory_offset(&d, dir::IMPORT), None);
+}
