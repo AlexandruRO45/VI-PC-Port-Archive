@@ -24,6 +24,7 @@
 
 #[cfg(windows)]
 mod crash;
+mod crash_log;
 #[cfg(target_os = "linux")]
 pub mod linux;
 pub mod prepare;
@@ -40,9 +41,10 @@ mod tls;
 mod windows;
 
 #[cfg(windows)]
-pub use crash::{
-    locate, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
-};
+pub use crash::{locate, report_crashes, report_unhandled};
+pub use crash_log::{log_crash, log_crashes_to, note_title_output};
+#[cfg(target_os = "linux")]
+pub use linux::seh::{locate, report_crashes};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;
 pub use prepare::{PrepareError, PreparedImage, prepare};

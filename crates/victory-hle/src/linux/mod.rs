@@ -13,6 +13,7 @@ use crate::HleModule;
 
 #[allow(dead_code)] // used by the slices as they land
 pub(crate) mod handles;
+mod kernel32_exception;
 pub(crate) mod kernel32_file;
 pub(crate) mod kernel32_heap;
 mod kernel32_interlocked;
@@ -28,6 +29,7 @@ mod kernel32_thread;
 mod kernel32_threadpool;
 mod kernel32_time;
 mod kernel32_wait;
+mod ntdll_exception;
 mod ucrt_convert;
 mod ucrt_environment;
 mod ucrt_filesystem;
@@ -41,6 +43,7 @@ mod ucrt_stdio;
 mod ucrt_string;
 mod ucrt_time;
 mod ucrt_utility;
+
 fn modules() -> Vec<HleModule> {
     vec![
         kernel32_wait::module(),
@@ -69,6 +72,8 @@ fn modules() -> Vec<HleModule> {
         kernel32_memory::module(),
         kernel32_path::module(),
         kernel32_text::module(),
+        kernel32_exception::module(),
+        ntdll_exception::module(),
     ]
 }
 

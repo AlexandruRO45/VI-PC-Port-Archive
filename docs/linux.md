@@ -79,7 +79,7 @@ calling convention; check before you bind.
 | Workspace builds and tests on Linux | done |
 | Title-facing ABI is `win64` | done |
 | PE mapper, TEB, guest threads, TLS, entry | done |
-| SEH, signals, unwinding | not started |
+| SEH, signals, unwinding | done: dispatcher, unwinder, signals, `Rtl*`/`RaiseException`, crash report (`linux/seh.rs`) |
 | kernel32: handles, waits, sync objects and locks, threads, TLS/FLS, thread pool, time, system, process | done (`victory-hle/src/linux/handles.rs`, `kernel32_*.rs`; SuspendThread uses `SIGRTMIN+6`) |
 | Region table (`vm.rs`), kernel32 memory, heap, files at host level, text, locale | done: `kernel32_{memory,heap,file,io,path,text,locale}.rs`; overlapped I/O completes inside the call |
 | UCRT | every import the title and its DLLs take (`ucrt_*.rs`); C locale only |

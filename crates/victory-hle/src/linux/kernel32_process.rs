@@ -97,12 +97,6 @@ pub extern "win64" fn IsDebuggerPresent() -> i32 {
         .into()
 }
 
-/// A breakpoint exception, as on Windows (`SIGTRAP` here).
-pub extern "win64" fn DebugBreak() {
-    // SAFETY: int3 raises SIGTRAP; the exception layer or the default kills.
-    unsafe { std::arch::asm!("int3") };
-}
-
 /// Identity: the pair only has to round-trip.
 pub extern "win64" fn EncodePointer(p: usize) -> usize {
     p
@@ -250,7 +244,6 @@ pub(crate) fn module() -> HleModule {
             hle_export!(GetLastError),
             hle_export!(SetLastError),
             hle_export!(IsDebuggerPresent),
-            hle_export!(DebugBreak),
             hle_export!(EncodePointer),
             hle_export!(DecodePointer),
             hle_export!(GetCommandLineA),
