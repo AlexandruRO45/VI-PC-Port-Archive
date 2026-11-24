@@ -256,4 +256,57 @@ mod tests {
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
     }
+
+    /// A frame's two waits take one tick between them, not two: the rate a
+    /// title gets is the interval it asked for, not half of it.
+    ///
+    /// The test above bounds a flip above (never faster than the clock) and
+    /// leaves the other side open, which is the side a halving sits on: a
+    /// movie that presented at 15 fps where it used to present at 30 asked
+    /// for a 33 ms interval and got 67 ms of clock per frame, one tick for
+    /// its origin poll and a second for its flip, with the frame token still
+    /// counting one frame per flip. Measured on `5728350`, `e3dac6e` and
+    /// `991cff7` the boot movie takes 12 frames per 12 intervals, so this
+    /// pins the contract those runs met.
+    #[test]
+    fn a_frames_origin_and_flip_share_a_tick() {
+        let null = std::ptr::null();
+        const FLIP: u32 = 2;
+        // The interval the title asks for while its boot movie plays: above
+        // the host's sleep granularity, which a shorter one would not be.
+        const INTERVAL_US: u64 = 33_333;
+        const FRAMES: u64 = 8;
+        assert_eq!(set_interval(null, null, INTERVAL_US as u32, 3, 0), S_OK);
+        let started = Instant::now();
+        let (mut token, mut tokens) = (0, Vec::with_capacity(FRAMES as usize));
+        for _ in 0..FRAMES {
+            // The title's movie loop: an origin poll that always times out
+            // and still takes the frame's token, then a blocking flip wait.
+            let _ = wait(
+                null,
+                0,
+                0,
+                std::ptr::null(),
+                TOKEN_ON_TIMEOUT,
+                &mut token,
+            );
+            assert_eq!(
+                wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+                S_OK
+            );
+            tokens.push(token);
+        }
+        let elapsed = started.elapsed().as_micros() as u64;
+        let intervals = elapsed / INTERVAL_US;
+        // Half again the frames' worth of intervals leaves room for a
+        // descheduled thread; two ticks a frame would need twice as many.
+        assert!(
+            intervals <= FRAMES + FRAMES / 2,
+            "{FRAMES} frames took {intervals} intervals"
+        );
+        assert!(
+            tokens.windows(2).all(|w| w[1] == w[0] + 1),
+            "frames are not consecutive: {tokens:?}"
+        );
+    }
 }
