@@ -1113,7 +1113,8 @@ fn ensure_not_user_base(
 /// The game folder is the user's own dump: Victory reads it and never
 /// writes there, and it must survive the cache being cleared. So it may not
 /// be inside (or equal to) the cache folder, where clearing the cache would
-/// delete it, and neither the cache nor the data folder may be inside it,
+/// delete it, may not be inside the data folder, which holds saves and
+/// settings, and neither the cache nor the data folder may be inside it,
 /// where derived files and saves would be mixed into the dump. Each is an
 /// easy slip with one parent folder for everything, e.g.
 /// `VICTORY_CACHE_DIR=~/gta` with `VICTORY_GAME_DIR=~/gta/game`, or
@@ -1131,6 +1132,17 @@ fn ensure_game_apart(game: &Path, cache: &Path, data: &Path, origins: &Origins) 
             origins.game_dir,
             cache.display(),
             origins.cache_dir
+        );
+    }
+    if let Some(links) = inside(game, data) {
+        anyhow::bail!(
+            "the game folder {} (from {}) is inside the data folder {} (from {}){links}, which \
+             holds saves and settings; set VICTORY_GAME_DIR or [paths].game_dir to a folder \
+             outside it",
+            game.display(),
+            origins.game_dir,
+            data.display(),
+            origins.data_dir
         );
     }
     for (name, dir, origin, setting) in [
@@ -1163,9 +1175,10 @@ fn ensure_game_apart(game: &Path, cache: &Path, data: &Path, origins: &Origins) 
 
 /// Each of the test titles is, like the game folder, a dump that Victory
 /// only reads, so [`ensure_game_apart`] applies to them too: a title inside
-/// (or equal to) the cache folder would be deleted with the cache, and a
-/// cache or data folder inside a title would mix derived files and saves
-/// into that dump. The easy slip is one parent folder for everything, e.g.
+/// (or equal to) the cache folder would be deleted with the cache, one
+/// inside the data folder would mix the dump with saves, and a cache or data
+/// folder inside a title would mix derived files and saves into that dump.
+/// The easy slip is one parent folder for everything, e.g.
 /// `VICTORY_CACHE_DIR=~/xbox` with `VICTORY_TEST_TITLES=~/xbox/title-a`.
 /// The error names the title, so it is clear which entry of the list is
 /// meant. Compared like [`ensure_game_apart`]: lexically, then once links
@@ -1186,6 +1199,17 @@ fn ensure_titles_apart(
                 origins.test_titles,
                 cache.display(),
                 origins.cache_dir
+            );
+        }
+        if let Some(links) = inside(title, data) {
+            anyhow::bail!(
+                "the test title {} (from {}) is inside the data folder {} (from {}){links}, \
+                 which holds saves and settings; set VICTORY_TEST_TITLES or [paths].test_titles \
+                 to a folder outside it",
+                title.display(),
+                origins.test_titles,
+                data.display(),
+                origins.data_dir
             );
         }
         for (name, dir, origin, setting) in [
@@ -5690,6 +5714,15 @@ mod tests {
         let e = err(with(v.clone(), PathBuf::from(abs("c")), v.join("saves")));
         assert!(e.contains("data folder"), "{e}");
         assert!(e.contains("(from VICTORY_DATA_DIR)"), "{e}");
+        // The game inside the data would mix the dump with saves.
+        let e = err(with(
+            v.join("saves").join("gta"),
+            PathBuf::from(abs("c")),
+            v.join("saves"),
+        ));
+        assert!(e.contains("game folder"), "{e}");
+        assert!(e.contains("inside the data folder"), "{e}");
+        assert!(e.contains("(from VICTORY_GAME_DIR)"), "{e}");
         // `.` and `..` are folded first: `v/../c` is outside `v`.
         let e = err(with(
             v.join("."),
@@ -5794,6 +5827,97 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn a_game_folder_inside_the_data_only_as_written_is_refused_through_a_link() {
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-game-linked-into-data-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let data = scratch.join("data");
+        let cache = scratch.join("cache");
+        std::fs::create_dir_all(data.join("gta")).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        std::os::unix::fs::symlink("data/gta", scratch.join("gta")).unwrap();
+        let with = |game: PathBuf, cache: PathBuf, data: PathBuf| {
+            move |k: &str| match k {
+                "VICTORY_GAME_DIR" => Some(game.clone().into_os_string()),
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let err = |game: PathBuf, cache: PathBuf, data: PathBuf| {
+            Config::resolve(FilePaths::default(), None, with(game, cache, data))
+                .unwrap_err()
+                .to_string()
+        };
+        let real = std::fs::canonicalize(&scratch).unwrap();
+        let game = scratch.join("gta");
+        let e = err(game.clone(), cache.clone(), data.clone());
+        assert_eq!(
+            e,
+            format!(
+                "the game folder {} (from VICTORY_GAME_DIR) is inside the data folder {} (from \
+                 VICTORY_DATA_DIR) once links are followed ({} is inside {}), which holds saves \
+                 and settings; set VICTORY_GAME_DIR or [paths].game_dir to a folder outside it",
+                game.display(),
+                data.display(),
+                real.join("data").join("gta").display(),
+                real.join("data").display()
+            )
+        );
+        let ok = with(
+            scratch.join("outside").join("gta"),
+            cache.clone(),
+            data.clone(),
+        );
+        assert!(Config::resolve(FilePaths::default(), None, ok).is_ok());
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_test_title_inside_the_data_only_as_written_is_refused_through_a_link() {
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-title-linked-into-data-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let data = scratch.join("data");
+        let cache = scratch.join("cache");
+        std::fs::create_dir_all(data.join("halo")).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        std::os::unix::fs::symlink("data/halo", scratch.join("halo")).unwrap();
+        let title = scratch.join("halo");
+        let data_dir = data.clone();
+        let with = move |k: &str| match k {
+            "VICTORY_TEST_TITLES" => Some(std::env::join_paths([title.clone()]).unwrap()),
+            "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+            "VICTORY_DATA_DIR" => Some(data_dir.clone().into_os_string()),
+            _ => None,
+        };
+        let e = Config::resolve(FilePaths::default(), None, with)
+            .unwrap_err()
+            .to_string();
+        let real = std::fs::canonicalize(&scratch).unwrap();
+        assert_eq!(
+            e,
+            format!(
+                "the test title {} (from VICTORY_TEST_TITLES) is inside the data folder {} \
+                 (from VICTORY_DATA_DIR) once links are followed ({} is inside {}), which \
+                 holds saves and settings; set VICTORY_TEST_TITLES or [paths].test_titles to a \
+                 folder outside it",
+                scratch.join("halo").display(),
+                data.display(),
+                real.join("data").join("halo").display(),
+                real.join("data").display()
+            )
+        );
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
     fn test_titles_are_kept_apart_from_cache_and_data() {
         let with = |titles: Vec<PathBuf>, cache: PathBuf, data: PathBuf| {
             move |k: &str| match k {
@@ -5840,6 +5964,16 @@ mod tests {
         ));
         assert!(e.contains("data folder"), "{e}");
         assert!(e.contains("(from VICTORY_DATA_DIR)"), "{e}");
+        // A title inside the data would mix the dump with saves.
+        let e = err(with(
+            vec![x.join("saves").join("title-a")],
+            PathBuf::from(abs("c")),
+            x.join("saves"),
+        ));
+        assert!(e.contains("test title"), "{e}");
+        assert!(e.contains("title-a"), "{e}");
+        assert!(e.contains("inside the data folder"), "{e}");
+        assert!(e.contains("(from VICTORY_TEST_TITLES)"), "{e}");
         // `.` and `..` are folded first.
         let e = err(with(
             vec![x.join(".")],
