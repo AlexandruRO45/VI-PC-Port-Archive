@@ -42,12 +42,29 @@ pub(crate) struct Shadow {
     pending: Mutex<Vec<(usize, usize)>>,
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
-    before: Mutex<Option<(usize, Vec<u8>)>>,
+    before: Mutex<Option<Snap>>,
     /// Local build: the buffer is title memory itself (`crate::direct`): nothing to copy.
     direct: bool,
     /// Local build: the copy lives in the mirror (`crate::mirror`): the CPU address of each
     /// 64 KiB title page from `start`'s on (empty otherwise: one block at `data`).
     pages: Vec<usize>,
+}
+
+/// Local build: a snapshot of a copy's bytes, indexed like the copy (byte `off` of the copy is
+/// `buf[off]`); only `[from, to)` is filled in, and `buf`'s length stays 0 (its capacity is
+/// reserved address space: untouched parts cost nothing). Growing a snapshot gathers only the
+/// newly covered parts, in place: it used to be rebuilt (copied whole) at every growth, dozens
+/// of times a submission for the world's 174 MB heap.
+struct Snap {
+    buf: Vec<u8>,
+    from: usize,
+    to: usize,
+}
+
+impl Snap {
+    fn ptr(&self) -> *mut u8 {
+        self.buf.as_ptr().cast_mut()
+    }
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -127,10 +144,25 @@ impl Shadow {
         }
     }
 
-    /// Appends the copy's bytes `[from, to)` to `out`.
-    fn gather(&self, from: usize, to: usize, out: &mut Vec<u8>) {
-        // SAFETY: each piece lies in one page of the copy.
-        self.pieces(from, to, |_, p, n| out.extend_from_slice(unsafe { std::slice::from_raw_parts(p, n) }));
+    /// Copies the copy's bytes `[from, to)` to the same offsets from `base` (a snapshot buffer),
+    /// on the pool's threads when there are many.
+    fn gather(&self, base: usize, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        const CHUNK: usize = 2 << 20;
+        let one = |from: usize, to: usize| {
+            // SAFETY: each piece lies in one page of the copy; `base` holds the offsets.
+            self.pieces(from, to, |off, p, n| unsafe { std::ptr::copy_nonoverlapping(p, (base + off) as *mut u8, n) });
+        };
+        if to - from < 4 * CHUNK {
+            return one(from, to);
+        }
+        let chunks: Vec<(usize, usize)> = (from..to).step_by(CHUNK).map(|a| (a, (a + CHUNK).min(to))).collect();
+        crate::host::pool().scope(&chunks, |&(a, b)| -> bool {
+            one(a, b);
+            true
+        });
     }
 
     /// A copy in the mirror (`crate::mirror`) of `[start, start + len)`.
@@ -225,27 +257,41 @@ impl Shadow {
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
+            Some(s) => (s.from.min(from), s.to.max(to)),
             None => (from, to),
         };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
-        {
-            return;
-        }
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                self.gather(start, at, &mut grown);
-                grown.extend_from_slice(&bytes);
-                self.gather(at + bytes.len(), end, &mut grown);
-                give_back(bytes);
+        match before.as_mut() {
+            Some(s) if (s.from, s.to) == (start, end) => return,
+            Some(s) => {
+                if s.buf.capacity() < end {
+                    // (only for copies too big to reserve whole: see below)
+                    let mut bigger = pooled(end);
+                    // SAFETY: both hold the range; the new one is larger.
+                    unsafe { std::ptr::copy_nonoverlapping(s.ptr().add(s.from), bigger.as_mut_ptr().add(s.from), s.to - s.from) };
+                    give_back(std::mem::replace(&mut s.buf, bigger));
+                }
+                let base = s.ptr() as usize;
+                self.gather(base, start, s.from);
+                self.gather(base, s.to, end);
+                (s.from, s.to) = (start, end);
             }
-            None => self.gather(start, end, &mut grown),
+            None => {
+                // Reserved whole (not touched): room to grow in place. Past 512 MB only what
+                // is needed, grown by a copy when more is asked.
+                let want = if self.len <= 512 << 20 { self.len as usize } else { end };
+                let buf = pooled(want.max(end));
+                self.gather(buf.as_ptr() as usize, start, end);
+                *before = Some(Snap { buf, from: start, to: end });
+            }
         }
-        *before = Some((start, grown));
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::SnapUs, started.elapsed().as_micros() as u64);
+        }
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -263,12 +309,15 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
-            && *taken <= from
-            && to <= taken + before.len()
+        if let Some(snap) = &*snapshot
+            && snap.from <= from
+            && to <= snap.to
             && from < to
         {
-            let before = &before[from - taken..to - taken];
+            let base = snap.ptr() as usize;
+            // SAFETY: `[from, to)` is inside the snapshot's filled part; nothing writes it
+            // while the lock is held.
+            let before_at = |at: usize, n: usize| unsafe { std::slice::from_raw_parts((base + at) as *const u8, n) };
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
@@ -276,7 +325,7 @@ impl Shadow {
             let mut synced = Vec::new();
             // Local build: which pieces the GPU changed, compared on several threads (one core
             // compared ~100 MB per submission, 27 submissions a frame: ~170 ms).
-            let changed = changed_pieces(self, before.as_ptr() as usize, start, from, to);
+            let changed = changed_pieces(self, base, start, from, to);
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
@@ -287,7 +336,7 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.ptr(at), n) };
-                let old = &before[at - from..at - from + n];
+                let old = before_at(at, n);
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
@@ -330,9 +379,9 @@ impl Shadow {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
+            && let Some(snap) = snapshot.take()
         {
-            give_back(bytes);
+            give_back(snap.buf);
         }
         written
     }
@@ -549,7 +598,7 @@ impl Shadow {
 }
 
 /// Offsets (from the copy's start) of the 64 KiB pieces of `[from, to)` whose bytes in the copy
-/// at `data` differ from `before` (the snapshot of `[from, to)`), compared on several threads.
+/// at `data` differ from `before` (the snapshot, indexed by offset), compared on several threads.
 fn changed_pieces(shadow: &Shadow, before: usize, start: usize, from: usize, to: usize) -> std::collections::HashSet<usize> {
     const PIECE: usize = 64 << 10;
     let mut pieces = Vec::new();
@@ -563,7 +612,7 @@ fn changed_pieces(shadow: &Shadow, before: usize, start: usize, from: usize, to:
     let differs = move |&(at, n, host): &(usize, usize, usize)| -> bool {
         // SAFETY: inside the copy (one page) and the snapshot.
         let host = unsafe { std::slice::from_raw_parts(host as *const u8, n) };
-        let old = unsafe { std::slice::from_raw_parts((before + at - from) as *const u8, n) };
+        let old = unsafe { std::slice::from_raw_parts((before + at) as *const u8, n) };
         host != old
     };
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 12);
