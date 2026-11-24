@@ -569,6 +569,18 @@ impl Module {
     }
     pub fn cmp(&mut self, p: Pred, a: Value, b: Value) -> Value {
         let t = self.i1();
+        // SCC is stored as a zero-extended predicate and read back with != 0.
+        if let (Pred::Ne, Value::Inst(i), Value::Const(k)) = (p, a, b) {
+            if let (Some(Op::Cast(CastOp::ZExt, Value::Inst(bit), dst)), Some(ConstDef::Int(ty, 0))) =
+                (self.insts.get(i as usize).map(|d| &d.op), self.consts.get(k as usize))
+            {
+                if dst == ty && self.int_width(*dst) == Some(32)
+                    && self.insts.get(*bit as usize).is_some_and(|d| d.ty == t) && !self.terminated()
+                {
+                    return Value::Inst(*bit);
+                }
+            }
+        }
         self.push(Op::Cmp(p, a, b), t)
     }
     pub fn select(&mut self, c: Value, t: Value, f: Value) -> Value {
@@ -1463,6 +1475,24 @@ impl Module {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scc_nonzero_test_reuses_the_original_predicate() {
+        let mut m = Module::new();
+        let i32t = m.i32();
+        let zero = m.i32c(0);
+        let ptr = m.alloca(i32t, 4);
+        let word = m.load(ptr, 4);
+        let bit = m.cmp(Pred::Ne, word, zero);
+        let scc = m.cast(CastOp::ZExt, bit, i32t);
+        let before = m.insts.len();
+        let read = m.cmp(Pred::Ne, scc, zero);
+        assert_eq!(read, bit);
+        assert_eq!(m.insts.len(), before);
+        assert_ne!(m.cmp(Pred::Eq, scc, zero), bit);
+        let one = m.i32c(1);
+        assert_ne!(m.cmp(Pred::Ne, scc, one), bit);
+    }
 
     #[test]
     fn unreachable_conversion_does_not_require_double_extensions() {
