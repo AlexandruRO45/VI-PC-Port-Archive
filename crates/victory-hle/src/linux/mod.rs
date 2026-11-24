@@ -11,8 +11,13 @@ use std::sync::LazyLock;
 
 use crate::HleModule;
 
+mod advapi32_eventing;
+mod advapi32_registry;
 mod audio_out;
+mod bcrypt;
 mod combase;
+mod crypt32;
+mod dbghelp;
 #[allow(dead_code)] // used by the slices as they land
 pub(crate) mod handles;
 mod mmdevapi;
@@ -23,7 +28,12 @@ mod xaudio2;
 
 fn modules() -> Vec<HleModule> {
     vec![
+        advapi32_eventing::module(),
+        advapi32_registry::module(),
+        bcrypt::module(),
         combase::module(),
+        crypt32::module(),
+        dbghelp::module(),
         oleaut32::module(),
         winhttp::module(),
         ws2_32::module(),
