@@ -5884,6 +5884,38 @@ mod queue_tests {
         0
     }
 
+    // a fake fence: every method but these fails (E_NOTIMPL)
+    unsafe extern "system" fn not_impl(_: *mut c_void) -> i32 {
+        0x8000_4001u32 as i32
+    }
+    unsafe extern "system" fn one_ref(_: *mut c_void) -> u32 {
+        1
+    }
+    unsafe extern "system" fn completed_value(_: *mut c_void) -> u64 {
+        u64::MAX
+    }
+
+    /// A fence object that lives as long as the process and is complete. A Signal of the
+    /// title's fence goes to the title-fence bookkeeping (`fence_x`, `list_x`'s sync graph),
+    /// which keeps it and asks it for its completed value later, from other threads' queue
+    /// calls (other tests, in a parallel run). At `u64::MAX` it is dropped from there at the
+    /// first look. A bare number there (0x5EED_0000) was called through and faulted the
+    /// process (#1487).
+    fn fake_fence() -> usize {
+        static FENCE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *FENCE.get_or_init(|| {
+            // IUnknown (3), ID3D12Object (4), ID3D12DeviceChild (1), then GetCompletedValue
+            // at #8, SetEventOnCompletion #9, Signal #10
+            let mut vt = [not_impl as usize; 11];
+            vt[1] = one_ref as usize;
+            vt[2] = one_ref as usize;
+            vt[8] = completed_value as usize;
+            let vt: &'static [usize; 11] = Box::leak(Box::new(vt));
+            let obj: &'static [usize; 1] = Box::leak(Box::new([vt.as_ptr() as usize]));
+            obj.as_ptr() as usize
+        })
+    }
+
     /// Queue #18 before the layout is known writes 8 bytes; after a Signal at #14 (the older
     /// layout) it is GetDesc with all 16.
     #[test]
@@ -5895,7 +5927,7 @@ mod queue_tests {
         let vtbl = ext.as_ptr() as usize + 8;
         let mut obj = [vtbl];
         let this = obj.as_mut_ptr() as *mut c_void;
-        let fence = 0x5EED_0000usize;
+        let fence = fake_fence();
         QUEUE_SHIFTED.store(false, Ordering::Release);
         QUEUE_OLDER.store(false, Ordering::Release);
         unsafe {
