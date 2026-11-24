@@ -287,6 +287,7 @@ pub(crate) struct HostList {
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
+    pub(crate) framegen_inputs: Mutex<Option<crate::ffx::framegen::Inputs>>,
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
@@ -479,6 +480,7 @@ impl Host {
                 allocator,
                 list,
                 deferred: Mutex::default(),
+                framegen_inputs: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
@@ -497,6 +499,10 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.execute_lists(runs, &mut submitted);
+    }
+
+    fn execute_lists(&self, runs: &[&HostList], submitted: &mut u64) {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -601,6 +607,9 @@ impl Host {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if crate::ffx::framegen::enabled() {
+            crate::ffx::framegen::submitted(runs);
+        }
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
@@ -884,6 +893,9 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        if crate::ffx::framegen::enabled() {
+            self.framegen_inputs.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -914,16 +926,20 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
-        let wanted = legal_state(texture, wanted);
+        self.transition_copy(&copy, wanted).map(|before| (texture, before))
+    }
+
+    pub(crate) fn transition_copy(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
+        let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+                v.insert((wanted, wanted, copy.clone()));
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some(before)
             }
         }
     }
@@ -1612,6 +1628,7 @@ impl Compositor {
 }
 
 struct Presenter {
+    framegen: Option<crate::ffx::framegen::Presentation>,
     swap_chain: IDXGISwapChain3,
     width: u32,
     height: u32,
@@ -1775,6 +1792,9 @@ impl Host {
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
+            if let Some(fg) = &mut p.framegen {
+                fg.disable(&p.swap_chain);
+            }
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
@@ -1796,6 +1816,18 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
+            // The inputs belong to submitted game work. Keep the submit lock until our
+            // preparation and copy finish, so a title submission cannot rewrite them.
+            let mut submitted = p.framegen.as_ref().map(|_| self.submitted.lock().unwrap_or_else(|e| e.into_inner()));
+            let mut generated = false;
+            if let Some(fg) = &mut p.framegen {
+                let inputs = crate::ffx::framegen::take_inputs();
+                if format == DXGI_FORMAT_R8G8B8A8_UNORM {
+                    generated = fg.prepare(&p.swap_chain, &self.device, &p.copy, [width, height], frame, inputs);
+                } else {
+                    fg.disable(&p.swap_chain);
+                }
+            }
             let (capture, probe) = if planes.len() == 1 {
                 let (texture, state) = planes[0];
                 let state = D3D12_RESOURCE_STATES(state as i32);
@@ -1973,12 +2005,24 @@ impl Host {
                 (capture, probe)
             };
             p.copy.close();
-            self.execute(&[&p.copy]);
+            if let Some(submitted) = &mut submitted {
+                self.execute_lists(&[&p.copy], submitted);
+            } else {
+                self.execute(&[&p.copy]);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let result = p.swap_chain.Present(u32::from(generated), DXGI_PRESENT(0));
+            if generated && let Some(fg) = &mut p.framegen {
+                if result.is_ok() {
+                    fg.presented(&p.swap_chain, frame);
+                } else {
+                    tracing::warn!(?result, frame, "ffx framegen: present failed");
+                    fg.disable(&p.swap_chain);
+                }
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -2016,13 +2060,15 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let (swap_chain, framegen) = match crate::ffx::framegen::Presentation::create(&factory, &self.queue, hwnd, &desc) {
+                Some((swap_chain, framegen)) => (swap_chain, Some(framegen)),
+                None => (factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?, None),
+            };
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             Ok(Presenter {
+                framegen,
                 swap_chain,
                 width,
                 height,

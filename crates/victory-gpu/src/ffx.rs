@@ -23,9 +23,12 @@ use windows::core::{Interface, PCSTR, PCWSTR};
 
 use crate::object::This;
 
+pub(crate) mod framegen;
+
 type ReturnCode = u32;
 const OK: ReturnCode = 0;
 const ERROR: ReturnCode = 1;
+const ERROR_UNKNOWN_DESC: ReturnCode = 2;
 const ERROR_PARAMETER: ReturnCode = 6;
 
 /// `ffxApiHeader`: a description's type and the next in its chain.
@@ -36,6 +39,8 @@ pub struct Header {
 }
 
 const CREATE_UPSCALE: u64 = 0x0001_0000;
+const UPSCALE_VERSION: u64 = 0x0001_000b;
+const SDK_UPSCALER_VERSION: u32 = (4 << 22) | (1 << 12) | 2;
 const DISPATCH_UPSCALE: u64 = 0x0001_0001;
 const QUERY_GET_VERSIONS: u64 = 4;
 const QUERY_JITTER_PHASE_COUNT: u64 = 0x0001_0004;
@@ -151,6 +156,9 @@ fn api() -> Option<&'static Api> {
             unsafe { LoadLibraryW(PCWSTR(path.as_ptr())) }.ok()
         };
         let _ = load("amd_fidelityfx_upscaler_dx12.dll");
+        if framegen::enabled() {
+            let _ = load("amd_fidelityfx_framegeneration_dx12.dll");
+        }
         let Some(loader) = load("amd_fidelityfx_loader_dx12.dll") else {
             tracing::error!(?dir, "ffx: amd_fidelityfx_loader_dx12.dll not found; set VICTORY_FFX_DIR to the SDK's signedbin");
             return None;
@@ -236,15 +244,77 @@ pub extern "C" fn ffxCreateContext(
         },
         device,
     };
-    upscale.next = (&raw mut dx12).cast();
+    #[repr(C)]
+    struct Version {
+        header: Header,
+        version: u32,
+    }
+    let mut version = Version {
+        header: Header { kind: UPSCALE_VERSION, next: &mut dx12.header },
+        version: SDK_UPSCALER_VERSION,
+    };
+    if framegen::enabled() {
+        static PROVIDERS: std::sync::Once = std::sync::Once::new();
+        PROVIDERS.call_once(|| {
+            log_versions(api, device, CREATE_UPSCALE, "upscaling");
+            log_versions(api, device, 0x20001, "frame generation");
+        });
+    }
+    upscale.next = &mut version.header;
     // SAFETY: the SDK's call with a chain that outlives it.
-    let r = unsafe { (api.create)(context, (&raw mut upscale).cast(), std::ptr::null()) };
+    let mut r = unsafe { (api.create)(context, (&raw mut upscale).cast(), std::ptr::null()) };
+    // SAFETY: the caller's context slot is non-null and the SDK has returned from create.
+    let retry_legacy = r == ERROR_UNKNOWN_DESC && unsafe { (*context).is_null() };
+    if retry_legacy {
+        upscale.next = &mut dx12.header;
+        // SAFETY: this SDK rejected the version descriptor without constructing a context.
+        r = unsafe { (api.create)(context, (&raw mut upscale).cast(), std::ptr::null()) };
+    }
+    if r == OK && framegen::enabled() {
+        // SAFETY: a successful create wrote the handle.
+        framegen::register(unsafe { *context }, upscale.flags);
+    }
     let provider = provider_name(context);
     tracing::info!(
         render = ?upscale.max_render, upscale = ?upscale.max_upscale, flags = upscale.flags, result = r, provider,
         "ffx: upscale context on the host GPU"
     );
     r
+}
+
+fn log_versions(api: &Api, device: *mut c_void, kind: u64, effect: &str) {
+    let mut count = 0;
+    let mut query = GetVersions {
+        kind: QUERY_GET_VERSIONS,
+        next: std::ptr::null_mut(),
+        create_kind: kind,
+        device,
+        count: &mut count,
+        ids: std::ptr::null_mut(),
+        names: std::ptr::null_mut(),
+    };
+    // SAFETY: the documented contextless version query writes the required array length.
+    let status = unsafe { (api.query)(std::ptr::null_mut(), (&raw mut query).cast()) };
+    if status != OK || count == 0 || count > 64 {
+        tracing::info!(effect, count, status, "ffx: provider enumeration unavailable");
+        return;
+    }
+    let mut names = vec![std::ptr::null::<i8>(); count as usize];
+    query.names = names.as_mut_ptr();
+    // SAFETY: the SDK fills up to the count it returned, and names are its own strings.
+    let status = unsafe { (api.query)(std::ptr::null_mut(), (&raw mut query).cast()) };
+    if status == OK {
+        let providers: Vec<_> = names
+            .into_iter()
+            .take(count as usize)
+            .filter(|p| !p.is_null())
+            .map(|p| {
+                // SAFETY: the successful query returned a nul-terminated provider name.
+                unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()
+            })
+            .collect();
+        tracing::info!(effect, ?providers, "ffx: available PC providers");
+    }
 }
 
 /// The upscaler version the loader chose for a context, for the log.
@@ -284,6 +354,10 @@ pub extern "C" fn ffxDestroyContext(
     _memory: *const c_void,
 ) -> ReturnCode {
     let Some(api) = api() else { return ERROR };
+    if framegen::enabled() && !context.is_null() {
+        // SAFETY: the caller owns a live context slot.
+        framegen::forget(unsafe { *context });
+    }
     // SAFETY: a context this module created.
     unsafe { (api.destroy)(context, std::ptr::null()) }
 }
@@ -399,6 +473,12 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
     let Some(list) = crate::list::host_list(title_list) else {
         return ERROR_PARAMETER;
     };
+    let geometry = framegen::enabled().then(|| {
+        (
+            crate::resource::host_copy(d.resources[1].resource as This),
+            crate::resource::host_copy(d.resources[2].resource as This),
+        )
+    });
     for (i, r) in d.resources.iter_mut().enumerate() {
         if r.resource.is_null() {
             continue;
@@ -431,6 +511,10 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
     d.command_list = list.list.as_raw();
     // SAFETY: the SDK's call on an open host list with live textures.
     let r = unsafe { (api.dispatch)(context, (&raw const d).cast()) };
+    if r == OK && let Some((Some(depth), Some(motion))) = geometry {
+        // SAFETY: the SDK just accepted this context.
+        framegen::record(list, unsafe { *context }, &d, depth, motion);
+    }
     // The upscaler bound its own heaps, root signature and pipeline.
     crate::list::forget_host_bindings(title_list);
     static FIRST: std::sync::Once = std::sync::Once::new();
