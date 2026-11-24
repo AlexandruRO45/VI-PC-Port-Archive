@@ -16,16 +16,19 @@ ApplicationWindow {
     property int pageIndex: 0
     readonly property color paper: "#f0ece7"
     readonly property color muted: "#aaa39b"
-    readonly property color red: "#cf293c"
+    readonly property color red: "#d33649"
 
     RowLayout {
         anchors.fill: parent
         spacing: 0
 
         Rectangle {
-            Layout.preferredWidth: 82
+            Layout.preferredWidth: 86
             Layout.fillHeight: true
-            color: "#090b0e"
+            gradient: Gradient {
+                GradientStop { position: 0.0; color: "#101114" }
+                GradientStop { position: 1.0; color: "#08090b" }
+            }
             border.color: "#292b2e"
             border.width: 1
 
@@ -40,7 +43,9 @@ ApplicationWindow {
                     width: 52
                     height: 58
                     radius: 8
-                    color: window.pageIndex === 0 ? "#21171a" : "#131518"
+                    color: window.pageIndex === 0 ? "#24171c" : "#151619"
+                    border.color: window.pageIndex === 0 ? "#493039" : "#2c2d30"
+                    border.width: 1
                     Text {
                         anchors.centerIn: parent
                         text: "VI"
@@ -82,8 +87,10 @@ ApplicationWindow {
                         height: 54
                         Rectangle {
                             anchors.fill: parent
-                            radius: 7
-                            color: window.pageIndex === modelData.page ? "#21171a" : navMouse.containsMouse ? "#191a1d" : "transparent"
+                            radius: 9
+                            color: window.pageIndex === modelData.page ? "#24171c" : navMouse.containsMouse ? "#191a1d" : "transparent"
+                            border.color: window.pageIndex === modelData.page ? "#493039" : "transparent"
+                            border.width: 1
                         }
                         Rectangle {
                             visible: window.pageIndex === modelData.page
@@ -195,23 +202,43 @@ ApplicationWindow {
                             }
                             Item { Layout.fillWidth: true }
                             Rectangle {
-                                width: 8
-                                height: 8
-                                radius: 4
-                                color: launcher.running ? "#e1b16d" : launcher.gameExists ? "#82bd91" : "#d39c70"
-                            }
-                            Text {
-                                text: launcher.running ? "In game" : launcher.gameExists ? "Ready" : "Setup"
-                                color: "#c7c3bd"
-                                font.pixelSize: 12
+                                Layout.preferredWidth: launcher.running ? 100 : launcher.gameExists ? 80 : 82
+                                Layout.preferredHeight: 30
+                                radius: 15
+                                color: "#b5121516"
+                                border.color: "#45484a"
+                                RowLayout {
+                                    anchors.centerIn: parent
+                                    spacing: 8
+                                    Rectangle {
+                                        width: 7
+                                        height: 7
+                                        radius: 4
+                                        color: launcher.running ? "#e4b36f" : launcher.gameExists ? "#83c395" : "#e2aa76"
+                                    }
+                                    Text {
+                                        text: launcher.running ? "In session" : launcher.gameExists ? "Ready" : "Setup"
+                                        color: "#d5d0c8"
+                                        font.pixelSize: 11
+                                    }
+                                }
                             }
                         }
                         Rectangle {
                             Layout.fillWidth: true
                             Layout.topMargin: 10
-                            Layout.bottomMargin: 30
+                            Layout.bottomMargin: 22
                             height: 1
                             color: "#54c0c3c5"
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            Layout.bottomMargin: 7
+                            text: "THE STATE OF LEONIDA"
+                            color: "#e5a0a0"
+                            font.pixelSize: 10
+                            font.weight: Font.DemiBold
+                            font.letterSpacing: 2.0
                         }
                         Text {
                             Layout.fillWidth: true
@@ -295,10 +322,10 @@ ApplicationWindow {
                                 delegate: Rectangle {
                                     required property string modelData
                                     Layout.preferredWidth: 105
-                                    Layout.preferredHeight: 34
-                                    radius: 6
-                                    color: launcher.consoleModel === modelData ? "#a72635" : "#a00d1014"
-                                    border.color: launcher.consoleModel === modelData ? "#df4858" : "#4b4d50"
+                                    Layout.preferredHeight: 36
+                                    radius: 8
+                                    color: launcher.consoleModel === modelData ? "#ad2d3d" : "#b8141719"
+                                    border.color: launcher.consoleModel === modelData ? "#e25968" : "#55575a"
                                     Text {
                                         anchors.centerIn: parent
                                         text: modelData
@@ -307,6 +334,7 @@ ApplicationWindow {
                                     }
                                     MouseArea {
                                         anchors.fill: parent
+                                        cursorShape: Qt.PointingHandCursor
                                         onClicked: launcher.setConsoleModel(modelData)
                                     }
                                 }
@@ -321,53 +349,78 @@ ApplicationWindow {
                         }
                         Repeater {
                             model: [
-                                { title: "Game files & library", detail: launcher.hasGame ? "Grand Theft Auto VI  ·  Ready" : "Choose your GTA VI executable", glyph: "▣", action: "files" },
-                                { title: "Launch activity", detail: launcher.logs.length > 0 ? launcher.logs[launcher.logs.length - 1] : "Your recent local sessions", glyph: "◷", action: "activity" },
-                                { title: "Console profile", detail: launcher.consoleModel + "  ·  Change target", glyph: "⌖", action: "profile" },
-                                { title: "Launcher settings", detail: "Local data and app information", glyph: "⚙", action: "settings" }
+                                { title: "Game files & library", detail: launcher.hasGame ? "Manage your GTA VI location" : "Locate your installed GTA VI files", badge: launcher.hasGame ? "READY" : "ADD FILES", glyph: "▣", action: "files" },
+                                { title: "Launch activity", detail: "Recent activity on this PC", badge: "OPEN", glyph: "◷", action: "activity" },
+                                { title: "Console profile", detail: launcher.consoleModel + " selected for your next session", badge: "EDIT", glyph: "⌖", action: "profile" },
+                                { title: "Launcher settings", detail: "Local data and app preferences", badge: "OPEN", glyph: "⚙", action: "settings" }
                             ]
                             delegate: Rectangle {
                                 required property var modelData
                                 Layout.fillWidth: true
-                                Layout.preferredHeight: 60
-                                Layout.bottomMargin: 9
-                                radius: 7
-                                color: cardMouse.containsMouse ? "#c01b1d21" : "#a0121417"
+                                Layout.preferredHeight: 68
+                                Layout.bottomMargin: 8
+                                radius: 9
+                                color: cardMouse.containsMouse ? "#e21b1d21" : "#c4101215"
                                 border.color: modelData.action === "files" && !launcher.hasGame ? window.red : "#37393d"
                                 RowLayout {
                                     anchors.fill: parent
-                                    anchors.leftMargin: 19
-                                    anchors.rightMargin: 16
-                                    spacing: 16
-                                    Text {
-                                        text: modelData.glyph
-                                        color: "#d1cbc4"
-                                        font.pixelSize: 20
-                                        Layout.preferredWidth: 20
-                                        horizontalAlignment: Text.AlignHCenter
+                                    anchors.leftMargin: 14
+                                    anchors.rightMargin: 15
+                                    spacing: 13
+                                    Rectangle {
+                                        Layout.preferredWidth: 40
+                                        Layout.preferredHeight: 40
+                                        radius: 8
+                                        color: "#671e2024"
+                                        border.color: "#44464a"
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: modelData.glyph
+                                            color: "#d6cfc7"
+                                            font.pixelSize: 19
+                                        }
                                     }
-                                    Text {
+                                    ColumnLayout {
                                         Layout.fillWidth: true
-                                        text: modelData.title
-                                        color: window.paper
-                                        font.family: "Georgia"
-                                        font.pixelSize: 17
-                                        elide: Text.ElideRight
+                                        spacing: 3
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: modelData.title
+                                            color: window.paper
+                                            font.family: "Georgia"
+                                            font.pixelSize: 16
+                                            elide: Text.ElideRight
+                                        }
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: modelData.detail
+                                            color: "#a9a39b"
+                                            font.pixelSize: 11
+                                            elide: Text.ElideRight
+                                        }
                                     }
-                                    Text {
-                                        Layout.preferredWidth: 170
-                                        horizontalAlignment: Text.AlignRight
-                                        text: modelData.detail
-                                        color: "#afa69d"
-                                        font.pixelSize: 11
-                                        elide: Text.ElideRight
+                                    Rectangle {
+                                        Layout.preferredWidth: modelData.badge === "ADD FILES" ? 79 : 57
+                                        Layout.preferredHeight: 24
+                                        radius: 12
+                                        color: modelData.action === "files" && !launcher.hasGame ? "#43232a30" : "#351a1c1f"
+                                        border.color: modelData.action === "files" && !launcher.hasGame ? "#a04a535a" : "#583a3c40"
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: modelData.badge
+                                            color: modelData.action === "files" && !launcher.hasGame ? "#edc2a7" : "#bcb5ac"
+                                            font.pixelSize: 9
+                                            font.weight: Font.DemiBold
+                                            font.letterSpacing: 0.8
+                                        }
                                     }
-                                    Text { text: "›"; color: "#d6d0c8"; font.pixelSize: 24 }
+                                    Text { text: "›"; color: cardMouse.containsMouse ? "#f0d3c5" : "#8f8983"; font.pixelSize: 23 }
                                 }
                                 MouseArea {
                                     id: cardMouse
                                     anchors.fill: parent
                                     hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
                                     onClicked: {
                                         if (modelData.action === "files") launcher.browse()
                                         else if (modelData.action === "activity") window.pageIndex = 1
