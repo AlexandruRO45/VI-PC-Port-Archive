@@ -1043,6 +1043,7 @@ impl State {
         };
         if !ran {
             crate::indirect::done(list, &args.buffer);
+            list.note_shadow_state(&args, 0x8);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
