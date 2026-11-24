@@ -697,6 +697,7 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::buffer_format;
     use crate::gfx10::{Fields, Operand, decode};
 
     /// Text of each instruction in `words` (a straight-line program).
@@ -961,5 +962,96 @@ mod tests {
         };
         assert_eq!(data, Operand::Vector { reg: 8, dwords: 2 });
         assert_eq!(addr.len(), 2);
+    }
+
+    /// Scalar operand codes name their registers at every boundary: the last
+    /// SGPR, both VCC halves, the trap temporaries, m0, null and both EXEC
+    /// halves; a pair at VCC or EXEC takes the whole-register name, and SGPR
+    /// and trap temporary ranges keep their own numbering.
+    #[test]
+    fn scalar_codes_name_each_register_at_its_bounds() {
+        let s = |code: u8, dwords: u8| Operand::Scalar { code, dwords }.to_string();
+        let names: Vec<String> = [0, 105, 106, 107, 108, 123, 124, 125, 126, 127]
+            .into_iter()
+            .map(|code| s(code, 1))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "s0", "s105", "vcc_lo", "vcc_hi", "ttmp0", "ttmp15", "m0", "null", "exec_lo",
+                "exec_hi"
+            ]
+        );
+        assert_eq!(s(106, 2), "vcc");
+        assert_eq!(s(126, 2), "exec");
+        assert_eq!(s(104, 2), "s[104:105]");
+        assert_eq!(s(0, 16), "s[0:15]");
+        assert_eq!(s(108, 4), "ttmp[0:3]");
+        assert_eq!(s(120, 4), "ttmp[12:15]");
+    }
+
+    /// Inline constants: 0-64 and -1 to -16 at both ends of their codes, the
+    /// float constants including 1/(2*pi), the special sources, and codes in
+    /// no range (the gap after -16, 249-250, the literal's 255) as a marked
+    /// raw code rather than a misleading number.
+    #[test]
+    fn inline_constants_name_each_range_at_its_bounds() {
+        let c = |code: u8| Operand::Const(code).to_string();
+        assert_eq!(
+            (c(128), c(129), c(192)),
+            ("0".into(), "1".into(), "64".into())
+        );
+        assert_eq!((c(193), c(208)), ("-1".into(), "-16".into()));
+        let floats: Vec<String> = (240..=248).map(c).collect();
+        assert_eq!(
+            floats,
+            [
+                "0.5",
+                "-0.5",
+                "1.0",
+                "-1.0",
+                "2.0",
+                "-2.0",
+                "4.0",
+                "-4.0",
+                "0.15915494"
+            ]
+        );
+        let special: Vec<String> = [235, 236, 237, 238, 239, 251, 252, 253, 254]
+            .into_iter()
+            .map(c)
+            .collect();
+        assert_eq!(
+            special,
+            [
+                "src_shared_base",
+                "src_shared_limit",
+                "src_private_base",
+                "src_private_limit",
+                "src_pops_exiting_wave_id",
+                "src_vccz",
+                "src_execz",
+                "src_scc",
+                "src_lds_direct"
+            ]
+        );
+        for code in [209, 234, 249, 250, 255] {
+            assert_eq!(c(code), format!("<src {code}>"));
+        }
+    }
+
+    /// Buffer formats name every entry of the table from INVALID to the last
+    /// four-channel float, and a format past the table stays a bare number.
+    #[test]
+    fn buffer_formats_name_the_table_and_number_the_rest() {
+        assert_eq!(buffer_format(0), "BUF_FMT_INVALID");
+        assert_eq!(buffer_format(1), "BUF_FMT_8_UNORM");
+        assert_eq!(buffer_format(22), "BUF_FMT_32_FLOAT");
+        assert_eq!(buffer_format(77), "BUF_FMT_32_32_32_32_FLOAT");
+        assert_eq!(buffer_format(78), "78");
+        assert_eq!(buffer_format(127), "127");
+        // Every named entry is distinct, so no format reads as another.
+        let names: std::collections::HashSet<String> = (0..78).map(buffer_format).collect();
+        assert_eq!(names.len(), 78);
     }
 }
