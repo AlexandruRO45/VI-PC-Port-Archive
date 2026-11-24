@@ -1027,9 +1027,13 @@ impl<'a> Lanes<'a> {
             "cselect" => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
                 let scc = inst.read(Reg::Scc)?;
-                let born = self.born(scc);
-                let u = self.b.atom(Atom::Uniform(scc), born);
-                (self.b.ite(u, a, c), None)
+                if self.clear_scc_on_exec_exit(scc, inst) {
+                    (c, None)
+                } else {
+                    let born = self.born(scc);
+                    let u = self.b.atom(Atom::Uniform(scc), born);
+                    (self.b.ite(u, a, c), None)
+                }
             }
             _ => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
@@ -1043,6 +1047,45 @@ impl<'a> Lanes<'a> {
             derived,
             scc,
         })
+    }
+
+    /// `andn2_wrexec` sets SCC from the new EXEC. It must be clear in
+    /// the single-predecessor fallthrough of the matching EXECNZ loop.
+    fn clear_scc_on_exec_exit(&self, scc: Value, at: &Inst) -> bool {
+        let Some(&(latch, i)) = self.defs.get(&scc) else {
+            return false;
+        };
+        let b = &self.p.blocks[latch];
+        let Exit::Branch { taken, not_taken } = b.exit else {
+            return false;
+        };
+        let exit = &self.p.blocks[not_taken];
+        if self.index[taken] > self.index[latch]
+            || exit.preds.as_slice() != [latch]
+            || !exit
+                .insts
+                .iter()
+                .any(|candidate| std::ptr::eq(candidate, at))
+        {
+            return false;
+        }
+        let [write, branch] = &b.insts[i..] else {
+            return false;
+        };
+        let expected = if self.p.wave64 {
+            "s_andn2_wrexec_b64"
+        } else {
+            "s_andn2_wrexec_b32"
+        };
+        let same = |reg| {
+            write
+                .write(reg)
+                .is_some_and(|v| branch.read(reg) == Some(v))
+        };
+        write.name() == expected
+            && branch.name() == "s_cbranch_execnz"
+            && same(Reg::S(EXEC))
+            && (!self.p.wave64 || same(Reg::S(EXEC + 1)))
     }
 
     fn combine(&mut self, f: &str, a: Bool, c: Bool) -> Option<Bool> {
@@ -1495,6 +1538,35 @@ mod tests {
             s.bools.node(when),
             Some((Atom::Lane(_), Bool::TRUE, Bool::FALSE))
         ));
+    }
+
+    #[test]
+    fn scc_is_clear_only_at_the_matching_execnz_fallthrough() {
+        let words = [
+            0xbe83_037e, // save EXEC
+            0xbe9c_037e, // remaining lanes
+            0x7e3a_0507, // v_readfirstlane_b32 s29, v7
+            0x7da4_0e1d, // v_cmpx_eq_u32 exec_lo, s29, v7
+            0xbe9c_471c, // s_andn2_wrexec_b32 s28, s28
+            0xbf89_fffc, // s_cbranch_execnz back to v_readfirstlane
+            0xbefe_0303, // restore EXEC
+            0x8503_807e, // s_cselect_b32 s3, exec_lo, 0
+            0xd501_0001,
+            256 | (256 << 9) | (3 << 18),
+            S_ENDPGM,
+        ];
+        let p = build(&words, false);
+        let select = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "s_cselect_b32")
+            .unwrap();
+        let result = select.write(Reg::S(3)).unwrap();
+        assert_eq!(
+            structure(&p).unwrap().masks.get(&result),
+            Some(&Bool::FALSE)
+        );
     }
 
     #[test]
