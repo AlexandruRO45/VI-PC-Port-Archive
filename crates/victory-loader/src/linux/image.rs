@@ -19,6 +19,7 @@ use crate::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, ImportResolver, Provenance, 
 
 const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const SCN_MEM_WRITE: u32 = 0x8000_0000;
+const SCN_MEM_READ: u32 = 0x4000_0000;
 /// The Windows allocation granularity: every image base is a multiple.
 const GRANULE: usize = 0x1_0000;
 /// `PAGE_EXECUTE_WRITECOPY`: what `VirtualQuery` reports as an image's
@@ -176,8 +177,8 @@ pub fn load(original: &[u8], path: &Path) -> Result<LoadedImage> {
         info,
         tls_index,
     };
-    loaded.protect(headers);
     vm::adopt(base, size, PAGE_EXECUTE_WRITECOPY);
+    loaded.protect(headers);
     seh::register_image(base, size);
     // The exe: `GetModuleHandle(NULL)` and new threads' default stack.
     if !loaded.info.is_dll() {
@@ -245,6 +246,20 @@ fn relocate(image: &mut [u8], original: &[u8], delta: u64) -> Result<()> {
         at += block;
     }
     Ok(())
+}
+
+/// What `VirtualQuery` reports for a section, as on Windows: writable
+/// image pages are copy-on-write until written.
+fn windows_protection(characteristics: u32) -> u32 {
+    match (
+        characteristics & SCN_MEM_EXECUTE != 0,
+        characteristics & SCN_MEM_WRITE != 0,
+    ) {
+        (true, true) => PAGE_EXECUTE_WRITECOPY,
+        (true, false) => 0x20, // PAGE_EXECUTE_READ
+        (false, true) => 0x08, // PAGE_WRITECOPY
+        (false, false) => 0x02, // PAGE_READONLY
+    }
 }
 
 fn native_protection(characteristics: u32) -> libc::c_int {
@@ -480,13 +495,16 @@ impl LoadedImage {
             .map_or(libc::PROT_READ, |s| native_protection(s.characteristics))
     }
 
-    /// Headers read-only, then each section's own protection. A page two
-    /// sections share takes the later one's.
+    /// Headers read-only, then each section's own protection, also as the
+    /// region table records it. A page two sections share takes the later
+    /// one's.
     fn protect(&self, headers: usize) {
         let page = page_size();
-        let set = |rva: usize, len: usize, prot| {
+        let set = |rva: usize, len: usize, characteristics: u32| {
+            let prot = native_protection(characteristics);
             let start = (self.base + rva) & !(page - 1);
             let end = (self.base + rva + len).next_multiple_of(page);
+            vm::adopt(start, end - start, windows_protection(characteristics));
             // SAFETY: inside our mapping of the image.
             if unsafe { libc::mprotect(start as *mut c_void, end - start, prot) } != 0 {
                 tracing::warn!(
@@ -497,7 +515,7 @@ impl LoadedImage {
                 );
             }
         };
-        set(0, headers, libc::PROT_READ);
+        set(0, headers, SCN_MEM_READ);
         let size = self.info.size_of_image as usize;
         for s in &self.info.sections {
             let rva = s.rva as usize;
@@ -506,11 +524,7 @@ impl LoadedImage {
                 vs => vs,
             } as usize;
             if rva < size && len != 0 {
-                set(
-                    rva,
-                    len.min(size - rva),
-                    native_protection(s.characteristics),
-                );
+                set(rva, len.min(size - rva), s.characteristics);
             }
         }
     }
@@ -677,6 +691,7 @@ impl LoadedImage {
     pub unsafe fn unload(self) {
         thread::unmapped(self.base);
         seh::unregister_image(self.base);
+        vm::forget(self.base);
         if let Some(index) = self.tls_index {
             tls::remove(index);
         }

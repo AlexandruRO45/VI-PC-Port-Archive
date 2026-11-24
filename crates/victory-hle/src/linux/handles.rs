@@ -417,6 +417,11 @@ impl Object for Event {
     fn as_waitable(&self) -> Option<&dyn Waitable> {
         Some(self)
     }
+
+    fn set_signal(&self, signalled: bool) -> bool {
+        if signalled { self.set() } else { self.reset() }
+        true
+    }
 }
 impl Waitable for Event {
     fn try_acquire(&self) -> bool {

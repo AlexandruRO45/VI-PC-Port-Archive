@@ -206,6 +206,11 @@ fn maps_binds_and_calls_probe_on_guest_threads() {
 
     let image = victory_loader::load_file(&probe).unwrap();
     assert_eq!(image.base() % 0x1_0000, 0);
+    // VirtualQuery sees the headers read-only and code as execute-read.
+    let protect = |rva: u32| victory_loader::linux::vm::query(image.base() + rva as usize).unwrap().protect;
+    assert_eq!(protect(0), 0x02, "PAGE_READONLY");
+    let text = image.info().sections.iter().find(|s| s.name == ".text").unwrap();
+    assert_eq!(protect(text.rva), 0x20, "PAGE_EXECUTE_READ");
     assert!(
         image.tls_index().is_some_and(|i| i >= 1),
         "a DLL never takes index 0"

@@ -313,25 +313,19 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use super::*;
     use crate::linux::kernel32_file::tests::w;
     use crate::linux::kernel32_file::{
         CREATE_ALWAYS, CreateFileW, FILE_FLAG_OVERLAPPED, GENERIC_READ, GENERIC_WRITE, ReadFile,
         WriteFile, guest_path,
     };
+    use crate::linux::handles::Event;
+    use crate::linux::kernel32_wait::WaitForSingleObject;
     use victory_loader::linux::teb::last_error;
 
-    /// Stands in for the sync slice's event.
-    #[derive(Default)]
-    struct Event(AtomicBool);
-
-    impl Object for Event {
-        fn set_signal(&self, on: bool) -> bool {
-            self.0.store(on, Ordering::SeqCst);
-            true
-        }
+    /// Whether the event behind `h` is set, without taking it.
+    fn is_set(h: usize) -> bool {
+        WaitForSingleObject(h, 0) == 0
     }
 
     /// With `VICTORY_GAME_DIR`: a file of the dump, named in upper case,
@@ -438,8 +432,7 @@ mod tests {
         );
         assert_eq!(last_error(), ERROR_INVALID_PARAMETER);
 
-        let event = Arc::new(Event::default());
-        let eh = handles::insert(event.clone());
+        let eh = handles::insert(Event::new(true, false));
         let mut ov = Overlapped {
             offset_low: 4,
             event: eh,
@@ -447,7 +440,7 @@ mod tests {
         };
         assert_eq!(WriteFile(h, b"data".as_ptr().cast(), 4, &mut n, &mut ov), 1);
         assert_eq!((n, ov.internal, ov.internal_high), (4, 0, 4));
-        assert!(event.0.load(Ordering::SeqCst));
+        assert!(is_set(eh));
         // Append at the end.
         let mut append = Overlapped {
             offset_low: u32::MAX,
@@ -488,10 +481,10 @@ mod tests {
             event: eh | 1, // no packet
             ..Default::default()
         };
-        event.0.store(false, Ordering::SeqCst);
+        handles::object(eh).unwrap().set_signal(false);
         assert_eq!(ReadFile(h, buf.as_mut_ptr().cast(), 16, &mut n, &mut ov), 1);
         assert_eq!(&buf[..n as usize], b"\0\0\0\0data!");
-        assert!(event.0.load(Ordering::SeqCst));
+        assert!(is_set(eh));
         assert_eq!(GetOverlappedResult(h, &ov, &mut bytes, 1), 1);
         assert_eq!(bytes, 9);
         let mut removed = 0;
