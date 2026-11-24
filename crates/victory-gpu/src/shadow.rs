@@ -380,6 +380,9 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        if !self.pages.is_empty() {
+            return self.update_mirrored(from, to);
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
@@ -435,6 +438,94 @@ impl Shadow {
         bytes
     }
 
+    /// Local build: [`Shadow::update_free`] for a copy in the mirror. Its pages are shared by
+    /// every copy covering them, so what was copied when is kept per page for all copies
+    /// (`MIRROR_COPIED`), and a page checked whole in this submission is not checked again by
+    /// another copy (`MIRROR_CHECKED`): the world's copies overlap, and the same 174 MB heap
+    /// was checked 20 times a frame (9 GB checked, 879 ms a frame).
+    fn update_mirrored(&self, from: usize, to: usize) -> usize {
+        let sub = SUBMISSION.load(Ordering::Relaxed);
+        let first = from / PAGE;
+        let last = (to - 1) / PAGE;
+        // runs of pages still to look at, as byte ranges cut to [from, to)
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        {
+            let checked = lock_map(&MIRROR_CHECKED);
+            for page in first..=last {
+                let (a, b) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                let whole = a == page * PAGE && b == (page + 1) * PAGE;
+                if whole && checked.get(&page) == Some(&sub) {
+                    continue;
+                }
+                match runs.last_mut() {
+                    Some(r) if r.1 == a => r.1 = b,
+                    _ => runs.push((a, b)),
+                }
+            }
+        }
+        let mut bytes = 0;
+        for (a, b) in runs {
+            bytes += self.update_run(a, b, sub);
+        }
+        bytes
+    }
+
+    /// One run of [`Shadow::update_mirrored`].
+    fn update_run(&self, from: usize, to: usize, sub: u64) -> usize {
+        let whole_pages = || (from.div_ceil(PAGE)..to / PAGE);
+        let mark = |copied_at: Option<u64>| {
+            let mut checked = lock_map(&MIRROR_CHECKED);
+            let mut copied = lock_map(&MIRROR_COPIED);
+            for page in whole_pages() {
+                checked.insert(page, sub);
+                if let Some(now) = copied_at {
+                    copied.insert(page, now);
+                }
+            }
+        };
+        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED
+            && let Some((now, written)) = crate::watch::writes(from, to, true)
+        {
+            self.watched.store(1, Ordering::Relaxed);
+            // pages written after their last copy (or never copied), as runs
+            let stale: Vec<usize> = {
+                let copied = lock_map(&MIRROR_COPIED);
+                let mut writes = written.iter().peekable();
+                let mut out = Vec::new();
+                for page in from / PAGE..=(to - 1) / PAGE {
+                    let write = match writes.peek() {
+                        Some(&&(p, w)) if p == page => {
+                            writes.next();
+                            w
+                        }
+                        _ => 0,
+                    };
+                    let at = copied.get(&page).copied().unwrap_or(0);
+                    if at == 0 || write > at {
+                        out.push(page);
+                    }
+                }
+                out
+            };
+            let mut bytes = 0;
+            let mut i = 0;
+            while i < stale.len() {
+                let mut j = i;
+                while j + 1 < stale.len() && stale[j + 1] == stale[j] + 1 {
+                    j += 1;
+                }
+                bytes += self.copy((stale[i] * PAGE).max(from), ((stale[j] + 1) * PAGE).min(to));
+                i = j + 1;
+            }
+            mark(Some(now));
+            return bytes;
+        }
+        self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+        self.copy(from, to);
+        mark(None);
+        to - from
+    }
+
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -472,6 +563,49 @@ fn changed_pieces(shadow: &Shadow, before: usize, start: usize, from: usize, to:
     // Use the persistent pool to avoid OS thread spawn overhead.
     let results = crate::host::pool_foreach_bool(&pieces, differs);
     pieces.iter().zip(results).filter_map(|(p, diff)| diff.then_some(p.0)).collect()
+}
+
+/// Local build: submissions so far (`next_submission`), and per mirror page (64 KiB title
+/// page) the submission that last checked it whole and the write-watch asking it was last
+/// copied after (see `Shadow::update_mirrored`).
+static SUBMISSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static MIRROR_CHECKED: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
+static MIRROR_COPIED: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
+
+/// A new submission begins: pages must be checked again.
+pub(crate) fn next_submission() {
+    SUBMISSION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Local build: title memory mapped anew: its pages are stale for every copy.
+pub(crate) fn mirror_pages_remapped(at: usize, len: usize) {
+    let (first, last) = (at / PAGE, (at + len.max(1) - 1) / PAGE);
+    let mut copied = lock_map(&MIRROR_COPIED);
+    let mut checked = lock_map(&MIRROR_CHECKED);
+    for page in first..=last {
+        copied.remove(&page);
+        checked.remove(&page);
+    }
+}
+
+struct MapGuard<'a>(std::sync::MutexGuard<'a, Option<std::collections::HashMap<usize, u64>>>);
+impl std::ops::Deref for MapGuard<'_> {
+    type Target = std::collections::HashMap<usize, u64>;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("made")
+    }
+}
+impl std::ops::DerefMut for MapGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("made")
+    }
+}
+fn lock_map(m: &'static Mutex<Option<std::collections::HashMap<usize, u64>>>) -> MapGuard<'static> {
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    if g.is_none() {
+        *g = Some(std::collections::HashMap::new());
+    }
+    MapGuard(g)
 }
 
 struct Entry {
