@@ -135,6 +135,29 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     kept
 }
 
+/// The DXIL `VICTORY_DXIL_OVERRIDE` names for `hash`, if any.
+fn override_for(hash: &str) -> Option<Vec<u8>> {
+    let spec = std::env::var_os("VICTORY_DXIL_OVERRIDE")?;
+    let spec = spec.to_string_lossy().into_owned();
+    for pair in spec.split(',') {
+        let (want, path) = pair.split_once('=')?;
+        if want.trim() != hash {
+            continue;
+        }
+        match std::fs::read(path.trim()) {
+            Ok(bytes) => {
+                tracing::info!(hash, path = path.trim(), bytes = bytes.len(), "dxil override");
+                return Some(bytes);
+            }
+            Err(e) => {
+                tracing::warn!(hash, path = path.trim(), error = %e, "dxil override unreadable");
+                return None;
+            }
+        }
+    }
+    None
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
@@ -172,7 +195,17 @@ impl Shader {
             .get_or_init(|| {
                 #[cfg(feature = "diagnostics")]
                 let started = std::time::Instant::now();
-                let done = translate(&self.container);
+                let mut done = translate(&self.container);
+                // `VICTORY_DXIL_OVERRIDE=<hash>=<path>[,<hash>=<path>]`: run a
+                // candidate module in place of the one this container translated
+                // to. The bisect's editor is `dxc.exe` and its judge is the
+                // create, and both need the *real* root signature and state, which
+                // are built from the container — so only the code bytes change.
+                if let Ok(t) = &mut done {
+                    if let Some(bytes) = override_for(&self.hash) {
+                        t.host.dxil = bytes;
+                    }
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     worked = started.elapsed();
