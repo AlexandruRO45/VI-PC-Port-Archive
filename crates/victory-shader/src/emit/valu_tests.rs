@@ -943,7 +943,8 @@ fn v_cmp_class_f16_matches_rdna2() {
 }
 
 /// Indexed vector loads from a CBV, stored to a raw UAV for comparison with host data.
-fn build_indexed_cbv_cs(byte_offset: u16, dynamic: bool) -> HostShader {
+fn build_indexed_cbv_cs(load_op: u32, byte_offset: u16, dynamic: bool) -> HostShader {
+    let store_op = load_op + 16; // The matching dword width in the MUBUF store opcodes.
     let mut words = vec![s_mov_b32(1, 0x80), s_mov_b32(3, 0x80)];
     words.extend(s_load_dwordx4(8, 0));
     words.extend(s_load_dwordx4(12, 2));
@@ -954,10 +955,10 @@ fn build_indexed_cbv_cs(byte_offset: u16, dynamic: bool) -> HostShader {
         vop1(1, 3, sgpr(5)), // v_mov_b32 v3, s5; group ID
         0x3406_0689,         // v_lshlrev_b32 v3, 9, v3; output group base
         0x4a04_0503,         // v_add_nc_u32 v2, v3, v2
-        0xE038_2000 | (u32::from(dynamic) << 12) | u32::from(byte_offset),
-        0x8002_0400, // buffer_load_dwordx4 v[4:7], v0 or v[0:1], s[8:11]
-        0xE078_1000,
-        0x8003_0402, // buffer_store_dwordx4 v[4:7], v2, s[12:15], 0 offen
+        0xE000_2000 | (load_op << 18) | (u32::from(dynamic) << 12) | u32::from(byte_offset),
+        0x8002_0400, // buffer_load_dword[xN] v4..., v0 or v[0:1], s[8:11]
+        0xE000_1000 | (store_op << 18),
+        0x8003_0402, // buffer_store_dword[xN] v4..., v2, s[12:15], 0 offen
         S_ENDPGM,
     ]);
     let native = NativeProgram {
@@ -1014,11 +1015,28 @@ fn build_indexed_cbv_cs(byte_offset: u16, dynamic: bool) -> HostShader {
 
 #[test]
 fn indexed_cbv_loads_match_their_byte_addresses() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let input: Vec<u32> = (0u32..192)
         .map(|i| (i + 1).wrapping_mul(0x91de_2f71).rotate_left(i % 32))
         .collect();
-    let variants = [(0, false), (16, false), (12, false), (0, true)]
-        .map(|(offset, dynamic)| (offset, dynamic, build_indexed_cbv_cs(offset, dynamic)));
+    // The opcode order is dword, dwordx2, dwordx4, dwordx3.
+    let variants = [(12, 1), (13, 2), (15, 3), (14, 4)]
+        .into_iter()
+        .flat_map(|(op, count)| {
+            (0..=28)
+                .step_by(4)
+                .map(|offset| (offset, false))
+                .chain([(0, true)])
+                .map(move |(offset, dynamic)| {
+                    (
+                        count,
+                        offset,
+                        dynamic,
+                        build_indexed_cbv_cs(op, offset, dynamic),
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
     let mut ran = false;
 
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -1027,7 +1045,7 @@ fn indexed_cbv_loads_match_their_byte_addresses() {
             continue;
         };
         ran = true;
-        for (offset, dynamic, shader) in &variants {
+        for (count, offset, dynamic, shader) in &variants {
             let (root, pso) = host.compute_pipeline(shader).expect("compute pipeline");
             let byte_offsets: &[u32] = if *dynamic { &[0, 4, 12, 16] } else { &[0] };
             for &dynamic_offset in byte_offsets {
@@ -1054,12 +1072,16 @@ fn indexed_cbv_loads_match_their_byte_addresses() {
                     .expect("compute dispatch");
                 let dword = (usize::from(*offset) + dynamic_offset as usize) / 4;
                 assert_eq!(actual[0].len(), 256);
-                for group in actual[0].as_chunks::<128>().0 {
-                    assert_eq!(
-                        group.as_slice(),
-                        &input[dword..dword + 128],
-                        "{label}: offset {dword}"
-                    );
+                for (group_index, group) in actual[0].as_chunks::<128>().0.iter().enumerate() {
+                    for (lane, got) in group.as_chunks::<4>().0.iter().enumerate() {
+                        let first = lane * 4 + dword;
+                        assert_eq!(
+                            &got[..*count],
+                            &input[first..first + count],
+                            "{label}: {count} dwords at byte offset {} + {dynamic_offset}, group {group_index}, lane {lane}",
+                            offset
+                        );
+                    }
                 }
             }
         }
