@@ -163,7 +163,7 @@ pub(crate) extern "system" fn wait(
         timeout_ms,
         flags,
         hr,
-        tick,
+        tick = _tick,
         wait_us = wait.as_micros() as u64,
         frame = current(),
         "frame wait"
