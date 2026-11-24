@@ -3,6 +3,7 @@
 //! chose ([`victory_gpu::console`]).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use crate::modules::xasync::E_NOT_SUFFICIENT_BUFFER;
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put_string,
 };
@@ -65,7 +66,7 @@ extern "system" fn console_id(_: This, size: usize, buffer: *mut u8, used: *mut 
 }
 extern "system" fn sandbox_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
     if size < SANDBOX_ID_MAX_BYTES {
-        return super::xasync::E_NOT_SUFFICIENT_BUFFER;
+        return E_NOT_SUFFICIENT_BUFFER;
     }
     put_string(SANDBOX, size, buffer, used)
 }
@@ -414,7 +415,7 @@ mod tests {
         for size in [0, 7, 15] {
             assert_eq!(
                 get(this, size, buffer.as_mut_ptr(), &mut used),
-                super::xasync::E_NOT_SUFFICIENT_BUFFER,
+                E_NOT_SUFFICIENT_BUFFER,
                 "size {size} must fail with insufficient buffer"
             );
             assert_eq!(buffer[0], 0xAA, "buffer must remain untouched on failure");
