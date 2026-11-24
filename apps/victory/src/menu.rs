@@ -9,6 +9,9 @@
 //! leaves the menu up: the window stays open until Enter, with how the run
 //! ended, so its last lines can be read.
 //!
+//! After a run that ended badly the menu names the known problems its
+//! output and crash log show (`crate::doctor`), with where each is tracked.
+//!
 //! S sets the game folder in `victory.toml`, K shows the keyboard's
 //! stand-in pad, and M switches the console model runs use (remembered).
 //! Those three follow the launcher in #1330.
@@ -892,8 +895,11 @@ fn run_game(p: Paint, exe: &Path, data_dir: &Path, model: Model, input: &mut imp
         exe.display(),
         p.rgb(model.name(), DIM)
     );
-    let status = std::env::current_exe()
-        .and_then(|me| sparing_the_menu(|| run_command(&me, exe, model).status()));
+    let before = crate::doctor::crash_logs(data_dir);
+    let (status, said) = match std::env::current_exe() {
+        Ok(me) => sparing_the_menu(|| run_captured(run_command(&me, exe, model))),
+        Err(e) => (Err(e), String::new()),
+    };
     let (mark, text) = match status {
         Ok(s) => {
             let (status, text) = ended(s.code());
@@ -909,7 +915,74 @@ fn run_game(p: Paint, exe: &Path, data_dir: &Path, model: Model, input: &mut imp
         ),
     };
     println!("\n  {mark} {text}");
+    let crashed = crate::doctor::crash_text_since(data_dir, &before);
+    let found = crate::doctor::diagnose(&format!("{said}\n{crashed}"));
+    if !found.is_empty() {
+        print!("{}", findings_text(p, &found, console_columns()));
+    }
     pause(p, input);
+}
+
+/// Most of a run's error output the menu keeps for the doctor (its end,
+/// where a run says why it stopped).
+const KEPT_OUTPUT: usize = 4 << 20;
+
+/// Runs `command` with its error output (the log) shown as it comes and
+/// kept: how it ended, and the end of that output.
+fn run_captured(
+    mut command: std::process::Command,
+) -> (std::io::Result<std::process::ExitStatus>, String) {
+    use std::io::Read;
+    command.stderr(std::process::Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => return (Err(e), String::new()),
+    };
+    let stderr = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let Some(mut from) = stderr else {
+            return kept;
+        };
+        let mut out = std::io::stderr();
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = from.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            // Shown as it comes, colours and all.
+            let _ = out.write_all(&buf[..n]);
+            kept.extend_from_slice(&buf[..n]);
+            if kept.len() > KEPT_OUTPUT {
+                kept.drain(..kept.len() - KEPT_OUTPUT);
+            }
+        }
+        kept
+    });
+    let status = child.wait();
+    let kept = reader.join().unwrap_or_default();
+    (status, String::from_utf8_lossy(&kept).into_owned())
+}
+
+/// The doctor's findings after a run, as the menu shows them.
+fn findings_text(p: Paint, found: &[&crate::doctor::Known], columns: usize) -> String {
+    let mut out = format!("\n  {}\n", p.bold("What happened", SUNSET[2]));
+    let width = columns.saturating_sub(HINT_INDENT + 1);
+    for k in found {
+        out.push_str(&format!(
+            "\n  {}  {}\n",
+            p.rgb("!", WARN),
+            p.rgb(k.title, CREAM)
+        ));
+        for line in wrap(k.explain, width) {
+            out.push_str(&format!("{:HINT_INDENT$}{}\n", "", p.rgb(&line, DIM)));
+        }
+        for &n in k.links {
+            let at = crate::doctor::link(n);
+            out.push_str(&format!("{:HINT_INDENT$}{}\n", "", p.rgb(&at, SUNSET[1])));
+        }
+    }
+    out
 }
 
 /// Saves `dropped` (a folder, or a file in it) as the game folder in the
@@ -1341,6 +1414,29 @@ mod tests {
         ] {
             assert!(text.contains(row), "{row}");
         }
+    }
+
+    #[test]
+    fn after_a_run_the_known_problems_are_named_with_their_links() {
+        let found = crate::doctor::diagnose(
+            "root signature flags c01\nVIctory: exception 0x80000003 at victory-image-x.dll+0x5149aec",
+        );
+        let text = findings_text(Paint { color: false }, &found, 60);
+        assert!(text.contains("What happened"));
+        assert!(text.contains("!  Windows 10's built-in D3D12 is too old"));
+        assert!(text.contains("github.com/Marvisak/VIctory/issues/175"));
+        assert!(text.contains("instance pool is full"));
+        assert!(text.lines().all(|l| l.chars().count() <= 60), "{text}");
+    }
+
+    #[test]
+    fn a_run_shows_and_keeps_its_error_output() {
+        // A child that writes to its error output and fails (cmd's `echo`).
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "echo root signature flags c01 1>&2 & exit 3"]);
+        let (status, said) = run_captured(c);
+        assert_eq!(status.unwrap().code(), Some(3));
+        assert!(said.contains("root signature flags c01"), "{said:?}");
     }
 
     #[test]

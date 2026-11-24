@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod doctor;
 mod inspect;
 mod menu;
 mod run;
@@ -106,6 +107,10 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Name the known problems a run's log or crash log shows, in plain
+    /// words, with where each is tracked. Defaults to the data folder's
+    /// crash logs.
+    Doctor { files: Vec<PathBuf> },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -167,6 +172,7 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
+        Command::Doctor { files } => doctor::run(files),
         Command::Config => show_config(),
     }
 }
