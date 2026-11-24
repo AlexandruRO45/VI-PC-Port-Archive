@@ -350,6 +350,13 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     let attribute = attribute(inst, attr)?;
                     match (name, *src) {
                         ("v_interp_mov_f32", Operand::Const(vertex)) => {
+                            // VSRC is eight bits, but only P10, P20 and P0
+                            // name a vertex; 3 and up read no vertex at all.
+                            if vertex > 2 {
+                                return Err(ShaderError::Malformed(
+                                    "a vertex interpolation naming no vertex",
+                                ));
+                            }
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
@@ -656,6 +663,37 @@ mod tests {
         // attr1 is not in the stage data.
         let other = program(&[0xC808_0400, S_ENDPGM]); // v_interp_p1_f32 v2, v0, attr1.x
         assert!(raise(&other, &pixel(vec![TEXCOORD], 2)).is_err());
+    }
+
+    #[test]
+    fn a_vertex_interpolation_names_p10_p20_or_p0() {
+        // v_interp_mov_f32 v2, <vsrc>, attr0.x
+        let mov = |vsrc: u32| program(&[0xC80A_0000 | vsrc, S_ENDPGM]);
+        for vertex in 0..=2u8 {
+            let io = raise(&mov(vertex.into()), &pixel(vec![TEXCOORD], 2)).unwrap();
+            assert_eq!(
+                io.interps,
+                [(
+                    (0, 0),
+                    Interp::Vertex {
+                        attribute: Attribute {
+                            usage: Usage::Generic,
+                            row: 1,
+                            channel: 0,
+                            high: false
+                        },
+                        vertex
+                    }
+                )]
+            );
+        }
+        for vsrc in [3, 4, 0x80, 0xFF] {
+            assert_eq!(
+                raise(&mov(vsrc), &pixel(vec![TEXCOORD], 2)).unwrap_err(),
+                ShaderError::Malformed("a vertex interpolation naming no vertex"),
+                "vsrc {vsrc:#x}"
+            );
+        }
     }
 
     #[test]
