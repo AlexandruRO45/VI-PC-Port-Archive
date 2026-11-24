@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -53,6 +54,25 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                // Which group barriers wait is part of the translation too.
+                bytes.push(victory_shader::emit::group_sync());
+                // So are the switches that pick the form of a wave64 program:
+                // without them here a run with `VICTORY_WAVE_WIDE=0` was
+                // served the translations an earlier run of the same
+                // executable had cached with the switch unset.
+                for name in [
+                    "VICTORY_WAVE_WIDE",
+                    "VICTORY_WAVE_DEEP_SKIPS",
+                    "VICTORY_WAVE_OWN_BITS",
+                    "VICTORY_F16_NEAREST",
+                ] {
+                    bytes.extend_from_slice(name.as_bytes());
+                    bytes.push(b'=');
+                    if let Some(value) = std::env::var_os(name) {
+                        bytes.extend_from_slice(value.as_encoded_bytes());
+                    }
+                    bytes.push(0);
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -131,7 +151,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH1";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -206,15 +226,22 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    word(&mut out, s.root_cbvs.len() as u32);
-    out.extend(&s.root_cbvs);
-    word(&mut out, s.root_srvs.len() as u32);
-    for &reg in &s.root_srvs {
-        word(&mut out, u32::from(reg));
+    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
+        word(&mut out, slots.len() as u32);
+        out.extend(slots);
     }
-    word(&mut out, s.root_uavs.len() as u32);
-    out.extend(&s.root_uavs);
-    word(&mut out, u32::from(s.stride_table));
+    word(&mut out, s.root_indexed_views.len() as u32);
+    for view in &s.root_indexed_views {
+        for value in [
+            u32::from(view.table_slot),
+            u32::from(view.constant_slot),
+            view.constant_dword,
+            view.byte_offset,
+            u32::from(view.shift),
+        ] {
+            word(&mut out, value);
+        }
+    }
     out
 }
 
@@ -270,13 +297,19 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         });
     }
     let root_cbvs = r.list()?;
-    let n = r.word()? as usize;
-    let mut root_srvs = Vec::with_capacity(n.min(256));
-    for _ in 0..n {
-        root_srvs.push(u16::try_from(r.word()?).ok()?);
-    }
+    let root_srvs = r.list()?;
     let root_uavs = r.list()?;
-    let stride_table = r.word()? != 0;
+    let n = r.word()? as usize;
+    let mut root_indexed_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        root_indexed_views.push(RootIndexedView {
+            table_slot: u8::try_from(r.word()?).ok()?,
+            constant_slot: u8::try_from(r.word()?).ok()?,
+            constant_dword: r.word()?,
+            byte_offset: r.word()?,
+            shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
+        });
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -286,7 +319,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
-        stride_table,
+        root_indexed_views,
     })
 }
 
@@ -314,7 +347,13 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![1],
-            stride_table: true,
+            root_indexed_views: vec![RootIndexedView {
+                table_slot: 1,
+                constant_slot: 2,
+                constant_dword: 3,
+                byte_offset: 32,
+                shift: 5,
+            }],
         }
     }
 

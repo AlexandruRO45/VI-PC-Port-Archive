@@ -845,27 +845,13 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
-/// nothing says that is required. What it did not fill is zeroed by
-/// [`into_destination`], not left as the title had it.
+/// nothing says that is required.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
     miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
         .map_err(|status| {
             tracing::debug!(?status, "dstorage: zlib stream");
             INVALID_DATA
         })
-}
-
-/// Warns about the first stage that filled less than the destination it was
-/// given; the rest is then zeroed.
-fn short(filled: usize, len: usize) {
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if filled < len && !WARNED.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            filled,
-            len,
-            "dstorage: a stream ended short of its destination"
-        );
-    }
 }
 
 /// The BCPack format's constant tables, parsed once for the process. If
@@ -969,13 +955,7 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        let n = fill(out)?.min(len);
-        // The console's decompressor fills its whole destination: what this
-        // one did not is zeroed, not left as the title had it (a block it
-        // reuses still holds -1, and the title reads whole resources).
-        short(n, len);
-        out[n..].fill(0);
-        return Ok(());
+        return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,
@@ -989,18 +969,23 @@ fn into_destination(
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        let n = fill(window.bytes())?.min(len);
-        short(n, len);
-        window.bytes()[n..].fill(0);
-        return Ok(());
+        return fill(window.bytes()).map(drop);
     }
     let mut data = vec![0; len];
-    let n = fill(&mut data)?.min(len);
-    short(n, len);
-    // The whole destination, its unfilled tail zeroed by `data`'s.
-    if super::xmem::write_physical(pages, offset, &data) {
+    let n = fill(&mut data)?;
+    if super::xmem::write_physical(pages, offset, &data[..n]) {
         Ok(())
     } else {
+        // Said aloud: Grand Theft Auto VI never reads a request's result
+        // (it only polls for completion), so a destination left unwritten
+        // is a model or texture that silently holds whatever its pages
+        // held before.
+        tracing::warn!(
+            offset,
+            len,
+            pages = pages.len(),
+            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+        );
         Err(E_INVALIDARG)
     }
 }
@@ -1565,82 +1550,6 @@ mod tests {
             );
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
-        assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
-    }
-
-    #[test]
-    fn a_short_stream_zeroes_the_destination_it_did_not_fill() {
-        use crate::modules::xmem;
-        let plain = pattern(1000);
-        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
-        let (queue, array) = (new_queue(1), status_array(1));
-        let size = plain.len() + 900;
-
-        // In place: the bytes after the stream must not stay as the title
-        // left them (a fresh block holds whatever it holds, often -1).
-        let mut out = vec![0xEEu8; size];
-        let r = request(
-            ZLIB | MEMORY_SOURCE,
-            out.as_mut_ptr().cast(),
-            size,
-            packed.as_ptr().cast(),
-            0,
-            packed.len(),
-        );
-        enqueue(queue, &r);
-        enqueue_status(queue, array, 0);
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(out[..plain.len()], plain[..]);
-        assert!(out[plain.len()..].iter().all(|&b| b == 0), "stale tail");
-
-        // Pages of two allocations, which `write_physical` copies: the same
-        // whole destination.
-        let allocate = |n: usize| {
-            let (mut pages, mut given) = (vec![0usize; n], n);
-            assert_eq!(
-                xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()),
-                1
-            );
-            pages
-        };
-        let (a, b) = (allocate(1), allocate(1));
-        let mapped = xmem::XMemVirtualAlloc(
-            std::ptr::null_mut(),
-            2 * PAGE,
-            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
-            0,
-            0x04,
-        );
-        assert!(!mapped.is_null());
-        let pages = [a[0], b[0]];
-        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()), mapped);
-        // SAFETY: both pages are mapped read-write.
-        let seen = unsafe { std::slice::from_raw_parts_mut(mapped.cast::<u8>(), 2 * PAGE) };
-        seen.fill(0xEE);
-        let r = request(
-            ZLIB | PAGE_DESTINATION | MEMORY_SOURCE,
-            (pages.as_ptr() as *mut usize).cast(),
-            size,
-            packed.as_ptr().cast(),
-            0,
-            packed.len(),
-        );
-        enqueue(queue, &r);
-        enqueue_status(queue, array, 0);
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(seen[..plain.len()], plain[..]);
-        let stale = seen[plain.len()..size]
-            .iter()
-            .filter(|&&b| b == 0xEE)
-            .count();
-        assert!(stale == 0, "the page tail kept {stale} stale bytes");
-        assert_eq!(
-            xmem::XMemMapPhysicalPages(mapped, 2, std::ptr::null()),
-            mapped
-        );
-        assert_eq!(xmem::XMemFreePhysicalPages(1, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
 }
