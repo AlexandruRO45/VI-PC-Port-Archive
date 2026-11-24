@@ -252,8 +252,9 @@ fn dump_on() -> bool {
 /// the title's own picture. `VICTORY_SHOW_TARGET=busiest`: the displayable
 /// target (8-bit, 10-bit or 16-bit float colour, 16:9, at least 1280 wide) bound
 /// most often (render-target binds and UAV uses, not draws), usually a G-buffer layer
-/// in a world frame, picked once and shown for the rest of the run, until the
-/// title releases it (see [`LATCHED`]). Only textures the swap chain copy can take
+/// in a world frame, picked once and kept (see [`LATCHED`]) until the title
+/// releases it or, at a check every 64 frames, another displayable target is
+/// bound more than twice as often (so a menu pick gives way to the world). Only textures the swap chain copy can take
 /// (single-sampled 2D, one mip level, one array slice) are shown, in either mode. A debugging
 /// view: it shows a buffer as it is (a G-buffer layer unlit, say), not a
 /// finished picture.
@@ -332,6 +333,7 @@ pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTe
         binds
     };
     let logged = frame.is_power_of_two() && frame >= 256;
+    let recheck = logged || frame.is_multiple_of(64);
     if let Show::Index(n) = show
         && !logged
     {
@@ -344,7 +346,7 @@ pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTe
             .map(|(_, c)| c.clone());
     }
     if let Show::Busiest = show
-        && !logged
+        && !recheck
         && let Some(kept) = kept(&mut LATCHED.lock().unwrap_or_else(|e| e.into_inner()))
     {
         return Some(kept);
@@ -371,22 +373,38 @@ pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTe
             .map(|_| targets[n].1.clone()),
         Show::Busiest => {
             let mut latched = LATCHED.lock().unwrap_or_else(|e| e.into_inner());
+            let best = busiest(&seen);
             if let Some(kept) = kept(&mut latched) {
-                return Some(kept);
+                let kept_binds = targets
+                    .iter()
+                    .position(|(_, c)| std::sync::Arc::ptr_eq(c, &kept))
+                    .map_or(0, |i| seen[i].1);
+                match best {
+                    Some(i) if repick(kept_binds, seen[i].1) => {}
+                    _ => return Some(kept),
+                }
             }
-            let i = busiest(&seen)?;
+            let i = best?;
             let d = &seen[i].0;
             tracing::info!(
                 frame,
                 width = d.Width,
                 height = d.Height,
                 format = d.Format.0,
-                "VICTORY_SHOW_TARGET=busiest: showing this target until the title releases it"
+                binds = seen[i].1,
+                "VICTORY_SHOW_TARGET=busiest: showing this target"
             );
             *latched = Some(targets[i].1.clone());
             latched.clone()
         }
     }
+}
+
+/// Whether show mode `busiest` gives up its latched target (bound
+/// `kept` times this frame) for one bound `best` times: only for one bound
+/// more than twice as often, and often enough to be a frame's main target.
+fn repick(kept: u32, best: u32) -> bool {
+    best >= 8 && best > kept.saturating_mul(2)
 }
 
 /// What show mode `busiest` may show: a texture the swap chain copy takes,
@@ -798,6 +816,17 @@ mod tests {
         // Too small or no target displayable: none.
         assert_eq!(super::busiest(&[(screen(1024, 576, 28), 3)]), None);
         assert_eq!(super::busiest(&[]), None);
+    }
+
+    #[test]
+    fn a_latched_pick_gives_way_only_to_a_much_busier_one() {
+        // The world's G-buffer against a menu target latched at frame 2.
+        assert!(super::repick(3, 400));
+        assert!(super::repick(0, 8), "the latched target not bound this frame");
+        assert!(!super::repick(0, 7), "too few binds to be a frame's main target");
+        assert!(!super::repick(200, 400), "not more than twice");
+        assert!(super::repick(200, 401));
+        assert!(!super::repick(u32::MAX, u32::MAX));
     }
 
     #[test]

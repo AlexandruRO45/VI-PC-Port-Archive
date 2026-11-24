@@ -621,10 +621,15 @@ impl State {
     }
 
     /// Diagnostics (`VICTORY_PRODUCERS=1`): what the dropped draw or
-    /// dispatch bound now would have written, for [`crate::producers`].
+    /// dispatch bound now would have written, for [`crate::producers`];
+    /// and (`VICTORY_SHOW_TARGET`) the textures it would have written
+    /// through UAVs, for the target preview, so a layer only dropped work
+    /// writes still shows in its list.
     #[cfg(feature = "diagnostics")]
     fn note_dropped_writes(&self) {
-        if !crate::producers::on() {
+        let producers = crate::producers::on();
+        let preview = crate::capture::show_index().is_some();
+        if !producers && !preview {
             return;
         }
         let mut writer = String::new();
@@ -642,11 +647,16 @@ impl State {
                 };
                 let handle = table + u64::from(u.table_offset_dwords) * 4;
                 if let Some(view) = crate::descriptor::view(handle) {
-                    crate::producers::dropped_write(&format!("{stage} {hash}"), &view);
+                    if preview && let Some(texture) = crate::producers::texture_of(&view) {
+                        crate::capture::note_target(texture as This);
+                    }
+                    if producers {
+                        crate::producers::dropped_write(&format!("{stage} {hash}"), &view);
+                    }
                 }
             }
         }
-        if !writer.starts_with("compute") {
+        if producers && !writer.starts_with("compute") {
             for &t in &self.targets {
                 crate::producers::dropped_target(&writer, t);
             }
