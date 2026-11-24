@@ -320,6 +320,29 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     out
 }
 
+/// `ranges` of `data` (offsets in order, apart) as patches of dwords
+/// (`crate::host::CARD_PATCH`), appended to `out`: the dword's index, its
+/// bytes from `data` where the ranges hold them (zero elsewhere), and the
+/// mask of those bytes. A dword two ranges share is one patch, so that no
+/// two threads of the patch write the same dword.
+pub(crate) fn dword_patches(ranges: &[(usize, usize)], data: &[u8], out: &mut Vec<[u32; 3]>) {
+    let first = out.len();
+    for &(a, b) in ranges {
+        for (at, &byte) in data[a..b].iter().enumerate().map(|(i, v)| (a + i, v)) {
+            let (dword, shift) = ((at / 4) as u32, (at % 4) * 8);
+            let (byte, mask) = (u32::from(byte) << shift, 0xFFu32 << shift);
+            let ours = out.len() > first;
+            match out.last_mut() {
+                Some(p) if ours && p[0] == dword => {
+                    p[1] |= byte;
+                    p[2] |= mask;
+                }
+                _ => out.push([dword, byte, mask]),
+            }
+        }
+    }
+}
+
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
@@ -389,7 +412,50 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_piece_of, card_span_of, dword_patches, joined, joined_piece_runs};
+
+    /// What the patch shader does with `patches` to `card` (one thread per
+    /// patch; they name distinct dwords).
+    fn apply(card: &mut [u8], patches: &[[u32; 3]]) {
+        for &[dword, value, mask] in patches {
+            let at = dword as usize * 4;
+            let old = u32::from_le_bytes(card[at..at + 4].try_into().unwrap());
+            card[at..at + 4].copy_from_slice(&((old & !mask) | (value & mask)).to_le_bytes());
+        }
+    }
+
+    /// Patches put in exactly the bytes of the ranges, as a copy per range
+    /// would, and keep every other byte as the card holds it (a flight's
+    /// writes beside them, in the same dwords too); a dword two ranges
+    /// share is one patch.
+    #[test]
+    fn patches_put_in_the_ranges_bytes_and_nothing_else() {
+        const N: usize = 96;
+        let cpu: Vec<u8> = (0..N as u32).map(|i| (i * 7 + 3) as u8).collect();
+        let card0: Vec<u8> = (0..N as u32).map(|i| (i * 13 + 200) as u8).collect();
+        // Runs of one to five bytes, at every alignment; 9..10 and 11..13
+        // share dword 2, 13..14 is the next byte of the same dword's end.
+        let ranges = [(0usize, 1usize), (5, 8), (9, 10), (11, 13), (17, 22), (40, 41), (63, 64), (90, 96)];
+        let mut patches = vec![[u32::MAX; 3]];
+        dword_patches(&ranges, &cpu, &mut patches);
+        assert_eq!(patches[0], [u32::MAX; 3], "what was in `out` before is left alone");
+        let patches = &patches[1..];
+        let dwords: Vec<u32> = patches.iter().map(|p| p[0]).collect();
+        let mut distinct = dwords.clone();
+        distinct.dedup();
+        assert_eq!(dwords, distinct, "each dword once, in order");
+        assert_eq!(dwords, [0, 1, 2, 3, 4, 5, 10, 15, 22, 23]);
+        let mut card = card0.clone();
+        apply(&mut card, patches);
+        let mut copied = card0.clone();
+        for &(a, b) in &ranges {
+            copied[a..b].copy_from_slice(&cpu[a..b]);
+        }
+        assert_eq!(card, copied);
+        for p in patches {
+            assert_eq!(p[1] & !p[2], 0, "no byte outside the mask");
+        }
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -2578,6 +2644,24 @@ crate::host::copy_source_written(start + at, n);
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
         }
+    }
+
+    /// Of a copy in the card's memory: `ranges` of its CPU side (offsets,
+    /// in order and apart) as patches of dwords ([`dword_patches`]),
+    /// appended to `out`. Under the CPU side's lock, which the merges that
+    /// write it hold ([`Shadow::merge_under_writes`],
+    /// [`Shadow::card_merge_relay`]): the bytes are taken now, where a copy
+    /// takes them when the card runs it; both are the title's bytes noted
+    /// in `dirty` by then.
+    pub(crate) fn card_patches(&self, ranges: &[(usize, usize)], out: &mut Vec<[u32; 3]>) {
+        if ranges.is_empty() || self.card.is_none() {
+            return;
+        }
+        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the CPU side's mapping holds the copy's bytes; the ranges
+        // are offsets in it (`card_dirty`).
+        let data = unsafe { std::slice::from_raw_parts(self.data, self.len as usize) };
+        dword_patches(ranges, data, out);
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
