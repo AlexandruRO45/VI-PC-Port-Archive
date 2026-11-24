@@ -2132,6 +2132,71 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// A relative `core.excludesFile` is read from the top of the checkout,
+    /// wherever it is set and wherever git is run from: set in a file that
+    /// `.git/config` includes (`include.path`, itself relative to `.git`),
+    /// `rules` is the checkout's `rules`, not `.git/rules` beside the config
+    /// that names it, nor a file under the directory git is run in. So
+    /// `relative`, named in the checkout's `rules` (which also ignores
+    /// itself), is taken, while `beside`, named only in `.git/rules`, and
+    /// `sub`, named only in `sub/rules`, stay visible and are refused, left
+    /// empty. Unset, the rule is gone and `relative` is refused too.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_may_be_ignored_by_a_relative_excludes_file() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join("rules"), "/relative/\n/rules\n").unwrap();
+        std::fs::write(root.join(".git/rules"), "/beside/\n").unwrap();
+        std::fs::write(
+            root.join(".git/extra.config"),
+            "[core]\n\texcludesFile = rules\n",
+        )
+        .unwrap();
+        git_str(root, &["config", "include.path", "extra.config"]);
+        let relative = root.join("relative");
+        let beside = root.join("beside");
+        let sub = root.join("sub");
+        for dir in [&relative, &beside, &sub] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(sub.join("rules"), "/sub/\n*\n").unwrap();
+        let from_sub = super::git_command(root)
+            .args([
+                "-C",
+                "sub",
+                "check-ignore",
+                "--",
+                "../relative/a.rs",
+                "a.rs",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(from_sub.status.code(), Some(0));
+        assert_eq!(from_sub.stdout, b"../relative/a.rs\n");
+
+        let tmp = tempdir_in_first(root, [beside.clone(), sub.clone(), relative.clone()]);
+        assert_eq!(tmp.path().parent(), Some(relative.as_path()));
+        assert_eq!(std::fs::read_dir(&beside).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&sub).unwrap().count(), 1);
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        std::fs::write(beside.join("a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(sub.join("b.rs"), b"fn b() {}\n").unwrap();
+        assert_eq!(names(root, false), ["beside/a.rs", "sub/b.rs", "sub/rules"]);
+        drop(tmp);
+        std::fs::remove_file(sub.join("rules")).unwrap();
+        std::fs::remove_dir_all(&beside).unwrap();
+        std::fs::remove_dir_all(&sub).unwrap();
+        super::run(root, false).unwrap();
+
+        // With the included file gone (no error: a missing include is
+        // skipped), nothing names `rules`, and it and `relative` are seen.
+        std::fs::remove_file(root.join(".git/extra.config")).unwrap();
+        std::fs::write(relative.join("c.rs"), b"fn c() {}\n").unwrap();
+        assert_eq!(names(root, false), ["relative/c.rs", "rules"]);
+    }
+
     /// A TMPDIR is unseen when any directory above it is ignored, however
     /// deep: `/outer/` covers `outer/deep/er`, and a negation under it
     /// (`!/outer/deep/`) re-includes nothing, since git never looks inside
