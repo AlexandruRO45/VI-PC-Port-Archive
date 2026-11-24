@@ -22,7 +22,7 @@ class TestPeInspectGameDir(unittest.TestCase):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 rc = pe_inspect.main([str(Path(tmp) / "img.exe"), "--game-dir", str(missing), "--out", tmp])
-            self.assertEqual(rc, 1)
+            self.assertEqual(rc, 2)
             self.assertIn("does not exist", err.getvalue())
 
 
