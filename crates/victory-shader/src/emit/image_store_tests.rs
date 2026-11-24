@@ -19,6 +19,7 @@ use crate::{io, ir, resource, structure};
 const S_ENDPGM: u32 = 0xBF81_0000;
 const IMAGE_STORE: u8 = 0x08;
 const IMAGE_STORE_MIP: u8 = 0x09;
+const IMAGE_ATOMIC_ADD: u8 = 0x11;
 
 /// SOP1 `s_mov_b32 sdst, src0`.
 const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
@@ -66,12 +67,20 @@ enum Mip {
 }
 
 /// Root constants s0..s3: the fill; s4..s7: the data under test; s8, s9:
-/// the texel; s10: a mip level. s12 is the table of the texture UAV.
-fn program(dmask: u8, d16: bool, mip: Mip) -> NativeProgram {
+/// the texel; s10: a mip level. s12 is the table of the texture UAV. With
+/// `atomic`, the program first adds 0 to the texel with an image atomic
+/// through a second load of the descriptor, which shows the view is of an
+/// integer format.
+fn program(dmask: u8, d16: bool, mip: Mip, atomic: bool) -> NativeProgram {
     let mut words = vec![s_mov_b32(13, 0x80)]; // s13 = 0: the table's high dword
     words.extend(s_load_dwordx8(16, 12, 0));
     words.push(v_mov_b32(4, 8));
     words.push(v_mov_b32(5, 9));
+    if atomic {
+        words.extend(s_load_dwordx8(24, 12, 0));
+        words.push(v_mov_b32(7, 128));
+        words.extend(mimg_2d(IMAGE_ATOMIC_ADD, 7, 4, 24, 0x1, false));
+    }
     match mip {
         Mip::None => {}
         Mip::Inline(k) => words.push(v_mov_b32(6, k)),
@@ -168,8 +177,8 @@ fn lower(native: &NativeProgram) -> Result<HostShader, ShaderError> {
 }
 
 /// The program lowered and validated.
-fn build(dmask: u8, d16: bool, mip: Mip) -> HostShader {
-    let shader = lower(&program(dmask, d16, mip)).expect("lower");
+fn build(dmask: u8, d16: bool, mip: Mip, atomic: bool) -> HostShader {
+    let shader = lower(&program(dmask, d16, mip, atomic)).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         let ours = copy[4..20].to_vec();
@@ -216,9 +225,9 @@ struct Case {
 }
 
 /// Texel (1, 1) after the program: the enabled channels from the data VGPRs
-/// in order (d16: two per VGPR, low half first, widened to f32), the others
-/// 0.
-fn expected(case: &Case) -> [u32; 4] {
+/// in order (d16: two per VGPR, low half first, widened to f32, or with
+/// `integer` zero-extended), the others 0.
+fn expected(case: &Case, integer: bool) -> [u32; 4] {
     let mut texel = [0; 4];
     let mut k = 0;
     for (ch, t) in texel.iter_mut().enumerate() {
@@ -227,7 +236,11 @@ fn expected(case: &Case) -> [u32; 4] {
         }
         *t = if case.d16 {
             let half = (case.data[k / 2] >> (16 * (k % 2))) as u16;
-            f16_to_f32(half).to_bits()
+            if integer {
+                u32::from(half)
+            } else {
+                f16_to_f32(half).to_bits()
+            }
         } else {
             case.data[k]
         };
@@ -252,15 +265,18 @@ fn f16_to_f32(h: u16) -> f32 {
 const FILL: [u32; 4] = [0x3F80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000];
 
 fn run(cases: &[Case]) {
-    run_with(cases, Mip::None);
+    run_with(cases, Mip::None, false);
 }
 
-/// Runs each case's shader (its second store's level from `mip`) on the
-/// hardware adapter and WARP (each skipped without an SM 6.6 device) and
-/// checks the whole texture.
-fn run_with(cases: &[Case], mip: Mip) {
+/// Runs each case's shader (its second store's level from `mip`, an
+/// atomic first with `atomic`) on the hardware adapter and WARP (each
+/// skipped without an SM 6.6 device) and checks the whole texture.
+fn run_with(cases: &[Case], mip: Mip, atomic: bool) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let shaders: Vec<_> = cases.iter().map(|c| build(c.dmask, c.d16, mip)).collect();
+    let shaders: Vec<_> = cases
+        .iter()
+        .map(|c| build(c.dmask, c.d16, mip, atomic))
+        .collect();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -302,7 +318,7 @@ fn run_with(cases: &[Case], mip: Mip) {
                 )
                 .unwrap_or_else(|e| panic!("{what}: dispatch: {e}"));
             let n = case.format.channels();
-            let want = expected(case);
+            let want = expected(case, atomic);
             let mut texture = vec![0u32; 4 * n];
             texture[3 * n..].copy_from_slice(&want[..n]);
             assert_eq!(
@@ -400,13 +416,13 @@ fn mip_stores_to_the_views_level_run_on_the_host() {
             data: INTS,
         },
     ];
-    run_with(&cases, Mip::Inline(128));
+    run_with(&cases, Mip::Inline(128), false);
 }
 
 #[test]
 fn mip_stores_past_the_views_level_or_computed_stop_the_program() {
     for mip in [Mip::Inline(129), Mip::Computed] {
-        let Err(e) = lower(&program(0xF, false, mip)) else {
+        let Err(e) = lower(&program(0xF, false, mip, false)) else {
             panic!("a store to another level lowered");
         };
         assert!(
@@ -420,4 +436,27 @@ fn mip_stores_past_the_views_level_or_computed_stop_the_program() {
             "{e}"
         );
     }
+}
+
+#[test]
+fn stores_to_a_view_an_atomic_shows_integer_run_on_the_host() {
+    let mut cases = Vec::new();
+    for x in [1, 0x7F_FFFF, 0x7FC0_0001, 0xFFFF_FFFF] {
+        cases.push(Case {
+            dmask: 0x1,
+            d16: false,
+            format: Format::R32Uint,
+            data: [x, 0, 0, 0],
+        });
+    }
+    // d16: 16-bit integers, not f16 (as which 5 would be 0x34a00000).
+    for x in [0xBEEF_0005, 0x0000_FFFF] {
+        cases.push(Case {
+            dmask: 0x1,
+            d16: true,
+            format: Format::R32Uint,
+            data: [x, 0, 0, 0],
+        });
+    }
+    run_with(&cases, Mip::None, true);
 }
