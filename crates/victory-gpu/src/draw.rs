@@ -1091,12 +1091,39 @@ impl State {
             )
         };
         crate::indirect::done(list, &args.buffer);
+        self.clear_indirect_constants(kind == DISPATCH, title_args);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
+    }
+
+    /// Resets the guest root-constant dwords named by `CONSTANT` arguments in
+    /// `title_args` to zero, matching D3D12's indirect-execution state rules so
+    /// a later direct bind does not restore stale values while keeping
+    /// untouched neighboring dwords intact.
+    fn clear_indirect_constants(&mut self, compute: bool, title_args: &[[u32; 4]]) {
+        const CONSTANT: u32 = 5;
+        let roots = if compute {
+            &mut self.compute
+        } else {
+            &mut self.graphics
+        };
+        for arg in title_args {
+            if arg[0] != CONSTANT {
+                continue;
+            }
+            let Some(Root::Constants(values)) = roots.get_mut(arg[1] as usize) else {
+                continue;
+            };
+            let start = arg[2] as usize;
+            let end = start.saturating_add(arg[3] as usize).min(values.len());
+            if start < end {
+                values[start..end].fill(0);
+            }
+        }
     }
 }
 
@@ -1287,4 +1314,31 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Indirect `CONSTANT` arguments clear only the overwritten guest dwords
+    /// in the matching root table (compute or graphics), preserving neighbors
+    /// and leaving the other root table untouched.
+    #[test]
+    fn indirect_constants_clear_only_overwritten_guest_range() {
+        let mut s = State::default();
+        s.compute.resize(8, Root::None);
+        s.compute[7] = Root::Constants(vec![11, 22, 33, 44]);
+        s.graphics.resize(8, Root::None);
+        s.graphics[7] = Root::Constants(vec![1, 2, 3, 4]);
+
+        s.clear_indirect_constants(true, &[[5, 7, 1, 2], [2, 0, 0, 0]]);
+
+        let got = |compute: bool| -> Vec<u32> {
+            (0..4)
+                .map(|d| s.user_value(compute, 7, RootType::Constants, d))
+                .collect()
+        };
+        assert_eq!(got(true), vec![11, 0, 0, 44]);
+        assert_eq!(got(false), vec![1, 2, 3, 4]);
+    }
 }
