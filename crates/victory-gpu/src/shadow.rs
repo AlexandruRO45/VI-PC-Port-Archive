@@ -216,19 +216,23 @@ impl Shadow {
                 let title = &mut piece[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                    // takes the title's bytes in turn. Only the span the
+                    // title actually takes goes back: a shader writing one
+                    // dword of a 64 KiB piece used to write the whole piece
+                    // into title memory.
+                    let (mut lo, mut hi) = (usize::MAX, 0usize);
+                    for (i, ((t, h), o)) in title.iter_mut().zip(host.iter_mut()).zip(old).enumerate() {
                         if *h != *o && *t != *h {
                             *t = *h;
-                            changed = true;
+                            lo = lo.min(i);
+                            hi = i + 1;
                         }
                         *h = *t;
                     }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                    if lo < hi {
+                        crate::watch::writing(start + at + lo, hi - lo);
+                        crate::host::write_mapped((start + at + lo) as *mut u8, title[lo..hi].as_ptr(), hi - lo);
+                        written += hi - lo;
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -500,4 +504,73 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod cost {
+    use super::*;
+
+    /// What one submission pays for a range shaders write: the snapshot
+    /// before it runs, and the compare-and-write-back after. Synthetic
+    /// memory, a real host copy; no title. Run with
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture shadow_cost`.
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn shadow_cost() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host device");
+            return;
+        };
+        println!();
+        for mib in [4usize, 16, 64] {
+            let size = mib << 20;
+            // The title range this copy mirrors, and the copy itself.
+            let mut title = vec![0u8; size];
+            for (i, b) in title.iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+            let Some((buffer, data)) = host.shared_buffer(size as u64) else {
+                eprintln!("no shared buffer of {mib} MiB");
+                return;
+            };
+            // SAFETY: the mapping is `size` bytes; the copy starts as title.
+            let gpu = unsafe {
+                std::ptr::copy_nonoverlapping(title.as_ptr(), data, size);
+                buffer.GetGPUVirtualAddress()
+            };
+            let start = title.as_ptr() as usize;
+            let shadow = Shadow::new(buffer, data.cast(), gpu, start as u64, size as u64);
+
+            let t = std::time::Instant::now();
+            shadow.writing(start, size);
+            let snapshot = t.elapsed();
+
+            // The GPU wrote: 1% of the bytes, scattered in 64 KiB pieces.
+            let mut at = 0;
+            while at < size {
+                // SAFETY: inside the mapping; this thread owns it here.
+                unsafe {
+                    let piece = std::slice::from_raw_parts_mut(data.add(at).cast::<u8>(), 64 << 10);
+                    for b in piece.iter_mut().take(640) {
+                        *b = b.wrapping_add(1);
+                    }
+                }
+                at += 64 << 10;
+            }
+
+            let t = std::time::Instant::now();
+            let written = shadow.copy_back(start, size);
+            let back = t.elapsed();
+
+            let per = |d: std::time::Duration| d.as_nanos() as f64 / size as f64;
+            println!(
+                "{mib:>3} MiB: snapshot {:.2} ms ({:.2} ns/B), copy-back {:.2} ms ({:.2} ns/B), {written} B written back",
+                snapshot.as_secs_f64() * 1e3,
+                per(snapshot),
+                back.as_secs_f64() * 1e3,
+                per(back)
+            );
+        }
+        println!();
+    }
 }
