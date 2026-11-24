@@ -2655,6 +2655,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_merged_stage_fixed_sampler_may_name_the_end_of_the_sgprs() {
+        // One fixed sampler stating no SGPRs at user-data dword `user_data`
+        // in a `stage` program.
+        let program = |stage: HwStage, user_data: u8| {
+            let mut blob = fssm(&[(stage, &VS_CODE)]);
+            let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(stage)).unwrap() as usize;
+            let table = (blob.len() - FSSM_HEADER) as u64;
+            for v in [4u32, 0, 0, 0] {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+            blob.extend_from_slice(&[user_data, 0, 0, 0]);
+            let payload = (blob.len() - FSSM_HEADER) as u64;
+            blob[8..16].copy_from_slice(&payload.to_le_bytes());
+            blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
+            blob[record + RECORD_COUNTS..][..8].copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        // From s8, dword 98 names s106, just past the last SGPR, which a
+        // sampler taking none may; dword 99 (s107) and the byte's top
+        // would only grow `user_sgpr` toward its overflow, so are refused.
+        for stage in [
+            HwStage::Ls,
+            HwStage::Hs,
+            HwStage::Es,
+            HwStage::Gs,
+            HwStage::Ms,
+        ] {
+            let p = program(stage, 98).unwrap();
+            assert_eq!(
+                (p[0].layout[0].root, p[0].layout[0].user_data),
+                (RootType::ImmediateSampler, 98),
+                "{stage:?}"
+            );
+            for user_data in [99, 0xFF] {
+                assert_eq!(
+                    why_refused(program(stage, user_data)),
+                    "root parameter outside the SGPRs",
+                    "{stage:?}: dword {user_data}"
+                );
+            }
+        }
+        // A vertex program counts from s0, so its end is dword 106.
+        assert!(program(HwStage::Vs, 106).is_ok());
+        assert_eq!(
+            why_refused(program(HwStage::Vs, 107)),
+            "root parameter outside the SGPRs"
+        );
+    }
+
+    #[test]
+    fn a_layout_breaking_several_rules_is_named_for_the_first_checked() {
+        let (constants, table, unknown) = (0, 3, 2);
+        // Each layout below also breaks every rule named after it: the
+        // checks run as kind, SGPRs, user data, address width, then sharing.
+        for (params, why) in [
+            (
+                &[(unknown, 2, 0xFF, 0)][..],
+                "root parameter of unknown kind",
+            ),
+            (&[(table, 2, 0xFF, 0)], "root parameter outside the SGPRs"),
+            (&[(table, 2, 40, 0)], "root parameter past the user data"),
+            (
+                &[(constants, 2, 0, 0), (table, 2, 1, 1)],
+                "root address wider than one SGPR",
+            ),
+            (
+                &[(constants, 2, 0, 0), (table, 1, 1, 1)],
+                "root parameters share an SGPR",
+            ),
+        ] {
+            assert_eq!(why_refused(program(params)), why, "{params:?}");
+        }
+        // Wherever the breaking parameter sits in the list.
+        assert_eq!(
+            why_refused(program(&[(table, 2, 40, 1), (unknown, 1, 4, 2)])),
+            "root parameter of unknown kind"
+        );
+        assert_eq!(
+            why_refused(program(&[(table, 2, 4, 1), (constants, 1, 0xFF, 2)])),
+            "root parameter outside the SGPRs"
+        );
+    }
+
     /// A pixel program with a table in s4 (slot 2), a root descriptor in
     /// s6-s7 (slot 3), and these (kind, root type, table offset) reads.
     fn reading(reads: &[(u8, u8, u32)]) -> Result<Vec<NativeProgram>, ShaderError> {
