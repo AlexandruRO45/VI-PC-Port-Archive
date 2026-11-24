@@ -991,4 +991,73 @@ mod tests {
         assert!(checks <= 2 * count, "{checks} stream checks");
         assert!(read <= checks * PROBE, "{read} bytes read");
     }
+
+    /// Seeded files, some records stored as is (level 0, holding a record of
+    /// their own), the bytes then damaged (changed, inserted, removed, or a
+    /// marker or a small `n` put in), and every prefix of each: a file cut
+    /// short (still being written or copied, say) yields no container the
+    /// whole file does not, each from the same record in every field, so
+    /// reading it early never reports a container that later turns out to be
+    /// bytes of another record. Records only appear as the file grows:
+    /// nothing it adds can hide one that unpacks.
+    #[test]
+    fn cut_off_files_yield_only_records_of_the_whole_file() {
+        let mut x = 0x2545_F491_u32;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for seed in 0..300 {
+            let mut file = MAGIC.to_vec();
+            for i in 0..1 + next() % 4 {
+                let mut payload: Vec<u8> = (0..next() % 120).map(|_| (next() % 4) as u8).collect();
+                let level = [0, 1, 6, 10][next() as usize % 4];
+                if level == 0 {
+                    // Stored as is, holding a record: cut off after it, the
+                    // outer record must not expose it.
+                    payload.extend(record_bytes("PS_stored", 0x32, b"stored"));
+                    payload.extend((0..next() % 40).map(|_| next() as u8));
+                }
+                let packed = miniz_oxide::deflate::compress_to_vec(&payload, level);
+                let n = (packed.len() + 12) as u32;
+                let name = format!("PS_{i}");
+                file.extend_from_slice(&[0x01, name.len() as u8 + 1]);
+                file.extend_from_slice(name.as_bytes());
+                file.extend_from_slice(&[0, 0x32]);
+                for v in [n, 0x000D_DCE7, n, payload.len() as u32] {
+                    file.extend_from_slice(&v.to_le_bytes());
+                }
+                file.extend_from_slice(&packed);
+            }
+            for _ in 0..1 + next() % 5 {
+                let at = next() as usize % (file.len() + 1);
+                match next() % 5 {
+                    0 if at < file.len() => file[at] = next() as u8,
+                    1 => file.insert(at, next() as u8),
+                    2 if at < file.len() => _ = file.remove(at),
+                    3 => _ = file.splice(at..at, MARKER),
+                    _ => _ = file.splice(at..at, (next() % 600).to_le_bytes()),
+                }
+            }
+
+            let whole: Vec<_> = records(&file).collect();
+            for cut in 0..file.len() {
+                let part = &file[..cut];
+                for r in records(part) {
+                    assert!(r.span().end <= cut, "seed {seed}, cut at {cut}");
+                    if r.unpack().is_none() {
+                        // Corrupt bytes over corrupt bytes: which is the
+                        // record is not known, and neither yields a container.
+                        continue;
+                    }
+                    assert!(
+                        whole.contains(&r),
+                        "seed {seed}, cut at {cut}: {r:?} is not a record of the whole file"
+                    );
+                }
+            }
+        }
+    }
 }
