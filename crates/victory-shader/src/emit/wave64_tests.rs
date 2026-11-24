@@ -746,7 +746,20 @@ mod gpu {
         expected: &[u32],
         expect_native_fail: bool,
     ) {
+        // Explicit opt-in for environments whose reported wave capabilities
+        // do not match pipeline creation behavior.
+        let diagnostic = matches!(
+            std::env::var("VICTORY_WAVE64_DIAGNOSTIC").as_deref(),
+            Ok("1")
+        );
+
         with_hosts(|hosts| {
+            if diagnostic {
+                assert!(
+                    hosts[0].is_some(),
+                    "Hardware adapter unavailable: diagnostic run cannot qualify"
+                );
+            }
             for (warp_idx, host) in hosts.iter().enumerate() {
                 let Some(host) = host else {
                     continue;
@@ -758,19 +771,37 @@ mod gpu {
                 }
                 if expect_native_fail && !host.supports_wave64() {
                     let native = emit_cs(prog, Wave64Mode::Native).unwrap();
-                    assert!(
-                        host.compute_pipeline(&native).is_err(),
-                        "{name}: Native Wave64 unexpectedly built a PSO on warp={warp}"
-                    );
+                    let accepted = host.compute_pipeline(&native).is_ok();
+                    if diagnostic {
+                        println!(
+                            "NATIVE_PSO name={name} warp={warp} accepted={accepted}"
+                        );
+                    } else {
+                        assert!(
+                            !accepted,
+                            "{name}: Native Wave64 unexpectedly built a PSO on warp={warp}"
+                        );
+                    }
                 }
                 for mode in modes {
                     let shader = emit_cs(prog, mode)
                         .unwrap_or_else(|e| panic!("{name} ({mode:?}, warp={warp}): {e}"));
-                    if let Ok(mut v) = super::super::validator::Validator::load(
+                    match super::super::validator::Validator::load(
                         super::super::validator::Validator::default_path().as_deref(),
                     ) {
-                        v.validate(&mut shader.dxil.clone())
-                            .unwrap_or_else(|e| panic!("{name} ({mode:?}) validate: {e}"));
+                        Ok(mut v) => {
+                            v.validate(&mut shader.dxil.clone())
+                                .unwrap_or_else(|e| panic!("{name} ({mode:?}) validate: {e}"));
+                            if diagnostic {
+                                println!(
+                                    "VERIFIED_DXIL name={name} mode={mode:?} warp={warp}"
+                                );
+                            }
+                        }
+                        Err(e) if diagnostic => {
+                            panic!("DXIL validator required for diagnostic run: {e}");
+                        }
+                        Err(_) => {}
                     }
                     let (root, pso) = host
                         .compute_pipeline(&shader)
@@ -792,6 +823,12 @@ mod gpu {
                         expected,
                         "{name} ({mode:?}, warp={warp}) output mismatch"
                     );
+                    if diagnostic {
+                        println!(
+                            "VERIFIED_GPU name={name} mode={mode:?} warp={warp} words={}",
+                            expected.len()
+                        );
+                    }
                 }
             }
         });
@@ -1244,4 +1281,134 @@ mod gpu {
             false,
         );
     }
+
+    fn dynamic_pair_matrix(lane: u32, threads: u32) {
+        assert!(lane < 64);
+
+        let mut code = vec![
+            v_and_b32(2, inline_u(63), 0),
+            v_mov_b32(1, inline_u(0)),
+        ];
+
+        // Both scalar words originate from runtime lane reads.
+        // v2 contains the lane index within each virtual Wave64.
+
+        code.extend_from_slice(&v_readlane_b32(
+            12, 2, inline_u(u32::from(lane < 32)),
+        ));
+
+        code.extend_from_slice(&v_readlane_b32(
+            13, 2, inline_u(u32::from(lane >= 32)),
+        ));
+
+        if lane > 32 {
+            code.push(sop2(
+                13, 0x1E, 13, inline_u(lane - 32),
+            ));
+        }
+
+        // Consume the independently computed mask pair.
+        code.push(s_and_saveexec_b64(6, 12));
+
+        let br = code.len();
+        code.push(0);
+
+        code.push(v_add_nc_u32(1, inline_u(1), 0));
+
+        let after = code.len();
+        code[br] = s_cbranch_execz(
+            (after - br - 1) as i16
+        );
+
+        code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+
+        emit_uav_store(&mut code, 1, 0);
+
+        code.push(S_ENDPGM);
+
+        let program = make_cs_program(
+            &code, [threads, 1, 1], 0, false
+        );
+
+        let expected: Vec<u32> = (0..threads)
+            .map(|tid| {
+                if tid % 64 == lane {
+                    tid + 1
+                } else {
+                    0
+                }
+            })
+            .collect();
+
+        run_on_hosts(
+            &format!("dynamic-pair-lane-{lane}-threads-{threads}"),
+            &program,
+            [1, 1, 1],
+            threads,
+            &expected,
+            true,
+        );
+    }
+
+
+    #[test]
+    fn gpu_dynamic_pair_lane_0_threads_64() {
+        dynamic_pair_matrix(0, 64);
+    }
+
+    #[test]
+    fn gpu_dynamic_pair_lane_0_threads_128() {
+        dynamic_pair_matrix(0, 128);
+    }
+
+    #[test]
+    fn gpu_dynamic_pair_lane_0_threads_256() {
+        dynamic_pair_matrix(0, 256);
+    }
+
+    #[test]
+    fn gpu_dynamic_pair_lane_32_threads_64() {
+        dynamic_pair_matrix(32, 64);
+    }
+
+    #[test]
+    fn gpu_dynamic_pair_lane_32_threads_128() {
+        dynamic_pair_matrix(32, 128);
+    }
+
+    #[test]
+    fn gpu_dynamic_pair_lane_32_threads_256() {
+        dynamic_pair_matrix(32, 256);
+    }
+
+    #[test]
+    fn gpu_dynamic_pair_lane_39_threads_64() {
+        dynamic_pair_matrix(39, 64);
+    }
+
+    #[test]
+    fn gpu_dynamic_pair_lane_39_threads_128() {
+        dynamic_pair_matrix(39, 128);
+    }
+
+    #[test]
+    fn gpu_dynamic_pair_lane_39_threads_256() {
+        dynamic_pair_matrix(39, 256);
+    }
+
+    #[test]
+    fn gpu_dynamic_pair_lane_63_threads_64() {
+        dynamic_pair_matrix(63, 64);
+    }
+
+    #[test]
+    fn gpu_dynamic_pair_lane_63_threads_128() {
+        dynamic_pair_matrix(63, 128);
+    }
+
+    #[test]
+    fn gpu_dynamic_pair_lane_63_threads_256() {
+        dynamic_pair_matrix(63, 256);
+    }
+
 }
