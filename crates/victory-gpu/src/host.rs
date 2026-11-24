@@ -1267,10 +1267,11 @@ pub(crate) fn no_args_refresh() -> bool {
 
 /// What a frame's time is spent on, by pipeline (`VICTORY_PASS_COST=1`).
 ///
-/// Each submission's wall time is charged to the pipelines its lists bound, and
-/// the worst six are logged once a second: "1–3 fps" becomes "these passes are
-/// 80 % of the frame", which is a number that names what to fix rather than a
-/// total that names nothing.
+/// Each submission's wall time is charged to the pipelines its lists bound, once
+/// per distinct set, and the worst six are logged **since the run started** with
+/// the share of the wall clock they account for: "1–3 fps" becomes "these passes
+/// are most of the frame", a number that names what to fix rather than a total
+/// that names nothing. It is a running average, not a per-second window.
 #[cfg(feature = "diagnostics")]
 fn pass_cost(runs: &[&HostList], gpu: std::time::Duration) {
     use std::sync::Mutex;
@@ -1299,16 +1300,24 @@ fn pass_cost(runs: &[&HostList], gpu: std::time::Duration) {
     drop(span);
     let mut cost = COST.lock().unwrap_or_else(|e| e.into_inner());
     let map = cost.get_or_insert_with(std::collections::HashMap::new);
+    // A submission is many lists, so its time is charged once per **distinct**
+    // pipeline set and split between them: charging every list would enter one
+    // submission's time once per list, and the ranking would then measure how
+    // many lists a set appears in rather than what it cost.
+    let mut sets: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for list in runs {
         let names = list.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if names.is_empty() {
-            continue;
+        if !names.is_empty() {
+            sets.insert(names.into_iter().collect::<Vec<String>>().join(", "));
         }
-        let text: Vec<String> = names.into_iter().collect();
-        let key = text.join(", ");
-        let entry = map.entry(key).or_insert((0, 0));
-        entry.0 += gpu.as_micros() as u64;
-        entry.1 += 1;
+    }
+    if !sets.is_empty() {
+        let each = gpu.as_micros() as u64 / sets.len() as u64;
+        for key in sets {
+            let entry = map.entry(key).or_insert((0, 0));
+            entry.0 += each;
+            entry.1 += 1;
+        }
     }
     let mut worst: Vec<(&String, &(u64, u64))> = map.iter().collect();
     worst.sort_by_key(|(_, (us, _))| std::cmp::Reverse(*us));
@@ -1327,7 +1336,7 @@ fn pass_cost(runs: &[&HostList], gpu: std::time::Duration) {
         frame_ms = frame_us / 1000,
         accounted = format!("{accounted:.0}%"),
         passes = worst.len(),
-        "pass cost: the frame outside these submissions is the pipeline queue, copies and waits"
+        "pass cost since start: what these passes do not account for is the pipeline queue, copies and waits"
     );
     for (name, (us, count)) in worst.iter().take(6) {
         tracing::warn!(
