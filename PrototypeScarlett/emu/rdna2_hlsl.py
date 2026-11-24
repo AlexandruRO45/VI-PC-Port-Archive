@@ -11,7 +11,7 @@ from pathlib import Path
 import struct
 import sys
 
-from emu import rdna2, rdna2_hlsl_ext, rdna2_hlsl_image
+from emu import rdna2, rdna2_hlsl_ext, rdna2_hlsl_f16, rdna2_hlsl_image
 from emu.rdna2_exec_ops import signed
 from emu.rdna2_exec_vop3 import Fields
 from emu.rdna2_hlsl_memory import memory_statements
@@ -163,6 +163,8 @@ def statements(data, instruction, finish="return;", special=None):
     if family in ("VOP1", "VOP2", "VOPC"):
         fields = _fields(family, first)
         lit = _literal(data, instruction, 1)
+        if name in rdna2_hlsl_f16.TEMPLATES:        # avant is_ext : les formes SDWA/DPP du f16 sont refusées par rdna2_hlsl_f16
+            return rdna2_hlsl_f16.vector(name, fields, lit, ACTIVE)
         if rdna2_hlsl_ext.is_ext(family, fields.get("src0")):
             return rdna2_hlsl_ext.statements(family, name, fields, lit or 0, ACTIVE)
         return _vector(name, fields, lit)
@@ -189,7 +191,7 @@ def _leaders(data, instructions):
 
 def translate(data, sgprs=None):
     """Texte HLSL d'un programme RDNA 2 ; `sgprs` : valeurs initiales {numéro: valeur}."""
-    helpers = ALU_HELPERS + "\n" + rdna2_hlsl_image.HELPERS
+    helpers = ALU_HELPERS + "\n" + rdna2_hlsl_image.HELPERS + "\n" + rdna2_hlsl_f16.HELPERS
     prelude = PRELUDE.replace("[numthreads", helpers + "\n[numthreads", 1)
     return "\n".join([prelude.rstrip("\n"), *body(data, sgprs), "}", ""])
 
@@ -284,8 +286,8 @@ def body(data, sgprs=None, finish="return;", special=None):
 
 def coverage_names():
     """Mnémoniques que le recompilateur sait traduire (hors mémoire, comptée à part)."""
-    return set(SCALAR) | set(VECTOR) | set(BRANCHES) | set(CARRY) | {"s_endpgm", "v_readlane_b32",
-                                                                      "v_writelane_b32", "v_readfirstlane_b32"}
+    return set(SCALAR) | set(VECTOR) | set(BRANCHES) | set(CARRY) | set(rdna2_hlsl_f16.TEMPLATES) | {
+        "s_endpgm", "v_readlane_b32", "v_writelane_b32", "v_readfirstlane_b32"}
 
 
 __all__ = ["translate", "Untranslatable"]
