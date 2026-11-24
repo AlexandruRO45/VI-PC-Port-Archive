@@ -1104,14 +1104,14 @@ mod tests {
                 .ok()
                 .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf)),
         ];
-        tempdir_in_first(candidates.into_iter().flatten())
+        tempdir_in_first(&crate::workspace_root(), candidates.into_iter().flatten())
     }
 
     fn tempdir_in_first(
+        checkout: &std::path::Path,
         candidates: impl IntoIterator<Item = std::path::PathBuf>,
     ) -> tempfile::TempDir {
-        let checkout = crate::workspace_root();
-        let checkout = checkout.canonicalize().unwrap_or(checkout);
+        let checkout = checkout.canonicalize().unwrap();
         for dir in candidates {
             let Ok(dir) = dir.canonicalize() else {
                 continue;
@@ -1119,15 +1119,39 @@ mod tests {
             if cfg!(unix) && dir.as_os_str().as_encoded_bytes().contains(&b':') {
                 continue;
             }
-            if unseen_by_full_check(&checkout, &dir) {
-                return tempfile::tempdir_in(dir).unwrap();
+            if let Ok(tmp) = tempfile::tempdir_in(dir) {
+                if unseen_by_full_check(&checkout, tmp.path()) {
+                    return tmp;
+                }
             }
         }
         panic!(
-            "no temporary directory without `:`, and outside {} or ignored by it: \
-             set TMPDIR outside the checkout",
+            "could not create a temporary directory outside {} or ignored by it: \
+             set TMPDIR to a writable directory outside the checkout without `:`",
             checkout.display()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_require_a_writable_and_unseen_location() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        let ignore = root.join(".gitignore");
+        std::fs::write(&ignore, "/visible/probe\n/ignored/\n").unwrap();
+        let visible = root.join("visible");
+        let ignored = root.join("ignored");
+        std::fs::create_dir(&visible).unwrap();
+        std::fs::create_dir(&ignored).unwrap();
+
+        // A regular file cannot host a fixture. An ignore rule for a single
+        // filename also leaves its siblings visible to the checkout scan.
+        let tmp = tempdir_in_first(root, [ignore, visible.clone(), ignored.clone()]);
+        assert_eq!(tmp.path().parent(), Some(ignored.as_path()));
+        assert_eq!(std::fs::read_dir(visible).unwrap().count(), 0);
+        std::fs::write(tmp.path().join("fixture.rs"), b"fixture\n").unwrap();
+        assert_eq!(names(root, false), [".gitignore"]);
     }
 
     /// `path` quoted for `sh`, for the scripts tests write: a TMPDIR holding
@@ -1146,7 +1170,7 @@ mod tests {
         };
         let status = super::git_command(checkout)
             .args(["check-ignore", "-q", "--"])
-            .arg(relative.join("probe"))
+            .arg(relative)
             .status();
         match status.ok().and_then(|s| s.code()) {
             Some(0) => true,
@@ -2063,7 +2087,7 @@ mod tests {
             .unwrap();
         assert!(found.status.success(), "the ceiling held after all");
 
-        let tmp = tempdir_in_first([colon, plain.clone()]);
+        let tmp = tempdir_in_first(&crate::workspace_root(), [colon, plain.clone()]);
         assert!(tmp.path().starts_with(plain.canonicalize().unwrap()));
         let found = super::git_command(tmp.path())
             .args(["rev-parse", "--git-dir"])
