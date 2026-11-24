@@ -50,6 +50,12 @@ const IID_DEVICE: Iid = guid(
     0x408A,
     [0x86, 0x8F, 0x43, 0x9B, 0x3C, 0xD4, 0x71, 0x25],
 );
+const IID_DISPATCHER: Iid = guid(
+    0x415E_ED2E,
+    0x98CB,
+    0x42C2,
+    [0x8F, 0x28, 0xB9, 0x46, 0x01, 0x07, 0x4E, 0x31],
+);
 
 /// Input kinds (bits) our devices have.
 const KEYBOARD_KIND: u32 = 0x10;
@@ -391,6 +397,13 @@ pub struct Hub {
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
+    /// Live dispatcher objects; while there is one, input is processed by
+    /// `Dispatch` on the title's thread instead of our poll thread.
+    dispatchers: AtomicU32,
+    /// The auto-reset event behind dispatcher wait handles (0 until asked
+    /// for); never closed, the title gets duplicates.
+    #[cfg(windows)]
+    work: std::sync::OnceLock<usize>,
 }
 
 fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -426,6 +439,9 @@ impl Hub {
                 running: Vec::new(),
             }),
             returned: Condvar::new(),
+            dispatchers: AtomicU32::new(0),
+            #[cfg(windows)]
+            work: std::sync::OnceLock::new(),
         }));
         // SAFETY: just allocated and never freed; nothing else sees it yet.
         unsafe {
@@ -444,10 +460,48 @@ impl Hub {
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(POLL);
-                hub.poll();
+                hub.tick();
             }
         });
         hub
+    }
+
+    /// The poll thread's work each period: poll in automatic dispatch mode;
+    /// in manual mode (a dispatcher lives) only tell the title's wait
+    /// handles there is work, which its `Dispatch` then does.
+    fn tick(&self) {
+        if self.manual() {
+            self.signal_work();
+        } else {
+            self.poll();
+        }
+    }
+
+    fn manual(&self) -> bool {
+        self.dispatchers.load(Ordering::Acquire) != 0
+    }
+
+    /// The event behind dispatcher wait handles, made on first use.
+    #[cfg(windows)]
+    fn work_event(&self) -> Option<usize> {
+        use windows_sys::Win32::System::Threading::CreateEventW;
+        let event = *self.work.get_or_init(|| {
+            // SAFETY: an unnamed auto-reset event, not signaled.
+            unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) as usize }
+        });
+        (event != 0).then_some(event)
+    }
+
+    // shortcut: every period counts as work (the host may have changed);
+    // telling whether it did would take the poll `Dispatch` is for.
+    fn signal_work(&self) {
+        #[cfg(windows)]
+        if let Some(&event) = self.work.get()
+            && event != 0
+        {
+            // SAFETY: our event, never closed.
+            unsafe { windows_sys::Win32::System::Threading::SetEvent(event as _) };
+        }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -931,11 +985,111 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
     }
 }
 
-/// Dispatcher and aggregate device: no title of ours asks for them.
-extern "system" fn create_dispatcher(_: This, out: Out) -> HRESULT {
-    tracing::warn!("input dispatcher not implemented");
-    fail(out, E_NOTIMPL)
+/// A dispatcher: while one lives, the title runs input work (polling the
+/// host, device callbacks) with `Dispatch` on its own threads, as
+/// documented: holding one switches to manual dispatch, releasing the last
+/// switches back.
+#[repr(C)]
+pub struct Dispatcher {
+    vtable: &'static Table<5>,
+    refs: AtomicU32,
+    hub: &'static Hub,
 }
+
+extern "system" fn create_dispatcher(this: This, out: Out) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    let hub = hub(this);
+    hub.dispatchers.fetch_add(1, Ordering::AcqRel);
+    tracing::info!("input dispatcher: manual dispatch");
+    let dispatcher = Box::leak(Box::new(Dispatcher {
+        vtable: &DISPATCHER,
+        refs: AtomicU32::new(1),
+        hub,
+    }));
+    // SAFETY: checked non-null; the title passes room for a pointer.
+    unsafe { out.write((dispatcher as *const Dispatcher).cast()) };
+    S_OK
+}
+
+fn dispatcher<'a>(this: *const Dispatcher) -> &'a Dispatcher {
+    // SAFETY: a dispatcher we handed out and the title still holds.
+    unsafe { &*this }
+}
+extern "system" fn query_dispatcher(this: *const Dispatcher, iid: *const Iid, out: Out) -> HRESULT {
+    query(this, iid, &IID_DISPATCHER, dispatcher_add_ref, out)
+}
+extern "system" fn dispatcher_add_ref(this: *const Dispatcher) -> u32 {
+    dispatcher(this).refs.fetch_add(1, Ordering::Relaxed) + 1
+}
+extern "system" fn dispatcher_release(this: *const Dispatcher) -> u32 {
+    let left = dispatcher(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if left == 0 {
+        // SAFETY: the last reference is gone; `create_dispatcher` boxed it.
+        let dispatcher = unsafe { Box::from_raw(this.cast_mut()) };
+        if dispatcher.hub.dispatchers.fetch_sub(1, Ordering::AcqRel) == 1 {
+            tracing::info!("input dispatcher: automatic dispatch");
+        }
+    }
+    left
+}
+/// Polls the host and runs the callbacks that brings, on this thread. That
+/// is all the work there is, so none is left: false. A poll is one step, so
+/// the quota is kept (the documented minimum is one item even at zero).
+extern "system" fn dispatch(this: *const Dispatcher, _quota: u64) -> bool {
+    dispatcher(this).hub.poll();
+    false
+}
+/// A new handle to the event our poll thread sets each period while
+/// dispatch is manual; the title closes it.
+extern "system" fn open_wait_handle(this: *const Dispatcher, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: checked non-null; nothing until we have a handle.
+    unsafe { out.write(std::ptr::null_mut()) };
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            DUPLICATE_SAME_ACCESS, DuplicateHandle, GetLastError,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // HRESULT_FROM_WIN32 of the last error.
+        // SAFETY: plain query.
+        let error = || 0x8007_0000_u32 as i32 | (unsafe { GetLastError() } & 0xFFFF) as i32;
+        let Some(event) = dispatcher(this).hub.work_event() else {
+            return error();
+        };
+        let mut copy = std::ptr::null_mut();
+        // SAFETY: our own event, duplicated within our process.
+        let ok = unsafe {
+            let me = GetCurrentProcess();
+            DuplicateHandle(me, event as _, me, &mut copy, 0, 0, DUPLICATE_SAME_ACCESS)
+        };
+        if ok == 0 {
+            return error();
+        }
+        // SAFETY: checked non-null.
+        unsafe { out.write(copy) };
+        S_OK
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = this;
+        E_NOTIMPL
+    }
+}
+
+static DISPATCHER: Table<5> = Table([
+    query_dispatcher as *const (),
+    dispatcher_add_ref as *const (),
+    dispatcher_release as *const (),
+    dispatch as *const (),         // 0x18
+    open_wait_handle as *const (), // 0x20
+]);
+
+/// Aggregate device: no title of ours asks for it.
 extern "system" fn create_aggregate(_: This, _kind: u32, out: Out) -> HRESULT {
     tracing::warn!("aggregate input device not implemented");
     fail(out, E_NOTIMPL)
@@ -1576,6 +1730,99 @@ mod tests {
             release(r);
         }
         assert_eq!(refs(), 1);
+    }
+
+    fn new_dispatcher(hub: &Hub) -> *const Dispatcher {
+        type Create = extern "system" fn(This, Out) -> HRESULT;
+        let mut out = std::ptr::null();
+        let create = slot::<Create, _>(&hub.object, 0x70);
+        assert_eq!(create(&hub.object, &mut out), S_OK);
+        assert!(!out.is_null());
+        assert_eq!(create(&hub.object, std::ptr::null_mut()), E_INVALIDARG);
+        out.cast()
+    }
+
+    fn release_dispatcher(d: *const Dispatcher) -> u32 {
+        slot::<extern "system" fn(*const Dispatcher) -> u32, _>(d, 0x10)(d)
+    }
+
+    #[test]
+    fn a_dispatcher_moves_input_work_to_the_title_thread() {
+        let (hub, host) = fake();
+        assert!(!hub.manual());
+        let d = new_dispatcher(hub);
+        assert!(hub.manual());
+        let refs = || dispatcher(d).refs.load(Ordering::SeqCst);
+        for iid in [IID_UNKNOWN, IID_DISPATCHER] {
+            assert_eq!(query_as(d, &iid), Ok(d.cast()));
+        }
+        for iid in [IID_INPUT, IID_DEVICE, IID_READING, FOREIGN] {
+            assert_eq!(query_as(d, &iid), Err(E_NOINTERFACE));
+        }
+        assert_eq!(refs(), 3);
+
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 0, &log);
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
+        // Our poll thread's period no longer polls...
+        hub.tick();
+        assert!(log.lock().unwrap().is_empty());
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+        // ...the title's Dispatch does, callbacks on its thread.
+        let dispatch = slot::<extern "system" fn(*const Dispatcher, u64) -> bool, _>(d, 0x18);
+        assert!(!dispatch(d, 0), "nothing left after one dispatch");
+        assert_eq!(
+            *log.lock().unwrap(),
+            [(0, STATUS_CONNECTED, 0), (FALLBACK, 0, STATUS_CONNECTED)]
+        );
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r).buttons, A);
+        release(r);
+
+        // Releasing the last reference returns to automatic dispatch.
+        assert_eq!(release_dispatcher(d), 2);
+        assert_eq!(release_dispatcher(d), 1);
+        assert!(hub.manual());
+        assert_eq!(release_dispatcher(d), 0);
+        assert!(!hub.manual());
+        host.lock().unwrap().pads[0] = None;
+        hub.tick();
+        assert_eq!(log.lock().unwrap().len(), 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dispatcher_wait_handles_signal_while_dispatch_is_manual() {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        type Open = extern "system" fn(*const Dispatcher, *mut *mut c_void) -> HRESULT;
+        let (hub, _) = fake();
+        let d = new_dispatcher(hub);
+        let open = slot::<Open, _>(d, 0x20);
+        let (mut a, mut b) = (std::ptr::null_mut(), std::ptr::null_mut());
+        assert_eq!(open(d, &mut a), S_OK);
+        assert_eq!(open(d, &mut b), S_OK);
+        assert!(!a.is_null() && !b.is_null() && a != b, "a handle per call");
+        assert_eq!(open(d, std::ptr::null_mut()), E_INVALIDARG);
+        // SAFETY: handles we were just given; the title owns and closes them.
+        unsafe {
+            assert_eq!(WaitForSingleObject(a, 0), WAIT_TIMEOUT);
+            hub.tick();
+            assert_eq!(WaitForSingleObject(b, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(a, 0), WAIT_TIMEOUT, "auto-reset");
+            CloseHandle(a);
+            // Closing the title's handle leaves ours working.
+            hub.tick();
+            assert_eq!(WaitForSingleObject(b, 0), WAIT_OBJECT_0);
+            assert_eq!(release_dispatcher(d), 0);
+            // Automatic dispatch: the period polls instead of signalling.
+            hub.tick();
+            assert_eq!(WaitForSingleObject(b, 0), WAIT_TIMEOUT);
+            CloseHandle(b);
+        }
     }
 
     #[test]
