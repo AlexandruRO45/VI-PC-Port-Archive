@@ -580,8 +580,11 @@ fn list_files_built_by(root: &Path, staged: bool, exe: Option<&Path>) -> Result<
         let mut files: Vec<File> = fields
             .iter()
             .filter(|raw| index.contains_key(*raw) || !is_under(raw, build.as_deref()))
-            .map(|raw| {
-                let (name, utf8_name, on_disk) = decode(root, raw);
+            .map(|raw| (raw, decode(root, raw)))
+            .filter(|(raw, (_, _, on_disk))| {
+                index.contains_key(*raw) || !exe.is_some_and(|exe| leads_to_build_dir(on_disk, exe))
+            })
+            .map(|(raw, (name, utf8_name, on_disk))| {
                 let stages = index.get(raw).map(Vec::as_slice).unwrap_or_default();
                 let source = if stages.iter().any(|(mode, _)| mode == "160000") {
                     Source::Index {
@@ -660,6 +663,31 @@ fn build_dir_in(root: &Path, exe: &Path) -> Option<String> {
         .last()?;
     let relative = top.strip_prefix(&root).ok()?.to_str()?;
     Some(relative.replace('\\', "/"))
+}
+
+/// Whether `path` is a symlink to the Cargo target directory `exe` was
+/// built in, wherever that is.
+///
+/// Git lists a symlink to a directory as one untracked file and does not
+/// look inside, and the `/target/` rule in `.gitignore` matches only a
+/// directory. A `target` kept on another disk or a tmpfs through a symlink,
+/// or a `CARGO_TARGET_DIR` reached through one, was therefore listed as an
+/// untracked file named `target` and failed the full check (`build_dir_in`
+/// sees only the canonical path, which lies outside the checkout). Such a
+/// link is passed over only while it leads to a directory holding Cargo's
+/// `CACHEDIR.TAG` that the running program was built in; any other link is
+/// still read, and a tracked or staged one always is.
+fn leads_to_build_dir(path: &Path, exe: &Path) -> bool {
+    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return false;
+    }
+    let (Ok(dir), Ok(exe)) = (path.canonicalize(), exe.canonicalize()) else {
+        return false;
+    };
+    dir != exe
+        && exe.starts_with(&dir)
+        && std::fs::read(dir.join("CACHEDIR.TAG"))
+            .is_ok_and(|tag| tag.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55"))
 }
 
 /// Whether the `/`-separated path `raw` lies under the directory `dir`.
@@ -1444,6 +1472,52 @@ mod tests {
         std::fs::write(plain.join("a.rs"), b"fn a() {}\n").unwrap();
         let exe = fake_build_dir(&plain.join("build-out"));
         assert_eq!(names_built_by(&plain, &exe), ["a.rs"]);
+    }
+
+    /// A target directory kept elsewhere and reached through a symlink in
+    /// the checkout, such as `target -> /mnt/fast/target`, was listed as an
+    /// untracked file: git does not descend into a symlink, and `/target/`
+    /// ignores only a directory. The link the check runs through is passed
+    /// over; a link to any other build directory, or to a directory without
+    /// Cargo's tag, is still read, as is the same link once it is tracked.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_build_directory_is_passed_over() {
+        let repo = tempdir();
+        let elsewhere = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "/target/\n").unwrap();
+        std::fs::write(root.join("a.rs"), b"fn a() {}\n").unwrap();
+        let exe = fake_build_dir(&elsewhere.path().join("build"));
+        let other = fake_build_dir(&elsewhere.path().join("other"));
+        let untagged = elsewhere.path().join("untagged");
+        std::fs::create_dir(&untagged).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join("build"), root.join("target")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join("other"), root.join("other")).unwrap();
+        std::os::unix::fs::symlink(&untagged, root.join("untagged")).unwrap();
+        std::os::unix::fs::symlink(&exe, root.join("program")).unwrap();
+
+        // Git really does see the link: the ignore rule does not cover it.
+        let status = super::git_command(root)
+            .args(["check-ignore", "-q", "--", "target"])
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(1));
+
+        assert_eq!(
+            names_built_by(root, &exe),
+            [".gitignore", "a.rs", "other", "program", "untagged"]
+        );
+        assert!(names_built_by(root, &other).contains(&"target".to_owned()));
+        assert!(!super::leads_to_build_dir(
+            &elsewhere.path().join("build"),
+            &exe
+        ));
+
+        git_str(root, &["add", "-f", "target"]);
+        assert!(names_built_by(root, &exe).contains(&"target".to_owned()));
+        assert_eq!(names(root, true), ["target"]);
     }
 
     /// `path` quoted for `sh`, for the scripts tests write: a TMPDIR holding
