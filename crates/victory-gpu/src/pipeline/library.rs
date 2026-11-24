@@ -539,6 +539,25 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
+    // Said before the call, not after: the vendor compiler can fault on this
+    // path, and a fault leaves nothing behind to say which pipeline was being
+    // made or why the library missed it. This line is the only account of it.
+    tracing::info!(
+        pipeline = %name,
+        refused = %refused,
+        "host pipeline: the library did not hold it, making it"
+    );
+    // A pipeline we refuse leaves a draw missing; a pipeline we hand to a
+    // compiler that faults kills the run. `VICTORY_NO_PIPELINE_FALLBACK=1`
+    // (diagnostics only) takes the first outcome on purpose.
+    if no_fallback() {
+        tracing::warn!(
+            pipeline = %name,
+            refused = %refused,
+            "host pipeline: the library missed and the fallback is switched off"
+        );
+        return Err(refused);
+    }
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
@@ -847,4 +866,17 @@ mod tests {
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
     }
+}
+
+
+/// Whether a pipeline the library did not hold is refused instead of made
+/// (`VICTORY_NO_PIPELINE_FALLBACK=1`, diagnostics builds only). The fallback
+/// runs the vendor compiler over a description it has faulted on before; this
+/// switch turns that into a refusal that names the pipeline.
+fn no_fallback() -> bool {
+    if !cfg!(feature = "diagnostics") {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_PIPELINE_FALLBACK").is_some())
 }
