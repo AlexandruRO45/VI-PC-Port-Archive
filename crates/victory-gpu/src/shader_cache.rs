@@ -9,11 +9,12 @@
 //! must be added to `encode` and `decode` too (entries of older builds
 //! are ignored anyway).
 //!
-//! A container this build cannot translate is cached too, as its error:
-//! translation depends only on the container and on what [`build`]
-//! hashes, so it would fail the same way again. Without that, every run
-//! translated the same few hundred refused programs again (seconds each
-//! for the large ones) while the title waited for them.
+//! A container this build cannot translate is cached too, as its error
+//! (marker, length, text: the length is what tells a cut-short entry from a
+//! shorter reason): translation depends only on the container and on what
+//! [`build`] hashes, so it would fail the same way again. Without that,
+//! every run translated the same few hundred refused programs again
+//! (seconds each for the large ones) while the title waited for them.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -143,16 +144,30 @@ fn cached(
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
-/// The entry of a container that does not translate: this, then the
-/// error's text (UTF-8).
+/// The entry of a container that does not translate: this, then the text's
+/// length (little endian, 4 bytes), then the error's text (UTF-8).
 const FAILED: &[u8; 4] = b"VSF1";
+/// The bytes the payload's length takes, after [`FAILED`].
+const LENGTH: usize = 4;
 
+/// A refusal's entry. The length is what tells a cut-short entry from a
+/// shorter error: text that is not exactly as long as it says is damage,
+/// and is translated again rather than served with a truncated reason.
 fn encode_failure(error: &str) -> Vec<u8> {
-    [FAILED.as_slice(), error.as_bytes()].concat()
+    let mut entry = Vec::with_capacity(FAILED.len() + LENGTH + error.len());
+    entry.extend_from_slice(FAILED);
+    entry.extend_from_slice(&(error.len() as u32).to_le_bytes());
+    entry.extend_from_slice(error.as_bytes());
+    entry
 }
 
 fn decode_failure(bytes: &[u8]) -> Option<String> {
-    let text = bytes.strip_prefix(FAILED.as_slice())?;
+    let rest = bytes.strip_prefix(FAILED.as_slice())?;
+    let (length, text) = rest.split_at_checked(LENGTH)?;
+    let length = u32::from_le_bytes(length.try_into().ok()?) as usize;
+    if text.len() != length {
+        return None;
+    }
     String::from_utf8(text.to_vec()).ok()
 }
 const STAGES: [HwStage; 8] = [
@@ -396,6 +411,27 @@ mod tests {
         );
         assert_eq!(decode(&bytes), None);
         assert_eq!(decode_failure(&encode(&shader())), None);
+    }
+
+    #[test]
+    fn a_damaged_failure_entry_is_no_entry() {
+        let full = encode_failure("a scalar memory read as data");
+        assert_eq!(
+            decode_failure(&full).as_deref(),
+            Some("a scalar memory read as data")
+        );
+        // Truncated after the marker, and after a valid UTF-8 prefix: both
+        // are damaged, not an entry with a shorter error, so both are retried.
+        for n in [FAILED.len(), FAILED.len() + 4, full.len() - 1] {
+            assert_eq!(decode_failure(&full[..n]), None, "cut to {n} bytes");
+        }
+        // Text that is not UTF-8, and a marker followed by text that is not
+        // one (a shader entry's magic, say) are no entry either.
+        assert_eq!(
+            decode_failure(&[FAILED.as_slice(), &[0xff, 0xfe]].concat()),
+            None
+        );
+        assert_eq!(decode_failure(b"VSH1a scalar memory read as data"), None);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
