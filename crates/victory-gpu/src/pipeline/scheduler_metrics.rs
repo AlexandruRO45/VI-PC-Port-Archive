@@ -1,5 +1,7 @@
 //! Diagnostics for pipeline-worker occupancy and queued work.
 //!
+//! Full-pool saturation uses the successfully spawned worker count, published only
+//! after all spawn attempts finish, so a partially started pool is not misreported.
 //! These counters answer a question that shader wait-time totals alone cannot:
 //! was work still queued while workers were waiting for a shared translation?
 //! They do not prove that every queued pipeline was independently runnable;
@@ -57,7 +59,7 @@ impl State {
         self.queued_jobs > 0 && self.dependency_waiters > 0
     }
 
-    fn has_all_registered_workers_waiting_with_queue(&self) -> bool {
+    fn has_full_pool_backlog(&self) -> bool {
         self.queued_jobs > 0
             && self.pool_ready
             && self.pool_workers > 0
@@ -113,15 +115,15 @@ impl Tracker {
                 .queued_with_dependency_wait_us
                 .saturating_add(elapsed_us);
         }
-        if state.has_all_registered_workers_waiting_with_queue() {
+        if state.has_full_pool_backlog() {
             state.all_pool_workers_waiting_with_queue_us = state
                 .all_pool_workers_waiting_with_queue_us
                 .saturating_add(elapsed_us);
         }
 
         let had_queued_dependency_wait = state.has_queued_dependency_wait();
-        let had_all_registered_workers_waiting_with_queue =
-            state.has_all_registered_workers_waiting_with_queue();
+        let had_full_pool_backlog =
+            state.has_full_pool_backlog();
 
         state.last_event = now;
         change(&mut state);
@@ -131,8 +133,8 @@ impl Tracker {
                 state.queued_with_dependency_wait_periods.saturating_add(1);
         }
         let entered_all_registered_workers_backlog =
-            !had_all_registered_workers_waiting_with_queue
-                && state.has_all_registered_workers_waiting_with_queue();
+            !had_full_pool_backlog
+                && state.has_full_pool_backlog();
         if entered_all_registered_workers_backlog {
             state.all_pool_workers_waiting_with_queue_periods = state
                 .all_pool_workers_waiting_with_queue_periods
@@ -353,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_only_new_all_registered_worker_backlog_intervals() {
+    fn reports_only_new_full_pool_backlog_intervals() {
         let start = Instant::now();
         let tracker = Tracker::new_at(start);
 
@@ -369,7 +371,7 @@ mod tests {
             s.dependency_waiters = 1;
         }));
 
-        // The second waiter blocks the last registered worker while work is still queued.
+        // The second waiter blocks the final worker in the initialized pool while work is still queued.
         assert!(tracker.update_at(start + Duration::from_millis(30), |s| {
             s.dependency_waiters = 2;
         }));
