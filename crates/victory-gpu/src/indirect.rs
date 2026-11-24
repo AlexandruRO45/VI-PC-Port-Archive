@@ -671,6 +671,8 @@ void main() {
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
         let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        // Bound, never written: no slots.
+        let (_ring, _, ring_gpu) = warp.shared_buffer(256);
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         // SAFETY: the mapping holds `size` bytes.
         unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
@@ -684,11 +686,12 @@ void main() {
                 }
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, skew, size as u32, PIECES, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                let constants = [0u32, skew, size as u32, PIECES, 0, mode, 0, 0];
+                warp.list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, ring_gpu);
                 let groups = PIECES.div_ceil(crate::host::CARD_COMPARE_PIECES_PER_GROUP);
                 warp.list.Dispatch(groups, 1, 1);
             }
@@ -741,6 +744,112 @@ void main() {
             assert_eq!(run_with_skew(&mut warp, 1, skew as u32), expected);
             // SAFETY: the same byte is still mapped after the list finishes.
             unsafe { now_ptr.add(at).write_volatile(content[at]) };
+        }
+    }
+
+    /// With slots, the compare copies each piece it finds differing into
+    /// the ring, in the order of the queue: its dword is 2 + the slot, the
+    /// slot holds the piece's bytes from `card_slot_start` on, as they were
+    /// when the compare ran (a later change of the copy does not reach it),
+    /// and a piece found differing once the slots are gone is flagged 1 with
+    /// nothing copied. Skewed copies, the partial first piece and the last
+    /// piece are covered.
+    #[test]
+    fn warp_card_compare_copies_differing_pieces_into_the_ring() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 9;
+        const SLOT: usize = crate::host::CARD_SLOT_BYTES;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        const SLOTS: u32 = 3;
+        let (_ring, ring_ptr, ring_gpu) = warp.shared_buffer((SLOT * (SLOTS as usize + 1)) as u64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 7 + i / 509) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let run = |warp: &mut WarpHarness, mode: u32, skew: u32, slots: u32| -> Vec<u32> {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for piece in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                }
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, skew, size as u32, PIECES, 0, mode, slots, 0];
+                warp.list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, ring_gpu);
+                warp.list.Dispatch(PIECES.div_ceil(crate::host::CARD_COMPARE_PIECES_PER_GROUP), 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            (0..PIECES as usize).map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() }).collect()
+        };
+        // SAFETY (each): inside the mappings.
+        let taken = || unsafe { ring_ptr.cast::<u32>().read_volatile() };
+        let reset = || unsafe { ring_ptr.cast::<u32>().write_volatile(0) };
+        let slot = |s: u32| unsafe { std::slice::from_raw_parts(ring_ptr.add(SLOT * (s as usize + 1)), SLOT) };
+        let flip = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+        for skew in [0u32, 4096] {
+            let skew_bytes = skew as usize;
+            // Piece p's first and last offsets in the copy, as `piece_at` cuts them.
+            let first_of = |p: u32| ((p as usize) * PIECE).saturating_sub(skew_bytes);
+            let last_of = |p: u32| ((p as usize + 1) * PIECE - skew_bytes).min(size) - 1;
+            reset();
+            assert!(run(&mut warp, 0, skew, SLOTS).iter().all(|&d| d == 7), "hashing alone flags nothing");
+            assert_eq!(taken(), 0, "hashing alone takes no slot");
+            // Change the first piece's last byte, piece 4's first byte and
+            // the last piece's last byte (piece 0 is partial when skewed).
+            let changed = [(0u32, last_of(0)), (4, first_of(4)), (PIECES - 1, last_of(PIECES - 1))];
+            for &(_, at) in &changed {
+                flip(at, content[at] ^ 0x5a);
+            }
+            let flags = run(&mut warp, 2, skew, SLOTS);
+            assert_eq!(taken(), 3, "skew {skew}: a slot per changed piece");
+            for p in 0..PIECES {
+                let changed_here = changed.iter().any(|&(q, _)| q == p);
+                assert_eq!(flags[p as usize] >= 2, changed_here, "skew {skew}: piece {p} flagged {}", flags[p as usize]);
+            }
+            // Each slot holds its piece as the compare saw it.
+            let mut slots_seen = Vec::new();
+            for &(p, at) in &changed {
+                let s = flags[p as usize] - 2;
+                slots_seen.push(s);
+                let base = crate::host::card_slot_start(p, skew);
+                let bytes = slot(s);
+                for off in [first_of(p), at, last_of(p)] {
+                    // SAFETY: inside the copy's mapping.
+                    let now = unsafe { now_ptr.add(off).read_volatile() };
+                    assert_eq!(bytes[off - base], now, "skew {skew}: piece {p} offset {off:#x} in slot {s}");
+                }
+            }
+            slots_seen.sort_unstable();
+            assert_eq!(slots_seen, [0, 1, 2], "skew {skew}: three distinct slots");
+            // A later change does not reach a slot already written.
+            let (p, at) = changed[1];
+            let s = flags[p as usize] - 2;
+            flip(at, content[at] ^ 0x33);
+            let before = slot(s)[at - crate::host::card_slot_start(p, skew)];
+            assert_eq!(before, content[at] ^ 0x5a);
+            // Now the ring is full: the changed piece is flagged 1, nothing copied.
+            let flags = run(&mut warp, 2, skew, SLOTS);
+            assert_eq!(flags[p as usize], 1, "skew {skew}: no slot left");
+            assert!(taken() > SLOTS);
+            assert_eq!(slot(s)[at - crate::host::card_slot_start(p, skew)], content[at] ^ 0x5a, "the full ring is left as it was");
+            // Restore the copy and the hashes for the next skew.
+            for &(_, at) in &changed {
+                flip(at, content[at]);
+            }
+            reset();
+            run(&mut warp, 0, skew, 0);
         }
     }
 

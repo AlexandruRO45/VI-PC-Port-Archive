@@ -1428,6 +1428,10 @@ struct CardWork {
     differs: (ID3D12Resource, usize, u64),
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
+    /// With [`relay_snapshot`]: where the compare copies the pieces it
+    /// finds differing (PC memory, mapped: buffer, mapping, slots). The
+    /// count of slots taken starts again with `taken`.
+    ring: Option<(ID3D12Resource, usize, u32)>,
     /// The dwords of `differs` taken by plans whose results were not read
     /// yet.
     taken: u32,
@@ -1450,7 +1454,7 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 pub(crate) const CARD_COMPARE_PIECES_PER_GROUP: u32 = 2;
 
 pub(crate) const CARD_COMPARE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=8, b0), SRV(t0), UAV(u0), UAV(u1), UAV(u2)"
 cbuffer Span : register(b0) {
     uint first;    // the first piece
     uint skew;     // where the copy starts in its piece 0
@@ -1458,14 +1462,23 @@ cbuffer Span : register(b0) {
     uint pieces;
     uint out_at;   // the first piece's dword in `differs`, in bytes
     uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
+    uint slots;    // with compare: a piece found differing is copied into `ring` while it has slots (0: never)
+    uint unused;
 };
 ByteAddressBuffer now : register(t0);
 // 16 bytes per piece of the copy: the hash of its bytes when they were
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
+// Per piece compared: 0 the same; 1 it differs; 2 + s it differs and its
+// bytes are in slot s of `ring`.
 RWByteAddressBuffer differs : register(u1);
+// Dword 0 counts the slots taken; slot s holds a piece's bytes (widened to
+// 16 bytes as the hashing reads them) from slotBytes * (s + 1) on.
+RWByteAddressBuffer ring : register(u2);
 groupshared uint4 stripes[64];
+groupshared uint copyTo[2];
 static const uint pieceBytes = 65536u;
+static const uint slotBytes = 65792u;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint index : SV_GroupIndex, uint3 group : SV_GroupID) {
@@ -1477,11 +1490,13 @@ void main(uint index : SV_GroupIndex, uint3 group : SV_GroupID) {
     uint4 start = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
     uint4 mix = uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
     uint4 h = start ^ (lane * mix);
+    uint lo = 0u;
+    uint hi = 0u;
     if (offset < pieces) {
-        uint lo = piece * pieceBytes;
+        lo = piece * pieceBytes;
         lo = lo > skew ? lo - skew : 0u;
         lo = min(lo, size);
-        uint hi = lo + min(size - lo, piece == 0u ? pieceBytes - skew : pieceBytes);
+        hi = lo + min(size - lo, piece == 0u ? pieceBytes - skew : pieceBytes);
         lo = lo & ~15u;
         hi = (hi + 15u) & ~15u;
         [loop]
@@ -1492,21 +1507,138 @@ void main(uint index : SV_GroupIndex, uint3 group : SV_GroupID) {
     }
     stripes[index] = h;
     GroupMemoryBarrierWithGroupSync();
-    if (offset >= pieces || lane != 0u) return;
-    [unroll]
-    for (uint n = 1u; n < 32u; ++n) {
-        h ^= stripes[index + n];
+    if (lane == 0u) {
+        uint slot = 0xFFFFFFFFu;
+        if (offset < pieces) {
+            [unroll]
+            for (uint n = 1u; n < 32u; ++n) {
+                h ^= stripes[index + n];
+            }
+            if (compare != 0u) {
+                uint flag = any(h != hashes.Load4(piece * 16u)) ? 1u : 0u;
+                // In the queue's order, before any later submission can
+                // write the copy: the piece as this submission left it.
+                if (flag != 0u && slots != 0u) {
+                    uint taken;
+                    ring.InterlockedAdd(0u, 1u, taken);
+                    if (taken < slots) {
+                        slot = taken;
+                        flag = 2u + taken;
+                    }
+                }
+                differs.Store(out_at + offset * 4u, flag);
+                // With the copy-back on its own thread: the next compare of
+                // the piece finds what is written from here on.
+                if (compare == 2u) hashes.Store4(piece * 16u, h);
+            } else {
+                hashes.Store4(piece * 16u, h);
+            }
+        }
+        copyTo[localPiece] = slot;
     }
-    if (compare != 0u) {
-        differs.Store(out_at + offset * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
-        // With the copy-back on its own thread: the next compare of the
-        // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
-    } else {
-        hashes.Store4(piece * 16u, h);
+    GroupMemoryBarrierWithGroupSync();
+    uint to = copyTo[localPiece];
+    if (to == 0xFFFFFFFFu) return;
+    uint base = slotBytes * (to + 1u);
+    [loop]
+    for (uint at = lo + lane * 16u; at < hi; at += 32u * 16u) {
+        ring.Store4(base + (at - lo), now.Load4(at));
     }
 }
 "#;
+
+/// The bytes of a slot of [`CARD_COMPARE`]'s ring: a piece widened to 16
+/// bytes at both ends, as the hashing reads it. The ring's first slot's
+/// worth of bytes holds the count of slots taken (dword 0).
+pub(crate) const CARD_SLOT_BYTES: usize = 65792;
+
+/// Where the bytes of piece `piece` of a copy start in its slot of the
+/// ring: the piece's first offset in the copy as [`CARD_COMPARE`] widens
+/// it (`skew`: where the copy starts in its piece 0).
+pub(crate) fn card_slot_start(piece: u32, skew: u32) -> usize {
+    let lo = (piece as usize) * 65536;
+    let lo = if lo > skew as usize { lo - skew as usize } else { 0 };
+    lo & !15
+}
+
+/// `VICTORY_RELAY_SNAPSHOT=1` (with [`relay`]): the compare after a flight's
+/// lists also copies each piece it finds differing into a ring in PC
+/// memory, on the queue, before any later submission can write the copy;
+/// the thread that lands the flight merges from there, with no fetch of
+/// its own and no wait behind the submissions sent since (75 ms a frame of
+/// the relay's 111 ms in the prison-bus scene, which kept 128 lists in the
+/// air and the submitting thread waiting 88 ms a frame). A piece the ring
+/// had no slot for, or a range not compared, makes its landing fetch as
+/// before. `VICTORY_RELAY_SNAPSHOT_MB` sizes the ring (256).
+fn relay_snapshot() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY_SNAPSHOT").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line, of [`relay_snapshot`]: landings merged
+/// from the ring, landings that fetched (a piece without a slot, or a range
+/// not compared), pieces merged from the ring, their bytes, and pieces left
+/// out because a fetch had brought newer bytes of them (`MERGED_UPTO`).
+static SNAPSHOT_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// With [`relay_snapshot`], by copy (its `Arc` pointer) and piece: the
+/// queue order (`QUEUE_ORDER`) a landing that fetched it ran behind. Such a
+/// fetch runs behind every submission queued so far and may bring the bytes
+/// of flights still in the air; a flight numbered below it (`CardPlan`'s
+/// `sent_as`) ran wholly before the fetch, so its ring copy of the piece is
+/// older than what was merged, and putting it in would take title memory
+/// back until the newer flight lands. Kept only while such flights are in
+/// the air ([`forget_merged_upto`]).
+static MERGED_UPTO: Mutex<Option<std::collections::HashMap<(usize, u32), u64>>> = Mutex::new(None);
+
+/// The flights numbered up to `landed` have landed: an entry of
+/// [`MERGED_UPTO`] no later flight is numbered below is of no use.
+fn forget_merged_upto(landed: Option<u64>) {
+    let Some(landed) = landed else { return };
+    if let Some(upto) = MERGED_UPTO.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        forget_upto(upto, landed);
+    }
+}
+
+/// [`forget_merged_upto`] on a table: a later flight is numbered above
+/// `landed`, so an entry at `landed + 1` or below can leave out none.
+fn forget_upto(upto: &mut std::collections::HashMap<(usize, u32), u64>, landed: u64) {
+    upto.retain(|_, w| *w > landed + 1);
+}
+
+/// A fetch that ran behind queue order `after` merged `keys`.
+fn note_upto(upto: &mut std::collections::HashMap<(usize, u32), u64>, keys: impl IntoIterator<Item = (usize, u32)>, after: u64) {
+    for key in keys {
+        let w = upto.entry(key).or_insert(0);
+        *w = (*w).max(after);
+    }
+}
+
+/// What a landing from the ring does with a flagged piece of a flight
+/// numbered `sent_as`: `slot` is what the compare left for it (`None`: no
+/// flag with a slot), `upto` the order of a fetch that merged it already.
+#[derive(Debug, PartialEq, Eq)]
+enum RingPiece {
+    /// Merge its bytes from this slot.
+    Merge(u32),
+    /// Leave it out: a fetch that ran after this flight merged newer bytes.
+    Older,
+    /// The ring cannot serve it: the landing fetches, as before.
+    Fetch,
+}
+
+fn ring_piece(slot: Option<u32>, slots: u32, sent_as: u64, upto: Option<u64>) -> RingPiece {
+    match slot {
+        Some(slot) if slot < slots => {
+            if upto.is_some_and(|w| sent_as < w) {
+                RingPiece::Older
+            } else {
+                RingPiece::Merge(slot)
+            }
+        }
+        _ => RingPiece::Fetch,
+    }
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -1564,6 +1696,14 @@ struct CardPlan {
     /// The lists of ours the plan recorded (whether the compare, the
     /// list), given back by `Host::card_done`.
     lists: Vec<(bool, Prelude)>,
+    /// With [`relay`]: the number its sends of title bytes to the card's
+    /// side were given in the order of the queue (`QUEUE_ORDER`). Every
+    /// send numbered up to it ran before the compare; every later one
+    /// after it.
+    sent_as: u64,
+    /// Whether the compare copies the pieces it finds differing into the
+    /// ring ([`relay_snapshot`]).
+    in_ring: bool,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -1842,7 +1982,47 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{RingPiece, flagged_pieces, forget_upto, landable, note_upto, ring_piece};
+
+    /// The change from fetching to the ring (`VICTORY_RELAY_SNAPSHOT`): a
+    /// landing that had to fetch ran behind every submission queued so far,
+    /// so it may have merged a later flight's write to a piece. A flight
+    /// numbered below that fetch then lands from the ring with an older
+    /// copy of the same piece: it must be left out, not put over the newer
+    /// bytes. A flight numbered at or above the fetch may have run after it
+    /// and is merged. The note goes once no flight below it can land.
+    #[test]
+    fn an_older_ring_copy_does_not_undo_a_newer_fetch() {
+        let mut upto = std::collections::HashMap::new();
+        let piece = (0x1000usize, 7u32);
+        let other = (0x1000usize, 8u32);
+        // Flights 8, 9 and 10 are in the air; flight 7's landing fetches
+        // behind queue order 10 and merges `piece`, which flight 9 wrote.
+        note_upto(&mut upto, [piece], 10);
+        // Flight 8 and 9 land from the ring with their copies of `piece`.
+        assert_eq!(ring_piece(Some(3), 16, 8, upto.get(&piece).copied()), RingPiece::Older);
+        assert_eq!(ring_piece(Some(4), 16, 9, upto.get(&piece).copied()), RingPiece::Older);
+        // Another piece the fetch did not bring is merged.
+        assert_eq!(ring_piece(Some(5), 16, 9, upto.get(&other).copied()), RingPiece::Merge(5));
+        // Flight 10 took its sends' number before the fetch: its lists may
+        // have run after it, so its copy is merged.
+        assert_eq!(ring_piece(Some(6), 16, 10, upto.get(&piece).copied()), RingPiece::Merge(6));
+        // A later fetch only raises the note.
+        note_upto(&mut upto, [piece], 9);
+        assert_eq!(upto[&piece], 10);
+        // Flight 8 landed: flight 9 still needs the note.
+        forget_upto(&mut upto, 8);
+        assert!(upto.contains_key(&piece));
+        // Flight 9 landed: no flight below 10 is left.
+        forget_upto(&mut upto, 9);
+        assert!(upto.is_empty());
+        // Without a note, a slot merges; a piece flagged with no slot (the
+        // ring was full) or with a slot past the ring makes the landing fetch.
+        assert_eq!(ring_piece(Some(0), 1, 3, None), RingPiece::Merge(0));
+        assert_eq!(ring_piece(None, 16, 3, None), RingPiece::Fetch);
+        assert_eq!(ring_piece(Some(16), 16, 3, None), RingPiece::Fetch);
+        assert_eq!(ring_piece(None, 16, 3, Some(99)), RingPiece::Fetch);
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -2524,6 +2704,15 @@ fn late_line(frames: f64) {
             r[4] / 1000.0,
         );
     }
+    if relay_snapshot() {
+        let [ring, fetched, pieces, bytes, older] = SNAPSHOT_STATS.each_ref().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "pieces copied by the compare in the queue's order, per frame (VICTORY_RELAY_SNAPSHOT=1): {ring:.1} landings merged \
+             from the ring, {fetched:.1} that fetched (a piece without a slot, or a range not compared); {pieces:.0} pieces, \
+             {:.1} MB from the ring; {older:.1} pieces left out, a fetch having merged newer bytes of them",
+            bytes / 1e6
+        );
+    }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
@@ -2947,6 +3136,29 @@ impl Host {
         const RESULTS: u64 = 1 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
+        // The ring of pieces the compare copies (`relay_snapshot`): its
+        // first slot's worth of bytes holds the count of slots taken.
+        let ring = relay_snapshot()
+            .then(|| {
+                let mb: u64 = std::env::var("VICTORY_RELAY_SNAPSHOT_MB")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(256)
+                    .clamp(16, 4096);
+                let slots = ((mb << 20) / CARD_SLOT_BYTES as u64).saturating_sub(1).max(1) as u32;
+                let bytes = (u64::from(slots) + 1) * CARD_SLOT_BYTES as u64;
+                let (ring, data) = self.shared_buffer(bytes)?;
+                name(&ring, || "card compare ring of pieces".into());
+                // SAFETY: the mapping's first dword; nothing runs on the
+                // card yet.
+                unsafe { (data as *mut u32).write_volatile(0) };
+                tracing::info!(slots, mb, "pieces the card's compare finds differing are copied in the queue's order (VICTORY_RELAY_SNAPSHOT=1)");
+                Some((ring, data as usize, slots))
+            })
+            .flatten();
+        if relay_snapshot() && ring.is_none() {
+            tracing::warn!("no ring for the pieces the card's compare finds differing: they are fetched as before");
+        }
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
         unsafe {
@@ -2968,9 +3180,22 @@ impl Host {
                 pso,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
+                ring,
                 taken: 0,
                 out: 0,
             })
+        }
+    }
+
+    /// The compare's ring UAV and its slots for a compare of `flown` lists:
+    /// the ring's own buffer when [`relay_snapshot`] is on and the lists
+    /// are sent ahead, else the results buffer and no slots (the shader
+    /// never writes the ring then, but the root parameter is set).
+    fn card_ring(work: &CardWork, flown: bool) -> (u64, u32) {
+        match (&work.ring, flown) {
+            // SAFETY (both): plain queries of live buffers.
+            (Some((ring, _, slots)), true) => (unsafe { ring.GetGPUVirtualAddress() }, *slots),
+            _ => (unsafe { work.differs.0.GetGPUVirtualAddress() }, 0),
         }
     }
 
@@ -3082,6 +3307,8 @@ impl Host {
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                        // Hashing only: the ring is set, never written.
+                        list.SetComputeRootUnorderedAccessView(4, Self::card_ring(work, false).0);
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
@@ -3092,8 +3319,8 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
-                            let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
-                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                            let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0, 0, 0];
+                            list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
                             list.Dispatch(run.pieces.div_ceil(CARD_COMPARE_PIECES_PER_GROUP), 1, 1);
                         }
                     }
@@ -3108,11 +3335,14 @@ impl Host {
             used.push((false, sync));
         }
         drop(order);
+        let (ring, slots) = Self::card_ring(work, flown);
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
+            sent_as,
+            in_ring: slots != 0,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -3171,12 +3401,14 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    list.SetComputeRootUnorderedAccessView(4, ring);
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
-                        list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                        let constants =
+                            [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }, slots, 0];
+                        list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.Dispatch(r.span.pieces.div_ceil(CARD_COMPARE_PIECES_PER_GROUP), 1, 1);
@@ -3200,11 +3432,17 @@ impl Host {
     /// plans in the air. It starts from the beginning only when no plan is
     /// out, so the caller lets the flights land first.
     fn card_results_low(&self) -> bool {
-        CARD_WORK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .is_some_and(|work| u64::from(work.taken) * 8 > work.differs.2)
+        CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|work| {
+            // Also the ring of pieces (`relay_snapshot`), by the slots the
+            // compares that ran took: a piece it has no slot for is
+            // fetched, as before, and costs its landing the wait.
+            // SAFETY: the ring's first dword, which only the compares
+            // write (atomically) while plans are out.
+            let ring_low = work.ring.as_ref().is_some_and(|(_, data, slots)| {
+                unsafe { (*data as *const u32).read_volatile() }.saturating_mul(2) > *slots
+            });
+            u64::from(work.taken) * 8 > work.differs.2 || ring_low
+        })
     }
 
     /// The plan's submission has run and its results were read
@@ -3224,6 +3462,14 @@ impl Host {
         // not read yet: the area starts again only when none is out.
         if !relay() || work.out == 0 {
             work.taken = 0;
+            // The ring too, once no plan is out: no compare can take a slot
+            // now, and every slot taken was merged by its landing.
+            if work.out == 0
+                && let Some((_, data, _)) = &work.ring
+            {
+                // SAFETY: the ring's first dword; nothing of ours is on the card.
+                unsafe { (*data as *mut u32).write_volatile(0) };
+            }
         }
     }
 
@@ -3255,11 +3501,38 @@ impl Host {
     /// bytes, which that flight's landing then finds merged already; and
     /// nothing is sent back up.
     fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
-        let differs = {
+        let (differs, ring) = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-            work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
+            (
+                work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize)),
+                work.as_ref().and_then(|work| work.ring.as_ref().map(|(_, data, slots)| (*data, *slots))),
+            )
         };
+        // With the ring (`relay_snapshot`) a later landing may merge pieces
+        // the card copied before sends that are already on the queue now:
+        // their notes must stay until that landing, so notes are dropped
+        // only up to the sends these flights saw. (Dropping fewer is always
+        // safe: a note older than a merge's own sends skips nothing.)
+        let seen_by_these = plans.iter().map(|p| p.sent_as).max();
+        let drop_notes = |after: u64| match (relay_snapshot(), seen_by_these) {
+            (false, _) => crate::shadow::relay_fetched(after),
+            (true, Some(seen)) => crate::shadow::relay_fetched(after.min(seen)),
+            (true, None) => {}
+        };
+        if let (Some((differs, dwords)), Some((ring, slots))) = (differs, ring)
+            && relay_snapshot()
+            // SAFETY: as below, for the results; the ring's slots that these
+            // plans' compares took are given to no other plan before these
+            // are done with (`card_done`).
+            && unsafe { self.relay_from_ring(plans, std::slice::from_raw_parts(differs as *const u32, dwords), ring, slots) }
+        {
+            drop_notes(seen_by_these.unwrap_or(0));
+            forget_merged_upto(seen_by_these);
+            return;
+        }
         let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
+        // The pieces fetched, by copy and piece (`MERGED_UPTO`).
+        let mut keys: Vec<(usize, u32)> = Vec::new();
         let mut total = 0u64;
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
@@ -3288,6 +3561,7 @@ impl Host {
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi && seen.insert((copy, lo, hi)) {
                             pieces.push((r.shadow.clone(), lo, hi, total));
+                            keys.push((copy, r.span.first + p));
                             total += (hi - lo) as u64;
                         }
                     }
@@ -3295,9 +3569,13 @@ impl Host {
                 }
             }
         }
+        if relay_snapshot() && !plans.is_empty() {
+            SNAPSHOT_STATS[1].fetch_add(1, Ordering::Relaxed);
+        }
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next fetch.
-            crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            drop_notes(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            forget_merged_upto(seen_by_these);
             return;
         }
         if fetch.is_none() {
@@ -3364,7 +3642,116 @@ impl Host {
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
-        crate::shadow::relay_fetched(after);
+        drop_notes(after);
+        // This fetch ran behind every submission queued so far, so it may
+        // have brought bytes of flights still in the air: a later landing
+        // must not put an older copy of these pieces over them.
+        if relay_snapshot() {
+            let mut upto = MERGED_UPTO.lock().unwrap_or_else(|e| e.into_inner());
+            note_upto(upto.get_or_insert_with(Default::default), keys, after);
+        }
+        forget_merged_upto(seen_by_these);
+    }
+
+    /// [`relay_snapshot`], for [`Host::relay_card_back`]: the pieces these
+    /// plans' compares flagged are merged from the ring, plan by plan in the
+    /// order the flights ran, each with the sends its own flight saw (a
+    /// piece's bytes are as that flight left them, before any later
+    /// submission's sends or shader writes reached the copy). All or
+    /// nothing: false, with nothing merged, if a plan did not use the ring,
+    /// did not compare a range, or flagged a piece the ring had no slot for;
+    /// the caller then fetches as before.
+    ///
+    /// # Safety
+    /// `differs` is the compare's results and `ring` the mapping of the
+    /// ring of `slots` slots; the compares of `plans` have run.
+    unsafe fn relay_from_ring(&self, plans: &[&CardPlan], differs: &[u32], ring: usize, slots: u32) -> bool {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+        if plans.is_empty() || !plans.iter().all(|p| p.in_ring && p.ranges.iter().all(|r| r.compared)) {
+            return false;
+        }
+        // (copy, offsets, where its bytes are, the sends its flight saw).
+        let mut merges: Vec<(Arc<crate::shadow::Shadow>, usize, usize, usize, u64)> = Vec::new();
+        let mut compared = 0u64;
+        let mut older = 0u64;
+        let upto = MERGED_UPTO.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+        for plan in plans {
+            // Per piece of a copy: its slot, if the compare of any of the
+            // plan's ranges copied it (a piece two ranges share is hashed
+            // twice, and only the first compare finds it changed).
+            let mut slot_of: HashMap<(usize, u32), Option<u32>> = HashMap::new();
+            let mut flags: Vec<(usize, u32, bool)> = Vec::new();
+            for r in &plan.ranges {
+                let copy = Arc::as_ptr(&r.shadow) as usize;
+                for p in 0..r.span.pieces {
+                    let piece = r.span.first + p;
+                    // A dword outside the results counts as flagged, without a slot.
+                    let d = differs.get((r.at + p) as usize).copied().unwrap_or(1);
+                    flags.push((copy, piece, d != 0));
+                    match d {
+                        0 => {}
+                        1 => {
+                            slot_of.entry((copy, piece)).or_insert(None);
+                        }
+                        _ => {
+                            slot_of.insert((copy, piece), Some(d - 2));
+                        }
+                    }
+                }
+                compared += u64::from(r.span.pieces);
+            }
+            let flagged = flagged_pieces(&flags);
+            let mut seen = HashSet::new();
+            for r in &plan.ranges {
+                let copy = Arc::as_ptr(&r.shadow) as usize;
+                for p in 0..r.span.pieces {
+                    let piece = r.span.first + p;
+                    if !flagged.contains(&(copy, piece)) {
+                        continue;
+                    }
+                    let slot = match ring_piece(
+                        slot_of.get(&(copy, piece)).copied().flatten(),
+                        slots,
+                        plan.sent_as,
+                        upto.get(&(copy, piece)).copied(),
+                    ) {
+                        RingPiece::Fetch => return false,
+                        RingPiece::Older => {
+                            older += 1;
+                            continue;
+                        }
+                        RingPiece::Merge(slot) => slot,
+                    };
+                    let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                    if lo >= hi || !seen.insert((copy, lo, hi)) {
+                        continue;
+                    }
+                    let base = card_slot_start(piece, r.span.skew);
+                    if lo < base || hi - base > CARD_SLOT_BYTES {
+                        return false;
+                    }
+                    let at = ring + CARD_SLOT_BYTES * (slot as usize + 1) + (lo - base);
+                    merges.push((r.shadow.clone(), lo, hi, at, plan.sent_as));
+                }
+            }
+        }
+        crate::shadow::CARD_STATS[2].fetch_add(compared, Ordering::Relaxed);
+        let mut title = Vec::new();
+        let (mut written, mut bytes) = (0usize, 0u64);
+        for (shadow, lo, hi, at, after) in &merges {
+            // SAFETY: the slot's bytes, which the compare wrote before its
+            // flight's fence (the caller's); inside the ring (checked above).
+            let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+            written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+            bytes += (hi - lo) as u64;
+        }
+        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        SNAPSHOT_STATS[0].fetch_add(1, Ordering::Relaxed);
+        SNAPSHOT_STATS[2].fetch_add(merges.len() as u64, Ordering::Relaxed);
+        SNAPSHOT_STATS[3].fetch_add(bytes, Ordering::Relaxed);
+        SNAPSHOT_STATS[4].fetch_add(older, Ordering::Relaxed);
+        true
     }
 
     /// [`relay`], on the thread that lands flights: `items` are the first
