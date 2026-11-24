@@ -137,9 +137,14 @@ enum Kind {
 /// `$XDG_CACHE_HOME` (`~/.cache`), the data under `$XDG_DATA_HOME`
 /// (`~/.local/share`), so clearing the user's cache does not take what titles
 /// must keep with it.
+///
+/// A variable that is set but empty or relative is skipped, as the XDG base
+/// directory spec asks: otherwise `XDG_CACHE_HOME=` (or a relative value)
+/// would put the directory under the working directory, which is often the
+/// repository itself and so refused by the asset policy.
 fn default_dir(kind: Kind, env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<PathBuf> {
-    let var = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    if let Some(local) = var("LOCALAPPDATA") {
+    let absolute = |k: &str| env(k).map(PathBuf::from).filter(|p| p.is_absolute());
+    if let Some(local) = absolute("LOCALAPPDATA") {
         let name = match kind {
             Kind::Cache => "cache",
             Kind::Data => "data",
@@ -150,10 +155,8 @@ fn default_dir(kind: Kind, env: impl Fn(&str) -> Option<std::ffi::OsString>) -> 
         Kind::Cache => ("XDG_CACHE_HOME", Path::new(".cache")),
         Kind::Data => ("XDG_DATA_HOME", Path::new(".local/share")),
     };
-    // The XDG spec ignores a relative value.
-    let base = var(xdg)
-        .filter(|p| p.is_absolute())
-        .or_else(|| var("HOME").map(|h| h.join(fallback)))
+    let base = absolute(xdg)
+        .or_else(|| absolute("HOME").map(|h| h.join(fallback)))
         .context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")?;
     Ok(base.join("victory"))
 }
@@ -171,7 +174,11 @@ mod tests {
             data_dir: Some("data-from-file".into()),
             ..Default::default()
         };
-        let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
+        let env = |k: &str| match k {
+            "VICTORY_GAME_DIR" => Some(OsString::from("from-env")),
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
@@ -185,57 +192,91 @@ mod tests {
         };
         let env = |k: &str| match k {
             "VICTORY_GAME_DIR" => Some(OsString::new()),
-            "HOME" => Some(OsString::from("/h")),
+            "HOME" => Some(abs("home")),
             _ => None,
         };
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));
     }
 
-    fn defaults(vars: &[(&str, &str)]) -> Config {
-        let vars: Vec<(String, OsString)> = vars
-            .iter()
-            .map(|&(k, v)| (k.to_owned(), OsString::from(v)))
-            .collect();
-        let env = |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    fn defaults(vars: &[(&str, OsString)]) -> Config {
+        let env = |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
         Config::resolve(FilePaths::default(), None, env).unwrap()
     }
 
     #[test]
     fn local_app_data_holds_cache_and_data() {
-        let cfg = defaults(&[("LOCALAPPDATA", "/l"), ("XDG_CACHE_HOME", "/x")]);
-        assert_eq!(cfg.cache_dir, Path::new("/l/victory/cache"));
-        assert_eq!(cfg.data_dir, Path::new("/l/victory/data"));
+        let cfg = defaults(&[("LOCALAPPDATA", abs("l")), ("XDG_CACHE_HOME", abs("x"))]);
+        let base = PathBuf::from(abs("l")).join("victory");
+        assert_eq!(cfg.cache_dir, base.join("cache"));
+        assert_eq!(cfg.data_dir, base.join("data"));
     }
 
     #[test]
     fn data_is_not_under_the_xdg_cache() {
-        let cfg = defaults(&[("XDG_CACHE_HOME", "/c"), ("XDG_DATA_HOME", "/d")]);
-        assert_eq!(cfg.cache_dir, Path::new("/c/victory"));
-        assert_eq!(cfg.data_dir, Path::new("/d/victory"));
+        let cfg = defaults(&[("XDG_CACHE_HOME", abs("c")), ("XDG_DATA_HOME", abs("d"))]);
+        assert_eq!(cfg.cache_dir, PathBuf::from(abs("c")).join("victory"));
+        assert_eq!(cfg.data_dir, PathBuf::from(abs("d")).join("victory"));
 
-        let cfg = defaults(&[("HOME", "/h")]);
-        assert_eq!(cfg.cache_dir, Path::new("/h/.cache/victory"));
-        assert_eq!(cfg.data_dir, Path::new("/h/.local/share/victory"));
+        let cfg = defaults(&[("HOME", abs("h"))]);
+        let home = PathBuf::from(abs("h"));
+        assert_eq!(cfg.cache_dir, home.join(".cache").join("victory"));
+        assert_eq!(cfg.data_dir, home.join(".local/share").join("victory"));
         assert!(!cfg.data_dir.starts_with(&cfg.cache_dir));
     }
 
     #[test]
-    fn empty_or_relative_xdg_values_are_ignored() {
+    fn empty_or_relative_values_are_ignored() {
         let cfg = defaults(&[
-            ("LOCALAPPDATA", ""),
-            ("XDG_CACHE_HOME", ""),
-            ("XDG_DATA_HOME", "relative"),
-            ("HOME", "/h"),
+            ("LOCALAPPDATA", OsString::new()),
+            ("XDG_CACHE_HOME", OsString::new()),
+            ("XDG_DATA_HOME", OsString::from("relative")),
+            ("HOME", abs("h")),
         ]);
-        assert_eq!(cfg.cache_dir, Path::new("/h/.cache/victory"));
-        assert_eq!(cfg.data_dir, Path::new("/h/.local/share/victory"));
+        let home = PathBuf::from(abs("h"));
+        assert_eq!(cfg.cache_dir, home.join(".cache").join("victory"));
+        assert_eq!(cfg.data_dir, home.join(".local/share").join("victory"));
+
+        // A relative LOCALAPPDATA or XDG_CACHE_HOME falls through as well.
+        let cfg = defaults(&[
+            ("LOCALAPPDATA", OsString::from("relative/lad")),
+            ("XDG_CACHE_HOME", OsString::from("relative/cache")),
+            ("HOME", abs("h")),
+        ]);
+        assert_eq!(cfg.cache_dir, home.join(".cache").join("victory"));
+    }
+
+    #[test]
+    fn default_dir_prefers_localappdata_then_xdg_then_home() {
+        let all = |k: &str| match k {
+            "LOCALAPPDATA" => Some(abs("lad")),
+            "XDG_CACHE_HOME" => Some(abs("xdg")),
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        assert_eq!(
+            default_dir(Kind::Cache, all).unwrap(),
+            PathBuf::from(abs("lad")).join("victory").join("cache")
+        );
+        let no_lad = |k: &str| if k == "LOCALAPPDATA" { None } else { all(k) };
+        assert_eq!(
+            default_dir(Kind::Cache, no_lad).unwrap(),
+            PathBuf::from(abs("xdg")).join("victory")
+        );
+        let home_only = |k: &str| (k == "HOME").then(|| abs("home"));
+        assert_eq!(
+            default_dir(Kind::Cache, home_only).unwrap(),
+            PathBuf::from(abs("home")).join(".cache").join("victory")
+        );
     }
 
     #[test]
     fn no_user_directory_is_an_error() {
         let env = |_: &str| None;
         assert!(Config::resolve(FilePaths::default(), None, env).is_err());
+        let nothing_usable = |k: &str| (k == "HOME").then(OsString::new);
+        assert!(default_dir(Kind::Cache, nothing_usable).is_err());
+        assert!(default_dir(Kind::Data, nothing_usable).is_err());
     }
 
     #[test]
@@ -253,5 +294,14 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.cache_subdir("x").is_err());
+    }
+
+    /// A path that is absolute on the host (`/x` is not absolute on Windows).
+    fn abs(p: &str) -> OsString {
+        if cfg!(windows) {
+            format!("C:\\{p}").into()
+        } else {
+            format!("/{p}").into()
+        }
     }
 }
