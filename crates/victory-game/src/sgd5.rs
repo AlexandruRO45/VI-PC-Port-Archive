@@ -2502,4 +2502,65 @@ mod tests {
             assert_eq!(found[1].span().end, file.len(), "stated {stated}");
         }
     }
+
+    #[test]
+    fn two_records_stored_in_one_container_are_both_its_or_both_yielded() {
+        // A container holding two records back to back, stored as is in one
+        // final stored block. Stating the container's size, the outer record
+        // is a stream and wins over both: neither is yielded, both markers
+        // are inside it. Stating one byte more or fewer, it is noise laid
+        // over the first stored record, which wins; the search goes on
+        // after it and finds the second, then the record after the outer.
+        let first = record_bytes("PS_first", 0x41, b"stored first");
+        let second = record_bytes("PS_second", 0x3c, b"stored second");
+        let mut container = b"DXBC head ".to_vec();
+        let first_at = container.len();
+        container.extend_from_slice(&first);
+        let second_at = container.len();
+        container.extend_from_slice(&second);
+        container.extend_from_slice(b" DXBC tail");
+        let packed = miniz_oxide::deflate::compress_to_vec(&container, 0);
+        let marker_in = |r: &[u8]| memchr::memmem::find(r, &MARKER).unwrap();
+        for stated in [container.len() - 1, container.len(), container.len() + 1] {
+            let (file, marker) = outer_then_after(&packed, stated);
+            let stored = [
+                marker + 12 + 5 + first_at + marker_in(&first),
+                marker + 12 + 5 + second_at + marker_in(&second),
+            ];
+            for at in stored {
+                assert_eq!(&file[at..at + 4], &MARKER, "stated {stated}");
+            }
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            if stated == container.len() {
+                assert_eq!(
+                    names,
+                    [Some("PS_outer"), Some("PS_after")],
+                    "stated {stated}"
+                );
+                assert_eq!(found[0].unpack(), Some(container.clone()));
+                for at in stored {
+                    assert!(in_record(&found, at), "stated {stated}");
+                }
+            } else {
+                assert_eq!(
+                    names,
+                    [Some("PS_first"), Some("PS_second"), Some("PS_after")],
+                    "stated {stated}"
+                );
+                assert_eq!(found[0].offset, stored[0], "stated {stated}");
+                assert_eq!(found[1].offset, stored[1], "stated {stated}");
+                assert_eq!(found[0].kind, 0x41, "stated {stated}");
+                assert_eq!(found[1].kind, 0x3c, "stated {stated}");
+                // The second starts right where the first one's span ends.
+                assert_eq!(found[0].span().end + marker_in(&second), found[1].offset);
+                assert_eq!(found[0].unpack().as_deref(), Some(&b"stored first"[..]));
+                assert_eq!(found[1].unpack().as_deref(), Some(&b"stored second"[..]));
+                assert!(!in_record(&found, marker), "stated {stated}");
+            }
+            let last = found.last().unwrap();
+            assert_eq!(last.unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(last.span().end, file.len(), "stated {stated}");
+        }
+    }
 }
