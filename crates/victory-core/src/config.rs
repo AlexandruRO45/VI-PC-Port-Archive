@@ -2824,6 +2824,128 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn a_folder_setting_through_a_link_to_a_file_is_refused() {
+        // A scratch folder under the system temp folder, never the
+        // repository; removed at the end.
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-link-to-file-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(scratch.join("gta")).unwrap();
+        let exe = scratch.join("gta").join("default.xex");
+        std::fs::write(&exe, b"").unwrap();
+        let to_file = scratch.join("to-file");
+        std::os::unix::fs::symlink(&exe, &to_file).unwrap();
+        // A link to a link that leads nowhere is followed to its end.
+        let dangling = scratch.join("dangling");
+        std::os::unix::fs::symlink(scratch.join("moved-away"), &dangling).unwrap();
+        let chained = scratch.join("chained");
+        std::os::unix::fs::symlink(&dangling, &chained).unwrap();
+        let env = |k: &'static str, v: PathBuf| {
+            let cache = scratch.join("cache");
+            let data = scratch.join("data");
+            move |key: &str| match key {
+                _ if key == k => Some(v.clone().into_os_string()),
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let resolve = |k: &'static str, v: PathBuf| {
+            Config::resolve(FilePaths::default(), None, env(k, v))
+                .unwrap_err()
+                .to_string()
+        };
+
+        // The folder itself is a link to a file: a file, not a link that
+        // leads nowhere, and the hint names the folder holding the link.
+        let err = resolve("VICTORY_CACHE_DIR", to_file.clone());
+        assert!(
+            err.contains(&format!(
+                "the cache folder {} (from VICTORY_CACHE_DIR) is a file, not a folder",
+                to_file.display()
+            )),
+            "{err}"
+        );
+        assert!(!err.contains("leads nowhere"), "{err}");
+        let err = resolve("VICTORY_GAME_DIR", to_file.clone());
+        assert!(
+            err.contains(&format!("perhaps {}", scratch.display())),
+            "{err}"
+        );
+
+        // A folder under a link to a file names the link, not its target.
+        let below = to_file.join("saves");
+        let err = resolve("VICTORY_DATA_DIR", below.clone());
+        assert!(
+            err.contains(&format!(
+                "the data folder {} (from VICTORY_DATA_DIR) cannot be a folder because {} \
+                 is not a directory",
+                below.display(),
+                to_file.display()
+            )),
+            "{err}"
+        );
+
+        // A chain ending in a link that leads nowhere is refused at the
+        // first link, with that link's own target.
+        let err = resolve("VICTORY_DATA_DIR", chained.clone());
+        assert!(
+            err.contains(&format!(
+                "{} (from VICTORY_DATA_DIR) is a link to {} that leads nowhere",
+                chained.display(),
+                dangling.display()
+            )),
+            "{err}"
+        );
+
+        // Nothing was created or replaced.
+        assert!(exe.is_file());
+        assert!(!scratch.join("moved-away").exists());
+        assert!(!scratch.join("cache").exists() && !scratch.join("data").exists());
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_subfolder_blocked_by_a_link_that_leads_nowhere_is_an_error() {
+        // The settings are checked when resolved; a link made inside the
+        // cache afterwards is met by `create_dir_all`, which must fail
+        // naming the path rather than succeed or replace the link.
+        let scratch =
+            std::env::temp_dir().join(format!("victory-config-subdir-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let cfg = Config {
+            cache_dir: scratch.join("cache"),
+            data_dir: scratch.join("data"),
+            ..Default::default()
+        };
+        if ensure_outside_repo(&scratch).is_err() {
+            return;
+        }
+        std::fs::create_dir_all(&cfg.cache_dir).unwrap();
+        let link = cfg.cache_dir.join("shaders");
+        std::os::unix::fs::symlink(scratch.join("moved-away"), &link).unwrap();
+        for sub in ["shaders", "shaders/inner"] {
+            let err = format!("{:#}", cfg.cache_subdir(sub).unwrap_err());
+            assert!(err.contains("creating"), "{sub}: {err}");
+            assert!(err.contains(&link.display().to_string()), "{sub}: {err}");
+        }
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(!scratch.join("moved-away").exists());
+        // A link to a real folder is followed.
+        std::fs::create_dir_all(scratch.join("real")).unwrap();
+        let good = cfg.cache_dir.join("good");
+        std::os::unix::fs::symlink(scratch.join("real"), &good).unwrap();
+        let dir = cfg.cache_subdir("good/inner").unwrap();
+        assert_eq!(dir, good.join("inner"));
+        assert!(scratch.join("real").join("inner").is_dir());
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
     fn cache_or_data_at_the_root_or_home_is_refused() {
         let home = PathBuf::from(abs("home")).join("me");
         let root = PathBuf::from(abs("x")).parent().unwrap().to_path_buf();
