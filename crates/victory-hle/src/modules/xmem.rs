@@ -1175,7 +1175,10 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let (mut within, mut done) = (offset % PAGE, 0);
     for p in pool {
         let k = (PAGE - within).min(data.len() - done);
-        if file.write_all_at(&data[done..done + k], p * PAGE as u64 + within as u64).is_err() {
+        let written = file.write_all_at(&data[done..done + k], p * PAGE as u64 + within as u64);
+        // Not through the views: the GPU side's guards on them did not see it.
+        vm::pool_written(&[p]);
+        if written.is_err() {
             return false;
         }
         (within, done) = (0, done + k);
@@ -1191,6 +1194,8 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 #[cfg(target_os = "linux")]
 pub(crate) struct PageWindow {
     at: usize,
+    /// The pool pages shown.
+    pages: std::ops::Range<u64>,
     mapped: usize,
     within: usize,
     len: usize,
@@ -1212,6 +1217,8 @@ impl Drop for PageWindow {
     fn drop(&mut self) {
         // SAFETY: the view we mapped.
         unsafe { libc::munmap(self.at as *mut c_void, self.mapped) };
+        // Written outside the title's views, whose guards did not see it.
+        vm::pool_written(&self.pages.clone().collect::<Vec<_>>());
     }
 }
 
@@ -1245,6 +1252,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     };
     (at != libc::MAP_FAILED).then(|| PageWindow {
         at: at as usize,
+        pages: first..first + pool.len() as u64,
         mapped,
         within: offset % PAGE,
         len,

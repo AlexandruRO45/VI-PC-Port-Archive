@@ -8,6 +8,7 @@
 //! - [`seh`]: exception dispatch and unwinding ([`context`] the structures,
 //!   [`signals`] faults to exceptions).
 //! - [`vm`]: the region table behind `VirtualAlloc` and friends.
+//! - [`watch`]: write watching for the GPU side's copies of title memory.
 //! - `stacks`: `VICTORY_STACKS` (diagnostics builds).
 
 mod asm;
@@ -22,3 +23,4 @@ pub mod thread;
 pub mod tls;
 mod unwind;
 pub mod vm;
+pub mod watch;

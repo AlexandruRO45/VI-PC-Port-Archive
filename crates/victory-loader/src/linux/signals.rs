@@ -334,6 +334,15 @@ extern "C" fn on_signal(signal: i32, info: *mut libc::siginfo_t, raw: *mut libc:
         return;
     }
     let trap = g[libc::REG_TRAPNO as usize] as u64;
+    // A write to a block the GPU side guards, by title code or ours: taken
+    // before anyone sees it, and the write is retried.
+    if signal == libc::SIGSEGV
+        && trap == 14
+        && g[libc::REG_ERR as usize] & 2 != 0
+        && super::watch::take_write(g[libc::REG_CR2 as usize] as usize)
+    {
+        return;
+    }
     let fault = Fault {
         signal,
         si_code: si.si_code,

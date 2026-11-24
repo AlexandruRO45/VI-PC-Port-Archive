@@ -164,6 +164,8 @@ fn read(fd_: i32, buffer: *mut u8, count: u32) -> i32 {
         return 0;
     }
     let count = count.min(i32::MAX as u32) as usize;
+    // The kernel writes the buffer, and fails on blocks the GPU side guards.
+    victory_gpu::kernel_will_write(buffer as usize, count);
     // SAFETY: the caller's buffer of count bytes.
     let n = unsafe { libc::read(entry.host, buffer.cast(), count) };
     if n < 0 {

@@ -626,7 +626,8 @@ pub extern "win64" fn CreateSymbolicLinkW(link: *const u16, target: *const u16, 
 // fail there instead of faulting into its handler; Grand Theft Auto VI's
 // synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
 // destinations and retry a failed `ReadFile` forever. So the destination
-// is opened first.
+// is opened first (on Linux by the host layer's own reads, which these
+// forward to).
 
 pub extern "win64" fn ReadFile(
     file: *mut c_void,
