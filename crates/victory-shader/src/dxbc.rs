@@ -28,11 +28,19 @@ impl FourCC {
     pub const HASH: FourCC = FourCC(*b"HASH");
     pub const ILDB: FourCC = FourCC(*b"ILDB");
     pub const ILDN: FourCC = FourCC(*b"ILDN");
+    /// Runtime data for libraries and work graphs.
+    pub const RDAT: FourCC = FourCC(*b"RDAT");
+    /// The compiler's version, commit and custom string.
+    pub const VERS: FourCC = FourCC(*b"VERS");
+    /// Embedded source and compile arguments.
+    pub const SRCI: FourCC = FourCC(*b"SRCI");
+    /// The PDB's own description of the shader.
+    pub const PDBI: FourCC = FourCC(*b"PDBI");
 
     /// The parts DXC knows. Its validator refuses a container that lists one
     /// of them twice ("More than one ... part"); other FourCCs are a title's
     /// own and may repeat.
-    const KNOWN: [FourCC; 11] = [
+    const KNOWN: [FourCC; 15] = [
         Self::DXIL,
         Self::STAT,
         Self::RTS0,
@@ -44,6 +52,10 @@ impl FourCC {
         Self::HASH,
         Self::ILDB,
         Self::ILDN,
+        Self::RDAT,
+        Self::VERS,
+        Self::SRCI,
+        Self::PDBI,
     ];
 }
 
@@ -396,7 +408,10 @@ mod tests {
         }
         // Each known part once, and a title's own part twice, still parse.
         let once: Vec<_> = FourCC::KNOWN.iter().map(|&f| (f, &[0u8; 4][..])).collect();
-        assert_eq!(Container::parse(&build(&once)).unwrap().parts.len(), 11);
+        assert_eq!(
+            Container::parse(&build(&once)).unwrap().parts.len(),
+            FourCC::KNOWN.len()
+        );
         let own = FourCC(*b"PRIV");
         let twice = build(&[(own, &[1; 4]), (FourCC::DXIL, &[0; 4]), (own, &[2; 4])]);
         let c = Container::parse(&twice).unwrap();
@@ -548,6 +563,33 @@ mod tests {
             let c = Container::parse(&bytes).unwrap();
             assert_eq!(c.part(FourCC::DXIL).unwrap().data, &[3; 4], "{near}");
             assert_eq!(c.parts.len(), 3);
+        }
+    }
+
+    #[test]
+    fn dxcs_newer_parts_may_not_repeat_either() {
+        // DXC also writes runtime data, its version, the embedded source and
+        // PDB info, and its validator refuses a second of each like any other.
+        for fourcc in [*b"RDAT", *b"VERS", *b"SRCI", *b"PDBI"] {
+            let fourcc = FourCC(fourcc);
+            let bytes = build(&[
+                (FourCC::DXIL, &[0; 4]),
+                (fourcc, &[1; 4]),
+                (fourcc, &[2; 4]),
+            ]);
+            assert_eq!(malformed(&bytes), "a part listed twice", "{fourcc}");
+            // Once, beside the program, it is simply kept.
+            let once = build(&[(FourCC::DXIL, &[0; 4]), (fourcc, &[1; 4])]);
+            assert_eq!(
+                Container::parse(&once).unwrap().part(fourcc).unwrap().data,
+                &[1; 4]
+            );
+        }
+        // DXBC-era signature parts are not DXC's and still repeat freely.
+        for fourcc in [*b"ISGN", *b"OSGN", *b"RDEF"] {
+            let fourcc = FourCC(fourcc);
+            let bytes = build(&[(fourcc, &[1; 4]), (fourcc, &[2; 4])]);
+            assert_eq!(Container::parse(&bytes).unwrap().parts.len(), 2, "{fourcc}");
         }
     }
 
