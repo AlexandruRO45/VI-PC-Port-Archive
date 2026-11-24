@@ -706,8 +706,6 @@ pub(crate) fn pipeline(
             Err(e)
         }
     }
-        }
-    }
 }
 
 /// Writes the library and the early list if pipelines were added since the
