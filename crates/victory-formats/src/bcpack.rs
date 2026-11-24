@@ -1433,6 +1433,72 @@ mod tests {
         assert!(ok > 0 && err > 0);
     }
 
+    /// Tables whose models tile 65536 in shapes the shipped file never uses:
+    /// one bucket holding nearly all of the range and every other bucket a
+    /// frequency of 1, or a random split. `Tables::parse` accepts them, so
+    /// noise streams decoded with them must give blocks or errors, never a
+    /// panic or an arithmetic overflow in the range decoder.
+    #[test]
+    fn extreme_models_never_panic() {
+        let mut seed = 0x6a09_e667_f3bc_c908u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let shipped = include_bytes!("bcpack-tables.bin");
+        let (mut ok, mut err) = (0, 0);
+        for round in 0..96 {
+            let mut bytes = shipped.to_vec();
+            for m in 0..MODELS {
+                // Bucket b > 0 holds 2^(b-1) symbols; model m uses m / 16 + 2.
+                let used = m / 16 + 2;
+                let weight = |b: usize| 1u32 << b.saturating_sub(1);
+                let mut freq = [1u32; BUCKETS];
+                let mut rest = (1 << 16) - (0..used).map(weight).sum::<u32>();
+                let big = (next() as usize + round) % used;
+                for b in (1..used).rev() {
+                    let most = (rest / weight(b)).min(u32::from(u16::MAX) - 1);
+                    let extra = match round % 3 {
+                        0 if b == big => most,
+                        0 => 0,
+                        1 => most,
+                        _ => next() as u32 % (most + 1),
+                    };
+                    freq[b] += extra;
+                    rest -= extra * weight(b);
+                }
+                // Bucket 0 takes what is left when it fits in a u16, else
+                // bucket 1 (also one symbol wide) takes the overflow.
+                let spill = rest.saturating_sub(u32::from(u16::MAX) - 1);
+                freq[1] += spill;
+                rest -= spill;
+                freq[0] += rest;
+                for (b, f) in freq.iter().enumerate() {
+                    // Buckets past `used` are never read.
+                    let v = if b < used { *f as u16 } else { next() as u16 };
+                    bytes[(m * BUCKETS + b) * 2..][..2].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+            if round % 2 == 1 {
+                for b in &mut bytes[MODELS * BUCKETS * 2..] {
+                    *b = next() as u8;
+                }
+            }
+            let t = Tables::parse(&bytes).unwrap();
+            for bc in [1, 3, 4, 5, 6, 7] {
+                let src: Vec<u8> = (0..next() % 3000).map(|_| next() as u8).collect();
+                let mut dst = vec![0u8; 16 * (1 + next() as usize % 300)];
+                match decode(bc, &src, &mut dst, &t) {
+                    Ok(()) => ok += 1,
+                    Err(_) => err += 1,
+                }
+            }
+        }
+        assert!(ok > 0 && err > 0);
+    }
+
     /// Compares with reference outputs made outside the repository:
     /// `VICTORY_BCPACK_CASES`, a directory of `<name>.bc<n>` packed chunks
     /// with `<name>.out` beside them. The tables are the built-in ones unless
