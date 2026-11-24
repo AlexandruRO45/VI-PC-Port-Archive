@@ -1,9 +1,11 @@
-//! End-to-end tests of byte and half LDS accesses: synthetic GFX10 compute
-//! programs lowered to DXIL, validated by `dxil.dll` when present, run on
-//! the host GPU and WARP and checked against a model of the console's
-//! memory.
+//! End-to-end tests of byte and half LDS accesses and of typed buffer
+//! accesses: synthetic GFX10 compute programs lowered to DXIL, validated by
+//! `dxil.dll` when present, run on the host GPU and WARP and checked
+//! against a model of the console's memory.
 
-use super::host::{Dispatch, Host, Root, View};
+use windows::Win32::Graphics::Dxgi::Common::*;
+
+use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -508,4 +510,222 @@ fn sub_dword_lds_opcodes_decode() {
     ] {
         assert!(!lower::sub_dword(n), "{n}");
     }
+}
+
+// ---- typed buffers ----
+
+const BUFFER_LOAD_FORMAT_XYZW: u8 = 0x03;
+const BUFFER_STORE_FORMAT_XYZW: u8 = 0x07;
+const V_CVT_F32_U32: u16 = 0x06;
+const V_ADD_F32: u8 = 0x03;
+const V_MUL_F32: u8 = 0x08;
+/// Inline constants 0.5, 1.0 and 2.0.
+const HALF: u16 = 240;
+const ONE: u16 = 242;
+const TWO: u16 = 244;
+
+/// A float exactly representable as a half (normal or zero).
+fn f16(x: f32) -> u16 {
+    if x == 0.0 {
+        return 0;
+    }
+    let b = x.to_bits();
+    let (sign, exp, mant) = (b >> 31, (b >> 23 & 0xFF) as i32 - 127 + 15, b & 0x7F_FFFF);
+    assert!(
+        (1..31).contains(&exp) && mant & 0x1FFF == 0,
+        "{x} is not a half"
+    );
+    (sign << 15 | (exp as u32) << 10 | mant >> 13) as u16
+}
+
+/// A half's value (normal or zero).
+fn from_f16(h: u16) -> f32 {
+    let (sign, exp, mant) = (
+        u32::from(h >> 15),
+        u32::from(h >> 10 & 0x1F),
+        u32::from(h & 0x3FF),
+    );
+    if exp == 0 && mant == 0 {
+        return f32::from_bits(sign << 31);
+    }
+    assert!((1..31).contains(&exp), "{h:#x}");
+    f32::from_bits(sign << 31 | (exp + 112) << 23 | mant << 13)
+}
+
+fn channel(element: u32, c: u32) -> f32 {
+    (element * 4 + c) as f32 + 0.5
+}
+
+/// Typed views in two formats: (format, bytes per element, the dwords of
+/// `elements` elements, channel `c` of element `e` `channel(e, c)`).
+fn typed_formats(elements: u32) -> Vec<(DXGI_FORMAT, u32, Vec<u32>)> {
+    let mut full = Vec::new();
+    let mut halves = Vec::new();
+    for e in 0..elements {
+        let ch: Vec<f32> = (0..4).map(|c| channel(e, c)).collect();
+        full.extend(ch.iter().map(|x| x.to_bits()));
+        for pair in ch.chunks(2) {
+            halves.push(u32::from(f16(pair[0])) | u32::from(f16(pair[1])) << 16);
+        }
+    }
+    vec![
+        (DXGI_FORMAT_R32G32B32A32_FLOAT, 16, full),
+        (DXGI_FORMAT_R16G16B16A16_FLOAT, 8, halves),
+    ]
+}
+
+/// Channel `c` of element `e` of a typed view's dwords.
+fn typed_channel(dwords: &[u32], size: u32, e: u32, c: u32) -> f32 {
+    if size == 16 {
+        f32::from_bits(dwords[(4 * e + c) as usize])
+    } else {
+        let d = dwords[(2 * e + c / 2) as usize];
+        from_f16((d >> (16 * (c % 2))) as u16)
+    }
+}
+
+/// Lowers a 32-thread `words` accessing the typed view at table entry 1
+/// (`size`: the entry's stride) and writing results through entry 0.
+fn build_typed(words: &[u32], size: u32, kind: ResourceType) -> Result<HostShader, String> {
+    build(
+        words,
+        32,
+        0,
+        vec![table()],
+        vec![entry(ResourceType::Uav, 0, 0), entry(kind, 1, size)],
+    )
+}
+
+/// The elements the loads of `typed_load_program` read, per lane.
+fn typed_load_elements(t: u32) -> [u32; 4] {
+    [t + 1, t + 2 * (t & 1), t + 1, t + 3]
+}
+
+/// 32 lanes load whole elements of the typed view at entry 1 (elements
+/// of `size` bytes) at byte offsets added the four ways the console adds
+/// them: the instruction's offset to an index; a lane's offset to its
+/// index; a lane's offset plus a constant SGPR offset; a lane's offset
+/// plus the instruction's.
+fn typed_load_program(size: u32) -> Vec<u32> {
+    let mut w = prologue();
+    // v1 = t, v2 = 2 size (t & 1), v3 = size t, v14 = 64 t.
+    w.push(vop1(V_MOV_B32, 1, v(0)));
+    w.push(vop2(V_AND_B32, 2, int(1), 0));
+    w.extend(vop2_lit(V_MUL_U32_U24, 2, 2 * size, 2));
+    w.extend(vop2_lit(V_MUL_U32_U24, 3, size, 0));
+    w.push(vop2(V_LSHLREV_B32, 14, int(6), 0));
+    let (op, s) = (BUFFER_LOAD_FORMAT_XYZW, size as u16);
+    w.extend(mubuf(op, 20, 0, 12, 0x80, s, false, true));
+    w.extend(mubuf(op, 24, 1, 12, 0x80, 0, true, true));
+    w.extend(mubuf(op, 28, 3, 12, int(size as u8) as u8, 0, true, false));
+    w.extend(mubuf(op, 32, 3, 12, 0x80, 3 * s, true, false));
+    for k in 0..16u8 {
+        w.extend(store_dword(20 + k, 14, 8, 4 * u16::from(k)));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn typed_loads_at_whole_element_offsets() {
+    for (format, size, data) in typed_formats(40) {
+        let shader = build_typed(&typed_load_program(size), size, ResourceType::Srv)
+            .unwrap_or_else(|e| panic!("{size}-byte elements: {e}"));
+        let views = [
+            View::RawUav(32 * 16),
+            View::Buffer {
+                data: &data,
+                stride: Stride::Format(format, size),
+            },
+        ];
+        for (label, uavs) in run(&shader, &views, &[]) {
+            for t in 0..32 {
+                for (k, e) in typed_load_elements(t).into_iter().enumerate() {
+                    for c in 0..4 {
+                        let at = (t * 16 + 4 * k as u32 + c) as usize;
+                        let got = f32::from_bits(uavs[0][at]);
+                        assert_eq!(
+                            got,
+                            channel(e, c),
+                            "{label}, {size}-byte elements: lane {t} load {k} channel {c}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 32 lanes store whole elements at byte offsets: element t + 32 through
+/// an index and the instruction's offset, element t through a lane's
+/// offset.
+fn typed_store_program(size: u32) -> Vec<u32> {
+    let mut w = prologue();
+    w.push(vop1(V_CVT_F32_U32, 20, v(0)));
+    w.push(vop2(V_ADD_F32, 21, HALF, 20));
+    w.push(vop2(V_MUL_F32, 22, TWO, 20));
+    w.push(vop2(V_ADD_F32, 23, ONE, 20));
+    w.extend(vop2_lit(V_MUL_U32_U24, 3, size, 0));
+    let op = BUFFER_STORE_FORMAT_XYZW;
+    w.extend(mubuf(op, 20, 0, 12, 0x80, 32 * size as u16, false, true));
+    w.push(vop2(V_ADD_F32, 20, HALF, 20));
+    w.extend(mubuf(op, 20, 3, 12, 0x80, 0, true, false));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn typed_stores_at_whole_element_offsets() {
+    for (format, size, data) in typed_formats(64) {
+        let shader = build_typed(&typed_store_program(size), size, ResourceType::Uav)
+            .unwrap_or_else(|e| panic!("{size}-byte elements: {e}"));
+        let views = [
+            View::RawUav(1),
+            View::FormatUav {
+                data: &data,
+                format,
+                bytes: size,
+            },
+        ];
+        for (label, uavs) in run(&shader, &views, &[]) {
+            for e in 0..64u32 {
+                let t = (e % 32) as f32;
+                let x = if e < 32 { t + 0.5 } else { t };
+                let want = [x, t + 0.5, 2.0 * t, t + 1.0];
+                for (c, &w) in want.iter().enumerate() {
+                    let g = typed_channel(&uavs[1], size, e, c as u32);
+                    assert_eq!(
+                        g, w,
+                        "{label}, {size}-byte elements: element {e} channel {c}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn typed_offsets_refused_inside_an_element_or_of_unknown_size() {
+    let load = |offset: u16| {
+        let mut w = prologue();
+        w.extend(mubuf(
+            BUFFER_LOAD_FORMAT_XYZW,
+            20,
+            0,
+            12,
+            0x80,
+            offset,
+            false,
+            true,
+        ));
+        w.extend(store_dword(20, 0, 8, 0));
+        w.push(S_ENDPGM);
+        w
+    };
+    let e = build_typed(&load(4), 16, ResourceType::Srv).expect_err("refused");
+    assert!(e.contains("inside an element"), "{e}");
+    let e = build_typed(&load(16), 0, ResourceType::Srv).expect_err("refused");
+    assert!(e.contains("unknown element size"), "{e}");
+    // Offset 0 needs no element size.
+    build_typed(&load(0), 0, ResourceType::Srv).expect("offset 0");
 }

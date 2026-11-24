@@ -62,7 +62,10 @@
 //!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
 //!   that index must be of that kind and start at the console descriptor's
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
-//!   title's view description says. Typed-format loads from heap
+//!   title's view description says. A typed access at a byte offset
+//!   (added 2026-11-24) reads element `index + offset / stride`, the stride
+//!   the used-resource entry's: the host's typed view must have elements of
+//!   that size. Typed-format loads from heap
 //!   descriptors (1,024 world compute programs, ray-tracing material
 //!   resolves) read raw views this way. Buffers read by element through
 //!   the resource heap (no used-resource entry, so no stride) are raw too,

@@ -9465,9 +9465,12 @@ impl<'a> Lower<'a> {
         };
         let index = if *idxen { Some(vaddr(self, 0)?) } else { None };
         let mut off = self.s.m.i32(u32::from(*offset));
+        // The byte offset when it is a constant.
+        let mut fixed = Some(u32::from(*offset));
         if *offen {
             let o = vaddr(self, u8::from(*idxen))?;
             off = self.s.m.bin(c, Bin::Add, off, o);
+            fixed = None;
         }
         if !matches!(
             soffset,
@@ -9475,6 +9478,9 @@ impl<'a> Lower<'a> {
         ) {
             let so = self.operand(inst, soffset)?;
             off = self.s.m.bin(c, Bin::Add, off, so);
+            fixed = fixed
+                .zip(self.s.m.int_value(so))
+                .map(|(f, k)| f.wrapping_add(k as u32));
         }
         let src = self
             .descriptors
@@ -9486,9 +9492,11 @@ impl<'a> Lower<'a> {
         if base != 0 {
             let b = self.s.m.i32(base);
             off = self.s.m.bin(c, Bin::Add, off, b);
+            fixed = fixed.map(|f| f.wrapping_add(base));
         }
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
+            fixed = None;
         }
         // A descriptor built around a root view has the stride the code puts
         // in dword 1 (bits 16-29) and no record limit (dword 2 is -1): an
@@ -9701,11 +9709,11 @@ impl<'a> Lower<'a> {
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
-                if count != 4 || *offen || *offset != 0 {
-                    return Err("a typed buffer store of some channels or at an offset");
+                if count != 4 {
+                    return Err("a typed buffer store of some channels");
                 }
                 let h = typed_h.ok_or("a typed buffer store")?;
-                let element = index.unwrap_or(self.s.m.i32(0));
+                let element = self.typed_element(index, off, fixed, used)?;
                 args.push(h);
                 args.extend([element, iu]);
                 for x in vals {
@@ -9811,15 +9819,13 @@ impl<'a> Lower<'a> {
         }
         let mut typed_h = None;
         let r = if typed {
-            if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
-                return Err("a typed buffer load at an offset");
-            }
+            // The console's index and byte offset as the host's element.
+            let index = self.typed_element(index, off, fixed, used)?;
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
             let h = self.handle(site, src, false, (10 | u, 0x409))?;
             typed_h = Some(h);
-            let index = index.unwrap_or(self.s.m.i32(0));
             self.s.op(
                 c,
                 "bufferLoad.f32",
@@ -9910,6 +9916,48 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// The element of a typed view (`buffer_load_format_*`,
+    /// `buffer_store_format_*`) the console addresses at `index` (none:
+    /// 0) and byte offset `off` (`fixed` when constant): the console adds
+    /// `index * stride + off` to the base; the host's typed view numbers
+    /// elements of its format, and DXIL typed loads and stores take an
+    /// element, not a byte offset. So the offset must be whole elements:
+    /// `index + off / size`.
+    ///
+    /// shortcut: the element size is the used-resource entry's stride (the
+    /// console's typed descriptors have their format's size as stride);
+    /// without one, only offset 0 translates. A computed offset is taken
+    /// as whole elements (a part of an element is dropped); a constant one
+    /// that is not stops the translation.
+    fn typed_element(
+        &mut self,
+        index: Option<V>,
+        off: V,
+        fixed: Option<u32>,
+        used: Option<&UsedResource>,
+    ) -> Result<V, Why> {
+        let c = self.cur;
+        let index = index.unwrap_or_else(|| self.s.m.i32(0));
+        if fixed == Some(0) {
+            return Ok(index);
+        }
+        let size = used.map_or(0, |u| u.stride);
+        if size == 0 {
+            return Err("a typed buffer access at an offset, of unknown element size");
+        }
+        let elements = match fixed {
+            Some(f) if f % size != 0 => {
+                return Err("a typed buffer access at an offset inside an element");
+            }
+            Some(f) => self.s.m.i32(f / size),
+            None => {
+                let k = self.s.m.i32(size);
+                self.s.m.bin(c, Bin::UDiv, off, k)
+            }
+        };
+        Ok(self.s.m.bin(c, Bin::Add, index, elements))
     }
 
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
