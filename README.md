@@ -48,7 +48,9 @@ What each part does today and what it still needs:
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+`rust-toolchain.toml`), and enough page file for the 6.5 GB of physical pages
+the title asks for at startup (the `xmem: host commit budget` line names the
+host's commit limit).
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
