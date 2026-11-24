@@ -1951,6 +1951,88 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// A TMPDIR's name is matched as `.gitignore` syntax reads the rules,
+    /// not as they are spelled: an unescaped `#` starts a comment and an
+    /// unescaped trailing space is trimmed, so `#comment` and `space ` stay
+    /// visible and are refused, as is a name holding a newline, which no
+    /// rule line can spell; `\#hash`, `\!bang` and `trail\ ` name their
+    /// directories exactly, and those are taken.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_matched_as_gitignore_syntax_reads_them() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(
+            root.join(".gitignore"),
+            "#comment/\n/space \n/\\#hash/\n/\\!bang/\n/trail\\ /\n",
+        )
+        .unwrap();
+        let comment = root.join("#comment");
+        let spaced = root.join("space ");
+        let newline = root.join("line\nbreak");
+        let trimmed = root.join("space");
+        let hash = root.join("#hash");
+        let bang = root.join("!bang");
+        let trail = root.join("trail ");
+        for dir in [&comment, &spaced, &newline, &trimmed, &hash, &bang, &trail] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        // The trimmed rule ignores `space`, without its trailing space.
+        let ignored = super::git_command(root)
+            .args(["check-ignore", "-q", "--", "space"])
+            .status()
+            .unwrap();
+        assert_eq!(ignored.code(), Some(0));
+
+        let tmp = tempdir_in_first(root, [comment.clone(), spaced.clone(), hash.clone()]);
+        assert_eq!(tmp.path().parent(), Some(hash.as_path()));
+        let tmp_bang = tempdir_in_first(root, [newline.clone(), bang.clone()]);
+        assert_eq!(tmp_bang.path().parent(), Some(bang.as_path()));
+        let tmp_trail = tempdir_in_first(root, [trail.clone()]);
+        assert_eq!(tmp_trail.path().parent(), Some(trail.as_path()));
+        for dir in [&comment, &spaced, &newline] {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        for dir in [tmp.path(), tmp_bang.path(), tmp_trail.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        std::fs::write(spaced.join("a.rs"), b"fn a() {}\n").unwrap();
+        assert_eq!(names(root, false), [".gitignore", "space /a.rs"]);
+        super::run(root, false).unwrap();
+    }
+
+    /// A `core.excludesFile` set in the checkout's own `.git/config`, and
+    /// kept outside the checkout, is an ignore source the full check reads
+    /// as well: a TMPDIR ignored only there is taken, while a directory it
+    /// does not name is refused and left empty.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_may_be_ignored_by_the_checkouts_excludes_file() {
+        let repo = tempdir();
+        let outside = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        let excludes = outside.path().join("excludes");
+        std::fs::write(&excludes, "/via-config/\n").unwrap();
+        git_str(
+            root,
+            &["config", "core.excludesFile", excludes.to_str().unwrap()],
+        );
+        let visible = root.join("visible");
+        let via_config = root.join("via-config");
+        std::fs::create_dir(&visible).unwrap();
+        std::fs::create_dir(&via_config).unwrap();
+
+        let tmp = tempdir_in_first(root, [visible.clone(), via_config.clone()]);
+        assert_eq!(tmp.path().parent(), Some(via_config.as_path()));
+        assert_eq!(std::fs::read_dir(&visible).unwrap().count(), 0);
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        std::fs::write(visible.join("a.rs"), b"fn a() {}\n").unwrap();
+        assert_eq!(names(root, false), ["visible/a.rs"]);
+        super::run(root, false).unwrap();
+    }
+
     /// A CARGO_TARGET_DIR that is the checkout itself is never passed over,
     /// whatever its tag says: the whole tree would go unchecked. What is
     /// built there is listed, in a repository and outside one, and passing
