@@ -976,4 +976,45 @@ mod tests {
             ]
         );
     }
+
+    /// Every `SPI_PS_INPUT_ADDR` bit packs its VGPRs straight after the
+    /// last enabled one: all sixteen fill v0-v23 without a gap, and the
+    /// register's upper bits, which name no input, load nothing.
+    #[test]
+    fn every_pixel_input_bit_packs_v0_to_v23() {
+        assert!(ps_vgprs(0).is_empty());
+        assert!(ps_vgprs(0xFFFF_0000).is_empty());
+        let all = ps_vgprs(u32::MAX);
+        assert_eq!(all, ps_vgprs(0xFFFF));
+        let regs: Vec<u8> = all.iter().map(|v| v.0).collect();
+        assert_eq!(regs, (0..24).collect::<Vec<u8>>());
+        // The pull model's three VGPRs sit between the centroid pair and
+        // the linear sample pair.
+        assert_eq!(
+            all[6..9].iter().map(|v| v.1).collect::<Vec<_>>(),
+            (0..3)
+                .map(|index| Input::Barycentric {
+                    kind: Barycentric::PerspectivePullModel,
+                    index
+                })
+                .collect::<Vec<_>>()
+        );
+        // Then the system values, one VGPR each, in bit order.
+        assert_eq!(
+            all[15..].iter().map(|v| v.1).collect::<Vec<_>>(),
+            [
+                Input::LineStipple,
+                Input::Position(0),
+                Input::Position(1),
+                Input::Position(2),
+                Input::Position(3),
+                Input::FrontFace,
+                Input::Ancillary,
+                Input::SampleCoverage,
+                Input::FixedPosition,
+            ]
+        );
+        // Only the last bit: fixed-point position alone, in v0.
+        assert_eq!(ps_vgprs(1 << 15), [(0, Input::FixedPosition)]);
+    }
 }
