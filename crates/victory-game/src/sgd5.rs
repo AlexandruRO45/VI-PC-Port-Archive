@@ -2563,4 +2563,122 @@ mod tests {
             assert_eq!(last.span().end, file.len(), "stated {stated}");
         }
     }
+
+    /// Bits written least significant first, as deflate packs them.
+    #[derive(Default)]
+    struct Bits {
+        out: Vec<u8>,
+        used: u32,
+    }
+
+    impl Bits {
+        /// `count` bits of `value`, its low bit first (block headers,
+        /// extra bits).
+        fn put(&mut self, value: u32, count: u32) {
+            for i in 0..count {
+                if self.used.is_multiple_of(8) {
+                    self.out.push(0);
+                }
+                let bit = (value >> i) & 1;
+                *self.out.last_mut().unwrap() |= (bit as u8) << (self.used % 8);
+                self.used += 1;
+            }
+        }
+
+        /// A Huffman code of `count` bits, its high bit first.
+        fn code(&mut self, code: u32, count: u32) {
+            for i in (0..count).rev() {
+                self.put((code >> i) & 1, 1);
+            }
+        }
+    }
+
+    /// One final fixed-code block: the literal `A`, then a copy of 3 bytes
+    /// from `distance` (1 to 4) bytes back, then the end of the block.
+    fn literal_then_copy(distance: u32) -> Vec<u8> {
+        let mut bits = Bits::default();
+        bits.put(1, 1); // BFINAL
+        bits.put(1, 2); // fixed codes
+        bits.code(0x30 + u32::from(b'A'), 8); // literals 0-143: 8 bits from 0x30
+        bits.code(1, 7); // length code 257: 3 bytes
+        bits.code(distance - 1, 5); // distance codes 0-3: 1-4, no extra bits
+        bits.code(0, 7); // end of block (256)
+        bits.out
+    }
+
+    #[test]
+    fn copy_from_before_the_start_of_the_container_is_noise() {
+        // A copy may only reach back over bytes already unpacked. One byte
+        // back from the first literal is a stream of `AAAA`; two bytes back
+        // reaches before the container's start, and the stream breaks
+        // there: such a record covers no other, so it is yielded and does
+        // not unpack, and the record after it is found either way.
+        let good = literal_then_copy(1);
+        assert_eq!(
+            miniz_oxide::inflate::decompress_to_vec(&good)
+                .ok()
+                .as_deref(),
+            Some(&b"AAAA"[..])
+        );
+        for distance in [2, 3, 4] {
+            let bad = literal_then_copy(distance);
+            assert_eq!(bad.len(), good.len());
+            assert!(miniz_oxide::inflate::decompress_to_vec(&bad).is_err());
+            assert!(!starts_stream(&bad, 4), "distance {distance}");
+        }
+        assert!(starts_stream(&good, 4));
+        assert!(!starts_stream(&good, 3));
+        assert!(!starts_stream(&good, 5));
+
+        for distance in [1, 2, 4] {
+            let (file, marker) = outer_then_after(&literal_then_copy(distance), 4);
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(
+                names,
+                [Some("PS_outer"), Some("PS_after")],
+                "distance {distance}"
+            );
+            assert_eq!(found[0].offset, marker, "distance {distance}");
+            let want = (distance == 1).then(|| b"AAAA".to_vec());
+            assert_eq!(found[0].unpack(), want, "distance {distance}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "distance {distance}");
+        }
+    }
+
+    #[test]
+    fn stream_without_a_final_block_is_a_record_that_does_not_unpack() {
+        // Packed bytes of non-final stored blocks only (a stream left after
+        // a sync flush, never finished) hold the whole container but no
+        // end: inflating them runs out of bytes, as a cut-off stream does,
+        // so they are a record, but one that does not unpack. Its span is
+        // what its sizes state, and the record after it is found.
+        let container = b"DXBC never finished".to_vec();
+        let (head, tail) = container.split_at(7);
+        for packed in [
+            stored_block(&container),
+            [stored_block(head), stored_block(tail)].concat(),
+            [stored_block(&container), stored_block(&[])].concat(),
+        ] {
+            assert!(miniz_oxide::inflate::decompress_to_vec(&packed).is_err());
+            assert!(starts_stream(&packed, container.len()));
+
+            let (file, marker) = outer_then_after(&packed, container.len());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")]);
+            assert_eq!(found[0].span(), marker..marker + 12 + packed.len());
+            assert_eq!(found[0].unpack(), None);
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+
+            // Ended by an empty final stored block, the same bytes unpack.
+            let mut ended = packed.clone();
+            ended.extend_from_slice(&[1, 0, 0, 0xFF, 0xFF]);
+            let (file, _) = outer_then_after(&ended, container.len());
+            let found: Vec<_> = records(&file).collect();
+            assert_eq!(found.len(), 2);
+            assert_eq!(found[0].unpack(), Some(container.clone()));
+        }
+    }
 }
