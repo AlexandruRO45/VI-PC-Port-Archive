@@ -72,7 +72,7 @@ mod watch;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{on_failure, redirect_null_write};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
