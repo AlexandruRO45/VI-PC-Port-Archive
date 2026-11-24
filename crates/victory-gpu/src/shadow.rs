@@ -177,15 +177,16 @@ impl Shadow {
         if !crate::host::read_into(from as *const u8, &mut title) || title == host {
             return 0;
         }
-        {
+        let written = {
             let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
-        }
-        // Our write is not the title's: the copy holds the page as it is.
-        if let Some(t) = &self.tracked {
+            crate::host::write_mapped(from as *mut u8, host.as_ptr(), n)
+        };
+        // The writing guard marked this page changed. Clear that mark only
+        // when the copy and title memory are equal after the write.
+        if written == n && let Some(t) = &self.tracked {
             t.taken(&[page / PAGE]);
         }
-        n
+        written
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -343,12 +344,17 @@ impl Shadow {
                         }
                         *h = *t;
                     }
-                    if changed {
+                    let synchronized = if changed {
                         let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                        let stored = crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        written += stored;
+                        stored == n
+                    } else {
+                        true
+                    };
+                    if synchronized {
+                        synced.push((start + at) / PAGE);
                     }
-                    synced.push((start + at) / PAGE);
                 }
                 at += n;
             }
@@ -698,6 +704,87 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
+    };
+
+    const OS_PAGE: usize = 4 << 10;
+
+    struct TitlePage(usize);
+
+    impl Drop for TitlePage {
+        fn drop(&mut self) {
+            crate::watch::tests::free(self.0);
+        }
+    }
+
+    impl TitlePage {
+        fn protect_readonly(&self, offset: usize) {
+            assert!(offset <= PAGE - OS_PAGE);
+            let mut previous = 0;
+            // SAFETY: a committed page in the fixture's allocation.
+            let ok = unsafe {
+                VirtualProtect((self.0 + offset) as _, OS_PAGE, PAGE_READONLY, &mut previous)
+            };
+            assert_ne!(ok, 0);
+        }
+
+        fn byte(&self, offset: usize) -> u8 {
+            assert!(offset < PAGE);
+            // SAFETY: the fixture's committed pages remain readable.
+            unsafe { ((self.0 + offset) as *const u8).read_volatile() }
+        }
+    }
+
+    /// A fully delivered computed-address write becomes current in a watched
+    /// shadow. A later partial declared write must keep that shadow dirty.
+    #[test]
+    fn copyback_acknowledges_only_delivered_watched_pages() {
+        let Some(host) = host() else { return };
+        let title = TitlePage(crate::watch::tests::pool(1));
+        let at = title.0;
+        let (buffer, data) = host.shared_buffer(PAGE as u64).expect("native shadow");
+        let copy = Shadow::new(buffer, data, 0, at as u64, PAGE as u64);
+        let tracked = copy.tracked.as_ref().expect("watched title allocation");
+        assert_eq!(copy.update(at, PAGE), PAGE);
+        assert!(!tracked.changed(at / PAGE));
+
+        copy.write_host((at + 8) as u64, &[0x31]);
+        assert_eq!(copy.copy_back_page(at), PAGE);
+        assert_eq!(title.byte(8), 0x31);
+        assert!(!tracked.changed(at / PAGE));
+
+        copy.writing(at, PAGE);
+        copy.write_host((at + 8) as u64, &[0x62]);
+        copy.write_host((at + OS_PAGE + 8) as u64, &[0x73]);
+        // Hand the page back to the title, then apply a different protection
+        // that belongs to the test, not to the write-watch tracker.
+        drop(crate::watch::writing(at, PAGE));
+        title.protect_readonly(OS_PAGE);
+        assert_eq!(copy.copy_back(at, PAGE), PAGE - OS_PAGE);
+        assert_eq!([title.byte(8), title.byte(OS_PAGE + 8)], [0x62, 0]);
+        assert!(tracked.changed(at / PAGE));
+    }
+
+    #[test]
+    fn computed_address_copyback_counts_only_delivered_spans() {
+        let Some(host) = host() else { return };
+        // SAFETY: a committed private allocation owned by TitlePage.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), PAGE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0);
+        let title = TitlePage(at);
+        let (buffer, data) = host.shared_buffer(PAGE as u64).expect("native shadow");
+        let copy = Shadow::new(buffer, data, 0, at as u64, PAGE as u64);
+        assert!(copy.tracked.is_none());
+        assert_eq!(copy.update(at, PAGE), PAGE);
+        copy.write_host((at + 8) as u64, &[0x42]);
+        copy.write_host((at + OS_PAGE + 8) as u64, &[0x53]);
+        title.protect_readonly(OS_PAGE);
+        assert_eq!(copy.copy_back_page(at), PAGE - OS_PAGE);
+        assert_eq!([title.byte(8), title.byte(OS_PAGE + 8)], [0x42, 0]);
+    }
 
     /// Ranges shaders write far apart are kept apart (not the copy between
     /// them); what the GPU wrote goes back once, whichever overlapping
