@@ -1784,6 +1784,97 @@ mod tests {
         );
     }
 
+    /// A compute program with this `COMPUTE_PGM_RSRC2` and these (root
+    /// type, SGPRs, user data, slot) parameters.
+    fn compute_layout(
+        rsrc2: u32,
+        params: &[(u32, u32, u8, u8)],
+    ) -> Result<Vec<NativeProgram>, ShaderError> {
+        let mut blob = fssm(&[(HwStage::Cs, &VS_CODE)]);
+        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Cs)).unwrap() as usize;
+        let e = record + RECORD_SIZE as usize;
+        blob[e + CS_RSRC2..][..4].copy_from_slice(&rsrc2.to_le_bytes());
+        let table = (blob.len() - FSSM_HEADER) as u64;
+        for &(root, sgprs, user_data, slot) in params {
+            for v in [root, 0, sgprs, 0] {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+            blob.extend_from_slice(&[user_data, slot, 0, 0]);
+        }
+        let payload = (blob.len() - FSSM_HEADER) as u64;
+        blob[8..16].copy_from_slice(&payload.to_le_bytes());
+        blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
+        let count = params.len() as u64;
+        blob[record + RECORD_COUNTS..][..8].copy_from_slice(&count.to_le_bytes());
+        native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+    }
+
+    #[test]
+    fn every_compute_parameter_is_checked_against_the_system_sgprs() {
+        let (constants, table, sampler) = (0, 3, 4);
+        // Three user SGPRs, then group id x in s3.
+        let rsrc2: u32 = 3 << 1 | 1 << 7;
+        assert!(compute_layout(rsrc2, &[(constants, 2, 0, 0), (table, 1, 2, 1)]).is_ok());
+        // A fixed sampler beside them names s3 but takes no SGPR.
+        assert!(compute_layout(rsrc2, &[(constants, 3, 0, 0), (sampler, 0, 3, 1)]).is_ok());
+        // A later parameter over the id is found whatever comes first, and
+        // wherever it sits in the list.
+        for params in [
+            &[(constants, 2, 0, 0), (table, 1, 3, 1)][..],
+            &[(table, 1, 3, 1), (constants, 2, 0, 0)],
+            &[
+                (constants, 1, 0, 0),
+                (sampler, 0, 1, 1),
+                (constants, 1, 3, 2),
+            ],
+        ] {
+            assert_eq!(
+                why_refused(compute_layout(rsrc2, params)),
+                "root parameter over a system SGPR",
+                "{params:?}"
+            );
+        }
+        // A table range stating no SGPRs still names its table's address
+        // SGPR, so over the id it is refused too.
+        assert_eq!(
+            why_refused(compute_layout(rsrc2, &[(table, 0, 3, 1)])),
+            "root parameter over a system SGPR"
+        );
+        assert!(compute_layout(rsrc2, &[(table, 0, 2, 1)]).is_ok());
+    }
+
+    #[test]
+    fn a_root_descriptor_stating_more_than_two_sgprs_takes_them_all() {
+        let (constants, descriptor) = (0, 1);
+        // In a pixel program's 32 dwords, four SGPRs may start at dword 28
+        // but not 29.
+        assert!(program(&[(descriptor, 4, 28, 0)]).is_ok());
+        assert_eq!(
+            why_refused(program(&[(descriptor, 4, 29, 0)])),
+            "root parameter past the user data"
+        );
+        // Its fourth SGPR is still its own: constants there collide, and
+        // right after it they don't.
+        assert_eq!(
+            why_refused(program(&[(descriptor, 4, 0, 0), (constants, 1, 3, 1)])),
+            "root parameters share an SGPR"
+        );
+        assert!(program(&[(descriptor, 4, 0, 0), (constants, 1, 4, 1)]).is_ok());
+        // In compute's 16 dwords it may start at 12, not 13, and with four
+        // user SGPRs and group id x in s4 its last SGPR may be s3, not s4.
+        assert!(compute_program(0, descriptor, 4, 12).is_ok());
+        assert_eq!(
+            why_refused(compute_program(0, descriptor, 4, 13)),
+            "root parameter past the user data"
+        );
+        let id_in_s4: u32 = 4 << 1 | 1 << 7;
+        assert!(compute_program(id_in_s4, descriptor, 4, 0).is_ok());
+        assert_eq!(
+            why_refused(compute_program(id_in_s4, descriptor, 4, 1)),
+            "root parameter over a system SGPR"
+        );
+    }
+
     #[test]
     fn compute_user_data_is_refused_before_system_sgprs() {
         // Sixteen user SGPRs (all of compute's user data) put group id x in
