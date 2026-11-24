@@ -4449,6 +4449,38 @@ ctest --preset dev --no-tests=error -R '^descriptor_heap_paging_' -V
 
 Repeat with `release`.
 
+### Desktop sampler contract for `CreateSamplerX`
+
+The startup GPU task list on #874 includes a `CreateSamplerX` desktop sampler contract. The public XCL notes list `CreateSamplerX` as console device slot #61 with a 0x6C-byte descriptor. They give no field layout, and this repository does not establish one. `startup_sampler_x` checks only the desktop side: the `D3D12_SAMPLER_DESC` fields a translated sampler must reproduce. A source-built `cs_6_0` shader makes one `SampleLevel` call per dispatch through a one-sampler descriptor table. It reads an 8×8 `R32_FLOAT` texture with four mips, where each texel holds the unique value `2 + 64·mip + 8·y + x`. [Tracking issue #874](https://github.com/R0Y00/Xbox2Windows/issues/874) · [XCL notes](https://github.com/ivall/xcl/blob/main/HANDOFF.md)
+
+| Sampler | Filter | AddressU | AddressV | MinLOD | MaxLOD | Probes |
+|---|---|---|---|---|---|---|
+| A | MIN_MAG_MIP_POINT | WRAP | MIRROR | 1 | 2 | 8 point probes |
+| B | MIN_MAG_MIP_POINT | CLAMP | BORDER, opaque white (red 1.0) | 0 | 0 | same 8 point probes |
+| C | MIN_MAG_MIP_LINEAR | CLAMP | CLAMP | 0 | unlimited | 5 linear probes |
+
+Every point-probe coordinate is an odd multiple of 1/16, so no point probe lands on a texel edge at any mip. The linear probes sit midway between texel centres on one or both axes, and at LOD 0.5 and 1.5. Their weights are 0.25-step fractions that fixed-point filtering represents exactly. The linear rows use a tolerance of 0.01 and the point rows must match exactly.
+
+A CPU reference gives each expected value. Before dispatching, the fixture checks that the probes separate the settings. For A and B, any non-default field must change at least one reference value when it is replaced: AddressU or AddressV by any other mode, MinLOD or MaxLOD by its desktop default. No linear result may equal a point sample from a neighbouring texel at either mip. The swapped control writes A and B into each other's descriptor slots and must read back exactly the other sampler's rows. The test skips when `R32_FLOAT` does not report shader sampling with mips, or when the adapter lacks Shader Model 6.0.
+
+The tests were run on Windows 11 build `26300.9974` with MSVC 19.44.35230, on base commit `78a6b31e` plus this fixture. They passed in Debug and Release on an RTX 4090 (driver `32.0.16.1088`) and on in-box WARP (`10.0.26100.9818`). The D3D12 debug layer was not available on this machine. Both adapters returned:
+
+- A: `66,68,68,74,74,76,139,139`
+- B: `2,9,2,1,1,1,38,38`
+- C: `2.5,6,6.5,34,98`
+
+Each run had 0 of 21 mismatches. The swapped control returned the A and B rows in reverse order, with C unchanged.
+
+Measured fields: Filter (`MIN_MAG_MIP_POINT` and `MIN_MAG_MIP_LINEAR`), AddressU, AddressV, BorderColor (opaque white only), MinLOD and MaxLOD. Not measured: AddressW, MipLODBias, comparison functions, other border colours, and any mapping from the console descriptor. Anisotropic filtering cannot be measured with this probe, because `SampleLevel` supplies no derivatives.
+
+```powershell
+cmake --preset dev
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^startup_sampler_x_' -V
+```
+
+Repeat with the `release` preset.
+
 ### Shader-visible descriptor windows across submissions
 
 `descriptor_window_submissions` and `descriptor_window_stale` use one shader-visible CBV/SRV/UAV heap with 1,000,000 descriptors. A source-built `cs_6_0` shader reads a word through a one-SRV descriptor table and writes it to the selected output word. The fixture binds slot 0 for the first submission, waits for fence 1, resets the allocator and command list, binds slot 999,999, then submits and waits for fence 2. It checks both words after each fence. The stale case binds slot 0 again and must change only the second word relative to the baseline. [Tracking issue #874](https://github.com/R0Y00/Xbox2Windows/issues/874) · [Two-submission pattern #829](https://github.com/R0Y00/Xbox2Windows/pull/829)

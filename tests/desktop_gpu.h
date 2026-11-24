@@ -12,6 +12,7 @@ Microsoft::WRL::ComPtr<ID3D12Resource> resource(ID3D12Device* device, const D3D1
     D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear = nullptr);
 void check_compute(ID3D12Device* device, bool tables);
 void check_sampler_views(ID3D12Device* device, const char* shader_path);
+bool check_startup_sampler_x(ID3D12Device* device, bool swapped);
 void dump_raw_uav(ID3D12Device* device, const char* shader_path, const char* groups,
                   const char* bytes, const char* out_path);
 void check_spirv_window(ID3D12Device* device, const char* shader_path);
