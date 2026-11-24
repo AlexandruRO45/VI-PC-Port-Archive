@@ -961,6 +961,21 @@ impl HostList {
         }
     }
 
+    /// Records a state change already emitted by a helper such as the
+    /// indirect-argument clamp, without adding another barrier.
+    pub(crate) fn note_shadow_state(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        state: u32,
+    ) {
+        let mut states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        states
+            .entry(key)
+            .and_modify(|entry| entry.1 = state)
+            .or_insert_with(|| (state, state, shadow.clone()));
+    }
+
     /// Buffers decay to COMMON after a completed ExecuteCommandLists call.
     fn decay_shadows(&self) {
         let states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
