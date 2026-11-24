@@ -9,10 +9,10 @@ use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
 use victory_shader::emit::{
-    DESCRIPTOR_DATA_SLOT, ROOT_CBV_SPACE, SAMPLER_SPACE, TITLE_MEMORY_SLOT, TITLE_MEMORY_SPACE,
-    TITLE_MEMORY_VIEWS, USER_DATA_SPACE,
+    DESCRIPTOR_DATA_SLOT, HostShader, ROOT_CBV_SPACE, SAMPLER_SPACE, TITLE_MEMORY_SLOT,
+    TITLE_MEMORY_SPACE, TITLE_MEMORY_VIEWS, USER_DATA_SPACE,
 };
-use victory_shader::{Container, FourCC};
+use victory_shader::{Container, DxilProgram, FourCC, HwStage, RootType, ShaderKind};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -247,15 +247,151 @@ pub(crate) struct Input {
 const RECTANGLES: i32 = 19;
 const QUADS: i32 = 32;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootBuffer {
+    Cbv,
+    Srv,
+    Uav,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootBinding {
+    Constants(u32),
+    Buffer { slot: u8, kind: RootBuffer },
+    DescriptorData,
+    TitleMemory,
+}
+
+impl RootBinding {
+    /// The same binding determines the signature's parameter and the
+    /// command list setter used to supply it.
+    fn parameter(self, visibility: D3D12_SHADER_VISIBILITY) -> D3D12_ROOT_PARAMETER1 {
+        static IMAGE_DATA: D3D12_DESCRIPTOR_RANGE1 =
+            srv_range(1, DESCRIPTOR_DATA_SLOT as u32, ROOT_CBV_SPACE);
+        static TITLE_MEMORY: D3D12_DESCRIPTOR_RANGE1 =
+            srv_range(TITLE_MEMORY_VIEWS, 0, TITLE_MEMORY_SPACE);
+        let (kind, binding) = match self {
+            Self::Constants(dwords) => (
+                D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: USER_DATA_SPACE,
+                        Num32BitValues: dwords,
+                    },
+                },
+            ),
+            Self::Buffer { slot, kind } => (
+                match kind {
+                    RootBuffer::Cbv => D3D12_ROOT_PARAMETER_TYPE_CBV,
+                    RootBuffer::Srv => D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    RootBuffer::Uav => D3D12_ROOT_PARAMETER_TYPE_UAV,
+                },
+                D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: u32::from(slot),
+                        RegisterSpace: ROOT_CBV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+            ),
+            Self::DescriptorData | Self::TitleMemory => (
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                D3D12_ROOT_PARAMETER1_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: if self == Self::TitleMemory {
+                            &TITLE_MEMORY
+                        } else {
+                            &IMAGE_DATA
+                        },
+                    },
+                },
+            ),
+        };
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: kind,
+            Anonymous: binding,
+            ShaderVisibility: visibility,
+        }
+    }
+}
+
+const fn srv_range(count: u32, register: u32, space: u32) -> D3D12_DESCRIPTOR_RANGE1 {
+    D3D12_DESCRIPTOR_RANGE1 {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: count,
+        BaseShaderRegister: register,
+        RegisterSpace: space,
+        // Both tables own initialized slots for the lifetime of their heap.
+        Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+        OffsetInDescriptorsFromTableStart: 0,
+    }
+}
+
+fn shader_root_bindings(t: &HostShader) -> Result<Vec<RootBinding>, &'static str> {
+    let mut roots = Vec::new();
+    let mut words = 0u64;
+    for u in &t.user_data {
+        if u.index >= D3D12_MAX_ROOT_COST
+            || !matches!(u.root, RootType::Constants | RootType::Table)
+            || u.root == RootType::Table && u.dword != 0
+        {
+            return Err("invalid translated root constants");
+        }
+        let bit = 1 << u.index;
+        if words & bit != 0 {
+            return Err("duplicate translated root constant");
+        }
+        words |= bit;
+    }
+    if words != 0 {
+        roots.push(RootBinding::Constants(t.user_data_dwords()));
+    }
+    for (kind, slots) in [
+        (RootBuffer::Cbv, &t.root_cbvs),
+        (RootBuffer::Srv, &t.root_srvs),
+        (RootBuffer::Uav, &t.root_uavs),
+    ] {
+        for &slot in slots {
+            let binding = match (slot, kind) {
+                (DESCRIPTOR_DATA_SLOT, RootBuffer::Srv) => RootBinding::DescriptorData,
+                (TITLE_MEMORY_SLOT, RootBuffer::Srv) if t.stage == HwStage::Cs => {
+                    RootBinding::TitleMemory
+                }
+                (DESCRIPTOR_DATA_SLOT | TITLE_MEMORY_SLOT, _) => {
+                    return Err("invalid reserved root slot");
+                }
+                _ => RootBinding::Buffer { slot, kind },
+            };
+            if roots.contains(&binding) {
+                return Err("duplicate translated root view");
+            }
+            roots.push(binding);
+        }
+    }
+    Ok(roots)
+}
+
+fn shader_stage_matches(t: &HostShader, visibility: D3D12_SHADER_VISIBILITY) -> bool {
+    let (stage, kind) = match visibility {
+        D3D12_SHADER_VISIBILITY_ALL => (HwStage::Cs, ShaderKind::Compute),
+        D3D12_SHADER_VISIBILITY_VERTEX => (HwStage::Vs, ShaderKind::Vertex),
+        D3D12_SHADER_VISIBILITY_MESH => (HwStage::Ms, ShaderKind::Mesh),
+        D3D12_SHADER_VISIBILITY_PIXEL => (HwStage::Ps, ShaderKind::Pixel),
+        _ => return false,
+    };
+    t.stage == stage
+        && Container::parse(&t.dxil)
+            .ok()
+            .and_then(|c| DxilProgram::parse(c.part(FourCC::DXIL)?.data).ok())
+            .is_some_and(|program| program.kind == kind)
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
-    /// The root parameter of its user data, and its size in dwords.
-    pub(crate) user_data: Option<(u32, u32)>,
-    /// Root parameters of its root views: (title root parameter, ours).
-    pub(crate) root_cbvs: Vec<(u8, u32)>,
-    pub(crate) root_srvs: Vec<(u8, u32)>,
-    pub(crate) root_uavs: Vec<(u8, u32)>,
+    pub(crate) roots: Vec<(u32, RootBinding)>,
 }
 
 impl Stage {
@@ -348,96 +484,27 @@ impl HostPipeline {
             for (indexed, used) in indexed_heaps.iter_mut().zip(heaps) {
                 *indexed |= used;
             }
-            let mut stage = Stage {
-                shader: shader.clone(),
-                user_data: None,
-                root_cbvs: Vec::new(),
-                root_srvs: Vec::new(),
-                root_uavs: Vec::new(),
+            if !shader_stage_matches(t, visibility) {
+                return refuse(
+                    "translated shader stage disagrees with the pipeline",
+                    shaders,
+                );
+            }
+            let roots = match shader_root_bindings(t) {
+                Ok(roots) => roots,
+                Err(reason) => return refuse(reason, shaders),
             };
-            let dwords = t.user_data_dwords();
-            if dwords > 0 {
-                stage.user_data = Some((params.len() as u32, dwords));
-                params.push(D3D12_ROOT_PARAMETER1 {
-                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                        Constants: D3D12_ROOT_CONSTANTS {
-                            ShaderRegister: 0,
-                            RegisterSpace: USER_DATA_SPACE,
-                            Num32BitValues: dwords,
-                        },
-                    },
-                    ShaderVisibility: visibility,
-                });
-            }
-            for (slots, kind, out) in [
-                (
-                    &t.root_cbvs,
-                    D3D12_ROOT_PARAMETER_TYPE_CBV,
-                    &mut stage.root_cbvs,
-                ),
-                (
-                    &t.root_srvs,
-                    D3D12_ROOT_PARAMETER_TYPE_SRV,
-                    &mut stage.root_srvs,
-                ),
-                (
-                    &t.root_uavs,
-                    D3D12_ROOT_PARAMETER_TYPE_UAV,
-                    &mut stage.root_uavs,
-                ),
-            ] {
-                for &slot in slots {
-                    out.push((slot, params.len() as u32));
-                    let image_data =
-                        kind == D3D12_ROOT_PARAMETER_TYPE_SRV && slot == DESCRIPTOR_DATA_SLOT;
-                    let title_memory =
-                        kind == D3D12_ROOT_PARAMETER_TYPE_SRV && slot == TITLE_MEMORY_SLOT;
-                    let (kind, binding) = if image_data || title_memory {
-                        static RANGE: D3D12_DESCRIPTOR_RANGE1 = D3D12_DESCRIPTOR_RANGE1 {
-                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-                            NumDescriptors: 1,
-                            BaseShaderRegister: DESCRIPTOR_DATA_SLOT as u32,
-                            RegisterSpace: ROOT_CBV_SPACE,
-                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
-                            OffsetInDescriptorsFromTableStart: 0,
-                        };
-                        static TITLE: D3D12_DESCRIPTOR_RANGE1 = D3D12_DESCRIPTOR_RANGE1 {
-                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-                            NumDescriptors: TITLE_MEMORY_VIEWS,
-                            BaseShaderRegister: 0,
-                            RegisterSpace: TITLE_MEMORY_SPACE,
-                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
-                            OffsetInDescriptorsFromTableStart: 0,
-                        };
-                        (
-                            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                            D3D12_ROOT_PARAMETER1_0 {
-                                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
-                                    NumDescriptorRanges: 1,
-                                    pDescriptorRanges: if title_memory { &TITLE } else { &RANGE },
-                                },
-                            },
-                        )
-                    } else {
-                        (
-                            kind,
-                            D3D12_ROOT_PARAMETER1_0 {
-                                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                    ShaderRegister: u32::from(slot),
-                                    RegisterSpace: ROOT_CBV_SPACE,
-                                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
-                                },
-                            },
-                        )
-                    };
-                    params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: kind,
-                        Anonymous: binding,
-                        ShaderVisibility: visibility,
-                    });
-                }
-            }
+            let stage = Stage {
+                shader: shader.clone(),
+                roots: roots
+                    .into_iter()
+                    .map(|binding| {
+                        let index = params.len() as u32;
+                        params.push(binding.parameter(visibility));
+                        (index, binding)
+                    })
+                    .collect(),
+            };
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
                     Filter: D3D12_FILTER(s.filter as i32),
@@ -726,6 +793,102 @@ fn root_cost(params: &[D3D12_ROOT_PARAMETER1]) -> u64 {
             _ => 2,
         })
         .sum()
+}
+
+#[cfg(test)]
+mod root_binding_tests {
+    use super::*;
+    use victory_shader::emit::UserData;
+
+    fn shader() -> HostShader {
+        HostShader {
+            stage: HwStage::Cs,
+            dxil: Vec::new(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            descriptor_bindings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn binding_kinds_match_signature_parameters_and_cost() {
+        let mut shader = shader();
+        shader.user_data.push(UserData {
+            index: 59,
+            slot: 0,
+            root: RootType::Constants,
+            dword: 0,
+        });
+        shader.root_srvs = vec![DESCRIPTOR_DATA_SLOT, TITLE_MEMORY_SLOT];
+        shader.root_uavs = vec![2];
+        let roots = shader_root_bindings(&shader).unwrap();
+        assert_eq!(
+            roots,
+            [
+                RootBinding::Constants(60),
+                RootBinding::DescriptorData,
+                RootBinding::TitleMemory,
+                RootBinding::Buffer {
+                    slot: 2,
+                    kind: RootBuffer::Uav
+                },
+            ]
+        );
+        let visibility = D3D12_SHADER_VISIBILITY_ALL;
+        let mut params: Vec<_> = roots.into_iter().map(|b| b.parameter(visibility)).collect();
+        assert_eq!(
+            params[1].ParameterType,
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE
+        );
+        assert_eq!(
+            params[2].ParameterType,
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE
+        );
+        assert_eq!(params[3].ParameterType, D3D12_ROOT_PARAMETER_TYPE_UAV);
+        // SAFETY: these two bindings each point to a static one-range table.
+        unsafe {
+            assert_eq!(
+                (*params[1].Anonymous.DescriptorTable.pDescriptorRanges).NumDescriptors,
+                1
+            );
+            assert_eq!(
+                (*params[2].Anonymous.DescriptorTable.pDescriptorRanges).NumDescriptors,
+                TITLE_MEMORY_VIEWS
+            );
+        }
+        assert_eq!(root_cost(&params), u64::from(D3D12_MAX_ROOT_COST));
+        params.push(
+            RootBinding::Buffer {
+                slot: 3,
+                kind: RootBuffer::Srv,
+            }
+            .parameter(visibility),
+        );
+        assert!(root_cost(&params) > u64::from(D3D12_MAX_ROOT_COST));
+    }
+
+    #[test]
+    fn invalid_reserved_slots_and_constant_indices_are_rejected() {
+        let mut shader = shader();
+        shader.root_uavs.push(DESCRIPTOR_DATA_SLOT);
+        assert!(shader_root_bindings(&shader).is_err());
+        shader.root_uavs.clear();
+        shader.stage = HwStage::Ps;
+        shader.root_srvs.push(TITLE_MEMORY_SLOT);
+        assert!(shader_root_bindings(&shader).is_err());
+        shader.root_srvs.clear();
+        shader.user_data.push(UserData {
+            index: u32::MAX,
+            slot: 0,
+            root: RootType::Table,
+            dword: 0,
+        });
+        assert!(shader_root_bindings(&shader).is_err());
+    }
 }
 
 fn root_signature(

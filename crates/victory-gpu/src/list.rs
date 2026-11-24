@@ -904,9 +904,7 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     at
 }
 
-/// Draw state the host has no use for (root signatures: ours come with
-/// the pipeline; depth bounds, depth order and shading rate hints): any
-/// arguments, nothing returned.
+/// Draw hints the host does not use, such as depth order and shading rate.
 extern "system" fn ignored_state(_: This) {}
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or
@@ -964,6 +962,12 @@ mod state {
     pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
         with_state(this, |_, s| s.set_table(false, slot, handle));
     }
+    pub(super) extern "system" fn compute_signature(this: This, signature: This) {
+        with_state(this, |_, s| s.set_root_signature(true, signature as usize));
+    }
+    pub(super) extern "system" fn graphics_signature(this: This, signature: This) {
+        with_state(this, |_, s| s.set_root_signature(false, signature as usize));
+    }
     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
         with_state(this, |_, s| s.set_constants(true, slot, &[value], offset));
     }
@@ -997,13 +1001,22 @@ mod state {
             s.set_constants(false, slot, items(values, count), offset)
         });
     }
-    /// Root constant buffer, shader resource and unordered access views.
-    pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
-        with_state(this, |_, s| s.set_view(true, slot, address));
+    macro_rules! root_view {
+        ($name:ident, $compute:literal, $kind:ident) => {
+            pub(super) extern "system" fn $name(this: This, slot: u32, address: u64) {
+                use crate::pipeline::host::RootBuffer;
+                with_state(this, |_, s| {
+                    s.set_view($compute, slot, RootBuffer::$kind, address)
+                });
+            }
+        };
     }
-    pub(super) extern "system" fn graphics_view(this: This, slot: u32, address: u64) {
-        with_state(this, |_, s| s.set_view(false, slot, address));
-    }
+    root_view!(compute_cbv, true, Cbv);
+    root_view!(graphics_cbv, false, Cbv);
+    root_view!(compute_srv, true, Srv);
+    root_view!(graphics_srv, false, Srv);
+    root_view!(compute_uav, true, Uav);
+    root_view!(graphics_uav, false, Uav);
     pub(super) extern "system" fn index_buffer(this: This, view: *const IndexView) {
         // SAFETY: the title passes a view or null.
         with_state(this, |_, s| s.set_index_buffer(unsafe { view.as_ref() }));
@@ -1113,11 +1126,17 @@ mod state {
     pub(super) use super::ignored_state as compute_constant;
     pub(super) use super::ignored_state as compute_constants;
     pub(super) use super::ignored_state as compute_table;
-    pub(super) use super::ignored_state as compute_view;
+    pub(super) use super::ignored_state as compute_signature;
+    pub(super) use super::ignored_state as compute_cbv;
+    pub(super) use super::ignored_state as compute_srv;
+    pub(super) use super::ignored_state as compute_uav;
     pub(super) use super::ignored_state as graphics_constant;
     pub(super) use super::ignored_state as graphics_constants;
     pub(super) use super::ignored_state as graphics_table;
-    pub(super) use super::ignored_state as graphics_view;
+    pub(super) use super::ignored_state as graphics_signature;
+    pub(super) use super::ignored_state as graphics_cbv;
+    pub(super) use super::ignored_state as graphics_srv;
+    pub(super) use super::ignored_state as graphics_uav;
     pub(super) use super::ignored_state as heaps;
     pub(super) use super::ignored_state as index_buffer;
     pub(super) use super::ignored_state as scissors;
@@ -1306,20 +1325,20 @@ const METHODS: [(usize, *const ()); 52] = [
     (25, set_pipeline as *const ()),              // 0xc8
     (26, barrier as *const ()),                   // 0xd0
     (32, state::heaps as *const ()),              // 0x100
-    (33, ignored_state as *const ()),             // 0x108 compute root signature
-    (34, ignored_state as *const ()),             // 0x110 graphics root signature
+    (33, state::compute_signature as *const ()),  // 0x108 compute root signature
+    (34, state::graphics_signature as *const ()), // 0x110 graphics root signature
     (35, state::compute_table as *const ()),      // 0x118
     (36, state::graphics_table as *const ()),     // 0x120
     (37, state::compute_constant as *const ()),   // 0x128
     (38, state::graphics_constant as *const ()),  // 0x130
     (39, state::compute_constants as *const ()),  // 0x138
     (40, state::graphics_constants as *const ()), // 0x140
-    (41, state::compute_view as *const ()),       // 0x148 CBV
-    (42, state::graphics_view as *const ()),      // 0x150 CBV
-    (43, state::compute_view as *const ()),       // 0x158 SRV
-    (44, state::graphics_view as *const ()),      // 0x160 SRV
-    (45, state::compute_view as *const ()),       // 0x168 UAV
-    (46, state::graphics_view as *const ()),      // 0x170 UAV
+    (41, state::compute_cbv as *const ()),        // 0x148 CBV
+    (42, state::graphics_cbv as *const ()),       // 0x150 CBV
+    (43, state::compute_srv as *const ()),        // 0x158 SRV
+    (44, state::graphics_srv as *const ()),       // 0x160 SRV
+    (45, state::compute_uav as *const ()),        // 0x168 UAV
+    (46, state::graphics_uav as *const ()),       // 0x170 UAV
     (47, state::index_buffer as *const ()),       // 0x178
     (48, state::vertex_buffers as *const ()),     // 0x180
     (50, state::targets as *const ()),            // 0x190

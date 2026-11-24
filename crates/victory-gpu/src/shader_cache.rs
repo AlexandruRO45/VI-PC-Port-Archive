@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{DescriptorBinding, HostShader, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -210,6 +210,17 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, s.descriptor_bindings.len() as u32);
+    for b in &s.descriptor_bindings {
+        for v in [
+            b.table.map_or(u32::MAX, u32::from),
+            b.byte_offset,
+            b.properties.0,
+            b.properties.1,
+        ] {
+            word(&mut out, v);
+        }
+    }
     out
 }
 
@@ -271,6 +282,21 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     } else {
         r.list()?
     };
+    let mut descriptor_bindings = Vec::new();
+    if !r.0.is_empty() {
+        for _ in 0..r.word()? {
+            let slot = r.word()?;
+            descriptor_bindings.push(DescriptorBinding {
+                table: if slot == u32::MAX {
+                    None
+                } else {
+                    Some(u8::try_from(slot).ok()?)
+                },
+                byte_offset: r.word()?,
+                properties: (r.word()?, r.word()?),
+            });
+        }
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -280,6 +306,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        descriptor_bindings,
     })
 }
 
@@ -307,6 +334,11 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![4],
+            descriptor_bindings: vec![DescriptorBinding {
+                table: Some(1),
+                byte_offset: 32,
+                properties: (10, 0x409),
+            }],
         }
     }
 

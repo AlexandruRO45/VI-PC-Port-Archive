@@ -557,6 +557,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        descriptor_bindings: Vec::new(),
     }
 }
 
