@@ -2729,7 +2729,12 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
-        if let Some(a) = self.scalar.get(&site).copied().filter(|a| self.in_constants(a)) {
+        if let Some(a) = self
+            .scalar
+            .get(&site)
+            .copied()
+            .filter(|a| self.in_constants(a))
+        {
             return self.pair_smem(inst, a);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
