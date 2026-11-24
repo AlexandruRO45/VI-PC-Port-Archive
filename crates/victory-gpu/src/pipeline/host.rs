@@ -528,7 +528,26 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                tracing::warn!(
+                    error = %e,
+                    ?shaders,
+                    vs_bytes = code_bytes(&code(0)).len(),
+                    ps_bytes = code_bytes(&code(1)).len(),
+                    num_rt = g.targets.NumRenderTargets,
+                    rtv0 = g.targets.RTFormats[0].0 as i32,
+                    dsv = g.depth_format.0 as i32,
+                    samples = g.samples.Count,
+                    inputs = g.inputs.len(),
+                    cull = g.rasterizer.CullMode.0,
+                    fill = g.rasterizer.FillMode.0,
+                    depth_enable = g.depth.DepthEnable.0,
+                    blend_enable = g.blend.RenderTarget[0].BlendEnable.0,
+                    blend_op = g.blend.RenderTarget[0].BlendOp.0,
+                    src_blend = g.blend.RenderTarget[0].SrcBlend.0,
+                    dst_blend = g.blend.RenderTarget[0].DestBlend.0,
+                    topo = g.topology.0 as i32,
+                    "host pipeline refused"
+                );
                 host.log_messages();
                 return None;
             }
