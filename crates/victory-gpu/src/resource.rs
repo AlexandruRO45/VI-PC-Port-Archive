@@ -324,6 +324,19 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// A subresource index packed into the footprint offset slot for `CopyLocation`.
+    #[cfg(windows)]
+    pub(crate) const fn subresource(index: u32) -> Self {
+        Self {
+            offset: index as u64,
+            format: 0,
+            width: 0,
+            height: 0,
+            depth: 0,
+            row_pitch: 0,
+        }
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
@@ -783,6 +796,12 @@ pub(crate) struct HostTexture {
 
 #[cfg(windows)]
 impl HostTexture {
+    pub(crate) fn host_mips(&self) -> u32 {
+        u32::from(self.title_mips)
+            .saturating_sub(u32::from(self.mip_drop))
+            .max(1)
+    }
+
     /// Maps a guest subresource index to the corresponding host subresource index,
     /// or `None` if the subresource was dropped.
     pub(crate) fn host_subresource(&self, guest_sub: u32) -> Option<u32> {
@@ -831,6 +850,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 /// Computes the number of mips to drop for this texture under the current
 /// mip drop setting. Pure sampled textures with sufficient mips and size
 /// are scaled down to reduce VRAM consumption on low-VRAM GPUs.
+#[cfg(windows)]
 pub(crate) fn compute_mip_drop(desc: &ResourceDesc) -> u32 {
     let drop = crate::texture::texture_mip_drop();
     if drop == 0 {
@@ -869,12 +889,20 @@ pub(crate) fn compute_mip_drop_explicit(desc: &ResourceDesc, drop: u32, min_size
     if desc.width < min_size || u64::from(desc.height) < min_size {
         return 0;
     }
+    let block = element(pc_format(desc.format)).map_or(1, |(_, b)| b);
     let mut k = drop;
     while k > 0 {
-        // Require at least 2 mips to survive on the host.
+        let w = desc.width >> k;
+        let h = u64::from(desc.height) >> k;
+        // Require at least 2 mips to survive on the host and preserve BCn block alignment.
         if desc.mip_levels > (k as u16 + 1)
-            && (desc.width >> k) > 0
-            && (desc.height >> k) > 0
+            && w > 0
+            && h > 0
+            && (block <= 1
+                || (w >= block
+                    && h >= block
+                    && w.is_multiple_of(block)
+                    && h.is_multiple_of(block)))
         {
             return k;
         }
@@ -888,7 +916,7 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -972,7 +1000,7 @@ fn host_texture(
             }
         });
     }
-    texture
+    texture.map(|t| (t, drop))
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1038,9 +1066,8 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|texture| {
+        host: host.map(|(texture, drop)| {
             let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-            let drop = compute_mip_drop(&desc);
             std::sync::Arc::new(HostTexture {
                 texture,
                 state: state.into(),
@@ -1565,6 +1592,13 @@ mod tests {
         assert_eq!(compute_mip_drop_explicit(&sample_tex, 1, 2048), 0);
         assert_eq!(compute_mip_drop_explicit(&non_square_pot, 1, 2048), 0);
         assert_eq!(compute_mip_drop_explicit(&large_tex, 1, 2048), 1);
+
+        // BCn block alignment: BC7 (format 98, 4x4 blocks) at 16x16 with custom min_size=4
+        // must clamp drop from 3 to 2 so mip 0 stays >= 4x4 and block-aligned.
+        let small_bc7 = texture(16, 16, 98, 5);
+        assert_eq!(compute_mip_drop_explicit(&small_bc7, 3, 4), 2);
+        let tiny_bc7 = texture(4, 4, 98, 3);
+        assert_eq!(compute_mip_drop_explicit(&tiny_bc7, 1, 4), 0);
     }
 
     #[test]

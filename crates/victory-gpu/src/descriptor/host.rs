@@ -621,7 +621,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
-/// Adjusts the most detailed mip and mip count in a shader resource view
+/// Adjusts the most detailed mip and mip count in a shader resource view.
 pub fn adjust_mips(most_detailed: &mut u32, mip_levels: &mut u32, drop: u32, host_mips: u32) {
     let dropped_from_view = drop.saturating_sub(*most_detailed);
     *most_detailed = most_detailed
@@ -631,6 +631,20 @@ pub fn adjust_mips(most_detailed: &mut u32, mip_levels: &mut u32, drop: u32, hos
         let surviving_mips = mip_levels.saturating_sub(dropped_from_view);
         let max_mips = host_mips.saturating_sub(*most_detailed);
         *mip_levels = surviving_mips.min(max_mips).max(1);
+    }
+}
+
+/// Adjusts an SRV mip window and `ResourceMinLODClamp` for a mip-dropped texture.
+fn adjust_srv_window(
+    most_detailed: &mut u32,
+    mip_levels: &mut u32,
+    min_lod_clamp: &mut f32,
+    drop: u32,
+    host_mips: u32,
+) {
+    adjust_mips(most_detailed, mip_levels, drop, host_mips);
+    if *min_lod_clamp > 0.0 {
+        *min_lod_clamp = (*min_lod_clamp - drop as f32).max(0.0);
     }
 }
 
@@ -645,37 +659,79 @@ fn adjust_srv_for_dropped_mips(
         D3D12_SRV_DIMENSION_TEXTURE1D => {
             // SAFETY: matching union variant for ViewDimension.
             let tex = unsafe { &mut desc.Anonymous.Texture1D };
-            adjust_mips(&mut tex.MostDetailedMip, &mut tex.MipLevels, drop, host_mips);
+            adjust_srv_window(
+                &mut tex.MostDetailedMip,
+                &mut tex.MipLevels,
+                &mut tex.ResourceMinLODClamp,
+                drop,
+                host_mips,
+            );
         }
         D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
             // SAFETY: matching union variant for ViewDimension.
             let tex = unsafe { &mut desc.Anonymous.Texture1DArray };
-            adjust_mips(&mut tex.MostDetailedMip, &mut tex.MipLevels, drop, host_mips);
+            adjust_srv_window(
+                &mut tex.MostDetailedMip,
+                &mut tex.MipLevels,
+                &mut tex.ResourceMinLODClamp,
+                drop,
+                host_mips,
+            );
         }
         D3D12_SRV_DIMENSION_TEXTURE2D => {
             // SAFETY: matching union variant for ViewDimension.
             let tex = unsafe { &mut desc.Anonymous.Texture2D };
-            adjust_mips(&mut tex.MostDetailedMip, &mut tex.MipLevels, drop, host_mips);
+            adjust_srv_window(
+                &mut tex.MostDetailedMip,
+                &mut tex.MipLevels,
+                &mut tex.ResourceMinLODClamp,
+                drop,
+                host_mips,
+            );
         }
         D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
             // SAFETY: matching union variant for ViewDimension.
             let tex = unsafe { &mut desc.Anonymous.Texture2DArray };
-            adjust_mips(&mut tex.MostDetailedMip, &mut tex.MipLevels, drop, host_mips);
+            adjust_srv_window(
+                &mut tex.MostDetailedMip,
+                &mut tex.MipLevels,
+                &mut tex.ResourceMinLODClamp,
+                drop,
+                host_mips,
+            );
         }
         D3D12_SRV_DIMENSION_TEXTURE3D => {
             // SAFETY: matching union variant for ViewDimension.
             let tex = unsafe { &mut desc.Anonymous.Texture3D };
-            adjust_mips(&mut tex.MostDetailedMip, &mut tex.MipLevels, drop, host_mips);
+            adjust_srv_window(
+                &mut tex.MostDetailedMip,
+                &mut tex.MipLevels,
+                &mut tex.ResourceMinLODClamp,
+                drop,
+                host_mips,
+            );
         }
         D3D12_SRV_DIMENSION_TEXTURECUBE => {
             // SAFETY: matching union variant for ViewDimension.
             let tex = unsafe { &mut desc.Anonymous.TextureCube };
-            adjust_mips(&mut tex.MostDetailedMip, &mut tex.MipLevels, drop, host_mips);
+            adjust_srv_window(
+                &mut tex.MostDetailedMip,
+                &mut tex.MipLevels,
+                &mut tex.ResourceMinLODClamp,
+                drop,
+                host_mips,
+            );
         }
         D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
             // SAFETY: matching union variant for ViewDimension.
             let tex = unsafe { &mut desc.Anonymous.TextureCubeArray };
-            adjust_mips(&mut tex.MostDetailedMip, &mut tex.MipLevels, drop, host_mips);
+            adjust_srv_window(
+                &mut tex.MostDetailedMip,
+                &mut tex.MipLevels,
+                &mut tex.ResourceMinLODClamp,
+                drop,
+                host_mips,
+            );
         }
         _ => {}
     }
@@ -712,17 +768,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
-                let drop = crate::resource::texture_memory(resource)
-                    .map(|(_, orig)| {
-                        // SAFETY: live texture.
-                        let host_mips = unsafe { texture.GetDesc() }.MipLevels;
-                        u32::from(orig.mip_levels).saturating_sub(u32::from(host_mips))
-                    })
-                    .unwrap_or(0);
-                if let (true, Some(d)) = (drop > 0, desc.as_mut()) {
+                if let (Some(d), Some((_, orig))) =
+                    (desc.as_mut(), crate::resource::texture_memory(resource))
+                {
                     // SAFETY: live texture.
-                    let host_mips = unsafe { texture.GetDesc() }.MipLevels;
-                    adjust_srv_for_dropped_mips(d, drop, u32::from(host_mips));
+                    let host_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                    let drop = u32::from(orig.mip_levels).saturating_sub(host_mips);
+                    if drop > 0 {
+                        adjust_srv_for_dropped_mips(d, drop, host_mips);
+                    }
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -1079,5 +1133,31 @@ mod tests {
         adjust_mips(&mut most_detailed, &mut mip_levels, 2, 5);
         assert_eq!(most_detailed, 0);
         assert_eq!(mip_levels, u32::MAX);
+
+        // Out-of-range view (most_detailed >= drop + host_mips) clamps safely to last host mip.
+        let mut most_detailed = 8;
+        let mut mip_levels = 2;
+        adjust_mips(&mut most_detailed, &mut mip_levels, 2, 5);
+        assert_eq!(most_detailed, 4);
+        assert_eq!(mip_levels, 1);
+
+        // ResourceMinLODClamp is also shifted by drop and clamped to >= 0.0.
+        let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 1,
+                    MipLevels: 3,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 3.5,
+                },
+            },
+            ..Default::default()
+        };
+        adjust_srv_for_dropped_mips(&mut srv2d, 2, 5);
+        // SAFETY: `ViewDimension` is `TEXTURE2D`.
+        let t2 = unsafe { srv2d.Anonymous.Texture2D };
+        assert_eq!((t2.MostDetailedMip, t2.MipLevels), (0, 2));
+        assert_eq!(t2.ResourceMinLODClamp, 1.5);
     }
 }

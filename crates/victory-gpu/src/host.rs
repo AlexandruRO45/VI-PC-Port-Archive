@@ -180,10 +180,15 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
-        } else if let Some(adapter) = best_adapter() {
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            if let Some(adapter) = best_adapter()
+                && D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err()
+            {
+                device = None;
+            }
+            if device.is_none() {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let mem = adapter_memory(&device).unwrap_or(0);
@@ -256,9 +261,16 @@ fn adapter_memory(device: &ID3D12Device) -> Option<u64> {
     }
 }
 
-/// Finds the non-software hardware adapter with the most dedicated video memory.
+fn supports_fl12(adapter: &IDXGIAdapter1) -> bool {
+    let mut probe: Option<ID3D12Device> = None;
+    // SAFETY: plain D3D12 Feature Level 12.0 capability probe on enumerated adapter.
+    unsafe { D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut probe) }.is_ok()
+}
+
+/// Finds the non-software hardware adapter supporting D3D_FEATURE_LEVEL_12_0
+/// with the most dedicated video memory.
 fn best_adapter() -> Option<IDXGIAdapter1> {
-    // SAFETY: plain DXGI adapter queries.
+    // SAFETY: plain DXGI adapter queries and D3D12 FL 12.0 device probes.
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
         let mut best: Option<IDXGIAdapter1> = None;
@@ -269,6 +281,7 @@ fn best_adapter() -> Option<IDXGIAdapter1> {
             if let Ok(desc) = adapter.GetDesc1()
                 && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0)
                 && desc.DedicatedVideoMemory > max_vram
+                && supports_fl12(&adapter)
             {
                 max_vram = desc.DedicatedVideoMemory;
                 best = Some(adapter);
