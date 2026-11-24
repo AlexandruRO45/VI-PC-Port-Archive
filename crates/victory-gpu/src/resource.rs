@@ -1042,7 +1042,7 @@ fn host_texture_with_drop(
     if base.flags & DEPTH != 0 {
         base.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
+    base.format = pc_format(base.format);
     // Xbox permits video and certain 16-bit formats as render targets and
     // UAVs; PC D3D12 refuses those flag combinations.
     // NV12 (86): planar YUV video format — no RTV or UAV on PC.
@@ -1051,9 +1051,9 @@ fn host_texture_with_drop(
     // resource; Bink2 may still write video frames via the D3D12 video-decode
     // path rather than UAV writes.
     const RENDER_TARGET: u32 = 1;
-    match d.format {
-        86 => d.flags &= !(RENDER_TARGET | UNORDERED), // NV12: no RTV or UAV
-        115 => d.flags &= !RENDER_TARGET,              // B4G4R4A4_UNORM: no RTV
+    match base.format {
+        86 => base.flags &= !(RENDER_TARGET | UNORDERED), // NV12: no RTV or UAV
+        115 => base.flags &= !RENDER_TARGET,              // B4G4R4A4_UNORM: no RTV
         _ => {}
     }
     const DENY_SHADER_RESOURCE: u32 = 8;

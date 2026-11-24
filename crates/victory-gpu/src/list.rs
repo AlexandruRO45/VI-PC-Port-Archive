@@ -582,7 +582,19 @@ extern "system" fn copy_texture_region(
         };
         let Some(dst_copy) = crate::resource::host_copy(dst.resource) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            ONCE.call_once(|| {
+                // SAFETY: the locations name live resources or nothing.
+                let (w, h, d, pitch) = dst.footprint.shape();
+                let src_desc = crate::resource::host_resource(src.resource)
+                    .map(|t| unsafe { t.GetDesc() });
+                tracing::warn!(
+                    dst_kind = dst.kind,
+                    src_kind = src.kind,
+                    footprint = ?(w, h, d, pitch),
+                    src_desc = ?src_desc,
+                    "texture to buffer copies not implemented"
+                );
+            });
             return;
         };
         let to = &dst_copy.texture;
