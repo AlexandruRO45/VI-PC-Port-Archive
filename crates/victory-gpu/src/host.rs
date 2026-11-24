@@ -1596,7 +1596,7 @@ impl HostList {
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
+/// range union: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
@@ -1611,30 +1611,80 @@ impl HostList {
 /// GPU).
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<ShadowRefresh>,
     /// Where each copy's refresh is in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
-    /// The range of each copy brought up to date since the last title
-    /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Each copy's exact refreshed ranges since the last title write. The
+    /// copy is kept so its address cannot be reused for a different copy.
+    current: std::collections::HashMap<usize, ShadowRefresh>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
+type ShadowRefresh = (std::sync::Arc<crate::shadow::Shadow>, RefreshRanges);
+
+/// Most copies only request one range. Gather disjoint requests without
+/// allocating on the single-range path, then merge only touching ranges.
+enum RefreshRanges {
+    One((usize, usize)),
+    Many(Vec<(usize, usize)>),
+}
+
+impl RefreshRanges {
+    fn add(&mut self, range: (usize, usize)) {
+        match self {
+            Self::One((from, to)) if range.0 <= *to && *from <= range.1 => {
+                *from = (*from).min(range.0);
+                *to = (*to).max(range.1);
+            }
+            Self::One(previous) => *self = Self::Many(vec![*previous, range]),
+            Self::Many(ranges) => ranges.push(range),
+        }
+    }
+
+    fn merge(&mut self) {
+        if let Self::Many(ranges) = self {
+            ranges.sort_unstable();
+            ranges.dedup_by(|next, previous| {
+                if next.0 > previous.1 {
+                    return false;
+                }
+                previous.1 = previous.1.max(next.1);
+                true
+            });
+            if ranges.len() == 1 {
+                *self = Self::One(ranges[0]);
+            }
+        }
+    }
+
+    fn slices(&self) -> &[(usize, usize)] {
+        match self {
+            Self::One(range) => std::slice::from_ref(range),
+            Self::Many(ranges) => ranges,
+        }
+    }
+
+    /// The ranges are merged before recording them as current.
+    fn covers(&self, (from, to): (usize, usize)) -> bool {
+        let ranges = self.slices();
+        let end = ranges.partition_point(|&(start, _)| start <= from);
+        end != 0 && to <= ranges[end - 1].1
+    }
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+        let range = (address, address + len);
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if len == 0 || self.current.get(&key).is_some_and(|(_, ranges)| ranges.covers(range)) {
             return;
         }
         match self.pending.get(&key) {
-            Some(&i) => {
-                let (_, from, to) = &mut self.refreshes[i];
-                (*from, *to) = ((*from).min(address), (*to).max(end));
-            }
+            Some(&i) => self.refreshes[i].1.add(range),
             None => {
                 self.pending.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), RefreshRanges::One(range)));
             }
         }
     }
@@ -1659,23 +1709,31 @@ impl Batch {
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-            total += copied;
-            // Kept: the union with what was current if they touch, else
-            // the larger.
+        use std::collections::hash_map::Entry;
+        for (shadow, mut ranges) in self.refreshes.drain(..) {
+            ranges.merge();
+            for &(from, to) in ranges.slices() {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                total += copied;
+            }
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (from, to);
+            match self.current.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert((shadow, ranges));
+                }
+                Entry::Occupied(mut entry) => {
+                    let current = &mut entry.get_mut().1;
+                    for &range in ranges.slices() {
+                        current.add(range);
+                    }
+                    current.merge();
+                }
             }
         }
         total
@@ -2543,6 +2601,66 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+
+    /// Two requested ranges leave a dirty interior page available to its
+    /// own reader. The change journal must not consume it with the first two.
+    #[test]
+    fn disjoint_refreshes_leave_the_dirty_gap_for_its_reader() {
+        use crate::watch::PAGE;
+
+        let title = crate::watch::tests::pool(3);
+        let len = 3 * PAGE;
+        crate::shadow::register(title, title as u64, len as u64);
+        let Some(copy) = crate::shadow::find(title as u64, len as u64) else {
+            crate::shadow::unregister(title, title as u64);
+            crate::watch::tests::free(title);
+            assert!(std::env::var_os("VICTORY_TEST_SHADOW_DISJOINT_REQUIRE_GPU").is_none());
+            return;
+        };
+        let mut warm = Batch::default();
+        warm.add(&copy, title, len);
+        let warmed = warm.flush();
+        for (page, marker) in [11u8, 22, 33].into_iter().enumerate() {
+            // SAFETY: each address belongs to the test's guarded allocation.
+            unsafe { ((title + page * PAGE) as *mut u8).write_volatile(marker) };
+        }
+
+        let mut batch = Batch::default();
+        batch.add(&copy, title + 2 * PAGE, PAGE);
+        batch.add(&copy, title, PAGE);
+        batch.add(&copy, title + PAGE / 2, PAGE / 2);
+        let first_bytes = batch.flush();
+        let markers = [0, 1, 2].map(|page| copy.read_host((title + page * PAGE) as u64, 1)[0]);
+        // SAFETY: the test still owns the title allocation.
+        unsafe { ((title + 2 * PAGE) as *mut u8).write_volatile(44) };
+        batch.add(&copy, title + 2 * PAGE, PAGE);
+        let repeated_bytes = batch.flush();
+        batch.add(&copy, title + PAGE, PAGE);
+        let late_bytes = batch.flush();
+        let late_marker = copy.read_host((title + PAGE) as u64, 1)[0];
+        batch.title_written();
+        batch.add(&copy, title + 2 * PAGE, PAGE);
+        let next_phase_bytes = batch.flush();
+        let next_phase_marker = copy.read_host((title + 2 * PAGE) as u64, 1)[0];
+
+        // The temporary read batches hold copies of the backing while live.
+        drop((warm, batch));
+        crate::shadow::unregister(title, title as u64);
+        drop(copy);
+        crate::watch::tests::free(title);
+
+        eprintln!(
+            "disjoint refresh copied {first_bytes} then {late_bytes} bytes, markers {markers:?} then {late_marker}"
+        );
+        assert_eq!(warmed, len);
+        assert_eq!(first_bytes, 2 * PAGE);
+        assert_eq!(markers, [11, 0, 33]);
+        assert_eq!(repeated_bytes, 0);
+        assert_eq!(late_bytes, PAGE);
+        assert_eq!(late_marker, 22);
+        assert_eq!(next_phase_bytes, PAGE);
+        assert_eq!(next_phase_marker, 44);
     }
 
     /// The hashing a submission does for textures in physical-page memory,
