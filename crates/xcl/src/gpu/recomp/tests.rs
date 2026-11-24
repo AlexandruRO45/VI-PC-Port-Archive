@@ -3208,6 +3208,8 @@ fn gpu_memory_windows_above_4_gib() {
         glbl("GLOBAL_LOAD_DWORD", &[("VDST", 6), ("ADDR", 4), ("SADDR", 0x7D), ("OFFSET", 0)]), // v[4:5] → window 1
         glbl("GLOBAL_STORE_DWORD", &[("ADDR", 8), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0)]), // v[8:9] → window 1
         glbl("GLOBAL_ATOMIC_ADD", &[("VDST", 10), ("ADDR", 3), ("DATA", 11), ("SADDR", 16), ("OFFSET", 0), ("GLC", 1)]), // s[16:17] + v3 → window 1
+        glbl("GLOBAL_LOAD_DWORDX4", &[("VDST", 12), ("ADDR", 4), ("SADDR", 0x7D), ("OFFSET", 4)]), // v[4:5] + 4: not 16-byte aligned
+        glbl("GLOBAL_STORE_DWORDX3", &[("ADDR", 16), ("DATA", 12), ("SADDR", 0x7D), ("OFFSET", 0)]), // v[16:17] → window 1
     ];
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let p = prog(&refs);
@@ -3215,6 +3217,8 @@ fn gpu_memory_windows_above_4_gib() {
     assert!(!one.hlsl.contains("mem1") && !one.hlsl.contains("xcl_w =") && !one.hlsl.contains("xcl_m"), "one window: the single-window HLSL");
     let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
+    // check call sites since the accessors are defined either way
+    assert!(t.hlsl.contains("= xcl_mLoad4(") && t.hlsl.contains(") xcl_mStore3("), "global x4 / x3: one window switch each");
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
     let hi = |a: u64| (a >> 32) as u32;
     let mut st = KernelState::default();
@@ -3232,6 +3236,8 @@ fn gpu_memory_windows_above_4_gib() {
         r[8] = (w1 + 0x5000 + 4 * l) as u32;
         r[9] = hi(w1);
         r[11] = 1;
+        r[16] = (w1 + 0x7000 + 16 * l) as u32;
+        r[17] = hi(w1);
     }
     let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
     assert_eq!((r.sgpr[20], r.sgpr[21]), (0xC0FFEE, 0x1234), "s_load from window 1");
@@ -3241,6 +3247,11 @@ fn gpu_memory_windows_above_4_gib() {
         assert_eq!(r.vgpr[l as usize][6], 5000 + l as u32, "lane {l}: global_load from window 1");
         assert_eq!(*word(w0 + 0x3000 + 4 * l), 7 * l as u32, "lane {l}: buffer_store into window 0");
         assert_eq!(*word(w1 + 0x5000 + 4 * l), 7 * l as u32, "lane {l}: global_store into window 1");
+        // dwords l+1..l+4 of the 64 written at 0x4000; anything past them is 0
+        let x4: Vec<u32> = (1..5).map(|k| if l + k < 64 { 5000 + (l + k) as u32 } else { 0 }).collect();
+        assert_eq!(r.vgpr[l as usize][12..16], x4, "lane {l}: global_load_dwordx4 from window 1");
+        let x3: Vec<u32> = (0..3).map(|k| *word(w1 + 0x7000 + 16 * l + 4 * k)).collect();
+        assert_eq!(x3, x4[..3], "lane {l}: global_store_dwordx3 into window 1");
     }
     assert_eq!(*word(w1 + 0x6000), 64, "global_atomic_add in window 1");
     assert_eq!(*word(w0 + 0x6000), 0, "nothing in window 0 at the same low address");

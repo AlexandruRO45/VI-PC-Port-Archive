@@ -3827,6 +3827,18 @@ impl Em {
         let t = self.t();
         self.emit_flat_addr(global, op.ends_with("_addtid"), saddr, f("ADDR"), off, 0, store, &t);
         let act = self.act();
+        if count > 1 {
+            // contiguous dwords, so one Load / Store takes one window switch
+            let first = f(if store { "DATA" } else { "VDST" });
+            let regs: Vec<String> = (0..count).map(|i| self.vreg(first + i)).collect();
+            if store {
+                self.line(&format!("if ({act}) mem.Store{count}({t}_a & ~3u, uint{count}({}));", regs.join(", ")));
+            } else {
+                let set: Vec<String> = regs.iter().zip(["x", "y", "z", "w"]).map(|(v, c)| format!("{v} = {t}_v.{c};")).collect();
+                self.line(&format!("if ({act}) {{ uint{count} {t}_v = mem.Load{count}({t}_a & ~3u); {} }}", set.join(" ")));
+            }
+            return Ok(());
+        }
         let mut st = Vec::new();
         for i in 0..count {
             if store {
