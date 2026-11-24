@@ -220,6 +220,11 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         .vgpr
                         .checked_add(channel)
                         .ok_or(ShaderError::Malformed("vertex attribute past v255"))?;
+                    // The fetch shader writes each VGPR once; a second
+                    // meaning for it would leave one of the two unread.
+                    if loaded.iter().any(|l| l.0 == Reg::V(reg)) {
+                        return Err(ShaderError::Malformed("two vertex inputs in one VGPR"));
+                    }
                     loaded.push((Reg::V(reg), input));
                 }
             }
@@ -275,19 +280,25 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         .collect();
     let input_of = |v: Value| inputs.iter().find(|i| i.0 == v).map(|i| i.1);
     let attribute = |inst: &Inst, attr: &Operand| match *attr {
-        Operand::Attr { index, chan, high } => ps_inputs
-            .iter()
-            .find(|i: &&PsInput| i.attr == index)
-            .map(|i| Attribute {
+        Operand::Attr { index, chan, high } => {
+            let mut listed = ps_inputs.iter().filter(|i: &&PsInput| i.attr == index);
+            let i = listed.next().ok_or(unsupported(
+                inst.machine.offset,
+                "an interpolated attribute the stage data does not list",
+            ))?;
+            // Two rows for one attribute: which one this reads is unknown.
+            if listed.next().is_some() {
+                return Err(ShaderError::Malformed(
+                    "an attribute the stage data lists twice",
+                ));
+            }
+            Ok(Attribute {
                 usage: i.usage,
                 row: i.row,
                 channel: chan,
                 high,
             })
-            .ok_or(unsupported(
-                inst.machine.offset,
-                "an interpolated attribute the stage data does not list",
-            )),
+        }
         _ => Err(unsupported(inst.machine.offset, "an interpolation operand")),
     };
     // A VGPR value's barycentric kind and index, if it is one as loaded.
@@ -392,9 +403,18 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         32 if params.is_empty() => Target::Unread,
                         t @ 32..=63 => {
                             // Bit 7: a mesh program's per-primitive output.
-                            let o = params.iter().find(|o| o.param & 0x7F == t - 32).ok_or(
-                                unsupported(at, "a parameter export the stage data does not list"),
-                            )?;
+                            let mut listed = params.iter().filter(|o| o.param & 0x7F == t - 32);
+                            let o = listed.next().ok_or(unsupported(
+                                at,
+                                "a parameter export the stage data does not list",
+                            ))?;
+                            // Two outputs (or a per-vertex and a per-primitive
+                            // one) in one parameter: which this writes is unknown.
+                            if listed.next().is_some() {
+                                return Err(ShaderError::Malformed(
+                                    "a parameter the stage data lists twice",
+                                ));
+                            }
                             let (usage, row) = (o.usage, o.row);
                             if o.param & 0x80 != 0 {
                                 Target::PrimitiveParam { usage, row }
@@ -709,6 +729,95 @@ mod tests {
                 raise(&p, &vertex(vec![input(vgpr, mask)])),
                 Err(ShaderError::Malformed("vertex attribute past v255")),
                 "v{vgpr} mask {mask:#x}"
+            );
+        }
+    }
+
+    /// The fetch shader loads each VGPR once: an attribute channel landing
+    /// on another one (or on the vertex, primitive or instance id) is
+    /// refused rather than resolved to whichever input is listed first.
+    #[test]
+    fn vertex_inputs_do_not_share_a_vgpr() {
+        let p = program(&[S_ENDPGM]);
+        let input = |row, vgpr, mask| crate::native::VsInput {
+            usage: Usage::Generic,
+            row,
+            mask,
+            vgpr,
+        };
+        assert!(raise(&p, &vertex(vec![input(0, 4, 0xF), input(1, 8, 0xF)])).is_ok());
+        // A channel the mask leaves off loads nothing.
+        assert!(raise(&p, &vertex(vec![input(0, 4, 0x7), input(1, 7, 0x1)])).is_ok());
+        for inputs in [
+            vec![input(0, 4, 0xF), input(1, 7, 0x1)],
+            vec![input(0, 4, 0x1), input(1, 4, 0x1)],
+            vec![input(0, 3, 0x1)], // the instance id
+            vec![input(0, 0, 0x1)], // the vertex id
+        ] {
+            assert_eq!(
+                raise(&p, &vertex(inputs.clone())),
+                Err(ShaderError::Malformed("two vertex inputs in one VGPR")),
+                "{inputs:?}"
+            );
+        }
+    }
+
+    /// An interpolated attribute and a parameter export each name one row
+    /// of the signature; stage data listing either twice is refused.
+    #[test]
+    fn attributes_and_parameters_are_listed_once() {
+        let interp = program(&[
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            S_ENDPGM,
+        ]);
+        let again = PsInput { row: 2, ..TEXCOORD };
+        assert!(raise(&interp, &pixel(vec![TEXCOORD], 2)).is_ok());
+        // Another attribute's entry is no ambiguity.
+        let other = PsInput { attr: 1, ..again };
+        assert!(raise(&interp, &pixel(vec![TEXCOORD, other], 2)).is_ok());
+        assert_eq!(
+            raise(&interp, &pixel(vec![TEXCOORD, again], 2)),
+            Err(ShaderError::Malformed(
+                "an attribute the stage data lists twice"
+            ))
+        );
+
+        let export = program(&[
+            0xF800_0A01,
+            0x0000_0000, // exp param0, v0, off, off, off done
+            S_ENDPGM,
+        ]);
+        let out = |row, param| crate::native::VsOutput {
+            usage: Usage::Generic,
+            row,
+            param,
+            fp16: false,
+            pack2: false,
+        };
+        let vs = |outputs| NativeProgram {
+            io: StageIo::Vs {
+                inputs: vec![],
+                outputs,
+            },
+            ..vertex(vec![])
+        };
+        let io = raise(&export, &vs(vec![out(1, 0), out(2, 1)])).unwrap();
+        assert_eq!(
+            io.exports[0].target,
+            Target::Param {
+                usage: Usage::Generic,
+                row: 1
+            }
+        );
+        // Bit 7 marks a per-primitive output in the same parameter space.
+        for outputs in [vec![out(1, 0), out(2, 0)], vec![out(1, 0), out(2, 0x80)]] {
+            assert_eq!(
+                raise(&export, &vs(outputs.clone())),
+                Err(ShaderError::Malformed(
+                    "a parameter the stage data lists twice"
+                )),
+                "{outputs:?}"
             );
         }
     }
