@@ -930,9 +930,14 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
     Some(pending)
 }
 
+/// Structured code is indented at most this many levels (4 spaces each): loops nest 65 deep in
+/// retail programs and the leading whitespace was 80 % of the HLSL DXC has to read. 8 levels
+/// keep the shape of the usual code readable; deeper code stays at the cap.
+const MAX_INDENT: usize = 8;
+
 /// The instructions of block [start, end) at `depth`; the flow of the last one.
 fn emit_block(c: &Ctx, em: &mut emit::Em, body: &mut String, start: u64, end: u64, depth: usize, blocks: &mut usize) -> emit::Flow {
-    em.indent = depth;
+    em.indent = depth.min(MAX_INDENT);
     let mut flow = emit::Flow::Next;
     let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
     for (k, d) in block.iter().enumerate() {
@@ -964,7 +969,7 @@ fn emit_structured(
     blocks: &mut usize,
     flags: &mut BTreeSet<u64>,
 ) -> BTreeSet<u64> {
-    let pad = "    ".repeat(depth);
+    let pad = "    ".repeat(depth.min(MAX_INDENT));
     let mut pending: BTreeSet<u64> = incoming.clone();
     let none = BTreeSet::new();
     // flags of the open `if (!(skip …)) {` around the following items
@@ -998,7 +1003,8 @@ fn emit_structured(
                 guard = Some(pending.clone());
             }
         }
-        let d = depth + guard.is_some() as usize;
+        // the lines inside a loop are written one level in: ipad stays below the cap
+        let d = (depth + guard.is_some() as usize).min(MAX_INDENT - 1);
         let ipad = "    ".repeat(d);
         if resolved {
             body.push_str(&format!("{ipad}{} = false;\n", skip_flag(s)));
