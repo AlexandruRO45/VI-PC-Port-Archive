@@ -1876,6 +1876,42 @@ mod tests {
     }
 
     #[test]
+    fn a_fixed_sampler_stating_sgprs_takes_them_all() {
+        let (constants, sampler) = (0, 4);
+        // A fixed sampler stating no SGPRs takes none, but one stating some
+        // covers each like constants: beside the constants it is fine, in
+        // their last dword it collides.
+        assert!(program(&[(constants, 2, 0, 0), (sampler, 1, 2, 1)]).is_ok());
+        assert!(program(&[(constants, 2, 0, 0), (sampler, 0, 1, 1)]).is_ok());
+        assert_eq!(
+            why_refused(program(&[(constants, 2, 0, 0), (sampler, 1, 1, 1)])),
+            "root parameters share an SGPR"
+        );
+        // Its SGPRs must fit the user data: two may start at dword 30 of a
+        // pixel program's 32, not 31; stating none, dword 31 is fine.
+        assert!(program(&[(sampler, 2, 30, 0)]).is_ok());
+        assert!(program(&[(sampler, 0, 31, 0)]).is_ok());
+        assert_eq!(
+            why_refused(program(&[(sampler, 2, 31, 0)])),
+            "root parameter past the user data"
+        );
+        // In compute, with group id x in s3 after three user SGPRs, a
+        // sampler stating one SGPR there covers the id; stating none it
+        // doesn't.
+        let id_in_s3: u32 = 3 << 1 | 1 << 7;
+        assert!(compute_program(id_in_s3, sampler, 0, 3).is_ok());
+        assert!(compute_program(id_in_s3, sampler, 1, 2).is_ok());
+        assert_eq!(
+            why_refused(compute_program(id_in_s3, sampler, 1, 3)),
+            "root parameter over a system SGPR"
+        );
+        assert_eq!(
+            why_refused(compute_program(id_in_s3, sampler, 2, 2)),
+            "root parameter over a system SGPR"
+        );
+    }
+
+    #[test]
     fn compute_user_data_is_refused_before_system_sgprs() {
         // Sixteen user SGPRs (all of compute's user data) put group id x in
         // s16. Constants at dword 16 would cover it too, but are first a
