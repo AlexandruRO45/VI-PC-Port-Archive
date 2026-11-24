@@ -354,6 +354,11 @@ fn local_shader_baseline(
                                     Ok(mut shader) => match validator.as_mut() {
                                         Some(v) => match v.validate(&mut shader.dxil) {
                                             Ok(()) => {
+                                                if let Some(dir) = std::env::var_os("VICTORY_LOCAL_DUMP") {
+                                                    let _ = std::fs::write(Path::new(&dir).join(format!("{id}.translated.dxil")), &shader.dxil);
+                                                    let _ = std::fs::write(Path::new(&dir).join(format!("{id}.console.bin")), input);
+                                                    let _ = std::fs::write(Path::new(&dir).join(format!("{id}.gfx10.txt")), local_disasm(input));
+                                                }
                                                 if std::env::var_os("VICTORY_LOCAL_AUDIT").is_some() {
                                                     format!("validated\t{}", local_wave_audit(input, &shader))
                                                 } else {
@@ -431,6 +436,35 @@ fn local_shader_baseline(
     }
     println!("matched {} of {}", lock(&found).len(), ids.len());
     Ok(())
+}
+
+/// The console shader's layout, used resources and GFX10 code as text.
+fn local_disasm(input: &[u8]) -> String {
+    let mut out = String::new();
+    if let Ok(c) = Container::parse(input)
+        && let Some(d) = c.part(FourCC::DXIL)
+        && let Ok(ns) = native_programs(d.data)
+    {
+        for n in ns {
+            out.push_str(&format!("{:?} wave64={} vgprs={}
+", n.stage, n.wave64, n.vgprs));
+            for p in &n.layout {
+                out.push_str(&format!("  {p:?}
+"));
+            }
+            for u in &n.used {
+                out.push_str(&format!("  {u:?}
+"));
+            }
+            if let Ok(insts) = victory_shader::gfx10::decode(&n.code) {
+                for i in &insts {
+                    out.push_str(&format!("{}
+", crate::shader::format_instruction(i, n.wave64)));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn local_wave_audit(input: &[u8], shader: &emit::HostShader) -> String {
