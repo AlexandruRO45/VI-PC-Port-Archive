@@ -197,7 +197,8 @@ impl Written {
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                 let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
+                let real = (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64;
+                gpu_clock(real)
             }
             Written::SystemTimestamp => system_timestamp(),
         };
@@ -208,6 +209,40 @@ impl Written {
             } else {
                 at.cast::<u64>().write_unaligned(value);
             }
+        }
+    }
+}
+
+/// Local build: the GPU clock titles read. Our GPU work runs on the CPU's timeline (copies,
+/// waits), so the real clock tells Grand Theft Auto VI its GPU takes ~500 ms a frame and its
+/// dynamic resolution drops to the minimum (a pixelated picture). `VICTORY_GPU_CLOCK=scaled`
+/// (default) runs the clock `VICTORY_GPU_CLOCK_SCALE` (default 16) times slower than real time,
+/// so the same work measures 16 times shorter while time still moves forward;
+/// `VICTORY_GPU_CLOCK=real` keeps the real clock.
+fn gpu_clock(real: u64) -> u64 {
+    static SCALE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let scale = *SCALE.get_or_init(|| {
+        if std::env::var("VICTORY_GPU_CLOCK").is_ok_and(|v| v == "real") {
+            return 1;
+        }
+        std::env::var("VICTORY_GPU_CLOCK_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &u64| n >= 1)
+            .unwrap_or(16)
+    });
+    if scale == 1 {
+        return real;
+    }
+    // strictly increasing, so two timestamps of one frame never read equal
+    let want = real / scale;
+    let mut last = LAST.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = want.max(last + 1);
+        match LAST.compare_exchange_weak(last, next, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(now) => last = now,
         }
     }
 }

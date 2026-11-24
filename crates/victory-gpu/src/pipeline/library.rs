@@ -27,7 +27,10 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
-    let _ = DIR.set(dir);
+    // Local build: one library per build (a library saved by a build with other root signatures
+    // made the device remove itself with an invalid call when another build loaded it).
+    let tag: String = crate::shader_cache::build()[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let _ = DIR.set(dir.join(format!("build-{tag}")));
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
