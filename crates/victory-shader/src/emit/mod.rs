@@ -838,7 +838,7 @@ mod tests {
             vgprs: 4,
             layout: vec![],
             used: vec![],
-            io: super::StageIo::Ps {
+            io: StageIo::Ps {
                 inputs: vec![],
                 input_addr: 0,
                 db_shader_control: 0,
@@ -878,7 +878,7 @@ mod tests {
 
     #[test]
     fn image_store_partial_contiguous_dmasks_validate_and_reject_sparse() {
-        use crate::native::{ComputeIo, ResourceType, RootParam, RootType, UsedResource};
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
         let emit_store = |dmask: u8, d16: bool| {
             let store_w0 = 0xF020_0008u32 | (u32::from(dmask) << 8);
             let store_w1 = 4u32 | (1 << 16) | (u32::from(d16) << 31);
@@ -917,7 +917,7 @@ mod tests {
                     user_data: 2,
                     slot: 0,
                 }],
-                io: super::StageIo::Cs(ComputeIo {
+                io: StageIo::Cs(ComputeIo {
                     rsrc2: 0,
                     threads: [1, 1, 1],
                 }),
@@ -984,7 +984,7 @@ mod tests {
             vgprs: 4,
             layout: vec![],
             used: vec![],
-            io: super::StageIo::Vs {
+            io: StageIo::Vs {
                 inputs: vec![],
                 outputs: vec![],
             },

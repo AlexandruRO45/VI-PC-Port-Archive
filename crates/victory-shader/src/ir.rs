@@ -1237,9 +1237,10 @@ mod tests {
     fn remove_trivial_phis_compresses_deep_chain() {
         // Chain of 64 trivial phis in reverse order so each points to the next.
         let n = 64u32;
+        let machine = gfx10::decode(&S_ENDPGM.to_le_bytes(), 0).unwrap();
         let mut blocks = vec![Block {
-            id: 0,
             offset: 0,
+            preds: vec![0, 0],
             phis: (1..=n)
                 .rev()
                 .map(|k| Phi {
@@ -1249,14 +1250,12 @@ mod tests {
                 })
                 .collect(),
             insts: vec![Inst {
-                offset: 0,
-                op: "s_endpgm",
+                machine,
                 fields: Fields::Sopp { imm: 0 },
                 reads: vec![(Reg::V(0), Value(n))],
                 writes: vec![],
             }],
-            term: Term::End,
-            preds: vec![0, 0],
+            exit: Exit::End,
         }];
         remove_trivial_phis(&mut blocks, n + 1);
         assert!(blocks[0].phis.is_empty());
