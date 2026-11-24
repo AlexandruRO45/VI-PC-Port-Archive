@@ -107,14 +107,24 @@ fn all_kept() -> (usize, usize) {
 fn a_dropped_copy_leaves_no_snapshot() {
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     let title = vec![0x11u8; 2 * PAGE];
+    let forgotten_before = forgotten();
     let Some(a) = copy_of(&title) else {
         return; // no host GPU here
     };
     a.writing(title.as_ptr() as usize, 100);
     a.writing(title.as_ptr() as usize + PAGE, 300);
-    assert_eq!(all_kept(), (2, 400));
+    // The copy's own parts, whichever the arena-like copies elsewhere in the
+    // process hold.
+    assert_eq!(a.kept(), (2, 400));
     drop(a);
-    assert_eq!(all_kept(), (0, 0));
+    // The arena is shared with every copy in the test binary, and another
+    // thread submitting a list declares ranges too (the indirect and draw
+    // tests do), so how many parts it holds now says nothing about ours.
+    // What did happen to ours is counted: they were given up.
+    assert!(
+        forgotten() >= forgotten_before + 2,
+        "a dropped copy keeps its parts"
+    );
 }
 
 /// Two copies' snapshots in one submission, taken in turns: each copies
@@ -132,7 +142,8 @@ fn two_copies_keep_their_snapshots_apart() {
     b.writing(bt, 200);
     a.writing(at + PAGE, 300);
     b.writing(bt + PAGE, 400);
-    assert_eq!(all_kept(), (4, 1000));
+    assert_eq!(a.kept(), (2, 400));
+    assert_eq!(b.kept(), (2, 600));
     // SAFETY: inside both mappings: what shaders wrote, one byte undeclared.
     unsafe {
         a.data.add(50).write(7);
@@ -144,12 +155,14 @@ fn two_copies_keep_their_snapshots_apart() {
     a.copy_back(at, 100);
     b.copy_back(bt, 200);
     a.copy_back(at + PAGE, 300);
-    // `a` is done; `b`'s second range still has its bytes.
-    assert_eq!(all_kept().0, 2);
+    // `a` is done; `b` keeps both of its ranges until its last one is copied
+    // back.
+    assert_eq!(a.kept(), (0, 0));
+    assert_eq!(b.kept(), (2, 600));
     drop(a);
-    assert_eq!(all_kept().0, 2);
+    assert_eq!(b.kept(), (2, 600));
     b.copy_back(bt + PAGE, 400);
-    assert_eq!(all_kept(), (0, 0));
+    assert_eq!(b.kept(), (0, 0));
     let changed = |title: &[u8], was: u8| -> Vec<(usize, u8)> {
         let now = title.iter().enumerate();
         now.filter(|(_, v)| **v != was)

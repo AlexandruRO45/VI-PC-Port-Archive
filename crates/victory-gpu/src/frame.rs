@@ -206,7 +206,9 @@ mod tests {
         // origin poll that times out (and starts the frame), then a
         // blocking flip wait. Each flip takes its own tick.
         const FLIP: u32 = 2;
-        assert_eq!(set_interval(null, null, 5_000, 3, 0), S_OK);
+        const INTERVAL_US: u64 = 5_000;
+        assert_eq!(set_interval(null, null, INTERVAL_US as u32, 3, 0), S_OK);
+        let started = Instant::now();
         let mut token = 0;
         let flips: Vec<u64> = (0..4)
             .map(|_| {
@@ -218,7 +220,18 @@ mod tests {
                 LAST[2].load(Ordering::Relaxed)
             })
             .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        let elapsed = started.elapsed();
+        // Each wait ends on a tick of its own, which is the contract: ticks
+        // are absolute, so lateness never makes two waits share one. How
+        // many ticks pass is the machine's business, not the clock's — a
+        // thread descheduled for several intervals must not fail this.
+        assert!(flips.windows(2).all(|w| w[1] > w[0]), "{flips:?}");
+        // No faster than the clock that made them.
+        let intervals = elapsed.as_micros() as u64 / INTERVAL_US;
+        assert!(
+            flips[3] - flips[0] <= intervals + 1,
+            "{flips:?} over {intervals} intervals"
+        );
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
