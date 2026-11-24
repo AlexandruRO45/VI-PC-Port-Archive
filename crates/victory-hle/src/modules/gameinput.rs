@@ -1057,6 +1057,45 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+/// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
+/// 0.2 s that long after input starts, with or without focus. A key is a
+/// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
+/// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+#[cfg(feature = "diagnostics")]
+fn scripted() -> Vec<u8> {
+    static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
+        let keys = list.split(',').filter_map(|entry| {
+            let (at, key) = entry.split_once(':')?;
+            let vk = match key.trim() {
+                "Enter" => 0x0D,
+                "Esc" => 0x1B,
+                "Tab" => 0x09,
+                "Back" => 0x08,
+                "Up" => 0x26,
+                "Down" => 0x28,
+                "Left" => 0x25,
+                "Right" => 0x27,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    k.as_bytes()[0].to_ascii_uppercase()
+                }
+                _ => return None,
+            };
+            Some((
+                Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+                vk,
+            ))
+        });
+        (Instant::now(), keys.collect())
+    });
+    let (start, keys) = &*SCRIPT;
+    let now = start.elapsed();
+    keys.iter()
+        .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+        .map(|&(_, vk)| vk)
+        .collect()
+}
+
 /// Host input: XInput pads, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
@@ -1139,7 +1178,7 @@ mod host {
 
         fn keys(&mut self) -> Vec<KeyState> {
             #[cfg(feature = "diagnostics")]
-            let mut down = scripted();
+            let mut down = super::scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
             if focused() {
@@ -1172,45 +1211,6 @@ mod host {
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
-    }
-
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
-    fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
-        });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1333,9 +1333,16 @@ mod sdl {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
+            #[cfg(feature = "diagnostics")]
+            let scripted = super::scripted()
+                .into_iter()
+                .filter_map(|vk| (0..=230).filter_map(key).find(|&(v, _)| v == vk));
+            #[cfg(not(feature = "diagnostics"))]
+            let scripted = std::iter::empty();
             linux::keys()
                 .into_iter()
                 .filter_map(key)
+                .chain(scripted)
                 .map(|(virtual_key, scan_code)| KeyState {
                     scan_code,
                     virtual_key,
