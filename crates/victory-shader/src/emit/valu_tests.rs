@@ -1631,3 +1631,73 @@ fn indexed_load_uses_stride_from_built_root_descriptor() {
     }
     assert!(ran > 0, "neither hardware nor WARP device available");
 }
+
+#[test]
+fn wave64_uniform_ballot_read_inside_divergent_branch_emulates_on_wave32() {
+    // Compare (v0 & 1) == 1 in uniform entry block, then read the uniform
+    // ballot mask inside a divergent `if (v0 < 32)` branch (lanes >= 32 keep 0).
+    let body = [
+        // v1 = v0 & 1
+        (0x1B << 25) | (1 << 17) | 0x81,
+        // v_cmp_eq_u32 s[4:5], v1, 1
+        vop3(0x0c2, 4, vgpr(1), 0x81, 0)[0],
+        vop3(0x0c2, 4, vgpr(1), 0x81, 0)[1],
+        // Divergent branch: v_cmp_lt_u32 s[6:7], v0, 32
+        vop3(0x0c1, 6, vgpr(0), 128 + 32, 0)[0],
+        vop3(0x0c1, 6, vgpr(0), 128 + 32, 0)[1],
+        // v2 = 0
+        vop1(0x001, 2, 0x80),
+        // s_and_saveexec_b64 s[6:7], s[6:7]
+        0xBE86_2406,
+        // s_cbranch_execz +1 (skip the 1-dword v2 = s4 when exec == 0)
+        0xBF88_0001,
+        // v2 = s4 (low 32 bits of uniform odd-lanes ballot = 0xAAAA_AAAA), read inside divergent block!
+        vop1(0x001, 2, sgpr(4)),
+        // s_or_b64 exec, exec, s[6:7]
+        0x88FE_067E,
+    ];
+    let Some(out) = run_wave64_on_wave32([64, 1, 1], 0, &body, 2) else {
+        return;
+    };
+    for (i, &val) in out.iter().enumerate() {
+        let want = if i < 32 { 0xAAAA_AAAA } else { 0 };
+        assert_eq!(val, want, "lane {i}");
+    }
+}
+
+#[test]
+fn wave64_readfirstlane_only_with_large_title_lds_fits_on_wave32() {
+    // 8064 dwords of title LDS (63 * 128) with 256 threads leaves 128 dwords before
+    // 8192: old per-thread LDS (8064 + 256 = 8320) overflowed, whereas waves64 * 2
+    // = 8 dwords (8072 <= 8192) fits cleanly.
+    let body = [
+        // v_cmp_ge_u32 s[4:5], v0, 35 (only wave 0 lanes 0..34 are masked off in wave 0).
+        vop3(0x0c6, 4, vgpr(0), 0xFF, 0)[0],
+        vop3(0x0c6, 4, vgpr(0), 0xFF, 0)[1],
+        35,
+        // Read s4 as data so console_lanes = true activates wave64 emulation.
+        vop1(0x001, 3, sgpr(4)),
+        // v1 = v0 + 100
+        (0x25 << 25) | (1 << 17) | 0xFF,
+        100,
+        // s_and_saveexec_b64 s[4:5], s[4:5]
+        0xBE84_2404,
+        // v_readfirstlane_b32 s6, v1
+        0x7E0C_0400 | 257,
+        // s_or_b64 exec, exec, s[4:5]
+        0x88FE_047E,
+        // v2 = s6
+        vop1(0x001, 2, sgpr(6)),
+    ];
+    let Some(out) = run_wave64_on_wave32([256, 1, 1], 8064, &body, 2) else {
+        return;
+    };
+    for (i, &val) in out.iter().enumerate() {
+        let want = if i < 64 {
+            35 + 100
+        } else {
+            ((i & !63) + 100) as u32
+        };
+        assert_eq!(val, want, "lane {i}");
+    }
+}

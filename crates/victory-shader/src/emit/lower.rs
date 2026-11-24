@@ -657,6 +657,7 @@ impl<'a> Lower<'a> {
                     let uniform = uniform_blocks(p, x.st);
                     let waves64 = total.div_ceil(64);
                     let mut uses_readlane = false;
+                    let mut uses_readfirstlane = false;
                     let mut uses_ballot_or_red = false;
                     let mut can_emulate = total > 0;
                     let is_mask =
@@ -670,14 +671,17 @@ impl<'a> Lower<'a> {
                         }
                         for inst in &p.blocks[b].insts {
                             let n = inst.name();
-                            if n == "v_readlane_b32"
-                                || (n == "v_readfirstlane_b32"
-                                    && !inst
-                                        .writes
-                                        .first()
-                                        .is_some_and(|w| x.res.waterfall.reads.contains(&w.1)))
-                            {
-                                uses_readlane = true;
+                            let is_readfirstlane = n == "v_readfirstlane_b32"
+                                && !inst
+                                    .writes
+                                    .first()
+                                    .is_some_and(|w| x.res.waterfall.reads.contains(&w.1));
+                            if n == "v_readlane_b32" || is_readfirstlane {
+                                if n == "v_readlane_b32" {
+                                    uses_readlane = true;
+                                } else {
+                                    uses_readfirstlane = true;
+                                }
                                 if total > 32 && !uniform[b] {
                                     can_emulate = false;
                                 }
@@ -685,9 +689,6 @@ impl<'a> Lower<'a> {
                             if reads_mask_as_data(x.st, inst) {
                                 uses_ballot_or_red = true;
                                 if total > 32 {
-                                    if !uniform[b] {
-                                        can_emulate = false;
-                                    }
                                     for &(_, r) in &inst.reads {
                                         if is_mask(r) {
                                             let lo = x.st.highs.get(&r).copied().unwrap_or(r);
@@ -712,7 +713,9 @@ impl<'a> Lower<'a> {
                             }
                         }
                     }
-                    let emu_lds_dwords = if total <= 32 || (!uses_readlane && !uses_ballot_or_red) {
+                    let emu_lds_dwords = if total <= 32
+                        || (!uses_readlane && !uses_readfirstlane && !uses_ballot_or_red)
+                    {
                         0
                     } else if uses_readlane {
                         total.next_multiple_of(64)
@@ -2586,23 +2589,45 @@ impl<'a> Lower<'a> {
 
     fn emu_read_first_lane(&mut self, at: usize, a: V, guard: Option<V>) -> V {
         let z = self.s.m.i32(0);
-        let lane = match guard {
-            None => z,
+        let i32t = self.s.t.i32;
+        match guard {
+            None => {
+                let first = self.s.op(
+                    at,
+                    "waveReadLaneAt.i32",
+                    Attr::NoUnwind,
+                    i32t,
+                    117,
+                    &[a, z],
+                );
+                self.emu_exchange_pair(at, first, z).0
+            }
             Some(g) => {
                 let (lo, hi) = self.emulate_ballot(at, g);
-                let i32t = self.s.t.i32;
-                let k32 = self.s.m.i32(32);
-                let flo = self.s.op(at, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
-                let fhi = self.s.op(at, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
-                let fhi32 = self.s.m.bin(at, Bin::Add, fhi, k32);
+                let sub = self.console_subwave();
+                let one = self.s.m.i32(1);
+                let is_hi = self.s.m.cmp(at, pred::EQ, sub, one);
+                let my_mask = self.s.m.select(at, is_hi, hi, lo);
+                let my_bit = self
+                    .s
+                    .op(at, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[my_mask]);
+                let my_nz = self.s.m.cmp(at, pred::NE, my_mask, z);
+                let my_lane = self.s.m.select(at, my_nz, my_bit, z);
+                let my_val = self.s.op(
+                    at,
+                    "waveReadLaneAt.i32",
+                    Attr::NoUnwind,
+                    i32t,
+                    117,
+                    &[a, my_lane],
+                );
+                let (v0, v1) = self.emu_exchange_pair(at, my_val, z);
                 let lo_nz = self.s.m.cmp(at, pred::NE, lo, z);
-                let first = self.s.m.select(at, lo_nz, flo, fhi32);
-                let both = self.s.m.bin(at, Bin::Or, lo, hi);
-                let any_nz = self.s.m.cmp(at, pred::NE, both, z);
-                self.s.m.select(at, any_nz, first, z)
+                let hi_nz = self.s.m.cmp(at, pred::NE, hi, z);
+                let fallback = self.s.m.select(at, hi_nz, v1, v0);
+                self.s.m.select(at, lo_nz, v0, fallback)
             }
-        };
-        self.read_lane(a, lane)
+        }
     }
 
     /// The float value of a register value.
