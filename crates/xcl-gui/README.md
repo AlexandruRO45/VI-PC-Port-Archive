@@ -1,0 +1,67 @@
+# xcl-gui – a window for XCL
+
+`xcl-gui` runs `xcl.exe` for you, so a game can be started, watched and configured without a
+command line. It is a program of its own: it starts `xcl run <game>` as you would, reads what it
+prints and the `xcl.log` it writes, and edits the title's `xcl.toml`. Nothing of XCL's runtime is
+linked into it or changed by it.
+
+```powershell
+cargo build --release -p xcl-gui      # target\release\xcl-gui.exe, next to xcl.exe
+```
+
+## What it does
+
+- **Home:** the game's folder, its exe or its `MicrosoftGame.config`, chosen once and kept.
+  *Play* runs it; *Stop* ends `xcl` and the game process it started. Under it, what is known of
+  the title's last run and of this PC (the graphics adapter `xcl run` named).
+- **Console:** what `xcl` prints, as it prints it, and how the run ended (the exit code and, for
+  the known ones, what it means: device removed, device hung, out of memory, …).
+- **Log (xcl.log):** the title's log, followed while the game runs.
+- **Errors and warnings:** the `WARN` / `ERROR` lines of the log and the console lines that
+  report a failure, on a tab of their own with a count.
+- **Settings**
+  - *Every run:* offline (`XCL_NETWORK=0`), `XCL_PIPELINE_THREADS`, `XCL_RUN_SECONDS`, any other
+    variable as `NAME=value` lines, and arguments for the game.
+  - *This title:* the settings of its `xcl.toml` that matter most – Series X / S, title memory
+    (and `title_memory_fit`, shown only where the file has that key),
+    GPU-visible memory, ray tracing, adapter, log level, window size, keyboard and mouse. The
+    file's other keys, its comments and its order are kept; a key it does not have is added only
+    when its value is not XCL's default. XCL writes a title's `xcl.toml` at its first run, so
+    the section is empty until then.
+- **Graphics and shaders (every run):** the shader translator (`XCL_DIRECT_DXIL`), the shader
+  compiler's threads, the two disk caches, background pipelines and `XCL_DRED`. XCL has no
+  resolution scale, V-Sync or frame limit to set.
+- **XCL:** which `xcl.exe` and which source folder are used (found from where `xcl-gui.exe` is,
+  or set by hand). *Update and build* runs `git pull --rebase --autostash` and then
+  `cargo build --release -p xcl` in that folder, with a progress bar that follows cargo's own
+  count; each step has a button of its own too. Only `xcl` is built: `xcl-gui.exe` is running
+  and cannot be written over.
+
+Every view has a filter, *Follow* (stay at the end), *Copy* and *Clear*.
+
+## Where it keeps things
+
+Under XCL's data root (`%LOCALAPPDATA%\XCL`, or `%XCL_DATA_ROOT%`):
+
+- `gui\settings.toml` – the window's own settings;
+- `gui\sessions\<date>_console.log`, `<date>_xcl.log`, `<date>_report.json` – what a run printed,
+  and copies of its log and report (XCL itself keeps the last two runs). The newest 20 runs are
+  kept. *Save what each run prints* turns it off.
+
+The game folder is not written to, as with `xcl run`.
+
+## Languages
+
+English and Spanish; the button at the foot of the side column switches. Next to it, the theme: dark (the
+default) or light.
+
+## Tested
+
+Its own tests pass on Windows and Linux. The window was tried on Linux with a stand-in for
+`xcl.exe` (the pages, the settings, stop, saved sessions, update and build) and builds and opens on
+Windows.
+
+## Not tested
+
+Not yet run with a real title: stopping a running game, the log followed live and the title's
+settings page on a real `xcl.toml` are untried.
