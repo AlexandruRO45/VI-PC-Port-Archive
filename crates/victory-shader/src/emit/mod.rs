@@ -461,15 +461,33 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
         if kind == 16 && register != u32::MAX && register >= RENDER_TARGETS {
             return Err(ShaderError::Malformed("render target past the 8 D3D12 has"));
         }
+        // Each component of a register belongs to one element. Lowering
+        // finds an element by its register and component, so a second one
+        // over the same components was never read or written, and D3D12
+        // refuses a signature whose elements overlap.
+        let row = (register != u32::MAX).then_some(register);
+        let (col, cols) = (
+            mask.trailing_zeros().min(3) as u8,
+            mask.count_ones().max(1) as u8,
+        );
+        if row.is_some()
+            && out.iter().any(|e: &container::SigElement| {
+                e.row == row && col < e.col + e.cols && e.col < col + cols
+            })
+        {
+            return Err(ShaderError::Malformed(
+                "two signature elements in one register component",
+            ));
+        }
         out.push(container::SigElement {
             name: String::from_utf8_lossy(name).into_owned(),
             index: u32_at(part, at + 8)?,
             kind,
             comp,
             interp: 0,
-            row: (register != u32::MAX).then_some(register),
-            col: mask.trailing_zeros().min(3) as u8,
-            cols: mask.count_ones().max(1) as u8,
+            row,
+            col,
+            cols,
             usage: 0,
             half: (4..=6).contains(&raw),
         });
@@ -718,6 +736,49 @@ mod tests {
                 refused.to_string(),
                 "mask {mask:#x}"
             );
+        }
+    }
+
+    /// Two elements over the same components of one register are refused:
+    /// lowering finds an element by register and component, so the second
+    /// was never read or written. Elements in one register's other
+    /// components, or without a register, still share it.
+    #[test]
+    fn signature_elements_sharing_a_component_are_refused() {
+        // One 32-byte row per `(register, mask)`, all named after the rows.
+        let part = |rows: &[(u32, u32)]| {
+            let name = 8 + 32 * rows.len() as u32;
+            let mut p = Vec::new();
+            for w in [rows.len() as u32, 8] {
+                p.extend_from_slice(&u32::to_le_bytes(w));
+            }
+            for (index, &(register, mask)) in rows.iter().enumerate() {
+                for w in [0, name, index as u32, 0, 3, register, mask, 0] {
+                    p.extend_from_slice(&u32::to_le_bytes(w));
+                }
+            }
+            p.extend_from_slice(b"TEXCOORD\0");
+            p
+        };
+        for rows in [
+            &[(0, 0x3), (0, 0xC)][..],
+            &[(0, 0x1), (0, 0x2), (0, 0x4), (0, 0x8)],
+            &[(0, 0xF), (1, 0xF)],
+            &[(0, 0x7), (1, 0x7), (0, 0x8)],
+            &[(u32::MAX, 0x1), (u32::MAX, 0x1)],
+        ] {
+            let parsed = signature(&part(rows)).expect("disjoint components");
+            assert_eq!(parsed.len(), rows.len(), "{rows:x?}");
+        }
+        let refused = ShaderError::Malformed("two signature elements in one register component");
+        for rows in [
+            &[(0, 0xF), (0, 0xF)][..],
+            &[(0, 0x3), (0, 0x6)],
+            &[(0, 0x1), (0, 0xF)],
+            &[(2, 0x8), (1, 0xF), (2, 0xC)],
+            &[(31, 0xE), (31, 0x2)],
+        ] {
+            assert_eq!(signature(&part(rows)).unwrap_err(), refused, "{rows:x?}");
         }
     }
 
