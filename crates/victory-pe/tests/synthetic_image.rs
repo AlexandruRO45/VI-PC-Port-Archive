@@ -2447,3 +2447,272 @@ fn tls_data_in_the_zero_filled_tail_is_outside_the_sections() {
     let tls = ImageInfo::parse(&with_raw_size(raw)).unwrap().tls.unwrap();
     assert_eq!(tls.callback_rvas, [0x1010]);
 }
+
+/// The second section, `.data`: RVA 0x2000, file offset 0x600, 0x200 bytes.
+/// Its file offset is not the `.text` shift (RVA 0x2000 would be file offset
+/// 0x1200 there), and the file holds 0xEE bytes at 0x1200, so a read that
+/// maps every RVA through the first section finds garbage.
+const DATA_RVA: u32 = 0x2000;
+const DATA_FILE_OFFSET: u32 = SECTION_FILE_OFFSET + SECTION_SIZE;
+const DATA_SIZE: u32 = 0x200;
+
+/// File offset of an RVA inside `.data`.
+fn at_data(rva: u32) -> usize {
+    (rva - DATA_RVA + DATA_FILE_OFFSET) as usize
+}
+
+fn put_data_bytes(d: &mut [u8], rva: u32, bytes: &[u8]) {
+    d[at_data(rva)..at_data(rva) + bytes.len()].copy_from_slice(bytes);
+}
+
+/// `image()` with `.data` added after `.text` in the section table, or before
+/// it when `data_first`.
+fn with_data_section(data_first: bool) -> Vec<u8> {
+    let mut d = image();
+    let wrong = at(DATA_RVA);
+    d.resize(DATA_FILE_OFFSET as usize + DATA_SIZE as usize, 0);
+    d.resize(wrong, 0xEE);
+    d.resize(wrong + DATA_SIZE as usize, 0xEE);
+    put16(&mut d, 0x46, 2);
+    put32(&mut d, OPT + 56, DATA_RVA + 0x1000);
+    let text = OPT + 240;
+    let data = text + 40;
+    d.copy_within(text..text + 40, data);
+    let (text, data) = if data_first {
+        (data, text)
+    } else {
+        (text, data)
+    };
+    d[data..data + 40].fill(0);
+    d[data..data + 5].copy_from_slice(b".data");
+    put32(&mut d, data + 8, DATA_SIZE);
+    put32(&mut d, data + 12, DATA_RVA);
+    put32(&mut d, data + 16, DATA_SIZE);
+    put32(&mut d, data + 20, DATA_FILE_OFFSET);
+    put32(&mut d, data + 36, 0xC000_0040); // initialised data, read, write
+    assert_eq!(&d[text..text + 5], b".text");
+    d
+}
+
+#[test]
+fn imports_in_a_second_section_are_read_at_its_file_offset() {
+    // Two descriptors in `.data`, with their names and name tables there
+    // too. The second one's IAT is back in `.text`: nothing reads the IAT, so
+    // it may be in any section.
+    const DESCRIPTORS: u32 = DATA_RVA;
+    const NAMES: u32 = DATA_RVA + 0x80;
+    const SLOTS: u32 = DATA_RVA + 0xA0;
+    const DLL: u32 = DATA_RVA + 0xC0;
+    const FUNC: u32 = DATA_RVA + 0xD0;
+    const NAMES2: u32 = DATA_RVA + 0x100;
+    const DLL2: u32 = DATA_RVA + 0x120;
+    let mut d = with_data_section(false);
+    set_directory(&mut d, dir::IMPORT, DESCRIPTORS, 60);
+    let desc = at_data(DESCRIPTORS);
+    put32(&mut d, desc, NAMES);
+    put32(&mut d, desc + 12, DLL);
+    put32(&mut d, desc + 16, SLOTS);
+    put32(&mut d, desc + 20, NAMES2);
+    put32(&mut d, desc + 20 + 12, DLL2);
+    put32(&mut d, desc + 20 + 16, IAT);
+    put64(&mut d, at_data(NAMES), u64::from(FUNC));
+    put64(&mut d, at_data(NAMES) + 8, (1 << 63) | 9);
+    put64(&mut d, at_data(NAMES2), (1 << 63) | 5);
+    put_data_bytes(&mut d, DLL, b"USER32.dll\0");
+    put_data_bytes(&mut d, DLL2, b"KERNEL32.dll\0");
+    put16(&mut d, at_data(FUNC), 0x2B);
+    put_data_bytes(&mut d, FUNC + 2, b"MessageBoxW\0");
+
+    let info = ImageInfo::parse(&d).unwrap();
+    let modules: Vec<_> = info
+        .imports
+        .iter()
+        .map(|m| {
+            let entries: Vec<_> = m
+                .entries
+                .iter()
+                .map(|e| (e.symbol.to_string(), e.iat_slot_rva))
+                .collect();
+            (m.dll.as_str(), entries)
+        })
+        .collect();
+    assert_eq!(
+        modules,
+        [
+            (
+                "USER32.dll",
+                vec![("MessageBoxW".into(), SLOTS), ("#9".into(), SLOTS + 8)]
+            ),
+            ("KERNEL32.dll", vec![("#5".into(), IAT)]),
+        ]
+    );
+    assert_eq!(
+        info.imports[0].entries[0].symbol,
+        ImportSymbol::Name {
+            hint: 0x2B,
+            name: "MessageBoxW".into()
+        }
+    );
+    assert_eq!(info.import_count(), 3);
+    assert_eq!(info.rva_to_file_offset(FUNC), Some(at_data(FUNC) as u32));
+
+    // Names and name tables are read only from the section that holds the
+    // import directory: pointing either one back into `.text`, where the
+    // same strings and table are, makes the image malformed.
+    for (field, rva) in [(12, DLL_NAME), (0, NAME_TABLE)] {
+        let mut d = d.clone();
+        put32(&mut d, desc + 20 + field, rva);
+        assert!(
+            matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))),
+            "field {field}"
+        );
+    }
+    // So is a hint/name entry in `.text`.
+    put64(&mut d, at_data(NAMES), u64::from(HINT_NAME));
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+}
+
+#[test]
+fn delay_imports_in_a_second_section_are_read_at_its_file_offset() {
+    // The delay descriptor, its name table, DLL name and hint/name entry are
+    // all in `.data`; its IAT is in `.text`.
+    const DESCRIPTORS: u32 = DATA_RVA + 0x100;
+    const NAMES: u32 = DATA_RVA + 0x140;
+    const DLL: u32 = DATA_RVA + 0x160;
+    const FUNC: u32 = DATA_RVA + 0x170;
+    let mut d = with_data_section(false);
+    set_directory(&mut d, DIR_DELAY_IMPORT, DESCRIPTORS, 64);
+    let desc = at_data(DESCRIPTORS);
+    put32(&mut d, desc, 1); // attributes: RVA based
+    put32(&mut d, desc + 4, DLL);
+    put32(&mut d, desc + 12, DELAY_IAT);
+    put32(&mut d, desc + 16, NAMES);
+    put64(&mut d, at_data(NAMES), u64::from(FUNC));
+    put64(&mut d, at_data(NAMES) + 8, (1 << 63) | 0x1234);
+    put_data_bytes(&mut d, DLL, b"USER32.dll\0");
+    put16(&mut d, at_data(FUNC), 7);
+    put_data_bytes(&mut d, FUNC + 2, b"MessageBoxW\0");
+
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.delay_imports.len(), 1);
+    let user32 = &info.delay_imports[0];
+    assert_eq!(user32.dll, "USER32.dll");
+    let entries: Vec<_> = user32
+        .entries
+        .iter()
+        .map(|e| (e.symbol.clone(), e.iat_slot_rva))
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            (
+                ImportSymbol::Name {
+                    hint: 7,
+                    name: "MessageBoxW".into()
+                },
+                DELAY_IAT
+            ),
+            (ImportSymbol::Ordinal(0x1234), DELAY_IAT + 8),
+        ]
+    );
+    // The direct imports in `.text` are unchanged.
+    assert_eq!(info.import_count(), 2);
+
+    // As with direct imports, the DLL name must be in the descriptor's
+    // section: the same string in `.text` is not read.
+    add_delay_import(&mut d);
+    set_directory(&mut d, DIR_DELAY_IMPORT, DESCRIPTORS, 64);
+    put32(&mut d, desc + 4, DELAY_DLL_NAME);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+}
+
+#[test]
+fn a_tls_callback_array_in_another_section_is_read_there() {
+    // The directory stays in `.text`; its callbacks pointer names an array
+    // in `.data`, which ends at the first null slot.
+    const CALLBACKS: u32 = DATA_RVA + 0x1F0;
+    let mut d = with_data_section(false);
+    put64(
+        &mut d,
+        at(TLS_DIRECTORY) + layout::TLS64_ADDRESS_OF_CALLBACKS,
+        IMAGE_BASE + u64::from(CALLBACKS),
+    );
+    put64(&mut d, at_data(CALLBACKS), IMAGE_BASE + 0x1030);
+    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
+    assert_eq!(tls.directory_rva, TLS_DIRECTORY);
+    assert_eq!(tls.callbacks_va, IMAGE_BASE + u64::from(CALLBACKS));
+    // Two slots fit before the end of `.data`, and the second is zero.
+    assert_eq!(tls.callback_rvas, [0x1030]);
+
+    // With the second slot set too, both are read. The file holds 0xEE bytes
+    // right after `.data`'s raw data, and they are not read as a third.
+    put64(&mut d, at_data(CALLBACKS) + 8, IMAGE_BASE + 0x1040);
+    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
+    assert_eq!(tls.callback_rvas, [0x1030, 0x1040]);
+}
+
+#[test]
+fn a_tls_directory_in_another_section_than_its_callbacks_is_read_there() {
+    // The reverse: the directory moves into `.data`, the array stays in
+    // `.text`.
+    const DIRECTORY: u32 = DATA_RVA + 0x40;
+    let mut d = with_data_section(false);
+    let old = at(TLS_DIRECTORY);
+    d[old..old + 40].fill(0);
+    set_directory(&mut d, DIR_TLS, DIRECTORY, 40);
+    put64(
+        &mut d,
+        at_data(DIRECTORY) + layout::TLS64_ADDRESS_OF_CALLBACKS,
+        IMAGE_BASE + u64::from(TLS_CALLBACKS),
+    );
+    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
+    assert_eq!(tls.directory_rva, DIRECTORY);
+    assert_eq!(tls.callback_rvas, [0x10, 0x20].map(|o| SECTION_RVA + o));
+}
+
+#[test]
+fn the_section_table_order_does_not_change_what_is_read() {
+    // `.data` listed before `.text`: sections are reported in table order,
+    // and imports and TLS that cross between them are read the same way.
+    const CALLBACKS: u32 = DATA_RVA + 0x10;
+    let parse = |data_first: bool| {
+        let mut d = with_data_section(data_first);
+        put64(
+            &mut d,
+            at(TLS_DIRECTORY) + layout::TLS64_ADDRESS_OF_CALLBACKS,
+            IMAGE_BASE + u64::from(CALLBACKS),
+        );
+        put64(&mut d, at_data(CALLBACKS), IMAGE_BASE + 0x1010);
+        put32(&mut d, at(IMPORT_DESCRIPTORS) + 16, DATA_RVA + 0x100);
+        ImageInfo::parse(&d).unwrap()
+    };
+    let (after, before) = (parse(false), parse(true));
+    let names = |info: &ImageInfo| -> Vec<String> {
+        info.sections
+            .iter()
+            .map(|s| s.name.trim_end_matches('\0').to_owned())
+            .collect()
+    };
+    assert_eq!(names(&after), [".text", ".data"]);
+    assert_eq!(names(&before), [".data", ".text"]);
+    for info in [&after, &before] {
+        assert_eq!(info.tls.as_ref().unwrap().callback_rvas, [0x1010]);
+        let slots: Vec<u32> = info.imports[0]
+            .entries
+            .iter()
+            .map(|e| e.iat_slot_rva)
+            .collect();
+        assert_eq!(slots, [DATA_RVA + 0x100, DATA_RVA + 0x108]);
+        for rva in [ENTRY, HINT_NAME, DATA_RVA, CALLBACKS] {
+            let expected = if rva < DATA_RVA {
+                at(rva)
+            } else {
+                at_data(rva)
+            };
+            assert_eq!(info.rva_to_file_offset(rva), Some(expected as u32));
+        }
+        // Between `.text` and `.data`, and past `.data`, nothing is mapped.
+        assert_eq!(info.rva_to_file_offset(SECTION_RVA + SECTION_SIZE), None);
+        assert_eq!(info.rva_to_file_offset(DATA_RVA + DATA_SIZE), None);
+    }
+}
