@@ -202,10 +202,10 @@ enum Blob {
 
 impl Blob {
     /// The library file in `dir`: a library a save left beside it
-    /// ([`NEXT_FILE`]) takes its place first.
+    /// (`<file>.next`) takes its place first.
     fn of(dir: &std::path::Path) -> Blob {
-        let path = dir.join(LIBRARY_FILE);
-        let next = dir.join(NEXT_FILE);
+        let path = dir.join(library_file());
+        let next = dir.join(format!("{}.next", library_file()));
         if next.exists() && std::fs::rename(&next, &path).is_err() {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
         }
@@ -445,10 +445,33 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
 }
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
-/// A saved library that could not replace [`LIBRARY_FILE`] while this run
+/// The library of a run on the software adapter. A pipeline library blob is
+/// keyed to the adapter: the host refuses one of another with
+/// `D3D12_ERROR_ADAPTER_NOT_FOUND`, "the blob provided does not match the
+/// adapter that the device was created on" (0x887E0001). WARP runs and card
+/// runs share one cache folder, so one file for both meant each kind of run
+/// rejected the other's library, started empty, and missed every load: ten
+/// such rejections in one night's logs, and 0 loads served against 313
+/// refusals in the run that measured it (2026-11-24).
+const WARP_LIBRARY_FILE: &str = "host-pipelines-warp.bin";
+
+/// Whether this run's device is the software adapter: the same condition that
+/// picks the device in `host::create`.
+fn software() -> bool {
+    cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some()
+}
+
+/// The library's file for this run's adapter.
+fn library_file() -> &'static str {
+    if software() {
+        WARP_LIBRARY_FILE
+    } else {
+        LIBRARY_FILE
+    }
+}
+/// A saved library that could not replace the library's file while this run
 /// had it mapped (a system that refuses to replace a mapped file): the next
-/// start renames it over the library first ([`Blob::of`]).
-const NEXT_FILE: &str = "host-pipelines.next";
+/// start renames `<file>.next` over the library first ([`Blob::of`]).
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
@@ -495,7 +518,25 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     saving: RwLock::new(()),
                 });
             }
-            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
+            Err(e) => {
+                // Kept beside the library rather than overwritten by this
+                // run's save: a blob of another adapter, a driver change or
+                // damage is worth reading next to the run that refused it,
+                // and one bad file must not cost the next run a warm cache.
+                let mut kept = None;
+                if let Some(dir) = DIR.get() {
+                    let aside = dir.join(format!("{}.rejected", library_file()));
+                    match std::fs::rename(dir.join(library_file()), &aside) {
+                        Ok(()) => kept = Some(aside),
+                        Err(why) => tracing::warn!(error = %why, "the rejected library could not be set aside"),
+                    }
+                }
+                tracing::info!(
+                    error = %e,
+                    kept_as = %kept.map_or_else(|| "(nowhere)".into(), |p| p.display().to_string()),
+                    "host pipeline library rejected; starting an empty one"
+                );
+            }
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
@@ -632,7 +673,7 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let tmp = dir.join(library_file()).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -665,7 +706,7 @@ pub(crate) fn save(now: bool) {
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
-        let in_place = !dir.join(NEXT_FILE).exists();
+        let in_place = !dir.join(format!("{}.next", library_file())).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
             REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
             REPLACED[0].fetch_add(1, Ordering::Relaxed);
@@ -716,9 +757,10 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// the mapping goes on reading the old one for as long as a handle on it
 /// is open ([`holds`]; with none, only the pages in memory at that moment
 /// stay: the rest read as zeros). Where a system refuses, the new library
-/// is left beside it as [`NEXT_FILE`] for the next start.
+/// is left beside it as `<file>.next` for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    std::fs::rename(tmp, dir.join(library_file()))
+        .or_else(|_| std::fs::rename(tmp, dir.join(format!("{}.next", library_file()))))
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -818,7 +860,7 @@ mod tests {
         drop(blob);
         // The next start reads the new one, wherever the save left it.
         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
-        assert!(!dir.path().join(NEXT_FILE).exists());
+        assert!(!dir.path().join(format!("{}.next", library_file())).exists());
     }
 
     /// The bytes at `at` of the pattern the test below writes.
