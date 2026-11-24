@@ -892,6 +892,8 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
     let state = pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state);
+    // a depth buffer that shaders write too: the state its twin's copies start from (#970)
+    let depth_uav = u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()) & 6 == 6;
     let mut clear_buf = [0u8; 24];
     let clear = pc_clear(clear, &mut clear_buf);
     if buffer {
@@ -913,6 +915,9 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                         super::title_textures::retire_overlapping(va as usize, bytes as usize);
                     }
                     real::note_title_address(*ppv as usize, va as usize);
+                    if depth_uav {
+                        super::depth_twin::note_created(*ppv as usize, state);
+                    }
                 }
                 return hr;
             }
@@ -927,6 +932,9 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv)
         }
     };
+    if hr >= 0 && depth_uav && !(*ppv).is_null() {
+        super::depth_twin::note_created(*ppv as usize, state);
+    }
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
