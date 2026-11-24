@@ -2251,6 +2251,96 @@ mod tests {
     }
 
     #[test]
+    fn an_xbch_stream_is_read_exactly_as_stated() {
+        let fssm_blob = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let good = xbch(&fssm_blob);
+        let packed = u64_at(&good, 8).unwrap();
+        let with = |at: usize, value: u64| {
+            let mut blob = good.clone();
+            blob[at..at + 8].copy_from_slice(&value.to_le_bytes());
+            blob
+        };
+
+        // Bytes after the stated stream are never read.
+        let mut trailing = good.clone();
+        trailing.extend_from_slice(&[0xFF; 9]);
+        assert_eq!(
+            native_programs(&part(&[(KIND_NATIVE, &trailing)]))
+                .unwrap()
+                .len(),
+            1
+        );
+        // A stated stream one byte short of the real one does not inflate.
+        assert_eq!(
+            refused_blob(&with(8, packed - 1)),
+            "XBCH stream does not inflate to its stated size"
+        );
+        // Nor does an empty one.
+        assert_eq!(
+            refused_blob(&with(8, 0)),
+            "XBCH stream does not inflate to its stated size"
+        );
+        // The largest packed size does not wrap round into the blob.
+        assert_eq!(
+            refused_blob(&with(8, u64::MAX)),
+            "XBCH stream out of bounds"
+        );
+
+        // The largest plausible unpacked size passes the limit, then fails to
+        // match what the stream holds; the largest of all is implausible.
+        assert_eq!(
+            refused_blob(&with(16, MAX_UNPACKED)),
+            "XBCH stream does not inflate to its stated size"
+        );
+        assert_eq!(
+            refused_blob(&with(16, u64::MAX)),
+            "implausible XBCH unpacked size"
+        );
+        // The unpacked limit is checked before the stream's bounds.
+        let mut both = with(16, MAX_UNPACKED + 1);
+        both[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(refused_blob(&both), "implausible XBCH unpacked size");
+
+        // A stream inflating to bytes that are not FSSM is refused there.
+        assert_eq!(
+            refused_blob(&xbch(b"not fssm")),
+            "native blob lacks FSSM magic"
+        );
+        // As is one inflating to nothing at all.
+        assert_eq!(refused_blob(&xbch(&[])), "native blob lacks FSSM magic");
+    }
+
+    #[test]
+    fn only_the_exact_native_kind_is_read() {
+        let native = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
+        // The native blob under a neighbouring or wider kind is skipped.
+        for kind in [
+            KIND_NATIVE - 1,
+            KIND_NATIVE + 1,
+            KIND_NATIVE | 1 << 8,
+            0,
+            u32::MAX,
+        ] {
+            assert!(
+                native_programs(&part(&[(kind, &native)]))
+                    .unwrap()
+                    .is_empty(),
+                "{kind:#x}"
+            );
+        }
+        // Two native entries naming the same bytes read them twice.
+        let mut data = part(&[(KIND_NATIVE, &native), (KIND_NATIVE, b"")]);
+        let first = XDAT_OFFSET + 12;
+        let (offset, size) = (
+            u32_at(&data, first + 4).unwrap(),
+            u32_at(&data, first + 8).unwrap(),
+        );
+        data[first + 12 + 4..][..4].copy_from_slice(&offset.to_le_bytes());
+        data[first + 12 + 8..][..4].copy_from_slice(&size.to_le_bytes());
+        assert_eq!(native_programs(&data).unwrap().len(), 2);
+    }
+
+    #[test]
     fn names_each_fssm_header_refusal() {
         let good = fssm(&[(HwStage::Vs, &VS_CODE)]);
         let with = |at: usize, value: &[u8]| {
