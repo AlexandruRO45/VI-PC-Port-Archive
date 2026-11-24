@@ -2703,6 +2703,67 @@ mod tests {
         assert_eq!(names(&main, false), ["a.rs", "own/c.rs"]);
     }
 
+    /// A checkout made with `--separate-git-dir` has a `.git` file pointing
+    /// at a repository kept elsewhere, and that repository's `info/exclude`
+    /// and the `core.excludesFile` its config names are the ones that apply:
+    /// `shared` and `configured`, each ignored by one of them alone, are
+    /// taken, while `visible` is refused and left empty. A candidate under
+    /// the `.git` file cannot be made and is passed over, not taken for the
+    /// repository's own directory, and nothing of the separate repository
+    /// is listed.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_may_be_ignored_by_a_separate_git_directory() {
+        let repo = tempdir();
+        let outside = tempdir();
+        let root = repo.path().join("checkout");
+        let git_dir = outside.path().join("repo.git");
+        std::fs::create_dir(&root).unwrap();
+        git_str(
+            &root,
+            &[
+                "init",
+                "-q",
+                "--separate-git-dir",
+                git_dir.to_str().unwrap(),
+            ],
+        );
+        assert!(root.join(".git").is_file());
+        std::fs::create_dir_all(git_dir.join("info")).unwrap();
+        std::fs::write(git_dir.join("info/exclude"), "/shared/\n").unwrap();
+        let rules = outside.path().join("configured.rules");
+        std::fs::write(&rules, "/configured/\n").unwrap();
+        git_str(
+            &root,
+            &["config", "core.excludesFile", rules.to_str().unwrap()],
+        );
+        assert!(
+            std::fs::read_to_string(git_dir.join("config"))
+                .unwrap()
+                .contains("configured.rules")
+        );
+        let visible = root.join("visible");
+        let shared = root.join("shared");
+        let configured = root.join("configured");
+        for dir in [&visible, &shared, &configured] {
+            std::fs::create_dir(dir).unwrap();
+        }
+
+        let through_file = root.join(".git/scratch");
+        let tmp = tempdir_in_first(&root, [through_file, visible.clone(), shared.clone()]);
+        assert_eq!(tmp.path().parent(), Some(shared.as_path()));
+        assert_eq!(std::fs::read_dir(&visible).unwrap().count(), 0);
+        let tmp_configured = tempdir_in_first(&root, [visible.clone(), configured.clone()]);
+        assert_eq!(tmp_configured.path().parent(), Some(configured.as_path()));
+        assert_eq!(std::fs::read_dir(&visible).unwrap().count(), 0);
+        for dir in [tmp.path(), tmp_configured.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        std::fs::write(visible.join("a.rs"), b"fn a() {}\n").unwrap();
+        assert_eq!(names(&root, false), ["visible/a.rs"]);
+        super::run(&root, false).unwrap();
+    }
+
     /// Ignore sources are opened as git opens them: a UTF-8 byte order mark
     /// at the start of `.gitignore` is dropped, so its first rule ignores
     /// `bom`, which is taken, while the same mark before a later rule is
