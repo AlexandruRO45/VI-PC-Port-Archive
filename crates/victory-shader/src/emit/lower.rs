@@ -7058,9 +7058,9 @@ mod tests {
             code,
         };
         let p = ir::build(&native.code, false, 8).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
             native: &native,
             p: &p,
