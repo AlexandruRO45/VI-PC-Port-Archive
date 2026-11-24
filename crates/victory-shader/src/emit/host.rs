@@ -437,6 +437,27 @@ impl Host {
         // SAFETY: the stream points at live data and outlives the call.
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
+
+    /// The adapter the device runs on, as DXGI names it, for test messages:
+    /// on a laptop the default adapter is often the integrated GPU, not the
+    /// one its owner has in mind.
+    pub fn adapter(&self) -> String {
+        // SAFETY: plain DXGI queries.
+        let desc = unsafe {
+            let luid = self.device.GetAdapterLuid();
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+                .and_then(|a| a.GetDesc1())
+        };
+        match desc {
+            Ok(d) => {
+                let name = &d.Description;
+                let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+                String::from_utf16_lossy(&name[..len])
+            }
+            Err(e) => format!("unknown adapter: {}", err(e)),
+        }
+    }
 }
 
 /// A vertex shader that feeds `ps`'s inputs (zeros) and a position.

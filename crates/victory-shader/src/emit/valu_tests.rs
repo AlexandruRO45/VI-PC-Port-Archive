@@ -168,7 +168,8 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
-/// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
+/// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`,
+/// `backend` naming the adapter too (`hardware (<adapter>)`).
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
@@ -181,6 +182,9 @@ fn run_cases(
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        // Failures name the adapter: the default one is not always the GPU
+        // the tester expects (on a laptop, often the integrated one).
+        let label: &str = &format!("{label} ({})", host.adapter());
         let (root, pso) = host
             .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
