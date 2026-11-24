@@ -764,11 +764,26 @@ impl Staging {
             // console's view of them every frame while the movie's texture
             // reads a second view of the same pages, and the runtime records
             // both (127 view entries an end, section 3464, 64 KiB a slice).
-            if unwritten && !turn && !self.second_view(start, size) {
+            let second = self.second_view(start, size);
+            if unwritten && !turn && !second {
                 crate::movie::verdict("guarded view, no write seen, not its hash turn", start, size, || {
                     format!("asked {now}, last wrote at {}, one hash in {HASH_EVERY} frames", last.asked)
                 });
                 return 0;
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(
+                    if !unwritten && !second {
+                        C::TexPastWrote
+                    } else if second {
+                        C::TexPastSecond
+                    } else {
+                        C::TexPastTurn
+                    },
+                    size as u64,
+                );
             }
         }
         // From here on the texture's memory may be read in place. Held until
