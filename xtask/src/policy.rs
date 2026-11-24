@@ -63,6 +63,7 @@ const LFS_POINTER_PREFIXES: &[&[u8]] = &[
 
 pub fn run(root: &Path, staged: bool) -> Result<()> {
     let files = list_files(root, staged)?;
+    let indexed = indexed_blobs(root, &files)?;
     let mut violations = Vec::new();
     for file in &files {
         let path = &file.name;
@@ -78,14 +79,22 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
                 continue;
             }
         };
-        if let Some(problem) = exempt(path, &content) {
-            if let Err(problem) = problem {
-                violations.push(format!("{path}: {problem}"));
+        check_content(path, path, &content, &mut violations);
+        // The working copy is not what the repository holds: a tracked file
+        // edited after a `--no-verify` commit, or hidden from `git status`
+        // by `--assume-unchanged` or `--skip-worktree`, still has its
+        // committed content in the index. Checked as well when it differs.
+        if let Source::Worktree {
+            index: Some(oid), ..
+        } = &file.source
+        {
+            match indexed.get(oid) {
+                Some(Some(blob)) if *blob != content => {
+                    check_content(path, &format!("{path} (as indexed)"), blob, &mut violations);
+                }
+                Some(Some(_)) => {}
+                _ => violations.push(format!("{path}: cannot read the indexed content")),
             }
-            continue;
-        }
-        for problem in check(path, &content) {
-            violations.push(format!("{path}: {problem}"));
         }
     }
     if violations.is_empty() {
@@ -100,6 +109,85 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
          see docs/asset-policy.md",
         violations.len()
     )
+}
+
+/// Adds the problems with one file's content, reported as `label`.
+fn check_content(path: &str, label: &str, content: &[u8], violations: &mut Vec<String>) {
+    if let Some(problem) = exempt(path, content) {
+        if let Err(problem) = problem {
+            violations.push(format!("{label}: {problem}"));
+        }
+        return;
+    }
+    for problem in check(path, content) {
+        violations.push(format!("{label}: {problem}"));
+    }
+}
+
+/// The index's blob for every tracked file of the full check, by object id,
+/// read with one `git cat-file --batch` rather than a process per file;
+/// `None` for an object git does not have.
+fn indexed_blobs(
+    root: &Path,
+    files: &[File],
+) -> Result<std::collections::HashMap<String, Option<Vec<u8>>>> {
+    use std::io::{BufRead, Read, Write};
+    let mut oids: Vec<&str> = files
+        .iter()
+        .filter_map(|file| match &file.source {
+            Source::Worktree {
+                index: Some(oid), ..
+            } => Some(oid.as_str()),
+            _ => None,
+        })
+        .collect();
+    oids.sort_unstable();
+    oids.dedup();
+    let mut blobs = std::collections::HashMap::new();
+    if oids.is_empty() {
+        return Ok(blobs);
+    }
+    let mut child = git_command(root)
+        .args(["cat-file", "--batch"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("running git cat-file")?;
+    let mut stdin = child.stdin.take().context("git cat-file stdin")?;
+    let request: String = oids.iter().map(|oid| format!("{oid}\n")).collect();
+    // Written from another thread: git answers while it reads, and a full
+    // stdout pipe would otherwise stop both.
+    let writer = std::thread::spawn(move || stdin.write_all(request.as_bytes()));
+    let mut out = std::io::BufReader::new(child.stdout.take().context("git cat-file stdout")?);
+    for oid in &oids {
+        // `<oid> <type> <size>\n<content>\n`, or `<oid> missing\n`.
+        let mut header = String::new();
+        out.read_line(&mut header).context("reading git cat-file")?;
+        let size = match header.split_whitespace().collect::<Vec<_>>()[..] {
+            [_, _, size] => size.parse::<u64>().ok(),
+            _ => None,
+        };
+        let Some(size) = size else {
+            if header.is_empty() {
+                bail!("git cat-file ended early");
+            }
+            blobs.insert((*oid).to_owned(), None);
+            continue;
+        };
+        let mut content = Vec::new();
+        (&mut out)
+            .take(size)
+            .read_to_end(&mut content)
+            .context("reading git cat-file")?;
+        out.read_exact(&mut [0]).context("reading git cat-file")?;
+        blobs.insert((*oid).to_owned(), Some(content));
+    }
+    writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("git cat-file writer panicked"))?
+        .context("writing to git cat-file")?;
+    child.wait().context("waiting for git cat-file")?;
+    Ok(blobs)
 }
 
 /// One path to check.
@@ -1102,6 +1190,49 @@ mod tests {
             super::read(root, link).unwrap().as_deref(),
             Some(target.as_bytes())
         );
+    }
+
+    /// The full check reads what the index holds as well as the working
+    /// copy: a binary committed with `--no-verify` and then overwritten on
+    /// disk with text stays in the repository, and `--assume-unchanged` or
+    /// `--skip-worktree` hide it from `git status` too.
+    #[cfg(unix)]
+    #[test]
+    fn tracked_files_are_read_as_indexed_as_well() {
+        let tmp = tempdir();
+        let root = tmp.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join("a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(root.join("game.rs"), b"MZ\x90\0binary").unwrap();
+        git_str(root, &["add", "a.rs", "game.rs"]);
+        git_str(root, &["commit", "-q", "--no-verify", "-m", "x"]);
+
+        std::fs::write(root.join("game.rs"), b"fn game() {}\n").unwrap();
+        assert!(super::run(root, false).is_err(), "edited on disk");
+        for flag in ["--assume-unchanged", "--skip-worktree"] {
+            git_str(root, &["update-index", flag, "game.rs"]);
+            assert!(super::run(root, false).is_err(), "{flag}");
+            git_str(
+                root,
+                &["update-index", &flag.replace("--", "--no-"), "game.rs"],
+            );
+        }
+        let indexed = super::indexed_blobs(root, &super::list_files(root, false).unwrap()).unwrap();
+        assert_eq!(indexed.len(), 2);
+        assert!(
+            indexed
+                .values()
+                .any(|b| b.as_deref() == Some(b"MZ\x90\0binary"))
+        );
+
+        // Staged, the index holds the text too, and both checks pass.
+        git_str(root, &["add", "game.rs"]);
+        super::run(root, false).unwrap();
+        super::run(root, true).unwrap();
+
+        // Text on disk over text in the index is read once.
+        std::fs::write(root.join("a.rs"), b"fn a() { 1 }\n").unwrap();
+        super::run(root, false).unwrap();
     }
 
     /// A submodule pulls in another repository's content, which no check

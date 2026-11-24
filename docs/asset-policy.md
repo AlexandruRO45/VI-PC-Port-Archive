@@ -53,7 +53,10 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
    entries are split into rows). File names must
    be UTF-8, and submodules, like untracked git repositories nested in the
    checkout, are refused. A symlink is checked as git stores it, as
-   its target path. Git LFS pointers are refused: what they stand for is
+   its target path. A tracked file is checked as the index holds it as
+   well as on disk, so editing or hiding the working copy
+   (`--assume-unchanged`, `--skip-worktree`) does not hide what is
+   committed. Git LFS pointers are refused: what they stand for is
    stored outside the repository, where no check reads it. Exceptions need
    an entry with a reason in `xtask/src/policy.rs`, pinned to the BLAKE3 of
    the exempted content: any other content at that path is refused, so a
