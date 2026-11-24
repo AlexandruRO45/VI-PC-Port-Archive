@@ -279,13 +279,16 @@ extern "system" fn present(
         let now = crate::draw::drawn() + crate::draw::dispatched();
         crate::capture::note_busy(frame, now - LAST.swap(now, Ordering::Relaxed));
     }
-    // Show mode (diagnostics builds) picks its target before a dump takes
-    // the frame's list.
+    // Show mode (diagnostics builds) picks its target from its own list,
+    // apart from the dump's.
     #[cfg(all(windows, feature = "diagnostics"))]
     let shown = crate::capture::shown(frame);
     #[cfg(all(windows, feature = "diagnostics"))]
-    if crate::capture::listed(frame) {
-        crate::capture::dump_targets(frame);
+    {
+        crate::capture::presented(frame);
+        if crate::capture::listed(frame) || crate::capture::has_targets() {
+            crate::capture::dump_targets(frame);
+        }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     if let (Some(copy), Some(host)) = (&shown, crate::host::host()) {
