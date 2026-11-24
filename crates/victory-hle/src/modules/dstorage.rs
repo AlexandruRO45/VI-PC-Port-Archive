@@ -484,7 +484,7 @@ impl Lanes {
             self.bcpack.0 += u64::from(job.read.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
-        if job.request.options & PAGE_DESTINATION != 0 {
+        if job.read.request.options & PAGE_DESTINATION != 0 {
             self.pages += 1;
         }
         let since = *self.since.get_or_insert(started);
