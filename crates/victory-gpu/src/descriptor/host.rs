@@ -1565,7 +1565,7 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let mut shadow = crate::shadow::find(address, len)?;
     let offset = shadow.offset(address);
     // A structured view as a raw view of the same bytes (see `raw_window`).
     // SAFETY: a buffer view's union member.
@@ -1586,15 +1586,17 @@ fn buffer_srv(
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     if window.is_none() {
-        if element == 0 || offset % element != 0 {
-            once!(
-                offset,
-                element,
-                "buffer view not on an element of its host copy"
-            );
+        if element == 0 {
+            once!(len, "buffer view of elements without a size");
             return None;
         }
-        buffer.FirstElement += offset / element;
+        // The copy this view's own bytes are in, its first element counted
+        // from there: a console view starts at any address, and one off its
+        // buffer's element boundary reads a copy of its own instead of
+        // being refused (refused, its slot read zeros).
+        let start = address + buffer.FirstElement * element;
+        shadow = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+        buffer.FirstElement = shadow.offset(start) / element;
     }
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
@@ -1637,13 +1639,7 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
-    // SAFETY: a live buffer.
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
-    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-        once!("unordered access to a buffer whose host copy shaders cannot write");
-        return None;
-    }
+    let mut shadow = crate::shadow::find(address, len)?;
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -1664,11 +1660,19 @@ fn buffer_uav(
         buffer.StructureByteStride = 0;
         buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     } else {
-        if element == 0 || offset % element != 0 {
-            once!(offset, element, "unordered buffer view not on an element of its host copy");
+        if element == 0 {
+            once!(len, "unordered buffer view of elements without a size");
             return None;
         }
-        buffer.FirstElement += offset / element;
+        let start = address + buffer.FirstElement * element;
+        shadow = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+        buffer.FirstElement = shadow.offset(start) / element;
+    }
+    // SAFETY: a live buffer.
+    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+        once!("unordered access to a buffer whose host copy shaders cannot write");
+        return None;
     }
     buffer.CounterOffsetInBytes = 0;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
