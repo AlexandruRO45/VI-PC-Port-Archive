@@ -189,12 +189,17 @@ developed with Claude Code.
 ### What this fork's own crew added
 
 Each row is a change this fork wrote, with the file it lives in, the test that
-pinned it, and the measurement that justifies it. The third column is what
-`b3b8533` actually contains, read at that sha: the adoption merge resolved the
-conflicted GPU files in the base's favour, so several of these are no longer in
-the tree and are waiting to be re-applied. A row marked *carried by the base*
-kept its effect without our commit, and a row marked *unverified* means nobody
-has checked whether the base's own form does the same thing.
+pinned it, and the measurement that justifies it.
+
+The third column is a **symbol check against the tree, on the sha named, never a
+memory of what landed**: each verdict rests on a named symbol being present at
+that sha or absent from it. A row marked **No** is a re-application that has not
+happened yet, not a claim that the fix never worked — the measurement beside it
+stands, on the tree that produced it. The adoption merge resolved the conflicted
+GPU files in the base's favour, so six of the nine rows are no longer in the
+tree. A row marked *carried by the base* kept its effect without our commit, and
+*unverified* means nobody has checked whether the base's own form does the same
+thing.
 
 | Change | Where | In `b3b8533`? | Measurement, with its conditions |
 |---|---|---|---|
