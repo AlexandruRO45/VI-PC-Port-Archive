@@ -52,7 +52,9 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
    wrapped onto several lines, as `base64` writes it, is one run), no long
    runs without whitespace (ascii85, Z85, uuencode, and base32768 or
    base65536 in any script), and no long
-   numeric arrays or `\xHH` escape strings (`xxd -i` output; tables over 512
+   numeric arrays or `\xHH` / `\u{..}` escape strings (`xxd -i` output;
+   a string of escapes split into many literals, by `\` continuations,
+   adjacent literals or commas, is one string; tables over 512
    entries are split into rows). File names must
    be UTF-8, and submodules, like untracked git repositories nested in the
    checkout, are refused. A symlink is checked as git stores it, as

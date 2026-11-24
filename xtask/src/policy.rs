@@ -836,7 +836,8 @@ fn longest_printable_run(content: &[u8]) -> usize {
 }
 
 /// Longest list of numeric literals separated by commas, or run of `\xHH`
-/// escapes, in `content`.
+/// or `\u{..}` escapes (across string boundaries, as `string_join_len`
+/// describes), in `content`.
 ///
 /// Neither is a hex/base64 run: `xxd -i` and `bin2c` write a file as
 /// `0x4d, 0x5a, 0x90, ...`, and a byte string as `"\x4d\x5a\x90..."`,
@@ -881,22 +882,63 @@ fn longest_literal_run(content: &[u8]) -> usize {
             run = 0;
         }
     }
-    // `\xHH` escapes back to back.
+    // Escapes back to back, joined across string boundaries.
     let (mut run, mut i) = (0, 0);
     while i < content.len() {
-        if let [b'\\', b'x', h, l, ..] = content[i..]
-            && h.is_ascii_hexdigit()
-            && l.is_ascii_hexdigit()
-        {
+        if let Some(len) = escape_len(&content[i..]) {
             run += 1;
             longest = longest.max(run);
-            i += 4;
+            i += len;
+            let join = string_join_len(&content[i..]);
+            if join > 0 && escape_len(&content[i + join..]).is_some() {
+                i += join;
+            }
             continue;
         }
         run = 0;
         i += 1;
     }
     longest
+}
+
+/// Length of the byte escape at the start of `rest`: `\xHH` (Rust, C,
+/// HLSL) or `\u{H}` to `\u{HHHHHH}` (Rust), which `escape_default` and
+/// `{:?}` write for any character outside printable ASCII.
+fn escape_len(rest: &[u8]) -> Option<usize> {
+    match rest {
+        [b'\\', b'x', h, l, ..] if h.is_ascii_hexdigit() && l.is_ascii_hexdigit() => Some(4),
+        [b'\\', b'u', b'{', digits @ ..] => {
+            let n = digits.iter().take_while(|b| b.is_ascii_hexdigit()).count();
+            ((1..=6).contains(&n) && digits.get(n) == Some(&b'}')).then_some(n + 4)
+        }
+        _ => None,
+    }
+}
+
+/// Length of what closes one string of escapes and opens the next, so that
+/// the strings count as one run: a Rust string continuation (`\` and a line
+/// break, then indentation), adjacent literals (`"\x4d" "\x5a"`, which C and
+/// HLSL concatenate), or literals separated by commas (`concat!("\x4d",
+/// "\x5a")`, `[b"\x4d", b"\x5a"]`). Without it, a string of escapes wrapped
+/// every hundred escapes passed whatever its length. Zero if `rest` starts
+/// with anything else, or with whitespace alone: inside one string that is
+/// text, as in `"\x1b[0m \x1b[1m"`.
+fn string_join_len(rest: &[u8]) -> usize {
+    let (mut i, mut boundary) = (0, false);
+    loop {
+        let len = match &rest[i..] {
+            [b'\\', b'\r', b'\n', ..] => 3,
+            [b'\\', b'\n', ..] => 2,
+            [b'b', b'"', ..] => 2,
+            [b'"', ..] => 1,
+            [b, ..] if b.is_ascii_whitespace() || *b == b',' => {
+                i += 1;
+                continue;
+            }
+            _ => return if boundary { i } else { 0 },
+        };
+        (i, boundary) = (i + len, true);
+    }
 }
 
 #[cfg(test)]
@@ -2220,6 +2262,73 @@ mod tests {
                 "{blob:.80}"
             );
         }
+    }
+
+    /// The same escapes split into many short strings, each well under the
+    /// limit: a Rust string continuation, C/HLSL adjacent literals,
+    /// `concat!` arguments, an array of byte strings, and `\u{..}` escapes.
+    #[test]
+    fn rejects_escape_strings_split_across_literals() {
+        let bytes: Vec<u8> = (0..MAX_LITERAL_RUN * 2).map(|i| (i * 37) as u8).collect();
+        let rows = |escape: &dyn Fn(u8) -> String, join: &str| -> String {
+            bytes
+                .chunks(64)
+                .map(|row| row.iter().map(|&b| escape(b)).collect::<String>())
+                .collect::<Vec<_>>()
+                .join(join)
+        };
+        let x = |b: u8| format!("\\x{b:02x}");
+        let u = |b: u8| format!("\\u{{{b:x}}}");
+        for blob in [
+            format!("const DATA: &[u8] = b\"{}\";\n", rows(&x, "\\\n    ")),
+            format!("const DATA: &[u8] = b\"{}\";\n", rows(&x, "\\\r\n\t")),
+            format!("const char data[] =\n    \"{}\";\n", rows(&x, "\"\n    \"")),
+            format!("const DATA: &str = concat!(\"{}\");\n", rows(&x, "\", \"")),
+            format!(
+                "const DATA: &[&[u8]] = &[\n    b\"{}\",\n];\n",
+                rows(&x, "\",\n    b\"")
+            ),
+            format!("const DATA: &str = \"{}\";\n", rows(&u, "\\\n    ")),
+        ] {
+            assert_eq!(
+                super::longest_literal_run(blob.as_bytes()),
+                bytes.len(),
+                "{blob:.80}"
+            );
+            assert!(
+                check("src/data.rs", blob.as_bytes())
+                    .iter()
+                    .any(|p| p.contains("byte-escape string")),
+                "{blob:.80}"
+            );
+        }
+    }
+
+    /// Strings of escapes join only when nothing but a string boundary lies
+    /// between them.
+    #[test]
+    fn escape_runs_join_only_across_string_boundaries() {
+        let run = super::longest_literal_run;
+        assert_eq!(
+            run(br#""\x1b[0m" "\x1b[1m""#),
+            1,
+            "text between escapes ends a run"
+        );
+        assert_eq!(run(br#"f("\x00", 1, "\x01")"#), 1, "an argument ends a run");
+        assert_eq!(run(br#""\x00\x01", // two"#), 2);
+        assert_eq!(run(br#""\x00\x01", "\x02""#), 3);
+        assert_eq!(run(b"\"\\x00\\\n   \\x01\""), 2);
+        assert_eq!(
+            run(br"\x00, \x01"),
+            1,
+            "a comma alone is text inside one string"
+        );
+        assert_eq!(
+            run(br#""\u{1F600}\u{1}\u{}\u{1234567}""#),
+            2,
+            "one to six digits"
+        );
+        assert_eq!(run(br#""caf\u{e9}", "na\u{ef}ve""#), 1);
     }
 
     /// Tables split into rows, numbers inside identifiers, prose and the odd
