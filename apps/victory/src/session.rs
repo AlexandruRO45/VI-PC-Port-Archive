@@ -39,8 +39,9 @@ use anyhow::Result;
 /// trusted together.
 const NAME: &str = "VIctory-title-session-2";
 
-/// Set by the process that took the session; inherited by every child it
-/// starts, which then hold the inherited object instead of taking it again.
+/// Set by the process that took the session, so a child it starts knows a
+/// parent already holds it: the child opens the name to prove the object
+/// exists instead of taking it again, and holds nothing itself.
 pub(crate) const INHERITED: &str = "VICTORY_SESSION_INHERITED";
 
 /// A session held for as long as this value lives: dropping it releases the
@@ -176,7 +177,11 @@ mod imp {
     pub(super) fn inherited(name: &str) -> anyhow::Result<Session> {
         let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
         // SAFETY: a null-terminated name; the object is opened only to prove
-        // it exists, and the inherited handle is what holds it.
+        // it exists, and the handle is not kept. What holds the object is the
+        // parent's own handle, and the handle is not inheritable, so a child
+        // that outlives its parent holds nothing: the name frees when the
+        // parent exits, which is the tradeoff taken to escape the corpse
+        // handle — a child never keeps a session name taken.
         let handle = unsafe { OpenMutexW(MUTEX_MODIFY_STATE, 0, wide.as_ptr()) };
         if handle.is_null() {
             anyhow::bail!(unavailable(std::io::Error::last_os_error()));

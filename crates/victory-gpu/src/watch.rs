@@ -65,32 +65,20 @@ const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
-/// Asks the kernel about many ranges `(start, end)` at once, before the
-/// [`writes`] of each: ranges close together are one asking, and `writes`
-/// then answers from the journal until [`ask_ahead_done`]. The world's
-/// submissions refresh thousands of host copies (6,664 askings a frame,
-/// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
-/// left to `writes`.
-pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+/// The runs one asking covers: `ranges` in page order with those closer than
+/// [`AHEAD_GAP`] merged, none longer than [`AHEAD_MAX`]. Merging is for the
+/// kernel call, so the gap it walks is a call's worth of pages; nothing else
+/// is asked about, because a page no refresh reads costs a walk to learn
+/// nothing.
+fn clusters(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         .filter(|r| r.0 < r.1)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
-    if pieces.len() < 2 {
-        return;
-    }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if j.kept {
-        return;
-    }
-    j.asked += 1;
-    j.ahead_asked = j.asked;
-    j.ahead.clear();
+    pieces.dedup();
+    let mut runs = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -103,8 +91,32 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(j, &pieces[i..k]);
+        runs.push((first, last));
         i = k;
+    }
+    runs
+}
+
+/// Asks the kernel about many ranges `(start, end)` at once, before the
+/// [`writes`] of each: ranges close together are one asking, and `writes`
+/// then answers from the journal until [`ask_ahead_done`]. The world's
+/// submissions refresh thousands of host copies (6,664 askings a frame,
+/// 456 ms, in run 14). Ranges that are not write-watched are left to
+/// `writes`, which asks and falls back as it can.
+pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    let runs = clusters(ranges);
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    // The submission's one asking stands ([`ask_once`]): what it does not
+    // hold is left to `writes`.
+    if j.kept || runs.is_empty() {
+        return;
+    }
+    j.asked += 1;
+    j.ahead_asked = j.asked;
+    j.ahead.clear();
+    for (first, last) in runs {
+        ask_span(j, first, last);
     }
 }
 
@@ -177,15 +189,14 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
-        // `ask_ahead` asked nothing (fewer than two ranges).
+        // `ask_ahead` asked nothing: no range was given at all.
         j.asked += 1;
         j.ahead_asked = j.asked;
     }
-    // `ask_ahead` leaves a range that lies alone to `writes`, which asks
-    // once per flush: with one asking for the submission that was every
-    // such range asked again at each of its 70 flushes (run 76: 2,300
-    // askings a frame with the switch on, as without it). They are asked
-    // here, once; what is not write-watched stays with `writes`.
+    // A range `ask_ahead` could not cover (memory that is not write-watched,
+    // or a run the kernel refused) is asked here, alone, rather than left to
+    // `writes` at each of its flushes (run 76: 2,300 askings a frame that
+    // way); what the kernel refuses stays with `writes`.
     for &(start, end) in ranges {
         if start >= end {
             continue;
@@ -223,22 +234,20 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
-/// One kernel asking for `pieces` (page ranges in order); by halves if it
-/// fails, as a run across two reservations or into memory that is not
-/// write-watched does. A piece alone is left to [`writes`].
-fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
-    if pieces.len() < 2 {
-        return;
-    }
-    let first = pieces[0].0;
-    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+/// One kernel asking for the page run `[first, last)`; by halves if it fails,
+/// as a run across two reservations or into memory that is not write-watched
+/// does.
+fn ask_span(j: &mut Journal, first: usize, last: usize) {
     if ask_kernel(j, first, last) {
         j.ahead.push((first, last));
         return;
     }
-    let (a, b) = pieces.split_at(pieces.len() / 2);
-    ask_run(j, a);
-    ask_run(j, b);
+    if last - first < 2 {
+        return;
+    }
+    let mid = (first + last) / 2;
+    ask_span(j, first, mid);
+    ask_span(j, mid, last);
 }
 
 /// Asks the kernel for the written pages of pages `[first, last)` and notes
@@ -719,6 +728,34 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// A submission's refreshed ranges are asked about as they are, not as
+    /// the span between them: two ranges far apart are two runs, so the
+    /// pages in the gap — which no refresh reads — are never walked.
+    #[test]
+    fn distant_ranges_are_two_runs_and_a_close_one_is_merged() {
+        let base = 0x1000_0000;
+        let runs = clusters(&[(base, base + PAGE), (base + (512 << 20), base + (512 << 20) + PAGE)]);
+        assert_eq!(
+            runs,
+            [
+                (base / super::PAGE, base / super::PAGE + 1),
+                ((base + (512 << 20)) / super::PAGE, (base + (512 << 20)) / super::PAGE + 1)
+            ]
+        );
+        // Close enough that one kernel call walks less than a second call
+        // costs: one run, gap included.
+        let near = clusters(&[(base, base + PAGE), (base + (1 << 20), base + (1 << 20) + PAGE)]);
+        assert_eq!(near.len(), 1, "{near:?}");
+        assert_eq!(near[0].0, base / super::PAGE);
+        assert_eq!(near[0].1, (base + (1 << 20) + PAGE).div_ceil(super::PAGE));
+        // The same range twice is one run, so a list that refreshes a page
+        // twice is not asked about twice.
+        assert_eq!(
+            clusters(&[(base, base + PAGE), (base, base + PAGE)]),
+            clusters(&[(base, base + PAGE)])
+        );
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
