@@ -2620,6 +2620,117 @@ mod tests {
     }
 
     #[test]
+    fn only_the_exact_xbch_and_fssm_versions_are_read() {
+        let fssm_blob = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let good = xbch(&fssm_blob);
+        // Each version is its whole dword: a neighbour, a stray high byte, the
+        // other header's version or every bit set is refused.
+        for version in [
+            0,
+            XBCH_VERSION - 1,
+            XBCH_VERSION + 1,
+            XBCH_VERSION | 1 << 8,
+            XBCH_VERSION | 1 << 31,
+            FSSM_VERSION,
+            u32::MAX,
+        ] {
+            let mut blob = good.clone();
+            blob[4..8].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(refused_blob(&blob), "unknown XBCH version", "{version:#x}");
+        }
+        for version in [
+            0,
+            FSSM_VERSION - 1,
+            FSSM_VERSION + 1,
+            FSSM_VERSION & 0xFF,
+            FSSM_VERSION | 1 << 16,
+            XBCH_VERSION,
+            u32::MAX,
+        ] {
+            let mut blob = fssm_blob.clone();
+            blob[4..8].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(
+                refused_blob(&xbch(&blob)),
+                "unknown FSSM version",
+                "{version:#x}"
+            );
+        }
+        assert_eq!(
+            native_programs(&part(&[(KIND_NATIVE, &good)]))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn xbch_and_fssm_headers_breaking_several_rules_are_named_for_the_first_checked() {
+        let fssm_blob = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let good = xbch(&fssm_blob);
+        let xbch_with = |fields: &[(usize, &[u8])]| {
+            let mut blob = good.clone();
+            for &(at, value) in fields {
+                blob[at..at + value.len()].copy_from_slice(value);
+            }
+            refused_blob(&blob)
+        };
+        let bad_version = (XBCH_VERSION + 1).to_le_bytes();
+        let implausible = (MAX_UNPACKED + 1).to_le_bytes();
+        let past_end = u64::MAX.to_le_bytes();
+        // Magic, then version, then the unpacked limit, then the stream's
+        // bounds: each is named while every later rule is broken too.
+        assert_eq!(
+            xbch_with(&[(0, b"XBCX"), (4, &bad_version), (16, &implausible)]),
+            "native blob lacks XBCH magic"
+        );
+        assert_eq!(
+            xbch_with(&[(4, &bad_version), (8, &past_end), (16, &implausible)]),
+            "unknown XBCH version"
+        );
+        // A bad version is named even when the header is cut after it.
+        let mut cut = good[..8].to_vec();
+        cut[4..8].copy_from_slice(&bad_version);
+        assert_eq!(refused_blob(&cut), "unknown XBCH version");
+
+        let fssm_with = |fields: &[(usize, &[u8])]| {
+            let mut blob = fssm_blob.clone();
+            for &(at, value) in fields {
+                blob[at..at + value.len()].copy_from_slice(value);
+            }
+            refused_blob(&xbch(&blob))
+        };
+        let bad_version = (FSSM_VERSION + 1).to_le_bytes();
+        let wrong_payload = 0u64.to_le_bytes();
+        let wrong_slots = (GRAPHICS_SLOT_COUNT + 1).to_le_bytes();
+        // Magic, then version, then the payload size, then the slot count.
+        assert_eq!(
+            fssm_with(&[
+                (0, b"FSSX"),
+                (4, &bad_version),
+                (8, &wrong_payload),
+                (FSSM_HEADER, &wrong_slots)
+            ]),
+            "native blob lacks FSSM magic"
+        );
+        assert_eq!(
+            fssm_with(&[
+                (4, &bad_version),
+                (8, &wrong_payload),
+                (FSSM_HEADER, &wrong_slots)
+            ]),
+            "unknown FSSM version"
+        );
+        assert_eq!(
+            fssm_with(&[(8, &wrong_payload), (FSSM_HEADER, &wrong_slots)]),
+            "FSSM payload size disagrees"
+        );
+        // A bad FSSM version is named even with nothing after it.
+        let mut cut = fssm_blob[..8].to_vec();
+        cut[4..8].copy_from_slice(&bad_version);
+        assert_eq!(refused_blob(&xbch(&cut)), "unknown FSSM version");
+    }
+
+    #[test]
     fn an_fssm_header_or_slot_table_cut_anywhere_is_truncated() {
         let good = fssm(&[]);
         // `good[..len]` with its stated payload size made to agree, so only
