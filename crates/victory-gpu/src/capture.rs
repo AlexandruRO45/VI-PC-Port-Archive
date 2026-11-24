@@ -250,8 +250,10 @@ fn dump_on() -> bool {
 /// rendered to or wrote (first-use order, the `<i>` of a target dump's file
 /// names) instead of what the title presents; frames with fewer targets show
 /// the title's own picture. `VICTORY_SHOW_TARGET=busiest`: the displayable
-/// target (8-bit, 10-bit or 16-bit float colour, 16:9, at least 1280 wide) the
-/// most draws wrote, which in a world frame is a G-buffer layer. A debugging
+/// target (8-bit, 10-bit or 16-bit float colour, 16:9, at least 1280 wide) bound
+/// most often (render-target binds and UAV uses, not draws), usually a G-buffer layer
+/// in a world frame. Only textures the swap chain copy can take (one mip level,
+/// one array slice) are shown, in either mode. A debugging
 /// view: it shows a buffer as it is (a G-buffer layer unlit, say), not a
 /// finished picture.
 #[derive(Clone, Copy)]
@@ -275,7 +277,8 @@ pub(crate) fn show_index() -> Option<Show> {
     })
 }
 
-/// Draws that wrote each noted target this frame (show mode `busiest`).
+/// Binds (render-target binds and UAV uses) of each noted target this frame
+/// (show mode `busiest`); not draws.
 static HITS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
 
 /// At the present of `frame` in show mode: the noted target to show, if the
@@ -292,20 +295,21 @@ pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTe
                 // SAFETY: a live resource.
                 let d = unsafe { c.texture.GetDesc() };
                 let n = hits.iter().find(|h| h.0 == *r).map_or(0, |h| h.1);
-                format!("{i}: {}x{} f{} ({n} draws)", d.Width, d.Height, d.Format.0)
+                format!("{i}: {}x{} f{} ({n} binds)", d.Width, d.Height, d.Format.0)
             })
             .collect();
         tracing::info!(frame, ?list, "VICTORY_SHOW_TARGET: this frame's targets");
     }
     let pick = match show {
-        Show::Index(n) => targets.get(n).map(|(_, c)| c.clone()),
+        Show::Index(n) => targets.get(n).filter(|(_, c)| presentable(c)).map(|(_, c)| c.clone()),
         Show::Busiest => targets
             .iter()
             .filter(|(_, c)| {
                 // SAFETY: a live resource.
                 let d = unsafe { c.texture.GetDesc() };
-                d.Width >= 1280
-                    // Screen-shaped (16:9): not a shadow map, which more draws write.
+                presentable(c)
+                    && d.Width >= 1280
+                    // Screen-shaped (16:9): not a shadow map, which is bound more often.
                     && d.Width * 9 == u64::from(d.Height) * 16
                     && matches!(d.Format.0, 9..=14 | 23..=25 | 27..=32 | 87 | 90 | 91)
             })
@@ -317,6 +321,14 @@ pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTe
     }
     hits.clear();
     pick
+}
+
+/// Whether the swap chain copy can take `c` (`CopyResource` needs one mip
+/// level and one array slice, like the back buffer's).
+fn presentable(c: &crate::resource::HostTexture) -> bool {
+    // SAFETY: a live resource.
+    let d = unsafe { c.texture.GetDesc() };
+    d.MipLevels == 1 && d.DepthOrArraySize == 1
 }
 
 /// Notes a title texture the frame being built renders to or writes.
