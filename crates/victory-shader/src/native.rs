@@ -545,14 +545,22 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         // while lowering finds what a read is by the table address's SGPR
         // (`used_kind`). A read naming no table parameter with both would be
         // classified from one table and its descriptors bound from another,
-        // or from none.
-        if used.iter().any(|u| {
-            u.root == RootType::Table
-                && !layout.iter().any(|p| {
-                    p.root == RootType::Table && p.slot == u.slot && p.user_data == u.user_data
-                })
-        }) {
+        // or from none. A root descriptor's read is likewise found by its
+        // SGPR (`handle`, which picks CBV or SRV from it) and bound by the
+        // parameter's slot, so it must name that parameter with both too.
+        let named = |u: &UsedResource| {
+            layout
+                .iter()
+                .any(|p| p.root == u.root && p.slot == u.slot && p.user_data == u.user_data)
+        };
+        if used.iter().any(|u| u.root == RootType::Table && !named(u)) {
             return Err(Malformed("used descriptor names no root table"));
+        }
+        if used
+            .iter()
+            .any(|u| u.root == RootType::Descriptor && !named(u))
+        {
+            return Err(Malformed("used descriptor names no root descriptor"));
         }
         // The record is in bounds, so its end is too.
         let stage_data = &payload[(start + RECORD_SIZE) as usize..];
@@ -1130,17 +1138,20 @@ mod tests {
             desc[entry + ENTRY_SIZE as usize + 1] = 1;
             desc[entry + 8..entry + 12].copy_from_slice(&sgprs.to_le_bytes());
             desc[entry + 16] = 104;
+            desc[entry + ENTRY_SIZE as usize + 17] = 104;
             assert_eq!(
                 layout(&desc).unwrap()[0].layout[0].root,
                 RootType::Descriptor
             );
             desc[entry + 16] = 105;
+            desc[entry + ENTRY_SIZE as usize + 17] = 105;
             assert_eq!(
                 refused_blob(&xbch(&desc)),
                 "root parameter outside the SGPRs"
             );
             // Other kinds of parameter still take one SGPR there.
             desc[entry..entry + 4].copy_from_slice(&3u32.to_le_bytes());
+            desc[entry + ENTRY_SIZE as usize + 1] = 3;
             if sgprs <= 1 {
                 assert!(layout(&desc).is_ok());
             }
@@ -1169,6 +1180,32 @@ mod tests {
         let mut desc = constants.clone();
         desc[used + 1] = 0;
         assert!(layout(&desc).is_ok());
+
+        // A root descriptor read must name the root descriptor in its SGPR
+        // and slot: not another SGPR or slot, nor a table or constants there.
+        let mut root = blob.clone();
+        root[entry..entry + 4].copy_from_slice(&1u32.to_le_bytes());
+        root[entry + 8..entry + 12].copy_from_slice(&2u32.to_le_bytes());
+        root[used + 1] = 1;
+        assert!(layout(&root).is_ok());
+        for (at, byte) in [(17, 8u8), (17, 10), (18, 0), (18, 2)] {
+            let mut stray = root.clone();
+            stray[used + at] = byte;
+            assert_eq!(
+                refused_blob(&xbch(&stray)),
+                "used descriptor names no root descriptor",
+                "byte {at} = {byte}"
+            );
+        }
+        for kind in [0u32, 3] {
+            let mut other = root.clone();
+            other[entry..entry + 4].copy_from_slice(&kind.to_le_bytes());
+            assert_eq!(
+                refused_blob(&xbch(&other)),
+                "used descriptor names no root descriptor",
+                "parameter kind {kind}"
+            );
+        }
 
         blob[record + RECORD_COUNTS] = 9;
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_err());
