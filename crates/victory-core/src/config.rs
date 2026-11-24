@@ -161,8 +161,11 @@ impl Config {
             }
             None => (None, FilePaths::default()),
         };
-        let cwd = std::env::current_dir().context("reading the working directory")?;
-        Self::resolve_in(parsed, source, env, Some(&cwd))
+        // Needed only for a value still relative: with every path absolute,
+        // a working directory deleted under the shell (`rm -rf` of the build
+        // folder in another terminal) is no reason to refuse to start.
+        let cwd = std::env::current_dir();
+        Self::resolve_in(parsed, source, env, Some(cwd.as_deref()))
     }
 
     /// [`Config::resolve_in`] with relative paths kept as written.
@@ -183,16 +186,28 @@ impl Config {
     /// `VICTORY_CACHE_DIR=/home/me/victory` with `VICTORY_DATA_DIR=data`
     /// started from `/home/me/victory` puts the saves inside the cache, and
     /// `victory config` would show `data` rather than the folder used. It
-    /// would also move if the working directory later changed.
+    /// would also move if the working directory later changed. A working
+    /// directory that cannot be read (deleted, or a parent made
+    /// unsearchable, after the shell entered it) is an error only for a
+    /// value that is relative, naming that value and its setting.
     fn resolve_in(
         file: FilePaths,
         source: Option<PathBuf>,
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
-        cwd: Option<&Path>,
+        cwd: Option<std::result::Result<&Path, &std::io::Error>>,
     ) -> Result<Self> {
-        let absolute = |p: PathBuf| match cwd {
-            Some(cwd) if p.is_relative() => cwd.join(p),
-            _ => p,
+        let absolute = |setting: &str, p: PathBuf| -> Result<PathBuf> {
+            match cwd {
+                Some(Ok(cwd)) if p.is_relative() => Ok(cwd.join(p)),
+                Some(Err(e)) if p.is_relative() => anyhow::bail!(
+                    "{} (from {setting}) is relative to the working directory, which cannot \
+                     be read ({e}); it may have been deleted or moved since the shell \
+                     entered it: change to a folder that is there, or make {setting} \
+                     absolute",
+                    p.display()
+                ),
+                _ => Ok(p),
+            }
         };
         // A quoted `VICTORY_GAME_DIR="~/games"` reaches us unexpanded.
         let home = home_dir(&env);
@@ -234,13 +249,24 @@ impl Config {
                 None if file.test_titles.is_empty() => (file.test_titles, Origin::Default),
                 None => (file.test_titles, Origin::File),
             };
-        let test_titles: Vec<PathBuf> = test_titles.into_iter().map(absolute).collect();
+        let test_titles: Vec<PathBuf> = test_titles
+            .into_iter()
+            .map(|p| absolute(&setting_of(test_titles_origin, "test_titles"), p))
+            .collect::<Result<_>>()?;
         let (game_dir, game_origin) = pick("VICTORY_GAME_DIR", file.game_dir)?;
-        let game_dir = game_dir.map(absolute);
+        let game_dir = game_dir
+            .map(|p| absolute(&setting_of(game_origin, "game_dir"), p))
+            .transpose()?;
         let (cache_dir, cache_origin) = pick("VICTORY_CACHE_DIR", file.cache_dir)?;
-        let cache_dir = absolute(cache_dir.map_or_else(|| default_dir(Kind::Cache, &env), Ok)?);
+        let cache_dir = absolute(
+            &setting_of(cache_origin, "cache_dir"),
+            cache_dir.map_or_else(|| default_dir(Kind::Cache, &env), Ok)?,
+        )?;
         let (data_dir, data_origin) = pick("VICTORY_DATA_DIR", file.data_dir)?;
-        let data_dir = absolute(data_dir.map_or_else(|| default_dir(Kind::Data, &env), Ok)?);
+        let data_dir = absolute(
+            &setting_of(data_origin, "data_dir"),
+            data_dir.map_or_else(|| default_dir(Kind::Data, &env), Ok)?,
+        )?;
         let origins = Origins {
             game_dir: game_origin,
             cache_dir: cache_origin,
@@ -344,6 +370,15 @@ impl Config {
     /// Returns `<data>/<sub>`, creating it, after checking the asset policy.
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
+    }
+}
+
+/// The setting a value of `origin` is written in, for errors: the variable,
+/// or `[paths].<key>` of the config file (a default is never relative).
+fn setting_of(origin: Origin, key: &str) -> String {
+    match origin {
+        Origin::Env(name) => name.to_owned(),
+        Origin::File | Origin::Default => format!("[paths].{key}"),
     }
 }
 
@@ -2192,7 +2227,7 @@ mod tests {
             "HOME" => Some(abs("home")),
             _ => None,
         };
-        let cfg = Config::resolve_in(paths, Some(config.clone()), env, Some(&cwd)).unwrap();
+        let cfg = Config::resolve_in(paths, Some(config.clone()), env, Some(Ok(&cwd))).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), cwd.join("conf/./~gta"));
         assert_eq!(cfg.cache_dir, cwd.join("conf/../shared/cache"));
         assert_eq!(cfg.data_dir, home.join("saves"));
@@ -5435,7 +5470,7 @@ mod tests {
             "VICTORY_DATA_DIR" => Some(OsString::from("data")),
             _ => None,
         };
-        let err = Config::resolve_in(FilePaths::default(), None, env, Some(&cwd))
+        let err = Config::resolve_in(FilePaths::default(), None, env, Some(Ok(&cwd)))
             .unwrap_err()
             .to_string();
         assert!(err.contains("inside the cache folder"), "{err}");
@@ -5452,12 +5487,73 @@ mod tests {
             "VICTORY_DATA_DIR" => Some(OsString::from("data")),
             _ => None,
         };
-        let cfg = Config::resolve_in(file, None, env, Some(&cwd)).unwrap();
+        let cfg = Config::resolve_in(file, None, env, Some(Ok(&cwd))).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), cwd.join("game"));
         assert_eq!(cfg.cache_dir, cwd.join("cache"));
         assert_eq!(cfg.data_dir, cwd.join("data"));
         assert_eq!(cfg.test_titles, vec![cwd.join("t")]);
         assert_eq!(cfg.origins.cache_dir, Origin::Env("VICTORY_CACHE_DIR"));
+    }
+
+    #[test]
+    fn a_working_directory_that_cannot_be_read_matters_only_to_relative_values() {
+        // What `current_dir` gives once the folder the shell is in is deleted.
+        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        // Every value absolute: nothing is relative to it, so nothing fails.
+        let env = |k: &str| match k {
+            "VICTORY_GAME_DIR" => Some(abs("game")),
+            "VICTORY_CACHE_DIR" => Some(abs("cache")),
+            "VICTORY_DATA_DIR" => Some(abs("data")),
+            "VICTORY_TEST_TITLES" => Some(abs("t")),
+            _ => None,
+        };
+        let cfg = Config::resolve_in(FilePaths::default(), None, env, Some(Err(&gone))).unwrap();
+        assert_eq!(cfg.data_dir, PathBuf::from(abs("data")));
+        // The defaults are absolute too (relative bases are skipped).
+        let env = |k: &str| (k == "HOME").then(|| abs("home"));
+        assert!(Config::resolve_in(FilePaths::default(), None, env, Some(Err(&gone))).is_ok());
+
+        // A relative value names itself, its setting and what to do, for a
+        // variable and for each `[paths]` key of the file.
+        let refused = |file: FilePaths, var: Option<(&'static str, &'static str)>| {
+            let env = move |k: &str| match (k, var) {
+                ("HOME", _) => Some(abs("home")),
+                (k, Some((name, value))) if k == name => Some(OsString::from(value)),
+                _ => None,
+            };
+            Config::resolve_in(file, None, env, Some(Err(&gone)))
+                .unwrap_err()
+                .to_string()
+        };
+        for (var, value) in [
+            ("VICTORY_GAME_DIR", "game"),
+            ("VICTORY_CACHE_DIR", "cache"),
+            ("VICTORY_DATA_DIR", "data"),
+            ("VICTORY_TEST_TITLES", "t"),
+        ] {
+            let err = refused(FilePaths::default(), Some((var, value)));
+            assert!(
+                err.contains(&format!(
+                    "{value} (from {var}) is relative to the working directory"
+                )),
+                "{err}"
+            );
+            assert!(err.contains("cannot be read"), "{err}");
+            assert!(err.contains(&format!("make {var} absolute")), "{err}");
+        }
+        let one = |set: fn(&mut FilePaths)| {
+            let mut file = FilePaths::default();
+            set(&mut file);
+            refused(file, None)
+        };
+        for (err, key) in [
+            (one(|f| f.game_dir = Some("g".into())), "game_dir"),
+            (one(|f| f.cache_dir = Some("c".into())), "cache_dir"),
+            (one(|f| f.data_dir = Some("d".into())), "data_dir"),
+            (one(|f| f.test_titles = vec!["t".into()]), "test_titles"),
+        ] {
+            assert!(err.contains(&format!("(from [paths].{key})")), "{err}");
+        }
     }
 
     #[test]
