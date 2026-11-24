@@ -688,3 +688,102 @@ fn damaged_images_return_a_result_without_panicking() {
         }
     }
 }
+
+#[test]
+fn relocations_in_their_own_section_are_read_through_the_section_table() {
+    // Linkers put base relocations in a `.reloc` section of their own, at a
+    // file offset that is not the `.data` section's. A stale copy of the old
+    // block stays in `.data`: the directory no longer points there, so it is
+    // left alone. The first `.reloc` block covers another page, with a DIR64
+    // entry whose page offset equals the callbacks pointer's: its target is
+    // a different RVA, so it is not the pointer's relocation.
+    const RELOC_RVA: u32 = 0x2000;
+    const RELOC_FILE: usize = SECTION_FILE + SECTION_SIZE;
+    const RELOC_SIZE: usize = 0x200;
+    let offset = (callbacks_field() - SECTION_RVA) as u16;
+    let mut original = image();
+    original.resize(RELOC_FILE + RELOC_SIZE, 0);
+    put16(&mut original, FILE_HEADER + 2, 2); // sections
+    put32(&mut original, OPT + 56, RELOC_RVA + 0x1000); // size of image
+    let sec = SECTIONS + 40;
+    put(&mut original, sec, b".reloc\0\0");
+    put32(&mut original, sec + 8, RELOC_SIZE as u32);
+    put32(&mut original, sec + 12, RELOC_RVA);
+    put32(&mut original, sec + 16, RELOC_SIZE as u32);
+    put32(&mut original, sec + 20, RELOC_FILE as u32);
+    put32(&mut original, sec + 36, 0x4200_0040); // data, discardable, read
+
+    let other = RELOC_FILE;
+    put32(&mut original, other, RELOC_RVA);
+    put32(&mut original, other + 4, 12);
+    put16(&mut original, other + 8, (10 << 12) | offset);
+    put16(&mut original, other + 10, 0); // ABSOLUTE padding
+    let ours = other + 12;
+    let block = original[file(RELOCS)..file(RELOCS) + 16].to_vec();
+    put(&mut original, ours, &block);
+    set_dir(&mut original, dir::BASERELOC, RELOC_RVA, 12 + 16);
+
+    let info = ImageInfo::parse(&original).unwrap();
+    assert_eq!(info.sections.len(), 2);
+    assert_eq!(info.rva_to_file_offset(RELOC_RVA), Some(RELOC_FILE as u32));
+
+    let prepared = prepare(&original).unwrap();
+    assert_eq!(
+        layout::read_u64(&prepared.bytes, file(callbacks_field())),
+        Some(0)
+    );
+    // Only the entry in the block for the callbacks pointer's page changes.
+    assert_eq!(&prepared.bytes[ours + 8 + 2..][..2], &[0, 0]);
+    assert_eq!(
+        &prepared.bytes[other..other + 12],
+        &original[other..other + 12],
+        "same page offset, different page"
+    );
+    let ours_rest = [ours..ours + 10, ours + 12..ours + 16];
+    for range in ours_rest {
+        assert_eq!(&prepared.bytes[range.clone()], &original[range]);
+    }
+    assert_eq!(
+        &prepared.bytes[file(RELOCS)..file(RELOCS) + 16],
+        &original[file(RELOCS)..file(RELOCS) + 16],
+        "the stale block in `.data` is not a relocation table any more"
+    );
+
+    let delta = 0x3_0000_0000;
+    let mut mapped = prepared.bytes;
+    rebase(&mut mapped, delta);
+    assert_eq!(layout::read_u64(&mapped, file(callbacks_field())), Some(0));
+    assert_eq!(
+        layout::read_u64(&mapped, file(TLS) + 16),
+        Some(IMAGE_BASE + u64::from(TLS_INDEX) + delta)
+    );
+    assert_eq!(
+        layout::read_u64(&mapped, file(CALLBACKS)),
+        Some(IMAGE_BASE + u64::from(CODE) + delta)
+    );
+}
+
+#[test]
+fn an_import_directory_without_an_rva_is_left_as_it_is() {
+    // A size with no RVA is no import table. There is no terminator to point
+    // at, so the slot is kept rather than aimed at the headers.
+    let mut original = image();
+    set_dir(&mut original, dir::IMPORT, 0, 40);
+    set_dir(&mut original, dir::IAT, 0, 0);
+    let prepared = prepare(&original).unwrap();
+    assert!(prepared.info.imports.is_empty());
+    let import = dir_offset(dir::IMPORT);
+    assert_eq!(
+        &prepared.bytes[import..import + 8],
+        &original[import..import + 8]
+    );
+    // The rest of the patch still happened.
+    let patched = ImageInfo::parse(&prepared.bytes).unwrap();
+    assert!(patched.is_dll());
+    assert_eq!(patched.entry_rva, 0);
+    assert_eq!(patched.tls.as_ref().unwrap().callbacks_va, 0);
+    assert_eq!(
+        &prepared.bytes[dir_offset(dir::BOUND_IMPORT)..][..8],
+        &[0; 8]
+    );
+}
