@@ -1153,6 +1153,74 @@ mod tests {
         assert_eq!(c.next, None);
     }
 
+    /// Random packets walked frame by frame and decoded, and random bits
+    /// decoded directly, give frames or errors, never a panic or a loop
+    /// that does not end; every decode still appends a whole frame.
+    #[test]
+    fn noise_never_panics() {
+        let mut seed = 0xd1b5_4a32_d192_ed03u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..200 {
+            let mut data: Vec<u8> = (0..PACKET_BYTES * (1 + round % 4))
+                .map(|_| next() as u8)
+                .collect();
+            // Half the rounds have plausible headers: a few frames, the
+            // first near the start, no skip, so walks get past packet 0.
+            if round % 2 == 0 {
+                for p in 0..data.len() / PACKET_BYTES {
+                    let first = (next() % 64) as u32;
+                    let header = (1 + next() as u32 % 4) << 26 | first << 11;
+                    data[p * PACKET_BYTES..][..4].copy_from_slice(&header.to_be_bytes());
+                    // A frame length that fits the payload.
+                    let start = HEADER_BITS + first as usize;
+                    let len = 16 + next() as u32 % 4000;
+                    for i in 0..LENGTH_BITS as usize {
+                        let bit = (len >> (LENGTH_BITS as usize - 1 - i)) & 1;
+                        let at = p * PACKET_BITS + start + i;
+                        data[at / 8] =
+                            (data[at / 8] & !(1 << (7 - at % 8))) | ((bit as u8) << (7 - at % 8));
+                    }
+                }
+            }
+            let mut decoder = Decoder::new(
+                1 + round % 2,
+                [24_000, 32_000, 44_100, 48_000][round % 4] as u32,
+            );
+            let mut out = Vec::new();
+            let mut walked = 0;
+            for p in 0..data.len() / PACKET_BYTES {
+                let Some(header) = packet(&data, p) else {
+                    continue;
+                };
+                let mut at = Some(p * PACKET_BITS + HEADER_BITS + header.first_frame_bit as usize);
+                while let Some(start) = at {
+                    let Some(frame) = read_frame(&data, start) else {
+                        break;
+                    };
+                    let before = out.len();
+                    let _ = decoder.decode(&frame.data, frame.bits, &mut out);
+                    assert_eq!(out.len() - before, FRAME_SAMPLES * decoder.channels());
+                    walked += 1;
+                    assert!(walked < 10_000, "the frame walk does not end");
+                    at = frame.next.filter(|&n| n > start);
+                }
+            }
+            for _ in 0..4 {
+                let raw: Vec<u8> = (0..next() % 600).map(|_| next() as u8).collect();
+                let bits = (next() as usize) % (raw.len() * 8 + 64);
+                let before = out.len();
+                let _ = decoder.decode(&raw, bits, &mut out);
+                assert_eq!(out.len() - before, FRAME_SAMPLES * decoder.channels());
+            }
+            decoder.flush(&mut out);
+        }
+    }
+
     /// Walks and decodes saved input buffers (`VICTORY_XMA_STREAMS=<dir>` of
     /// `*.xma` files with their `*.ctx` context words, made outside the
     /// repository): the frames walked from the first packet must be the

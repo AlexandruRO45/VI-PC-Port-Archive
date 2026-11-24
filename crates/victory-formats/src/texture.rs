@@ -1109,4 +1109,104 @@ mod tests {
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
     }
+
+    /// Random descriptions, coordinates and copy pitches give layouts or
+    /// errors, never a panic or an overflow; every layout and copy stays
+    /// inside the buffers it is given.
+    #[test]
+    fn noise_never_panics() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let dimensions = [Dimension::Tex1d, Dimension::Tex2d, Dimension::Tex3d];
+        for _ in 0..3000 {
+            // Mostly small sizes so copies are cheap, sometimes anything.
+            let mut extent = |small: u64| match next() % 8 {
+                0 => next() as u32,
+                1 => MAX_EXTENT + (next() % 3) as u32 - 1,
+                _ => (next() % small) as u32,
+            };
+            let (width, height, depth) = (extent(300), extent(300), extent(9));
+            let dimension = dimensions[(next() % 3) as usize];
+            // Each field is usually one the hardware takes, sometimes not.
+            let mut pick = |good: &[u32], any: u64| {
+                let r = next();
+                if r % 8 == 0 {
+                    (r >> 8) as u32 % any as u32
+                } else {
+                    good[(r >> 8) as usize % good.len()]
+                }
+            };
+            let modes = [0, 1, 2, 5, 6, 9, 10, 17, 18, 21, 22, 23, 24, 25, 26, 27];
+            let d = Desc {
+                dimension,
+                width,
+                height,
+                depth,
+                mips: pick(&[1, 1, 2, 3, 5, 9], 18),
+                element_bytes: pick(&[1, 2, 4, 8, 16], 33),
+                block: pick(&[1, 1, 4], 6),
+                samples: pick(&[1, 1, 1, 2, 4, 8], 17),
+                swizzle: Swizzle(pick(&modes, 34)),
+            };
+            let Ok(l) = Layout::new(&d) else { continue };
+            assert!(l.alignment.is_power_of_two(), "{d:?}");
+            if l.size > 1 << 22 {
+                continue;
+            }
+            let mut tiled = vec![0u8; l.size as usize];
+            for _ in 0..8 {
+                let mip = (next() % (u64::from(d.mips) + 2)) as u32;
+                // Mostly inside the mip, sometimes just past it.
+                let mut coordinate = |n: u32| {
+                    (next() % u64::from((n >> mip).div_ceil(d.block.max(1)).clamp(1, 512) + 1))
+                        as u32
+                };
+                let (x, y, z) = (
+                    coordinate(d.width),
+                    coordinate(d.height),
+                    coordinate(d.depth << mip),
+                );
+                if let Ok(offset) = l.offset(mip, x, y, z) {
+                    assert!(
+                        offset + u64::from(d.element_bytes) <= l.size,
+                        "{d:?} {mip} {x} {y} {z}"
+                    );
+                }
+                let slice = (next() % 10) as u32;
+                let row_pitch = match next() % 4 {
+                    0 => next() as usize,
+                    _ => (next() % 5000) as usize,
+                };
+                let depth_pitch = match next() % 4 {
+                    0 => next() as usize,
+                    _ => (next() % 200_000) as usize,
+                };
+                let mut linear = vec![0u8; (next() % 300_000) as usize];
+                let _ = l.detile(&tiled, mip, slice, &mut linear, row_pitch, depth_pitch);
+                let _ = l.tile(&mut tiled, mip, slice, &linear, row_pitch, depth_pitch);
+            }
+        }
+        for _ in 0..3000 {
+            let desc = TextureDesc {
+                dimension: dimensions[(next() % 3) as usize],
+                width: (next() % 5000) as u32,
+                height: (next() % 5000) as u32,
+                depth_or_array: (next() % 70) as u32,
+                mips: (next() % 18) as u32,
+                format: (next() % 200) as u32,
+                samples: [0, 1, 1, 1, 4, 3][(next() % 6) as usize],
+                swizzle: Swizzle([0, 5, 9, 22, 24, 26, 27, 30][(next() % 8) as usize]),
+            };
+            if let Ok(t) = Texture::new(&desc) {
+                let last = t.planes.last().unwrap();
+                assert_eq!(t.size, last.offset + last.layout.size);
+                assert!(t.planes.iter().all(|p| p.offset % p.layout.alignment == 0));
+            }
+        }
+    }
 }
