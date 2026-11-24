@@ -331,7 +331,8 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(translation_key(&container)) {
+    let key = translation_key(&container);
+    if !lock(seen).insert(key) {
         t.duplicates += 1;
         return;
     }
@@ -345,7 +346,11 @@ fn translate(
             Ok(program) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
-                let res = match resource::track(&program, &p.layout, p.stage) {
+                // Per-lane descriptors are traced on the per-lane form; its
+                // failure is listed after the resources' and I/O's.
+                let structured = structure::structure(&program);
+                let lanes = structured.as_ref().ok();
+                let res = match resource::track(&program, &p.layout, p.stage, lanes) {
                     Ok(r) => {
                         tally_resources(&p, &r, t);
                         Some(r)
@@ -380,7 +385,7 @@ fn translate(
                         Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
                     }
                 }
-                let structured = match structure::structure(&program) {
+                let structured = match structured {
                     Ok(s) => {
                         tally_structured(&program, &s, t);
                         Some(s)
@@ -423,8 +428,8 @@ fn translate(
 }
 
 fn translation_key(container: &Container<'_>) -> blake3::Hash {
-    // The emitter reads signatures and pipeline metadata alongside DXIL.
-    // Hash the parts rather than the source slice, which can extend past DXBC.
+    // Emission reads signatures and pipeline metadata alongside the DXIL.
+    // Parsed parts exclude bytes after a container embedded in another file.
     let mut hash = blake3::Hasher::new();
     for part in &container.parts {
         hash.update(&part.fourcc.0);
@@ -571,7 +576,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
     let mut traced = HashSet::new();
     for leaf in r.descriptors.iter().flat_map(|d| d.source.leaves()) {
         let a = match *leaf {
-            resource::Source::Loaded { load, .. } => {
+            resource::Source::Loaded { load, .. } | resource::Source::Fetched { load, .. } => {
                 t.loaded += 1;
                 address(load)
             }
@@ -584,7 +589,12 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.constant += 1;
                 None
             }
-            resource::Source::Phi { .. } => unreachable!("leaves are no phis"),
+            resource::Source::Phi { .. }
+            | resource::Source::Select { .. }
+            | resource::Source::Lanes { .. }
+            | resource::Source::LanePhi { .. } => {
+                unreachable!("leaves are no phis, selects or per-lane choices")
+            }
         };
         // Heaps hold dynamic resources, which no used entry lists; code
         // tables are no root parameter.
@@ -688,39 +698,63 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use victory_shader::Part;
 
     #[test]
-    fn pipeline_pair_selects_the_requested_shader_stage() {
+    fn pipeline_pair_selects_each_shader_by_stage() {
         let ps = host::stub_ps();
         let vs = host::stub_vs(&ps).unwrap();
-        let shaders = [("test Ps".into(), ps), ("test Vs".into(), vs)];
-        let graphics = find_shader(&shaders, "test", &[HwStage::Vs, HwStage::Ms]);
-        let pixel = find_shader(&shaders, "test", &[HwStage::Ps]);
+        let shaders = [("shared Ps".to_owned(), ps), ("shared Vs".to_owned(), vs)];
+
+        let graphics = find_shader(&shaders, "shared", &[HwStage::Vs, HwStage::Ms]);
+        let pixel = find_shader(&shaders, "shared", &[HwStage::Ps]);
         assert_eq!(graphics.map(|shader| shader.stage), Some(HwStage::Vs));
         assert_eq!(pixel.map(|shader| shader.stage), Some(HwStage::Ps));
+        assert!(find_shader(&shaders, "Vs", &[HwStage::Ps]).is_none());
+    }
+
+    fn shader_with_signature(signature: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; 40]; // Header and two part offsets.
+        bytes[..4].copy_from_slice(b"DXBC");
+        bytes[20..22].copy_from_slice(&1u16.to_le_bytes());
+        bytes[28..32].copy_from_slice(&2u32.to_le_bytes());
+        let parts = [(b"DXIL", b"synthetic program".as_slice()), (b"ISG1", signature)];
+        for (index, (tag, part)) in parts.into_iter().enumerate() {
+            let offset = bytes.len() as u32;
+            let table = 32 + index * 4;
+            bytes[table..table + 4].copy_from_slice(&offset.to_le_bytes());
+            bytes.extend_from_slice(tag);
+            bytes.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(part);
+        }
+        let size = bytes.len() as u32;
+        bytes[24..28].copy_from_slice(&size.to_le_bytes());
+        bytes
     }
 
     #[test]
-    fn translation_key_includes_shader_signatures() {
-        let container = |signature: &'static [u8], offset| Container {
-            digest: [0; 16],
-            version: (1, 0),
-            parts: vec![
-                Part {
-                    fourcc: FourCC::DXIL,
-                    offset: 40,
-                    data: b"identical program",
-                },
-                Part {
-                    fourcc: FourCC::ISG1,
-                    offset,
-                    data: signature,
-                },
-            ],
+    fn translates_distinct_signatures_and_skips_duplicate_parts() {
+        let first = shader_with_signature(b"first signature");
+        let second = shader_with_signature(b"second signature");
+        let mut embedded = first.clone();
+        embedded.extend_from_slice(b"unrelated bytes after the container");
+        let seen = Mutex::new(HashSet::new());
+        let mut tally = Tally::default();
+        let mut checks = Checks {
+            keep: None,
+            validator: None,
+            host: None,
         };
-        let key = translation_key(&container(b"signature a", 80));
-        assert_ne!(key, translation_key(&container(b"signature b", 80)));
-        assert_eq!(key, translation_key(&container(b"signature a", 128)));
+        for data in [&first, &second, &embedded] {
+            translate(
+                &Source::Raw { offset: 0, data },
+                Path::new("synthetic"),
+                &seen,
+                &mut tally,
+                &mut checks,
+            );
+        }
+
+        assert_eq!(tally.containers, 3);
+        assert_eq!(tally.duplicates, 1);
     }
 }

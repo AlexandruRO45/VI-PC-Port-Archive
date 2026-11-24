@@ -60,10 +60,10 @@ impl Cache {
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
-        // Stage in the same directory for atomic publication. A competing
-        // writer's result is already valid for this content-addressed key.
+        // Write to a temporary file on the same filesystem and then publish.
         let mut file = tempfile::NamedTempFile::new_in(dir)?;
         file.write_all(&output)?;
+        // A writer that already published this content-addressed key won.
         match file.persist_noclobber(&path) {
             Ok(_) => Ok(path),
             Err(err) if err.error.kind() == ErrorKind::AlreadyExists && path.is_file() => Ok(path),
@@ -96,21 +96,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn converts_once_then_hits() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cache = Cache::open(tmp.path().join("cache")).unwrap();
-        let conv = Upper {
-            version: 1,
-            runs: AtomicUsize::new(0),
-        };
-        let a = cache.get_or_convert(&conv, b"abc").unwrap();
-        let b = cache.get_or_convert(&conv, b"abc").unwrap();
-        assert_eq!(a, b);
-        assert_eq!(std::fs::read(&a).unwrap(), b"ABC");
-        assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
-    }
-
     fn in_child(test: &str) -> bool {
         const CHILD: &str = "VICTORY_TEST_CACHE_CHILD";
         if std::env::var(CHILD).as_deref() == Ok(test) {
@@ -134,7 +119,7 @@ mod tests {
 
     #[test]
     fn relative_cache_survives_a_working_directory_change() {
-        // The current directory is process-wide, so change it in a child.
+        // Changing the working directory must not affect other tests.
         if !in_child("relative_cache_survives_a_working_directory_change") {
             return;
         }
@@ -144,11 +129,11 @@ mod tests {
         let title_dir = startup_dir.join("title");
         std::fs::create_dir(&title_dir).unwrap();
         std::env::set_current_dir(&title_dir).unwrap();
-        let conv = Upper {
+        let converter = Upper {
             version: 1,
             runs: AtomicUsize::new(0),
         };
-        let path = cache.get_or_convert(&conv, b"abc").unwrap();
+        let path = cache.get_or_convert(&converter, b"abc").unwrap();
         assert!(path.starts_with(startup_dir.join("cache")));
         assert_eq!(std::fs::read(path).unwrap(), b"ABC");
         assert!(!title_dir.join("cache").exists());
@@ -178,6 +163,21 @@ mod tests {
     }
 
     #[test]
+    fn converts_once_then_hits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let a = cache.get_or_convert(&conv, b"abc").unwrap();
+        let b = cache.get_or_convert(&conv, b"abc").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(std::fs::read(&a).unwrap(), b"ABC");
+        assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn keeps_an_entry_published_during_conversion() {
         struct RacingConverter {
             path: PathBuf,
@@ -194,7 +194,7 @@ mod tests {
             }
 
             fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
-                // A second writer finishes after our cache miss.
+                // Simulate another writer finishing after our cache miss.
                 let entry = std::fs::File::create(&self.path)?;
                 let output = input.to_ascii_uppercase();
                 (&entry).write_all(&output)?;

@@ -276,7 +276,11 @@ impl Layout {
             && (!d.swizzle.z_order() || (d.block == 1 && d.element_bytes <= 8))
             && d.samples.is_power_of_two()
             && d.samples <= 8
-            && (d.samples == 1 || (d.dimension == Dimension::Tex2d && d.mips == 1))
+            && (d.samples == 1
+                || (d.dimension == Dimension::Tex2d
+                    && d.mips == 1
+                    && !d.swizzle.standard()
+                    && !d.swizzle.display()))
             // GFX10 permits linear, Z and render swizzles for 1D resources.
             && (d.dimension != Dimension::Tex1d
                 || (d.height == 1 && !d.swizzle.standard() && !d.swizzle.display()))
@@ -877,6 +881,24 @@ mod tests {
         for swizzle in [Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
             d.swizzle = swizzle;
             assert_eq!(Layout::new(&d), Err(Error::Invalid), "{swizzle:?}");
+        }
+    }
+
+    #[test]
+    fn multisampling_requires_a_compatible_tiled_swizzle() {
+        for samples in [2, 4, 8] {
+            let d = Desc {
+                samples,
+                ..desc(128, 128, 1, 4, Swizzle::SW_64KB_R_X)
+            };
+            let layout = Layout::new(&d).unwrap();
+            let single_sampled = Layout::new(&Desc { samples: 1, ..d }).unwrap();
+            assert_eq!(layout.size, single_sampled.size * u64::from(samples));
+            for swizzle in [Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
+                let d = Desc { swizzle, ..d };
+                assert!(Layout::new(&Desc { samples: 1, ..d }).is_ok());
+                assert_eq!(Layout::new(&d), Err(Error::Invalid), "{samples}x {swizzle:?}");
+            }
         }
     }
 
