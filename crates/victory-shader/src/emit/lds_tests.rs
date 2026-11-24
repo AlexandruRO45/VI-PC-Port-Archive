@@ -290,31 +290,39 @@ const DWORD0: u32 = 0x8281_7F01;
 const DWORD1: u32 = 0xFEDC_BA98;
 const OLD: u32 = 0x1234_5678;
 
+/// Three dwords: `DWORD0`, then `DWORD1` twice (the root constants hold
+/// only two).
 fn initial_lds() -> Vec<u8> {
-    [DWORD0, DWORD1]
+    [DWORD0, DWORD1, DWORD1]
         .iter()
         .flat_map(|d| d.to_le_bytes())
         .collect()
 }
 
 /// Byte addresses (before the instruction's offset of 2) for an access of
-/// `name`'s width: every byte of two dwords, or every halfword.
+/// `name`'s width: every byte from 2 to 7, odd and straddling halfwords too.
 fn addresses(name: &str) -> Vec<u32> {
-    let step = if halfword(name) { 2 } else { 1 };
-    (0..6).step_by(step).collect()
+    (0..if halfword(name) { 5 } else { 6 }).collect()
+}
+
+/// Writes the three dwords of `initial_lds` (`v7` = 0), then waits for them.
+fn store_initial_lds(body: &mut Vec<u32>) {
+    body.push(v_mov_b32(7, int(0)));
+    body.extend_from_slice(&ds(DS_WRITE_B32, 0, 7, 1, 0));
+    body.extend_from_slice(&ds(DS_WRITE_B32, 0, 7, 2, 4));
+    body.extend_from_slice(&ds(DS_WRITE_B32, 0, 7, 2, 8));
+    body.push(S_WAITCNT_0);
+    body.push(S_BARRIER);
 }
 
 #[test]
 fn byte_and_halfword_reads() {
     let (_one, hosts) = hosts();
     for &(name, op) in READS {
-        // Two dwords of LDS from v1/v2, then the read at v3 + 2 into v5,
+        // Three dwords of LDS from v1/v2, then the read at v3 + 2 into v5,
         // which holds v4 first (the half a d16 read keeps).
-        let mut body = vec![v_mov_b32(7, int(0))];
-        body.extend_from_slice(&ds(DS_WRITE_B32, 0, 7, 1, 0));
-        body.extend_from_slice(&ds(DS_WRITE_B32, 0, 7, 2, 4));
-        body.push(S_WAITCNT_0);
-        body.push(S_BARRIER);
+        let mut body = vec![];
+        store_initial_lds(&mut body);
         body.push(v_mov_b32(5, vgpr(4)));
         body.extend_from_slice(&ds(op, 5, 3, 0, 2));
         body.push(S_WAITCNT_0);
@@ -339,18 +347,19 @@ fn byte_and_halfword_reads() {
 fn byte_and_halfword_writes() {
     let (_one, hosts) = hosts();
     for &(name, op) in WRITES {
-        // Two dwords of LDS from v1/v2, the write of v4 at v3 + 2 (the same
-        // in every lane), then the dword holding it read back.
-        let mut body = vec![v_mov_b32(7, int(0))];
-        body.extend_from_slice(&ds(DS_WRITE_B32, 0, 7, 1, 0));
-        body.extend_from_slice(&ds(DS_WRITE_B32, 0, 7, 2, 4));
-        body.push(S_WAITCNT_0);
-        body.push(S_BARRIER);
+        // Three dwords of LDS from v1/v2, the write of v4 at v3 + 2 (the
+        // same in every lane), then the dword holding it read back by even
+        // lanes and the next one by odd lanes.
+        let mut body = vec![];
+        store_initial_lds(&mut body);
         body.extend_from_slice(&ds(op, 0, 3, 4, 2));
         body.push(S_WAITCNT_0);
         body.push(S_BARRIER);
         body.push(v_add_nc_u32(9, int(2), 3));
         body.push(v_and_b32(9, int(-4), 9));
+        body.push(v_and_b32(12, int(1), 0));
+        body.push(v_lshlrev_b32(12, int(2), 12));
+        body.push(v_add_nc_u32(9, vgpr(12), 9));
         body.extend_from_slice(&ds(DS_READ_B32, 5, 9, 0, 0));
         body.push(S_WAITCNT_0);
         let shader = build_cs(&body, LANES);
@@ -359,10 +368,10 @@ fn byte_and_halfword_writes() {
                 let at = at as usize + 2;
                 let mut lds = initial_lds();
                 model_write(name, &mut lds, at, OLD);
-                let d = at & !3;
-                let want = u32::from_le_bytes(lds[d..d + 4].try_into().unwrap());
                 let k = [DWORD0, DWORD1, at as u32 - 2, OLD];
                 for (lane, g) in run(label, host, &shader, k, LANES).into_iter().enumerate() {
+                    let d = (at & !3) + 4 * (lane & 1);
+                    let want = u32::from_le_bytes(lds[d..d + 4].try_into().unwrap());
                     assert_eq!(
                         g, want,
                         "{label}: {name} at {at}, lane {lane}: {g:#010x}, want {want:#010x}"

@@ -2121,8 +2121,7 @@ impl<'a> Lower<'a> {
         use super::bitcode::Rmw;
         let c = self.cur;
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-        // shortcut: as for dwords, in bounds; a halfword is taken as
-        // 2-aligned (the bytes never straddle two dwords).
+        // shortcut: as for dwords, in bounds.
         let o = k(self, offset);
         let at = self.s.m.bin(c, Bin::Add, a, o);
         let two = k(self, 2);
@@ -2133,10 +2132,34 @@ impl<'a> Lower<'a> {
         let byte = self.s.m.bin(c, Bin::And, at, three);
         let shift = self.s.m.bin(c, Bin::Shl, byte, three);
         let mask = k(self, (1 << sub.bits) - 1);
+        // A halfword at byte 3 of a dword takes its high byte from byte 0 of
+        // the next, as the hardware reads and writes it (measured on RDNA2):
+        // `next` is that dword then, else the same one again, with nothing
+        // of it read or written.
+        let next = if sub.bits == 16 {
+            let straddle = self.s.m.cmp(c, pred::EQ, byte, three);
+            let one = k(self, 1);
+            let after = self.s.m.bin(c, Bin::Add, index, one);
+            let i = self.s.m.select(c, straddle, after, index);
+            Some((straddle, self.s.m.element(c, lds, i)))
+        } else {
+            None
+        };
+        let zero = k(self, 0);
+        let eight = k(self, 8);
         if !sub.write {
             let reg = dst_reg.ok_or("an LDS read result")?;
             let x = self.s.m.load(c, p);
             let x = self.s.m.bin(c, Bin::LShr, x, shift);
+            let x = match next {
+                None => x,
+                Some((straddle, p2)) => {
+                    let y = self.s.m.load(c, p2);
+                    let y = self.s.m.bin(c, Bin::Shl, y, eight);
+                    let y = self.s.m.select(c, straddle, y, zero);
+                    self.s.m.bin(c, Bin::Or, x, y)
+                }
+            };
             let x = if sub.signed {
                 let up = k(self, 32 - sub.bits);
                 let x = self.s.m.bin(c, Bin::Shl, x, up);
@@ -2178,13 +2201,29 @@ impl<'a> Lower<'a> {
         let bits = self.s.m.bin(c, Bin::Shl, mask, shift);
         let ones = k(self, !0);
         let clear = self.s.m.bin(c, Bin::Xor, bits, ones);
+        // The high byte of a straddling halfword, for the next dword.
+        let high = match next {
+            None => None,
+            Some((straddle, p2)) => {
+                let byte_mask = k(self, 0xFF);
+                let bits2 = self.s.m.select(c, straddle, byte_mask, zero);
+                let clear2 = self.s.m.bin(c, Bin::Xor, bits2, ones);
+                let set2 = self.s.m.bin(c, Bin::LShr, d, eight);
+                let set2 = self.s.m.select(c, straddle, set2, zero);
+                Some((p2, clear2, set2))
+            }
+        };
         // Lanes write other bytes of the same dword at the same time, so
         // the bytes go in atomically: cleared, then set. shortcut: lanes
-        // writing the same bytes at once leave both values or-ed together
-        // where the console keeps one of them.
+        // writing the same bytes at once leave their values or-ed together
+        // where the hardware keeps the highest lane's (measured on RDNA2).
         let at = self.begin_guarded(guard);
         self.s.m.atomic(self.cur, Rmw::And, p, clear);
         self.s.m.atomic(self.cur, Rmw::Or, p, set);
+        if let Some((p2, clear2, set2)) = high {
+            self.s.m.atomic(self.cur, Rmw::And, p2, clear2);
+            self.s.m.atomic(self.cur, Rmw::Or, p2, set2);
+        }
         self.end_guarded(at, &[]);
         Ok(())
     }
