@@ -159,14 +159,14 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     let mut extraction_errors = 0;
     let mut output_ready = false;
     let mut extraction_paths = BTreeSet::new();
-    for r in &recs {
+    for (index, r) in recs.iter().enumerate() {
         let ext = r.name.rsplit_once('.').map(|x| x.1.to_ascii_lowercase()).unwrap_or_else(|| "(no extension)".into());
         let e = by_ext.entry(ext).or_default();
         e.0 += 1;
         e.1 += r.usize;
         let hit = find.as_deref().is_none_or(|f| r.name.contains(f));
         let want = extract.as_deref().is_some_and(|f| r.name.contains(f));
-        if !(hit && shown < top) && !want && by_magic.len() > 64 {
+        if !(hit && shown < top) && !want && index >= 64 {
             continue;
         }
         let Some(blob) = pack::inflate(&data, r) else {
