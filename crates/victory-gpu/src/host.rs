@@ -1434,31 +1434,66 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// Maximum gap between two shadow refresh ranges that are coalesced into one
+/// watch/copy span (64 KiB, matching one watch page).
+const COALESCE_GAP: usize = 64 << 10;
+
+/// Inserts `[from, to)` into sorted disjoint intervals, merging any within [`COALESCE_GAP`].
+fn coalesce_interval(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    let mut merged_from = from;
+    let mut merged_to = to;
+    let mut i = 0;
+    while i < ranges.len() {
+        let (a, b) = ranges[i];
+        if merged_from <= b.saturating_add(COALESCE_GAP)
+            && a <= merged_to.saturating_add(COALESCE_GAP)
+        {
+            merged_from = merged_from.min(a);
+            merged_to = merged_to.max(b);
+            ranges.remove(i);
+        } else if a > merged_to.saturating_add(COALESCE_GAP) {
+            break;
+        } else {
+            i += 1;
+        }
+    }
+    let pos = ranges.partition_point(|&(a, _)| a < merged_from);
+    ranges.insert(pos, (merged_from, merged_to));
+}
+
+/// A submission's refreshes not done yet, merged per buffer copy into sorted
+/// disjoint ranges within [`COALESCE_GAP`]: done before a step that writes
+/// title memory or gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
+type ShadowRefresh = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<ShadowRefresh>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
+        let end = address.saturating_add(len);
+        if address >= end {
+            return;
+        }
         match self
             .refreshes
             .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
+            .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
         {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+            Some((_, ranges)) => coalesce_interval(ranges, address, end),
+            None => self.refreshes.push((shadow.clone(), vec![(address, end)])),
         }
     }
 
@@ -1476,14 +1511,16 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        for (shadow, ranges) in self.refreshes.drain(..) {
+            for (from, to) in ranges {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -2302,5 +2339,22 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(super::reclaim_one_completed_dynamic());
         assert!(list.dynamic.lock().unwrap().is_empty());
         assert!(!super::reclaim_one_completed_dynamic());
+    }
+
+    #[test]
+    fn batch_intervals_keep_disjoint_ranges_and_coalesce_nearby() {
+        let mut ranges = Vec::new();
+        super::coalesce_interval(&mut ranges, 0x1000, 0x2000);
+        // Far away (> 64 KiB): stays separate.
+        super::coalesce_interval(&mut ranges, 0x10_0000, 0x10_2000);
+        assert_eq!(ranges, vec![(0x1000, 0x2000), (0x10_0000, 0x10_2000)]);
+
+        // Within 64 KiB of first range: coalesces with first without swallowing second.
+        super::coalesce_interval(&mut ranges, 0x1_0000, 0x1_1000);
+        assert_eq!(ranges, vec![(0x1000, 0x1_1000), (0x10_0000, 0x10_2000)]);
+
+        // Overlapping both: bridges into one interval.
+        super::coalesce_interval(&mut ranges, 0x1_0000, 0x10_0500);
+        assert_eq!(ranges, vec![(0x1000, 0x10_2000)]);
     }
 }
