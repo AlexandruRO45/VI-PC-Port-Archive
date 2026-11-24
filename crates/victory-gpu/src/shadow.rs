@@ -541,7 +541,9 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len + (1 << 20))?;
+    // Local build: a whole window more past the end: shaders read across a window's end (a GPU
+    // page fault 1.1 MB past one removed the device)
+    let (buffer, data) = host()?.shared_buffer(len + WINDOW)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
