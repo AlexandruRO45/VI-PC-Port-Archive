@@ -4,9 +4,10 @@
 //! Run a game (its executable dragged onto the window, or typed), run the
 //! last one again, check what this PC has for VIctory (Windows 10's shader
 //! model, AVX2, the GPU's shader model, mesh shaders and wave size, the
-//! configured paths), or open the data folder (saves, `crashes.log`). The
-//! window stays open after a run until Enter, so its last lines can be
-//! read.
+//! configured paths), or open the data folder (saves, `crashes.log`). A
+//! game runs in a child `victory run`, so a crash or an exit of the title
+//! leaves the menu up: the window stays open until Enter, with how the run
+//! ended, so its last lines can be read.
 //!
 //! The colours are a sunset gradient of VIctory's own (violet, pink,
 //! peach), nothing of the title's. `NO_COLOR` turns them off, and so does a
@@ -16,8 +17,6 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-
-use crate::{Console, Unimplemented};
 
 /// Whether `victory` was started with no arguments in a console of its own
 /// (a double-click), or `VICTORY_MENU=1` asks for the menu anyway.
@@ -464,7 +463,53 @@ fn menu_text(p: Paint, last: Option<&Path>) -> String {
     out
 }
 
-fn check_text(p: Paint, pc: &Pc, cfg: Option<&victory_core::Config>) -> String {
+/// Hints start this far in, under the line they explain.
+const HINT_INDENT: usize = 5;
+
+/// `text` in lines of at most `width` characters, broken at spaces (a word
+/// longer than that gets a line of its own).
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(20);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let len = line.chars().count();
+        if len > 0 && len + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// The console window's width in columns (80 where it cannot be read).
+#[cfg(windows)]
+fn console_columns() -> usize {
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+    // SAFETY: a plain query of our own output handle into a local structure.
+    unsafe {
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &mut info) == 0 {
+            return 80;
+        }
+        usize::try_from(info.srWindow.Right - info.srWindow.Left + 1).unwrap_or(80)
+    }
+}
+
+#[cfg(not(windows))]
+fn console_columns() -> usize {
+    80
+}
+
+fn check_text(p: Paint, pc: &Pc, cfg: Option<&victory_core::Config>, columns: usize) -> String {
     let mut out = String::new();
     let mut section = |title: &str, lines: Vec<(Status, String, Option<String>)>| {
         out.push_str(&format!("\n  {}\n\n", p.bold(title, SUNSET[2])));
@@ -476,7 +521,11 @@ fn check_text(p: Paint, pc: &Pc, cfg: Option<&victory_core::Config>) -> String {
             };
             out.push_str(&format!("  {mark}  {what}\n"));
             if let Some(h) = hint {
-                out.push_str(&format!("     {}\n", p.rgb(&h, DIM)));
+                // One column spare: a line that fills the window wraps early
+                // in some consoles.
+                for line in wrap(&h, columns.saturating_sub(HINT_INDENT + 1)) {
+                    out.push_str(&format!("{:HINT_INDENT$}{}\n", "", p.rgb(&line, DIM)));
+                }
             }
         }
     };
@@ -501,7 +550,53 @@ fn pause(p: Paint, input: &mut impl BufRead) {
     let _ = read_line(input);
 }
 
-/// Runs `exe` as `victory run <exe> --execute` would, then waits for Enter.
+/// The command that runs `game` the way the menu does: `victory run <game>
+/// --execute` from this same executable, in this console.
+fn run_command(victory: &Path, game: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new(victory);
+    c.arg("run").arg(game).arg("--execute");
+    c
+}
+
+/// How a run ended, for the line after it: the exit code, and in hex where
+/// it reads as an NTSTATUS (a crash such as 0xC0000005).
+fn ended(code: Option<i32>) -> (Status, String) {
+    match code {
+        Some(0) => (Status::Good, "The run ended.".to_owned()),
+        Some(c) if c < 0 => (
+            Status::Bad,
+            format!("The run stopped: exit code {:#010X}.", c as u32),
+        ),
+        Some(c) => (Status::Bad, format!("The run stopped: exit code {c}.")),
+        None => (Status::Bad, "The run was stopped.".to_owned()),
+    }
+}
+
+/// Runs `f` with Ctrl+C and Ctrl+Break left to the child process sharing
+/// the console: the run stops, the menu stays.
+#[cfg(windows)]
+fn sparing_the_menu<T>(f: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
+    };
+    unsafe extern "system" fn handled(ctrl: u32) -> windows_sys::core::BOOL {
+        i32::from(ctrl == CTRL_C_EVENT || ctrl == CTRL_BREAK_EVENT)
+    }
+    // SAFETY: a handler of the expected signature, removed again below.
+    unsafe { SetConsoleCtrlHandler(Some(handled), 1) };
+    let out = f();
+    // SAFETY: as above.
+    unsafe { SetConsoleCtrlHandler(Some(handled), 0) };
+    out
+}
+
+#[cfg(not(windows))]
+fn sparing_the_menu<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+/// Runs `exe` in a child `victory run <exe> --execute`, then waits for
+/// Enter whatever happened to it.
 fn run_game(p: Paint, exe: &Path, data_dir: &Path, input: &mut impl BufRead) {
     if !exe.is_file() {
         println!(
@@ -514,26 +609,42 @@ fn run_game(p: Paint, exe: &Path, data_dir: &Path, input: &mut impl BufRead) {
     }
     save_last(data_dir, exe);
     println!("\n  {} {}\n", p.rgb("\u{25b6}", SUNSET[4]), exe.display());
-    match crate::run::run(exe, Unimplemented::Trap, false, true, Console::SeriesX) {
-        Ok(()) => println!(
-            "\n  {} {}",
-            p.rgb("\u{2713}", GOOD),
-            p.rgb("The run ended.", CREAM)
-        ),
-        Err(e) => println!(
-            "\n  {} {}\n     {}",
+    let status =
+        std::env::current_exe().and_then(|me| sparing_the_menu(|| run_command(&me, exe).status()));
+    let (mark, text) = match status {
+        Ok(s) => {
+            let (status, text) = ended(s.code());
+            let mark = match status {
+                Status::Good => p.rgb("\u{2713}", GOOD),
+                _ => p.rgb("\u{2717}", BAD),
+            };
+            (mark, p.rgb(&text, CREAM))
+        }
+        Err(e) => (
             p.rgb("\u{2717}", BAD),
-            p.rgb("The run stopped:", CREAM),
-            p.rgb(&format!("{e:#}"), DIM)
+            p.rgb(&format!("The run could not start: {e}"), CREAM),
         ),
-    }
+    };
+    println!("\n  {mark} {text}");
     pause(p, input);
 }
+
+/// Names the console window (it shows the executable's path otherwise).
+#[cfg(windows)]
+fn set_title(title: &str) {
+    let wide: Vec<u16> = title.encode_utf16().chain([0]).collect();
+    // SAFETY: a NUL-terminated string that outlives the call.
+    unsafe { windows_sys::Win32::System::Console::SetConsoleTitleW(wide.as_ptr()) };
+}
+
+#[cfg(not(windows))]
+fn set_title(_: &str) {}
 
 pub fn run() -> Result<()> {
     let p = Paint {
         color: enable_color(),
     };
+    set_title("VIctory");
     let data_dir = victory_core::Config::load()
         .map(|c| c.data_dir)
         .unwrap_or_else(|_| std::env::temp_dir().join("victory"));
@@ -569,15 +680,27 @@ pub fn run() -> Result<()> {
                 }
             },
             Choice::Check => {
+                // Making the GPU device can take a moment.
+                print!("\n  {}", p.rgb("Checking this PC...", DIM));
+                let _ = std::io::stdout().flush();
+                let pc = check();
+                println!();
                 let cfg = victory_core::Config::load().ok();
-                print!("{}", check_text(p, &check(), cfg.as_ref()));
+                print!("{}", check_text(p, &pc, cfg.as_ref(), console_columns()));
                 pause(p, &mut input);
             }
             Choice::Data => {
                 let _ = std::fs::create_dir_all(&data_dir);
-                let _ = std::process::Command::new("explorer")
+                let opened = std::process::Command::new("explorer")
                     .arg(&data_dir)
-                    .spawn();
+                    .spawn()
+                    .is_ok();
+                let text = if opened {
+                    format!("Opened {}", data_dir.display())
+                } else {
+                    format!("Could not open {}", data_dir.display())
+                };
+                println!("\n  {}", p.rgb(&text, DIM));
             }
             Choice::Quit => return Ok(()),
             Choice::Unknown if line.trim().is_empty() => {}
@@ -685,6 +808,54 @@ mod tests {
                 .gradient("VI", &SUNSET)
                 .contains("\x1b[38;2;86;98;196mV")
         );
+    }
+
+    #[test]
+    fn hints_wrap_to_the_window_under_their_line() {
+        let hint = "Its built-in D3D12 stops at shader model 6.5. VIctory needs 6.6 from the D3D12 Agility SDK runtime (#84, #175).";
+        let lines = wrap(hint, 40);
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|l| l.chars().count() <= 40), "{lines:?}");
+        assert_eq!(lines.join(" "), hint);
+        // A word longer than the width keeps its own line, unbroken.
+        let long = wrap(
+            r"see C:\a\very\long\path\that\does\not\fit\at\all.exe now",
+            20,
+        );
+        assert_eq!(long[0], "see");
+        assert!(long[1].ends_with("all.exe"));
+        assert_eq!(long[2], "now");
+        // In the check, hint lines stay inside the window, indented.
+        let pc = Pc {
+            windows_build: Some(19045),
+            sm66: Some(false),
+            ..Pc::default()
+        };
+        let text = check_text(Paint { color: false }, &pc, None, 50);
+        for line in text.lines() {
+            assert!(line.chars().count() <= 50, "{line:?}");
+        }
+        let hint_lines: Vec<_> = text.lines().filter(|l| l.starts_with("     ")).collect();
+        assert!(hint_lines.len() > 2, "{text}");
+        assert!(text.contains("\n     Its built-in D3D12"));
+    }
+
+    #[test]
+    fn a_game_runs_in_a_child_and_its_end_is_told() {
+        let c = run_command(
+            Path::new(r"C:\VIctory\victory.exe"),
+            Path::new(r"D:\Games\title.exe"),
+        );
+        assert_eq!(c.get_program(), r"C:\VIctory\victory.exe");
+        let args: Vec<_> = c.get_args().collect();
+        assert_eq!(args, ["run", r"D:\Games\title.exe", "--execute"]);
+        assert_eq!(ended(Some(0)), (Status::Good, "The run ended.".to_owned()));
+        assert_eq!(
+            ended(Some(0xC000_0005_u32 as i32)).1,
+            "The run stopped: exit code 0xC0000005."
+        );
+        assert_eq!(ended(Some(1)).1, "The run stopped: exit code 1.");
+        assert_eq!(ended(None).0, Status::Bad);
     }
 
     #[test]
