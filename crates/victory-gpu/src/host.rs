@@ -339,15 +339,6 @@ pub(crate) fn dred_on() -> bool {
     })
 }
 
-/// Whether each list of a submission runs and is timed on its own, slow
-/// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
-/// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
-#[cfg(feature = "diagnostics")]
-fn timing() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
-}
-
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
