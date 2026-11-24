@@ -5125,6 +5125,14 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
+            // The hold on the title-memory lock lasts for a run of texture
+            // refreshes and no longer: the lock's own contract is that it is
+            // never held across anything that maps title memory, and a hold
+            // reaching the end of the walk would span list execution and
+            // submission for the whole submission.
+            if !matches!(step, Step::Texture(_)) {
+                batch.reading = None;
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -5161,6 +5169,9 @@ impl HostList {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
+                    // A host step may take the title-memory read lock itself (a
+                    // rectangle's vertices are read in place at submission); the
+                    // hold was let go above for that reason.
                     work();
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
@@ -5192,8 +5203,23 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
+                    // The hold lasts for the run of texture refreshes it was
+                    // taken for and nothing else: the lock's own contract is
+                    // that it is not held across anything that maps title
+                    // memory, and a hold kept to the end of the walk would
+                    // span list execution and submission for the whole
+                    // submission.
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if lock_each() {
+                            // The old one-acquisition-a-texture path, kept as
+                            // the control the hoist is measured against
+                            // (`VICTORY_TEXTURE_LOCK_EACH=1`).
+                            batch.reading = None;
+                            staging.refresh();
+                        } else {
+                            let reading = batch.reading();
+                            staging.refresh_holding(reading);
+                        }
                     }
                     continue;
                 }
@@ -5202,6 +5228,14 @@ impl HostList {
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
     }
+}
+
+/// Whether each texture refresh takes the title-memory read lock for itself
+/// (`VICTORY_TEXTURE_LOCK_EACH=1`): the control that measures what holding it
+/// once a submission is worth, with nothing else changed.
+fn lock_each() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LOCK_EACH").is_some_and(|v| v == "1"))
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
@@ -5239,6 +5273,11 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// The title-memory read lock, held across this submission's texture
+    /// refreshes and dropped before any step that might take it itself. One
+    /// acquisition instead of one per texture: a hundred of them waited
+    /// 6,896.6 ms a frame for 48 ms of reading (stability-01, 20:00:37).
+    reading: Option<crate::watch::Reading>,
 }
 
 impl Batch {
@@ -5280,6 +5319,17 @@ impl Batch {
         crate::copystat::range(from, to - from, us, 0);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    }
+
+    /// The title-memory read lock for this submission's textures, taken on
+    /// the first refresh that needs it and kept until a step that could take
+    /// it itself (see the walk below).
+    fn reading(&mut self) -> &crate::watch::Reading {
+        self.reading.get_or_insert_with(|| {
+            crate::texture::REFRESH_HOLDS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::watch::title_memory_reading()
+        })
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -5743,9 +5793,10 @@ impl Meter {
         {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
-            if all >= 1.0 {
+            let holds = crate::texture::REFRESH_HOLDS.swap(0, Ordering::Relaxed) as f64 / frames;
+            if all >= 1.0 || holds > 0.0 {
                 tracing::info!(
-                    "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
+                    "texture refreshes per frame, all threads: {all:.1} ms in {holds:.0} holds of the title-memory lock, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
@@ -6360,6 +6411,16 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // A person's keyboard and an injected `SendInput` both arrive here and
+    // only while this window is foreground; the async key state a real
+    // keyboard updates never sees the injected ones. The input source reads
+    // this set, so both reach the title by the same route.
+    match message {
+        WM_KEYDOWN | WM_SYSKEYDOWN => crate::keys::down(wparam.0 as u8),
+        WM_KEYUP | WM_SYSKEYUP => crate::keys::up(wparam.0 as u8),
+        WM_KILLFOCUS => crate::keys::release_all(),
+        _ => {}
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }

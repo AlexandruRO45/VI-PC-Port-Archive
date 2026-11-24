@@ -407,7 +407,34 @@ impl Hub {
             (pads, source.keys())
         };
         let events = self.state().poll(&self.devices, pads, keys);
+        #[cfg(feature = "diagnostics")]
+        self.log_presses();
         self.deliver(events);
+    }
+
+    /// Every press that began this poll, with the frame it lands in and the
+    /// reading the title will poll: the two facts a capture has to be lined
+    /// up against afterwards.
+    #[cfg(feature = "diagnostics")]
+    fn log_presses(&self) {
+        let started = script::started();
+        if started.is_empty() {
+            return;
+        }
+        let state = self.state();
+        let reading = state.slots[KEYBOARD].history.back().map(|r| r.0.as_ptr());
+        let Some(reading) = reading else {
+            return;
+        };
+        for vk in started {
+            tracing::info!(
+                key = script::name(vk),
+                virtual_key = vk,
+                frame = victory_gpu::frame::current(),
+                reading = ?reading,
+                "input press"
+            );
+        }
     }
 
     /// Runs callbacks, never under our lock: they call back into us. One
@@ -480,6 +507,20 @@ impl State {
         if let Some(value) = value
             && (!was || slot.history.back().is_none_or(|r| r.value != value))
         {
+            // Every keyboard change the title can see, with the frame it lands
+            // in and the reading it will poll: what proves a press from outside
+            // reached the input path, at the layer before the game decides
+            // anything about it.
+            #[cfg(feature = "diagnostics")]
+            if index == KEYBOARD && let Value::Keys(keys) = &value {
+                tracing::debug!(
+                    frame = victory_gpu::frame::current(),
+                    virtual_keys =
+                        ?keys.iter().map(|key| key.virtual_key).collect::<Vec<_>>(),
+                    sequence = slot.sequence + 1,
+                    "input keys"
+                );
+            }
             slot.sequence += 1;
             if slot.history.len() == HISTORY {
                 slot.history.pop_front();
@@ -508,6 +549,64 @@ impl State {
             );
         }
     }
+}
+
+/// Every key any source reports held, in first-seen order.
+///
+/// Three sources write the keyboard: the scripted presses (diagnostics only),
+/// the title window's key messages, and the host's async key state while we are
+/// the foreground window. A key is down if any of them holds it, so a bot can
+/// never release a key a person is holding — the async state is the source a
+/// person's keyboard writes and an injected key cannot reach, so the release a
+/// bot sends takes the key out of the message source and the person's own
+/// keyboard keeps it down in the async one. Nothing here can invent a press:
+/// every source is a real input path.
+pub(crate) fn union<const N: usize>(sources: [Vec<u8>; N]) -> Vec<u8> {
+    let mut keys: Vec<u8> = Vec::new();
+    for source in sources {
+        for vk in source {
+            if !keys.contains(&vk) {
+                keys.push(vk);
+            }
+        }
+    }
+    keys
+}
+
+/// A press from the window's key messages presses the stand-in pad's button,
+/// with no feature in the build and no XInput slot involved: this is the path
+/// a phantom pad (a virtual controller, a wheel, a sleeping pad on a dongle)
+/// used to close. It is a pure function of the sources and the pad table, so
+/// it runs in a release build and needs no card.
+#[test]
+fn a_window_key_press_presses_the_stand_in_pads_a() {
+    let held = union([Vec::new(), vec![0x0D], Vec::new()]);
+    let button = crate::modules::gameinput::FALLBACK_BUTTONS
+        .iter()
+        .find(|(key, _)| held.contains(key))
+        .map(|&(_, button)| button);
+    assert_eq!(
+        button,
+        Some(crate::modules::gameinput::A),
+        "Enter must press the stand-in pad's A"
+    );
+    // And the async source alone is enough, which is a person's own keyboard.
+    let held = union([Vec::new(), Vec::new(), vec![0x0D]]);
+    assert!(held.contains(&0x0D), "{held:?}");
+}
+
+/// A person holds a key and a bot injects the same one; the bot releases it.
+/// The person's hold survives, so a session cannot end with a key the bot
+/// thinks it released still down, and cannot lose a press the person made.
+#[test]
+fn a_bot_release_does_not_lift_a_key_a_person_holds() {
+    let person = vec![0x0D];
+    let window_after_bot_release: Vec<u8> = Vec::new();
+    assert_eq!(union([Vec::new(), window_after_bot_release, person]), vec![0x0D]);
+    // And a key only the bot holds is a press like any other.
+    assert_eq!(union([Vec::new(), vec![0x0D], Vec::new()]), vec![0x0D]);
+    // One key reported by two sources is one key.
+    assert_eq!(union([vec![0x0D], vec![0x0D], vec![0x0D]]), vec![0x0D]);
 }
 
 #[cfg(windows)]
@@ -1068,6 +1167,328 @@ pub(crate) fn module() -> HleModule {
 }
 
 /// Host input: XInput pads, the keyboard while our process has focus.
+/// Debugging aid: presses from the environment, from a schedule file, and
+/// from a file a harness appends to while the title is up.
+///
+/// `VICTORY_KEYS=<second>:<key>,...` and `VICTORY_KEYS_FILE=<path>` are one
+/// schedule fixed before the run; the file takes one `<second> <key>` (or
+/// `<second>:<key>`) per line, so a long schedule is edit-and-rerun rather
+/// than an environment variable with a thousand commas in it. Blank lines and
+/// `#` comments are skipped, and an entry naming a key we do not know is
+/// skipped rather than guessed at.
+///
+/// `VICTORY_INPUT_FILE=<path>` is the closed loop: it is read on every poll
+/// while the title runs, and a line appended at any time is a press as soon
+/// as the next poll sees it. That is the difference between a schedule and a
+/// driver — capture a frame, look at it, append `Enter`. Only a whole line
+/// counts, so a line written in two pieces is delivered by the poll after its
+/// newline, never as half a key name.
+///
+/// A press is held for [`HOLD`] of wall clock from when it started, so a
+/// frame that takes a second cannot swallow it: it stays down across the
+/// polls that frame contains. Presses reach the title the same way the pad's
+/// and the keyboard's do, through [`Source::keys`], which is what keeps a
+/// harness from passing a screen a person could not.
+#[cfg(feature = "diagnostics")]
+mod script {
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// How long a press holds. The fixed schedule has always used two tenths
+    /// of a second, and that is longer than a title frame on any machine that
+    /// presents at all.
+    pub(super) const HOLD: Duration = Duration::from_millis(200);
+
+    /// The virtual key a name stands for: a letter, a digit, or one of the
+    /// named keys the stand-in pad also reads.
+    pub(super) fn key(name: &str) -> Option<u8> {
+        let name = name.trim();
+        match name {
+            "Enter" => Some(0x0D),
+            "Esc" | "Escape" => Some(0x1B),
+            "Tab" => Some(0x09),
+            "Back" | "Backspace" => Some(0x08),
+            "Space" => Some(0x20),
+            "Up" => Some(0x26),
+            "Down" => Some(0x28),
+            "Left" => Some(0x25),
+            "Right" => Some(0x27),
+            one if one.len() == 1 && one.as_bytes()[0].is_ascii_alphanumeric() => {
+                Some(one.as_bytes()[0].to_ascii_uppercase())
+            }
+            _ => None,
+        }
+    }
+
+    /// The name a logged press is written under.
+    pub(super) fn name(vk: u8) -> String {
+        match vk {
+            0x0D => "Enter".to_owned(),
+            0x1B => "Esc".to_owned(),
+            0x09 => "Tab".to_owned(),
+            0x08 => "Back".to_owned(),
+            0x20 => "Space".to_owned(),
+            0x26 => "Up".to_owned(),
+            0x28 => "Down".to_owned(),
+            0x25 => "Left".to_owned(),
+            0x27 => "Right".to_owned(),
+            vk => char::from(vk).to_string(),
+        }
+    }
+
+    /// `<second>:<key>` or `<second> <key>`, one per comma or line.
+    pub(super) fn parse(text: &str) -> Vec<(Duration, u8)> {
+        text.split(['\n', ','])
+            .filter_map(|entry| {
+                let entry = entry.split('#').next().unwrap_or_default().trim();
+                if entry.is_empty() {
+                    return None;
+                }
+                let (at, name) = entry.split_once([':', ' ', '\t'])?;
+                let at = Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?;
+                Some((at, key(name)?))
+            })
+            .collect()
+    }
+
+    /// A live line's key: the name on it, whether or not a second came with
+    /// it. `Enter` and `12 Enter` both press Enter now — the live file is the
+    /// driver, so its second is when the line lands, not when it says.
+    pub(super) fn named(line: &str) -> Option<u8> {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        key(line.split_whitespace().last()?)
+    }
+
+    /// The live input file: whole lines appended since the last read.
+    pub(super) struct Live {
+        path: PathBuf,
+        /// Bytes already taken, so appended text is delivered once.
+        offset: usize,
+        /// Text past the last newline: half a line waits for the rest.
+        partial: String,
+    }
+
+    impl Live {
+        pub(super) fn open(path: impl Into<PathBuf>) -> Live {
+            Live {
+                path: path.into(),
+                offset: 0,
+                partial: String::new(),
+            }
+        }
+
+        pub(super) fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// The keys whose lines arrived since the last call. A file that
+        /// shrank was truncated or replaced, and is read from the start.
+        pub(super) fn read(&mut self) -> Vec<u8> {
+            let text = match std::fs::read_to_string(&self.path) {
+                Ok(text) => text,
+                // Not there yet, or unreadable: no press this poll, and the
+                // next one tries again.
+                Err(_) => return Vec::new(),
+            };
+            if text.len() < self.offset {
+                self.offset = 0;
+                self.partial.clear();
+            }
+            if self.offset < text.len() {
+                self.partial.push_str(&text[self.offset..]);
+                self.offset = text.len();
+            }
+            let mut keys = Vec::new();
+            while let Some(end) = self.partial.find('\n') {
+                let line: String = self.partial.drain(..=end).collect();
+                keys.extend(named(&line));
+            }
+            keys
+        }
+    }
+
+    /// What is down now, and what began since the last poll.
+    pub(super) struct Presses {
+        start: Instant,
+        /// Sorted by second; `next` is the first not yet started.
+        schedule: Vec<(Duration, u8)>,
+        next: usize,
+        live: Option<Live>,
+        /// Key and when its hold ends.
+        held: Vec<(u8, Instant)>,
+        /// Presses that began since the last drain, for the log.
+        started: Vec<u8>,
+    }
+
+    impl Presses {
+        fn from_env() -> Presses {
+            let mut schedule = parse(&std::env::var("VICTORY_KEYS").unwrap_or_default());
+            if let Ok(path) = std::env::var("VICTORY_KEYS_FILE") {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => schedule.extend(parse(&text)),
+                    Err(error) => tracing::warn!(%path, %error, "keys file"),
+                }
+            }
+            let live = std::env::var("VICTORY_INPUT_FILE").ok().inspect(|path| {
+                if Path::new(path).exists() {
+                    tracing::info!(%path, "input file");
+                } else {
+                    tracing::warn!(%path, "input file does not exist yet");
+                }
+            });
+            Presses::at(
+                Instant::now(),
+                schedule,
+                live.map(Live::open),
+            )
+        }
+
+        pub(super) fn at(
+            start: Instant,
+            mut schedule: Vec<(Duration, u8)>,
+            live: Option<Live>,
+        ) -> Presses {
+            schedule.sort_by_key(|&(at, _)| at);
+            Presses {
+                start,
+                schedule,
+                next: 0,
+                live,
+                held: Vec::new(),
+                started: Vec::new(),
+            }
+        }
+
+        /// The keys held down at `now`, starting whatever came due.
+        pub(super) fn down(&mut self, now: Instant) -> Vec<u8> {
+            let elapsed = now.saturating_duration_since(self.start);
+            while self.next < self.schedule.len() && self.schedule[self.next].0 <= elapsed {
+                let (_, vk) = self.schedule[self.next];
+                self.next += 1;
+                self.hold(vk, now);
+            }
+            if let Some(live) = &mut self.live {
+                for vk in live.read() {
+                    self.hold(vk, now);
+                }
+            }
+            self.held.retain(|&(_, until)| now < until);
+            self.held.iter().map(|&(vk, _)| vk).collect()
+        }
+
+        fn hold(&mut self, vk: u8, now: Instant) {
+            self.started.push(vk);
+            self.held.retain(|&(key, _)| key != vk);
+            self.held.push((vk, now + HOLD));
+        }
+
+        /// The presses that began since the last call.
+        fn started(&mut self) -> Vec<u8> {
+            std::mem::take(&mut self.started)
+        }
+    }
+
+    static PRESSES: LazyLock<Mutex<Presses>> =
+        LazyLock::new(|| Mutex::new(Presses::from_env()));
+
+    /// The keys held down now.
+    pub(super) fn down() -> Vec<u8> {
+        match PRESSES.lock() {
+            Ok(mut presses) => presses.down(Instant::now()),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// The presses that began since the last call. Drained by the log rather
+    /// than by [`down`], because the log names the reading the title will
+    /// poll, and that reading is made after the keys are taken.
+    pub(super) fn started() -> Vec<u8> {
+        match PRESSES.lock() {
+            Ok(mut presses) => presses.started(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::io::Write;
+
+        use super::*;
+
+        #[test]
+        fn a_schedule_takes_a_colon_or_a_space_and_skips_what_it_cannot_read() {
+            let schedule = parse("5:Enter\n10 A\r\n\n# a comment\n12:Nope\n15:Z,20:Q");
+            assert_eq!(
+                schedule,
+                vec![
+                    (Duration::from_secs(5), 0x0D),
+                    (Duration::from_secs(10), 0x41),
+                    (Duration::from_secs(15), 0x5A),
+                    (Duration::from_secs(20), 0x51),
+                ]
+            );
+        }
+
+        #[test]
+        fn a_press_is_held_for_two_tenths_and_then_released() {
+            let start = Instant::now();
+            let mut presses = Presses::at(start, vec![(Duration::from_secs(5), 0x0D)], None);
+            assert!(presses.down(start + Duration::from_millis(4_999)).is_empty());
+            assert_eq!(
+                presses.down(start + Duration::from_millis(5_000)),
+                vec![0x0D]
+            );
+            assert_eq!(
+                presses.down(start + Duration::from_millis(5_100)),
+                vec![0x0D]
+            );
+            assert!(presses.down(start + Duration::from_millis(5_200)).is_empty());
+            assert_eq!(presses.started(), vec![0x0D]);
+            assert!(presses.started().is_empty());
+        }
+
+        #[test]
+        fn a_live_line_is_delivered_once_its_newline_lands() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("input.txt");
+            std::fs::write(&path, "Ent").unwrap();
+            let mut live = Live::open(&path);
+            assert!(live.read().is_empty());
+
+            std::fs::write(&path, "Enter\n").unwrap();
+            assert_eq!(live.read(), vec![0x0D]);
+            // Read already: a poll with nothing new presses nothing.
+            assert!(live.read().is_empty());
+
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(b"X\n").unwrap();
+            assert_eq!(live.read(), vec![0x58]);
+
+            // Truncating and starting again is read from the top.
+            std::fs::write(&path, "A\n").unwrap();
+            assert_eq!(live.read(), vec![0x41]);
+        }
+
+        #[test]
+        fn a_live_press_starts_on_the_poll_that_reads_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("input.txt");
+            std::fs::write(&path, "").unwrap();
+            let start = Instant::now();
+            let mut presses = Presses::at(start, Vec::new(), Some(Live::open(&path)));
+            assert!(presses.down(start).is_empty());
+
+            std::fs::write(&path, "Enter\n").unwrap();
+            // A frame a second long: the press is down on the next poll, and
+            // gone two tenths after it started.
+            assert_eq!(presses.down(start + Duration::from_millis(300)), vec![0x0D]);
+            assert_eq!(presses.started(), vec![0x0D]);
+            assert!(presses.down(start + Duration::from_millis(501)).is_empty());
+        }
+    }
+}
+
 #[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
@@ -1110,6 +1531,35 @@ mod host {
         (XINPUT_GAMEPAD_RIGHT_THUMB, RIGHT_STICK),
     ];
 
+    /// Every key held by any source: the scripted presses (diagnostics only),
+    /// the title window's own key messages, and the host's async state while
+    /// the window is foreground.
+    ///
+    /// One definition, used by the keyboard device and by the stand-in pad
+    /// alike. The pad's merge used to read the scripted presses only, under
+    /// `diagnostics`, so with a pad present a keyboard press could not press A
+    /// in a release build — a person and a bot both stuck, and only in the
+    /// build the person runs.
+    fn held_keys() -> Vec<u8> {
+        #[cfg(feature = "diagnostics")]
+        let scripted = super::script::down();
+        #[cfg(not(feature = "diagnostics"))]
+        let scripted = Vec::new();
+        // Only while the window is foreground does it receive key messages, so
+        // the window source needs no focus check of its own; the async state
+        // is the one a person's keyboard writes.
+        let held: Vec<u8> = if focused() {
+            (0x08..=0xFE_u8)
+                .filter(|vk| !(0x10..=0x12).contains(vk))
+                // SAFETY: plain queries.
+                .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        super::union([scripted, victory_gpu::keys::pressed(), held])
+    }
+
     /// Raw values, no dead zone: titles apply their own.
     pub(super) fn convert(pad: &XINPUT_GAMEPAD) -> PadState {
         let stick = |v: i16| (f32::from(v) / 32767.0).max(-1.0);
@@ -1146,14 +1596,17 @@ mod host {
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
-            // The scripted keys (`VICTORY_KEYS`) also press the first
-            // pad's buttons, by the stand-in pad's table: with a real pad
-            // connected the stand-in is not there, and a title that listens
-            // to the pad (Grand Theft Auto VI's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
+            // Keys also press the first pad's buttons, by the stand-in pad's
+            // table: with a real pad connected the stand-in is not there, and a
+            // title that listens to the pad (Grand Theft Auto VI's start
+            // screen) hears nothing from a keyboard alone. This is the same
+            // path for a person and for an injected press, and it is not
+            // behind diagnostics, because the window's key messages are not.
             if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                for vk in held_keys() {
+                    if let Some(&(_, button)) =
+                        super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk)
+                    {
                         pad.buttons |= button;
                     }
                 }
@@ -1162,20 +1615,8 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
-            let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
-            if focused() {
-                // Left/right modifier keys only, as devices report them; no
-                // mouse buttons (below 0x08).
-                let held: Vec<u8> = (0x08..=0xFE_u8)
-                    .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
-                    // SAFETY: plain queries.
-                    .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
-                    .collect();
-                down.extend(held);
-            }
+            let down = held_keys();
+            tracing::trace!(?down, "keyboard poll");
             down.into_iter()
                 .map(|vk| KeyState {
                     // SAFETY: plain query.
@@ -1196,45 +1637,6 @@ mod host {
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
-    }
-
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
-    fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
-        });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
