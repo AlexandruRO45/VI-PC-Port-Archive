@@ -237,6 +237,15 @@ const PATHSPEC_ENV: &[&str] = &[
 /// tests stage are refused by. `GIT_ATTR_SOURCE` reads attributes from a
 /// tree-ish that a new repository does not have, and every command fails.
 /// Nor do they look for a repository above themselves.
+///
+/// Nor does a hook's quarantine reach them: a `pre-receive` hook runs with
+/// `GIT_QUARANTINE_PATH` set beside the object directories dropped above,
+/// and with it git refuses every ref update, `git init` included. And since
+/// they read no global configuration, the `safe.directory` a developer
+/// keeps there for a TMPDIR owned by someone else (a shared one, or one an
+/// elevated Windows shell made, which belongs to Administrators) cannot
+/// reach them either; they trust themselves, which a test made them, as
+/// command-line configuration that git honours for it.
 pub(crate) fn git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(root);
@@ -257,7 +266,9 @@ pub(crate) fn git_command(root: &Path) -> Command {
                 .env_remove("GIT_DEFAULT_HASH")
                 // Reads `.gitattributes` from that tree-ish instead of the
                 // working tree; a fresh repository has no HEAD to read.
-                .env_remove("GIT_ATTR_SOURCE");
+                .env_remove("GIT_ATTR_SOURCE")
+                .env_remove("GIT_QUARANTINE_PATH")
+                .args(["-c", "safe.directory=*"]);
             // Git looks no further up than `root` itself: a directory that is
             // not a repository is walked, not taken for part of whatever
             // repository encloses it (the checkout, when the temporary
@@ -949,7 +960,10 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         for line in String::from_utf8(out.stdout).unwrap().lines() {
-            assert!(line.starts_with("local\t"), "outside config: {line}");
+            assert!(
+                line.starts_with("local\t") || line == "command\tsafe.directory=*",
+                "outside config: {line}"
+            );
         }
 
         let checkout = super::git_command(&crate::workspace_root());
@@ -994,7 +1008,8 @@ mod tests {
         }
         plain
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1");
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["-c", "safe.directory=*"]);
         assert_eq!(probe(&mut plain, &["check-ignore", "a.rs"]), "a.rs\n");
 
         let ignored = probe(&mut super::git_command(root), &["check-ignore", "a.rs"]);
@@ -1122,6 +1137,71 @@ mod tests {
         // attribute source is the checkout's own business.
         let checkout = super::git_command(&crate::workspace_root());
         assert!(checkout.get_envs().all(|(key, _)| key != "GIT_ATTR_SOURCE"));
+    }
+
+    /// A `pre-receive` hook's `GIT_QUARANTINE_PATH` made every temporary
+    /// repository's `git init` fail ("ref updates forbidden inside
+    /// quarantine environment"), and a TMPDIR owned by another user made
+    /// git refuse each one as a dubious repository, with no global config
+    /// to hold the `safe.directory` that would let it in. Git's own
+    /// `GIT_TEST_ASSUME_DIFFERENT_OWNER` stands in for that owner.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_repositories_ignore_quarantine_and_ownership() {
+        let tmp = tempdir();
+        let root = tmp.path();
+        let control = tempdir();
+
+        // Plain git, as the tests used to run it: refused.
+        let init = super::git_command(control.path())
+            .env("GIT_QUARANTINE_PATH", root)
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(!init.status.success(), "quarantine allowed git init");
+        git_str(control.path(), &["init", "-q"]);
+        // As test git, less its trust (and with no config that could hold one).
+        let mut plain = std::process::Command::new("git");
+        for var in super::REPOSITORY_ENV {
+            plain.env_remove(var);
+        }
+        let dubious = plain
+            .current_dir(control.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .unwrap();
+        assert!(!dubious.status.success(), "ownership was not checked");
+
+        // Test git drops the quarantine, and trusts a repository another
+        // user owns, so the check runs.
+        let command = super::git_command(root);
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "GIT_QUARANTINE_PATH" && value.is_none()),
+            "GIT_QUARANTINE_PATH is inherited"
+        );
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join("game.bin"), b"MZ\x90\0").unwrap();
+        let add = super::git_command(root)
+            .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+            .args(["add", "game.bin"])
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "ownership refused the test");
+        assert_eq!(names(root, true), ["game.bin"]);
+
+        // The checkout keeps both checks.
+        let checkout = super::git_command(&crate::workspace_root());
+        assert!(
+            checkout
+                .get_envs()
+                .all(|(key, _)| key != "GIT_QUARANTINE_PATH")
+        );
+        assert!(checkout.get_args().all(|arg| arg != "safe.directory=*"));
     }
 
     /// A temporary directory that is not a repository is walked. Made beside
