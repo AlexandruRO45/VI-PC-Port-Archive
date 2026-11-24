@@ -381,12 +381,15 @@ struct Guards {
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
+    /// Destination block ranges of synchronous writes still in the kernel.
+    kernel_writes: Vec<(usize, usize)>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
+    kernel_writes: Vec::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -532,6 +535,9 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    let pinned = |g: &Guards, from: usize, to: usize| {
+        g.kernel_writes.iter().any(|&(first, last)| first < to && from < last)
+    };
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
@@ -548,11 +554,14 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
     };
-    if set(from, to) {
+    if !pinned(g, from, to) && set(from, to) {
         note(g, from, to);
         return;
     }
     for block in from..to {
+        if pinned(g, block, block + 1) {
+            continue;
+        }
         if set(block, block + 1) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
@@ -625,6 +634,50 @@ pub fn writing(at: usize, len: usize) {
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+}
+
+struct KernelWrite {
+    at: usize,
+    len: usize,
+    blocks: (usize, usize),
+}
+
+impl Drop for KernelWrite {
+    fn drop(&mut self) {
+        {
+            let mut g = guards();
+            if let Some(i) = g.kernel_writes.iter().position(|&r| r == self.blocks) {
+                g.kernel_writes.swap_remove(i);
+            }
+            // Another view may have been guarded while the bytes were
+            // arriving. Report its changes once the kernel has finished.
+            open(&mut g, self.at, self.at.saturating_add(self.len));
+        }
+        crate::descriptor::host::remapped(self.at, self.len);
+    }
+}
+
+/// Keeps title memory writable until a synchronous kernel write returns.
+/// Texture refreshes can rearm guards while the I/O worker is reading a
+/// file. The kernel cannot take our user-mode write-fault path.
+pub fn with_kernel_write<T>(at: usize, len: usize, write: impl FnOnce() -> T) -> T {
+    if len == 0 {
+        return write();
+    }
+    let end = at.saturating_add(len);
+    let pending = KernelWrite {
+        at,
+        len,
+        blocks: (at / BLOCK, end.div_ceil(BLOCK)),
+    };
+    {
+        let mut g = guards();
+        g.kernel_writes.push(pending.blocks);
+        open(&mut g, at, end);
+    }
+    let result = write();
+    drop(pending);
+    result
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
@@ -882,7 +935,13 @@ mod tests {
             "the kernel does not fault into our handler"
         );
         writing(view + 100, 13);
-        assert!(read(&mut file));
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        assert!(!read(&mut file), "a refresh can rearm a block opened for upcoming I/O");
+        with_kernel_write(view + 100, 13, || {
+            assert!(guard(view, view + 2 * BLOCK).is_some());
+            assert!(read(&mut file), "the read must survive the refresh during I/O");
+            assert!(!writable(view + BLOCK), "unrelated blocks stay guarded");
+        });
         // SAFETY: the bytes just read.
         let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
         assert_eq!(landed, b"from the disk");

@@ -956,13 +956,18 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
-        // SAFETY: the title's destination holds `destination_size` bytes, at
-        // least `len`, and nothing else writes it until completion.
-        let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let write = || {
+            // SAFETY: the title's destination holds `destination_size`
+            // bytes, at least `len`, and nothing else writes it until completion.
+            let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
+            fill(out).map(drop)
+        };
+        let at = request.destination as usize;
+        if request.options == 0 {
+            return victory_gpu::with_kernel_write(at, len, write);
+        }
+        victory_gpu::kernel_will_write(at, len);
+        return write();
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let mut pages = vec![0usize; (offset + len).div_ceil(PAGE)];
