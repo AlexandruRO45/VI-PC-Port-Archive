@@ -545,7 +545,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         let stage_data = &payload[(start + RECORD_SIZE) as usize..];
         let io = match stage {
             HwStage::Ps => ps_io(stage_data, code.len())?,
-            HwStage::Vs => vs_inputs_fit(vs_io(stage_data)?)?,
+            HwStage::Vs => vs_outputs_per_vertex(vs_inputs_fit(vs_io(stage_data)?)?)?,
             HwStage::Cs => StageIo::Cs(compute_io(stage_data, &layout)?),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
             _ => StageIo::None,
@@ -844,6 +844,19 @@ fn vs_inputs_fit(io: StageIo) -> Result<StageIo, ShaderError> {
                 }
             }
         }
+    }
+    Ok(io)
+}
+
+/// Bit 7 of an output's parameter marks a mesh program's per-primitive
+/// output (a `PSG1` row). A vertex program has no primitive signature: such
+/// an output's exports would be written to an element that doesn't exist
+/// and silently dropped, and its row would escape the shared-row check.
+fn vs_outputs_per_vertex(io: StageIo) -> Result<StageIo, ShaderError> {
+    if let StageIo::Vs { outputs, .. } = &io
+        && outputs.iter().any(|o| o.param & 0x80 != 0)
+    {
+        return Err(Malformed("vertex output marked per-primitive"));
     }
     Ok(io)
 }
@@ -1792,8 +1805,21 @@ mod tests {
             };
             assert!(outputs(1, 1).is_ok(), "{stage:?}");
             // A per-primitive output's row is in the primitive signature, so
-            // row 0 there is not the vertex output's row 0.
-            assert!(outputs(0x81, 0).is_ok(), "{stage:?}");
+            // row 0 there is not the vertex output's row 0. Only a mesh
+            // program has that signature.
+            if stage == HwStage::Ms {
+                assert!(outputs(0x81, 0).is_ok());
+            } else {
+                for (param, row) in [(0x81, 0), (0x81, 1), (0xFF, 7)] {
+                    assert!(
+                        matches!(
+                            outputs(param, row),
+                            Err(Malformed("vertex output marked per-primitive"))
+                        ),
+                        "{param:#x} in row {row}"
+                    );
+                }
+            }
             assert!(
                 matches!(outputs(1, 0), Err(Malformed("vertex outputs share a row"))),
                 "{stage:?}"
