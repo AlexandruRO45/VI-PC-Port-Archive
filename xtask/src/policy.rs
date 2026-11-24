@@ -2654,6 +2654,58 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// A NUL byte ends a rule where it stands, as git reads each line as a
+    /// C string: `/nul\0junk/` is the rule `/nul`, so `nul` is taken and
+    /// `nuljunk` stays visible and is refused, and `/cut\0/kept/` is the
+    /// rule `/cut`, leaving `kept` visible and refused too. A last line no
+    /// newline ends is still a rule: `/tail/`, unterminated, takes `tail`.
+    /// The `.gitignore` itself, holding a NUL, is refused as binary.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_judged_by_rules_a_nul_byte_cuts_short() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "/nul\0junk/\n/cut\0/kept/\n/tail/").unwrap();
+        let nul = root.join("nul");
+        let junk = root.join("nuljunk");
+        let kept = root.join("kept");
+        let tail = root.join("tail");
+        for dir in [&nul, &junk, &kept, &tail] {
+            std::fs::create_dir(dir).unwrap();
+        }
+
+        let tmp = tempdir_in_first(root, [junk.clone(), nul.clone()]);
+        assert_eq!(tmp.path().parent(), Some(nul.as_path()));
+        let tmp_tail = tempdir_in_first(root, [kept.clone(), tail.clone()]);
+        assert_eq!(tmp_tail.path().parent(), Some(tail.as_path()));
+        for dir in [&junk, &kept] {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        for dir in [tmp.path(), tmp_tail.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        std::fs::write(junk.join("a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(kept.join("b.rs"), b"fn b() {}\n").unwrap();
+        assert_eq!(
+            names(root, false),
+            [".gitignore", "kept/b.rs", "nuljunk/a.rs"]
+        );
+        // The fixtures stay unseen; only the `.gitignore` is refused, as a
+        // NUL byte marks it binary whatever git makes of its rules.
+        assert!(
+            !super::check(
+                ".gitignore",
+                &std::fs::read(root.join(".gitignore")).unwrap()
+            )
+            .is_empty()
+        );
+        for path in ["kept/b.rs", "nuljunk/a.rs"] {
+            assert!(super::check(path, &std::fs::read(root.join(path)).unwrap()).is_empty());
+        }
+        assert!(super::run(root, false).is_err());
+    }
+
     /// In a linked worktree, where `.git` is a file, the repository's
     /// shared `info/exclude` still applies: a TMPDIR it alone ignores in
     /// the worktree is taken, a visible sibling is refused, and only the
