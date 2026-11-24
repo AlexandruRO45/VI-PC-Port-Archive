@@ -4504,4 +4504,241 @@ mod tests {
             native_programs(&part(&[(KIND_NATIVE, &xbch(&good))])).unwrap()
         );
     }
+
+    #[test]
+    fn compute_stage_data_breaking_several_rules_is_named_for_the_first_checked() {
+        let base = fssm(&[(HwStage::Cs, &VS_CODE)]);
+        let e = stage_data_at(&base, HwStage::Cs);
+        let record = e - RECORD_SIZE as usize;
+        // Root constants in s4, with these VGPRs, `COMPUTE_PGM_RSRC2` and
+        // numthreads.
+        let cs = |vgprs: u32, rsrc2: u32, threads: [u32; 3]| {
+            let mut blob = base.clone();
+            blob[record + RECORD_REGS..][..4].copy_from_slice(&vgprs.to_le_bytes());
+            blob[e + CS_RSRC2..][..4].copy_from_slice(&rsrc2.to_le_bytes());
+            for (k, n) in threads.into_iter().enumerate() {
+                blob[e + CS_THREADS + 4 * k..][..4].copy_from_slice(&n.to_le_bytes());
+            }
+            let table = (blob.len() - FSSM_HEADER) as u64;
+            for v in [0u32, 0, 1, 0] {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+            blob.extend_from_slice(&[4, 0, 0, 0]);
+            let payload = (blob.len() - FSSM_HEADER) as u64;
+            blob[8..16].copy_from_slice(&payload.to_le_bytes());
+            blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
+            blob[record + RECORD_COUNTS..][..4].copy_from_slice(&1u32.to_le_bytes());
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        // 4 user SGPRs, then group id x in s4, under the constants.
+        let group_id_in_s4 = 4 << 1 | 1 << 7;
+        let (three_ids, too_much_lds) = (2 << 11, 129 << 15);
+        let (no_threads, one_thread) = ([0, 1, 1], [1, 1, 1]);
+        let every = group_id_in_s4 | three_ids | too_much_lds;
+        // Each program below also breaks every rule named after it: the
+        // record's VGPRs are checked first, then the group size, LDS, the
+        // thread ids' VGPRs and the system SGPRs.
+        for (vgprs, rsrc2, threads, why) in [
+            (257, every, no_threads, "implausible VGPR count"),
+            (2, every, no_threads, "implausible thread-group size"),
+            (2, every, one_thread, "implausible LDS size"),
+            (
+                2,
+                group_id_in_s4 | three_ids,
+                one_thread,
+                "thread ids outside the VGPRs",
+            ),
+            (
+                3,
+                group_id_in_s4 | three_ids,
+                one_thread,
+                "root parameter over a system SGPR",
+            ),
+        ] {
+            assert_eq!(
+                why_refused(cs(vgprs, rsrc2, threads)),
+                why,
+                "{vgprs} VGPRs, RSRC2 {rsrc2:#x}, {threads:?}"
+            );
+        }
+        // With group id x off, s4 is the constants' alone.
+        let p = cs(3, 4 << 1 | three_ids, one_thread).unwrap();
+        assert!(matches!(p[0].io, StageIo::Cs(c) if c.thread_id_vgprs() == 3));
+    }
+
+    #[test]
+    fn vertex_stage_data_breaking_several_rules_is_named_for_the_first_checked() {
+        let base = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let e = stage_data_at(&base, HwStage::Vs);
+        let record = e - RECORD_SIZE as usize;
+        // `inputs` entries with `input_count` stated, and `outputs`.
+        let vs = |vgprs: u32, input_count: u32, inputs: &[[u8; 5]], outputs: &[[u8; 6]]| {
+            let mut blob = base.clone();
+            blob[record + RECORD_REGS..][..4].copy_from_slice(&vgprs.to_le_bytes());
+            blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&input_count.to_le_bytes());
+            blob[e + VS_INPUTS..][..5 * inputs.len()].copy_from_slice(inputs.as_flattened());
+            let output_count = outputs.len() as u32;
+            blob[e + VS_OUTPUT_COUNT..][..4].copy_from_slice(&output_count.to_le_bytes());
+            blob[e + VS_OUTPUTS..][..6 * outputs.len()].copy_from_slice(outputs.as_flattened());
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        // Inputs as (usage, row, mask, VGPR, -): x-w of v255 is past the
+        // 28 VGPRs; x of v0 is the vertex id, twice; x of v4 twice overlaps.
+        let past = [6, 2, 0xf, 255, 0];
+        let (v0, v0_again) = ([6, 0, 0x1, 0, 0], [6, 1, 0x1, 0, 0]);
+        let (v4, v4_again, v5) = ([6, 0, 0x1, 4, 0], [6, 1, 0x1, 4, 0], [6, 1, 0x1, 5, 0]);
+        // Outputs as (usage, row, param, -, -, flags): per-primitive param0
+        // twice in row 0, then param0 and param1 in row 0, then rows 0 and 1.
+        let same_param = [[6, 0, 0x80, 0, 0, 0], [6, 0, 0x80, 0, 0, 0]];
+        let same_row = [[6, 0, 0x80, 0, 0, 0], [6, 0, 0x81, 0, 0, 0]];
+        let per_primitive = [[6, 0, 0x80, 0, 0, 0], [6, 1, 0x81, 0, 0, 0]];
+        let too_many = MAX_SEMANTICS + 1;
+        let all_bad = [past, v0, v0_again];
+        // Each program below also breaks every rule named after it: the
+        // record's VGPRs, then the semantic counts, the outputs' parameters
+        // and rows, the inputs' VGPRs, and per-primitive outputs last.
+        for (vgprs, count, inputs, outputs, why) in [
+            (
+                257,
+                too_many,
+                &all_bad[..],
+                same_param,
+                "implausible VGPR count",
+            ),
+            (
+                VGPRS,
+                too_many,
+                &all_bad,
+                same_param,
+                "implausible semantic count",
+            ),
+            (
+                VGPRS,
+                3,
+                &all_bad,
+                same_param,
+                "vertex outputs share a parameter",
+            ),
+            (VGPRS, 3, &all_bad, same_row, "vertex outputs share a row"),
+            (
+                VGPRS,
+                3,
+                &all_bad,
+                per_primitive,
+                "vertex input outside the VGPRs",
+            ),
+            (
+                VGPRS,
+                2,
+                &all_bad[1..],
+                per_primitive,
+                "vertex input over a system VGPR",
+            ),
+            (
+                VGPRS,
+                2,
+                &[v4, v4_again],
+                per_primitive,
+                "vertex inputs overlap",
+            ),
+            (
+                VGPRS,
+                2,
+                &[v4, v5],
+                per_primitive,
+                "vertex output marked per-primitive",
+            ),
+        ] {
+            assert_eq!(why_refused(vs(vgprs, count, inputs, &outputs)), why);
+        }
+        // With every rule kept, the same program is read.
+        let per_vertex = [[6, 0, 0, 0, 0, 0], [6, 1, 1, 0, 0, 0]];
+        let p = vs(VGPRS, 2, &[v4, v5], &per_vertex).unwrap();
+        assert!(matches!(&p[0].io, StageIo::Vs { inputs, outputs }
+            if inputs.len() == 2 && outputs.len() == 2));
+    }
+
+    #[test]
+    fn pixel_stage_data_breaking_several_rules_is_named_for_the_first_checked() {
+        let code: Vec<u8> = [0xBF80_0000u32; 4] // s_nop
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let base = fssm(&[(HwStage::Ps, &code)]);
+        let e = stage_data_at(&base, HwStage::Ps);
+        // `inputs` entries with `input_count` stated, and patches of `size`
+        // dwords for MRT0 and MRT1 at these offsets.
+        let ps = |input_count: u32, inputs: &[[u8; 8]], size: u32, offsets: [u32; 2]| {
+            let mut blob = base.clone();
+            blob[e + PS_INPUT_COUNT..][..4].copy_from_slice(&input_count.to_le_bytes());
+            blob[e + PS_INPUTS..][..8 * inputs.len()].copy_from_slice(inputs.as_flattened());
+            blob[e + PS_PATCH_SIZE..][..4].copy_from_slice(&size.to_le_bytes());
+            for (mrt, offset) in offsets.into_iter().enumerate() {
+                let at = e + PS_PATCHES + mrt * PATCH_BYTES;
+                blob[at..][..4].copy_from_slice(&offset.to_le_bytes());
+            }
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        // Inputs as (usage, row, mask, attr, -, row2, -, flags): attr0 packs
+        // rows 2 and 3; a 32-bit attr0 (or attr1) names row 3, its second
+        // row; a 32-bit attr2 reads row 2, which attr0 reads packed.
+        let packed = [6, 2, 0x3, 0, 0, 3, 0, 0x18];
+        let (on_its_row, on_its_row_attr1) =
+            ([6, 3, 0xc, 0, 0, 3, 0, 0], [6, 3, 0xc, 1, 0, 3, 0, 0]);
+        let row_two_ways = [6, 2, 0xc, 2, 0, 2, 0, 0];
+        let too_many = MAX_SEMANTICS + 1;
+        let too_big = PATCH_SLOT_DWORDS as u32 + 1;
+        // Two-dword patches: MRT1 at dword 3 runs past the four-dword code
+        // and over MRT0 at dword 2; at dword 1 it only overlaps MRT0.
+        let (past_and_over, over) = ([2, 3], [2, 1]);
+        let every = [packed, on_its_row, row_two_ways];
+        // Each program below also breaks every rule named after it: the
+        // input count, then attributes, rows read two ways, claimed packed
+        // rows, the patch size, patches past the code and overlaps.
+        for (count, inputs, size, offsets, why) in [
+            (
+                too_many,
+                &every[..],
+                too_big,
+                past_and_over,
+                "implausible semantic count",
+            ),
+            (
+                3,
+                &every,
+                too_big,
+                past_and_over,
+                "pixel inputs share an attribute",
+            ),
+            (
+                3,
+                &[packed, on_its_row_attr1, row_two_ways],
+                too_big,
+                past_and_over,
+                "pixel inputs read a row two ways",
+            ),
+            (
+                2,
+                &[packed, on_its_row_attr1],
+                too_big,
+                past_and_over,
+                "pixel inputs claim a packed row",
+            ),
+            (
+                0,
+                &[],
+                too_big,
+                past_and_over,
+                "implausible export patch size",
+            ),
+            (0, &[], 2, past_and_over, "export patch outside the code"),
+            (0, &[], 2, over, "export patches overlap"),
+        ] {
+            assert_eq!(why_refused(ps(count, inputs, size, offsets)), why);
+        }
+        // With every rule kept, the same program is read.
+        let p = ps(1, &[packed], 2, [2, 0]).unwrap();
+        assert!(matches!(&p[0].io, StageIo::Ps { inputs, patches, .. }
+            if inputs.len() == 1 && patches.len() == 2));
+    }
 }
