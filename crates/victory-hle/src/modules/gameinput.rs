@@ -325,9 +325,9 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
-    /// Host slots that have reported input at least once. A wireless receiver
-    /// answers for its pad while the pad is off, with an all-zero report; that
-    /// slot is not a pad until something is actually pressed.
+    /// Host slots that have reported input on their current connection. A
+    /// wireless receiver may report a neutral pad while the pad is off, so the
+    /// flag belongs to the connection: a disconnect clears it.
     seen_input: [bool; PADS],
 }
 
@@ -463,7 +463,12 @@ impl State {
         // answering for a pad that is switched off, and its all-zero report used to hide the
         // keyboard's stand-in, leaving the keyboard dead with no pad in hand.
         let pads: [Option<PadState>; PADS] = std::array::from_fn(|slot| {
-            let pad = pads[slot]?;
+            let Some(pad) = pads[slot] else {
+                // A disconnect ends the connection the flag belongs to: a receiver that
+                // comes back neutral is not the pad that was played with.
+                self.seen_input[slot] = false;
+                return None;
+            };
             if pad != PadState::default() {
                 self.seen_input[slot] = true;
             }
@@ -1530,6 +1535,35 @@ mod tests {
         assert_eq!(pad(rest), PadState::default());
         release(rest);
         assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
+    }
+
+    #[test]
+    fn a_reconnected_idle_slot_does_not_hide_the_keyboard_stand_in() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: B,
+            ..Default::default()
+        });
+        hub.poll();
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
+
+        host.lock().unwrap().pads[0] = None;
+        hub.poll();
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+
+        {
+            let mut host = host.lock().unwrap();
+            host.pads[0] = Some(PadState::default());
+            host.keys = vec![key(0x0D)];
+        }
+        hub.poll();
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+        let reading = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(reading).buttons, A);
+        release(reading);
     }
 
     #[test]
