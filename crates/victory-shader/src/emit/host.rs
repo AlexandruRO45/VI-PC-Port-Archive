@@ -71,10 +71,15 @@ fn hardware(d: &DXGI_ADAPTER_DESC1) -> bool {
     d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && !basic_render_driver
 }
 
-/// The hardware adapters, in DXGI's order: each one's description.
+/// The hardware adapters that run waves of 32 or 64 lanes, in DXGI's
+/// order: each one's description. An integrated GPU with narrower waves
+/// (some Intel ones report 16-16) runs none of the console's programs
+/// that depend on the wave size: the translator refuses them for it by
+/// name, and what walks this list expects a pipeline. An adapter no SM 6.6
+/// device can be made on stays listed, for its user to skip.
 pub fn adapters() -> Result<Vec<String>, String> {
     // SAFETY: plain DXGI calls.
-    unsafe {
+    let mut out = unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
         let mut out = Vec::new();
         let mut i = 0;
@@ -85,8 +90,15 @@ pub fn adapters() -> Result<Vec<String>, String> {
             }
             i += 1;
         }
-        Ok(out)
-    }
+        out
+    };
+    out.retain(|name| {
+        Host::on(name).map_or(true, |host| {
+            let target = host.target();
+            target.runs(32) || target.runs(64)
+        })
+    });
+    Ok(out)
 }
 
 fn description(wide: &[u16]) -> String {
