@@ -2663,6 +2663,165 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(next_phase_marker, 44);
     }
 
+    #[test]
+    fn disjoint_refreshes_see_alias_writes_on_repeated_submissions() {
+        use crate::watch::{PAGE, tests::twin_views, title_memory_remapped};
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+
+        if crate::host::host().is_none() {
+            assert!(std::env::var_os("VICTORY_TEST_SHADOW_DISJOINT_REQUIRE_GPU").is_none());
+            return;
+        }
+        let len = 3 * PAGE;
+        let (title, alias) = twin_views(3);
+        crate::shadow::register(title, title as u64, len as u64);
+        crate::shadow::register(alias, alias as u64, len as u64);
+        let copy = crate::shadow::find(title as u64, len as u64).unwrap();
+        let other_copy = crate::shadow::find(alias as u64, len as u64).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&copy, &other_copy));
+        assert_eq!(copy.update(title, len), len);
+        assert_eq!(other_copy.update(alias, len), len);
+
+        let mut previous_gap = 0;
+        for value in [11u32, 21, 31] {
+            // SAFETY: both addresses are in our alias view, outside the gap.
+            unsafe {
+                (alias as *mut u32).write_volatile(value);
+                ((alias + 2 * PAGE) as *mut u32).write_volatile(value + 2);
+            }
+            let mut batch = Batch::default();
+            batch.add(&copy, title, PAGE);
+            batch.add(&copy, title + 2 * PAGE, PAGE);
+            let gate = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    gate.wait();
+                    // SAFETY: the gap is outside both active refresh ranges.
+                    unsafe { ((alias + PAGE) as *mut u32).write_volatile(value + 1) };
+                });
+                gate.wait();
+                let bytes = batch.flush();
+                writer.join().unwrap();
+                assert_eq!(bytes, 2 * PAGE);
+            });
+            let markers = |s: &crate::shadow::Shadow, base| {
+                [0, 1, 2].map(|page| s.read_host((base + page * PAGE) as u64, 1)[0])
+            };
+            assert_eq!(markers(&copy, title), [value, previous_gap, value + 2]);
+            assert_eq!(other_copy.update(alias, len), len, "the other backing sees its own dirt");
+            assert_eq!(markers(&other_copy, alias), [value, value + 1, value + 2]);
+            batch.add(&copy, title + PAGE, PAGE);
+            assert_eq!(batch.flush(), PAGE);
+            assert_eq!(markers(&copy, title), [value, value + 1, value + 2]);
+            previous_gap = value + 1;
+        }
+
+        crate::shadow::unregister(title, title as u64);
+        crate::shadow::unregister(alias, alias as u64);
+        drop((copy, other_copy));
+        for address in [title, alias] {
+            // SAFETY: both views were made by this test and are no longer read.
+            assert_ne!(unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: address as *mut _ }) }, 0);
+            title_memory_remapped(address, len);
+        }
+    }
+
+    #[test]
+    fn disjoint_refreshes_handle_mapping_invalidation_between_submissions() {
+        use crate::watch::{PAGE, tests::{free, pool}, title_memory_remapped};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+
+        if crate::host::host().is_none() {
+            assert!(std::env::var_os("VICTORY_TEST_SHADOW_DISJOINT_REQUIRE_GPU").is_none());
+            return;
+        }
+        let title = pool(3);
+        let middle = title + PAGE;
+        let len = 3 * PAGE;
+        crate::shadow::register(title, title as u64, len as u64);
+        let copy = crate::shadow::find(title as u64, len as u64).unwrap();
+        // SAFETY: the committed middle page is owned by the test.
+        unsafe { (middle as *mut u8).write_volatile(12) };
+        assert_eq!(copy.update(title, len), len);
+        assert_eq!(copy.read_host(middle as u64, 1)[0], 12);
+        // SAFETY: the middle page is committed inside our reservation.
+        assert_ne!(unsafe { VirtualFree(middle as *mut _, PAGE, MEM_DECOMMIT) }, 0);
+        title_memory_remapped(middle, PAGE);
+
+        let mut batch = Batch::default();
+        batch.add(&copy, title, PAGE);
+        batch.add(&copy, title + 2 * PAGE, PAGE);
+        assert_eq!(batch.flush(), 0);
+        assert_eq!(copy.read_host(middle as u64, 1)[0], 12);
+        batch.add(&copy, middle, PAGE);
+        assert_eq!(batch.flush(), PAGE);
+        assert_eq!(copy.read_host(middle as u64, 1)[0], 0);
+        drop(batch);
+
+        // SAFETY: recommit only the missing region of our live reservation.
+        assert_eq!(unsafe { VirtualAlloc(middle as *mut _, PAGE, MEM_COMMIT, PAGE_READWRITE) } as usize, middle);
+        title_memory_remapped(middle, PAGE);
+        // SAFETY: the recommitted page is writable and stays live below.
+        unsafe { (middle as *mut u8).write_volatile(34) };
+        let mut batch = Batch::default();
+        batch.add(&copy, middle, PAGE);
+        assert_eq!(batch.flush(), PAGE);
+        assert_eq!(copy.read_host(middle as u64, 1)[0], 34);
+
+        drop(batch);
+        crate::shadow::unregister(title, title as u64);
+        drop(copy);
+        free(title);
+    }
+
+    #[test]
+    fn disjoint_partial_refreshes_preserve_pending_gpu_writes() {
+        use crate::watch::{PAGE, tests::{free, pool}};
+
+        let Some(host) = crate::host::host() else {
+            assert!(std::env::var_os("VICTORY_TEST_SHADOW_DISJOINT_REQUIRE_GPU").is_none());
+            return;
+        };
+        let title = pool(1);
+        crate::shadow::register(title, title as u64, PAGE as u64);
+        let copy = crate::shadow::find(title as u64, PAGE as u64).unwrap();
+        assert_eq!(copy.update(title, PAGE), PAGE);
+        let busy = title + 32;
+        copy.writing(busy, 4);
+        for (offset, value) in [(4, 11u8), (16, 22), (32, 33), (40, 44)] {
+            // SAFETY: every marker belongs to the test's live title page.
+            unsafe { ((title + offset) as *mut u8).write_volatile(value) };
+        }
+        let mut batch = Batch::default();
+        batch.add(&copy, title + 4, 4);
+        batch.add(&copy, busy, 12);
+        assert_eq!(batch.flush(), 12, "the pending dword and the gap stay untouched");
+        let markers = || [4, 16, 32, 40].map(|offset| copy.read_host((title + offset) as u64, 1)[0]);
+        assert_eq!(markers(), [11, 0, 0, 44]);
+
+        let (upload, data) = host.upload_buffer(4).unwrap();
+        let writer = host.new_list().unwrap();
+        // SAFETY: both buffers live through the synchronous submission; the
+        // copy targets the pending dword, outside the CPU refreshes above.
+        unsafe {
+            data.cast::<u32>().write(55);
+            writer.list.CopyBufferRegion(&copy.buffer, 32, &upload, 0, 4);
+        }
+        writer.close();
+        host.execute(&[&writer]);
+        assert_eq!(copy.copy_back(busy, 4), 4);
+        // SAFETY: the copy-back completed and the test owns this page.
+        assert_eq!(unsafe { (busy as *const u8).read_volatile() }, 55);
+
+        batch.add(&copy, title + 16, 4);
+        assert_eq!(batch.flush(), 4, "the unobserved partial page stays dirty");
+        assert_eq!(markers(), [11, 22, 55, 44]);
+        drop(batch);
+        crate::shadow::unregister(title, title as u64);
+        drop(copy);
+        free(title);
+    }
+
     /// The hashing a submission does for textures in physical-page memory,
     /// with every list checking the textures it samples (before) and with
     /// each checked once (after). Run with
