@@ -252,8 +252,9 @@ fn dump_on() -> bool {
 /// the title's own picture. `VICTORY_SHOW_TARGET=busiest`: the displayable
 /// target (8-bit, 10-bit or 16-bit float colour, 16:9, at least 1280 wide) bound
 /// most often (render-target binds and UAV uses, not draws), usually a G-buffer layer
-/// in a world frame. Only textures the swap chain copy can take (single-sampled 2D,
-/// one mip level, one array slice) are shown, in either mode. A debugging
+/// in a world frame, picked once and shown for the rest of the run, until the
+/// title releases it (see [`LATCHED`]). Only textures the swap chain copy can take
+/// (single-sampled 2D, one mip level, one array slice) are shown, in either mode. A debugging
 /// view: it shows a buffer as it is (a G-buffer layer unlit, say), not a
 /// finished picture.
 #[derive(Clone, Copy)]
@@ -281,6 +282,25 @@ pub(crate) fn show_index() -> Option<Show> {
 /// (show mode `busiest`), by resource address; not draws.
 static HITS: std::sync::Mutex<Option<std::collections::HashMap<usize, u32>>> =
     std::sync::Mutex::new(None);
+
+/// Show mode `busiest`: the target it picked, kept for the run (a pick of
+/// another size or format on the next frame would resize the swap chain,
+/// which stalls the queue) until the title releases it.
+static LATCHED: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
+    std::sync::Mutex::new(None);
+
+/// The latched value, while anything but the latch holds it; a value only
+/// the latch holds (its title resource is released, no list or target list
+/// holds it) is dropped, so a later pick can latch another.
+fn kept<T>(latched: &mut Option<std::sync::Arc<T>>) -> Option<std::sync::Arc<T>> {
+    if latched
+        .as_ref()
+        .is_some_and(|l| std::sync::Arc::strong_count(l) == 1)
+    {
+        *latched = None;
+    }
+    latched.clone()
+}
 
 /// Counts one bind of `resource` in `hits`.
 fn hit(hits: &mut std::collections::HashMap<usize, u32>, resource: usize) {
@@ -323,6 +343,12 @@ pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTe
             })
             .map(|(_, c)| c.clone());
     }
+    if let Show::Busiest = show
+        && !logged
+        && let Some(kept) = kept(&mut LATCHED.lock().unwrap_or_else(|e| e.into_inner()))
+    {
+        return Some(kept);
+    }
     // One pass: each target's description, read once, with its binds.
     let seen: Vec<(D3D12_RESOURCE_DESC, u32)> = targets
         .iter()
@@ -338,11 +364,29 @@ pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTe
             .collect();
         tracing::info!(frame, ?list, "VICTORY_SHOW_TARGET: this frame's targets");
     }
-    let pick = match show {
-        Show::Index(n) => seen.get(n).filter(|(d, _)| presentable(d)).map(|_| n),
-        Show::Busiest => busiest(&seen),
-    };
-    pick.map(|i| targets[i].1.clone())
+    match show {
+        Show::Index(n) => seen
+            .get(n)
+            .filter(|(d, _)| presentable(d))
+            .map(|_| targets[n].1.clone()),
+        Show::Busiest => {
+            let mut latched = LATCHED.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(kept) = kept(&mut latched) {
+                return Some(kept);
+            }
+            let i = busiest(&seen)?;
+            let d = &seen[i].0;
+            tracing::info!(
+                frame,
+                width = d.Width,
+                height = d.Height,
+                format = d.Format.0,
+                "VICTORY_SHOW_TARGET=busiest: showing this target until the title releases it"
+            );
+            *latched = Some(targets[i].1.clone());
+            latched.clone()
+        }
+    }
 }
 
 /// What show mode `busiest` may show: a texture the swap chain copy takes,
@@ -754,6 +798,20 @@ mod tests {
         // Too small or no target displayable: none.
         assert_eq!(super::busiest(&[(screen(1024, 576, 28), 3)]), None);
         assert_eq!(super::busiest(&[]), None);
+    }
+
+    #[test]
+    fn a_latched_pick_is_kept_until_only_the_latch_holds_it() {
+        let title = std::sync::Arc::new(7u32);
+        let mut latched = Some(title.clone());
+        // The title still holds it: kept, though another target is busier now.
+        assert!(super::kept(&mut latched).is_some_and(|k| *k == 7));
+        assert!(latched.is_some());
+        // Released: dropped, a later pick may latch another.
+        drop(title);
+        assert!(super::kept(&mut latched).is_none());
+        assert!(latched.is_none());
+        assert!(super::kept::<u32>(&mut None).is_none());
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
