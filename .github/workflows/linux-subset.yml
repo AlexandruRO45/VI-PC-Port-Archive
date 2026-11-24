@@ -99,6 +99,27 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           "$RUNNER_TEMP/actionlint" -color -ignore 'SC2086:'
 
+      # Security audit of the workflows, which actionlint does not do:
+      # template injection in `run:` scripts, credentials persisted by
+      # checkout, over-broad permissions, cache poisoning, unpinned actions.
+      # With the job's read-only token it also checks online that each pinned
+      # SHA really is a commit of the action's repository (impostor commits)
+      # and that no pinned version has a known advisory. Pinned and
+      # checksum-verified like actionlint; exits non-zero on any finding.
+      - name: zizmor
+        env:
+          ZIZMOR_VERSION: 1.32.0
+          ZIZMOR_SHA256: bb110cc765eca9cd7efb2e284a956be5974c60027b0970f16397d86208a9957b
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tarball="zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfL --retry 3 -O "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/${tarball}"
+          echo "${ZIZMOR_SHA256}  ${tarball}" | sha256sum -c -
+          tar xzf "$tarball" zizmor
+          cd "$GITHUB_WORKSPACE"
+          "$RUNNER_TEMP/zizmor" --color=always .github/workflows
+
       # Fast, needs no build: keep the clean packages clean. load_probe.rs is
       # checked by itself, since the rest of victory-loader is not clean yet.
       - name: rustfmt (clean packages)
