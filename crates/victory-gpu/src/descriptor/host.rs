@@ -533,6 +533,13 @@ fn buffer_srv(
     Some(Some(shadow.buffer.clone()))
 }
 
+/// Which `ClearUnorderedAccessView*` operation is preparing a descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClearKind {
+    Uint,
+    Float,
+}
+
 /// Prepared target for `ClearUnorderedAccessViewUint`/`Float`.
 pub(crate) enum ClearUavTarget {
     Texture {
@@ -550,7 +557,7 @@ fn resolve_buffer_uav(
     address: u64,
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
-    force_raw: bool,
+    clear: Option<ClearKind>,
 ) -> Option<(std::sync::Arc<crate::shadow::Shadow>, D3D12_UNORDERED_ACCESS_VIEW_DESC)> {
     let shadow = crate::shadow::find(address, len)?;
     // SAFETY: a live buffer.
@@ -563,10 +570,24 @@ fn resolve_buffer_uav(
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     buffer.CounterOffsetInBytes = 0;
-    if force_raw && buffer.StructureByteStride > 0 && desc.Format.0 == 0 {
-        // D3D12 forbids `ClearUnorderedAccessView*` on structured buffers (`Format == UNKNOWN`);
-        // translate 4-byte-aligned views to `R32_TYPELESS | RAW`.
-        let stride = u64::from(buffer.StructureByteStride);
+    let is_structured = buffer.StructureByteStride > 0 && desc.Format.0 == 0;
+    let is_raw = desc.Format == DXGI_FORMAT_R32_TYPELESS
+        || buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    if let Some(kind) = clear
+        && (is_structured || is_raw)
+    {
+        if kind == ClearKind::Float {
+            once!("ClearUnorderedAccessViewFloat on a raw or structured buffer view");
+            return None;
+        }
+        // D3D12 forbids ClearUnorderedAccessView* on structured buffers (`Format == UNKNOWN`)
+        // and requires 16-byte `FirstElement` alignment for `D3D12_BUFFER_UAV_FLAG_RAW`
+        // (`R32_TYPELESS`). Typed `R32_UINT` clears any 4-byte-aligned window cleanly.
+        let stride = if is_structured {
+            u64::from(buffer.StructureByteStride)
+        } else {
+            4
+        };
         let byte_offset = offset.checked_add(buffer.FirstElement.checked_mul(stride)?)?;
         let byte_len = u64::from(buffer.NumElements).checked_mul(stride)?;
         if byte_len == 0 || !byte_offset.is_multiple_of(4) || !byte_len.is_multiple_of(4) {
@@ -577,9 +598,9 @@ fn resolve_buffer_uav(
             NumElements: u32::try_from(byte_len / 4).ok()?,
             StructureByteStride: 0,
             CounterOffsetInBytes: 0,
-            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+            Flags: D3D12_BUFFER_UAV_FLAG_NONE,
         };
-        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        desc.Format = DXGI_FORMAT_R32_UINT;
         return Some((shadow, desc));
     }
     let element = if buffer.StructureByteStride > 0 {
@@ -608,7 +629,7 @@ fn buffer_uav(
     desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let (shadow, desc) = resolve_buffer_uav(address, len, desc, false)?;
+    let (shadow, desc) = resolve_buffer_uav(address, len, desc, None)?;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -659,6 +680,7 @@ impl HostHeap {
         view: &View,
         fallback_resource: crate::object::This,
         cpu_only: D3D12_CPU_DESCRIPTOR_HANDLE,
+        kind: ClearKind,
     ) -> Option<ClearUavTarget> {
         match view {
             View::Unordered(r, _, desc) => {
@@ -715,7 +737,8 @@ impl HostHeap {
                     Some(words) => uav_desc(words),
                     None => raw_default()?,
                 };
-                let (shadow, host_desc) = resolve_buffer_uav(address, buf_len.max(1), uav, true)?;
+                let (shadow, host_desc) =
+                    resolve_buffer_uav(address, buf_len.max(1), uav, Some(kind))?;
                 let range = desc
                     .as_ref()
                     .and_then(|words| unordered_range(address, words))
@@ -727,7 +750,7 @@ impl HostHeap {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let words: &[u32; 10] = desc[..10].try_into().ok()?;
                 let (shadow, host_desc) =
-                    resolve_buffer_uav(address, len.max(1), uav_desc(words), true)?;
+                    resolve_buffer_uav(address, len.max(1), uav_desc(words), Some(kind))?;
                 let range = unordered_range(address, words).unwrap_or((address, len));
                 self.write_buffer_uav(slot, &shadow, &host_desc, cpu_only, range)
             }
@@ -1177,7 +1200,7 @@ mod tests {
             },
         };
         // Unforced descriptor keeps structured layout (at 64-byte aligned sub-offset +32).
-        let (_, keep_struct) = resolve_buffer_uav(addr + 32, 96, desc, false).unwrap();
+        let (_, keep_struct) = resolve_buffer_uav(addr + 32, 96, desc, None).unwrap();
         assert_eq!(keep_struct.Format, DXGI_FORMAT_UNKNOWN);
         // SAFETY: buffer view union matches `ViewDimension == BUFFER`.
         let keep_buf = unsafe { keep_struct.Anonymous.Buffer };
@@ -1185,15 +1208,42 @@ mod tests {
         assert_eq!(keep_buf.FirstElement, 3);
         assert_eq!(keep_buf.NumElements, 3);
 
-        // Forced raw conversion translates 32B elements into R32_TYPELESS | RAW dwords.
-        let (_, raw) = resolve_buffer_uav(addr + 32, 96, desc, true).unwrap();
-        assert_eq!(raw.Format, DXGI_FORMAT_R32_TYPELESS);
+        // `ClearKind::Uint` translates 32B structured and raw views (including non-16B-aligned
+        // 4-byte offsets) into typed `DXGI_FORMAT_R32_UINT` (`FLAG_NONE`) dwords.
+        let (_, uint_clear) =
+            resolve_buffer_uav(addr + 8, 96, desc, Some(ClearKind::Uint)).unwrap();
+        assert_eq!(uint_clear.Format, DXGI_FORMAT_R32_UINT);
         // SAFETY: buffer view union matches `ViewDimension == BUFFER`.
-        let raw_buf = unsafe { raw.Anonymous.Buffer };
-        assert_eq!(raw_buf.StructureByteStride, 0);
-        assert_eq!(raw_buf.Flags, D3D12_BUFFER_UAV_FLAG_RAW);
-        assert_eq!(raw_buf.FirstElement, (32 + 2 * 32) / 4);
-        assert_eq!(raw_buf.NumElements, (3 * 32) / 4);
+        let uint_buf = unsafe { uint_clear.Anonymous.Buffer };
+        assert_eq!(uint_buf.StructureByteStride, 0);
+        assert_eq!(uint_buf.Flags, D3D12_BUFFER_UAV_FLAG_NONE);
+        assert_eq!(uint_buf.FirstElement, (8 + 2 * 32) / 4);
+        assert_eq!(uint_buf.NumElements, (3 * 32) / 4);
+
+        let raw_uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: 2,
+                    NumElements: 4,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        let (_, raw_to_uint) =
+            resolve_buffer_uav(addr + 8, 16, raw_uav, Some(ClearKind::Uint)).unwrap();
+        assert_eq!(raw_to_uint.Format, DXGI_FORMAT_R32_UINT);
+        // SAFETY: buffer view union matches `ViewDimension == BUFFER`.
+        let raw_to_uint_buf = unsafe { raw_to_uint.Anonymous.Buffer };
+        assert_eq!(raw_to_uint_buf.Flags, D3D12_BUFFER_UAV_FLAG_NONE);
+        assert_eq!(raw_to_uint_buf.FirstElement, 4);
+        assert_eq!(raw_to_uint_buf.NumElements, 4);
+
+        // `ClearKind::Float` refuses raw and structured buffer views.
+        assert!(resolve_buffer_uav(addr + 32, 96, desc, Some(ClearKind::Float)).is_none());
+        assert!(resolve_buffer_uav(addr + 8, 16, raw_uav, Some(ClearKind::Float)).is_none());
 
         let Some(heap) = HostHeap::new(false, 4) else {
             crate::shadow::unregister(0x7000_0001, addr);
@@ -1226,6 +1276,7 @@ mod tests {
             &View::Placed(true, res_desc, placed_words),
             std::ptr::null(),
             cpu_only,
+            ClearKind::Uint,
         );
         assert!(matches!(
             target,
@@ -1235,6 +1286,16 @@ mod tests {
                 ..
             }) if address == addr + 32
         ));
+        assert!(
+            heap.prepare_clear_uav(
+                slot,
+                &View::Placed(true, res_desc, placed_words),
+                std::ptr::null(),
+                cpu_only,
+                ClearKind::Float,
+            )
+            .is_none()
+        );
         heap.release(slot, 1);
         crate::shadow::unregister(0x7000_0001, addr);
     }

@@ -778,13 +778,17 @@ fn clear_uav(
     count: u32,
     rects: *const Rect,
 ) {
-    use crate::descriptor::host::ClearUavTarget;
+    use crate::descriptor::host::{ClearKind, ClearUavTarget};
     use windows::Win32::Foundation::RECT;
 
     let Some(view) =
         crate::descriptor::view(view_cpu).or_else(|| crate::descriptor::view(view_gpu))
     else {
         return;
+    };
+    let kind = match values {
+        ClearUavValues::Uint(_) => ClearKind::Uint,
+        ClearUavValues::Float(_) => ClearKind::Float,
     };
     with_state(this, |list, state| {
         let Some(host) = crate::host::host() else {
@@ -800,7 +804,7 @@ fn clear_uav(
             return;
         };
         let cpu_only = host.uav_cpu();
-        let Some(target) = host_heap.prepare_clear_uav(slot, &view, resource, cpu_only) else {
+        let Some(target) = host_heap.prepare_clear_uav(slot, &view, resource, cpu_only, kind) else {
             host_heap.release(slot, 1);
             return;
         };
@@ -822,7 +826,8 @@ fn clear_uav(
                     crate::texture::upload(list, *title_resource, tex);
                 }
                 ensure_state(list, *title_resource, UNORDERED_ACCESS);
-                crate::texture::host_written(*title_resource);
+                let raw = *title_resource as usize;
+                list.defer_host(move || crate::texture::host_written(raw as This));
                 tex.clone()
             }
             ClearUavTarget::Buffer {
@@ -2181,6 +2186,171 @@ mod tests {
             assert_eq!(host_heap.dynamic_used(), used_before + 3);
             f.submit_and_reset();
             assert_eq!(host_heap.dynamic_used(), used_before);
+        }
+
+        #[test]
+        fn clear_uav_uint_handles_non_16b_aligned_offsets_and_refuses_float_raw() {
+            let Some(mut f) = UavFixture::new(8) else {
+                return;
+            };
+            let list = f.title_list;
+            let buf = f.create_res(1, 512, 1, 0, 1, 4);
+            let (buf_ptr, _) = crate::resource::buffer_bytes(buf).unwrap();
+            // SAFETY: 128 u32 words in title buffer memory.
+            let buf_words = unsafe { std::slice::from_raw_parts_mut(buf_ptr.cast::<u32>(), 128) };
+            buf_words.fill(0xdead_beef);
+            // Byte offset 8 (`FirstElement = 2`), not 16-byte aligned: works via `R32_UINT`.
+            let uav_raw = f.make_uav(
+                0,
+                buf,
+                D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            FirstElement: 2,
+                            NumElements: 3,
+                            StructureByteStride: 0,
+                            CounterOffsetInBytes: 0,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        },
+                    },
+                },
+            );
+            // Byte offset 36 (`3 * 12`), non-16B-aligned structured window (dwords 9..15).
+            let uav_struct = f.make_uav(
+                1,
+                buf,
+                D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            FirstElement: 3,
+                            NumElements: 2,
+                            StructureByteStride: 12,
+                            CounterOffsetInBytes: 0,
+                            Flags: D3D12_BUFFER_UAV_FLAG_NONE,
+                        },
+                    },
+                },
+            );
+            let raw_val = [0x1122_3344u32, 0, 0, 0];
+            let struct_val = [0x5566_7788u32, 0, 0, 0];
+            let float_val = [1.0f32, 0.0, 0.0, 1.0];
+            f.bind_heap();
+            // SAFETY: open list, live buffer, and UAV descriptors.
+            unsafe {
+                slot::<ClearFloatFn>(list, 0x1b0)(
+                    list,
+                    uav_raw,
+                    uav_raw,
+                    buf,
+                    &float_val,
+                    0,
+                    std::ptr::null(),
+                );
+                slot::<ClearFloatFn>(list, 0x1b0)(
+                    list,
+                    uav_struct,
+                    uav_struct,
+                    buf,
+                    &float_val,
+                    0,
+                    std::ptr::null(),
+                );
+                slot::<ClearUintFn>(list, 0x1a8)(
+                    list,
+                    uav_raw,
+                    uav_raw,
+                    buf,
+                    &raw_val,
+                    0,
+                    std::ptr::null(),
+                );
+                slot::<ClearUintFn>(list, 0x1a8)(
+                    list,
+                    uav_struct,
+                    uav_struct,
+                    buf,
+                    &struct_val,
+                    0,
+                    std::ptr::null(),
+                );
+            }
+            f.submit_and_reset();
+
+            assert!(buf_words[..2].iter().all(|&w| w == 0xdead_beef));
+            assert!(buf_words[2..5].iter().all(|&w| w == 0x1122_3344));
+            assert!(buf_words[5..9].iter().all(|&w| w == 0xdead_beef));
+            assert!(buf_words[9..15].iter().all(|&w| w == 0x5566_7788));
+            assert!(buf_words[15..].iter().all(|&w| w == 0xdead_beef));
+            // SAFETY: live device query.
+            assert!(unsafe { f.host.device.GetDeviceRemovedReason() }.is_ok());
+        }
+
+        #[test]
+        fn clear_uav_defers_texture_host_written_until_submit() {
+            let Some(mut f) = UavFixture::new(4) else {
+                return;
+            };
+            let list = f.title_list;
+            let tex = f.create_res(3, 4, 4, 28, 0, 4);
+            let uav = f.make_uav(
+                0,
+                tex,
+                D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_UAV::default(),
+                    },
+                },
+            );
+            let color = [0.0f32, 0.0, 1.0, 1.0];
+            // Record ClearFloat and reset WITHOUT submitting: texture must NOT be host_written.
+            // SAFETY: open list, live texture, and UAV descriptor.
+            unsafe {
+                slot::<ClearFloatFn>(list, 0x1b0)(
+                    list,
+                    uav,
+                    uav,
+                    tex,
+                    &color,
+                    0,
+                    std::ptr::null(),
+                );
+            }
+            assert!(!crate::texture::is_host_written(tex));
+            assert_eq!(slot::<CloseFn>(list, 0x48)(list), S_OK);
+            assert_eq!(
+                slot::<ResetFn>(list, 0x50)(list, f.allocator, std::ptr::null()),
+                S_OK
+            );
+            assert!(!crate::texture::is_host_written(tex));
+
+            // Record again and submit: texture becomes `host_written` with expected pixels.
+            // SAFETY: open list, live texture, and UAV descriptor.
+            unsafe {
+                slot::<ClearFloatFn>(list, 0x1b0)(
+                    list,
+                    uav,
+                    uav,
+                    tex,
+                    &color,
+                    0,
+                    std::ptr::null(),
+                );
+            }
+            f.submit_and_reset();
+            assert!(crate::texture::is_host_written(tex));
+            let rgba = f.read_rgba_4x4(tex);
+            for y in 0..4usize {
+                for x in 0..4usize {
+                    let px = &rgba[y * 256 + x * 4..y * 256 + x * 4 + 4];
+                    assert_eq!(px, &[0, 0, 255, 255], "texel ({x}, {y})");
+                }
+            }
         }
     }
 }
