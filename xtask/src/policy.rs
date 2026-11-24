@@ -12,6 +12,9 @@ use anyhow::{Context, Result, bail};
 
 const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
+/// Longest array of numeric literals, or string of `\xHH` escapes, a file may
+/// hold. The largest table in the tree (XMA's, 272 entries) is well under.
+const MAX_LITERAL_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
@@ -500,6 +503,12 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
         if run > MAX_ENCODED_RUN {
             problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
         }
+        let run = longest_literal_run(content);
+        if run > MAX_LITERAL_RUN {
+            problems.push(format!(
+                "{run}-element numeric array or byte-escape string (embedded data?)"
+            ));
+        }
     }
     problems
 }
@@ -547,9 +556,73 @@ fn longest_run(content: &[u8], extra: &[u8]) -> usize {
     longest
 }
 
+/// Longest list of numeric literals separated by commas, or run of `\xHH`
+/// escapes, in `content`.
+///
+/// Neither is a hex/base64 run: `xxd -i` and `bin2c` write a file as
+/// `0x4d, 0x5a, 0x90, ...`, and a byte string as `"\x4d\x5a\x90..."`,
+/// each token two to four characters long. So an executable pasted into a
+/// `const DATA: [u8; N]` passed as long as the file stayed under the size
+/// limit. Whitespace and line breaks around the commas do not end a list;
+/// anything else (a bracket, a comment, an identifier) does, so the rows of
+/// a two-dimensional table count one by one.
+fn longest_literal_run(content: &[u8]) -> usize {
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let (mut longest, mut i) = (0, 0);
+    // Comma-separated literals: `0x4d`, `77u8`, `1_000`, `0.5`, `-3`.
+    let mut run = 0;
+    while i < content.len() {
+        let starts_literal = match content[i] {
+            b'0'..=b'9' => true,
+            b'-' => content.get(i + 1).is_some_and(u8::is_ascii_digit),
+            _ => false,
+        } && (i == 0 || !ident(content[i - 1]));
+        if !starts_literal {
+            run = 0;
+            i += 1;
+            continue;
+        }
+        i += 1;
+        while content.get(i).is_some_and(|&b| ident(b) || b == b'.') {
+            i += 1;
+        }
+        run += 1;
+        longest = longest.max(run);
+        let mut j = i;
+        while content.get(j).is_some_and(u8::is_ascii_whitespace) {
+            j += 1;
+        }
+        if content.get(j) == Some(&b',') {
+            j += 1;
+            while content.get(j).is_some_and(u8::is_ascii_whitespace) {
+                j += 1;
+            }
+            i = j;
+        } else {
+            run = 0;
+        }
+    }
+    // `\xHH` escapes back to back.
+    let (mut run, mut i) = (0, 0);
+    while i < content.len() {
+        if let [b'\\', b'x', h, l, ..] = content[i..]
+            && h.is_ascii_hexdigit()
+            && l.is_ascii_hexdigit()
+        {
+            run += 1;
+            longest = longest.max(run);
+            i += 4;
+            continue;
+        }
+        run = 0;
+        i += 1;
+    }
+    longest
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MAX_ENCODED_RUN, check};
+    use super::{MAX_ENCODED_RUN, MAX_LITERAL_RUN, check};
 
     /// Enforces the policy wherever tests run, even in clones without the hook.
     #[test]
@@ -1455,5 +1528,74 @@ mod tests {
         assert_eq!(run(b""), 0);
         let paragraph = "The quick brown fox\njumps over the lazy dog\n".repeat(200);
         assert!(run(paragraph.as_bytes()) < 20);
+    }
+
+    /// `xxd -i` output, a Rust byte array and a byte-escape string: every
+    /// token is short, but the file is an executable all the same.
+    #[test]
+    fn rejects_data_as_numeric_arrays_and_escapes() {
+        let bytes: Vec<u8> = (0..MAX_LITERAL_RUN * 2).map(|i| (i * 37) as u8).collect();
+        let xxd: String = bytes
+            .chunks(12)
+            .map(|row| {
+                let row: Vec<String> = row.iter().map(|b| format!("0x{b:02x}")).collect();
+                format!("  {},\n", row.join(", "))
+            })
+            .collect();
+        let decimal: Vec<String> = bytes.iter().map(|b| format!("{b}u8")).collect();
+        let escaped: String = bytes.iter().map(|b| format!("\\x{b:02x}")).collect();
+        for blob in [
+            format!("unsigned char data[] = {{\n{xxd}}};\n"),
+            format!(
+                "const DATA: [u8; {}] = [{}];\n",
+                bytes.len(),
+                decimal.join(",")
+            ),
+            format!("const DATA: &[u8] = b\"{escaped}\";\n"),
+        ] {
+            assert_eq!(
+                super::longest_literal_run(blob.as_bytes()),
+                bytes.len(),
+                "{blob:.80}"
+            );
+            assert!(
+                check("src/data.rs", blob.as_bytes())
+                    .iter()
+                    .any(|p| p.contains("numeric array")),
+                "{blob:.80}"
+            );
+        }
+    }
+
+    /// Tables split into rows, numbers inside identifiers, prose and the odd
+    /// escape stay short.
+    #[test]
+    fn literal_runs_end_at_anything_but_commas() {
+        let run = super::longest_literal_run;
+        assert_eq!(run(b"[1, 2,\n 3,\r\n\t-4, 0x5_u8, 6.5]"), 6);
+        assert_eq!(run(b"[[1, 2], [3, 4]]"), 2, "rows count one by one");
+        assert_eq!(run(b"1, 2, // three\n4, 5"), 2, "a comment ends the list");
+        assert_eq!(
+            run(b"f(x86_64, u8, 2)"),
+            1,
+            "digits inside identifiers are not literals"
+        );
+        assert_eq!(run(b"a - 1, b"), 1);
+        assert_eq!(run(br"\x4d\x5a\x90\x00 \x01"), 4);
+        assert_eq!(run(br"\x4\xzz\\x"), 0);
+        assert_eq!(run(b""), 0);
+        let table: String = (0..64)
+            .map(|r| {
+                format!(
+                    "    [{}],\n",
+                    (0..16)
+                        .map(|c| (r * c % 7).to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .collect();
+        assert_eq!(run(table.as_bytes()), 16);
+        assert!(check("src/table.rs", table.as_bytes()).is_empty());
     }
 }
