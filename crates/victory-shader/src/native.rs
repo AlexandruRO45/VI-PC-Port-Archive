@@ -4320,6 +4320,69 @@ mod tests {
     }
 
     #[test]
+    fn constants_reads_keep_none_of_the_table_or_descriptor_rules() {
+        let (srv, sampler, cbv, uav) = (0u8, 1u8, 2u8, 3u8);
+        let (constants, descriptor, table) = (0u8, 1u8, 3u8);
+        // A table in s4 (slot 2), a root descriptor in s6-s7 (slot 3) and
+        // two constants in s8-s9 (slot 4).
+        let params = [(3, 1, 4, 2), (1, 2, 6, 3), (0, 2, 8, 4)];
+        // Lowering classifies only table and root-descriptor reads, and the
+        // host binds only table reads, so a read through constants names no
+        // parameter and no descriptor: it is kept as stated, at any offset
+        // and whatever SGPR and slot it states, its own or none.
+        for (kind, offset, user_data, slot) in [
+            (cbv, 0, 8, 4),
+            (srv, u32::MAX, 8, 4),
+            (sampler, MAX_TABLE_DWORDS, 30, 7),
+            (uav, 4, 4, 2),
+        ] {
+            let p =
+                &reading_with(&params, &[(kind, constants, offset, user_data, slot)]).unwrap()[0];
+            assert_eq!(p.used[0].root, RootType::Constants);
+            assert_eq!(
+                (
+                    p.used[0].table_offset_dwords,
+                    p.used[0].user_data,
+                    p.used[0].slot
+                ),
+                (offset, user_data, slot)
+            );
+        }
+        // Beside the table's and the root descriptor's own reads, naming
+        // their SGPR and slot with another kind, it is neither a second way
+        // of reading their descriptor nor a sampler in the view table.
+        let beside = [
+            (cbv, table, 4, 4, 2),
+            (sampler, constants, 4, 4, 2),
+            (srv, descriptor, 0, 6, 3),
+            (uav, constants, 0, 6, 3),
+        ];
+        assert!(reading_with(&params, &beside).is_ok());
+        // The same reads through the table or the root descriptor are
+        // refused.
+        for (reads, refusal) in [
+            (
+                [(cbv, table, 4, 4, 2), (sampler, table, 4, 4, 2)],
+                "used descriptors read one descriptor two ways",
+            ),
+            (
+                [(cbv, table, 4, 4, 2), (sampler, table, 8, 4, 2)],
+                "root table mixes samplers and views",
+            ),
+            (
+                [(srv, descriptor, 0, 6, 3), (uav, descriptor, 0, 6, 3)],
+                "used descriptors read one descriptor two ways",
+            ),
+        ] {
+            assert_eq!(
+                why_refused(reading_with(&params, &reads)),
+                refusal,
+                "{reads:?}"
+            );
+        }
+    }
+
+    #[test]
     fn refuses_a_descriptor_read_of_unknown_kind() {
         let (descriptor, table) = (1u8, 3u8);
         // SRV, sampler, CBV and UAV are the kinds there are.
