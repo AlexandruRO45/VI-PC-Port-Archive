@@ -59,6 +59,11 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    if let StageIo::Cs(cs) = &parts.native.io
+        && !thread_group_fits(cs.threads)
+    {
+        return Err(ShaderError::Malformed("a thread group past D3D12's limits"));
+    }
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad).run() {
@@ -74,6 +79,14 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             Err(Stop::Fail(e)) => return Err(e),
         }
     }
+}
+
+/// Whether a compute program's `numthreads` is one D3D12 runs (and the
+/// console's compiler accepts): 1-1024 by 1-1024 by 1-64, at most 1024
+/// threads. The size comes from the title's stage data; the lowering
+/// multiplies its components in `u32` and divides by them.
+fn thread_group_fits([x, y, z]: [u32; 3]) -> bool {
+    (1..=1024).contains(&x) && (1..=1024).contains(&y) && (1..=64).contains(&z) && x * y * z <= 1024
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
@@ -6598,6 +6611,15 @@ mod tests {
 
     /// The DXIL of a compute program of constants.
     fn dxil(words: &[u32], wave64: bool) -> Result<Vec<u8>, crate::ShaderError> {
+        dxil_group(words, wave64, [1, 1, 1])
+    }
+
+    /// The DXIL of a compute program of constants run in `threads` groups.
+    fn dxil_group(
+        words: &[u32],
+        wave64: bool,
+        threads: [u32; 3],
+    ) -> Result<Vec<u8>, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -6605,10 +6627,7 @@ mod tests {
             vgprs: 256,
             layout: vec![],
             used: vec![],
-            io: StageIo::Cs(ComputeIo {
-                rsrc2: 0,
-                threads: [1, 1, 1],
-            }),
+            io: StageIo::Cs(ComputeIo { rsrc2: 0, threads }),
             code,
         };
         let p = ir::build(&native.code, false, 256).unwrap();
@@ -6627,6 +6646,47 @@ mod tests {
             mesh_stride: 0,
         })
         .map(|l| l.dxil)
+    }
+
+    /// `numthreads` comes from the title's stage data. A size D3D12 cannot
+    /// run is refused before lowering multiplies its components (which
+    /// overflowed `u32` for 65536 x 65536 and wrapped to 0 in a release
+    /// build) or divides by them (0).
+    #[test]
+    fn a_thread_group_past_d3d12s_limits_is_refused() {
+        let refused = Err(crate::ShaderError::Malformed(
+            "a thread group past D3D12's limits",
+        ));
+        for threads in [
+            [0, 1, 1],
+            [1, 0, 1],
+            [1, 1, 0],
+            [1025, 1, 1],
+            [1, 1025, 1],
+            [1, 1, 65],
+            [64, 32, 1],
+            [32, 8, 8],
+            [65536, 65536, 1],
+            [u32::MAX, u32::MAX, u32::MAX],
+        ] {
+            for wave64 in [false, true] {
+                let got = dxil_group(&[S_ENDPGM], wave64, threads).map(|_| ());
+                assert_eq!(got, refused, "{threads:?} wave64 {wave64}");
+            }
+        }
+        for threads in [
+            [1, 1, 1],
+            [1024, 1, 1],
+            [1, 1024, 1],
+            [1, 1, 64],
+            [16, 16, 4],
+            [8, 8, 16],
+        ] {
+            assert!(
+                dxil_group(&[S_ENDPGM], false, threads).is_ok(),
+                "{threads:?}"
+            );
+        }
     }
 
     /// A lane select keeps only the bits the wave has lanes for, as the
