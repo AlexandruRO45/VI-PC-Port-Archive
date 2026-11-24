@@ -5736,6 +5736,26 @@ impl Meter {
                 );
             }
         }
+        {
+            let p = crate::draw::HEAP_PHASES.each_ref().map(|a| a.swap(0, Ordering::Relaxed) as f64);
+            let ms = |i: usize| p[i] / 1e3 / frames;
+            tracing::info!(
+                "heap pass per frame: buffer slots {:.1} ms, buffer refreshes {:.1} ms, texture queue {:.1} ms, \
+                 mapped bytes {:.1} ms, views and host textures made {:.1} ms, uploads recorded {:.1} ms, rest {:.1} ms; \
+                 {:.0} texture slots looked at, {:.1} uploaded; passes ended by the time {:.2}, by the bytes {:.2}",
+                ms(0),
+                ms(1),
+                ms(2),
+                ms(3),
+                ms(4),
+                ms(5),
+                ms(6),
+                p[7] / frames,
+                p[8] / frames,
+                p[9] / frames,
+                p[10] / frames
+            );
+        }
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
@@ -5854,7 +5874,15 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        // `VICTORY_STATIC_TITLE=1`: a caption that does not change, so that
+        // window captures by title work while the game runs (the rate is in
+        // the log).
+        static STATIC_TITLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let text = if *STATIC_TITLE.get_or_init(|| std::env::var_os("VICTORY_STATIC_TITLE").is_some_and(|v| v == "1")) {
+            " | VIctory medindo".to_string()
+        } else {
+            format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame")
+        };
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
