@@ -50,14 +50,17 @@ use windows::core::{Interface, s};
 use windows_sys::Win32::System::Memory as mem;
 
 /// The unit heaps and placed buffers are cut on, and the console's page.
-const K64: usize = 64 << 10;
+pub(crate) const K64: usize = 64 << 10;
 /// The host's write watching (not in windows-sys' memory module).
-const MEM_WRITE_WATCH: u32 = 0x20_0000;
+pub(crate) const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
 /// `VICTORY_INPLACE_PROBE`: 0 (unset) nothing; 1 the probe on memory of
-/// its own at the first sweep, and the census 30 and 150 seconds later;
-/// 2 also opens one part of the title's own memory for a moment at the
-/// first census.
+/// its own at the first sweep (with Stage 0's small probes, P2-P6 and R9,
+/// `crate::inplace_probes`, on a thread of its own), and the census 30 and
+/// 150 seconds later; 2 also opens one part of the title's own memory for
+/// a moment at the first census; 3 also runs the probes that lock or
+/// commit gigabytes for a moment (P1, P2's 4 GiB, P7). The same probes
+/// without the title: `victory inplace-probe`.
 pub(crate) fn probe_level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE_PROBE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
@@ -235,7 +238,7 @@ pub(crate) fn open(device: &ID3D12Device, from: From) -> windows::core::Result<I
     }
 }
 
-fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
+pub(crate) fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
     D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: size.max(1),
@@ -454,7 +457,7 @@ pub(crate) fn private_whole(at: usize, len: usize) -> bool {
         && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(len)
 }
 
-fn hr<T>(result: &windows::core::Result<T>) -> String {
+pub(crate) fn hr<T>(result: &windows::core::Result<T>) -> String {
     match result {
         Ok(_) => "ok".to_owned(),
         Err(e) => format!("REFUSED {:#010x} ({})", e.code().0, e.message().trim()),
@@ -463,9 +466,9 @@ fn hr<T>(result: &windows::core::Result<T>) -> String {
 
 /// A queue, a list and a fence of the probe's own on `device`: nothing of
 /// the host's submissions is touched.
-struct Rig {
-    device: ID3D12Device,
-    queue: ID3D12CommandQueue,
+pub(crate) struct Rig {
+    pub(crate) device: ID3D12Device,
+    pub(crate) queue: ID3D12CommandQueue,
     allocator: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
@@ -483,7 +486,14 @@ impl Drop for Rig {
 }
 
 impl Rig {
-    fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
+    /// Why the device was removed, if it was.
+    pub(crate) fn removed(&self) -> Option<String> {
+        // SAFETY: a plain query.
+        let reason = unsafe { self.device.GetDeviceRemovedReason() };
+        reason.err().map(|e| format!("{:#010x} {}", e.code().0, e.message().trim()))
+    }
+
+    pub(crate) fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
         // SAFETY: plain creation of objects of our own.
         unsafe {
             let queue: ID3D12CommandQueue =
@@ -498,7 +508,7 @@ impl Rig {
     }
 
     /// Records with `record`, runs it and waits (ten seconds at most).
-    fn run(&mut self, record: impl FnOnce(&ID3D12GraphicsCommandList)) -> windows::core::Result<()> {
+    pub(crate) fn run(&mut self, record: impl FnOnce(&ID3D12GraphicsCommandList)) -> windows::core::Result<()> {
         // SAFETY: our own list and queue, one run at a time.
         unsafe {
             self.allocator.Reset()?;
@@ -528,7 +538,7 @@ impl Rig {
     }
 
     /// What the GPU reads of `size` bytes of `resource` from `offset`.
-    fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
+    pub(crate) fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
         let back = self.committed(D3D12_HEAP_TYPE_READBACK, size as u64, D3D12_RESOURCE_STATE_COPY_DEST)?;
         // SAFETY: two live buffers, the range inside both.
         self.run(|list| unsafe { list.CopyBufferRegion(&back, 0, resource, offset, size as u64) })?;
@@ -543,7 +553,7 @@ impl Rig {
     }
 
     /// The GPU writes `bytes` at `offset` of `resource` (a copy).
-    fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
+    pub(crate) fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
         let up = self.committed(D3D12_HEAP_TYPE_UPLOAD, bytes.len() as u64, D3D12_RESOURCE_STATE_GENERIC_READ)?;
         let mut data = std::ptr::null_mut();
         // SAFETY: the mapping holds the buffer's bytes until unmapped.
@@ -558,7 +568,7 @@ impl Rig {
 
     /// A compute shader stores, through a root unordered-access view at
     /// `gpu`, the sum of the buffer's first two words in its third.
-    fn shade(&mut self, gpu: u64) -> windows::core::Result<()> {
+    pub(crate) fn shade(&mut self, gpu: u64) -> windows::core::Result<()> {
         const SOURCE: &str = "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n[RootSignature(RS)]\n[numthreads(1, 1, 1)]\nvoid main() { b.Store(8, b.Load(0) + b.Load(4)); }\n";
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; then the
@@ -605,20 +615,20 @@ impl Rig {
     }
 }
 
-fn fill(at: *mut u8, len: usize, seed: u8) {
+pub(crate) fn fill(at: *mut u8, len: usize, seed: u8) {
     for i in 0..len {
         // SAFETY: the caller's own committed memory of `len` bytes.
         unsafe { at.add(i).write((i as u8).wrapping_mul(31).wrapping_add(seed)) };
     }
 }
 
-fn same(at: *const u8, bytes: &[u8]) -> bool {
+pub(crate) fn same(at: *const u8, bytes: &[u8]) -> bool {
     // SAFETY: the caller's own committed memory of that length.
     unsafe { std::slice::from_raw_parts(at, bytes.len()) == bytes }
 }
 
 /// The process's working set in MB.
-fn working_set_mb() -> u64 {
+pub(crate) fn working_set_mb() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     let mut counters = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
     // SAFETY: our own process and a sized structure.
@@ -653,7 +663,23 @@ pub(crate) struct Probe {
 /// gives the card's memory account (`Host::video_memory`) where there is
 /// one. Nothing of the title's is touched. `mb` is the size of the cost
 /// measurement (0 leaves it out).
+#[cfg(test)]
 pub(crate) fn probe(device: &ID3D12Device, memory: &dyn Fn() -> Option<[u64; 4]>, mb: usize) -> Probe {
+    probe_with(device, memory, mb, false, false)
+}
+
+/// [`probe`], then Stage 0's probes (`crate::inplace_probes`): with `big`
+/// also those that lock or commit gigabytes, with `tiles` the tile mapping
+/// that removes the device (only on a device of the probe's own).
+pub(crate) fn probe_with(device: &ID3D12Device, memory: &dyn Fn() -> Option<[u64; 4]>, mb: usize, big: bool, tiles: bool) -> Probe {
+    let mut p = probe_first(device, memory, mb);
+    if let Ok(mut rig) = Rig::new(device) {
+        crate::inplace_probes::stage0(&mut p.lines, &mut rig, big, tiles);
+    }
+    p
+}
+
+fn probe_first(device: &ID3D12Device, memory: &dyn Fn() -> Option<[u64; 4]>, mb: usize) -> Probe {
     let mut p = Probe::default();
     let mut rig = match Rig::new(device) {
         Ok(rig) => rig,
@@ -1078,12 +1104,18 @@ pub(crate) fn tick() {
                 return;
             };
             let mb = std::env::var("VICTORY_INPLACE_PROBE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64usize);
-            let took = std::time::Instant::now();
-            let probe = probe(&host.device, &|| host.video_memory(), mb.min(1024));
-            for line in &probe.lines {
-                tracing::info!("in place probe: {line}");
-            }
-            tracing::info!("in place probe: took {:.0} ms", took.elapsed().as_secs_f64() * 1000.0);
+            // On a thread of its own (a queue of its own too): Stage 0's
+            // probes take seconds; with level 3 they also lock and commit
+            // gigabytes for a moment (P1, P2's 4 GiB, P7).
+            let device = host.device.clone();
+            let _ = std::thread::Builder::new().name("victory-inplace-probe".into()).spawn(move || {
+                let took = std::time::Instant::now();
+                let probe = probe_with(&device, &|| host.video_memory(), mb.min(1024), probe_level() >= 3, false);
+                for line in &probe.lines {
+                    tracing::info!("in place probe: {line}");
+                }
+                tracing::info!("in place probe: took {:.0} ms", took.elapsed().as_secs_f64() * 1000.0);
+            });
             now
         }
         Err(started) => started,
@@ -1207,6 +1239,39 @@ mod tests {
         assert!(probe.section_reads && probe.section_writes, "a committed section in place");
         assert!(probe.section_outlives_views, "the section's heap does not depend on views");
         assert!(probe.reserved_section_refused, "a reserved section is refused");
+    }
+
+    /// Stage 0's small probes on the software adapter: every one gives its
+    /// line and none removes the device.
+    #[test]
+    fn warp_stage0_probes_give_their_lines() {
+        let Some(device) = warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        let mut rig = Rig::new(&device).unwrap();
+        let mut lines = Vec::new();
+        crate::inplace_probes::stage0(&mut lines, &mut rig, false, false);
+        for line in &lines {
+            eprintln!("in place probe: {line}");
+        }
+        let text = lines.join("\n");
+        for name in ["P1 GPU virtual", "P2 private", "P3 private part", "P3 committed section", "P4 ", "P5 512", "P5 two", "P6 vertex", "P6 root", "P6 ExecuteIndirect", "P6 CopyTextureRegion", "P6 ResolveQueryData", "R9 "] {
+            assert!(text.contains(name), "no line {name}: {text}");
+        }
+        assert!(!text.contains("REMOVED"), "{text}");
+        assert!(text.contains("InterlockedOr true, InterlockedAnd true"), "{text}");
+    }
+
+    /// All of Stage 0 on this PC's card (`cargo test -p victory-gpu --
+    /// --ignored probe_on_hardware --nocapture`); `victory inplace-probe`
+    /// is the same with a choice of what runs.
+    #[test]
+    #[ignore = "locks and commits gigabytes on the card's device"]
+    fn probe_on_hardware() {
+        for line in crate::inplace_probes::run_alone(1024, true, false, false) {
+            eprintln!("in place probe: {line}");
+        }
     }
 
     /// Stage 1's own call on the software adapter: a title buffer that
