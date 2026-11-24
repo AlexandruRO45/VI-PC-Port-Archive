@@ -8918,10 +8918,10 @@ impl<'a> Lower<'a> {
             // cover (for its marks).
             let (byte, bytes);
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
-                if count != 4 || *offen || *offset != 0 {
-                    return Err("a typed buffer store of some channels or at an offset");
+                // shortcut: typed stores are taken to write channels of a float
+                // format.
+                if *offen || *offset != 0 {
+                    return Err("a typed buffer store at an offset");
                 }
                 let h = self.handle(site, src, false, (10 | u, 0x409))?;
                 let element = index.unwrap_or(self.s.m.i32(0));
@@ -8930,6 +8930,7 @@ impl<'a> Lower<'a> {
                 for x in vals {
                     args.push(self.as_float(x));
                 }
+                args.resize(3 + 4, self.s.m.f32(0));
                 // The element's size is the view's stride (16 bytes at most).
                 (byte, bytes) = match self.s.view_index.get(&h).copied() {
                     Some(at) if self.x.view_marks => {
@@ -10723,6 +10724,70 @@ mod tests {
         // No parameter starts in rows 1, 3 or 4.
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
+        }
+    }
+
+    #[test]
+    fn partial_channel_typed_buffer_store_lowers() {
+        use crate::native::{RootParam, RootType};
+
+        // MUBUF buffer_store_format_{x,xy,xyz,d16_xyz} (ops 0x04, 0x05, 0x06, 0x86)
+        // with idxen=1, vaddr=v0, vdata=v1, srsrc=s[4:7].
+        for op in [0x04u32, 0x05, 0x06, 0x86] {
+            let mubuf_w0 = 0xE000_2000 | (op << 18);
+            let words = [
+                // s_mov_b32 s1, 0
+                0xBE81_0380u32,
+                // s_load_dwordx4 s[4:7], s[0:1], null
+                0xF408_0100,
+                0xFA00_0000,
+                // v_mov_b32 v0..v3, 0
+                0x7E00_0280,
+                0x7E02_0280,
+                0x7E04_0280,
+                0x7E06_0280,
+                // buffer_store_format_* v[1..], v0, s[4:7], 0 idxen
+                mubuf_w0,
+                0x8001_0100,
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 4).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                view_marks: false,
+            })
+            .unwrap();
         }
     }
 }
