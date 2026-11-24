@@ -608,4 +608,21 @@ mod tests {
         assert_eq!(FourCC(*b"A\0 \xFF").to_string(), "A...");
         assert_eq!(format!("{:?}", FourCC(*b"\nPS\x7F")), ".PS.");
     }
+
+    #[test]
+    fn the_major_version_is_checked_before_the_size() {
+        // A wrong major names the layout as unknown even when the size and
+        // part count are forged too: nothing past the version is trusted.
+        let mut bytes = build(&[(FourCC::SFI0, &[0; 8])]);
+        bytes[0x14..0x16].copy_from_slice(&2u16.to_le_bytes());
+        bytes[0x18..0x1C].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[0x1C..0x20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(malformed(&bytes), "container major version is not 1");
+        // With the major fixed, the size is named before the part count.
+        bytes[0x14..0x16].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(malformed(&bytes), "container larger than DXC allows");
+        let len = bytes.len() as u32;
+        bytes[0x18..0x1C].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(malformed(&bytes), "implausible part count");
+    }
 }

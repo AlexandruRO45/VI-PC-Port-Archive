@@ -313,4 +313,33 @@ mod tests {
         );
         assert_eq!((base.filter, base.mip_lod_bias), (0x15, 0.5));
     }
+
+    /// The clamp sits exactly at D3D12's bounds: the last bias step below
+    /// 15.99 is kept and the next clamps; -16 and the step above it are kept.
+    #[test]
+    fn lod_bias_clamps_at_the_exact_host_bound() {
+        let bias = |field: u32| StaticSampler::from_words([0, 0, field, 0]).mip_lod_bias;
+        assert_eq!(bias(0x0FFD), 4093.0 / 256.0, "15.988 is kept");
+        assert_eq!(bias(0x0FFE), 15.99, "15.992 clamps");
+        assert_eq!(bias(0x3001), -4095.0 / 256.0, "-15.996 is kept");
+        assert_eq!(bias(0x2FFF), -16.0, "-16.004 clamps");
+        assert_eq!(bias(0), 0.0);
+    }
+
+    /// Comparison is a reduction like any other: applied twice it is applied
+    /// once, and the reserved reduction (3) becomes comparison as filtering
+    /// does.
+    #[test]
+    fn comparison_is_idempotent_and_takes_the_reserved_reduction() {
+        for w0 in [0, 0x2000_0000, 0x4000_0000, 0x6000_0000] {
+            for w2 in [0, 0x0850_0000, 0x00F0_0000] {
+                let once = StaticSampler::from_words([w0, 0, w2, 0]).comparison();
+                assert_eq!(once.comparison(), once, "w0 {w0:#x} w2 {w2:#x}");
+                assert_eq!(once.filter >> 7, 1, "w0 {w0:#x} w2 {w2:#x}");
+            }
+        }
+        let reserved = |w2: u32| StaticSampler::from_words([0x6000_0000, 0, w2, 0]);
+        assert_eq!(reserved(0).comparison().filter, 0x80);
+        assert_eq!(reserved(0x00F0_0000).comparison().filter, 0xD5);
+    }
 }
