@@ -932,6 +932,42 @@ mod tests {
     }
 
     #[test]
+    fn marker_without_a_stream_ending_before_a_header_is_a_record_too() {
+        // The phantom of the test above, its span ending just short of
+        // PS_after's header (29 packed bytes: 16 of noise, then PS_after's
+        // 13 bytes before its NUL) or of its name (20: noise and the 4 bytes
+        // before the length byte). It covers no record, so it is yielded
+        // (and does not unpack), and PS_after follows it; a name the phantom
+        // swallowed, wholly or in part, is not read, as the name lies before
+        // where PS_after may start.
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("PS_first", 0x32, b"first"));
+        let after = record_bytes("PS_after", 0x32, b"after");
+        for (span, name) in [(20, Some("PS_after")), (21, None), (25, None), (29, None)] {
+            let mut file = file.clone();
+            file.extend_from_slice(b"DXBC");
+            let phantom = file.len() + 4;
+            let n = (12 + span) as u32;
+            for v in [n, 0x000D_DCE7, n, 64] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            file.extend_from_slice(&[0x07; 16]);
+            let start = file.len();
+            file.extend(&after);
+            file.extend_from_slice(&[0x5A; 16]);
+            let found: Vec<_> = records(&file).collect();
+            assert_eq!(found.len(), 3, "span {span}");
+            assert_eq!(found[1].offset, phantom, "span {span}");
+            assert_eq!(found[1].name, None, "span {span}");
+            assert_eq!(found[1].unpack(), None, "span {span}");
+            assert_eq!(found[2].offset, start + 19, "span {span}");
+            assert_eq!(found[2].name, name, "span {span}");
+            assert_eq!(found[2].unpack().as_deref(), Some(&b"after"[..]));
+            assert!(found[1].span().end <= found[2].offset - 6, "span {span}");
+        }
+    }
+
+    #[test]
     fn corrupt_record_is_still_a_record() {
         // A real record whose stream is damaged covers no other record: it
         // is yielded (and does not unpack), and so is the record after it.
