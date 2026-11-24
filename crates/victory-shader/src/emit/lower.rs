@@ -3627,8 +3627,17 @@ impl<'a> Lower<'a> {
                             )
                     });
                     if number {
+                        // Name the field the code wanted: an address word has
+                        // no host value at all, a size or format one is what a
+                        // host view's dimensions do not carry.
+                        let why: Why = match rel {
+                            0 => "a descriptor's base address read as data",
+                            1 => "a descriptor's high address read as data",
+                            3 => "a descriptor's format read as data",
+                            _ => OTHER,
+                        };
                         if let Some(v) = inst.write(reg) {
-                            self.vals.insert(v, Val::Missing(OTHER));
+                            self.vals.insert(v, Val::Missing(why));
                         }
                     } else {
                         let zero = self.s.m.i32(0);

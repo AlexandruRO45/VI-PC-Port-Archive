@@ -1680,6 +1680,24 @@ impl<'a> Tracer<'a> {
         }
         extra.offset = extra.offset.wrapping_add(offset as u32);
         let a = self.address(lo, hi, extra, depth)?;
+        // A scalar load whose address is the parameter's own first qword,
+        // with nothing added, reads the root arguments themselves rather
+        // than what that qword points at.
+        let a = match a.rel {
+            Some(RelOffset { value, base, .. })
+                if a.deref && value == base && extra.dynamic.is_none() =>
+            {
+                Address {
+                    param: a.param,
+                    offset: extra.offset,
+                    dynamic: None,
+                    rel: None,
+                    deref: false,
+                    bias: 0,
+                }
+            }
+            _ => a,
+        };
         // Root arguments have no memory behind them, so a read that reaches
         // past the parameter's own dwords is reaching through the pointer
         // its first qword holds.
