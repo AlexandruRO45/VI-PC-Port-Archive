@@ -2295,6 +2295,76 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// A `core.excludesFile` included on `hasconfig:remote.*.url:` holds
+    /// only while some remote's URL matches the pattern, as the full check
+    /// reads it: with no remote, or one whose host merely starts the same,
+    /// `remote` stays visible and is refused, left empty, and `local`
+    /// (ignored by `.git/info/exclude`) is taken; once `origin` matches,
+    /// `remote` is taken. A later empty `excludesFile` clears the included
+    /// one rather than naming a file, and `remote` is refused again.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_may_be_ignored_by_an_excludes_file_included_on_a_remote() {
+        let repo = tempdir();
+        let outside = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        std::fs::write(root.join(".git/info/exclude"), "/local/\n").unwrap();
+        let rules = outside.path().join("remote.rules");
+        std::fs::write(&rules, "/remote/\n").unwrap();
+        let include = outside.path().join("remote.config");
+        std::fs::write(
+            &include,
+            format!("[core]\n\texcludesFile = {}\n", rules.to_str().unwrap()),
+        )
+        .unwrap();
+        let mut config = std::fs::read_to_string(root.join(".git/config")).unwrap();
+        config.push_str(&format!(
+            "[includeIf \"hasconfig:remote.*.url:https://example.invalid/**\"]\n\tpath = {}\n",
+            include.to_str().unwrap()
+        ));
+        std::fs::write(root.join(".git/config"), config).unwrap();
+        let remote = root.join("remote");
+        let local = root.join("local");
+        std::fs::create_dir(&remote).unwrap();
+        std::fs::create_dir(&local).unwrap();
+        let refused = || {
+            let tmp = tempdir_in_first(root, [remote.clone(), local.clone()]);
+            assert_eq!(tmp.path().parent(), Some(local.as_path()));
+            assert_eq!(std::fs::read_dir(&remote).unwrap().count(), 0);
+        };
+
+        refused();
+        let url = "https://example.invalid.other/game";
+        git_str(root, &["remote", "add", "origin", url]);
+        refused();
+
+        git_str(
+            root,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/game",
+            ],
+        );
+        let tmp = tempdir_in_first(root, [remote.clone()]);
+        assert_eq!(tmp.path().parent(), Some(remote.as_path()));
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        std::fs::write(local.join("a.rs"), b"fn a() {}\n").unwrap();
+        assert_eq!(names(root, false), Vec::<String>::new());
+        super::run(root, false).unwrap();
+        drop(tmp);
+
+        let mut config = std::fs::read_to_string(root.join(".git/config")).unwrap();
+        config.push_str("[core]\n\texcludesFile =\n");
+        std::fs::write(root.join(".git/config"), config).unwrap();
+        refused();
+        std::fs::write(remote.join("b.rs"), b"fn b() {}\n").unwrap();
+        assert_eq!(names(root, false), ["remote/b.rs"]);
+    }
+
     /// A TMPDIR is unseen when any directory above it is ignored, however
     /// deep: `/outer/` covers `outer/deep/er`, and a negation under it
     /// (`!/outer/deep/`) re-includes nothing, since git never looks inside
