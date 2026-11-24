@@ -1056,6 +1056,57 @@ mod tests {
         }
     }
 
+    /// `mips: 0` asks for the full chain, down to one texel on the largest
+    /// side: the array size does not count, a 3D texture's depth does, and
+    /// block-compressed formats count texels, not 4x4 blocks. A depth format
+    /// gives its stencil plane the same chain.
+    #[test]
+    fn a_zero_mip_count_is_the_full_chain() {
+        use Dimension::*;
+        // R8G8B8A8_UNORM, BC1_UNORM, D32_FLOAT_S8X24_UINT.
+        let (rgba8, bc1, d32s8) = (28, 71, 20);
+        for (dimension, width, height, depth_or_array, dxgi, swizzle, want) in [
+            (Tex2d, 1, 1, 1, rgba8, Swizzle::SW_64KB_S, 1),
+            (Tex2d, 256, 256, 1, rgba8, Swizzle::SW_64KB_S, 9),
+            (Tex2d, 257, 3, 1, rgba8, Swizzle::SW_4KB_S, 9),
+            (Tex2d, 3, 1000, 1, rgba8, Swizzle::LINEAR, 10),
+            (Tex2d, 4, 4, 1024, rgba8, Swizzle::SW_4KB_S, 3),
+            (Tex1d, 4096, 1, 64, rgba8, Swizzle::LINEAR, 13),
+            (Tex3d, 64, 64, 128, rgba8, Swizzle::SW_64KB_S, 8),
+            (Tex3d, 8, 8, 1, rgba8, Swizzle::SW_4KB_S, 4),
+            (Tex2d, 16, 16, 1, bc1, Swizzle::SW_64KB_S, 5),
+            (Tex2d, 1920, 1080, 6, bc1, Swizzle::SW_64KB_S, 11),
+            (Tex2d, MAX_EXTENT, 1, 1, rgba8, Swizzle::SW_64KB_S, 15),
+            (Tex2d, 512, 512, 1, d32s8, Swizzle::SW_64KB_Z_X, 10),
+        ] {
+            let t = Texture::new(&TextureDesc {
+                dimension,
+                width,
+                height,
+                depth_or_array,
+                mips: 0,
+                format: dxgi,
+                samples: 1,
+                swizzle,
+            })
+            .unwrap_or_else(|e| panic!("{width}x{height}x{depth_or_array}: {e:?}"));
+            for plane in &t.planes {
+                let mips = &plane.layout.mips;
+                let what = format!("{width}x{height}x{depth_or_array} format {dxgi}");
+                assert_eq!(mips.len(), want, "{what}");
+                // The last mip is one element (one texel, or the block that
+                // holds it) on every side.
+                let last = mips[want - 1];
+                assert_eq!((last.width, last.height), (1, 1), "{what}");
+                if dimension == Tex3d {
+                    assert_eq!(last.depth, 1, "{what}");
+                }
+            }
+            let stencil = format(dxgi).unwrap().stencil;
+            assert_eq!(t.planes.len(), 1 + usize::from(stencil));
+        }
+    }
+
     #[test]
     fn texture_copies_reject_overflowing_pitches() {
         let layout = Layout::new(&desc(4, 2, 1, 4, Swizzle::LINEAR)).unwrap();
