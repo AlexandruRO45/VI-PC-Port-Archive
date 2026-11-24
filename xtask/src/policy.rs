@@ -2583,6 +2583,89 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// An exclude file git can find but not open (`.git/info/exclude`, or a
+    /// `core.excludesFile`, made `000`) is no error, unlike one that is a
+    /// directory: git only warns, checks every path, and lists untracked
+    /// files with no rule from it, so the walk is never needed. `excluded`
+    /// and `configured`, named only there, stay visible and are refused,
+    /// left empty, while `target`, no build directory here, is refused too,
+    /// as git lists it. An empty `core.excludesFile` names no file and
+    /// ignores nothing. Readable again, both rules hold and both are taken.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_judged_without_exclude_files_git_cannot_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = tempdir();
+        let outside = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "/own/\n").unwrap();
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        let exclude = root.join(".git/info/exclude");
+        std::fs::write(&exclude, "/excluded/\n").unwrap();
+        let rules = outside.path().join("excludes");
+        std::fs::write(&rules, "/configured/\n").unwrap();
+        git_str(
+            root,
+            &["config", "core.excludesFile", rules.to_str().unwrap()],
+        );
+        let excluded = root.join("excluded");
+        let configured = root.join("configured");
+        let target = root.join("target");
+        let own = root.join("own");
+        for dir in [&excluded, &configured, &target, &own] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let mode = |mode| {
+            for file in [&exclude, &rules] {
+                std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        };
+        mode(0o000);
+        if std::fs::read(&exclude).is_ok() {
+            // Root, or a capability like it, reads through the mode bits.
+            mode(0o644);
+            return;
+        }
+
+        let out = super::git_command(root)
+            .args(["ls-files", "-z", "--others", "--exclude-standard"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("warning"));
+        let refused = [excluded.clone(), configured.clone(), target.clone()];
+        let tmp = tempdir_in_first(root, refused.iter().cloned().chain([own.clone()]));
+        assert_eq!(tmp.path().parent(), Some(own.as_path()));
+        for dir in &refused {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        std::fs::write(excluded.join("a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(configured.join("b.rs"), b"fn b() {}\n").unwrap();
+        assert_eq!(
+            names(root, false),
+            [".gitignore", "configured/b.rs", "excluded/a.rs"]
+        );
+
+        // An empty setting is no file at all, and no error either.
+        mode(0o644);
+        git_str(root, &["config", "core.excludesFile", ""]);
+        assert_eq!(names(root, false), [".gitignore", "configured/b.rs"]);
+        let tmp_excluded = tempdir_in_first(root, [configured.clone(), excluded.clone()]);
+        assert_eq!(tmp_excluded.path().parent(), Some(excluded.as_path()));
+
+        // Readable and named again, both rules hold.
+        git_str(
+            root,
+            &["config", "core.excludesFile", rules.to_str().unwrap()],
+        );
+        let tmp_configured = tempdir_in_first(root, [target.clone(), configured.clone()]);
+        assert_eq!(tmp_configured.path().parent(), Some(configured.as_path()));
+        assert_eq!(names(root, false), [".gitignore"]);
+        super::run(root, false).unwrap();
+    }
+
     /// A tracked `.gitignore` is read from disk, not from `HEAD` or the
     /// index: rewritten there and left unstaged, its rule for `fresh` holds
     /// and `fresh` is taken, while `stale`, named only in the commit, and
