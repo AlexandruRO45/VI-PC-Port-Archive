@@ -1338,7 +1338,7 @@ mod tests {
         ];
         let endpoints = [138, 148, 0, 0, 0, 0, 0, 0, 158, 168, 0, 0, 0, 0, 0, 0];
         let empty = [128, 128, 0, 0, 0, 0, 0, 0, 128, 128, 0, 0, 0, 0, 0, 0];
-        for (i, block) in dst.chunks_exact(16).enumerate() {
+        for (i, block) in dst.as_chunks::<16>().0.iter().enumerate() {
             let mut expected = match i {
                 0 => dictionary,
                 1 | 256 | 257 => endpoints,
@@ -1347,7 +1347,7 @@ mod tests {
             if i == 2 || i == 257 {
                 expected[2] = 2;
             }
-            assert_eq!(block, expected, "BC5 block {i}");
+            assert_eq!(*block, expected, "BC5 block {i}");
         }
     }
 
