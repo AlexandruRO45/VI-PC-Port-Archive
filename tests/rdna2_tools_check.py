@@ -5253,6 +5253,12 @@ class TestRdna2Scanner(unittest.TestCase):
             "v_cvt_pk_u16_u32 v1, 0x12345, v3",
             "v_cvt_pk_i16_i32 v1, s2, v3",
             "v_cvt_pk_i16_i32_e64 v1, -16, v3",
+            "v_cvt_pknorm_i16_f32 v1, v2, v3",
+            "v_cvt_pknorm_u16_f32 v1, v2, v3",
+            "v_cvt_pknorm_i16_f16 v1, v2, v3",
+            "v_cvt_pknorm_u16_f16 v1, v2, v3",
+            "v_cvt_norm_i16_f16_e32 v1, v2",
+            "v_cvt_norm_u16_f16_e64 v1, v2",
         ):
             self.assertTrue(is_instruction_supported(line), line)
         for line in (
@@ -5261,8 +5267,9 @@ class TestRdna2Scanner(unittest.TestCase):
             "v_cvt_pk_u16_u32 v1, v2",
             "v_cvt_pk_i16_i32 v1, v2, v3, v4",
             "v_cvt_pk_i16_i32 v1, v2, v3 clamp",
-            "v_cvt_pknorm_i16_f32 v1, v2, v3",
-            "v_cvt_pknorm_u16_f32 v1, v2, v3",
+            "v_cvt_pknorm_i16_f32_e32 v1, v2, v3",
+            "v_cvt_pknorm_u16_f32_e32 v1, v2, v3",
+            "v_cvt_pknorm_i16_f32 v1, v2, v3 clamp",
             "v_cvt_pk_u8_f32 v1, v2, v3, v4",
         ):
             self.assertFalse(is_instruction_supported(line), line)

@@ -1158,6 +1158,18 @@ uint mul_hi_i32(uint a, uint b) {
         "    return asuint(int(f + ((x - f) >= 0.5f ? 1.0f : 0.0f)));\n"
         "}"
     ),
+    "cvt_snorm16_f32": (
+        "uint cvt_snorm16_f32(float x) {\n"
+        "    if (isnan(x)) return 0u;\n"
+        "    return asuint(clamp(int(round(clamp(x, -1.0f, 1.0f) * 32767.0f)), -32768, 32767)) & 0xffffu;\n"
+        "}"
+    ),
+    "cvt_unorm16_f32": (
+        "uint cvt_unorm16_f32(float x) {\n"
+        "    if (isnan(x)) return 0u;\n"
+        "    return uint(clamp(int(round(clamp(x, 0.0f, 1.0f) * 65535.0f)), 0, 65535)) & 0xffffu;\n"
+        "}"
+    ),
 }
 # (bit/float source, expression, shared conversion helper)
 DPP_CVT = {
@@ -1744,6 +1756,23 @@ def int16_known_value(token, scalar, vector, known_ssa_bits):
         return value & 0xffff if isinstance(value, int) else None
     value = vector.get(token)
     return known_ssa_bits[value] & 0xffff if isinstance(value, str) and value in known_ssa_bits else None
+
+
+def cvt_norm_f16_result(signed, u16):
+    """Normalized conversion of 16-bit float bits to signed/unsigned 16-bit integer."""
+    import struct
+    f = struct.unpack("<e", struct.pack("<H", u16 & 0xffff))[0]
+    import math
+    if math.isnan(f):
+        return 0
+    if signed:
+        clamped = max(-1.0, min(1.0, f))
+        val = int(round(clamped * 32767.0))
+        return max(-32768, min(32767, val)) & 0xffff
+    else:
+        clamped = max(0.0, min(1.0, f))
+        val = int(round(clamped * 65535.0))
+        return max(0, min(65535, val)) & 0xffff
 
 
 def half16_name(token, vector):
@@ -5090,6 +5119,30 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    int cv{i}_0 = int(trunc(hs{i}));")
             lines.append(f"    precise float alu{i} = asfloat(asuint(cv{i}_0) & 0xffffu);")
             vector[dst] = ("low16", f"alu{i}")
+        elif m := match(r"v_cvt_norm_(i16|u16)_f16(?:_e32|_e64)? (v\d+), ([^,\s]+)"):
+            # Normalizing float16 to integer: LLVM 15 VOP1 (0x63, 0x64). The source is the low 16 bits of
+            # one proven finite binary16 value (half16_arith_source). Clamped to [-1.0, 1.0] for snorm16
+            # or [0.0, 1.0] for unorm16 and scaled by 32767.0f or 65535.0f, rounding half to even.
+            # The result is ("low16", alu): only bits 15:0 are defined.
+            kind, dst, token = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid binary16 to normalized integer conversion operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            word, proven = half16_arith_source(token, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+            helper = "cvt_snorm16_f32" if kind == "i16" else "cvt_unorm16_f32"
+            helpers.add("widen16")
+            helpers.add(helper)
+            lines.append(f"    uint hf{i}_0 = ({word}) & 0xffffu;")
+            lines.append(f"    precise float hs{i} = widen16(hf{i}_0);")
+            lines.append(f"    precise float alu{i} = asfloat({helper}(hs{i}));")
+            vector[dst] = ("low16", f"alu{i}")
+            if proven is not None:
+                known_ssa_bits[f"alu{i}"] = cvt_norm_f16_result(kind == "i16", proven)
         elif m := match(r"v_cvt_off_f32_i4(?:_e32|_e64)? (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|\d+)( clamp)?"):
             # Bits 3:0 of the source as a signed nibble in units of 1/16, so 0x7 gives 0.4375
             # and 0x8 gives -0.5. The source is read as bits, so float modifiers do not apply.
@@ -5208,6 +5261,58 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if mask != "entry" or lo in sample_dest or hi in sample_dest or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in pair):
                 raise ValueError("Unsupported pack operand")
             vector[dst] = pair
+        elif m := match(r"v_cvt_pknorm_(i16|u16)_f32(?:_e64)? (v\d+), ([^,\s]+), ([^,\s]+)"):
+            # Packed normalizing float32 to 16-bit integer (VOP3 0x368, 0x369). Converts two 32-bit floats
+            # into snorm16/unorm16 packed into the low and high 16 bits of the destination word.
+            # Modifiers, clamp and omod are refused.
+            kind, dst, src0, src1 = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid packed normalizing conversion operation")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            for tok in (src0, src1):
+                if tok.startswith(("|", "abs(", "neg(")) or (tok.startswith("-") and not re.fullmatch(r"-(?:0x[0-9a-f]+|\d+(?:\.\d+)?)", tok)):
+                    raise ValueError(f"Unsupported source modifier: {tok}")
+                if rm := re.fullmatch(r"([vs])(\d+)", tok):
+                    limit = 255 if rm.group(1) == "v" else 105
+                    if not 0 <= int(rm.group(2)) <= limit:
+                        raise ValueError(f"Register out of range: {tok}")
+                    if tok not in (vector if rm.group(1) == "v" else scalar):
+                        raise ValueError(f"Untracked operand: {tok}")
+            op0 = fp_operand(src0, scalar, vector, pending, sample_dest)
+            op1 = fp_operand(src1, scalar, vector, pending, sample_dest)
+            helper = "cvt_snorm16_f32" if kind == "i16" else "cvt_unorm16_f32"
+            helpers.add(helper)
+            lines.append(f"    precise float alu{i} = asfloat({helper}({op0}) | ({helper}({op1}) << 16u));")
+            vector[dst] = f"alu{i}"
+        elif m := match(r"v_cvt_pknorm_(i16|u16)_f16(?:_e64)? (v\d+), ([^,\s]+), ([^,\s]+)"):
+            # Packed normalizing float16 to 16-bit integer (VOP3 0x312, 0x313). Converts two 16-bit floats
+            # into snorm16/unorm16 packed into the low and high 16 bits of the destination word.
+            # Sources must be statically proven finite under the entry denormal mode.
+            kind, dst, src0, src1 = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid packed normalizing conversion operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if not 0 <= int(dst[1:]) <= 255:
+                raise ValueError(f"Register out of range: {dst}")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            words, proven = zip(*(half16_arith_source(tok, scalar, vector, pending, sample_dest, known_ssa_bits, known_half)
+                                  for tok in (src0, src1)))
+            helper = "cvt_snorm16_f32" if kind == "i16" else "cvt_unorm16_f32"
+            helpers.add("widen16")
+            helpers.add(helper)
+            for k, word in enumerate(words):
+                lines.append(f"    uint hf{i}_{k} = ({word}) & 0xffffu;")
+            lines.append(f"    precise float alu{i} = asfloat({helper}(widen16(hf{i}_0)) | ({helper}(widen16(hf{i}_1)) << 16u));")
+            vector[dst] = f"alu{i}"
+            if proven[0] is not None and proven[1] is not None:
+                lo_b = cvt_norm_f16_result(kind == "i16", proven[0])
+                hi_b = cvt_norm_f16_result(kind == "i16", proven[1])
+                known_ssa_bits[f"alu{i}"] = lo_b | (hi_b << 16)
         elif m := match(r"exp mrt0,? (v\d+|off), \1, (v\d+|off), \2 done compr vm"):
             if integer_export:
                 raise ValueError("Integer export requires the uncompressed export form")

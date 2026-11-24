@@ -8699,6 +8699,88 @@ PACK_B32_BODY = ["v_pack_b32_f16 v12, v18, v19", "v_pack_b32_f16 v13, s44, v19",
                  "v_pack_b32_f16 v14, v18, s45", "v_pack_b32_f16 v18, v18, v19",
                  "v_mov_b32_e32 v15, v18"]
 PACK_B32_OPS = ("v_pack_b32_f16",)
+PKNORM_OPS = (
+    "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32",
+    "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16",
+)
+NORM_OPS = (
+    "v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16",
+    "v_cvt_norm_i16_f16_e64", "v_cvt_norm_u16_f16_e64",
+)
+ALL_NORM_OPS = PKNORM_OPS + NORM_OPS
+
+
+def cvt_snorm16_f32_ref(x: float) -> int:
+    import math
+    if math.isnan(x):
+        return 0
+    clamped = max(-1.0, min(1.0, x))
+    val = int(round(clamped * 32767.0))
+    return max(-32768, min(32767, val)) & 0xffff
+
+
+def cvt_unorm16_f32_ref(x: float) -> int:
+    import math
+    if math.isnan(x):
+        return 0
+    clamped = max(0.0, min(1.0, x))
+    val = int(round(clamped * 65535.0))
+    return max(0, min(65535, val)) & 0xffff
+
+
+def cvt_norm_f16_ref(signed: bool, u16: int) -> int:
+    import struct
+    f = struct.unpack("<e", struct.pack("<H", u16 & 0xffff))[0]
+    return cvt_snorm16_f32_ref(f) if signed else cvt_unorm16_f32_ref(f)
+
+
+def pknorm_i16_f32_ref(s0: float, s1: float) -> int:
+    return (cvt_snorm16_f32_ref(s0) & 0xffff) | ((cvt_snorm16_f32_ref(s1) & 0xffff) << 16)
+
+
+def pknorm_u16_f32_ref(s0: float, s1: float) -> int:
+    return (cvt_unorm16_f32_ref(s0) & 0xffff) | ((cvt_unorm16_f32_ref(s1) & 0xffff) << 16)
+
+
+def pknorm_group():
+    """Build and lower programs exercising the 8 normalizing and packing conversion forms."""
+    translate_f16 = lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
+                                    half_denorm=pixel_aot.HALF_DENORM_PRESERVE)
+    prog_f32 = uncompressed_export([
+        "v_mov_b32_e32 v18, s45",
+        "v_cvt_pknorm_i16_f32 v12, s44, v18",
+        "v_cvt_pknorm_u16_f32 v13, s44, v18",
+        "v_cvt_pknorm_i16_f32_e64 v14, 1.0, -1.0",
+        "v_cvt_pknorm_u16_f32_e64 v15, 1.0, 0.0",
+    ])
+    translate_int(prog_f32)
+    prog_f16 = uncompressed_export([
+        "v_cvt_pknorm_i16_f16 v12, 1.0, -1.0",
+        "v_cvt_pknorm_u16_f16 v13, 1.0, 0.5",
+        "v_cvt_pknorm_i16_f16_e64 v14, 0.5, -0.5",
+        "v_cvt_pknorm_u16_f16_e64 v15, 0.5, 0",
+    ])
+    translate_f16(prog_f16)
+    prog_norm = uncompressed_export([
+        "v_cvt_norm_i16_f16 v24, 1.0",
+        "v_cvt_norm_u16_f16 v25, 0.5",
+        "v_cvt_norm_i16_f16_e32 v26, -1.0",
+        "v_cvt_norm_u16_f16_e32 v27, 1.0",
+        "v_mov_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v13, v25 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v14, v26 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v15, v27 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    ])
+    translate_f16(prog_norm)
+    prog_norm_e64 = uncompressed_export([
+        "v_cvt_norm_i16_f16_e64 v24, 1.0",
+        "v_cvt_norm_u16_f16_e64 v25, 0.5",
+        "v_mov_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v13, v25 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v14, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v15, v25 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    ])
+    translate_f16(prog_norm_e64)
 
 
 def pack_b32_group():
@@ -9443,12 +9525,8 @@ def check_pack_int16_lowering():
     for op in PACK_OPS:
         expect_value_error(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", f"{op}_e32 v12, s44, v18"]),
                            "does not support e32 encoding")
-    # The float packs stay unsupported: no public source found here states their rounding and bounds.
+    # The remaining float packs stay unsupported: no public source found here states their rounding and bounds.
     for neighbour in (
-        "v_cvt_pknorm_i16_f32 v12, s44, v18",
-        "v_cvt_pknorm_u16_f32 v12, s44, v18",
-        "v_cvt_pknorm_i16_f16 v12, s44, v18",
-        "v_cvt_pknorm_u16_f16 v12, s44, v18",
         "v_cvt_pk_u8_f32 v12, s44, v18, v18",
     ):
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", neighbour]))
@@ -9549,6 +9627,114 @@ def check_pack_b32_lowering():
     rgb = rgb_sample()
     wait = rgb.index("s_waitcnt vmcnt(0)")
     must_reject(translate, rgb[:wait] + ["v_pack_b32_f16 v16, v12, v13"] + rgb[wait:])
+
+
+def check_pknorm_lowering():
+    """Static checks, reference oracle, live fixtures, and boundary controls for pknorm and norm forms."""
+    translate_f16 = lambda p: lower(p, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
+                                    half_denorm=pixel_aot.HALF_DENORM_PRESERVE)
+    # Run the positive programs
+    pknorm_group()
+    assert set(ALL_NORM_OPS) <= ACCEPTED, set(ALL_NORM_OPS) - ACCEPTED
+
+    # Statement checks
+    prog_f32 = uncompressed_export([
+        "v_mov_b32_e32 v18, s45",
+        "v_cvt_pknorm_i16_f32 v12, s44, v18",
+        "v_cvt_pknorm_u16_f32 v13, s44, v18",
+    ])
+    src_f32 = translate_int(prog_f32).splitlines()
+    for stmt in (
+        "uint cvt_snorm16_f32(float x) {",
+        "uint cvt_unorm16_f32(float x) {",
+        "    precise float alu21 = asfloat(cvt_snorm16_f32(asfloat(params[0].w)) | (cvt_snorm16_f32(alu20) << 16u));",
+        "    precise float alu22 = asfloat(cvt_unorm16_f32(asfloat(params[0].w)) | (cvt_unorm16_f32(alu20) << 16u));",
+    ):
+        assert any(stmt in line for line in src_f32), (stmt, src_f32)
+
+    # Reference oracle checks
+    assert cvt_snorm16_f32_ref(0.0) == 0
+    assert cvt_snorm16_f32_ref(1.0) == 32767
+    assert cvt_snorm16_f32_ref(-1.0) == 0x8001
+    assert cvt_snorm16_f32_ref(2.0) == 32767
+    assert cvt_snorm16_f32_ref(-2.0) == 0x8001
+    assert cvt_snorm16_f32_ref(float("nan")) == 0
+    assert cvt_unorm16_f32_ref(0.0) == 0
+    assert cvt_unorm16_f32_ref(1.0) == 65535
+    assert cvt_unorm16_f32_ref(-1.0) == 0
+    assert cvt_unorm16_f32_ref(2.0) == 65535
+    assert cvt_unorm16_f32_ref(float("nan")) == 0
+    assert cvt_norm_f16_ref(True, 0x3c00) == 32767
+    assert cvt_norm_f16_ref(True, 0xbc00) == 0x8001
+    assert cvt_norm_f16_ref(True, 0x3800) == 16384
+    assert cvt_norm_f16_ref(False, 0x3c00) == 65535
+    assert cvt_norm_f16_ref(False, 0xbc00) == 0
+    assert cvt_norm_f16_ref(False, 0x3800) == 32768
+    assert pknorm_i16_f32_ref(1.0, -1.0) == (0x8001 << 16) | 0x7fff
+    assert pknorm_u16_f32_ref(1.0, 0.0) == 0xffff
+
+    # Low16 contract: WORD_0 is valid, WORD_1 on v_cvt_norm_* must be refused, and direct export is refused
+    prog_sdwa_good = uncompressed_export([
+        "v_cvt_norm_i16_f16 v24, 1.0",
+        "v_mov_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v13, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v14, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v15, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    ])
+    translate_f16(prog_sdwa_good)
+
+    prog_sdwa_bad = uncompressed_export([
+        "v_cvt_norm_i16_f16 v24, 1.0",
+        "v_mov_b32_sdwa v14, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1",
+    ])
+    expect_value_error(translate_f16, prog_sdwa_bad, "Reads the undefined high half of a 16-bit result")
+
+    prog_direct_export = uncompressed_export([
+        "v_cvt_norm_i16_f16 v12, 1.0",
+    ])
+    expect_value_error(translate_f16, prog_direct_export, "Unsupported export")
+
+    # Negative boundary controls:
+    # 1. Encoding rejections (e32 invalid for VOP3-only pknorm)
+    for bad in (
+        "v_cvt_pknorm_i16_f32_e32 v12, s44, v18",
+        "v_cvt_pknorm_u16_f32_e32 v12, s44, v18",
+        "v_cvt_pknorm_i16_f16_e32 v12, 1.0, 1.0",
+        "v_cvt_pknorm_u16_f16_e32 v12, 1.0, 1.0",
+    ):
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+
+    # 2. Modifier rejections (clamp, neg, abs, omod)
+    for bad in (
+        "v_cvt_pknorm_i16_f32 v12, s44, v18 clamp",
+        "v_cvt_pknorm_i16_f32 v12, -s44, v18",
+        "v_cvt_pknorm_i16_f32 v12, |s44|, v18",
+        "v_cvt_pknorm_i16_f32 v12, s44, -v18",
+        "v_cvt_pknorm_i16_f16 v12, -v18, 1.0",
+        "v_cvt_pknorm_i16_f16 v12, |v18|, 1.0",
+        "v_cvt_norm_i16_f16 v12, -v18",
+        "v_cvt_norm_i16_f16 v12, |v18|",
+        "v_cvt_norm_i16_f16_e32 v12, 1.0 clamp",
+        "v_cvt_norm_i16_f16_e64 v12, 1.0 clamp",
+        "v_cvt_norm_i16_f16_e64 v12, 1.0 mul:2",
+    ):
+        must_reject(translate_f16, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+
+    # 3. Register bounds and untracked registers
+    for bad in (
+        "v_cvt_pknorm_i16_f32 v256, s44, v18",
+        "v_cvt_pknorm_i16_f32 v12, s106, v18",
+        "v_cvt_pknorm_i16_f32 v12, s44, v256",
+        "v_cvt_pknorm_i16_f32 v12, s44, v99",
+        "v_cvt_norm_i16_f16 v256, 1.0",
+        "v_cvt_norm_i16_f16 v12, v99",
+    ):
+        must_reject(translate_f16, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+
+    # 4. Outstanding sample access
+    rgb = rgb_sample()
+    wait = rgb.index("s_waitcnt vmcnt(0)")
+    must_reject(translate_f16, rgb[:wait] + ["v_cvt_norm_i16_f16 v16, 1.0"] + rgb[wait:])
 
 
 def check_carry_out_lowering():
@@ -11886,7 +12072,8 @@ def check_f16_cvt_int_controls():
                  "v_cvt_f16_i16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
                  "v_cvt_f16_u16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
                  "v_cvt_f16_i16 v24, v18, v19", "v_cvt_f16_i16 v24",
-                 "v_cvt_norm_i16_f16_e32 v24, v18", "v_cvt_norm_u16_f16_e64 v24, v18", "v_cvt_f16_i32 v24, v18",
+                 "v_cvt_norm_i16_f16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+                 "v_cvt_norm_u16_f16_dpp v24, v18 row_shl:1 row_mask:0xf bank_mask:0xf", "v_cvt_f16_i32 v24, v18",
                  "v_cvt_f16_f16_e32 v24, v18"):
         refuse(line, "Unsupported instruction")
 
@@ -12251,7 +12438,8 @@ def check_f16_to_int_controls():
                  "v_cvt_i16_f16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
                  "v_cvt_u16_f16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
                  "v_cvt_i16_f16 v24, v18, v19", "v_cvt_u16_f16 v24",
-                 "v_cvt_norm_i16_f16_e32 v24, v18", "v_cvt_norm_u16_f16_e64 v24, v18", "v_cvt_i32_f16 v24, v18"):
+                 "v_cvt_norm_i16_f16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+                 "v_cvt_norm_u16_f16_dpp v24, v18 row_shl:1 row_mask:0xf bank_mask:0xf", "v_cvt_i32_f16 v24, v18"):
         refuse(line, "Unsupported instruction")
     # Entry profile: unknown or an unsupported declaration refuses every spelling of both kinds.
     for kind in ("i16", "u16"):
@@ -12530,6 +12718,7 @@ def check_controls(directory):
     check_pack_int16_lowering()
     check_sat_pack_u8_lowering()
     check_pack_b32_lowering()
+    check_pknorm_lowering()
     check_sad_lowering()
     lshl_add_source = translate(sop2_lshl_add_group())
     assert set(SOP2_LSHL_ADD_OPS) <= ACCEPTED

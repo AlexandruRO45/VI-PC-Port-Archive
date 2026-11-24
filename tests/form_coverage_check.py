@@ -338,11 +338,18 @@ def check_shader_records():
     }
     sop1_scalar_alu_forms = {("SOP1", op) for op in pixel.SCALAR_ALU_SOP1_OPS}
     sop2_scalar_alu_forms = {("SOP2", op) for op in pixel.SCALAR_ALU_SOP2_OPS}
+    pknorm_forms = {
+        ("VOP3", "v_cvt_pknorm_i16_f32"), ("VOP3", "v_cvt_pknorm_u16_f32"),
+        ("VOP3", "v_cvt_pknorm_i16_f16"), ("VOP3", "v_cvt_pknorm_u16_f16"),
+    }
+    norm_forms = {
+        ("VOP1", "v_cvt_norm_i16_f16"), ("VOP1", "v_cvt_norm_u16_f16"),
+        ("VOP3", "v_cvt_norm_i16_f16_e64"), ("VOP3", "v_cvt_norm_u16_f16_e64"),
+    }
     rejected_forms = {
         "s_or_saveexec_b64", "s_andn2_saveexec_b64", "s_and_saveexec_b32",
         "v_mul_i32_i24_sdwa",
-        "v_cvt_pk_u8_f32", "v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32",
-        "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16",
+        "v_cvt_pk_u8_f32",
         "s_lshl0_add_u32", "s_lshl5_add_u32",
         "s_cbranch_execnz", "s_cbranch_vccz", "s_cbranch_vccnz",
         "s_cbranch_scc0", "s_cbranch_scc1",
@@ -372,6 +379,8 @@ def check_shader_records():
         assert not sop2_scalar_alu_forms & fc.gfx_forms(stripped, fc.load_reference(name)), name
         assert pack_int16_forms <= covered, (name, pack_int16_forms - covered)
         assert pack_b32_forms <= covered, (name, pack_b32_forms - covered)
+        assert pknorm_forms <= covered, (name, pknorm_forms - covered)
+        assert norm_forms <= covered, (name, norm_forms - covered)
         # v_mac_f32 is in the gfx1013 list only.
         approx_e64_forms = {("VOP3", "v_exp_f32_e64"), ("VOP3", "v_log_f32_e64")}
         approx_e64_forms |= {("VOP3", "v_mac_f32_e64")} if name == "gfx1013.tsv" else set()
@@ -706,6 +715,39 @@ def check_f16_to_int16_forms():
         for key in pixel.F16_ROUND_PROGRAMS:
             pixel.translate_f16(pixel.f16_round_program(*key))
         assert not forms & fc.gfx_forms(pixel.ACCEPTED, fc.load_reference("gfx1013.tsv"))
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
+def check_pknorm_forms():
+    """The eight normalizing and packing conversion forms (v_cvt_pknorm_i16_f32, v_cvt_pknorm_u16_f32,
+    v_cvt_pknorm_i16_f16, v_cvt_pknorm_u16_f16, v_cvt_norm_i16_f16, v_cvt_norm_u16_f16 and their e64
+    spellings) count as covered once the translator accepts their fixtures; DPP and SDWA spellings stay
+    uncovered, and so do the forms without these fixtures."""
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        pixel.pknorm_group()
+        forms = {
+            ("VOP3", "v_cvt_pknorm_i16_f32"), ("VOP3", "v_cvt_pknorm_u16_f32"),
+            ("VOP3", "v_cvt_pknorm_i16_f16"), ("VOP3", "v_cvt_pknorm_u16_f16"),
+            ("VOP1", "v_cvt_norm_i16_f16"), ("VOP1", "v_cvt_norm_u16_f16"),
+            ("VOP3", "v_cvt_norm_i16_f16_e64"), ("VOP3", "v_cvt_norm_u16_f16_e64"),
+        }
+        neighbours = {
+            ("SDWA", "v_cvt_norm_i16_f16_sdwa"), ("SDWA", "v_cvt_norm_u16_f16_sdwa"),
+            ("DPP16", "v_cvt_norm_i16_f16_dpp"), ("DPP16", "v_cvt_norm_u16_f16_dpp"),
+            ("DPP8", "v_cvt_norm_i16_f16_dpp"), ("DPP8", "v_cvt_norm_u16_f16_dpp"),
+        }
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, forms - reference)
+            assert neighbours <= reference, (name, neighbours - reference)
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, forms - covered)
+            assert not neighbours & covered, (name, neighbours & covered)
     finally:
         pixel.ACCEPTED.clear()
         pixel.ACCEPTED.update(saved)
@@ -1260,6 +1302,7 @@ if __name__ == "__main__":
     check_f16_fmac_ldexp_forms()
     check_f16_cvt_int16_forms()
     check_f16_to_int16_forms()
+    check_pknorm_forms()
     check_swap_coverage()
     check_pk_fmac_coverage()
     check_sopk_wait_forms()

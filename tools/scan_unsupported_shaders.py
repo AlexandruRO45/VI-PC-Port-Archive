@@ -232,6 +232,15 @@ if pixel_aot is not None:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cvt_f16_(?:i16|u16)_e32\s+{INT16_VGPR},\s+{INT16_SOURCE}"
     )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cvt_pknorm_(?:i16|u16)_f32(?:_e64)?\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cvt_pknorm_(?:i16|u16)_f16(?:_e64)?\s+v\d+,\s+{F16_ARITH_SOURCE},\s+{F16_ARITH_SOURCE}"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cvt_norm_(?:i16|u16)_f16(?:_e32|_e64)?\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE}"
+    )
 if PIXEL_VOP3P_F16:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_pk_(?:{'|'.join(map(re.escape, PIXEL_VOP3P_F16))})_f16\s+v\d+,\s+.+"
@@ -378,11 +387,10 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {f"v_{name}" for name in PIXEL_VOP3_INT16}
     | {f"v_{name}" for name in PIXEL_VOP3_INT16_TERNARY}
     | {f"v_{name}_f16" for name in PIXEL_VOP2_F16 + PIXEL_VOP2_F16_FUSED_SCALE + PIXEL_VOP1_F16_ROUND}
-    | {"v_cvt_f16_i16", "v_cvt_f16_u16"}
+    | {"v_cvt_f16_i16", "v_cvt_f16_u16", "v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16"}
     | {
         # Decoding only: no translator lowers these binary16 VOP1/VOP2 forms.
         "v_cvt_u16_f16", "v_cvt_i16_f16", "v_fract_f16",
-        "v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16",
         "v_fmac_f16", "v_max_f16", "v_min_f16", "v_ldexp_f16", "v_pk_fmac_f16",
     }
     | {name for name, _, _ in MUBUF_OPS.values()}
