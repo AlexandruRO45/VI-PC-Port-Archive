@@ -25,6 +25,23 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+/// `print!`, in the menu's language ([`crate::lang`]).
+macro_rules! say {
+    ($($t:tt)*) => {
+        print!("{}", crate::lang::localize(&format!($($t)*)))
+    };
+}
+
+/// `println!`, in the menu's language.
+macro_rules! sayln {
+    () => {
+        println!()
+    };
+    ($($t:tt)*) => {
+        println!("{}", crate::lang::localize(&format!($($t)*)))
+    };
+}
+
 /// Whether `victory` was started with no arguments in a console of its own
 /// (a double-click), or `VICTORY_MENU=1` asks for the menu anyway.
 pub fn wanted() -> bool {
@@ -734,6 +751,8 @@ fn check_text(p: Paint, pc: &Pc, cfg: Option<&victory_core::Config>, columns: us
             if let Some(h) = hint {
                 // One column spare: a line that fills the window wraps early
                 // in some consoles.
+                // Translated before it is wrapped: the phrases are whole sentences.
+                let h = crate::lang::localize(&h);
                 for line in wrap(&h, columns.saturating_sub(HINT_INDENT + 1)) {
                     out.push_str(&format!("{:HINT_INDENT$}{}\n", "", p.rgb(&line, DIM)));
                 }
@@ -822,7 +841,7 @@ fn read_line(input: &mut impl BufRead) -> Option<String> {
 }
 
 fn pause(p: Paint, input: &mut impl BufRead) {
-    print!("\n  {} ", p.rgb("Press Enter to go back to the menu.", DIM));
+    say!("\n  {} ", p.rgb("Press Enter to go back to the menu.", DIM));
     let _ = std::io::stdout().flush();
     let _ = read_line(input);
 }
@@ -880,7 +899,7 @@ fn sparing_the_menu<T>(f: impl FnOnce() -> T) -> T {
 /// Enter whatever happened to it.
 fn run_game(p: Paint, exe: &Path, data_dir: &Path, model: Model, input: &mut impl BufRead) {
     if !exe.is_file() {
-        println!(
+        sayln!(
             "\n  {} {}",
             p.rgb("\u{2717}", BAD),
             p.rgb("No file there.", CREAM)
@@ -889,7 +908,7 @@ fn run_game(p: Paint, exe: &Path, data_dir: &Path, model: Model, input: &mut imp
         return;
     }
     save_last(data_dir, exe);
-    println!(
+    sayln!(
         "\n  {} {}   {}\n",
         p.rgb("\u{25b6}", SUNSET[4]),
         exe.display(),
@@ -914,11 +933,11 @@ fn run_game(p: Paint, exe: &Path, data_dir: &Path, model: Model, input: &mut imp
             p.rgb(&format!("The run could not start: {e}"), CREAM),
         ),
     };
-    println!("\n  {mark} {text}");
+    sayln!("\n  {mark} {text}");
     let crashed = crate::doctor::crash_text_since(data_dir, &before);
     let found = crate::doctor::diagnose(&format!("{said}\n{crashed}"));
     if !found.is_empty() {
-        print!("{}", findings_text(p, &found, console_columns()));
+        say!("{}", findings_text(p, &found, console_columns()));
     }
     pause(p, input);
 }
@@ -974,7 +993,7 @@ fn findings_text(p: Paint, found: &[&crate::doctor::Known], columns: usize) -> S
             p.rgb("!", WARN),
             p.rgb(k.title, CREAM)
         ));
-        for line in wrap(k.explain, width) {
+        for line in wrap(&crate::lang::localize(k.explain), width) {
             out.push_str(&format!("{:HINT_INDENT$}{}\n", "", p.rgb(&line, DIM)));
         }
         for &n in k.links {
@@ -1039,7 +1058,7 @@ pub fn run() -> Result<()> {
         let last = load_last(&data_dir);
         let model = load_model(&data_dir);
         let game_dir = victory_core::Config::load().ok().and_then(|c| c.game_dir);
-        print!(
+        say!(
             "{}",
             menu_text(p, last.as_deref(), game_dir.as_deref(), model)
         );
@@ -1049,7 +1068,7 @@ pub fn run() -> Result<()> {
         };
         match choice(&line) {
             Choice::Run => {
-                print!(
+                say!(
                     "\n  {}\n  {} ",
                     p.rgb("Drag the game's .exe onto this window, or type its path, then press Enter.", CREAM),
                     p.rgb(">", SUNSET[3])
@@ -1065,19 +1084,19 @@ pub fn run() -> Result<()> {
             Choice::Again => match last {
                 Some(exe) => run_game(p, &exe, &data_dir, model, &mut input),
                 None => {
-                    println!("\n  {}", p.rgb("Nothing run yet: choose 1 first.", DIM));
+                    sayln!("\n  {}", p.rgb("Nothing run yet: choose 1 first.", DIM));
                     pause(p, &mut input);
                 }
             },
             Choice::Check => {
                 // Making the GPU device can take a moment.
-                print!("\n  {}", p.rgb("Checking this PC...", DIM));
+                say!("\n  {}", p.rgb("Checking this PC...", DIM));
                 let _ = std::io::stdout().flush();
                 let pc = check();
-                println!();
+                sayln!();
                 let cfg = victory_core::Config::load().ok();
-                print!("{}", check_text(p, &pc, cfg.as_ref(), console_columns()));
-                print!(
+                say!("{}", check_text(p, &pc, cfg.as_ref(), console_columns()));
+                say!(
                     "\n  {} ",
                     p.rgb(
                         "Enter: back to the menu.  C, then Enter: copy this for a GitHub report.",
@@ -1089,7 +1108,10 @@ pub fn run() -> Result<()> {
                     return Ok(());
                 };
                 if choice(&answer) == Choice::Check {
-                    let plain = check_text(Paint { color: false }, &pc, cfg.as_ref(), usize::MAX);
+                    // The report is for GitHub: English whatever the menu speaks.
+                    let plain = crate::lang::in_english(|| {
+                        check_text(Paint { color: false }, &pc, cfg.as_ref(), usize::MAX)
+                    });
                     let home = std::env::var("USERPROFILE").ok();
                     let text = report_text(&plain, home.as_deref());
                     let said = if copy_to_clipboard(&text) {
@@ -1097,7 +1119,7 @@ pub fn run() -> Result<()> {
                     } else {
                         "Could not reach the clipboard."
                     };
-                    println!("\n  {}", p.rgb(said, GOOD));
+                    sayln!("\n  {}", p.rgb(said, GOOD));
                     pause(p, &mut input);
                 }
             }
@@ -1112,10 +1134,10 @@ pub fn run() -> Result<()> {
                 } else {
                     format!("Could not open {}", data_dir.display())
                 };
-                println!("\n  {}", p.rgb(&text, DIM));
+                sayln!("\n  {}", p.rgb(&text, DIM));
             }
             Choice::Folder => {
-                print!(
+                say!(
                     "\n  {}\n  {} ",
                     p.rgb(
                         "Drag the game's folder (or its .exe) onto this window, or type its path, then press Enter.",
@@ -1133,19 +1155,19 @@ pub fn run() -> Result<()> {
                         Status::Good => ("\u{2713}", GOOD),
                         _ => ("\u{2717}", BAD),
                     };
-                    println!("\n  {} {}", p.rgb(mark, colour), p.rgb(&said.1, CREAM));
+                    sayln!("\n  {} {}", p.rgb(mark, colour), p.rgb(&said.1, CREAM));
                     pause(p, &mut input);
                 }
             }
             Choice::Keys => {
-                print!("{}", keys_text(p));
+                say!("{}", keys_text(p));
                 pause(p, &mut input);
             }
             Choice::Model => save_model(&data_dir, model.other()),
             Choice::Quit => return Ok(()),
             Choice::Unknown if line.trim().is_empty() => {}
             Choice::Unknown => {
-                println!(
+                sayln!(
                     "\n  {}",
                     p.rgb("Type 1 to 4, S, K or M and press Enter (Q to quit).", WARN)
                 );

@@ -6,6 +6,7 @@
 mod census;
 mod doctor;
 mod inspect;
+mod lang;
 mod menu;
 mod run;
 mod shader;
