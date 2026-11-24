@@ -342,4 +342,24 @@ mod tests {
         assert_eq!(reserved(0).comparison().filter, 0x80);
         assert_eq!(reserved(0x00F0_0000).comparison().filter, 0xD5);
     }
+
+    /// The anisotropy field is read whatever the filters say, and an
+    /// anisotropic filter without a mip filter still samples only the base
+    /// level: the LOD range follows the mip field alone.
+    #[test]
+    fn anisotropy_and_lod_range_are_independent_of_the_filter() {
+        let s = |w0: u32, w2: u32| StaticSampler::from_words([w0, 0x0054_0100, w2, 0]);
+        // log2 anisotropy 2 with point filters keeps 4, as with anisotropic.
+        assert_eq!(s(2 << 9, 0).max_anisotropy, 4);
+        assert_eq!(s(2 << 9, 0x00F0_0000).max_anisotropy, 4);
+        // Anisotropic magnification and minification, no mip filter.
+        let base = s(0, 0x00F0_0000);
+        assert_eq!((base.filter, base.min_lod, base.max_lod), (0x55, 0.0, 0.0));
+        // The same with a linear mip filter reads the LOD fields.
+        let mipped = s(0, 0x08F0_0000);
+        assert_eq!(
+            (mipped.filter, mipped.min_lod, mipped.max_lod),
+            (0x55, 1.0, 5.25)
+        );
+    }
 }
