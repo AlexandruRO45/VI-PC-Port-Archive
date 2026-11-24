@@ -1506,7 +1506,10 @@ fn recognize_whole_wave_reductions(insts: &[Decoded]) -> (BTreeMap<u64, &'static
             }
         }
         reductions.insert(seed.pc, op.unwrap());
-        for k in 1..=8 {
+        // Suppress only the within-half reduction (3 × DPP8 + DPP16 + v_permlanex16 + op);
+        // the `v_readlane` lane 32 + op + `v_readlane` lane 0 that combine the two 32-lane
+        // halves of a wave64 are kept (they use the upper-lane / exchange handling).
+        for k in 1..=6 {
             skip.insert(insts[i + k].pc);
         }
     }
