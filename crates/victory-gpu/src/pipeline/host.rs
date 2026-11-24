@@ -491,10 +491,9 @@ impl HostPipeline {
                 // SAFETY: as above.
                 || unsafe { host.device.CreateComputePipelineState(&desc) },
             );
-            drop(serial);
             let pso = match made {
                 Ok(pso) => {
-                    made_once(&name);
+                    record(&name, true);
                     pso
                 }
                 Err(e) => {
@@ -503,7 +502,7 @@ impl HostPipeline {
                     // module the driver dislikes, and the device's own reason,
                     // because a device that already faulted answers creation
                     // with the same code.
-                    let (tries, made_before) = attempts(&name);
+                    let (tries, made_before) = record(&name, false);
                     tracing::warn!(
                         error = %e,
                         ?shaders,
@@ -524,7 +523,7 @@ impl HostPipeline {
                     match unsafe { host.device.CreateComputePipelineState(&desc) } {
                         Ok(pso) => {
                             tracing::warn!(?shaders, "host pipeline created on the retry");
-                            made_once(&name);
+                            record(&name, true);
                             pso
                         }
                         Err(again) => {
@@ -534,6 +533,7 @@ impl HostPipeline {
                     }
                 }
             };
+            drop(serial);
             tracing::info!(
                 ?shaders,
                 cs_bytes = desc.CS.BytecodeLength,
@@ -724,26 +724,21 @@ fn mesh_pipeline(
 }
 
 /// How often a pipeline description has been tried and how often it was
-/// created, by name: a module refused once and created later is a state
-/// problem, and the ordinals are what says so.
-fn attempts(name: &str) -> (u32, u32) {
+/// created, by name — one map, because two would count two different things: a
+/// module refused once and created later is a state problem, and these are the
+/// ordinals that say so.
+fn record(name: &str, created: bool) -> (u32, u32) {
     static SEEN: std::sync::Mutex<Option<std::collections::HashMap<String, (u32, u32)>>> =
         std::sync::Mutex::new(None);
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let map = seen.get_or_insert_with(std::collections::HashMap::new);
     let entry = map.entry(name.to_owned()).or_insert((0, 0));
-    entry.0 += 1;
+    if created {
+        entry.1 += 1;
+    } else {
+        entry.0 += 1;
+    }
     *entry
-}
-
-/// Records that a description was created, so a later refusal can say so.
-fn made_once(name: &str) {
-    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<String, (u32, u32)>>> =
-        std::sync::Mutex::new(None);
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let map = seen.get_or_insert_with(std::collections::HashMap::new);
-    let entry = map.entry(name.to_owned()).or_insert((0, 0));
-    entry.1 += 1;
 }
 
 /// The bytes of shader code (none for an absent stage).
