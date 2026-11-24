@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -330,6 +332,99 @@ mod tests {
     }
 
     #[test]
+    fn list_scratch_reclaims_chunks_unused_by_two_recordings() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let finish = || {
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+        };
+        let chunk_count = || list.scratch.lock().unwrap().chunks.len();
+        let sizes = [FIRST_SCRATCH_CHUNK, 2 * FIRST_SCRATCH_CHUNK, 4 * FIRST_SCRATCH_CHUNK];
+        let addresses = sizes.map(|size| list.scratch(size).unwrap());
+        finish();
+        assert_eq!(chunk_count(), 3);
+
+        assert_eq!(list.scratch(1).unwrap(), addresses[0]);
+        finish();
+        assert_eq!(chunk_count(), 3);
+
+        assert_eq!(sizes.map(|size| list.scratch(size).unwrap()), addresses);
+        finish();
+
+        for expected in [3, 1] {
+            assert_eq!(list.scratch(1).unwrap(), addresses[0]);
+            finish();
+            assert_eq!(chunk_count(), expected);
+        }
+
+        // Dedicated uploads do not keep the rolling scratch cache warm.
+        list.scratch(SCRATCH_CHUNK + 1).unwrap();
+        finish();
+        assert_eq!(chunk_count(), 1);
+        finish();
+        assert_eq!(chunk_count(), 0);
+        list.close();
+    }
+
+    fn scratch_chunk(host: &Host, capacity: u64) -> Option<ScratchChunk> {
+        let (buffer, mapped) = host.upload_buffer(capacity)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some(ScratchChunk { _buffer: buffer, mapped: mapped as usize, gpu, capacity })
+    }
+
+    #[test]
+    fn failed_scratch_growth_leaves_room_for_a_smaller_request() {
+        let Some(host) = host() else { return };
+        let mut scratch = Scratch::default();
+        let remaining = 256;
+        let occupied = FIRST_SCRATCH_CHUNK - remaining;
+        let (gpu, mapped) = scratch
+            .reserve(occupied, |capacity, _| scratch_chunk(host, capacity))
+            .unwrap();
+        assert!(scratch.reserve(2 * remaining, |_, _| None).is_none());
+        let (tail_gpu, tail_mapped) = scratch
+            .reserve(remaining, |_, _| panic!("the existing buffer still has room"))
+            .unwrap();
+        assert_eq!(tail_gpu, gpu + occupied);
+        assert_eq!(tail_mapped, mapped.wrapping_add(occupied as usize));
+    }
+
+    #[test]
+    fn retired_scratch_reuses_exact_sizes_within_the_shared_byte_budget() {
+        let Some(host) = host() else { return };
+        let idle = ScratchPool::default();
+        let mut first = Scratch::default();
+        let sizes = [
+            FIRST_SCRATCH_CHUNK,
+            IDLE_SCRATCH_BYTES - FIRST_SCRATCH_CHUNK,
+            SCRATCH_CHUNK,
+        ];
+        let addresses = sizes.map(|size| {
+            first.reserve(size, |capacity, _| {
+                assert_eq!(capacity, size);
+                scratch_chunk(host, capacity)
+            }).unwrap()
+        });
+
+        first.reset(&idle);
+        first.reset(&idle);
+        assert!(idle.take(FIRST_SCRATCH_CHUNK).is_none());
+        first.reset(&idle);
+        assert!(first.chunks.is_empty());
+        assert!(idle.take(SCRATCH_CHUNK).is_none());
+        assert!(idle.take(2 * FIRST_SCRATCH_CHUNK).is_none());
+
+        let mut second = Scratch::default();
+        for (size, address) in sizes.into_iter().zip(addresses).take(2) {
+            assert_eq!(second.reserve(size, |capacity, _| idle.take(capacity)), Some(address));
+        }
+        assert!(idle.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -605,6 +700,44 @@ struct Scratch {
     chunks: Vec<ScratchChunk>,
     current: usize,
     used: u64,
+    previous_chunks: usize,
+}
+
+impl Scratch {
+    fn reserve(
+        &mut self,
+        len: u64,
+        allocate: impl FnOnce(u64, usize) -> Option<ScratchChunk>,
+    ) -> Option<(u64, *mut u8)> {
+        let (mut current, mut used) = (self.current, self.used);
+        while let Some(chunk) = self.chunks.get(current) {
+            if len <= chunk.capacity - used {
+                break;
+            }
+            (current, used) = (current + 1, 0);
+        }
+        if current == self.chunks.len() {
+            let next = self.chunks.last().map_or(FIRST_SCRATCH_CHUNK, |c| 2 * c.capacity);
+            let capacity = len.next_multiple_of(FIRST_SCRATCH_CHUNK).max(next).min(SCRATCH_CHUNK);
+            self.chunks.push(allocate(capacity, current)?);
+        }
+        let chunk = &self.chunks[current];
+        // Leave the original cursor available after a failed allocation.
+        (self.current, self.used) = (current, used + len);
+        Some((chunk.gpu + used, (chunk.mapped + used as usize) as *mut u8))
+    }
+
+    fn reset(&mut self, idle: &ScratchPool) {
+        let used_chunks = self.current + usize::from(self.used != 0);
+        // Keep the peak of the last two recordings across alternating loads.
+        let keep = used_chunks.max(self.previous_chunks);
+        if keep < self.chunks.len() {
+            let mut retired = self.chunks.drain(keep..).peekable();
+            idle.recycle(&mut retired);
+        }
+        self.previous_chunks = used_chunks;
+        (self.current, self.used) = (0, 0);
+    }
 }
 
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
@@ -618,6 +751,34 @@ struct ScratchChunk {
     mapped: usize,
     gpu: u64,
     capacity: u64,
+}
+
+/// Scratch released by a fenced list reset on the process-wide host device.
+/// Dedicated uploads bypass this pool.
+#[derive(Default)]
+struct ScratchPool(Mutex<Vec<ScratchChunk>>);
+
+const IDLE_SCRATCH_BYTES: u64 = 4 << 20;
+static IDLE_SCRATCH: ScratchPool = ScratchPool(Mutex::new(Vec::new()));
+
+impl ScratchPool {
+    fn take(&self, capacity: u64) -> Option<ScratchChunk> {
+        let mut idle = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        // Exact capacities preserve the requesting list's growth policy.
+        let index = idle.iter().rposition(|chunk| chunk.capacity == capacity)?;
+        Some(idle.swap_remove(index))
+    }
+
+    fn recycle(&self, chunks: &mut std::iter::Peekable<impl Iterator<Item = ScratchChunk>>) {
+        let mut idle = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut free = IDLE_SCRATCH_BYTES - idle.iter().map(|chunk| chunk.capacity).sum::<u64>();
+        // The drained chunks are in ascending capacity order. Excess chunks
+        // stay in the iterator and are released after this lock is dropped.
+        while let Some(chunk) = chunks.next_if(|chunk| chunk.capacity <= free) {
+            free -= chunk.capacity;
+            idle.push(chunk);
+        }
+    }
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -896,18 +1057,33 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
             // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
+            let waited = unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
+                self.queue
                     .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
-                }
+                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event))
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| match WaitForSingleObject(self.event, INFINITE) {
+                        WAIT_OBJECT_0 => Ok(()),
+                        WAIT_FAILED => Err(windows::core::Error::from_thread().to_string()),
+                        status => Err(format!("unexpected fence wait status {:#x}", status.0)),
+                    })
+            };
+            if let Err(e) = waited {
+                // Callers may reset lists or read GPU output as soon as we return.
+                let failed_list = removed_in.or_else(|| {
+                    // SAFETY: a plain query.
+                    (groups.len() > 1 && unsafe { self.device.GetDeviceRemovedReason() }.is_err())
+                        .then_some(i)
+                });
+                fail(format_args!(
+                    "host GPU fence wait failed for value {} in a submission of {} lists ({e}){}{}{}",
+                    *submitted,
+                    runs.len(),
+                    self.removal_data(runs),
+                    last_notes(runs),
+                    removed_during(runs, failed_list)
+                ));
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
@@ -1373,10 +1549,6 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        {
-            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-            (scratch.current, scratch.used) = (0, 0);
-        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1386,6 +1558,10 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset(&IDLE_SCRATCH);
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -1698,9 +1874,8 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
-        let host = host()?;
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).checked_next_multiple_of(256)?;
+        let host = host()?;
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
@@ -1709,30 +1884,23 @@ impl HostList {
             self.deferred().uploads.push(buffer);
             return Some((gpu, data));
         }
-        while let Some(chunk) = s.chunks.get(s.current) {
-            if len <= chunk.capacity - s.used {
-                break;
+        let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        scratch.reserve(len, |capacity, _chunk_index| {
+            if let Some(chunk) = IDLE_SCRATCH.take(capacity) {
+                #[cfg(feature = "diagnostics")]
+                tracing::debug!(target: "victory_gpu::scratch", list = ?std::ptr::from_ref(self),
+                    chunk = _chunk_index, requested = len, capacity, "reused list scratch");
+                return Some(chunk);
             }
-            (s.current, s.used) = (s.current + 1, 0);
-        }
-        if s.current == s.chunks.len() {
-            let next = s.chunks.last().map_or(FIRST_SCRATCH_CHUNK, |c| 2 * c.capacity);
-            let capacity = len.next_multiple_of(FIRST_SCRATCH_CHUNK).max(next).min(SCRATCH_CHUNK);
             let (buffer, data) = host.upload_buffer(capacity)?;
             name(&buffer, || format!("list scratch {capacity:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             #[cfg(feature = "diagnostics")]
             tracing::debug!(target: "victory_gpu::scratch", list = ?std::ptr::from_ref(self),
-                chunk = s.current, requested = len, capacity, "allocated list scratch");
-            s.chunks.push(ScratchChunk { _buffer: buffer, mapped: data as usize, gpu, capacity });
-            s.used = 0;
-        }
-        let chunk = &s.chunks[s.current];
-        let at = s.used;
-        let result = (chunk.gpu + at, (chunk.mapped + at as usize) as *mut u8);
-        s.used += len;
-        Some(result)
+                chunk = _chunk_index, requested = len, capacity, "allocated list scratch");
+            Some(ScratchChunk { _buffer: buffer, mapped: data as usize, gpu, capacity })
+        })
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
