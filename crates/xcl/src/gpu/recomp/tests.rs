@@ -471,9 +471,9 @@ fn f64_class_compare_vopc_and_vop3() {
     assert_eq!(t.hlsl.matches("fclass64(").count(), 5, "{}", t.hlsl); // helper plus four calls
     // SRC0 is the 64-bit f64 operand (VGPR/SGPR pair), SRC1 stays a plain 32-bit mask;
     // abs/neg act on the double operand only
-    assert!(t.hlsl.contains("(v12) >> fclass64(asdouble(v10, v11))"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("(v12) >> fclass64(asdouble(v10, (v11 & 0x7FFFFFFFu)))"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("(v13) >> fclass64(asdouble(v10, (v11 ^ 0x80000000u)))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("(v12) >> fclass64(v10, v11)"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("(v12) >> fclass64(v10, (v11 & 0x7FFFFFFFu))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("(v13) >> fclass64(v10, (v11 ^ 0x80000000u))"), "{}", t.hlsl);
     // mask destinations go through the shared compare/write-mask path: vcc, an SGPR pair, exec
     assert!(t.hlsl.contains("vcc_lo = t") && t.hlsl.contains("vcc_hi = t"), "{}", t.hlsl);
     assert!(t.hlsl.contains("s20 = t") && t.hlsl.contains("s21 = t"), "{}", t.hlsl);
@@ -7177,7 +7177,8 @@ fn v_cmp_class_f32_emits_bitwise_modifiers_without_asfloat() {
     assert!(t.complete());
     assert!(t.hlsl.contains("& 0x7FFFFFFFu"), "must apply abs bitwise: {}", t.hlsl);
     assert!(t.hlsl.contains("^ 0x80000000u"), "must apply neg bitwise: {}", t.hlsl);
-    assert!(!t.hlsl.contains("asfloat("), "must not convert to float for fclass: {}", t.hlsl);
+    assert!(!t.hlsl.contains("fclass(asfloat("), "must not convert to float for fclass: {}", t.hlsl);
+    assert!(t.hlsl.contains("fclass(((v0 & 0x7FFFFFFFu) ^ 0x80000000u))"), "must pass bitwise modifiers directly: {}", t.hlsl);
     assert!(t.hlsl.contains("fclass("), "must call fclass: {}", t.hlsl);
 }
 
