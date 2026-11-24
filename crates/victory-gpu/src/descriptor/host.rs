@@ -964,12 +964,16 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
+        // A free run can straddle the cursor. Extend the second scan far
+        // enough to finish a run that starts just before it.
+        let cursor = *next as usize;
+        let end = self.dynamic as usize;
+        let second_end = (cursor + n - 1).min(end);
+        let starts = (cursor..end).chain(0..second_end);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        for at in starts.take(if enough { end + n - 1 } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -999,7 +1003,7 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
     }
 
@@ -3059,6 +3063,22 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn dynamic_allocation_finds_a_free_range_across_the_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let left = heap.dynamic(6).unwrap();
+        let right = heap.dynamic(6).unwrap();
+        assert_eq!(heap.dynamic(heap.dynamic - 12), Some(right + 6));
+        heap.release(left, 6);
+        assert_eq!(heap.dynamic(6), Some(left));
+        // The cursor is between the two blocks, with no free slots elsewhere.
+        heap.release(left, 6);
+        heap.release(right, 6);
+        assert_eq!(heap.dynamic(10), Some(left));
     }
 
     /// Placed unordered texture views (2D and 3D) mirror onto host unordered
