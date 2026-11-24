@@ -169,7 +169,9 @@ target_compile_features(xgameruntime_shim_check PRIVATE cxx_std_17)
 add_test(NAME xgameruntime_thunks COMMAND xgameruntime_shim_check
     "$<TARGET_FILE:xgameruntime_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
     "$<TARGET_FILE_DIR:xmem_shim>")
-set_tests_properties(xgameruntime_thunks PROPERTIES TIMEOUT 30)
+# These three tests use the fixed %TEMP%\xbox-recomp-pls and %TEMP%\xbox-recomp-packages directories,
+# so they must not overlap when CTest runs tests in parallel.
+set_tests_properties(xgameruntime_thunks PROPERTIES TIMEOUT 30 RESOURCE_LOCK xgameruntime_temp_directories)
 
 add_executable(xgameruntime_contracts_check tests/xgameruntime_contracts_check.cpp)
 target_link_libraries(xgameruntime_contracts_check PRIVATE xgameruntime_shim)
@@ -177,7 +179,7 @@ target_compile_features(xgameruntime_contracts_check PRIVATE cxx_std_17)
 add_test(NAME xgameruntime_contracts COMMAND xgameruntime_contracts_check
     "$<TARGET_FILE:xgameruntime_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
     "$<TARGET_FILE_DIR:xmem_shim>")
-set_tests_properties(xgameruntime_contracts PROPERTIES TIMEOUT 30)
+set_tests_properties(xgameruntime_contracts PROPERTIES TIMEOUT 30 RESOURCE_LOCK xgameruntime_temp_directories)
 
 add_executable(xgameruntime_pls_xpackage_check tests/xgameruntime_pls_xpackage_check.cpp)
 add_dependencies(xgameruntime_pls_xpackage_check xgameruntime_shim)
@@ -185,7 +187,7 @@ target_compile_features(xgameruntime_pls_xpackage_check PRIVATE cxx_std_17)
 add_test(NAME xgameruntime_pls_xpackage COMMAND xgameruntime_pls_xpackage_check
     "$<TARGET_FILE:xgameruntime_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
     "$<TARGET_FILE_DIR:xmem_shim>")
-set_tests_properties(xgameruntime_pls_xpackage PROPERTIES TIMEOUT 30)
+set_tests_properties(xgameruntime_pls_xpackage PROPERTIES TIMEOUT 30 RESOURCE_LOCK xgameruntime_temp_directories)
 
 # A real source-built EXE import fixture. The import library below only names
 # xgameruntime.dll; no build product or test package copies the fixture DLL.

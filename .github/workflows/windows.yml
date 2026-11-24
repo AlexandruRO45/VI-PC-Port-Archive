@@ -133,7 +133,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build --preset dev
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          ctest --preset dev --no-tests=error -E '_hardware$' --output-junit "$PWD/out/test-results.xml"
+          ctest --preset dev --no-tests=error --parallel 4 -E '_hardware$' --output-junit "$PWD/out/test-results.xml"
       - name: Require the SPIR-V bridge WARP tests
         if: ${{ !cancelled() }}
         shell: pwsh
@@ -206,7 +206,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build --preset release
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          ctest --preset release --no-tests=error -E '_hardware$' --output-junit "$PWD/out/test-results-release.xml"
+          ctest --preset release --no-tests=error --parallel 4 -E '_hardware$' --output-junit "$PWD/out/test-results-release.xml"
       - name: Require the SPIR-V bridge WARP tests at /O2
         if: ${{ !cancelled() }}
         shell: pwsh
