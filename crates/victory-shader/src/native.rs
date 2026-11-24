@@ -2042,6 +2042,43 @@ mod tests {
     }
 
     #[test]
+    fn the_scratch_offset_follows_every_system_sgpr_and_moves_none() {
+        let cs = |rsrc2: u32| ComputeIo {
+            rsrc2,
+            threads: [1, 1, 1],
+        };
+        // Bit 0 adds the wave offset after whatever else is initialized: the
+        // user and system SGPRs stay where they were, and the count grows
+        // by exactly one, whichever ids and info are enabled.
+        for rest in [
+            0,
+            3 << 1,
+            1 << 9,
+            2 << 1 | 1 << 8 | 1 << 10,
+            0x1F << 1 | 0xF << 7,
+        ] {
+            let (off, on) = (cs(rest), cs(rest | 1));
+            assert_eq!(on.user_sgprs(), off.user_sgprs(), "{rest:#x}");
+            assert_eq!(on.system_sgprs(), off.system_sgprs(), "{rest:#x}");
+            assert_eq!(
+                on.initialized_sgprs(),
+                off.initialized_sgprs() + 1,
+                "{rest:#x}"
+            );
+        }
+        // Every field at its most: s0..=s30 user, s31..=s34 system, the
+        // wave offset in s35.
+        assert_eq!(cs(0x1F << 1 | 0xF << 7 | 1).initialized_sgprs(), 36);
+        // A parsed program keeps the bit: all sixteen user-data dwords as
+        // constants, below the ids, with scratch on.
+        let rsrc2: u32 = 16 << 1 | 0xF << 7 | 1;
+        let p = compute_program(rsrc2, 0, 16, 0).unwrap();
+        assert!(
+            matches!(p[0].io, StageIo::Cs(c) if c.rsrc2 == rsrc2 && c.initialized_sgprs() == 21)
+        );
+    }
+
+    #[test]
     fn a_parsed_compute_program_initializes_its_root_parameters() {
         // 4 user SGPRs, group id x and the info, scratch: s0..=s6.
         let rsrc2: u32 = 4 << 1 | 1 << 7 | 1 << 10 | 1;
