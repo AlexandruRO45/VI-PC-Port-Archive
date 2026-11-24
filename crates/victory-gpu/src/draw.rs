@@ -949,9 +949,15 @@ impl State {
                 self.table_entry(list, u, compute, uav_buffers);
             }
         }
+        struct Reserved<'a> {
+            host: &'a crate::descriptor::host::HostHeap,
+            heap_ptr: usize,
+            key: (u64, u64),
+            first: u32,
+            n: u32,
+        }
         let mut made = Vec::new();
-        let mut reserved: Vec<(&crate::descriptor::host::HostHeap, usize, (u64, u64), u32, u32)> =
-            Vec::new();
+        let mut reserved: Vec<Reserved<'_>> = Vec::new();
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
@@ -1024,7 +1030,13 @@ impl State {
             // directly on dynamic slot `first + offset`.
             let table_base = first - base;
             self.fresh_tables.insert(key, table_base);
-            reserved.push((host, heap_ptr, key, first, n));
+            reserved.push(Reserved {
+                host,
+                heap_ptr,
+                key,
+                first,
+                n,
+            });
             // The whole range from the first used entry to the last: a shader may
             // index across intermediate entries (descriptor arrays).
             for offset in 0..n {
@@ -1059,14 +1071,14 @@ impl State {
             made.push((slot, table_base * 32));
         }
         if self.table_failed {
-            for (host, _, key, first, n) in reserved {
-                self.fresh_tables.remove(&key);
-                host.release(first, n);
+            for r in reserved {
+                self.fresh_tables.remove(&r.key);
+                r.host.release(r.first, r.n);
             }
             made.clear();
         } else {
-            for (_, heap_ptr, _, first, n) in reserved {
-                list.record_dynamic(heap_ptr, first, n);
+            for r in reserved {
+                list.record_dynamic(r.heap_ptr, r.first, r.n);
             }
         }
         made

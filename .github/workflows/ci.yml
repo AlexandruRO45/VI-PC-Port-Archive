@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CARGO_TERM_COLOR: always
+  CARGO_TERM_COLOR: never
 
 jobs:
   check:
@@ -31,7 +31,7 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee clippy.log
           rc=${PIPESTATUS[0]}
           if [ "$rc" -ne 0 ]; then
-            grep -E "^(error|warning)" clippy.log | head -n 9 | while IFS= read -r line; do echo "::error::$line"; done
+            grep -E "^(error|warning|  --> )" clippy.log | head -n 9 | while IFS= read -r line; do echo "::error::$line"; done
             exit "$rc"
           fi
       - name: Clippy, diagnostics build
@@ -41,7 +41,7 @@ jobs:
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings 2>&1 | tee clippy-diag.log
           rc=${PIPESTATUS[0]}
           if [ "$rc" -ne 0 ]; then
-            grep -E "^(error|warning)" clippy-diag.log | head -n 9 | while IFS= read -r line; do echo "::error::$line"; done
+            grep -E "^(error|warning|  --> )" clippy-diag.log | head -n 9 | while IFS= read -r line; do echo "::error::$line"; done
             exit "$rc"
           fi
       # Includes xtask's repository_passes_policy, the asset-policy check.
