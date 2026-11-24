@@ -302,8 +302,10 @@ pub struct UserData {
 pub const GS_EMIT: &str = "GS emit";
 
 /// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container. A geometry container gets as far as [`emit`], which
-/// refuses it with [`GS_EMIT`].
+/// shader container. A geometry container on its own does not translate:
+/// the runtime table in its first user-data dwords is the merged stage's,
+/// which only a pair ([`translate_merged_gs`]) can tell from a root
+/// parameter of the ES half.
 ///
 /// A program refused because the first half of an interpolation is read as
 /// data is translated once more with first halves evaluated as the pair
@@ -337,7 +339,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute, mesh or geometry program",
         })?;
-    translate_native(&c, &native)
+    translate_native(&c, &native, false)
 }
 
 /// Translates a geometry program with the ES program it is linked with: the
@@ -360,15 +362,17 @@ pub fn translate_merged_gs(es: &[u8], gs: &[u8]) -> Result<HostShader, ShaderErr
             })
     };
     let merged = crate::merged::pair_es_gs(stage_of(es, HwStage::Es)?, stage_of(gs, HwStage::Gs)?)?;
-    translate_native(&Container::parse(gs)?, &merged.program())
+    translate_native(&Container::parse(gs)?, &merged.program(), true)
 }
 
-fn translate_native(c: &Container, native: &NativeProgram) -> Result<HostShader, ShaderError> {
+/// `merged`: the layout is the merged ES+GS stage's ([`resource::track_merged`]).
+fn translate_native(c: &Container, native: &NativeProgram, merged: bool) -> Result<HostShader, ShaderError> {
     let p = crate::spill::build(native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let track = if merged { resource::track_merged } else { resource::track };
+    let res = track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, native)?;
     let st = st?;
     emit(c, native, &p, &st, &io, &res)
@@ -1849,11 +1853,16 @@ mod merged_gs_tests {
     }
 
     #[test]
-    fn a_geometry_container_stops_at_emission() {
-        // The load through the runtime table pointer (user data 0 and 1) was
-        // "an address in an SGPR that is no root parameter".
+    fn a_geometry_container_alone_does_not_trace() {
+        // The load through the runtime table pointer (user data 0 and 1) is
+        // "an address in an SGPR that is no root parameter" until the ES
+        // half's layout says nothing is there.
         let gs = container(&[(HwStage::Gs, &load(8))]);
-        assert!(stopped_at_gs_emit(translate(&gs)));
+        assert!(matches!(
+            translate(&gs),
+            Err(ShaderError::Unsupported { what, .. })
+                if what == "an address in an SGPR that is no root parameter"
+        ));
     }
 
     #[test]
