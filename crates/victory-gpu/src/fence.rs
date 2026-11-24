@@ -96,81 +96,155 @@ fn watch_notify() {
     });
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum Comparison {
-    Equal,
-    GreaterEqual,
+/// The two list methods have distinct operand widths. Only Wait32 takes a mask.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Operand {
+    Dword(u32),
+    Qword,
 }
 
-/// One particular execution of a command-list memory predicate. Once observed,
-/// equality stays satisfied even if the producer has advanced again before wake().
-#[derive(Clone)]
-pub(crate) struct MemoryWait {
-    address: usize,
-    comparison: Comparison,
-    reference: u64,
-    observed: Arc<std::sync::atomic::AtomicBool>,
-}
-
-static MEMORY: Mutex<Vec<(MemoryWait, Arc<Timeline>)>> = Mutex::new(Vec::new());
-
-impl MemoryWait {
-    pub(crate) fn new(address: usize, comparison: Comparison, reference: u64) -> Self {
-        Self {
-            address,
-            comparison,
-            reference,
-            observed: Default::default(),
+impl Operand {
+    pub(crate) fn bytes(self) -> usize {
+        match self {
+            Self::Dword(_) => 4,
+            Self::Qword => 8,
         }
     }
+}
 
-    fn observe(&self) -> bool {
-        // SAFETY: command-list callers keep this aligned GPU address mapped until
-        // completion. Bottom-of-pipe writes to aligned words use a release store.
-        let word = unsafe { &*(self.address as *const AtomicU64) }.load(Ordering::Acquire);
-        let ready = match self.comparison {
-            Comparison::Equal => word == self.reference,
-            Comparison::GreaterEqual => word >= self.reference,
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Predicate {
+    pub address: usize,
+    pub operand: Operand,
+    pub comparison: u32,
+    pub reference: u64,
+}
+
+impl Predicate {
+    fn matches(self, value: u64) -> bool {
+        let value = match self.operand {
+            Operand::Dword(mask) => u64::from(value as u32 & mask),
+            Operand::Qword => value,
         };
-        if ready {
-            self.observed.store(true, Ordering::Release);
+        // D3D12_COMPARISON_FUNC, using unsigned operands of the guest width.
+        match self.comparison {
+            1 => false,
+            2 => value < self.reference,
+            3 => value == self.reference,
+            4 => value <= self.reference,
+            5 => value > self.reference,
+            6 => value != self.reference,
+            7 => value >= self.reference,
+            8 => true,
+            _ => unreachable!("comparison validated at record time"),
         }
-        ready
     }
 
-    pub(crate) fn register(&self, queue: &Arc<Timeline>) -> bool {
-        let mut pending = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
-        if self.observed.load(Ordering::Acquire) {
-            return true;
-        }
-        if pending
-            .iter()
-            .any(|(w, _)| Arc::ptr_eq(&w.observed, &self.observed))
-        {
+    fn reached(self) -> bool {
+        if self.comparison == 1 {
             return false;
         }
-        if self.observe() {
+        // SAFETY: the guest keeps the naturally aligned operand mapped until
+        // completion. Serialize with emulated writes using MEMORY, including
+        // mixed-width writes that overlap this operand.
+        let value = unsafe {
+            match self.operand {
+                Operand::Dword(_) => u64::from(
+                    (&*(self.address as *const std::sync::atomic::AtomicU32))
+                        .load(Ordering::Acquire),
+                ),
+                Operand::Qword => (&*(self.address as *const AtomicU64)).load(Ordering::Acquire),
+            }
+        };
+        self.matches(value)
+    }
+}
+
+/// Latch per execution, allocated only if the queue actually has to wait.
+pub(crate) struct MemoryWait {
+    predicate: Predicate,
+    observed: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// Submitted work outlives the guest queue handle. NEVER has no possible
+/// producer, so only its diagnostic needs to follow the queue's lifetime.
+enum WaitingQueue {
+    Reachable(Arc<Timeline>),
+    Never(Weak<Timeline>),
+}
+
+struct Pending {
+    predicate: Predicate,
+    observed: Arc<std::sync::atomic::AtomicBool>,
+    queue: WaitingQueue,
+    since: Instant,
+    warned: bool,
+}
+
+static MEMORY: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+
+impl MemoryWait {
+    pub(crate) fn new(predicate: Predicate) -> Self {
+        Self {
+            predicate,
+            observed: None,
+        }
+    }
+
+    pub(crate) fn register(&mut self, queue: &Arc<Timeline>) -> bool {
+        if let Some(observed) = &self.observed {
+            return observed.load(Ordering::Acquire);
+        }
+        let mut pending = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        if self.predicate.reached() {
             return true;
         }
-        pending.push((self.clone(), queue.clone()));
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.observed = Some(observed.clone());
+        pending.push(Pending {
+            predicate: self.predicate,
+            observed,
+            queue: if self.predicate.comparison == 1 {
+                WaitingQueue::Never(Arc::downgrade(queue))
+            } else {
+                WaitingQueue::Reachable(queue.clone())
+            },
+            since: Instant::now(),
+            warned: false,
+        });
         drop(pending);
         watch_notify();
         false
     }
 }
 
-fn scan_memory(pending: &mut Vec<(MemoryWait, Arc<Timeline>)>, range: Option<std::ops::Range<usize>>) -> (Vec<Arc<Timeline>>, bool) {
+fn scan_memory(
+    pending: &mut Vec<Pending>,
+    range: Option<std::ops::Range<usize>>,
+) -> (Vec<Arc<Timeline>>, bool) {
     let mut ready = Vec::new();
-    pending.retain(|(wait, queue)| {
-        let overlaps = range
-            .as_ref()
-            .is_none_or(|r| r.start < wait.address.saturating_add(8) && wait.address < r.end);
-        if overlaps && wait.observe() {
-            ready.push(queue.clone());
-            false
-        } else {
-            true
+    pending.retain_mut(|entry| {
+        let wait = entry.predicate;
+        let overlaps = range.as_ref().is_none_or(|r| {
+            r.start < wait.address.saturating_add(wait.operand.bytes()) && wait.address < r.end
+        });
+        if let WaitingQueue::Never(queue) = &entry.queue
+            && queue.strong_count() == 0
+        {
+            return false;
         }
+        if let WaitingQueue::Reachable(queue) = &entry.queue
+            && overlaps && wait.reached()
+        {
+            entry.observed.store(true, Ordering::Release);
+            ready.push(queue.clone());
+            return false;
+        }
+        if range.is_none() && !entry.warned && entry.since.elapsed() >= STALL {
+            tracing::warn!(?wait, elapsed = ?entry.since.elapsed(), "GPU queue still waiting for memory");
+            entry.warned = true;
+        }
+        true
     });
     (ready, !pending.is_empty())
 }
@@ -179,7 +253,8 @@ fn watch_loop() {
     loop {
         let seen = *WATCHER.generation.lock().unwrap_or_else(|e| e.into_inner());
         let (mut woken, fence_waiting) = scan_live_fences();
-        let (memory_ready, memory_waiting) = scan_memory(&mut MEMORY.lock().unwrap_or_else(|e| e.into_inner()), None);
+        let (memory_ready, memory_waiting) =
+            scan_memory(&mut MEMORY.lock().unwrap_or_else(|e| e.into_inner()), None);
         woken.extend(memory_ready);
         let any_waiting = fence_waiting || memory_waiting;
         if !woken.is_empty() {
@@ -488,6 +563,106 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn memory_predicates_use_unsigned_width_and_mask_only_the_operand() {
+        let matches = |operand, comparison, value, reference| {
+            Predicate {
+                address: 0,
+                operand,
+                comparison,
+                reference,
+            }
+            .matches(value)
+        };
+        for (comparison, less, equal, greater) in [
+            (1, false, false, false),
+            (2, true, false, false),
+            (3, false, true, false),
+            (4, true, true, false),
+            (5, false, false, true),
+            (6, true, false, true),
+            (7, false, true, true),
+            (8, true, true, true),
+        ] {
+            for (operand, maximum) in [
+                (Operand::Dword(u32::MAX), u64::from(u32::MAX)),
+                (Operand::Qword, u64::MAX),
+            ] {
+                assert_eq!(matches(operand, comparison, 0, maximum), less);
+                assert_eq!(matches(operand, comparison, maximum, maximum), equal);
+                assert_eq!(matches(operand, comparison, maximum, 0), greater);
+            }
+        }
+        assert!(matches(Operand::Dword(0xff), 3, 0x1_8000_ab10, 0x10));
+        assert!(!matches(Operand::Dword(0xff), 3, 0xab10, 0xab10));
+        assert!(matches(Operand::Dword(0), 3, u64::MAX, 0));
+        assert!(matches(Operand::Qword, 5, 1 << 63, (1 << 63) - 1));
+    }
+
+    #[test]
+    fn never_wait_releases_its_timeline_and_warns_without_resuming() {
+        let timeline = Arc::new(Timeline::default());
+        let weak = Arc::downgrade(&timeline);
+        let word = AtomicU64::new(1);
+        let predicate = Predicate {
+            address: word.as_ptr() as usize,
+            operand: Operand::Qword,
+            comparison: 1,
+            reference: 1,
+        };
+        let mut wait = MemoryWait::new(predicate);
+        assert!(!wait.register(&timeline));
+        let mut pending = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        let ours = |entry: &Pending| entry.predicate.address == predicate.address;
+        let index = pending.iter().position(ours).unwrap();
+        // Use the real scan and threshold, without sleeping or scanning other tests' entries.
+        let mut isolated = vec![pending.swap_remove(index)];
+        drop(pending);
+        isolated[0].since = Instant::now() - STALL;
+        assert!(scan_memory(&mut isolated, None).0.is_empty());
+        assert!(isolated[0].warned);
+        assert!(!wait.register(&timeline));
+        drop(timeline);
+        assert!(weak.upgrade().is_none());
+        assert!(!scan_memory(&mut isolated, None).1);
+    }
+
+    #[test]
+    fn racing_memory_write_and_registration_resume_exactly_once() {
+        use crate::timeline::Op;
+        use std::sync::Barrier;
+        for _ in 0..128 {
+            let timeline = Arc::new(Timeline::default());
+            let word = AtomicU64::new(0);
+            let start = Barrier::new(2);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let wait = MemoryWait::new(Predicate {
+                address: word.as_ptr() as usize,
+                operand: Operand::Qword,
+                comparison: 3,
+                reference: u64::MAX,
+            });
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    start.wait();
+                    crate::queue::Written::Value(u64::MAX)
+                        .write(word.as_ptr().cast(), 8)
+                        .run();
+                });
+                start.wait();
+                timeline.submit_batch([
+                    Op::Memory(wait),
+                    Op::Run(Box::new(move || tx.send(()).unwrap())),
+                ]);
+                rx.recv_timeout(Duration::from_secs(2)).expect("lost wake");
+            });
+            assert!(matches!(
+                rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ));
+        }
+    }
 
     type Wait = extern "system" fn(This, u64, *mut c_void) -> HRESULT;
     type Signal = extern "system" fn(This, u64) -> HRESULT;

@@ -138,13 +138,13 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             let prefixes = crate::list::prefixes(list);
             let split = !prefixes.is_empty();
             for prefix in prefixes {
-                batch.push(prefix.list);
-                ops.push(run_lists(std::mem::take(&mut batch)));
-                ops.push(Op::Memory(crate::fence::MemoryWait::new(
-                    prefix.address,
-                    prefix.comparison,
-                    prefix.reference,
-                )));
+                if let Some(segment) = prefix.list {
+                    batch.push(segment);
+                }
+                if !batch.is_empty() {
+                    ops.push(run_lists(std::mem::take(&mut batch)));
+                }
+                ops.push(Op::Memory(crate::fence::MemoryWait::new(prefix.predicate)));
             }
             batch.push(tail);
             if split {

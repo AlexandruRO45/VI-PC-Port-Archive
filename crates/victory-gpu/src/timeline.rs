@@ -104,7 +104,7 @@ impl Timeline {
                         break;
                     }
                 }
-                Op::Memory(wait) => {
+                Op::Memory(mut wait) => {
                     if !wait.register(self) {
                         s.ops.push_front(Op::Memory(wait));
                         s.held = true;
