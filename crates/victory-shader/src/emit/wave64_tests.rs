@@ -457,7 +457,6 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
 /// those alone). Every thread stores what lane 0 holds after the join: 5 once the body
 /// ran, 7 when the wave skipped it.
 #[test]
-#[ignore = "known failure: v_writelane_b32 is dropped when its lane is outside EXEC; run with --ignored"]
 fn a_lane_write_reaches_its_lane_outside_exec() {
     let words = [
         0x7E12_0287, // v_mov_b32 v9, 7
@@ -486,6 +485,7 @@ fn a_lane_write_reaches_its_lane_outside_exec() {
         ("without skips, scalars followed", ir::without_skips(&p, true)),
     ];
     let mut wrong = Vec::new();
+    let mut ran = 0;
     for (name, q) in &forms {
         let Some(q) = q else {
             eprintln!("{name}: the skip is kept");
@@ -494,11 +494,16 @@ fn a_lane_write_reaches_its_lane_outside_exec() {
         lower::take_needs();
         let shader = match lowered(&native, q, &HashSet::new()) {
             Ok(s) => s,
-            Err(e) => {
-                eprintln!("{name}: {e}");
+            // With the skip, lane 0 is not where the write stands: refused, and the forms
+            // without the skip are taken instead (`super::emit`).
+            Err(ShaderError::Unsupported { what, .. }) if *name == "as is" => {
+                assert_eq!(what, "a lane write where not every lane runs");
+                assert!(lower::needs_every_lane(what));
                 continue;
             }
+            Err(e) => panic!("{name}: {e}"),
         };
+        ran += 1;
         // (threads above s0 inside) -> lane 0 after the join
         for (s0, expected) in [(10u32, 5u32), (62, 5), (63, 7)] {
             let Some(got) = on_the_card(&shader, [s0, 0]) else { return };
@@ -508,17 +513,19 @@ fn a_lane_write_reaches_its_lane_outside_exec() {
             }
         }
     }
-    // The same with lane 0 inside (`t < s0`): the write lands in every form.
+    // The same with lane 0 inside (`t < s0`).
     let mut inside = words;
     inside[1] = 0x7D88_0000; // v_cmp_gt_u32 vcc, s0, v0
     let native = native_of(&inside, true, 64);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     lower::take_needs();
+    let p = ir::without_skips(&p, false).expect("the skip is left out");
     let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
-    for (s0, expected) in [(10u32, 5u32), (0, 7)] {
+    for (s0, expected) in [(10u32, 5u32), (64, 5), (0, 7)] {
         let Some(got) = on_the_card(&shader, [s0, 0]) else { return };
-        eprintln!("lane 0 inside, as is: threads below {s0} inside -> {got} (the console: {expected})");
+        eprintln!("lane 0 inside, without skips: threads below {s0} inside -> {got} (the console: {expected})");
         assert_eq!(got, expected, "lane 0 inside, s0 = {s0}");
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(ran, 2, "both forms without the skip translate");
 }
