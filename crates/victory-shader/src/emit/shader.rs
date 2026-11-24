@@ -20,6 +20,7 @@ pub const CONST_VIEW_SPACE: u32 = 2;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const USE_64_UAVS: u64 = 1 << 15;
     pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
@@ -84,6 +85,8 @@ pub(crate) struct Shader {
     /// [`CONST_VIEW_SPACE`].
     pub const_uavs: Vec<(u8, u32, u32, V)>,
     pub flags: u64,
+    /// Heap handles made with a non-uniform index.
+    pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -141,6 +144,7 @@ impl Shader {
             const_srvs: Vec::new(),
             const_uavs: Vec::new(),
             flags: 0,
+            nonuniform_handles: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -408,14 +412,23 @@ impl Shader {
         )
     }
 
-    /// A descriptor heap handle, annotated with `props`.
-    pub fn heap_handle(&mut self, block: usize, index: V, sampler: bool, props: (u32, u32)) -> V {
+    /// A descriptor heap handle, annotated with `props`; `nonuniform` when
+    /// the index may differ between lanes (`NonUniformResourceIndex`).
+    pub fn heap_handle(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+    ) -> V {
         self.flags |= if sampler {
             flags::SAMPLER_HEAP
         } else {
             flags::RESOURCE_HEAP
         };
-        let (s, n) = (self.m.bool(sampler), self.m.bool(false));
+        self.nonuniform_handles += u32::from(nonuniform);
+        let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
             "createHandleFromHeap",
@@ -713,6 +726,10 @@ impl Shader {
         } else {
             None
         };
+        // A pixel shader with an SV_StencilRef output (as DXC collects it).
+        if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
+            self.flags |= flags::STENCIL_REF;
+        }
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
@@ -796,6 +813,9 @@ impl Shader {
         }
         if self.flags & flags::USE_64_UAVS != 0 {
             features |= 0x8;
+        }
+        if self.flags & flags::STENCIL_REF != 0 {
+            features |= 0x200;
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;

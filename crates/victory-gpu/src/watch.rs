@@ -275,7 +275,8 @@ pub fn writing(at: usize, len: usize) {
     if len == 0 || !HAS_GUARDS.load(Ordering::Acquire) {
         return;
     }
-    open(&mut guards(), at, at + len);
+    // The length is the title's (`fread`'s size times count, saturated).
+    open(&mut guards(), at, at.saturating_add(len));
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -288,7 +289,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
     let blocks: Vec<usize> = g
         .protected
-        .range(at / BLOCK..(at + len).div_ceil(BLOCK))
+        .range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK))
         .copied()
         .collect();
     for block in blocks {
@@ -438,5 +439,15 @@ mod tests {
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// A write or mapping that runs past the end of the address space (a
+    /// title's `fread` with a huge count) covers up to the end; the sum used
+    /// to overflow. Up there no test has guarded blocks.
+    #[test]
+    fn ranges_past_the_address_space_end_do_not_overflow() {
+        let top = usize::MAX - 16;
+        writing(top, PAGE);
+        title_memory_remapped(top, usize::MAX);
     }
 }

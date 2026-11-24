@@ -75,6 +75,8 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// A fresh table of the stage being bound could not be made.
+    table_failed: bool,
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -259,10 +261,8 @@ impl State {
     }
 
     pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
-        for i in 0..count as usize {
-            if let Some(slot) = self.vertex.get_mut(start as usize + i) {
-                *slot = VertexView::default();
-            }
+        for slot in self.vertex.iter_mut().skip(start as usize).take(count as usize) {
+            *slot = VertexView::default();
         }
     }
 
@@ -402,7 +402,9 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
-        let uav_buffers = self.bind(list, p, false);
+        let Some(uav_buffers) = self.bind(list, p, false) else {
+            return false;
+        };
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -466,10 +468,11 @@ impl State {
     /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold. Returns shadow-buffer pointers bound as
-    /// UAVs by this operation so callers do not transition them away from
-    /// `UNORDERED_ACCESS`.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> Vec<usize> {
+    /// descriptors its tables hold. Returns `Some(uav_buffers)` with
+    /// shadow-buffer pointers bound as UAVs by this operation so callers do
+    /// not transition them away from `UNORDERED_ACCESS`, or `None` if a
+    /// required fresh table could not be made and the draw/dispatch must drop.
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> Option<Vec<usize>> {
         let mut uav_buffers = Vec::new();
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
@@ -513,7 +516,19 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            self.table_failed = false;
             let made = self.tables(list, &t.used, compute, &mut uav_buffers);
+            if self.table_failed {
+                static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
+                let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::warn!(
+                        dropped = n,
+                        "a draw or dispatch dropped: no dynamic slots for its tables"
+                    );
+                }
+                return None;
+            }
             if let Some(binding) = stage.user_data {
                 let dwords = match binding {
                     crate::pipeline::host::UserDataBinding::Constants { dwords, .. }
@@ -668,7 +683,7 @@ impl State {
                 }
             }
         }
-        uav_buffers
+        Some(uav_buffers)
     }
 
     /// Runs a dispatch on the host.
@@ -693,7 +708,10 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        let _ = self.bind(list, p, true);
+        if self.bind(list, p, true).is_none() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -906,6 +924,10 @@ impl State {
                     None
                 }
             }) else {
+                // Without its fresh table the shader would read the title's
+                // slots, which for constant buffer tables hold no constant
+                // view: drop the draw or dispatch instead of faulting (#59).
+                self.table_failed = true;
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     tracing::warn!(n, "no free dynamic descriptor slots: a table is not made")
@@ -1207,10 +1229,7 @@ impl State {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => {
-                    let _ = self.bind(list, p, true);
-                    true
-                }
+                Some(p) if p.compute => self.bind(list, p, true).is_some(),
                 _ => false,
             },
             _ => false,
@@ -1362,7 +1381,11 @@ fn describe(view: Option<&View>) -> String {
         None => "no view".into(),
         Some(v @ View::Shader(r, _)) => texture(*r as This)
             .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
-        Some(View::Unordered(r, ..)) => format!("uav {:?}", texture(*r as This)),
+        // A buffer has no host texture: its title range, as for a shader view.
+        Some(v @ View::Unordered(r, ..)) => texture(*r as This).map_or_else(
+            || format!("uav buffer {:?}", crate::descriptor::host::buffer_range(v)),
+            |t| format!("uav {t}"),
+        ),
         Some(View::Placed(u, r, d)) => format!(
             "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
             r[0],
