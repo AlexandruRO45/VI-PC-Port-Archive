@@ -300,6 +300,9 @@ pub fn emit(
     })
 }
 
+/// The registers D3D12 links one stage's signature to the next through.
+const SIGNATURE_REGISTERS: u32 = 32;
+
 /// The rows of an `ISG1`/`OSG1` part.
 fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
@@ -384,7 +387,17 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
                 });
             }
         };
+        // D3D12 links stages through 32 registers. The register is a raw
+        // `u32` of the title's part, and the container multiplies the row by
+        // four and writes a dependency mask for every input scalar, so a
+        // register far past them overflowed (a panic in debug builds) or
+        // asked for gigabytes of masks.
         let register = u32_at(part, at + 20)?;
+        if register != u32::MAX && register >= SIGNATURE_REGISTERS {
+            return Err(ShaderError::Malformed(
+                "signature register past the 32 D3D12 has",
+            ));
+        }
         out.push(container::SigElement {
             name: String::from_utf8_lossy(name).into_owned(),
             index: u32_at(part, at + 8)?,
@@ -454,6 +467,34 @@ mod tests {
                 signature(&part(count, base)).unwrap_err().to_string(),
                 refused.to_string(),
                 "count {count:#x}, rows at {base:#x}"
+            );
+        }
+    }
+
+    /// A signature register is a raw `u32` of the title's part. One past
+    /// D3D12's 32 is refused; a register of 2^30 used to overflow the
+    /// container's `row * 4` (a panic in debug builds), and smaller ones
+    /// sized the dependency masks by the register rather than the rows.
+    #[test]
+    fn a_signature_register_past_32_is_refused() {
+        let part = |register: u32| {
+            let mut p = Vec::new();
+            for w in [1, 8, 0, 40, 0, 0, 3, register, 0x0F, 0] {
+                p.extend_from_slice(&u32::to_le_bytes(w));
+            }
+            p.extend_from_slice(b"TEXCOORD\0");
+            p
+        };
+        for (register, row) in [(0, Some(0)), (31, Some(31)), (u32::MAX, None)] {
+            let rows = signature(&part(register)).expect("a register D3D12 has");
+            assert_eq!(rows[0].row, row, "register {register:#x}");
+        }
+        let refused = ShaderError::Malformed("signature register past the 32 D3D12 has");
+        for register in [32, 255, 256, 0x4000_0000, u32::MAX - 1] {
+            assert_eq!(
+                signature(&part(register)).unwrap_err().to_string(),
+                refused.to_string(),
+                "register {register:#x}"
             );
         }
     }
