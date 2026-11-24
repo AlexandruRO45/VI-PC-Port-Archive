@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
+use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -537,6 +538,11 @@ pub fn init() -> Result<String, String> {
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
         *ADAPTER.lock().unwrap() = name.clone();
+        // Log the chosen wave mode for diagnostics (#1407)
+        let compute_wave32 = crate::gpu::recomp::pso::wave32_only_for_device(&device);
+        let graphics_wave32 = crate::gpu::recomp::pso::graphics_wave32_for_device(&device);
+        let split_forced = crate::gpu::recomp::pso::split_wave64_forced();
+        crate::xlog_info!("D3D12.X: wave mode: compute_wave32={compute_wave32}, graphics_wave32={graphics_wave32}, split_forced={split_forced}");
         Ok(name)
     }
 }
@@ -633,7 +639,7 @@ fn module_of(addr: usize) -> usize {
 
 /// Whether `obj` is an object XCL adopted (its vtable is one of XCL's).
 pub(super) unsafe fn is_adopted(obj: *mut c_void) -> bool {
-    !obj.is_null() && crate::gpu::shader::readable(obj as usize, 8) && is_ext(*(obj as *const usize))
+    !obj.is_null() && crate::gpu::shader::readable(obj as usize, 8) && is_ext(ptr::read_unaligned(obj as *const usize))
 }
 
 /// A struct-returning method's first two arguments: true when `a` is the object (the C++ way:
