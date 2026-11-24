@@ -452,6 +452,33 @@ mod tests {
     }
 
     #[test]
+    fn parts_and_offsets_past_the_stated_size_are_out_of_bounds() {
+        let bytes = build(&[(FourCC::SFI0, &[0; 8])]);
+        let total = bytes.len() as u32;
+        // A part starting exactly at the container end has no header.
+        let mut at_end = bytes.clone();
+        at_end[0x20..0x24].copy_from_slice(&total.to_le_bytes());
+        assert_eq!(malformed(&at_end), "part header out of bounds");
+        // A whole, valid part in bytes after the stated size is still
+        // outside the container, though the buffer holds it.
+        let mut trailing = bytes.clone();
+        trailing.extend_from_slice(b"PRIV");
+        trailing.extend_from_slice(&0u32.to_le_bytes());
+        trailing[0x20..0x24].copy_from_slice(&total.to_le_bytes());
+        assert_eq!(malformed(&trailing), "part header out of bounds");
+        // An offset table the stated size cuts short is truncated, even
+        // when the buffer goes on past it.
+        let mut table = build(&[]);
+        table[0x1C..0x20].copy_from_slice(&1u32.to_le_bytes());
+        table.extend_from_slice(&(HEADER_SIZE as u32 + 4).to_le_bytes());
+        assert_eq!(malformed(&table), "truncated");
+        // With the size covering the table, its one entry points at the
+        // container end: no header there either.
+        table[0x18..0x1C].copy_from_slice(&(HEADER_SIZE as u32 + 4).to_le_bytes());
+        assert_eq!(malformed(&table), "part header out of bounds");
+    }
+
+    #[test]
     fn fourcc_display_masks_unprintable_bytes() {
         assert_eq!(FourCC::DXIL.to_string(), "DXIL");
         assert_eq!(FourCC(*b"A\0 \xFF").to_string(), "A...");
