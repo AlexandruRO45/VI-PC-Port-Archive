@@ -1139,16 +1139,9 @@ fn readable(
             .flatten();
         if let Some(from) = fed {
             from.refresh(list, address, len);
+            // The view's copy holds its whole range, so `len` bytes fit it.
             let len = len.min(from.left(address));
-            list.buffer_state(&from.buffer, crate::host::BUFFER_READ);
-            list.buffer_state(&copy.buffer, crate::host::BUFFER_COPY_DEST);
-            // SAFETY: an open list; both buffers are host copies the slot and
-            // the buffer registry keep alive, and `len` bytes lie in each
-            // (the view's copy holds its whole range).
-            unsafe {
-                list.list
-                    .CopyBufferRegion(&copy.buffer, 0, &from.buffer, from.offset(address), len)
-            };
+            list.copy_buffer(&copy.buffer, &from.buffer, from.offset(address), len);
             list.buffer_state(&copy.buffer, crate::host::BUFFER_READ);
         } else {
             copy.refresh(list, address, len);
