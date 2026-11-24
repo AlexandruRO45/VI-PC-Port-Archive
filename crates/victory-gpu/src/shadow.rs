@@ -526,6 +526,16 @@ impl Shadow {
         to - from
     }
 
+    /// Local build: whether this copy lives in the mirror (`crate::mirror`).
+    pub(crate) fn is_mirrored(&self) -> bool {
+        !self.pages.is_empty()
+    }
+
+    /// Local build: whether shaders of a submission not yet copied back may be writing it.
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -571,6 +581,21 @@ fn changed_pieces(shadow: &Shadow, before: usize, start: usize, from: usize, to:
 static SUBMISSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static MIRROR_CHECKED: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
 static MIRROR_COPIED: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
+
+/// Local build: brings title memory `[from, to)` up to date in the mirror's pages, for every
+/// copy covering it at once (`host`'s batch merges the copies' refreshes into such ranges).
+pub(crate) fn refresh_mirror(from: usize, to: usize) -> usize {
+    use crate::mirror::TILE;
+    let Some(m) = crate::mirror::get() else { return 0 };
+    if to <= from || !m.covers(from as u64, (to - from) as u64) {
+        return 0;
+    }
+    let first = from as u64 / TILE;
+    let Some(pages) = m.pages(first, (to as u64).div_ceil(TILE) - first) else { return 0 };
+    let mut view = Shadow::new(m.buffer.clone(), std::ptr::null_mut(), m.va + from as u64, from as u64, (to - from) as u64);
+    view.pages = pages.into_iter().map(|(cpu, _, _)| cpu).collect();
+    view.update_free(from, to)
+}
 
 /// A new submission begins: pages must be checked again.
 pub(crate) fn next_submission() {

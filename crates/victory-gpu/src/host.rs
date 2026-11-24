@@ -1588,7 +1588,30 @@ impl Batch {
         // so the updates are independent and safe to run concurrently on the
         // persistent pool. For small counts (≤ 1) the pool fast-paths to the
         // calling thread to avoid lock overhead.
-        let refreshes: Vec<_> = self.refreshes.drain(..).collect();
+        let all: Vec<_> = self.refreshes.drain(..).collect();
+        // Local build: copies in the mirror share their pages: their refreshes are merged into
+        // ranges of title memory, each checked and copied once (the world asked ~10,000
+        // overlapping refreshes a frame). Copies with shader writes pending keep their own.
+        let (mirrored, refreshes): (Vec<_>, Vec<_>) =
+            all.into_iter().partition(|(s, ..)| s.is_mirrored() && !s.has_pending());
+        let mut ranges: Vec<(usize, usize)> = mirrored.iter().map(|(_, f, t)| (*f, *t)).collect();
+        ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for (f, t) in ranges {
+            match merged.last_mut() {
+                Some(last) if f <= last.1 => last.1 = last.1.max(t),
+                _ => merged.push((f, t)),
+            }
+        }
+        let merged_results = pool().scope(&merged, |(from, to)| -> (u64, u64) {
+            let started = std::time::Instant::now();
+            let copied = crate::shadow::refresh_mirror(*from, *to);
+            (started.elapsed().as_micros() as u64, copied as u64)
+        });
+        for (us, copied) in merged_results {
+            PREPARING[0].fetch_add(us, Ordering::Relaxed);
+            PREPARING[1].fetch_add(copied, Ordering::Relaxed);
+        }
         let results = pool().scope(&refreshes, |(shadow, from, to)| -> (u64, u64) {
             let started = std::time::Instant::now();
             let copied = shadow.update(*from, to - from);
