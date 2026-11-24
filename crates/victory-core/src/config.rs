@@ -516,10 +516,23 @@ fn config_file(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
         let default = PathBuf::from("victory.toml");
         return Ok(default.is_file().then_some(default));
     };
-    if path.is_file() {
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "VICTORY_CONFIG points at {}, which does not exist",
+                path.display()
+            );
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("checking VICTORY_CONFIG at {}", path.display()));
+        }
+    };
+    if metadata.is_file() {
         return Ok(Some(path));
     }
-    if path.is_dir() {
+    if metadata.is_dir() {
         // An easy slip: the folder holding victory.toml instead of the file.
         let inside = path.join("victory.toml");
         let hint = if inside.is_file() {
@@ -533,7 +546,7 @@ fn config_file(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
         );
     }
     anyhow::bail!(
-        "VICTORY_CONFIG points at {}, which does not exist",
+        "VICTORY_CONFIG points at {}, which is not a regular file",
         path.display()
     );
 }
@@ -2141,6 +2154,23 @@ mod tests {
         let missing = dir.join("missing.toml");
         let err = config_file(Some(missing)).unwrap_err().to_string();
         assert!(err.contains("does not exist"), "{err}");
+        #[cfg(unix)]
+        {
+            let blocked = file.join("child");
+            let err = config_file(Some(blocked.clone())).unwrap_err();
+            assert!(err.to_string().contains(&blocked.display().to_string()));
+            assert_eq!(
+                err.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::NotADirectory
+            );
+
+            let device = PathBuf::from("/dev/null");
+            let err = config_file(Some(device)).unwrap_err().to_string();
+            assert!(
+                err.contains("/dev/null, which is not a regular file"),
+                "{err}"
+            );
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
