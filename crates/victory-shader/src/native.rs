@@ -3292,6 +3292,55 @@ mod tests {
     }
 
     #[test]
+    fn a_pixel_input_packed_without_fp16_is_read_as_32_bit() {
+        // Two inputs, attr0 and attr1, with these (row, row2, flags), as in
+        // `refuses_pixel_inputs_reading_a_row_two_ways`. Flag bit 4 (two
+        // values per dword) is kept as read, but only a 16-bit input packs:
+        // without bit 3 an input is 32-bit, so its row2 claims no row.
+        let ps = fssm(&[(HwStage::Ps, &PS_CODE)]);
+        let e = stage_data_at(&ps, HwStage::Ps);
+        let inputs = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+            let mut blob = ps.clone();
+            blob[e + PS_INPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+            blob[e + PS_INPUTS..][..16].copy_from_slice(&[
+                6, a.0, 0x3, 0, 0, a.1, 0, a.2, 6, b.0, 0xc, 1, 0, b.1, 1, b.2,
+            ]);
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        let (fp16, pack2, bare) = (0x8, 0x18, 0x10);
+        let p = inputs((0, 0, bare), (1, 1, 0)).unwrap();
+        let StageIo::Ps { inputs: read, .. } = &p[0].io else {
+            panic!("{:?}", p[0].io)
+        };
+        assert!(read[0].pack2 && !read[0].fp16);
+        // Sharing a row with a 32-bit input; a row2 another input names, or
+        // that a second bare input names too.
+        for (a, b) in [
+            ((0, 0, bare), (0, 0, 0)),
+            ((0, 0, 0), (0, 0, bare)),
+            ((2, 3, bare), (3, 3, 0)),
+            ((2, 3, bare), (3, 3, pack2)),
+            ((2, 3, bare), (4, 3, bare)),
+        ] {
+            assert!(inputs(a, b).is_ok(), "{a:?} {b:?}");
+        }
+        // It still reads its row as 32-bit, so a 16-bit input there clashes.
+        for (a, b) in [
+            ((0, 0, bare), (0, 0, fp16)),
+            ((2, 3, bare), (2, 3, pack2)),
+            ((2, 3, pack2), (2, 3, bare)),
+        ] {
+            assert!(
+                matches!(
+                    inputs(a, b),
+                    Err(Malformed("pixel inputs read a row two ways"))
+                ),
+                "{a:?} {b:?}"
+            );
+        }
+    }
+
+    #[test]
     fn refuses_outputs_sharing_a_row() {
         // Two outputs: param0 in row 0, param1 (or per-primitive param1) in
         // `row`.
