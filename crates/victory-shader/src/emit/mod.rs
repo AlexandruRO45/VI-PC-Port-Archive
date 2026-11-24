@@ -104,6 +104,14 @@ pub use shader::{
     ADDRESS_MAP_SPACE, DESCRIPTOR_WORDS_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
 };
 
+/// The stack for threads that make host pipelines from translated shaders.
+/// vkd3d-proton converts DXIL on the calling thread, recursively over its
+/// control flow: a large traversal program (the ray-tracing shadow passes,
+/// 500 KiB of DXIL) overflows the default 2 MiB, and under Wine the
+/// overflow hangs the thread instead of failing. Only reserved: pages are
+/// committed as they are used.
+pub const PIPELINE_STACK: usize = 256 << 20;
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 

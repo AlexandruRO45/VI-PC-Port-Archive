@@ -391,8 +391,14 @@ impl HostHeap {
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
     /// `n` dwords of `buffer` from dword `first` on, holding the buffer
-    /// while the slot does.
-    pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, first: u64, n: u32) {
+    /// while the slot does; a null one (reads give zero) without a buffer.
+    pub(crate) fn raw_uav_at(
+        &self,
+        index: u32,
+        buffer: Option<&ID3D12Resource>,
+        first: u64,
+        n: u32,
+    ) {
         let Some(host) = host() else { return };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
@@ -406,12 +412,12 @@ impl HostHeap {
                 },
             },
         };
-        // SAFETY: a slot of our heap and a live buffer.
+        // SAFETY: a slot of our heap and a live buffer, or none.
         unsafe {
             host.device
                 .CreateUnorderedAccessView(buffer, None, Some(&desc), self.cpu(index))
         };
-        self.keep(index, Some(buffer.clone()));
+        self.keep(index, buffer.cloned());
         self.write_words(index, [0; 8]);
     }
 

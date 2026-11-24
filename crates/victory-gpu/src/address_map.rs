@@ -98,15 +98,19 @@ pub(crate) fn make(list: &HostList, heap: &HostHeap) -> Option<(u64, (u32, u32))
     let mut views: Vec<(usize, u64)> = entries.iter().map(|e| e.2).collect();
     views.sort_unstable();
     views.dedup();
-    let n = views.len() as u32;
-    let first = if n == 0 { 0 } else { heap.dynamic(n)? };
+    // At least one view: shaders read the entry their search lands on.
+    let n = views.len().max(1) as u32;
+    let first = heap.dynamic(n)?;
+    if views.is_empty() {
+        heap.raw_uav_at(first, None, 0, 0);
+    }
     for (k, &(span, view)) in views.iter().enumerate() {
         let copy = &copies[span];
         let offset = view * VIEW_BYTES;
         let bytes = (copy.span().1 - offset).min(VIEW_BYTES).next_multiple_of(4);
         heap.raw_uav_at(
             first + k as u32,
-            &copy.buffer,
+            Some(&copy.buffer),
             offset / 4,
             (bytes / 4) as u32,
         );
@@ -117,7 +121,7 @@ pub(crate) fn make(list: &HostList, heap: &HostHeap) -> Option<(u64, (u32, u32))
             c.refresh(list, start, len);
         }
     }
-    let ranges: Vec<Range> = entries
+    let mut ranges: Vec<Range> = entries
         .iter()
         .map(|&(start, len, view, view_offset)| Range {
             start,
@@ -126,9 +130,17 @@ pub(crate) fn make(list: &HostList, heap: &HostHeap) -> Option<(u64, (u32, u32))
             view_offset,
         })
         .collect();
+    if ranges.is_empty() {
+        // Nothing to find: an empty range over the null view.
+        ranges.push(Range {
+            start: 0,
+            len: 0,
+            view: first,
+            view_offset: 0,
+        });
+    }
     let words = encode(&ranges);
-    // Room for one entry even when there is none: the shader reads it.
-    let bytes = u64::from(HEADER) + u64::from(ENTRY) * ranges.len().max(1) as u64;
+    let bytes = u64::from(HEADER) + u64::from(ENTRY) * ranges.len() as u64;
     let (gpu, to) = list.scratch(bytes)?;
     // SAFETY: `bytes` of the list's upload memory, which outlives the
     // list's run; the words fit.
