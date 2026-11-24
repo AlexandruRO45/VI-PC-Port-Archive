@@ -1097,3 +1097,46 @@ fn a_relocation_rva_past_the_headers_and_sections_is_not_read() {
         );
     }
 }
+
+#[test]
+fn relocation_types_x64_loaders_do_not_define_are_taken_as_pointer_wide() {
+    // Types 5 to 9 and 11 to 15 are machine-specific or reserved; Windows
+    // and Wine refuse to load an x64 image that uses them, so prepare cannot
+    // know how many bytes one would write. It takes each as a whole pointer:
+    // one on the callbacks pointer, or one four bytes before it (whose upper
+    // half would land on the pointer), becomes a no-op. One eight bytes
+    // before or past the pointer cannot reach it and stays as it is.
+    let at = |kind: u16, rva: u32| (kind << 12) | (rva - SECTION_RVA) as u16;
+    let field = callbacks_field();
+    for kind in (5..=9).chain(11..=15) {
+        let entries = [
+            at(kind, field),
+            at(kind, field - 4),
+            at(kind, field - 8),
+            at(kind, field + 8),
+        ];
+        let original = with_callback_entries(&entries);
+        let prepared = prepare(&original)
+            .unwrap_or_else(|e| panic!("type {kind}: {e}"))
+            .bytes;
+        // `with_callback_entries` puts `entries` after the index pointer's
+        // DIR64 entry in the only block.
+        let first = file(RELOCS) + 10;
+        let slot =
+            |b: &[u8], i: usize| u16::from_le_bytes([b[first + 2 * i], b[first + 2 * i + 1]]);
+        assert_eq!(
+            (0..4).map(|i| slot(&prepared, i)).collect::<Vec<_>>(),
+            [0, 0, entries[2], entries[3]],
+            "type {kind}"
+        );
+        // The index pointer's and the callback array's entries stay.
+        assert_eq!(
+            &prepared[file(RELOCS)..first],
+            &original[file(RELOCS)..first],
+            "type {kind}"
+        );
+        assert_eq!(slot(&prepared, 4), dir64(CALLBACKS), "type {kind}");
+        let tls = ImageInfo::parse(&prepared).unwrap().tls.unwrap();
+        assert_eq!(tls.callbacks_va, 0, "type {kind}");
+    }
+}
