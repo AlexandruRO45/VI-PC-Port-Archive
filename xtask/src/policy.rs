@@ -111,9 +111,8 @@ fn read(root: &Path, file: &File) -> Result<Option<Vec<u8>>, String> {
         }
         Source::Index { oid, .. } => {
             // By object id, not `:<path>`, so no file name can make it fail.
-            let out = Command::new("git")
+            let out = git_command(root)
                 .args(["cat-file", "blob", oid])
-                .current_dir(root)
                 .output()
                 .map_err(|e| format!("cannot run git: {e}"))?;
             if out.status.success() {
@@ -133,11 +132,48 @@ fn read(root: &Path, file: &File) -> Result<Option<Vec<u8>>, String> {
     }
 }
 
+/// Variables through which the environment, not `root`, picks the repository
+/// git works on (`git rev-parse --local-env-vars`).
+#[cfg(test)]
+const REPOSITORY_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// `git`, run in `root`.
+///
+/// The hook needs the environment it inherits: `git commit -a` and
+/// `git commit <path>` stage into a temporary index that only
+/// `GIT_INDEX_FILE` names. Tests point `root` at temporary repositories
+/// instead, and when they run from a hook those variables would send every
+/// one of them to the same, outside index, so there they are dropped.
+pub(crate) fn git_command(root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(root);
+    #[cfg(test)]
+    for var in REPOSITORY_ENV {
+        command.env_remove(var);
+    }
+    command
+}
+
 /// Splits NUL-terminated git output; each field is returned raw.
 fn git_z(root: &Path, args: &[&str]) -> Result<Option<Vec<Vec<u8>>>> {
-    let out = Command::new("git")
+    let out = git_command(root)
         .args(args)
-        .current_dir(root)
         .output()
         .context("running git")?;
     if !out.status.success() {
@@ -351,7 +387,7 @@ mod tests {
     /// Runs git in `root` with a throwaway identity, asserting success.
     #[cfg(unix)]
     fn git(root: &std::path::Path, args: &[&std::ffi::OsStr]) -> Vec<u8> {
-        let out = std::process::Command::new("git")
+        let out = super::git_command(root)
             .args([
                 "-c",
                 "user.name=t",
@@ -361,7 +397,6 @@ mod tests {
                 "commit.gpgsign=false",
             ])
             .args(args)
-            .current_dir(root)
             .output()
             .unwrap();
         assert!(out.status.success(), "git {args:?}");
@@ -428,9 +463,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         git_str(root, &["init", "-q"]);
-        let mut hash = std::process::Command::new("git")
+        let mut hash = super::git_command(root)
             .args(["hash-object", "-w", "--stdin"])
-            .current_dir(root)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -508,6 +542,35 @@ mod tests {
         // Not checked out, so nothing is on disk.
         assert_eq!(names(root, false), ["vendor"]);
         assert!(super::run(root, false).is_err());
+    }
+
+    /// Tests run git in temporary repositories; from a hook (`git commit -a`
+    /// sets an absolute GIT_INDEX_FILE) every one of them used to write into
+    /// that one outside index and fail.
+    #[test]
+    fn test_git_ignores_the_repository_environment() {
+        let command = super::git_command(std::path::Path::new("."));
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_str().unwrap().to_owned())
+            .collect();
+        for var in super::REPOSITORY_ENV {
+            assert!(removed.iter().any(|r| r == var), "{var} is inherited");
+        }
+        // The list is git's own; a git that adds a variable fails here.
+        let Some(out) = std::process::Command::new("git")
+            .args(["rev-parse", "--local-env-vars"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+        else {
+            eprintln!("skipped: no git");
+            return;
+        };
+        for var in String::from_utf8(out.stdout).unwrap().lines() {
+            assert!(super::REPOSITORY_ENV.contains(&var), "{var} is missing");
+        }
     }
 
     #[test]

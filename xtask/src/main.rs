@@ -63,9 +63,8 @@ mod tests {
     /// a hint), so the policy check would silently never run there.
     #[test]
     fn hooks_are_tracked_executable() {
-        let out = Command::new("git")
+        let out = policy::git_command(&workspace_root())
             .args(["ls-files", "--stage", "--", ".githooks"])
-            .current_dir(workspace_root())
             .output();
         let Some(out) = out.ok().filter(|o| o.status.success()) else {
             eprintln!("skipped: not a git checkout");
