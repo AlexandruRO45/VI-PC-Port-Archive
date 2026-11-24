@@ -526,6 +526,242 @@ mod gpu {
         });
     }
 
+    // ---- synthetic mesh programs ----
+
+    fn make_ms_program(
+        words: &[u32],
+        threads: u32,
+        lds_bytes: u32,
+        max_vertices: u32,
+        max_primitives: u32,
+    ) -> NativeProgram {
+        NativeProgram {
+            stage: HwStage::Ms,
+            wave64: true,
+            vgprs: 32,
+            // Mesh user data starts after the 8 system SGPRs (s8).
+            layout: vec![RootParam {
+                root: RootType::ResourceHeap,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 8,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: Vec::new(),
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: Vec::new(),
+                clip_cntl: 0,
+                threads,
+                max_vertices,
+                max_primitives,
+                topology: 2,
+                lds_bytes,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    /// Stores `data` at dword `addr` through the first raw UAV. `addr` and
+    /// `data` are VGPR numbers.
+    fn emit_ms_uav_store(code: &mut Vec<u32>, data: u32, addr: u32) {
+        // Heap base (user-data dword 0) is s8, its high half 0; descriptor 0
+        // into the 4-aligned s[12:15].
+        code.push(s_mov_b32(9, inline_u(0)));
+        code.extend_from_slice(&s_load_dwordx4(12, 8));
+        code.push(v_lshlrev_b32(15, inline_u(2), addr));
+        code.extend_from_slice(&buffer_store_dword(data, 15, 12));
+    }
+
+    /// A container for a synthetic mesh program with one `SV_Position` output
+    /// (a mesh shader without outputs is not a valid pipeline).
+    fn mesh_dxbc() -> Vec<u8> {
+        use crate::emit::container::{self, SigElement};
+        let pos = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let none_in = container::signature(&[], true);
+        let out = container::signature(&[pos], false);
+        let prims = container::signature(&[], false);
+        container::build(&[
+            (b"ISG1", &none_in),
+            (b"OSG1", &out),
+            (b"PSG1", &prims),
+        ])
+    }
+
+    /// Writes `SV_Position` (0,0,0,0) from v10-v13 (a mesh shader must write
+    /// every output its signature declares).
+    fn emit_ms_position(code: &mut Vec<u32>) {
+        for v in 10..14 {
+            code.push(v_mov_b32(v, inline_u(0)));
+        }
+        // exp pos0, v10, v11, v12, v13
+        code.push(0xF800_0000 | (12 << 4) | 0xF);
+        code.push(10 | (11 << 8) | (12 << 16) | (13 << 24));
+    }
+
+    fn emit_ms(native: &NativeProgram, mode: Wave64Mode) -> Result<HostShader, ShaderError> {
+        let dxbc = mesh_dxbc();
+        let container = Container::parse(&dxbc)?;
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let res = resource::track(&p, &native.layout, native.stage)?;
+        let st = structure::structure(&p)?;
+        let mut io = io::raise(&p, native)?;
+        // A synthetic mesh program reads its thread index from VGPR 0-2
+        // (the console derives it from EXEC); map them explicitly.
+        for &(reg, v) in &p.inputs {
+            let input = match reg {
+                crate::ir::Reg::V(0) => io::Input::ThreadIdInGroup(0),
+                crate::ir::Reg::V(1) => io::Input::ThreadIdInGroup(1),
+                crate::ir::Reg::V(2) => io::Input::ThreadIdInGroup(2),
+                _ => continue,
+            };
+            if !io.inputs.iter().any(|&(x, _)| x == v) {
+                io.inputs.push((v, input));
+            }
+        }
+        emit_with(
+            &container,
+            native,
+            &p,
+            &st,
+            &io,
+            &res,
+            TranslateOptions { wave64: mode },
+        )
+    }
+
+    /// A minimal pixel shader for a mesh pipeline, compiled with a `dxc` on
+    /// PATH (none: `None`, and mesh drawing tests are skipped).
+    fn trivial_ps() -> Option<Vec<u8>> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dxc = std::env::var_os("VICTORY_PC_DXC").unwrap_or_else(|| "dxc".into());
+        let dir = std::env::temp_dir().join(format!(
+            "victory-ms-ps-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).ok()?;
+        let src = dir.join("mps.hlsl");
+        let out = dir.join("mps.dxil");
+        std::fs::write(&src, "float4 main() : SV_Target { return 0; }\n").ok()?;
+        let status = std::process::Command::new(&dxc)
+            .args(["-T", "ps_6_6", "-E", "main", "-Fo"])
+            .arg(&out)
+            .arg(&src)
+            .status()
+            .ok()?;
+        if !status.success() {
+            return None;
+        }
+        std::fs::read(&out).ok()
+    }
+
+    fn run_mesh(name: &str, prog: &NativeProgram, groups: u32, uav_dwords: u32, expected: &[u32]) {
+        let shader = emit_ms(prog, Wave64Mode::Native)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut shader.dxil.clone())
+                .unwrap_or_else(|e| panic!("{name}: validate: {e}"));
+        }
+        let Some(ps) = trivial_ps() else {
+            eprintln!("{name}: no dxc for a pixel shader; PSO skipped");
+            return;
+        };
+        let Some(host) = Host::new(false).ok() else {
+            eprintln!("{name}: no SM 6.6 device; skipped");
+            return;
+        };
+        let ps_shader = HostShader {
+            stage: HwStage::Ps,
+            dxil: ps,
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+        };
+        let root = host
+            .root_signature_for(&[
+                (&shader, windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_MESH),
+                (&ps_shader, windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_PIXEL),
+            ])
+            .unwrap_or_else(|e| panic!("{name}: root signature: {e}"));
+        let pso = host
+            .mesh_pipeline_with(&root, &shader.dxil, &ps_shader.dxil)
+            .unwrap_or_else(|e| panic!("{name}: PSO: {e}"));
+        let out = host
+            .dispatch_mesh(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: Vec::new(),
+                    views: &[View::RawUav(uav_dwords)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+                groups,
+            )
+            .unwrap_or_else(|e| panic!("{name}: dispatch: {e}"));
+        assert_eq!(&out[0][..expected.len()], expected, "{name}: output mismatch");
+    }
+
+    #[test]
+    fn gpu_64_threads_thread_id_only() {
+        for (name, code, expected, addr_vreg) in [
+            (
+                "addr_tid_data_tid",
+                vec![v_mov_b32(1, vgpr(0))],
+                (0..64u32).collect::<Vec<_>>(),
+                1u32,
+            ),
+            (
+                "addr_tid_data_seven",
+                vec![v_mov_b32(1, inline_u(7))],
+                vec![7u32; 64],
+                0u32,
+            ),
+        ] {
+            let mut code = code;
+            emit_uav_store(&mut code, 1, addr_vreg);
+            code.push(S_ENDPGM);
+            let prog = make_cs_program(&code, [64, 1, 1], 0, false);
+            run_on_hosts(name, &prog, [1, 1, 1], 64, &expected, false);
+        }
+    }
+
+    #[test]
+    fn gpu_64_threads_thread_id_and_ballot_count() {
+        // Regression: a 64-thread program whose only cross-lane read is a
+        // ballot count must give every thread its own id, not zeros.
+        let mut code = vec![
+            v_mov_b32(1, vgpr(0)),           // v1 = SV_GroupThreadID
+            v_cmp_lt_u32(inline_u(40), 0),    // vcc = tid > 40
+            s_bcnt1_i32_b64(4, VCC),          // s4 = 23
+            sop2(4, 0x1E, 4, inline_u(16)),   // s4 <<= 16
+            v_or_b32(1, 4, 1),
+        ];
+        emit_uav_store(&mut code, 1, 0);
+        code.push(S_ENDPGM);
+
+        let prog = make_cs_program(&code, [64, 1, 1], 0, false);
+        let expected: Vec<u32> = (0..64u32).map(|i| i | (23 << 16)).collect();
+        run_on_hosts("thread_id_and_ballot", &prog, [1, 1, 1], 64, &expected, true);
+    }
+
     #[test]
     fn gpu_64_threads_mbcnt_ballot_and_high_ff1() {
         // v1 = mbcnt_64(-1) + bcnt1(tid > 34) * 1000 + ff1(tid > 34) * 100000
@@ -907,5 +1143,264 @@ mod gpu {
             &expected,
             true,
         );
+    }
+
+    /// Every lane's console lane (via `v_mbcnt`) and a ballot count over the
+    /// `lane > 40` mask, packed as `lane | bcnt << 16`.
+    fn ms_lane_ballot_program() -> Vec<u32> {
+        let mut code = Vec::new();
+        code.extend_from_slice(&v_mbcnt_lo_u32_b32(1, NEG_ONE, inline_u(0)));
+        code.extend_from_slice(&v_mbcnt_hi_u32_b32(1, NEG_ONE, vgpr(1)));
+        code.push(v_mov_b32(7, vgpr(0))); // v7 = SV_GroupIndex (store address)
+        code.push(v_mov_b32(2, vgpr(1)));
+        code.push(v_cmp_lt_u32(inline_u(40), 1));
+        code.push(s_bcnt1_i32_b64(4, VCC));
+        code.push(sop2(4, 0x1E, 4, inline_u(16)));
+        code.push(v_or_b32(2, 4, 2));
+        emit_ms_uav_store(&mut code, 2, 7);
+        emit_ms_position(&mut code);
+        code.push(S_ENDPGM);
+        code
+    }
+
+    #[test]
+    fn gpu_96_threads_3d_group_lane_mapping() {
+        // A 3-D group (4,4,6): lane mapping must come from the flattened
+        // thread id, and the last 32 threads form a partial console wave.
+        let mut code = vec![
+            v_mov_b32(3, vgpr(0)),           // v3 = x
+            v_lshlrev_b32(5, inline_u(3), 1), // v5 = y * 8
+            v_lshlrev_b32(6, inline_u(1), 1), // v6 = y * 2
+            v_add_nc_u32(3, vgpr(5), 3),
+            v_add_nc_u32(3, vgpr(6), 3),          // v3 = x + 10y
+            v_lshlrev_b32(5, inline_u(6), 2),     // z * 64
+            v_lshlrev_b32(6, inline_u(5), 2),     // z * 32
+            v_add_nc_u32(3, vgpr(5), 3),
+            v_add_nc_u32(3, vgpr(6), 3),
+            v_lshlrev_b32(5, inline_u(2), 2), // z * 4
+            v_add_nc_u32(3, vgpr(5), 3),      // v3 = x + 10y + 100z
+            // v4 = flattened id: x + 4y + 16z
+            v_mov_b32(4, vgpr(0)),
+            v_lshlrev_b32(5, inline_u(2), 1),
+            v_add_nc_u32(4, vgpr(5), 4),
+            v_lshlrev_b32(5, inline_u(4), 2),
+            v_add_nc_u32(4, vgpr(5), 4),
+            v_cmp_lt_u32(inline_u(40), 4),
+            s_bcnt1_i32_b64(6, VCC),
+        ];
+        code.push(sop2(6, 0x1E, 6, inline_u(16)));
+        code.push(v_or_b32(3, 6, 3));
+        emit_uav_store(&mut code, 3, 4);
+        code.push(S_ENDPGM);
+
+        let mut prog = make_cs_program(&code, [4, 4, 6], 0, false);
+        // All three thread-id VGPRs (the helper enables only v0).
+        if let StageIo::Cs(ref mut cs) = prog.io {
+            cs.rsrc2 |= 2 << 11;
+        }
+        let expected: Vec<u32> = (0..96u32)
+            .map(|flat| {
+                let (x, y, z) = (flat & 3, flat >> 2 & 3, flat >> 4);
+                let bcnt = if flat < 64 { 23 } else { 32 };
+                (x + 10 * y + 100 * z) | (bcnt << 16)
+            })
+            .collect();
+        run_on_hosts(
+            "three_d_group_96",
+            &prog,
+            [1, 1, 1],
+            96,
+            &expected,
+            true,
+        );
+    }
+
+    #[test]
+    fn gpu_mesh_64_threads_one_console_wave() {
+        let prog = make_ms_program(&ms_lane_ballot_program(), 64, 0, 64, 1);
+        let expected: Vec<u32> = (0..64u32).map(|i| i | (23 << 16)).collect();
+        run_mesh("ms_64_lane_ballot", &prog, 1, 64, &expected);
+    }
+
+    #[test]
+    fn gpu_mesh_96_threads_partial_last_console_wave() {
+        let prog = make_ms_program(&ms_lane_ballot_program(), 96, 0, 96, 1);
+        let mut expected = Vec::new();
+        for g in 0..96u32 {
+            let lane = g & 63;
+            let bcnt = if g < 64 { 23 } else { 0 };
+            expected.push(lane | (bcnt << 16));
+        }
+        run_mesh("ms_96_lane_ballot", &prog, 1, 96, &expected);
+    }
+
+    #[test]
+    fn gpu_mesh_128_threads_cross_wave_readlane() {
+        // Each lane reads (lane * 2 + 1) from lane (lane + 1) & 63.
+        let mut code = Vec::new();
+        code.extend_from_slice(&v_mbcnt_lo_u32_b32(1, NEG_ONE, inline_u(0)));
+        code.extend_from_slice(&v_mbcnt_hi_u32_b32(1, NEG_ONE, vgpr(1)));
+        code.push(v_mov_b32(6, vgpr(0))); // v6 = SV_GroupIndex (store address)
+        code.push(v_mov_b32(5, vgpr(1))); // v5 = lane
+        code.push(v_lshlrev_b32(2, inline_u(1), 1)); // v2 = lane * 2
+        code.push(v_add_nc_u32(2, inline_u(1), 2)); // v2 = lane * 2 + 1
+        code.push(v_add_nc_u32(3, inline_u(1), 1)); // v3 = lane + 1
+        code.push(v_and_b32(3, inline_u(63), 3)); // v3 = (lane + 1) & 63
+        code.extend_from_slice(&v_readlane_b32(4, 2, vgpr(3)));
+        code.push(sop2(4, 0x1E, 4, inline_u(16)));
+        code.push(v_or_b32(1, 4, 1));
+        emit_ms_uav_store(&mut code, 1, 6);
+        emit_ms_position(&mut code);
+        code.push(S_ENDPGM);
+
+        let prog = make_ms_program(&code, 128, 0, 128, 1);
+        let expected: Vec<u32> = (0..128u32)
+            .map(|g| {
+                let lane = g & 63;
+                lane | ((((lane + 1) & 63) * 2 + 1) << 16)
+            })
+            .collect();
+        run_mesh("ms_128_readlane", &prog, 1, 128, &expected);
+    }
+
+    #[test]
+    fn gpu_mesh_64_threads_ds_swizzle_across_halves() {
+        // v2 = swizzle XOR 2 of v1, where v1 = lane.
+        let mut code = Vec::new();
+        code.extend_from_slice(&v_mbcnt_lo_u32_b32(1, NEG_ONE, inline_u(0)));
+        code.extend_from_slice(&v_mbcnt_hi_u32_b32(1, NEG_ONE, vgpr(1)));
+        code.push(v_mov_b32(5, vgpr(1))); // v5 = lane (store address)
+        code.extend_from_slice(&ds_op(0x35, 0x1F, 0x08, 1, 0, 2)); // v2 = swizzle(v1, xor 2)
+        code.push(v_lshlrev_b32(2, inline_u(16), 2));
+        code.push(v_or_b32(1, vgpr(2), 1));
+        emit_ms_uav_store(&mut code, 1, 5);
+        emit_ms_position(&mut code);
+        code.push(S_ENDPGM);
+
+        let prog = make_ms_program(&code, 64, 0, 64, 1);
+        let expected: Vec<u32> = (0..64u32).map(|i| i | ((i ^ 2) << 16)).collect();
+        run_mesh("ms_64_swizzle", &prog, 1, 64, &expected);
+    }
+
+    #[test]
+    fn gpu_mesh_64_threads_lds_without_barrier() {
+        // 64 console threads share LDS in lockstep: each reads (lane ^ 32) + 7.
+        let mut code = Vec::new();
+        code.extend_from_slice(&v_mbcnt_lo_u32_b32(1, NEG_ONE, inline_u(0)));
+        code.extend_from_slice(&v_mbcnt_hi_u32_b32(1, NEG_ONE, vgpr(1)));
+        code.push(v_mov_b32(6, vgpr(1))); // v6 = lane (store address)
+        code.push(v_lshlrev_b32(2, inline_u(2), 1)); // addr = lane * 4
+        code.push(v_add_nc_u32(3, inline_u(7), 1)); // val = lane + 7
+        code.extend_from_slice(&ds_op(0x0D, 0, 0, 2, 3, 0)); // ds_write_b32
+        code.push(vop2(0x1D, 4, inline_u(32), 1)); // v4 = lane ^ 32
+        code.push(v_lshlrev_b32(4, inline_u(2), 4));
+        code.extend_from_slice(&ds_op(0x36, 0, 0, 4, 0, 5)); // ds_read_b32 v5
+        code.push(v_lshlrev_b32(5, inline_u(16), 5));
+        code.push(v_or_b32(1, vgpr(5), 1));
+        emit_ms_uav_store(&mut code, 1, 6);
+        emit_ms_position(&mut code);
+        code.push(S_ENDPGM);
+
+        let prog = make_ms_program(&code, 64, 512, 64, 1);
+        let expected: Vec<u32> = (0..64u32).map(|i| i | (((i ^ 32) + 7) << 16)).collect();
+        run_mesh("ms_64_lds_lockstep", &prog, 1, 64, &expected);
+    }
+
+    #[test]
+    fn gpu_mesh_64_threads_title_lds_and_swizzle_scratch() {
+        // The program's own LDS (64 dwords) and the emulation's exchange
+        // scratch must not overlap: write lane + 7 to LDS[lane], read it back,
+        // and swizzle (OR 8 within each 32-lane half) through the scratch.
+        let mut code = Vec::new();
+        code.extend_from_slice(&v_mbcnt_lo_u32_b32(1, NEG_ONE, inline_u(0)));
+        code.extend_from_slice(&v_mbcnt_hi_u32_b32(1, NEG_ONE, vgpr(1)));
+        code.push(v_mov_b32(6, vgpr(0))); // store address = flat id
+        code.push(v_lshlrev_b32(2, inline_u(2), 1)); // LDS byte address = lane * 4
+        code.push(v_add_nc_u32(3, inline_u(7), 1)); // value = lane + 7
+        code.extend_from_slice(&ds_op(0x0D, 0, 0, 2, 3, 0)); // ds_write_b32
+        code.extend_from_slice(&ds_op(0x35, 0, 1, 1, 0, 3)); // v3 = swizzle OR 8
+        code.extend_from_slice(&ds_op(0x36, 0, 0, 2, 0, 4)); // v4 = ds_read_b32
+        code.push(v_lshlrev_b32(3, inline_u(16), 3)); // swizzled << 16
+        code.push(v_or_b32(1, vgpr(3), 4)); // data = value | swizzled << 16
+        emit_ms_uav_store(&mut code, 1, 6);
+        emit_ms_position(&mut code);
+        code.push(S_ENDPGM);
+
+        let prog = make_ms_program(&code, 64, 256, 64, 1);
+        let expected: Vec<u32> = (0..64u32)
+            .map(|lane| (lane + 7) | (((lane & !31) | 8) << 16))
+            .collect();
+        run_mesh("ms_64_title_lds_and_scratch", &prog, 1, 64, &expected);
+    }
+
+    #[test]
+    fn gpu_mesh_64_threads_readfirstlane_uniform_in_divergent_flow() {
+        // A uniform value's first-lane read is the value itself: it must not
+        // need the group-wide exchange, which a lane guard would deadlock.
+        let mut code = Vec::new();
+        code.push(s_mov_b32(10, LIT));
+        code.push(0x1234);
+        code.push(v_mov_b32(2, 10)); // v2 = s10 (uniform)
+        code.push(v_cmp_gt_u32(inline_u(32), 0)); // vcc = 32 > tid
+        code.push(s_and_saveexec_b64(6, VCC));
+        let br = code.len();
+        code.push(0);
+        code.push(v_readfirstlane_b32(12, 2));
+        code.push(v_mov_b32(5, 12));
+        let after = code.len();
+        code[br] = s_cbranch_execz((after - (br + 1)) as i16);
+        code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+        code.push(v_mov_b32(7, vgpr(0))); // store address = flat id
+        emit_ms_uav_store(&mut code, 5, 7);
+        emit_ms_position(&mut code);
+        code.push(S_ENDPGM);
+
+        let prog = make_ms_program(&code, 64, 0, 64, 1);
+        let expected: Vec<u32> = (0..64u32)
+            .map(|g| if g < 32 { 0x1234 } else { 0 })
+            .collect();
+        run_mesh("ms_64_uniform_firstlane_divergent", &prog, 1, 64, &expected);
+    }
+
+    #[test]
+    fn gpu_mesh_64_threads_readfirstlane_and_ff1() {
+        // A lane-varying value in uniform flow: lane 0's value (1) and the
+        // first ballot lane above 40 (41) broadcast through the scratch.
+        let mut code = Vec::new();
+        code.extend_from_slice(&v_mbcnt_lo_u32_b32(1, NEG_ONE, inline_u(0)));
+        code.extend_from_slice(&v_mbcnt_hi_u32_b32(1, NEG_ONE, vgpr(1)));
+        code.push(v_mov_b32(7, vgpr(0))); // store address = flat id
+        code.push(v_lshlrev_b32(2, inline_u(1), 1)); // v2 = lane * 2
+        code.push(v_add_nc_u32(2, inline_u(1), 2)); // v2 = lane * 2 + 1
+        code.push(v_readfirstlane_b32(4, 2)); // lane 0: 1
+        code.push(v_cmp_lt_u32(inline_u(40), 1)); // vcc = lane > 40
+        code.push(s_ff1_i32_b64(5, VCC)); // 41
+        code.push(sop2(5, 0x1E, 5, inline_u(8)));
+        code.push(v_or_b32(1, 5, 1)); // lane | 41 << 8
+        code.push(sop2(4, 0x1E, 4, inline_u(16)));
+        code.push(v_or_b32(1, 4, 1)); // | 1 << 16
+        emit_ms_uav_store(&mut code, 1, 7);
+        emit_ms_position(&mut code);
+        code.push(S_ENDPGM);
+
+        let prog = make_ms_program(&code, 64, 0, 64, 1);
+        let expected: Vec<u32> = (0..64u32).map(|g| g | (41 << 8) | (1 << 16)).collect();
+        run_mesh("ms_64_firstlane_ff1", &prog, 1, 64, &expected);
+    }
+
+    #[test]
+    fn gpu_mesh_without_console_lane_code_stays_unemulated() {
+        // Only the thread index and a UAV store: no virtual wave machinery.
+        let mut code = vec![
+            v_mov_b32(1, vgpr(0)),
+            v_mov_b32(2, vgpr(1)),
+            v_add_nc_u32(1, inline_u(9), 1),
+        ];
+        emit_ms_uav_store(&mut code, 1, 2);
+        emit_ms_position(&mut code);
+        code.push(S_ENDPGM);
+        let prog = make_ms_program(&code, 64, 0, 64, 1);
+        let expected: Vec<u32> = (0..64u32).map(|i| i + 9).collect();
+        run_mesh("ms_no_console_lanes", &prog, 1, 64, &expected);
     }
 }

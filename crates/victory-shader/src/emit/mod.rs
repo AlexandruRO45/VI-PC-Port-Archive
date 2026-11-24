@@ -73,7 +73,13 @@
 //!   console numbers groups in x only: the draw path passes the title's
 //!   count as `DispatchMesh(x, 1, 1)`. Per-primitive outputs (`PSG1`) are
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
-//!   console never exports them).
+//!   console never exports them). A console wave64 mesh program that reads
+//!   lane numbers, other lanes or lane masks as numbers cannot declare a
+//!   wave size on the host; its console lanes (64 consecutive flattened
+//!   thread ids per wave) are emulated in group-shared memory, as a wave64
+//!   compute program's are without `WaveSize`. A cross-lane read only some
+//!   lanes reach is refused (it would need a barrier those lanes cannot
+//!   all reach), never run with host lanes.
 
 mod bitcode;
 mod container;

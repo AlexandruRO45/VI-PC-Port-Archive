@@ -263,8 +263,9 @@ enum MaskData {
     /// operations the console compiler expands). Lane numbers stay host
     /// lanes throughout (`v_mbcnt`, `v_readlane` at a computed lane).
     Host,
-    /// Mesh programs: their lanes and waves (LDS per console wave) are the
-    /// console's but no host wave size can be declared.
+    /// Mesh programs whose lanes and waves are the console's but which read
+    /// no lane numbers, other lanes or lane masks as data: they run on the
+    /// host's lanes unchanged.
     None,
 }
 
@@ -567,9 +568,47 @@ fn compute_uniformity(
                     && !iname.starts_with("s_bcnt")
                     && !iname.starts_with("s_ff1")
                     && !iname.contains("saveexec");
-                let reads_ok = blk_ok
-                    && scalar_op
-                    && inst.reads.iter().all(|&(_, v)| val_uniform[v.0 as usize]);
+                // A lane-wise VALU result is the same in every lane that
+                // runs it when its sources are (masks and lane numbers are
+                // not: they are never uniform), even under a lane guard. A
+                // `v_readfirstlane` of such a value needs no emulation.
+                let lane_wise = matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_none())
+                    && !iname.starts_with("v_mbcnt")
+                    && !iname.starts_with("v_interp")
+                    && !iname.starts_with("v_swap")
+                    && !iname.contains("swaprel")
+                    && !iname.contains("permlane")
+                    && !iname.contains("permute")
+                    && !matches!(iname, "v_writelane_b32");
+                // The destination's old value is read by a VALU instruction
+                // (lanes EXEC disables keep it); it only affects the result
+                // when it is also a source operand.
+                let dst_used = |r: crate::ir::Reg| match &inst.fields {
+                    Fields::Valu(v) => v.src.iter().any(|op| match *op {
+                        Operand::Vector { reg, dwords } => {
+                            (0..dwords).any(|k| crate::ir::Reg::V(reg + k) == r)
+                        }
+                        _ => false,
+                    }),
+                    // Conservatively: other vector fields may use it.
+                    _ => true,
+                };
+                let own = |r: crate::ir::Reg| inst.write(r).is_some() && !dst_used(r);
+                // Every VALU instruction also reads EXEC (lanes it runs in);
+                // that says nothing about the result's uniformity.
+                let srcs_ok = inst
+                    .reads
+                    .iter()
+                    .filter(|&&(r, _)| {
+                        !own(r) && !matches!(r, crate::ir::Reg::S(c) if c == EXEC || c == EXEC + 1)
+                    })
+                    .all(|&(_, v)| val_uniform[v.0 as usize]);
+                // An SGPR write holds the same value in every lane that runs
+                // it, even under a lane guard: inactive lanes keep the old
+                // value, which a phi or the block's own use never sees as the
+                // active value. (Uniform branches still require a block all
+                // lanes reach, checked separately.)
+                let reads_ok = (scalar_op && srcs_ok) || (lane_wise && srcs_ok);
                 for &(_, w) in &inst.writes {
                     if val_uniform[w.0 as usize] && !reads_ok {
                         val_uniform[w.0 as usize] = false;
@@ -717,16 +756,11 @@ impl<'a> Lower<'a> {
         let mut uniform = Vec::new();
         let mut val_uniform = Vec::new();
         let mut cross_block_masks = HashMap::new();
-
-        if let StageIo::Cs(cs) = x.native.io {
-            s.threads = Some(cs.threads);
-            total_threads = cs.threads.iter().product::<u32>();
-            title_lds_dwords = cs.lds_bytes() / 4;
-            s.lds_dwords = title_lds_dwords;
-            // Code reading other lanes needs the console's wave size and
-            // lane order; so do lane masks read as numbers, and LDS shared
-            // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
+        // Code reading other lanes needs the console's wave size and lane
+        // order; so do lane masks read as numbers, and LDS shared within one
+        // wave, where the console compiler leaves out barriers.
+        let uses_console_lanes = || {
+            insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
@@ -757,21 +791,29 @@ impl<'a> Lower<'a> {
                         .iter()
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
-            };
+            }
+        };
+        let has_lds_mem = insts()
+            .any(|i| matches!(i.fields, Fields::Ds { .. }) && i.name() != "ds_swizzle_b32");
+        let has_s_barrier = insts().any(|i| i.name() == "s_barrier");
+        let has_swizzle_or_dpp = insts().any(|i| {
+            i.name().starts_with("ds_swizzle")
+                || i.name().contains("permute")
+                || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+        });
+
+        if let StageIo::Cs(cs) = x.native.io {
+            s.threads = Some(cs.threads);
+            total_threads = cs.threads.iter().product::<u32>();
+            title_lds_dwords = cs.lds_bytes() / 4;
+            s.lds_dwords = title_lds_dwords;
+            console_lanes = uses_console_lanes();
 
             let req_mode = if x.native.wave64 {
                 x.options.wave64
             } else {
                 Wave64Mode::Native
             };
-            let has_lds_mem = insts()
-                .any(|i| matches!(i.fields, Fields::Ds { .. }) && i.name() != "ds_swizzle_b32");
-            let has_s_barrier = insts().any(|i| i.name() == "s_barrier");
-            let has_swizzle_or_dpp = insts().any(|i| {
-                i.name().starts_with("ds_swizzle")
-                    || i.name().contains("permute")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-            });
 
             match req_mode {
                 Wave64Mode::Native => {
@@ -865,6 +907,7 @@ impl<'a> Lower<'a> {
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
+            total_threads = ms.threads;
             title_lds_dwords = ms.lds_bytes.div_ceil(4);
             s.lds_dwords = title_lds_dwords;
             s.mesh = Some(super::shader::Mesh {
@@ -872,24 +915,57 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
-            // Console lane numbers: a mesh program that derives them from the
-            // wave (`v_mbcnt` and friends) needs the console's 64 lanes. A
-            // host without 64-lane waves refuses this pipeline instead of
-            // running it with 32-lane lane numbers, which silently corrupts
-            // mesh output and can hang the device.
-            if x.native.wave64
-                && p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
-                    let n = i.name();
-                    n.starts_with("v_mbcnt")
-                        || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                        || n.starts_with("ds_swizzle")
-                        || n.contains("permute")
-                        || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                        || reads_mask_as_data(x.st, i)
-                })
-            {
-                console_lanes = true;
-                s.wave_size = Some(64);
+            // Mesh shaders have no `WaveSize`, so a program that reads lane
+            // numbers, other lanes, or lane masks as numbers cannot run with
+            // the host's lane layout: its console wave's lanes are 64
+            // consecutive `SV_GroupIndex` values. Emulate them through
+            // group-shared memory instead (as a Wave64 compute program does
+            // without `WaveSize`); running with host lane numbers silently
+            // corrupts mesh output and can hang the device.
+            if x.native.wave64 {
+                spills = spilled_sgprs(p);
+                (uniform, val_uniform) = compute_uniformity(p, x.st, x.res, &x.io.inputs);
+                let has_non_uniform_firstlane = insts().any(|i| {
+                    i.name() == "v_readfirstlane_b32"
+                        && matches!(
+                            &i.fields,
+                            Fields::Valu(v)
+                                if matches!(v.src.first(), Some(Operand::Vector { reg, .. })
+                                    if i.read(Reg::V(*reg)).is_some_and(|val| !val_uniform[val.0 as usize]))
+                        )
+                });
+                let has_unresolved_readlane = p.blocks.iter().enumerate().any(|(b, blk)| {
+                    blk.insts.iter().enumerate().any(|(i, inst)| {
+                        inst.name() == "v_readlane_b32" && !spills.contains_key(&(b, i))
+                    })
+                });
+                if uses_console_lanes() || !sections.is_empty() || has_non_uniform_firstlane {
+                    wave64 = Wave64Mode::Emulate;
+                    console_lanes = true;
+                    virtual_waves = total_threads.div_ceil(64);
+                    ballot_stride = 2;
+                    let ballot_dwords = ballot_stride * virtual_waves;
+                    let exchange_dwords = if !sections.is_empty()
+                        || has_unresolved_readlane
+                        || has_swizzle_or_dpp
+                    {
+                        64 * virtual_waves
+                    } else {
+                        0
+                    };
+                    ballot_base = title_lds_dwords;
+                    exchange_base = title_lds_dwords + ballot_dwords;
+                    let emu_dwords = ballot_dwords + exchange_dwords;
+                    s.lds_dwords = title_lds_dwords.saturating_add(emu_dwords);
+                    lds_overflow = emu_dwords > 0 && s.lds_dwords > 8192;
+                    cross_block_masks = collect_cross_block_masks(p, x.st, &def_block);
+                }
+                // A console wave64 group of at most 64 threads is one wave
+                // there, so its LDS accesses are in lockstep and the compiler
+                // leaves out barriers; the host may run it as several waves.
+                if total_threads > 1 && total_threads <= 64 && has_lds_mem && !has_s_barrier {
+                    need_lds_barriers = true;
+                }
             }
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
@@ -984,6 +1060,7 @@ impl<'a> Lower<'a> {
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
+                HwStage::Ms if console_lanes => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
                 _ => MaskData::None,
             },
@@ -2836,10 +2913,9 @@ impl<'a> Lower<'a> {
     /// the console's wave size (lanes are thread ids in group order there).
     /// Pixel lanes match only within a quad.
     fn cross_lane(&mut self, quad: bool) -> Result<(), Why> {
-        if self.s.mesh.is_some() {
-            // shortcut: no wave size for mesh shaders in SM 6.6, so host
-            // lanes cannot follow the console's; emulate through group-shared
-            // memory if mesh programs turn out to need these.
+        if self.s.mesh.is_some() && !self.emulating_wave64() {
+            // Without emulation the host's lanes cannot follow the console's
+            // wave64 lanes (mesh has no `WaveSize`).
             return Err("a cross-lane operation in a mesh shader");
         }
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
@@ -2951,15 +3027,15 @@ impl<'a> Lower<'a> {
     }
 
     fn lane_index(&mut self) -> V {
+        if self.emulating_wave64() {
+            return self.ensure_wave_ids().1;
+        }
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.
             let f = self.mesh_thread();
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
-        }
-        if self.emulating_wave64() {
-            return self.ensure_wave_ids().1;
         }
         self.host_lane_index()
     }
@@ -5073,7 +5149,11 @@ impl<'a> Lower<'a> {
                     }),
                     _ => false,
                 });
-                if self.emulating_wave64() && (self.console_lanes || non_uniform) {
+                // A value every active lane holds alike reads the same from
+                // any lane, so the host's first-lane read is exact (and legal
+                // in divergent flow); only a value that differs per lane
+                // needs the 64-lane exchange.
+                if self.emulating_wave64() && non_uniform {
                     self.cross_lane(false)?;
                     let r = self.emulated_readfirstlane(a, guard)?;
                     return int(self, r);
