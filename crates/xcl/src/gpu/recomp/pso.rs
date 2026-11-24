@@ -139,6 +139,17 @@ pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_w
     console_to_dxil_in(blob, stage, sampler_base, split_wave64, mem_windows())
 }
 
+/// Like `console_to_dxil_for`, disabling DXC's GVN pass for retrying driver-rejected shaders
+/// without overwriting the default `ShaderCache` / `translated` entries.
+pub fn console_to_dxil_without_gvn(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool) -> Result<Compiled, String> {
+    console_to_dxil_in_without_gvn(blob, stage, sampler_base, split_wave64, mem_windows())
+}
+
+/// Like `console_to_dxil_in`, disabling DXC's GVN pass and using a distinct DXIL disk-cache key.
+pub fn console_to_dxil_in_without_gvn(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
+    compile_console_shader_with_extra(blob, stage, sampler_base, windows, split_wave64, &["-opt-disable", "gvn"])
+}
+
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
@@ -365,7 +376,21 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
             Err(e) => direct_fallback(if stage == Stage::Vertex { "VS" } else { "PS" }, &e),
         }
     }
+    compile_console_shader_with_extra(blob, stage, sampler_base, windows, split_wave64, &[])
+}
+
+fn compile_console_shader_with_extra(
+    blob: &[u8],
+    stage: Stage,
+    sampler_base: u32,
+    windows: u32,
+    split_wave64: bool,
+    extra: &[&str],
+) -> Result<Compiled, String> {
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
+    if !extra.is_empty() && extra.contains(&"-opt-disable") && t.hlsl.len() > 8 * 1024 * 1024 {
+        return Err("already compiled at -O0 without GVN".into());
+    }
     if let Some([r, g, b]) = (stage == Stage::Pixel).then(|| debug_color(blob)).flatten() {
         t.hlsl = t.hlsl.replacen("    return xo;\n}", &format!("    xo.t0 = float4({r:.3}, {g:.3}, {b:.3}, 1.0);\n    return xo;\n}}"), 1);
     }
@@ -395,7 +420,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     }) {
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
-    let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
+    let dxil = dxc::compile_cached_with_extra(&t.hlsl, "main", profile, extra)?.0;
     Ok(Compiled { dxil, samplers: t.static_samplers })
 }
 

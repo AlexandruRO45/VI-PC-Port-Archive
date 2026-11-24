@@ -3803,7 +3803,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 }
 
 unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
-    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
+    use crate::gpu::recomp::pso::{console_to_dxil_for, console_to_dxil_without_gvn, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return None;
     }
@@ -3823,7 +3823,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             return Some(Err(()));
         }
     };
-    let dxil = compiled.dxil;
+    let mut dxil = compiled.dxil;
     // a big program: the driver's compile takes it seconds to a minute (a retail game's 1 MB
     // ray-tracing resolve programs ~30 s each, ~600 of them): built in the background like one
     // whose DXIL is missing – the title's loading does not wait for it, its first bind does
@@ -3835,55 +3835,88 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
-    copy.CS = bytecode(&dxil);
-    copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-    // A program built again gets the driver's own result of its first build: a retail title
-    // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
-    let key = compute_blob_key(&dxil, rs as usize, copy.Flags.0);
-    let mut cached = compute_blob(key);
-    // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path(&dxil, copy.Flags.0);
-    let from_disk = cached.is_none();
-    if from_disk {
-        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
-    }
-    if let Some(b) = &cached {
-        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
-    }
-    // in the background, a few at a time and within the commit left (each ~1.5 GB in the driver)
     let record = crate::gpu::shader::fnv64(cs);
-    let (mut hr, mut in_driver) = driver_compile_identified(
-        "compute",
-        dxil.len(),
-        gate_compute_driver_compile(cached.is_some()),
-        Some((record, cached.is_some())),
-        || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv),
-    );
-    if hr < 0 && cached.is_some() {
-        // a blob the driver does not take (another root signature at the same address…): compiled
-        forget_compute_blob(key);
-        if from_disk {
-            driver_cache::note(false, disk.as_deref());
-        }
+    let try_create = |copy: &mut D3D12_COMPUTE_PIPELINE_STATE_DESC, dxil_bytes: &[u8], kind: &str| -> (HRESULT, bool, std::time::Duration, std::time::Duration) {
+        copy.CS = bytecode(dxil_bytes);
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-        let (retried, took) = driver_compile_identified(
-            "compute retry",
-            dxil.len(),
-            gate_compute_driver_compile(false),
-            Some((record, false)),
-            || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv),
-        );
-        hr = retried;
-        in_driver += took;
-    }
-    let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
-    if hr >= 0 && !reused {
-        keep_compute_blob(key, *ppv, dxil.len());
-        if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
-            driver_cache::keep(p, &b, in_driver);
+        // A program built again gets the driver's own result of its first build: a retail title
+        // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
+        let key = compute_blob_key(dxil_bytes, rs as usize, copy.Flags.0);
+        let mut cached = compute_blob(key);
+        // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
+        let disk = driver_cache::path(dxil_bytes, copy.Flags.0);
+        let from_disk = cached.is_none();
+        if from_disk {
+            cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
         }
-    } else if reused && from_disk {
-        driver_cache::note(true, None);
+        if let Some(b) = &cached {
+            copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+        }
+        // in the background, a few at a time and within the commit left (each ~1.5 GB in the driver)
+        let (mut hr, mut in_driver) = driver_compile_identified(
+            kind,
+            dxil_bytes.len(),
+            gate_compute_driver_compile(cached.is_some()),
+            Some((record, cached.is_some())),
+            || finish_pso(this, f, copy as *const _ as *const c_void, riid, ppv),
+        );
+        let mut refusal_elapsed = in_driver;
+        if hr < 0 && cached.is_some() {
+            // a blob the driver does not take (another root signature at the same address…): compiled
+            forget_compute_blob(key);
+            if from_disk {
+                driver_cache::note(false, disk.as_deref());
+            }
+            copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            let (retried, took) = driver_compile_identified(
+                "compute retry",
+                dxil_bytes.len(),
+                gate_compute_driver_compile(false),
+                Some((record, false)),
+                || finish_pso(this, f, copy as *const _ as *const c_void, riid, ppv),
+            );
+            hr = retried;
+            in_driver += took;
+            refusal_elapsed = took;
+        }
+        let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
+        if hr >= 0 && !reused {
+            keep_compute_blob(key, *ppv, dxil_bytes.len());
+            if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
+                driver_cache::keep(p, &b, in_driver);
+            }
+        } else if reused && from_disk {
+            driver_cache::note(true, None);
+        }
+        (hr, reused, in_driver, refusal_elapsed)
+    };
+    let (mut hr, mut reused, mut in_driver, _first_elapsed) = try_create(&mut copy, &dxil, "compute");
+    let mut retried_no_gvn = false;
+    if hr < 0 && !HEAP_WINDOW_OOM.with(|o| o.get()) {
+        let mut retry_reused = false;
+        let mut retry_in_driver = std::time::Duration::ZERO;
+        let mut retry_dxil = None;
+        let (retry_hr, retried) = retry_compute_pso_without_gvn(
+            hr,
+            &dxil,
+            || console_to_dxil_without_gvn(cs, Stage::Compute, 0, wave32_only(this)).map(|c| c.dxil),
+            |new_dxil| {
+                let (h, r, took, _) = try_create(&mut copy, new_dxil, "compute no-gvn");
+                retry_reused = r;
+                retry_in_driver = took;
+                retry_dxil = Some(new_dxil.to_vec());
+                h
+            },
+        );
+        hr = retry_hr;
+        if retried {
+            reused = retry_reused;
+            in_driver = retry_in_driver;
+            retried_no_gvn = true;
+            if let Some(new_dxil) = retry_dxil {
+                dxil = new_dxil;
+            }
+        }
     }
     if hr < 0 {
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
@@ -3896,10 +3929,11 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     note_translated_compute(hr, ppv);
     crate::xlog_info!(
-        "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
+        "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{}{})",
         dxil.len(),
         in_driver.as_millis(),
-        if reused { ", the driver's blob of an earlier build" } else { "" }
+        if reused { ", the driver's blob of an earlier build" } else { "" },
+        if retried_no_gvn { ", retried without GVN" } else { "" }
     );
     Some(Ok(hr))
 }
@@ -5011,6 +5045,27 @@ fn retry_without_rect_gs(copy: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC, rect_gs:
     create(copy)
 }
 
+/// Retry a driver-rejected compute PSO once using DXIL recompiled without DXC's GVN pass
+/// (avoiding handle phis that some drivers refuse with `E_OUTOFMEMORY`, #756).
+fn retry_compute_pso_without_gvn(
+    first_hr: HRESULT,
+    orig_dxil: &[u8],
+    recompile: impl FnOnce() -> Result<Vec<u8>, String>,
+    mut create: impl FnMut(&[u8]) -> HRESULT,
+) -> (HRESULT, bool) {
+    if first_hr >= 0 {
+        return (first_hr, false);
+    }
+    let Ok(retry_dxil) = recompile() else {
+        return (first_hr, false);
+    };
+    if retry_dxil == orig_dxil {
+        return (first_hr, false);
+    }
+    let hr2 = create(&retry_dxil);
+    (hr2, hr2 >= 0)
+}
+
 /// What an untranslated pipeline from a stream is made from: a rect list's (type 19, which
 /// `stream_pipeline` keeps for `translated_graphics_pso`) with the PC's topology type, as the
 /// stream path made it before; None: `desc` as it is.
@@ -5917,6 +5972,69 @@ mod fallback_stream_tests {
             assert_eq!((buf.len(), size), (24, [24, 0]));
             assert_eq!(u64::from_le_bytes(buf[16..24].try_into().unwrap()), dummy().vs.len() as u64);
         }
+    }
+}
+
+#[cfg(test)]
+mod compute_pso_retry_tests {
+    use super::*;
+
+    const REFUSED_OOM: HRESULT = 0x8007_000Eu32 as i32;
+    const REFUSED_ARG: HRESULT = 0x8007_0057u32 as i32;
+
+    #[test]
+    fn compute_pso_success_skips_no_gvn_retry() {
+        let mut create_calls = 0usize;
+        let (hr, retried) = retry_compute_pso_without_gvn(
+            0,
+            b"orig-dxil",
+            || panic!("successful compute PSO must not recompile without GVN"),
+            |_| {
+                create_calls += 1;
+                0
+            },
+        );
+        assert_eq!((hr, retried, create_calls), (0, false, 0));
+    }
+
+    #[test]
+    fn compute_pso_refusal_retries_without_gvn() {
+        let mut seen = Vec::new();
+        let (hr, retried) = retry_compute_pso_without_gvn(
+            REFUSED_OOM,
+            b"orig-dxil",
+            || Ok(b"no-gvn-dxil".to_vec()),
+            |dxil| {
+                seen.push(dxil.to_vec());
+                0
+            },
+        );
+        assert_eq!((hr, retried), (0, true));
+        assert_eq!(seen, vec![b"no-gvn-dxil".to_vec()]);
+    }
+
+    #[test]
+    fn compute_pso_refusal_skips_second_driver_call_when_dxil_unchanged() {
+        let mut create_calls = 0usize;
+        let (hr, retried) = retry_compute_pso_without_gvn(
+            REFUSED_OOM,
+            b"same-dxil",
+            || Ok(b"same-dxil".to_vec()),
+            |_| {
+                create_calls += 1;
+                0
+            },
+        );
+        assert_eq!((hr, retried, create_calls), (REFUSED_OOM, false, 0));
+    }
+
+    #[test]
+    fn compute_pso_refusal_propagates_failure_when_retry_fails() {
+        let (hr1, retried1) = retry_compute_pso_without_gvn(REFUSED_OOM, b"orig-dxil", || Err("already -O0".into()), |_| 0);
+        assert_eq!((hr1, retried1), (REFUSED_OOM, false));
+
+        let (hr2, retried2) = retry_compute_pso_without_gvn(REFUSED_OOM, b"orig-dxil", || Ok(b"no-gvn-dxil".to_vec()), |_| REFUSED_ARG);
+        assert_eq!((hr2, retried2), (REFUSED_ARG, false));
     }
 }
 

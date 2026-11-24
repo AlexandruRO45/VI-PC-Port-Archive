@@ -1029,7 +1029,8 @@ impl Pipelines {
     }
 
     /// The compute pipeline of `c` (made and released).
-    fn make(&self, c: &recomp::pso::Compiled) {
+    fn make(&self, name: &str, c: &recomp::pso::Compiled, retry_without_gvn: impl FnOnce() -> Option<recomp::pso::Compiled>) {
+        use crate::hle::d3d12x::real::driver_cache;
         use windows::Win32::Graphics::Direct3D12::*;
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
         let rs = {
@@ -1048,45 +1049,58 @@ impl Pipelines {
                 },
             }
         };
-        let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
-            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
-            ..Default::default()
-        };
-        {
-            let mut n = self.running.0.lock().unwrap();
-            while *n >= self.most {
-                n = self.running.1.wait(n).unwrap();
+        let try_create = |dxil: &[u8]| {
+            let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
+                ..Default::default()
+            };
+            {
+                let mut n = self.running.0.lock().unwrap();
+                while *n >= self.most {
+                    n = self.running.1.wait(n).unwrap();
+                }
+                *n += 1;
             }
-            *n += 1;
-        }
-        use crate::hle::d3d12x::real::driver_cache;
-        let path = driver_cache::path(&c.dxil, desc.Flags.0);
-        let cached = path.as_deref().and_then(driver_cache::load);
-        let from_cache = cached.as_ref().and_then(|bytes| {
-            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
-            unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }.ok()
-        });
-        let r = if let Some(pso) = from_cache {
-            self.reused.fetch_add(1, Ordering::Relaxed);
-            Ok(pso)
-        } else {
-            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-            let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
-            if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
-                if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
-                    let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
-                    let len = unsafe { blob.GetBufferSize() };
-                    if !bytes.is_null() && len != 0 {
-                        driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) });
+            let path = driver_cache::path(dxil, desc.Flags.0);
+            let cached = path.as_deref().and_then(driver_cache::load);
+            let from_cache = cached.as_ref().and_then(|bytes| {
+                desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
+                unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }.ok()
+            });
+            let r = if let Some(pso) = from_cache {
+                self.reused.fetch_add(1, Ordering::Relaxed);
+                Ok(pso)
+            } else {
+                desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+                let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+                if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
+                    if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
+                        let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
+                        let len = unsafe { blob.GetBufferSize() };
+                        if !bytes.is_null() && len != 0 {
+                            driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) });
+                        }
+                    }
+                }
+                pso
+            };
+            *self.running.0.lock().unwrap() -= 1;
+            self.running.1.notify_one();
+            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+            r
+        };
+        let mut r = try_create(&c.dxil);
+        if r.is_err() {
+            if let Some(nogvn) = retry_without_gvn() {
+                if nogvn.dxil != c.dxil {
+                    r = try_create(&nogvn.dxil);
+                    if r.is_ok() {
+                        eprintln!("  {name}: driver refused compute pipeline; built without GVN ({} B DXIL)", nogvn.dxil.len());
                     }
                 }
             }
-            pso
-        };
-        *self.running.0.lock().unwrap() -= 1;
-        self.running.1.notify_one();
-        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+        }
         let done = match r {
             Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
             Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
@@ -1150,7 +1164,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
-                                p.make(&c);
+                                p.make(&name, &c, || {
+                                    recomp::pso::console_to_dxil_in_without_gvn(&blob, recomp::pso::Stage::Compute, 0, split, windows).ok()
+                                });
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
