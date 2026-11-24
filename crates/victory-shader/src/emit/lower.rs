@@ -2544,6 +2544,24 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        if name == "ds_bpermute_b32" {
+            // Each lane reads the source of the lane its address names (a
+            // byte per lane), and an address with bit 0 set reads 0.
+            self.cross_lane(false)?;
+            let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+            let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+            let reg = dst_reg.ok_or("a permute result")?;
+            let two = self.s.m.i32(2);
+            let lane = self.s.m.bin(c, Bin::LShr, a, two);
+            let r = self.read_lane(x, lane);
+            let one = self.s.m.i32(1);
+            let odd = self.s.m.bin(c, Bin::And, a, one);
+            let zero = self.s.m.i32(0);
+            let is_odd = self.s.m.cmp(c, pred::NE, odd, zero);
+            let r = self.s.m.select(c, is_odd, zero, r);
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
