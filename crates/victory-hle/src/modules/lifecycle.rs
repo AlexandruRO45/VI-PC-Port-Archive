@@ -371,6 +371,21 @@ mod tests {
         assert!(exports.contains(&"RegisterAppConstrainedChangeNotification"));
         assert!(exports.contains(&"UnregisterAppConstrainedChangeNotification"));
 
+        let mut invalid = 99;
+        assert_eq!(
+            RegisterAppConstrainedChangeNotification(None, std::ptr::null_mut(), &mut invalid),
+            ERROR_INVALID_PARAMETER
+        );
+        assert_eq!(invalid, 99, "failed registration must not write an id");
+        assert_eq!(
+            RegisterAppConstrainedChangeNotification(
+                Some(noop),
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            ERROR_INVALID_PARAMETER
+        );
+
         let (mut a, mut b) = (0, 0);
         assert_eq!(
             RegisterAppConstrainedChangeNotification(Some(noop), std::ptr::null_mut(), &mut a,),
