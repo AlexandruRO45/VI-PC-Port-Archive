@@ -4078,6 +4078,55 @@ mod tests {
     }
 
     #[test]
+    fn folder_overlap_folds_only_ascii_case_and_keeps_relative_apart() {
+        for fold in [false, true] {
+            // A relative path is never inside an absolute folder, or the
+            // reverse, even when the names match.
+            assert!(!is_within(
+                Path::new("v/cache/data"),
+                Path::new("/v/cache"),
+                fold
+            ));
+            assert!(!is_within(
+                Path::new("/v/cache/data"),
+                Path::new("v/cache"),
+                fold
+            ));
+            // Leading `..` are kept and compared like names.
+            assert!(is_within(Path::new("../v/data"), Path::new("../v"), fold));
+            assert!(!is_within(
+                Path::new("../v/data"),
+                Path::new("../../v"),
+                fold
+            ));
+        }
+        // Only ASCII letters fold: `É` and `é` stay different folders.
+        assert!(!is_within(
+            Path::new("/Jeux/É/data"),
+            Path::new("/jeux/é"),
+            true
+        ));
+        assert!(is_within(
+            Path::new("/Jeux/É/data"),
+            Path::new("/jeux/É"),
+            true
+        ));
+    }
+
+    #[test]
+    fn subfolders_refuse_a_leading_dot_and_allow_a_trailing_slash() {
+        // A leading `./` is a `.` component; a trailing slash or a doubled
+        // separator adds none, and a `~` is a plain name, not the home.
+        for bad in ["./a", "a/.", "./"] {
+            let err = ensure_plain_subdir(bad).unwrap_err().to_string();
+            assert!(err.contains("not a plain relative path"), "{bad}: {err}");
+        }
+        for ok in ["a/", "a//b", "~", "~/x", "..a", "a.."] {
+            assert!(ensure_plain_subdir(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
     fn shared_xdg_base_names_the_xdg_variables() {
         let base = abs("shared");
         let env = |k: &str| match k {
