@@ -2254,6 +2254,81 @@ pub(crate) mod tests {
         }
     }
 
+    /// A source's leaves are what it can resolve to: every choice (phi,
+    /// SCC select, per-lane pick, per-lane phi) is flattened depth first in
+    /// argument order, a per-lane phi's untaken edges add nothing, and any
+    /// other source is its own one leaf, borrowed rather than copied.
+    #[test]
+    fn leaves_flatten_every_choice_in_argument_order() {
+        let c = |x: u32| Source::Constant(vec![x]);
+        let loaded = Source::Loaded {
+            load: (0, 1),
+            first: 4,
+        };
+        let fetched = Source::Fetched {
+            load: (2, 0),
+            first: 0,
+        };
+        let built = Source::Built {
+            address: at(0, 16),
+            bits: 0,
+            words: [0, 0],
+        };
+        // Each plain source is its own leaf, the very same one.
+        for s in [&c(7), &loaded, &fetched, &built] {
+            let l = s.leaves();
+            assert_eq!(l.len(), 1);
+            assert!(std::ptr::eq(l[0], s));
+        }
+        // Nested a few deep, every kind of choice inside another.
+        let tree = Source::Phi {
+            block: 3,
+            args: vec![
+                Source::Select {
+                    scc: Value(1),
+                    args: vec![c(1), loaded.clone()],
+                },
+                Source::LanePhi {
+                    block: 4,
+                    args: vec![
+                        None,
+                        Some(Source::Lanes {
+                            mask: Value(2),
+                            args: vec![fetched.clone(), c(2)],
+                        }),
+                        None,
+                        Some(built.clone()),
+                    ],
+                },
+                c(3),
+            ],
+        };
+        let leaves: Vec<Source> = tree.leaves().into_iter().cloned().collect();
+        assert_eq!(leaves, [c(1), loaded, fetched, c(2), built, c(3)]);
+        // A repeat is listed each time it is chosen, not merged.
+        let twice = Source::Select {
+            scc: Value(5),
+            args: vec![c(9), c(9)],
+        };
+        assert_eq!(twice.leaves(), [&c(9), &c(9)]);
+        // A choice with no arguments, or a per-lane phi no lane takes, has
+        // no leaves at all, and neither has a phi of those.
+        let empty = Source::Phi {
+            block: 0,
+            args: vec![
+                Source::Lanes {
+                    mask: Value(0),
+                    args: vec![],
+                },
+                Source::LanePhi {
+                    block: 1,
+                    args: vec![None, None],
+                },
+            ],
+        };
+        assert!(empty.leaves().is_empty());
+    }
+
     /// The first instruction of `words`, decoded into its SSA form.
     fn first_inst(words: &[u32]) -> (Program, Inst) {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
