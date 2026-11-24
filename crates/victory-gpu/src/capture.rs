@@ -278,55 +278,91 @@ pub(crate) fn show_index() -> Option<Show> {
 }
 
 /// Binds (render-target binds and UAV uses) of each noted target this frame
-/// (show mode `busiest`); not draws.
-static HITS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+/// (show mode `busiest`), by resource address; not draws.
+static HITS: std::sync::Mutex<Option<std::collections::HashMap<usize, u32>>> =
+    std::sync::Mutex::new(None);
+
+/// Counts one bind of `resource` in `hits`.
+fn hit(hits: &mut std::collections::HashMap<usize, u32>, resource: usize) {
+    *hits.entry(resource).or_default() += 1;
+}
 
 /// At the present of `frame` in show mode: the noted target to show, if the
-/// frame has one. Clears the frame's list unless a dump still needs it.
+/// frame has one. Clears the frame's list unless a dump still needs it. The
+/// lists are taken (or, for a dump, copied) first: the targets' descriptions
+/// are read with neither lock held.
 pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
     let show = show_index()?;
-    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
-    if frame.is_power_of_two() && frame >= 256 {
-        let list: Vec<String> = targets
+    let targets = {
+        let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+        if dump_on() && listed(frame) {
+            targets.clone()
+        } else {
+            std::mem::take(&mut *targets)
+        }
+    };
+    let binds: Vec<u32> = {
+        let mut hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
+        let hits = hits.get_or_insert_with(std::collections::HashMap::new);
+        let binds = targets
             .iter()
-            .enumerate()
-            .map(|(i, (r, c))| {
-                // SAFETY: a live resource.
-                let d = unsafe { c.texture.GetDesc() };
-                let n = hits.iter().find(|h| h.0 == *r).map_or(0, |h| h.1);
-                format!("{i}: {}x{} f{} ({n} binds)", d.Width, d.Height, d.Format.0)
-            })
+            .map(|(r, _)| hits.get(r).copied().unwrap_or(0))
             .collect();
-        tracing::info!(frame, ?list, "VICTORY_SHOW_TARGET: this frame's targets");
-    }
-    let pick = match show {
-        Show::Index(n) => targets
+        hits.clear();
+        binds
+    };
+    let logged = frame.is_power_of_two() && frame >= 256;
+    if let Show::Index(n) = show
+        && !logged
+    {
+        return targets
             .get(n)
             .filter(|(_, c)| {
                 // SAFETY: a live resource.
                 presentable(&unsafe { c.texture.GetDesc() })
             })
-            .map(|(_, c)| c.clone()),
-        Show::Busiest => targets
-            .iter()
-            .filter(|(_, c)| {
-                // SAFETY: a live resource.
-                let d = unsafe { c.texture.GetDesc() };
-                presentable(&d)
-                    && d.Width >= 1280
-                    // Screen-shaped (16:9): not a shadow map, which is bound more often.
-                    && d.Width * 9 == u64::from(d.Height) * 16
-                    && matches!(d.Format.0, 9..=14 | 23..=25 | 27..=32 | 87 | 90 | 91)
-            })
-            .max_by_key(|(r, _)| hits.iter().find(|h| h.0 == *r).map_or(0, |h| h.1))
-            .map(|(_, c)| c.clone()),
-    };
-    if !(dump_on() && listed(frame)) {
-        targets.clear();
+            .map(|(_, c)| c.clone());
     }
-    hits.clear();
-    pick
+    // One pass: each target's description, read once, with its binds.
+    let seen: Vec<(D3D12_RESOURCE_DESC, u32)> = targets
+        .iter()
+        .zip(binds)
+        // SAFETY: a live resource.
+        .map(|((_, c), n)| (unsafe { c.texture.GetDesc() }, n))
+        .collect();
+    if logged {
+        let list: Vec<String> = seen
+            .iter()
+            .enumerate()
+            .map(|(i, (d, n))| format!("{i}: {}x{} f{} ({n} binds)", d.Width, d.Height, d.Format.0))
+            .collect();
+        tracing::info!(frame, ?list, "VICTORY_SHOW_TARGET: this frame's targets");
+    }
+    let pick = match show {
+        Show::Index(n) => seen.get(n).filter(|(d, _)| presentable(d)).map(|_| n),
+        Show::Busiest => busiest(&seen),
+    };
+    pick.map(|i| targets[i].1.clone())
+}
+
+/// What show mode `busiest` may show: a texture the swap chain copy takes,
+/// 8-bit, 10-bit or 16-bit float colour, screen-shaped (16:9: not a shadow
+/// map, which is bound more often) and at least 1280 wide.
+fn displayable(d: &D3D12_RESOURCE_DESC) -> bool {
+    presentable(d)
+        && d.Width >= 1280
+        && d.Width * 9 == u64::from(d.Height) * 16
+        && matches!(d.Format.0, 9..=14 | 23..=25 | 27..=32 | 87 | 90 | 91)
+}
+
+/// The index of the displayable target bound most often (the last of
+/// equals), given each target's description and binds.
+fn busiest(seen: &[(D3D12_RESOURCE_DESC, u32)]) -> Option<usize> {
+    seen.iter()
+        .enumerate()
+        .filter(|(_, (d, _))| displayable(d))
+        .max_by_key(|(_, (_, n))| *n)
+        .map(|(i, _)| i)
 }
 
 /// Checks the resource shape required by the swap-chain copy.
@@ -348,10 +384,7 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
     if show_index().is_some() {
         let mut hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
-        match hits.iter_mut().find(|h| h.0 == resource as usize) {
-            Some(h) => h.1 += 1,
-            None => hits.push((resource as usize, 1)),
-        }
+        hit(hits.get_or_insert_with(std::collections::HashMap::new), resource as usize);
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     if !targets.iter().any(|&(r, _)| r == resource as usize)
@@ -679,6 +712,48 @@ mod tests {
         d.SampleDesc.Count = 1;
         d.Dimension = super::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         assert!(!super::presentable(&d));
+    }
+
+    /// A screen-shaped colour target of the swap chain copy's shape.
+    fn screen(width: u64, height: u32, format: i32) -> super::D3D12_RESOURCE_DESC {
+        super::D3D12_RESOURCE_DESC {
+            Dimension: super::D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            DepthOrArraySize: 1,
+            Format: super::DXGI_FORMAT(format),
+            SampleDesc: super::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn busiest_counts_binds_per_target_and_skips_undisplayable_ones() {
+        let mut hits = std::collections::HashMap::new();
+        // Target 1 (a shadow map, square) is bound most, then 3, then 2.
+        for (resource, binds) in [(1, 9), (2, 2), (3, 5), (4, 7)] {
+            for _ in 0..binds {
+                super::hit(&mut hits, resource);
+            }
+        }
+        assert_eq!(hits[&3], 5);
+        let shapes = [
+            screen(4096, 4096, 10),
+            screen(1920, 1080, 28),
+            screen(1920, 1080, 10),
+            // Depth (format 40) is not shown.
+            screen(1920, 1080, 40),
+        ];
+        let seen: Vec<_> = shapes
+            .into_iter()
+            .zip([1, 2, 3, 4])
+            .map(|(d, r)| (d, hits.get(&r).copied().unwrap_or(0)))
+            .collect();
+        assert_eq!(super::busiest(&seen), Some(2));
+        // Too small or no target displayable: none.
+        assert_eq!(super::busiest(&[(screen(1024, 576, 28), 3)]), None);
+        assert_eq!(super::busiest(&[]), None);
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
