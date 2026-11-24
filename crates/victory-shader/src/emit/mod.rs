@@ -765,6 +765,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            psv: None,
         })
         .unwrap();
         let mut dxil = l.dxil;
