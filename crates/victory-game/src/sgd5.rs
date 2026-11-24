@@ -4236,4 +4236,83 @@ mod tests {
             assert!(!cache.any_in(&file, 0, usize::MAX), "marker at {at}");
         }
     }
+
+    #[test]
+    fn repeat_after_a_zero_run_repeats_zero() {
+        // A dynamic block's 16 repeats the previous code length, and after
+        // a run of zeros (17 or 18, or a 0 sent as is) that length is 0:
+        // zeros sent that way are a stream whichever way the run before
+        // them was sent. After a length of 1 the same 16 repeats 1, giving
+        // more 1-bit codes than fit, and breaks the stream. Either way the record covers no other, so it is yielded,
+        // unpacking only if it is a stream, and the record after it is found.
+        let a = u32::from(b'A');
+        // 257 literal/length codes and one distance code: `A` and the end
+        // of the block in 1 bit, every other length (the distance code's
+        // too) 0.
+        let mut lit = vec![0; 258];
+        (lit[a as usize], lit[256]) = (1, 1);
+        let data = [a, a, a, a, 256];
+        let want = b"AAAA".to_vec();
+        // Code-length code: 0, 16 and 18 in 2 bits, 1 and 17 in 3.
+        let mut clen = [0; 19];
+        (clen[0], clen[16], clen[18], clen[1], clen[17]) = (2, 2, 2, 3, 3);
+        // `n` (3 and up) more of the previous length, as 16s of 3 to 6.
+        let again = |mut n: usize| {
+            let mut out = Vec::new();
+            while n > 6 {
+                let take = if n - 6 >= 3 { 6 } else { n - 3 };
+                out.push((16, take as u32 - 3));
+                n -= take;
+            }
+            out.push((16, n as u32 - 3));
+            out
+        };
+        // The 65 zeros before `A`, started by a 0, a 17 or an 18, the rest
+        // repeated; then `A`; the 190 zeros after it as an 18 and repeats;
+        // the end of the block and the distance code's 0.
+        let starts: [(&str, (u32, u32), usize); 3] = [
+            ("a 0", (0, 0), 1),
+            ("a 17", (17, 7), 10),
+            ("an 18", (18, 0), 11),
+        ];
+        let mut cases = Vec::new();
+        for (what, start, run) in starts {
+            let mut seq = vec![start];
+            seq.extend(again(65 - run));
+            seq.extend([(1, 0), (18, 127)]);
+            seq.extend(again(190 - 138));
+            seq.extend([(1, 0), (0, 0)]);
+            cases.push((format!("{what} first"), seq, true));
+        }
+        // A 16 right after `A`'s 1 repeats 1, not the zeros before it.
+        let mut after_one = vec![(18, 54), (1, 0)];
+        after_one.extend(again(3));
+        after_one.push((18, 127));
+        after_one.extend(again(190 - 138 - 3));
+        after_one.extend([(1, 0), (0, 0)]);
+        cases.push(("a repeat right after A".to_string(), after_one, false));
+
+        for (what, seq, valid) in &cases {
+            let packed = dynamic_block(&clen, seq, &lit[..257], &data);
+            assert_eq!(
+                miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                valid.then(|| want.clone()),
+                "{what}"
+            );
+            assert_eq!(starts_stream(&packed, want.len()), *valid, "{what}");
+
+            let (file, marker) = outer_then_after(&packed, want.len());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            assert_eq!(found[0].unpack(), valid.then(|| want.clone()), "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "{what}");
+        }
+    }
 }
