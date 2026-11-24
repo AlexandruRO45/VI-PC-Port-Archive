@@ -2534,6 +2534,97 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// Bracket expressions and escapes are read as git's wildmatch reads
+    /// them: `[[:digit:]]` is a POSIX class, taking `run7` and refusing
+    /// `runx`; a `]` first in a bracket is literal, so `[]]x` takes `]x`; a
+    /// `-` last in one is literal, so `[a-]z` takes `-z` and refuses `bz`;
+    /// `\?` matches only a literal `?`, taking `a?b` and refusing `acb`. A
+    /// pattern ending in a lone backslash matches nothing, so `odd\` stays
+    /// visible and is refused (it is left empty, since the listing shows a
+    /// backslash in a name as `/`). The last rule, with no newline after it,
+    /// still holds, and `nonl` is taken.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_matched_by_bracket_classes_and_escapes() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(
+            root.join(".gitignore"),
+            "/run[[:digit:]]/\n/[]]x/\n/[a-]z/\n/a\\?b/\n/odd\\\n/nonl/",
+        )
+        .unwrap();
+        let taken = ["run7", "]x", "-z", "a?b", "nonl"].map(|d| root.join(d));
+        let refused = ["runx", "bz", "acb", "odd\\"].map(|d| root.join(d));
+        for dir in taken.iter().chain(&refused) {
+            std::fs::create_dir(dir).unwrap();
+        }
+
+        let tmps: Vec<_> = taken
+            .iter()
+            .map(|hidden| {
+                let mut candidates = refused.to_vec();
+                candidates.push(hidden.clone());
+                let tmp = tempdir_in_first(root, candidates);
+                assert_eq!(tmp.path().parent(), Some(hidden.as_path()));
+                std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+                tmp
+            })
+            .collect();
+        assert_eq!(tmps.len(), taken.len());
+        for dir in &refused {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        // Not `odd\`: the listing shows a `\` in a name as `/`.
+        for (i, dir) in refused[..3].iter().enumerate() {
+            std::fs::write(dir.join(format!("f{i}.rs")), b"fn f() {}\n").unwrap();
+        }
+        assert_eq!(
+            names(root, false),
+            [".gitignore", "acb/f2.rs", "bz/f1.rs", "runx/f0.rs"]
+        );
+        super::run(root, false).unwrap();
+    }
+
+    /// A TMPDIR spelled with `.` or `..` is judged by the directory it
+    /// names, not by its spelling: `visible/../ignored` and `ignored/.` are
+    /// taken in `ignored`, while `ignored/../visible`, which passes through
+    /// the ignored directory on its way, leads to `visible` and is refused,
+    /// as is `ignored/../visible/.`. Nothing is made in `visible`.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_judged_by_the_directory_their_path_names() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "/ignored/\n").unwrap();
+        let ignored = root.join("ignored");
+        let visible = root.join("visible");
+        std::fs::create_dir(&ignored).unwrap();
+        std::fs::create_dir(&visible).unwrap();
+        let through = root.join("ignored/../visible");
+        let through_dot = root.join("ignored/../visible/.");
+
+        let tmp = tempdir_in_first(
+            root,
+            [
+                through.clone(),
+                through_dot.clone(),
+                root.join("visible/../ignored"),
+            ],
+        );
+        assert_eq!(tmp.path().parent(), Some(ignored.as_path()));
+        let tmp_dot = tempdir_in_first(root, [through, through_dot, root.join("ignored/.")]);
+        assert_eq!(tmp_dot.path().parent(), Some(ignored.as_path()));
+        assert_eq!(std::fs::read_dir(&visible).unwrap().count(), 0);
+        for dir in [tmp.path(), tmp_dot.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        std::fs::write(visible.join("a.rs"), b"fn a() {}\n").unwrap();
+        assert_eq!(names(root, false), [".gitignore", "visible/a.rs"]);
+        super::run(root, false).unwrap();
+    }
+
     /// A TMPDIR reached through symlinks inside the checkout is judged by
     /// the directory it leads to, not by the link's own name or by any
     /// rule naming the link: `alias.txt` and `hop.txt` (a link to it) lead
