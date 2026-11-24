@@ -6,5 +6,8 @@ import tempfile
 
 with tempfile.TemporaryDirectory() as directory:
     env = dict(os.environ, X2W_STORAGE_PATH=".")
-    for operation in ("write", "read"):
-        subprocess.run([sys.argv[1], operation], cwd=directory, env=env, check=True)
+    writer = sys.argv[2] if len(sys.argv) > 2 else "write"
+    for operation in (writer, "read"):
+        result = subprocess.run([sys.argv[1], operation], cwd=directory, env=env)
+        if result.returncode:
+            sys.exit(result.returncode)

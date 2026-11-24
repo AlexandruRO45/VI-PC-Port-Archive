@@ -356,21 +356,63 @@ std::string update_container(u64 update)
     ReleaseSRWLockShared(&save_lock);
     return name;
 }
-u64 last_submit_status;  // what the last asynchronous submit returned (hypothesis: one at a time)
 #include "startup_stubs/save_read.inl"
 // Publishes what an update has staged, all or nothing. The update itself stays open.
 u64 submit_update(u64 update)
 {
     if (update < save_update_handle || update - save_update_handle >= max_save_handles) return 0;
     const std::size_t index = static_cast<std::size_t>(update - save_update_handle);
-    AcquireSRWLockExclusive(&save_lock);
-    const std::string container = save_table.update_container(index);
-    std::vector<x2w_save::Action> actions = save_table.take(index);
-    ReleaseSRWLockExclusive(&save_lock);
-    if (container.empty() || actions.empty()) return 0;
-    const x2w_save::Status status = save_store().commit(container, actions);
-    if (status != x2w_save::Status::ok) x2w_local::logf("x2w-runtime game save: update refused, nothing published (status %d)", static_cast<int>(status));
-    return save_status(status);
+    try {
+        std::string container;
+        std::vector<x2w_save::Action> actions;
+        {
+            AcquireSRWLockExclusive(&save_lock);
+            struct Unlock { ~Unlock() { ReleaseSRWLockExclusive(&save_lock); } } guard;
+            container = save_table.update_container(index);
+            actions = save_table.take(index);
+        }
+        if (container.empty() || actions.empty()) return 0;
+        const auto status = save_store().commit(container, actions);
+        if (status != x2w_save::Status::ok) x2w_local::logf("x2w-runtime game save: update refused (status %d)", static_cast<int>(status));
+        return save_status(status);
+    } catch (const std::bad_alloc&) {
+        return e_outofmemory;
+    } catch (const std::filesystem::filesystem_error&) {
+        return e_fail;
+    }
+}
+// XAsyncBegin reserves the caller's block and completion queue. Disk publication
+// starts only after acceptance. Complete carries the result for this block;
+// it can invoke user code immediately, so no save lock may span that call.
+// The verified public PC GDK async interface uses slots 7, 10 and 11.
+constexpr GUID submit_async_family{0x073b7dcb,0x1fcf,0x4030,{0x94,0xbe,0xe3,0xc9,0xeb,0x62,0x34,0x28}};
+constexpr char submit_identity[] = "local XGameSaveSubmitUpdate";
+HRESULT WINAPI submit_provider(unsigned, const void*) { return S_OK; }
+u64 async_submit(int slot, u64 update, u64 block)
+{
+    if (!block || !real_query) return e_fail;
+    void* service = nullptr;
+    const auto query = real_query(&submit_async_family, &submit_async_family, &service);
+    if (FAILED(query)) return static_cast<unsigned>(query);
+    if (!service) return e_fail;
+    auto** methods = *static_cast<void***>(service);
+    struct ApiRef {
+        void* object;
+        ULONG (WINAPI* release)(void*);
+        ~ApiRef() { release(object); }
+    } api{service,reinterpret_cast<ULONG(WINAPI*)(void*)>(methods[2])};
+    auto* async = reinterpret_cast<void*>(block);
+    if (slot == 29) {
+        using Result = HRESULT(WINAPI*)(void*,void*,const void*,size_t,void*,size_t*);
+        return static_cast<unsigned>(reinterpret_cast<Result>(methods[11])(service, async, submit_identity, 0, nullptr, nullptr));
+    }
+    using Begin = HRESULT(WINAPI*)(void*,void*,void*,const void*,const char*,decltype(&submit_provider));
+    const auto hr = reinterpret_cast<Begin>(methods[7])(service, async, nullptr, submit_identity, submit_identity, submit_provider);
+    if (FAILED(hr)) return static_cast<unsigned>(hr);
+    const auto status = static_cast<HRESULT>(submit_update(update));
+    using Complete = void(WINAPI*)(void*,void*,HRESULT,size_t);
+    reinterpret_cast<Complete>(methods[10])(service, async, status, 0);
+    return S_OK;
 }
 u64 complete_async(u64 async_block)
 {
@@ -492,11 +534,10 @@ bool save_call(int slot, u64* args, u64* result)
         *result = submit_update(args[0]);
         return true;
     case 28:  // XGameSaveSubmitUpdateAsync(update, async)
-        last_submit_status = submit_update(args[0]);
-        *result = complete_async(args[1]);
+        *result = async_submit(slot, args[0], args[1]);
         return true;
-    case 29:  // XGameSaveSubmitUpdateResult(async): the status of the last asynchronous submit
-        *result = last_submit_status;
+    case 29:  // XGameSaveSubmitUpdateResult(async): consume this block's completion
+        *result = async_submit(slot, 0, args[0]);
         return true;
     default:
         *result = 0x80004001;  // E_NOTIMPL

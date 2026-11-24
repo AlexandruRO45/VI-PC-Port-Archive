@@ -8,8 +8,11 @@ const GUID interface_id{0x1bfff3af,0xf14a,0x40a3,{0x8e,0x35,0x9a,0xda,0x90,0x65,
 constexpr std::array<unsigned char,4> language{11,0,0xff,0};
 constexpr std::array<unsigned char,2> brightness{0,15};
 
-HRESULT WINAPI fixture_query(const GUID*, const GUID*, void** out)
+QueryApi system_async_query{};
+HRESULT WINAPI fixture_query(const GUID* cls, const GUID* iid, void** out)
 {
+    if (*cls == submit_async_family)
+        return system_async_query ? system_async_query(cls,iid,out) : E_NOINTERFACE;
     static void* token;
     *out = &token;
     return S_OK;
@@ -42,15 +45,34 @@ bool WINAPI collect_blob(const save_read::BlobInfo* info, void* state) {
     data.required += sizeof(save_read::Blob) + std::strlen(info->name) + 1 + info->size;
     return true;
 }
-int write(Client& client, u64 p) {
+int write(Client& client, u64 p, bool asynchronous) {
     const auto generated = "preferences-" + std::to_string(GetCurrentProcessId());
     u64 saved{}, empty{}, update{};
     if (client.call(16, p, address("empty"), address(&empty)) ||
         client.call(16, p, address(generated.c_str()), address(&saved)) ||
         client.call(23, saved, 0, address(&update)) ||
         client.call(25, update, address("language"), address(language.data()), language.size()) ||
-        client.call(25, update, address("brightness"), address(brightness.data()), brightness.size()) ||
-        client.call(27, update)) return 2;
+        client.call(25, update, address("brightness"), address(brightness.data()), brightness.size())) return 2;
+    if (asynchronous) {
+        const auto dll = LoadLibraryExW(L"xgameruntime.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!dll) return 77;
+        system_async_query = reinterpret_cast<QueryApi>(GetProcAddress(dll,"QueryApiImpl"));
+        void* runtime{};
+        if (!system_async_query || FAILED(system_async_query(&submit_async_family,&submit_async_family,&runtime)) || !runtime)
+            return 77;
+        auto** methods = *static_cast<void***>(runtime);
+        struct { void* queue{}; void* ctx{}; void* callback{}; unsigned char internal[32]{}; } block;
+        using CreateQueue = HRESULT(WINAPI*)(void*,unsigned,unsigned,void**);
+        if (FAILED(reinterpret_cast<CreateQueue>(methods[12])(runtime,3,3,&block.queue))) return 77;
+        const char* key="language";
+        std::uint32_t count=1;
+        alignas(8) unsigned char data[128]{};
+        if (client.call(28,update,0) != e_fail ||
+            client.call(20,saved,address(&key),address(&count),sizeof(data),address(data)) != save_read::missing_blob ||
+            client.call(28,update,address(&block)) || client.call(29,address(&block))) return 13;
+        reinterpret_cast<void(WINAPI*)(void*,void*)>(methods[17])(runtime,block.queue);
+        reinterpret_cast<ULONG(WINAPI*)(void*)>(methods[2])(runtime);
+    } else if (client.call(27, update)) return 2;
     client.call(24, update);
     client.call(17, saved);
     client.call(17, empty);
@@ -118,5 +140,6 @@ int main(int argc, char** argv) {
     u64 handle{};
     if (FAILED(proxy_query(&provider,&interface_id,&client.object)) ||
         client.call(3, local_user_handle, address("fixture"), 0, address(&handle)) || !handle) return 1;
-    return std::strcmp(argv[1],"write") == 0 ? write(client,handle) : read(client,handle);
+    if (std::strcmp(argv[1],"write-async") == 0) return write(client,handle,true);
+    return std::strcmp(argv[1],"write") == 0 ? write(client,handle,false) : read(client,handle);
 }
