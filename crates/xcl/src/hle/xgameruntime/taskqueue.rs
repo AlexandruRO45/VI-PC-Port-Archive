@@ -1120,15 +1120,19 @@ mod tests {
             assert_eq!(q_out, std::ptr::null_mut());
 
             let mut p_out = 0xDEADBEEF as *mut c_void;
-            assert_eq!(XTaskQueueGetPort(std::ptr::null_mut(), 0, &mut p_out), E_INVALIDARG);
+            assert_eq!(XTaskQueueGetPort(0x1234 as *mut c_void, 0, &mut p_out), E_INVALIDARG);
             assert_eq!(p_out, std::ptr::null_mut());
+
+            let mut p_out2 = 0xDEADBEEF as *mut c_void;
+            assert_eq!(XTaskQueueGetPort(std::ptr::null_mut(), 99, &mut p_out2), E_INVALIDARG);
+            assert_eq!(p_out2, std::ptr::null_mut());
 
             let mut comp_out = 0xDEADBEEF as *mut c_void;
             assert_eq!(XTaskQueueCreateComposite(std::ptr::null_mut(), std::ptr::null_mut(), &mut comp_out), E_INVALIDARG);
             assert_eq!(comp_out, std::ptr::null_mut());
 
             let mut dup_out = 0xDEADBEEF as *mut c_void;
-            assert_eq!(XTaskQueueDuplicateHandle(std::ptr::null_mut(), &mut dup_out), E_INVALIDARG);
+            assert_eq!(XTaskQueueDuplicateHandle(0x1234 as *mut c_void, &mut dup_out), E_INVALIDARG);
             assert_eq!(dup_out, std::ptr::null_mut());
         }
     }
