@@ -4295,6 +4295,17 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.i32(((x as i32) >> 31) as u32);
                 Ok((lo, hi))
             }
+            Operand::Const(code @ 240..=248) => {
+                let bits = if code == 248 {
+                    (std::f64::consts::FRAC_1_PI / 2.0).to_bits()
+                } else {
+                    let single = crate::resource::inline(code).ok_or("a special operand")?;
+                    f64::from(f32::from_bits(single)).to_bits()
+                };
+                Ok((self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32)))
+            }
+            // A literal supplies the upper word of an f64, with a zero low word.
+            Operand::Literal(hi) => Ok((self.s.m.i32(0), self.s.m.i32(hi))),
             _ => {
                 let x = self.operand(inst, &op)?;
                 Ok((x, self.s.m.i32(0)))
