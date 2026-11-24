@@ -805,6 +805,11 @@ impl<'a> Lower<'a> {
                     r
                 } else if matches!(op, Op::AddU | Op::AddF) {
                     self.s.m.bin(c, Bin::Add, r, arg)
+                } else if matches!(op, Op::MinF | Op::MaxF) {
+                    // FMin/FMax keep the non-NaN operand, as `v_min_f32` does:
+                    // a compare and select would keep the NaN one when this
+                    // lane's own term is the NaN.
+                    self.max_min(matches!(op, Op::MaxF), r, arg)
                 } else {
                     // The prefix is exclusive of the lane's own term, so an
                     // inclusive one folds it back in.
@@ -812,9 +817,7 @@ impl<'a> Lower<'a> {
                         Op::MinU => self.s.m.cmp(c, pred::IULT, r, arg),
                         Op::MaxU => self.s.m.cmp(c, pred::IUGT, r, arg),
                         Op::MinI => self.s.m.cmp(c, pred::SLT, r, arg),
-                        Op::MaxI => self.s.m.cmp(c, pred::SGT, r, arg),
-                        Op::MinF => self.s.m.cmp(c, pred::OLT, r, arg),
-                        _ => self.s.m.cmp(c, pred::OGT, r, arg),
+                        _ => self.s.m.cmp(c, pred::SGT, r, arg),
                     };
                     self.s.m.select(c, p, r, arg)
                 }
@@ -6988,6 +6991,11 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lowered(words, rsrc2).map(|_| ())
+    }
+
+    /// [`lowers`], keeping the lowered program so its DXIL can be inspected.
+    fn lowered(words: &[u32], rsrc2: u32) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -7016,7 +7024,6 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
@@ -7412,6 +7419,17 @@ mod tests {
             S_ENDPGM,
         ];
         lowers(&words, 1 << 15).unwrap();
+        // No compiler emits `wavePrefixOp` kind 2, so dxil.dll, where there is
+        // one, is the only check that the module is well formed.
+        #[cfg(windows)]
+        {
+            let out = lowered(&words, 1 << 15).unwrap();
+            if let Ok(mut v) = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone()).unwrap();
+            }
+        }
     }
 
     #[test]
