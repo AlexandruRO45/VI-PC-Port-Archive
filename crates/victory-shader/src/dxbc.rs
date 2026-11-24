@@ -88,6 +88,11 @@ impl<'a> Container<'a> {
         }
         let digest = data[4..20].try_into().expect("16 bytes");
         let version = (u16_at(data, 0x14)?, u16_at(data, 0x16)?);
+        // DXC writes 1.0 and its `IsValidDxilContainer` refuses any other
+        // major: a different one is a layout this parser does not know.
+        if version.0 != 1 {
+            return Err(ShaderError::Malformed("container major version is not 1"));
+        }
         let total = u32_at(data, 0x18)? as usize;
         if total > data.len() || total < HEADER_SIZE {
             return Err(ShaderError::Malformed("container size disagrees with data"));
@@ -237,6 +242,24 @@ mod tests {
         let mut padded = bytes.clone();
         padded.extend_from_slice(&[0xAA; 16]);
         assert_eq!(Container::parse(&padded).unwrap().parts.len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_container_major_version_other_than_1() {
+        let bytes = build(&[(FourCC::SFI0, &[0; 8])]);
+        for major in [0u16, 2, 0xFFFF] {
+            let mut bad = bytes.clone();
+            bad[0x14..0x16].copy_from_slice(&major.to_le_bytes());
+            assert_eq!(
+                malformed(&bad),
+                "container major version is not 1",
+                "major {major}"
+            );
+        }
+        // The minor version is DXC's to bump; any is kept.
+        let mut minor = bytes;
+        minor[0x16..0x18].copy_from_slice(&7u16.to_le_bytes());
+        assert_eq!(Container::parse(&minor).unwrap().version, (1, 7));
     }
 
     #[test]
