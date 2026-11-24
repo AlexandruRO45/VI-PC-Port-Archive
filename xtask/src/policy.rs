@@ -248,7 +248,12 @@ const PATHSPEC_ENV: &[&str] = &[
 /// command-line configuration that git honours for it.
 pub(crate) fn git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
-    command.current_dir(root);
+    // `git replace` refs are local and never pushed, yet git reads through
+    // them by default: replacing a staged blob shows `cat-file` other
+    // content than the commit will hold, and replacing HEAD with a commit
+    // whose tree already has a staged file drops it from `diff --cached`.
+    // The check reads the objects as they will be committed.
+    command.current_dir(root).arg("--no-replace-objects");
     #[cfg(test)]
     {
         for var in REPOSITORY_ENV.iter().chain(PATHSPEC_ENV) {
@@ -677,6 +682,40 @@ mod tests {
 
         assert_eq!(names(root, true), ["data.rs"]);
         assert!(super::run(root, true).is_err());
+    }
+
+    /// Replace refs stay local, so the hook must not read through them: a
+    /// staged blob replaced by harmless text, or a HEAD replaced by a commit
+    /// whose tree already holds the staged file, used to pass.
+    #[cfg(unix)]
+    #[test]
+    fn staged_check_ignores_replace_refs() {
+        let tmp = tempdir();
+        let root = tmp.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join("a.rs"), b"fn a() {}\n").unwrap();
+        git_str(root, &["add", "a.rs"]);
+        git_str(root, &["commit", "-q", "--no-verify", "-m", "a"]);
+        std::fs::write(root.join("b.rs"), b"MZ\x90\0binary").unwrap();
+        git_str(root, &["add", "b.rs"]);
+
+        let staged = git_str(root, &["rev-parse", ":b.rs"]);
+        let staged = String::from_utf8(staged).unwrap();
+        std::fs::write(root.join("ok.rs"), b"fn ok() {}\n").unwrap();
+        let harmless = git_str(root, &["hash-object", "-w", "ok.rs"]);
+        let harmless = String::from_utf8(harmless).unwrap();
+        std::fs::remove_file(root.join("ok.rs")).unwrap();
+        git_str(root, &["replace", staged.trim(), harmless.trim()]);
+        assert!(super::run(root, true).is_err(), "replaced blob");
+        git_str(root, &["replace", "-d", staged.trim()]);
+
+        let tree = git_str(root, &["write-tree"]);
+        let tree = String::from_utf8(tree).unwrap();
+        let fake = git_str(root, &["commit-tree", tree.trim(), "-p", "HEAD", "-m", "x"]);
+        let fake = String::from_utf8(fake).unwrap();
+        git_str(root, &["replace", "HEAD", fake.trim()]);
+        assert_eq!(names(root, true), ["b.rs"]);
+        assert!(super::run(root, true).is_err(), "replaced HEAD");
     }
 
     /// Git stores a symlink as its target path. The full check used to
