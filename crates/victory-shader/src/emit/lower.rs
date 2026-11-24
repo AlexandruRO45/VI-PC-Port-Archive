@@ -5673,12 +5673,15 @@ impl<'a> Lower<'a> {
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
             }
-            // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
-            }
+            // dmask: the data dwords (cmpswap: twice the value's). Two
+            // dwords are a 64-bit atomic on an R32G32 view, which DXIL does
+            // on a texture of 64-bit integers (SM 6.6).
+            let cmpswap = code == u32::MAX;
+            let wide = match (*dmask, cmpswap) {
+                (1, false) | (3, true) => false,
+                (3, false) | (0xF, true) => true,
+                _ => return Err("image atomic data"),
+            };
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -5687,29 +5690,54 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
-            let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
-            let mut value = vals[0];
+            let dwords: u8 = if wide { 2 } else { 1 };
+            let vals = self.vgprs(inst, data, if cmpswap { 2 * dwords } else { dwords })?;
+            let (i32t, i64t) = (self.s.t.i32, self.s.m.int(64));
+            // The value (and compare) as the operation's type, built in the
+            // current block: low dword first.
+            let join = |l: &mut Self, lo: V, hi: V| -> V {
+                let c = l.cur;
+                let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
+                let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
+                let k32 = l.s.m.int_const(i64t, 32);
+                let hi = l.s.m.bin(c, Bin::Shl, hi, k32);
+                l.s.m.bin(c, Bin::Or, lo, hi)
+            };
+            let (ty, sfx, mut value, compare) = if wide {
+                let v = join(self, vals[0], vals[1]);
+                let cmp = cmpswap.then(|| join(self, vals[2], vals[3]));
+                (i64t, "i64", v, cmp)
+            } else {
+                (i32t, "i32", vals[0], cmpswap.then(|| vals[1]))
+            };
             if op == "sub" {
-                let z = self.s.m.i32(0);
+                let z = self.s.m.int_const(ty, 0);
                 value = self.s.m.bin(c, Bin::Sub, z, value);
             }
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if cache.glc => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
-            };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            let mut old = Vec::new();
+            for k in 0..dwords {
+                old.push(match inst.read(Reg::V(reg + k)) {
+                    Some(v) if cache.glc => self.i32_of(v)?,
+                    _ => self.s.m.i32(0),
+                });
+            }
+            // The view's elements: U32 or U64, one component.
+            let element = if wide { 0x107 } else { 0x105 };
+            let h = self.handle(site, src, false, (kind | 0x1000, element))?;
+            if wide {
+                self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_TYPED | flags::ATOMIC_INT64_HEAP;
+            }
             let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
             let mut args = vec![h];
-            let r = if code == u32::MAX {
+            let r = if let Some(compare) = compare {
                 // cmpswap: data is (new, compare).
                 args.extend(cs);
-                args.extend([vals[1], vals[0]]);
+                args.extend([compare, value]);
                 self.s.op(
                     self.cur,
-                    "atomicCompareExchange.i32",
+                    &format!("atomicCompareExchange.{sfx}"),
                     Attr::NoUnwind,
-                    i32t,
+                    ty,
                     79,
                     &args,
                 )
@@ -5717,12 +5745,30 @@ impl<'a> Lower<'a> {
                 args.push(self.s.m.i32(code));
                 args.extend(cs);
                 args.push(value);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                self.s.op(
+                    self.cur,
+                    &format!("atomicBinOp.{sfx}"),
+                    Attr::NoUnwind,
+                    ty,
+                    78,
+                    &args,
+                )
             };
-            let r = self.end_guarded(at, &[(r, old)])[0];
+            let parts = if wide {
+                let c = self.cur;
+                let lo = self.s.m.cast(c, Cast::Trunc, r, i32t);
+                let k32 = self.s.m.int_const(i64t, 32);
+                let hi = self.s.m.bin(c, Bin::LShr, r, k32);
+                vec![lo, self.s.m.cast(c, Cast::Trunc, hi, i32t)]
+            } else {
+                vec![r]
+            };
+            let pairs: Vec<(V, V)> = parts.into_iter().zip(old).collect();
+            let r = self.end_guarded(at, &pairs);
             if cache.glc {
-                self.write(inst, Reg::V(reg), r, None);
+                for (k, x) in (0..dwords).zip(r) {
+                    self.write(inst, Reg::V(reg + k), x, None);
+                }
             }
             return Ok(());
         }
