@@ -433,27 +433,43 @@ pub fn emit(
         }
         _ => 0,
     };
-    let parts = |st, res| lower::Parts {
-        native,
-        p,
-        st,
-        io,
-        res,
-        inputs: inputs.clone(),
-        outputs: outputs.clone(),
-        prims: prims.clone(),
-        mesh_stride,
+    let run = |st: &structure::Structured, res: &resource::Resources, native_barycentrics| {
+        lower::lower_with_barycentrics(
+            &lower::Parts {
+                native,
+                p,
+                st,
+                io,
+                res,
+                inputs: inputs.clone(),
+                outputs: outputs.clone(),
+                prims: prims.clone(),
+                mesh_stride,
+            },
+            native_barycentrics,
+        )
     };
-    let l = match lower::lower(&parts(st, res)) {
-        // Discarded lanes kept on as helpers can read what no surviving
-        // lane does (a register only killed lanes skipped writing); such a
-        // program kills them as the console does (`structure::killing`).
-        Err(_) if !st.discards.is_empty() => {
-            let st = structure::killing(p)?;
-            let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+    let attempt = |native_barycentrics| {
+        match run(st, res, native_barycentrics) {
+            // Discarded lanes kept on as helpers can read what no surviving
+            // lane does (a register only killed lanes skipped writing); such a
+            // program kills them as the console does (`structure::killing`).
+            Err(_) if !st.discards.is_empty() => {
+                let st = structure::killing(p)?;
+                let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+                run(&st, &res, native_barycentrics)
+            }
+            result => result,
         }
-        l => l?,
+    };
+    let l = match attempt(false) {
+        // Do not introduce a device feature into a shader that already
+        // lowers without it, including the conservative kill-lanes retry.
+        Err(ShaderError::Unsupported {
+            what: lower::DIRECT_BARYCENTRICS,
+            ..
+        }) if pixel => attempt(true)?,
+        result => result?,
     };
     Ok(HostShader {
         stage: native.stage,

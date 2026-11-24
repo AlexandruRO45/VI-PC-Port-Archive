@@ -80,10 +80,22 @@ enum Stop {
     Fail(ShaderError),
 }
 
+pub(crate) const DIRECT_BARYCENTRICS: &str = "barycentrics read directly";
+
+#[cfg(any(test, all(windows, feature = "host")))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_barycentrics(parts, false)
+}
+
+pub(crate) fn lower_with_barycentrics(
+    parts: &Parts,
+    native_barycentrics: bool,
+) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        let mut l = Lower::new(parts, &bad);
+        l.native_barycentrics = native_barycentrics;
+        match l.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -165,6 +177,7 @@ fn half_shift(width: u32) -> u32 {
 
 struct Lower<'a> {
     s: Shader,
+    native_barycentrics: bool,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
@@ -573,6 +586,7 @@ impl<'a> Lower<'a> {
         }
         Lower {
             s,
+            native_barycentrics: false,
             x,
             bad,
             lane_fail: HashMap::new(),
@@ -1372,7 +1386,10 @@ impl<'a> Lower<'a> {
                 Reg::Scc => Val::Missing("SCC on entry"),
                 // Ordinary v_interp lowering does not consume raw I/J. Load
                 // the system value only for numeric uses (including live phis).
-                Reg::V(_) if matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) => {
+                Reg::V(_)
+                    if self.native_barycentrics
+                        && matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) =>
+                {
                     continue;
                 }
                 Reg::V(_) => match io_inputs.get(&v) {
@@ -1398,7 +1415,10 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { kind, index } => return self.barycentric(kind, index),
+            Input::Barycentric { kind, index } if self.native_barycentrics => {
+                return self.barycentric(kind, index);
+            }
+            Input::Barycentric { .. } => return Val::Missing(DIRECT_BARYCENTRICS),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -1599,7 +1619,7 @@ impl<'a> Lower<'a> {
     }
 
     fn load_barycentric(&mut self, value: Value) {
-        if !self.vals.contains_key(&value)
+        if self.native_barycentrics && !self.vals.contains_key(&value)
             && let Some((_, Input::Barycentric { kind, index })) =
                 self.x.io.inputs.iter().find(|(v, _)| *v == value)
         {
@@ -9714,7 +9734,9 @@ impl<'a> Lower<'a> {
                     && missing
                     && (self.never_taken(q, b)
                         || self.dead_on_edge(b, n, phi.reg)
-                        || self.overwritten_indexed_input(b, n, phi));
+                        || (self.x.io.inputs.iter().any(|&(v, input)| {
+                            v == arg && matches!(input, Input::Barycentric { .. })
+                        }) && self.overwritten_indexed_input(b, n, phi)));
                 if read && !dead {
                     self.load_barycentric(arg);
                 }
