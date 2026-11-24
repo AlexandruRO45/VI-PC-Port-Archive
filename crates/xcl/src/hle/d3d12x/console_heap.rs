@@ -178,9 +178,10 @@ pub fn window_views_failed() -> bool {
 /// The memory windows' buffers `(resource, bytes)` as raw UAVs at `MEM_HEAP_BASE + k` of the
 /// shared heap, made now if need be (`Options::heap_windows`: shaders take window k from there).
 /// A window without a buffer gets window 0's, and `MEM_HEAP_NULL` after them a null view.
-/// False (and the shaders keep the switch): no shared heap.
-pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -> bool {
-    let ok = !windows.is_empty() && windows[0].0 != 0 && shared_heap(dev) && {
+/// False (and the shaders keep the switch): no shared heap, or no 64-bit atomics on heap views
+/// (`atomics64`: translated programs' 64-bit atomics on the windows go through those views).
+pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)], atomics64: bool) -> bool {
+    let ok = atomics64 && !windows.is_empty() && windows[0].0 != 0 && shared_heap(dev) && {
         let (device, cpu, inc) = {
             let g = GLOBAL.lock().unwrap();
             let s = g.as_ref().unwrap();
@@ -200,7 +201,7 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
     };
     if !ok {
         WINDOW_VIEWS_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
-        crate::xlog_warn!("memory windows: not in the shared descriptor heap – translated shaders switch over the windows' root UAVs");
+        crate::xlog_warn!("memory windows: not in the shared descriptor heap (64-bit atomics on heap views: {atomics64}) – translated shaders switch over the windows' root UAVs");
     }
     ok
 }
@@ -584,7 +585,7 @@ mod tests {
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
                 next: crate::gpu::recomp::MEM_HEAP_NULL + 1, free: Vec::new(),
             });
-            assert!(set_window_views(&dev, &[(&mut resource as *mut _ as usize, 0x10000)]));
+            assert!(set_window_views(&dev, &[(&mut resource as *mut _ as usize, 0x10000)], true));
             // the windows' views and the null view after them
             assert_eq!(CALLS.load(Ordering::Relaxed), crate::gpu::uma::MAX_WINDOWS as u32 + 1);
             assert!(UNLOCKED.load(Ordering::Relaxed), "device callback ran while GLOBAL was locked");
