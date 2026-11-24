@@ -36,6 +36,7 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
+const LIST_POOL_CAP: usize = 16;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -44,6 +45,7 @@ pub(crate) struct Host {
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     retired: retirement::Retirement,
+    free_lists: Mutex<Vec<HostList>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -245,6 +247,7 @@ fn create() -> windows::core::Result<Host> {
             fence,
             submitted: Mutex::new(0),
             retired: retirement::Retirement::default(),
+            free_lists: Mutex::default(),
             event,
             rtvs,
             rtv_size,
@@ -288,6 +291,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn detached_list_pool_is_bounded_and_returns_open_lists() {
+        let host = host().expect("D3D12 host");
+        let lists: Vec<_> = (0..LIST_POOL_CAP + 3).map(|_| host.new_list().unwrap()).collect();
+        for list in lists {
+            list.need_rebind();
+            host.recycle_list(list);
+        }
+        assert_eq!(host.free_lists.lock().unwrap().len(), LIST_POOL_CAP);
+        let list = host.new_list().unwrap();
+        assert!(!list.closed.load(Ordering::Relaxed));
+        assert!(!list.take_rebind());
+        list.close();
+        host.recycle_list(list);
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -315,6 +334,7 @@ mod tests {
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
+    closed: std::sync::atomic::AtomicBool,
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
@@ -544,6 +564,9 @@ impl Host {
 
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
+        if let Some(list) = self.free_lists.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+            return Ok(list);
+        }
         // SAFETY: plain object creation.
         unsafe {
             let allocator: ID3D12CommandAllocator = self
@@ -566,6 +589,7 @@ impl Host {
             )?;
             prelude.Close()?;
             Ok(HostList {
+                closed: false.into(),
                 allocator,
                 list,
                 deferred: Mutex::default(),
@@ -583,6 +607,15 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
+        }
+    }
+
+    /// The last owner has gone and no submission can still borrow the list.
+    pub(crate) fn recycle_list(&self, list: HostList) {
+        list.reset();
+        let mut free = self.free_lists.lock().unwrap_or_else(|e| e.into_inner());
+        if free.len() < LIST_POOL_CAP {
+            free.push(list);
         }
     }
 
@@ -1104,12 +1137,17 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        self.closed.store(true, Ordering::Relaxed);
     }
 
     /// Only after the list's last submission finished (every one is waited
-    /// for).
+    /// for). A detached list may have been released while still recording.
     pub(crate) fn reset(&self) {
+        if !self.closed.load(Ordering::Relaxed) {
+            self.close();
+        }
         *self.deferred() = Deferred::default();
+        self.rebind.store(false, Ordering::Relaxed);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1130,6 +1168,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.closed.store(false, Ordering::Relaxed);
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this

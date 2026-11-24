@@ -123,6 +123,19 @@ struct List {
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
+#[cfg(windows)]
+impl Drop for List {
+    fn drop(&mut self) {
+        // Current upstream queues borrow host lists only for a synchronous
+        // submission. A deferred queue must keep the owning List alive.
+        if let Some(list) = self.host.take()
+            && let Some(host) = crate::host::host()
+        {
+            host.recycle_list(list);
+        }
+    }
+}
+
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
