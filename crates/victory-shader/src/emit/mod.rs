@@ -596,6 +596,7 @@ mod tests {
             !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
         };
         if under_wine {
+            eprintln!("pipeline created under Wine. Skipping native D3D12 checksum checks.");
             return;
         }
         // The runtime checks the container hash: no hash or a wrong one is
