@@ -1397,3 +1397,106 @@ fn an_image_without_sections_or_directories_has_only_headers() {
     assert_eq!(info.rva_to_file_offset(ENTRY), None);
     assert_eq!(info.rva_to_file_offset(0), None);
 }
+
+#[test]
+fn an_ordinal_thunk_for_ordinal_zero_ends_the_name_table() {
+    // Only the ordinal flag set: the address bits are zero, which is the
+    // terminator, so the slot and anything after it are not imports.
+    let mut d = image();
+    put64(&mut d, at(NAME_TABLE) + 8, 1 << 63);
+    let info = ImageInfo::parse(&d).unwrap();
+    let symbols: Vec<_> = info.imports[0]
+        .entries
+        .iter()
+        .map(|e| e.symbol.to_string())
+        .collect();
+    assert_eq!(symbols, ["ExitProcess"]);
+}
+
+/// The forwarder string of ordinal 2, rewritten in place (16 bytes free).
+fn with_forwarder(forward: &[u8]) -> Vec<u8> {
+    let mut d = image();
+    add_exports(&mut d);
+    put_bytes(&mut d, 0x13B8, &[0; 16]);
+    put_bytes(&mut d, 0x13B8, forward);
+    d
+}
+
+#[test]
+fn forwarders_split_at_the_last_dot_and_keep_a_dotted_dll_name() {
+    for (forward, kept) in [
+        (&b"x.dll.Bar\0"[..], "x.dll.Bar"),
+        (b"api-ms-x.Foo\0", "api-ms-x.Foo"),
+        // Nothing before the dot is still a forwarder with an empty DLL.
+        (b".Foo\0", ".Foo"),
+    ] {
+        let info = ImageInfo::parse(&with_forwarder(forward)).unwrap();
+        let fwd = info.exports.iter().find(|e| e.ordinal == 2).unwrap();
+        assert_eq!((fwd.rva, fwd.forward.as_deref()), (None, Some(kept)));
+    }
+}
+
+#[test]
+fn a_forwarder_without_a_name_or_a_valid_ordinal_makes_the_image_malformed() {
+    // One bad forwarder fails the whole parse, not just its own export.
+    for forward in [
+        &b"NTDLLRtlFoo\0"[..],
+        b"NTDLL.\0",
+        b"NTDLL.#\0",
+        b"NTDLL.#x\0",
+        b"NTDLL.#70000\0",
+    ] {
+        assert!(
+            matches!(
+                ImageInfo::parse(&with_forwarder(forward)),
+                Err(PeError::Malformed(_))
+            ),
+            "{}",
+            String::from_utf8_lossy(forward)
+        );
+    }
+}
+
+#[test]
+fn an_ordinal_with_two_names_is_listed_once() {
+    // `fwdord` is pointed at ordinal 1 as well, so ordinal 3 loses its name.
+    let mut d = image();
+    add_exports(&mut d);
+    put16(&mut d, at(0x1390) + 2, 0);
+    let info = ImageInfo::parse(&d).unwrap();
+    let ordinals: Vec<_> = info.exports.iter().map(|e| e.ordinal).collect();
+    assert_eq!(ordinals, [1, 2, 3]);
+    let first = &info.exports[0];
+    assert_eq!(first.rva, Some(ENTRY));
+    assert!(matches!(first.name.as_deref(), Some("local" | "fwdord")));
+    let third = &info.exports[2];
+    assert_eq!(
+        (third.name.as_deref(), third.forward.as_deref()),
+        (None, Some("NTDLL.#7"))
+    );
+}
+
+#[test]
+fn a_delay_iat_that_ends_exactly_at_the_size_of_image_is_inside_it() {
+    let mut d = image();
+    add_delay_import(&mut d);
+    put32(&mut d, at(DELAY_DESCRIPTORS) + 12, SIZE_OF_IMAGE - 8);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(
+        info.delay_imports[0].entries[0].iat_slot_rva,
+        SIZE_OF_IMAGE - 8
+    );
+}
+
+#[test]
+fn delay_descriptor_attributes_are_not_checked() {
+    // Attributes 0 marks an old VA-based descriptor; its fields are still
+    // read as RVAs, as for the RVA-based kind.
+    let mut d = image();
+    add_delay_import(&mut d);
+    put32(&mut d, at(DELAY_DESCRIPTORS), 0);
+    let info = ImageInfo::parse(&d).unwrap();
+    let user32 = &info.delay_imports[0];
+    assert_eq!(user32.dll, "USER32.dll");
+    assert_eq!(user32.entries[0].iat_slot_rva, DELAY_IAT);
+}
