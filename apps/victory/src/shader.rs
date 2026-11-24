@@ -19,7 +19,7 @@ pub(crate) const MAX_FILE: u64 = 2 << 30;
 
 /// A shader container in a file: as is, or packed in an SGD5 record.
 pub(crate) enum Source<'a> {
-    Raw { offset: usize, data: &'a [u8] },
+    Raw(&'a [u8]),
     Packed(sgd5::Record<'a>),
 }
 
@@ -27,7 +27,7 @@ impl Source<'_> {
     /// The container bytes; `None` if a packed record is corrupt.
     pub(crate) fn bytes(&self) -> Option<Cow<'_, [u8]>> {
         match self {
-            Source::Raw { data, .. } => Some(Cow::Borrowed(data)),
+            Source::Raw(data) => Some(Cow::Borrowed(data)),
             Source::Packed(r) => r.unpack().map(Cow::Owned),
         }
     }
@@ -42,10 +42,7 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     }
     let raw = memchr::memmem::find_iter(data, b"DXBC")
         .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
-            offset,
-            data: &data[offset..],
-        });
+        .map(|offset| Source::Raw(&data[offset..]));
     out.extend(raw);
     out
 }
