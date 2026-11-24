@@ -70,10 +70,10 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): kept at 2^16 so 934,464 title slots stay
+/// (a capped heap, NVIDIA): kept at 96,000 so ~904,000 title slots stay
 /// mirrored under NVIDIA's 1,000,000 view cap (active bindless indices
-/// reach ~888k right after loading).
-const MIN_DYNAMIC: u32 = 1 << 16;
+/// reach ~888k right after loading) while giving heavy world lists headroom.
+const MIN_DYNAMIC: u32 = 96_000;
 
 /// Computes `(mirrored_count, dynamic_count)` when `count + DYNAMIC` fails
 /// (e.g. NVIDIA's [`PORTABLE_VIEWS`] limit of 1,000,000 views).
@@ -124,6 +124,12 @@ impl HostHeap {
             let (mirrored, extra) = capped_layout(count);
             match make(mirrored + extra) {
                 Ok(heap) => {
+                    tracing::info!(
+                        count,
+                        mirrored,
+                        dynamic = extra,
+                        "host view heap capped layout"
+                    );
                     if mirrored < count {
                         // shortcut: descriptors past the host's limit are left
                         // out; `draw.rs` mirrors those tables in dynamic slots.
@@ -1007,6 +1013,7 @@ mod tests {
         assert_eq!(capped_layout(100_000), (100_000, MIN_DYNAMIC));
         assert_eq!(capped_layout(800_000), (800_000, PORTABLE_VIEWS - 800_000));
         assert_eq!(capped_layout(900_000), (900_000, PORTABLE_VIEWS - 900_000));
+        assert_eq!(capped_layout(904_000), (904_000, MIN_DYNAMIC));
         assert_eq!(
             capped_layout(950_000),
             (PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
