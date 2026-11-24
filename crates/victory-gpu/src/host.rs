@@ -330,6 +330,13 @@ type ShadowStates = std::collections::HashMap<
     (u32, u32, std::sync::Arc<crate::shadow::Shadow>),
 >;
 
+/// Whether GPU timestamp diagnostics are enabled (`VICTORY_GPU_TIMING`).
+#[cfg(feature = "diagnostics")]
+fn timing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+}
+
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
 pub(crate) fn dred_on() -> bool {
