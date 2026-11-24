@@ -49,6 +49,21 @@ pub fn pressed() -> Vec<u8> {
     held().iter().copied().collect()
 }
 
+/// Empties the set when the foreground is not this process's, for the title to
+/// call once a frame.
+///
+/// A key held while the foreground left us stays held if no further key event
+/// arrives — an alt-tab by mouse produces none — so a bot holding `A` while the
+/// person alt-tabs would come back with `A` still down. The window path hears
+/// `WM_KILLFOCUS`; this is the same contract for a foreground nobody told us
+/// about.
+pub fn release_if_not_foreground() {
+    #[cfg(windows)]
+    if !hook::foreground_is_ours() {
+        release_all();
+    }
+}
+
 fn held() -> MutexGuard<'static, BTreeSet<u8>> {
     HELD.lock().unwrap_or_else(|error| error.into_inner())
 }
@@ -82,6 +97,17 @@ pub mod hook {
     /// process is ours, and a foreground nobody owns is nobody's.
     pub fn ours(foreground_pid: u32, this_pid: u32) -> bool {
         foreground_pid != 0 && foreground_pid == this_pid
+    }
+
+    /// Whether the foreground window right now belongs to this process, which
+    /// [`super::pressed`] asks every frame so a stuck key cannot survive an
+    /// alt-tab that produced no key event.
+    pub fn foreground_is_ours() -> bool {
+        let mut pid = 0;
+        // SAFETY: reading the foreground window's process.
+        unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut pid) };
+        // SAFETY: this process's own id.
+        ours(pid, unsafe { GetCurrentProcessId() })
     }
 
     /// The installed hook and the thread whose message loop serves it.
@@ -133,6 +159,17 @@ pub mod hook {
                     last_error = unsafe { windows_sys::Win32::Foundation::GetLastError() },
                     "keyboard hook"
                 );
+                // A hook that failed to install loses every key press, a
+                // person's included, and would otherwise say nothing: this is
+                // outside `diagnostics` because it is the failure a release
+                // build must never hide.
+                if hook.is_null() {
+                    tracing::warn!(
+                        target: "victory_gpu::keys",
+                        last_error = unsafe { windows_sys::Win32::Foundation::GetLastError() },
+                        "the keyboard hook did not install: no key press will reach the title"
+                    );
+                }
                 let _ = sender.send((hook as usize, thread));
                 if hook.is_null() {
                     return;
