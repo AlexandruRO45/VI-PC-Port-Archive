@@ -1575,6 +1575,47 @@ mod tests {
     }
 
     #[test]
+    fn default_dir_skips_relative_bases_for_both_kinds() {
+        // A relative `LOCALAPPDATA` or XDG value is skipped tier by tier, not
+        // joined to the working directory, for the data folder as for the
+        // cache.
+        let env = |k: &str| match k {
+            "LOCALAPPDATA" => Some(OsString::from("AppData/Local")),
+            "XDG_CACHE_HOME" => Some(OsString::from(".cache")),
+            "XDG_DATA_HOME" => Some(OsString::from("share")),
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        let home = PathBuf::from(abs("home"));
+        assert_eq!(
+            default_dir(Kind::Cache, env).unwrap(),
+            home.join(".cache").join("victory")
+        );
+        assert_eq!(
+            default_dir(Kind::Data, env).unwrap(),
+            home.join(".local/share").join("victory")
+        );
+        // `LOCALAPPDATA` keeps cache and data apart under one `victory`.
+        let lad = |k: &str| (k == "LOCALAPPDATA").then(|| abs("lad"));
+        assert_eq!(
+            default_dir(Kind::Data, lad).unwrap(),
+            PathBuf::from(abs("lad")).join("victory").join("data")
+        );
+    }
+
+    #[test]
+    fn a_tilde_with_extra_slashes_is_still_home() {
+        // `~/` and `~//x` are what a trailing slash or a doubled separator
+        // in a copied path give; they are home and `home/x`, not a folder
+        // named `~`.
+        let home = PathBuf::from(abs("home"));
+        let ex = |p: &str| expand_home("VICTORY_GAME_DIR", p.into(), Some(&home)).unwrap();
+        assert_eq!(ex("~/"), home);
+        assert_eq!(ex("~//games"), home.join("games"));
+        assert_eq!(ex("~/./games"), home.join("games"));
+    }
+
+    #[test]
     fn no_user_directory_is_an_error() {
         let env = |_: &str| None;
         assert!(Config::resolve(FilePaths::default(), None, env).is_err());
