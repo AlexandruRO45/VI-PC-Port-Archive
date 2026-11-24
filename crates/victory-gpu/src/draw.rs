@@ -341,7 +341,10 @@ impl State {
             return false;
         };
         if p.compute || p.mesh != mesh {
-            once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            once!(
+                mesh,
+                "a draw or mesh dispatch with another kind of pipeline"
+            );
             return false;
         }
         self.bind(list, p, false);
@@ -513,12 +516,46 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        if self.drop_unbound_uav(p) {
+            once!(
+                pipeline = format_args!("{:#x}", self.pipeline),
+                "a compute dispatch with unbound UAVs dropped"
+            );
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
+            return;
+        }
         self.bind(list, p, true);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether any UAV table entry required by `p` is unbound or has no view.
+    fn has_unbound_uav(&self, p: &HostPipeline) -> bool {
+        p.stages.iter().any(|stage| {
+            stage.translated().used.iter().any(|u| {
+                if u.kind == ResourceType::Uav
+                    && u.root == RootType::Table
+                    && let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot))
+                {
+                    let handle = table + u64::from(u.table_offset_dwords) * 4;
+                    return crate::descriptor::view(handle).is_none();
+                }
+                false
+            })
+        })
+    }
+
+    /// Whether a compute dispatch should be dropped due to unbound UAVs.
+    fn drop_unbound_uav(&self, p: &HostPipeline) -> bool {
+        static DROP_UNBOUND_UAV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("VICTORY_DROP_UNBOUND_UAV").is_ok_and(|v| v == "1" || v == "true")
+        });
+        *DROP_UNBOUND_UAV && self.has_unbound_uav(p)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -603,6 +640,8 @@ impl State {
         };
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u, &view);
+        } else if u.kind == ResourceType::Uav {
+            host.make_null_uav(index, u.dwords == 4, u.stride);
         }
     }
 
@@ -722,7 +761,13 @@ impl State {
                         }
                     }
                     None => {
-                        host.make_null(index);
+                        if let Some(u) = used
+                            && u.kind == ResourceType::Uav
+                        {
+                            host.make_null_uav(index, u.dwords == 4, u.stride);
+                        } else {
+                            host.make_null(index);
+                        }
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
@@ -1001,13 +1046,19 @@ impl State {
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                Some(p) => why(&format!(
+                    "prepare failed (compute {}, mesh {})",
+                    p.compute, p.mesh
+                )),
             }
             return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                kind == DISPATCH,
+            )
         });
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
@@ -1124,7 +1175,10 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!(
+                "{}x{} f{} flags {:#x}",
+                d.Width, d.Height, d.Format.0, d.Flags.0
+            )
         })
     };
     match view {

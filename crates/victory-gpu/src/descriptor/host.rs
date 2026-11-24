@@ -48,7 +48,11 @@ pub(crate) fn near_heaps(va: u64) -> String {
         } else if va < start + bytes {
             format!("inside, slot {}", (va - start) / step)
         } else {
-            format!("{:#x} past its end (slot {})", va - start - bytes, (va - start) / step)
+            format!(
+                "{:#x} past its end (slot {})",
+                va - start - bytes,
+                (va - start) / step
+            )
         };
         text.push_str(&format!("; {kind} heap {start:#x}+{bytes:#x}: {place}"));
     }
@@ -132,7 +136,10 @@ impl HostHeap {
         if let Err(e) = h.fill_null(kind, count + extra) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
-        tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
+        tracing::debug!(
+            ms = started.elapsed().as_millis(),
+            "host descriptor heap made null"
+        );
         Some(h)
     }
 
@@ -144,11 +151,12 @@ impl HostHeap {
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
             let block: ID3D12DescriptorHeap =
-                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: kind,
-                    NumDescriptors: BLOCK,
-                    ..Default::default()
-                })?;
+                host.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: kind,
+                        NumDescriptors: BLOCK,
+                        ..Default::default()
+                    })?;
             let start = block.GetCPUDescriptorHandleForHeapStart();
             let at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
                 ptr: start.ptr + (i * self.step) as usize,
@@ -161,13 +169,15 @@ impl HostHeap {
             let mut filled = 1;
             while filled < BLOCK {
                 let n = filled.min(BLOCK - filled);
-                host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
+                host.device
+                    .CopyDescriptorsSimple(n, at(filled), start, kind);
                 filled += n;
             }
             let mut done = 0;
             while done < total {
                 let n = BLOCK.min(total - done);
-                host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
+                host.device
+                    .CopyDescriptorsSimple(n, self.cpu(done), start, kind);
                 done += n;
             }
         }
@@ -226,7 +236,9 @@ impl HostHeap {
         }
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                tracing::warn!(n, "no free dynamic descriptor slots: a table is not made")
+            });
             return None;
         };
         taken[first..first + n].fill(true);
@@ -271,6 +283,17 @@ impl HostHeap {
             self.null_sampler(index);
         } else {
             null_view(self.cpu(index));
+        }
+        self.keep(index, None);
+    }
+
+    /// Makes slot `index` a null unordered access view (raw buffer or 2D texture)
+    /// so that shader UAV writes are safely dropped by hardware rather than faulting.
+    pub(crate) fn make_null_uav(&self, index: u32, buffer: bool, stride: u32) {
+        if buffer {
+            null_uav_buffer_view(self.cpu(index), stride);
+        } else {
+            null_uav_view(self.cpu(index));
         }
         self.keep(index, None);
     }
@@ -360,7 +383,11 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let key = *self
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)?;
         if key == 0 {
             return Some("null".into());
         }
@@ -531,7 +558,11 @@ fn buffer_uav(
     };
     let offset = shadow.offset(address);
     if element == 0 || offset % element != 0 {
-        once!(offset, element, "unordered buffer view not on an element of its host copy");
+        once!(
+            offset,
+            element,
+            "unordered buffer view not on an element of its host copy"
+        );
         return None;
     }
     buffer.FirstElement += offset / element;
@@ -539,8 +570,12 @@ fn buffer_uav(
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
-        host.device
-            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
+        host.device.CreateUnorderedAccessView(
+            &shadow.buffer,
+            None::<&ID3D12Resource>,
+            Some(&desc),
+            at,
+        )
     };
     Some(Some(shadow.buffer.clone()))
 }
@@ -697,7 +732,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
                 // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                once!(
+                    dimension = resource[0],
+                    "placed unordered texture view not mirrored"
+                );
                 return None;
             }
             // The resource description's width, after the alignment.
@@ -713,59 +751,191 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A shader or unordered access view of a texture the title placed in memory itself,
+/// as a view of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
-        return None;
+    let (unordered, resource, desc) = match view {
+        View::Placed(unordered, resource, desc) => (*unordered, resource, desc),
+        _ => return None,
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    if unordered {
+        Some(View::Unordered(
+            texture as usize,
+            0,
+            desc[..10].try_into().ok(),
+        ))
+    } else {
+        Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    }
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
-/// cannot make: unordered access (to a buffer or a 2D texture) or a shader
-/// view. Writes to it are dropped, reads give zeros.
+/// cannot make: unordered access (to a buffer or texture of matching dimension)
+/// or a shader view. Writes to it are dropped, reads give zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
-    let buffer = match view {
-        View::Unordered(r, _, desc) => is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
-        View::Placed(true, resource, _) => resource[0] == 1,
-        // Shader views of buffers read nothing through a null buffer view:
-        // a null 2D view where the shader expects a buffer is a mismatch
-        // the hardware does not survive in general (GPU-based validation
-        // reports it).
-        View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => {
-            return null_buffer_view(at);
+    match view {
+        View::Unordered(r, _, Some(desc)) => {
+            if is_buffer(r) || desc[1] == 1 {
+                return null_uav_buffer_view(at, 0);
+            }
+            null_uav_like(desc, at);
         }
-        View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
-        // Textures: a null view of the title's dimension (1D, arrays, 3D,
-        // cubes), not always 2D.
-        View::Shader(_, Some(desc)) => return null_like(desc, at),
+        View::Unordered(r, _, None) => {
+            if is_buffer(r) {
+                null_uav_buffer_view(at, 0);
+            } else {
+                null_uav_view(at);
+            }
+        }
+        View::Placed(true, resource, desc) => {
+            if resource[0] == 1 {
+                null_uav_buffer_view(at, 0);
+            } else {
+                let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
+                null_uav_like(words, at);
+            }
+        }
+        View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => {
+            null_buffer_view(at);
+        }
+        View::Placed(false, resource, _) if resource[0] == 1 => null_buffer_view(at),
+        View::Shader(_, Some(desc)) => null_like(desc, at),
         View::Placed(false, _, desc) => {
-            return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
+            null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
         View::Constant(..) => {
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
             // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+            unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
         }
-        _ => return null_view(at),
+        _ => null_view(at),
+    }
+}
+
+/// An unordered access view that safely drops writes and reads zeros, matching
+/// the title's dimension from `words` (1D, 2D, arrays, 3D, buffer).
+fn null_uav_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    let dim = words[1];
+    let desc = match dim {
+        1 => return null_uav_buffer_view(at, 0),
+        2 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture1D: D3D12_TEX1D_UAV { MipSlice: 0 },
+            },
+        },
+        3 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1DARRAY,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture1DArray: D3D12_TEX1D_ARRAY_UAV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: 1,
+                },
+            },
+        },
+        5 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: 1,
+                    PlaneSlice: 0,
+                },
+            },
+        },
+        6 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE3D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_UAV {
+                    MipSlice: 0,
+                    FirstWSlice: 0,
+                    WSize: 1,
+                },
+            },
+        },
+        _ => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_UAV {
+                    MipSlice: 0,
+                    PlaneSlice: 0,
+                },
+            },
+        },
     };
+    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+    unsafe {
+        host.device.CreateUnorderedAccessView(
+            None::<&ID3D12Resource>,
+            None::<&ID3D12Resource>,
+            Some(&desc),
+            at,
+        )
+    };
+}
+
+/// A buffer UAV that safely drops writes (raw, or structured if `stride` > 0).
+fn null_uav_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE, stride: u32) {
+    let Some(host) = host() else { return };
+    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: if stride > 0 {
+            DXGI_FORMAT_UNKNOWN
+        } else {
+            DXGI_FORMAT_R32_TYPELESS
+        },
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                NumElements: 1,
+                StructureByteStride: stride,
+                Flags: if stride > 0 {
+                    D3D12_BUFFER_UAV_FLAG_NONE
+                } else {
+                    D3D12_BUFFER_UAV_FLAG_RAW
+                },
+                ..Default::default()
+            },
+        },
+    };
+    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+    unsafe {
+        host.device.CreateUnorderedAccessView(
+            None::<&ID3D12Resource>,
+            None::<&ID3D12Resource>,
+            Some(&desc),
+            at,
+        )
+    };
+}
+
+/// A 2D texture UAV that safely drops writes.
+fn null_uav_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
     let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
         Format: DXGI_FORMAT_R32_UINT,
-        ViewDimension: if buffer {
-            D3D12_UAV_DIMENSION_BUFFER
-        } else {
-            D3D12_UAV_DIMENSION_TEXTURE2D
+        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_UAV {
+                MipSlice: 0,
+                PlaneSlice: 0,
+            },
         },
-        ..Default::default()
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
@@ -870,5 +1040,41 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+    }
+
+    /// Null UAV descriptors for textures and raw/structured buffers can be made on host heaps.
+    #[test]
+    fn null_uav_descriptors_created_on_host_heap() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // Texture UAV null descriptor
+        heap.make_null_uav(0, false, 0);
+        // Raw buffer UAV null descriptor
+        heap.make_null_uav(1, true, 0);
+        // Structured buffer UAV null descriptor (stride 16)
+        heap.make_null_uav(2, true, 16);
+    }
+
+    /// null_for creates valid null descriptors matching UAV dimensions without faulting.
+    #[test]
+    fn null_for_creates_uav_matching_dimensions() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // Unordered access with no desc (fallback 2D)
+        null_for(&View::Unordered(0, 0, None), heap.cpu(0));
+        // Unordered access buffer
+        null_for(
+            &View::Unordered(0, 0, Some([0, 1, 0, 0, 0, 0, 0, 0, 0, 0])),
+            heap.cpu(1),
+        );
+        // Unordered access Texture3D (dim 6)
+        null_for(
+            &View::Unordered(0, 0, Some([0, 6, 0, 0, 0, 0, 0, 0, 0, 0])),
+            heap.cpu(2),
+        );
+        // Placed UAV on a buffer (resource[0] == 1)
+        null_for(&View::Placed(true, [1; 14], [0; 16]), heap.cpu(3));
     }
 }
