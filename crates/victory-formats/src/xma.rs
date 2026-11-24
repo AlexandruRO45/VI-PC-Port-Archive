@@ -1694,4 +1694,106 @@ mod tests {
             }
         }
     }
+
+    /// The radix-2 FFT matches a direct O(n²) DFT (`exp(-2πi nk/N)`) at
+    /// every power-of-two size the decoder uses and below, and an impulse at
+    /// `t` transforms to the unit-magnitude phasor `exp(-2πi kt/N)`.
+    #[test]
+    fn fft_matches_the_direct_dft() {
+        let mut seed = 0x9e37_79b9_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f64 / u32::MAX as f64 * 2.0 - 1.0
+        };
+        for log in 0..=9 {
+            let n = 1usize << log;
+            let (xr, xi): (Vec<f64>, Vec<f64>) = (0..n).map(|_| (next(), next())).unzip();
+            let (mut re, mut im) = (xr.clone(), xi.clone());
+            fft(&mut re, &mut im);
+            for k in 0..n {
+                let (mut sr, mut si) = (0.0, 0.0);
+                for t in 0..n {
+                    let (s, c) =
+                        (-2.0 * std::f64::consts::PI * ((k * t) % n) as f64 / n as f64).sin_cos();
+                    sr += xr[t] * c - xi[t] * s;
+                    si += xr[t] * s + xi[t] * c;
+                }
+                let tol = 1e-9 * n as f64;
+                assert!(
+                    (re[k] - sr).abs() < tol && (im[k] - si).abs() < tol,
+                    "n {n} bin {k}"
+                );
+            }
+        }
+        let n = 64;
+        for t in [0, 1, 5, 63] {
+            let (mut re, mut im) = (vec![0.0; n], vec![0.0; n]);
+            re[t] = 1.0;
+            fft(&mut re, &mut im);
+            for k in 0..n {
+                let (s, c) =
+                    (-2.0 * std::f64::consts::PI * ((k * t) % n) as f64 / n as f64).sin_cos();
+                assert!(
+                    (re[k] - c).abs() < 1e-12 && (im[k] - s).abs() < 1e-12,
+                    "t {t} k {k}"
+                );
+            }
+        }
+    }
+
+    /// `window_overlap` is FFmpeg's `vector_fmul_window` with `dst` = `src0`
+    /// = the block's first half (the previous tail), `src1` = its second half
+    /// (the current head) and `win` = the sine window of the block's length.
+    /// With a silent tail the block becomes the reversed head times the
+    /// window (negated in the first half); with a silent head, the reversed
+    /// tail times the window.
+    #[test]
+    fn window_overlap_is_vector_fmul_window() {
+        for (i, window) in windows().iter().enumerate() {
+            let len = 64 << i;
+            let full = &window[..];
+            assert_eq!(full.len(), 2 * len);
+            let src: Vec<f32> = (0..2 * len)
+                .map(|k| ((k * 37 + 11) % 97) as f32 / 48.0 - 1.0)
+                .collect();
+            let mut got = src.clone();
+            window_overlap(&mut got, full);
+            // The C loop, with every pointer advanced by `len`:
+            // for (i = -len, j = len - 1; i < 0; i++, j--)
+            //     dst[i] = src0[i]*win[j] - src1[j]*win[i];
+            //     dst[j] = src0[i]*win[i] + src1[j]*win[j];
+            let (tail, head) = src.split_at(len);
+            let mut want = vec![0f32; 2 * len];
+            let at = |i: isize| (len as isize + i) as usize;
+            let (mut i, mut j) = (-(len as isize), len as isize - 1);
+            while i < 0 {
+                let (s0, s1) = (tail[at(i)], head[j as usize]);
+                let (wi, wj) = (full[at(i)], full[at(j)]);
+                want[at(i)] = s0 * wj - s1 * wi;
+                want[at(j)] = s0 * wi + s1 * wj;
+                (i, j) = (i + 1, j - 1);
+            }
+            assert_eq!(got, want, "len {len}");
+
+            let mut silent_tail: Vec<f32> = vec![0.0; len];
+            silent_tail.extend_from_slice(head);
+            window_overlap(&mut silent_tail, full);
+            for k in 0..len {
+                assert_eq!(silent_tail[k], -head[len - 1 - k] * full[k]);
+                assert_eq!(
+                    silent_tail[2 * len - 1 - k],
+                    head[len - 1 - k] * full[2 * len - 1 - k]
+                );
+            }
+            let mut silent_head = tail.to_vec();
+            silent_head.extend(std::iter::repeat_n(0.0, len));
+            window_overlap(&mut silent_head, full);
+            for k in 0..len {
+                assert_eq!(silent_head[k], tail[k] * full[2 * len - 1 - k]);
+                assert_eq!(silent_head[2 * len - 1 - k], tail[k] * full[k]);
+            }
+        }
+    }
 }
