@@ -1984,6 +1984,7 @@ impl Deferred {
         self.kept.clear();
         self.refreshed.clear();
         self.textures.clear();
+        self.staging_copies.clear();
         self.writes.clear();
         self.backs.clear();
         self.budget_zeroed = false;
