@@ -529,9 +529,46 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Local build: the extent a copy of loose memory covers: the whole run of reserved or mapped
+/// memory around `address` when it is at most `SPAN` (every address in it shares the copy),
+/// else the `SPAN`-aligned piece holding `[address, end)`. Shaders index far past the address
+/// they start from (8 MB past a 4 MB window removed the device).
+fn loose_extent(address: u64, end: u64) -> (u64, u64) {
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    const SPAN: u64 = 128 << 20;
+    let query = |at: u64| -> Option<MEMORY_BASIC_INFORMATION> {
+        // SAFETY: a query only.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+        (n != 0 && info.State != MEM_FREE).then_some(info)
+    };
+    let fallback = || {
+        let start = address & !(SPAN - 1);
+        (start, end.next_multiple_of(WINDOW).max(start + WINDOW) - start)
+    };
+    let Some(here) = query(address) else { return fallback() };
+    let (mut lo, mut hi) = (here.BaseAddress as u64, here.BaseAddress as u64 + here.RegionSize as u64);
+    while address - lo < SPAN && lo > 0 {
+        match query(lo - 1) {
+            Some(i) => lo = i.BaseAddress as u64,
+            None => break,
+        }
+    }
+    while hi - address < SPAN {
+        match query(hi) {
+            Some(i) => hi = i.BaseAddress as u64 + i.RegionSize as u64,
+            None => break,
+        }
+    }
+    if hi - lo <= SPAN && end <= hi {
+        (lo, hi - lo)
+    } else {
+        fallback()
+    }
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    let (start, len) = loose_extent(address, end);
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
@@ -545,6 +582,15 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     // page fault 1.1 MB past one removed the device)
     let (buffer, data) = host()?.shared_buffer(len + WINDOW)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+    {
+        static TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let total = TOTAL.fetch_add(len + WINDOW, std::sync::atomic::Ordering::Relaxed) + len + WINDOW;
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::info!(n, start = format_args!("{start:#x}"), len, total_mb = total >> 20, "loose title memory copy");
+        }
+    }
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     tracing::debug!(

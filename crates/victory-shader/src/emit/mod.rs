@@ -105,7 +105,7 @@ pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 pub const DESCRIPTOR_DATA_SLOT: u8 = u8::MAX;
 
 /// Local build: the loop limit without an override (see [`loop_limit`]).
-const LOCAL_LOOP_LIMIT: u32 = 8192;
+const LOCAL_LOOP_LIMIT: u32 = 1024;
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
