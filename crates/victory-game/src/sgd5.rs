@@ -3691,6 +3691,65 @@ mod tests {
     }
 
     #[test]
+    fn code_length_code_of_seven_bits_is_a_stream_only_when_complete() {
+        // A dynamic block's code-length code has lengths of up to 7 bits
+        // (3 bits each in the header). One as deep as that, a symbol at
+        // each length from 1 to 6 and two at 7, is complete, and code
+        // lengths sent with both 7-bit codes (crossing byte boundaries) are
+        // a stream. Moving another symbol to 7 bits leaves a 7-bit code
+        // unassigned, and moving a 7-bit one up to 6 oversubscribes the
+        // code: both break the stream, though every symbol the sequence
+        // sends has a code. Such a broken record covers no other, so it is
+        // yielded and does not unpack, and the record after it is found
+        // either way.
+        let (a, b) = (u32::from(b'A'), u32::from(b'B'));
+        // `A` in 1 bit, `B` and the end of the block in 2; one distance
+        // code, unused, of length 0. The sequence sends 18, 1, 2 and 0.
+        let mut lengths = vec![0; 258];
+        (lengths[a as usize], lengths[b as usize], lengths[256]) = (1, 2, 2);
+        let seq = length_symbols(&lengths);
+        let used: std::collections::BTreeSet<_> = seq.iter().map(|&(sym, _)| sym).collect();
+        assert_eq!(used.into_iter().collect::<Vec<_>>(), [0, 1, 2, 18]);
+        // Code-length code: 18 in 1 bit, 0 in 2, 3 to 6 in 3 to 6, and the
+        // two lengths the literal codes use, 1 and 2, in 7.
+        let mut clen = [0; 19];
+        (clen[18], clen[0], clen[3], clen[4], clen[5], clen[6]) = (1, 2, 3, 4, 5, 6);
+        (clen[1], clen[2]) = (7, 7);
+        let data = [a, a, a, b, 256];
+        let want = b"AAAB".to_vec();
+        for (what, nudge, valid) in [
+            ("complete, 7 bits deep", &[][..], true),
+            ("6 in 7 bits: one code unassigned", &[(6, 7)][..], false),
+            ("2 in 6 bits: oversubscribed", &[(2, 6)][..], false),
+        ] {
+            let mut clen = clen;
+            for &(sym, len) in nudge {
+                clen[sym] = len;
+            }
+            let packed = dynamic_block(&clen, &seq, &lengths[..257], &data);
+            assert_eq!(
+                miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                valid.then(|| want.clone()),
+                "{what}"
+            );
+            assert_eq!(starts_stream(&packed, want.len()), valid, "{what}");
+
+            let (file, marker) = outer_then_after(&packed, want.len());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            assert_eq!(found[0].unpack(), valid.then(|| want.clone()), "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "{what}");
+        }
+    }
+
+    #[test]
     fn bytes_after_the_final_block_are_never_read() {
         // A stream ends with the block whose BFINAL bit is set: the rest of
         // its last byte and every byte after it (up to the size the record
