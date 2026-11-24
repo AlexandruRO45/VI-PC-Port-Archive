@@ -33,11 +33,13 @@ fn under_wine() -> bool {
 
 /// The fixture to load, or `None` when it cannot be had here.
 ///
-/// Normally it is built into its own target dir (the outer cargo holds the
-/// lock on the main one while tests run). Under Wine, as when a test exe
-/// cross-built on Linux is run by Wine or Proton, the `cargo` that built the
-/// test is a host program the guest cannot run, so the test is skipped
-/// unless the fixture was built beforehand, e.g. with
+/// Normally it is built into its own target dir under `CARGO_TARGET_TMPDIR`
+/// (the outer cargo holds the lock on the main one while tests run), so it
+/// follows `CARGO_TARGET_DIR` and `build.target-dir` like the rest of the
+/// build. Under Wine, as when a test exe cross-built on Linux is run by Wine
+/// or Proton, the `cargo` that built the test is a host program the guest
+/// cannot run, so the test is skipped unless the fixture was built
+/// beforehand, e.g. with
 /// `cargo xwin build --manifest-path tests/fixtures/hle-probe/Cargo.toml
 /// --target x86_64-pc-windows-msvc` and its path in `VICTORY_HLE_PROBE_DLL`.
 fn probe_dll() -> Option<PathBuf> {
@@ -49,7 +51,8 @@ fn probe_dll() -> Option<PathBuf> {
         assert!(
             path.is_file(),
             "{PREBUILT_PROBE}={} is not a file; under Wine use its Windows \
-             path, e.g. Z:/home/you/VIctory/target/fixtures/.../hle_probe.dll",
+             path, e.g. Z:/home/you/VIctory/tests/fixtures/hle-probe/target/\
+             x86_64-pc-windows-msvc/debug/hle_probe.dll",
             path.display()
         );
         return Some(path);
@@ -61,9 +64,8 @@ fn probe_dll() -> Option<PathBuf> {
         );
         return None;
     }
-    let root = workspace_root();
-    let manifest = root.join("tests/fixtures/hle-probe/Cargo.toml");
-    let target = root.join("target/fixtures");
+    let manifest = workspace_root().join("tests/fixtures/hle-probe/Cargo.toml");
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hle-probe");
     // Name the target: a `CARGO_BUILD_TARGET` or `build.target` from the
     // environment or a user config would otherwise move the output under a
     // triple directory the path below does not expect. The fixture's build
