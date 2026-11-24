@@ -926,7 +926,15 @@ fn ensure_directory_path(what: &str, dir: &Path, origin: Origin, setting: &str) 
     // but stop at a link that leads nowhere (its target moved or deleted, or
     // a loop): it is there, so create_dir_all cannot make a folder in its
     // place and would fail with "File exists" on first use.
-    let existing = dir.ancestors().find_map(|p| match std::fs::metadata(p) {
+    //
+    // Walk the path with trailing separators and interior `.` dropped
+    // (`Path::components` does both, and keeps `..`): the OS resolves a
+    // link named with a trailing slash (`lstat("link/")` follows it), so
+    // `dangling/` or `loop/` would never be seen as a link, and
+    // `Path::ancestors` goes straight from `default.xex/` to its parent, so
+    // a file named with a trailing slash would pass as a folder to create.
+    let walk: PathBuf = dir.components().collect();
+    let existing = walk.ancestors().find_map(|p| match std::fs::metadata(p) {
         Ok(m) => Some(Ok((p, m))),
         Err(_) => std::fs::symlink_metadata(p)
             .is_ok_and(|m| m.file_type().is_symlink())
@@ -939,7 +947,7 @@ fn ensure_directory_path(what: &str, dir: &Path, origin: Origin, setting: &str) 
             let target = std::fs::read_link(link)
                 .map(|t| format!(" to {}", t.display()))
                 .unwrap_or_default();
-            let place = if link == dir {
+            let place = if link == walk {
                 String::new()
             } else {
                 format!(" cannot be a folder because {}", link.display())
@@ -955,7 +963,7 @@ fn ensure_directory_path(what: &str, dir: &Path, origin: Origin, setting: &str) 
     if metadata.is_dir() {
         return Ok(());
     }
-    if path != dir {
+    if path != walk {
         anyhow::bail!(
             "the {what} {} (from {origin}) cannot be a folder because {} is not a directory; \
              set {setting} to a path under a directory",
@@ -969,7 +977,7 @@ fn ensure_directory_path(what: &str, dir: &Path, origin: Origin, setting: &str) 
             dir.display()
         );
     }
-    let parent = dir.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent = walk.parent().filter(|p| !p.as_os_str().is_empty());
     let hint = match (what, parent) {
         ("game folder" | "test title", Some(parent)) => format!(
             "set {setting} to the folder holding the dump, perhaps {}",
@@ -2820,6 +2828,116 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_trailing_slash_or_dot_does_not_hide_a_file_or_a_link_that_leads_nowhere() {
+        // A scratch folder under the system temp folder, never the
+        // repository; removed at the end.
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-trailing-slash-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(scratch.join("gta")).unwrap();
+        std::fs::create_dir_all(scratch.join("real")).unwrap();
+        let exe = scratch.join("gta").join("default.xex");
+        std::fs::write(&exe, b"").unwrap();
+        let gone = scratch.join("moved-away");
+        let dangling = scratch.join("dangling");
+        std::os::unix::fs::symlink(&gone, &dangling).unwrap();
+        let looped = scratch.join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        let good = scratch.join("good");
+        std::os::unix::fs::symlink(scratch.join("real"), &good).unwrap();
+        // `<path>/` and `<path>/.`, spelled as a user would type them.
+        let slash = |p: &Path| PathBuf::from(format!("{}/", p.display()));
+        let dot = |p: &Path| PathBuf::from(format!("{}/.", p.display()));
+        let env = |k: &'static str, v: PathBuf| {
+            let cache = scratch.join("cache");
+            let data = scratch.join("data");
+            move |key: &str| match key {
+                _ if key == k => Some(v.clone().into_os_string()),
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let resolve =
+            |k: &'static str, v: PathBuf| Config::resolve(FilePaths::default(), None, env(k, v));
+        let refused = |k: &'static str, v: PathBuf| resolve(k, v).unwrap_err().to_string();
+
+        // The game's executable with a trailing slash or `/.` is still a
+        // file, not a folder still to create next to it.
+        for spelled in [slash(&exe), dot(&exe)] {
+            let err = refused("VICTORY_GAME_DIR", spelled.clone());
+            assert!(
+                err.contains(&format!(
+                    "the game folder {} (from VICTORY_GAME_DIR) is a file, not a folder",
+                    spelled.display()
+                )),
+                "{err}"
+            );
+            assert!(
+                err.contains(&format!("perhaps {}", exe.parent().unwrap().display())),
+                "{err}"
+            );
+        }
+
+        // A link whose target is gone, named with a trailing slash: the OS
+        // follows the link for `<link>/`, so it must be looked at without
+        // the slash, or it passes as a folder to create and the first use
+        // fails with "File exists".
+        for spelled in [slash(&dangling), dot(&dangling)] {
+            let err = refused("VICTORY_CACHE_DIR", spelled.clone());
+            assert!(
+                err.contains(&format!(
+                    "the cache folder {} (from VICTORY_CACHE_DIR) is a link to {} that leads \
+                     nowhere",
+                    spelled.display(),
+                    gone.display()
+                )),
+                "{err}"
+            );
+        }
+        let err = refused("VICTORY_DATA_DIR", slash(&looped));
+        assert!(err.contains("leads nowhere"), "{err}");
+        assert!(err.contains("loops"), "{err}");
+        let title = slash(&dangling);
+        let err = refused("VICTORY_TEST_TITLES", title.clone());
+        assert!(
+            err.contains(&format!(
+                "the test title {} (from VICTORY_TEST_TITLES) is a link",
+                title.display()
+            )),
+            "{err}"
+        );
+
+        // A folder below them, spelled with a trailing slash, names the
+        // blocking path as before.
+        let below = slash(&dangling.join("victory"));
+        let err = refused("VICTORY_DATA_DIR", below.clone());
+        assert!(
+            err.contains(&format!(
+                "the data folder {} (from VICTORY_DATA_DIR) cannot be a folder because {} is a link",
+                below.display(),
+                dangling.display()
+            )),
+            "{err}"
+        );
+
+        // A trailing slash on a real folder, or on a good link to one, is
+        // still fine, and the setting is kept as written.
+        let cfg = resolve("VICTORY_CACHE_DIR", slash(&good)).unwrap();
+        assert_eq!(cfg.cache_dir, slash(&good));
+        assert!(resolve("VICTORY_GAME_DIR", slash(&scratch.join("gta"))).is_ok());
+        assert!(resolve("VICTORY_DATA_DIR", slash(&scratch.join("new"))).is_ok());
+
+        // Nothing was created in place of the links.
+        assert!(!gone.exists());
+        assert!(!scratch.join("new").exists());
         std::fs::remove_dir_all(&scratch).unwrap();
     }
 
