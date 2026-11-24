@@ -230,6 +230,9 @@ fn verdicts(pc: &Pc) -> Vec<(Status, String, Option<String>)> {
     let mut out = Vec::new();
     match pc.windows_build {
         Some(b) if b >= 22000 => out.push((Status::Good, format!("Windows 11 (build {b})"), None)),
+        Some(b) if pc.sm66 == Some(true) => {
+            out.push((Status::Good, format!("Windows 10 (build {b})"), None))
+        }
         Some(b) => out.push((
             Status::Warn,
             format!("Windows 10 (build {b})"),
@@ -641,11 +644,17 @@ mod tests {
         };
         let v = verdicts(&pc);
         let find = |what: &str| v.iter().find(|l| l.1.starts_with(what)).unwrap();
-        assert_eq!(find("Windows 10").0, Status::Warn);
-        assert!(find("Windows 10").2.as_deref().unwrap().contains("Agility"));
+        assert_eq!(find("Windows 10").0, Status::Good);
+        assert!(find("Windows 10").2.is_none());
         assert_eq!(find("CPU has AVX2").0, Status::Good);
         assert_eq!(find("GPU: no mesh shaders").0, Status::Warn);
         assert_eq!(find("GPU: waves of 32").0, Status::Warn);
+        let without_sm66 = verdicts(&Pc {
+            sm66: Some(false),
+            ..pc
+        });
+        assert_eq!(without_sm66[0].0, Status::Warn);
+        assert!(without_sm66[0].2.as_deref().unwrap().contains("Agility"));
         // Windows 11, no SM 6.6: nothing about mesh or waves (not asked).
         let pc = Pc {
             windows_build: Some(26100),
