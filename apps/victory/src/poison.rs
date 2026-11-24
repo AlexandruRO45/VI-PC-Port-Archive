@@ -50,6 +50,22 @@ pub fn run(dump: PathBuf, shaders: Option<PathBuf>, out: Option<PathBuf>, module
     let out = out.unwrap_or_else(|| shaders.join("poisoned-modules.txt"));
     let exe = std::env::current_exe().context("current exe")?;
     let key = victory_gpu::pipeline::poison_key().unwrap_or_else(|| "unknown".to_owned());
+    // A list is a statement about one build's DXIL, and the runtime obeys only
+    // the list whose `build` matches its own bytes. Writing this build's list
+    // over another's would leave a boot that reads a list and refuses nothing,
+    // so the older list is kept and the run stops here instead.
+    if let Ok(old) = std::fs::read_to_string(&out)
+        && let Some(old) = old.lines().find_map(|line| line.trim().strip_prefix("# build="))
+        && old.trim() != key
+    {
+        anyhow::bail!(
+            "{} holds a list written for build {} and this is {}: remove it, or write this one \
+             with --out to another path",
+            out.display(),
+            old.trim(),
+            key
+        );
+    }
     let mut probe = std::fs::File::create(&out).with_context(|| format!("writing {}", out.display()))?;
     use std::io::Write;
     writeln!(probe, "# build={key}")?;

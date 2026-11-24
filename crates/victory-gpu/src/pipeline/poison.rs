@@ -24,7 +24,20 @@ fn set() -> &'static Option<HashSet<(String, String)>> {
     SET.get_or_init(|| {
         let dir = super::library::cache_dir()?;
         let path = dir.join(file_name());
-        let text = std::fs::read_to_string(path).ok()?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                // Named, not silent: a list in the wrong directory reads as a
+                // run with no list at all, which is how a list once went
+                // unnoticed while the scene kept dying.
+                tracing::info!(
+                    path = %path.display(),
+                    error = %e,
+                    "poisoned modules: no list here, every module is created"
+                );
+                return None;
+            }
+        };
         let build = build_key()?;
         let mut pairs = HashSet::new();
         let mut mine = false;
@@ -43,12 +56,18 @@ fn set() -> &'static Option<HashSet<(String, String)>> {
         }
         if !mine {
             tracing::info!(
+                path = %path.display(),
                 pairs = pairs.len(),
+                build = %build,
                 "poisoned modules: not this build's list, ignored"
             );
             return None;
         }
-        tracing::info!(pairs = pairs.len(), "modules this build refuses to create");
+        tracing::info!(
+            path = %path.display(),
+            pairs = pairs.len(),
+            "modules this build refuses to create"
+        );
         Some(pairs)
     })
 }
