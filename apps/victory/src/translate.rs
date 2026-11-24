@@ -313,11 +313,24 @@ fn translate(
         return t.fail("corrupt record".into(), example);
     };
     t.containers += 1;
-    let Ok(container) = Container::parse(&bytes) else {
-        return t.fail("no DXIL part (SM5 or older)".into(), example);
+    let container = match Container::parse(&bytes) {
+        Ok(container) => container,
+        Err(error) => return t.fail(error.to_string(), example),
     };
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
-        return t.fail("no DXIL part (SM5 or older)".into(), example);
+        let reason = if container
+            .part(FourCC(*b"ACCC"))
+            .is_some_and(|part| part.data.starts_with(b"FSPX"))
+        {
+            "unsupported ACCC/FSPX shader (no DXIL part)"
+        } else if container.part(FourCC(*b"SHDR")).is_some()
+            || container.part(FourCC(*b"SHEX")).is_some()
+        {
+            "no DXIL part (SM5 or older)"
+        } else {
+            "no DXIL part"
+        };
+        return t.fail(reason.into(), example);
     };
     if !lock(seen).insert(blake3::hash(dxil)) {
         t.duplicates += 1;
@@ -668,4 +681,52 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_dxil_is_classified_by_part_and_payload() {
+        // A DXBC header and part directory followed by one four-byte payload.
+        let mut bytes = [0u8; 48];
+        bytes[..4].copy_from_slice(b"DXBC");
+        bytes[20] = 1; // container version
+        bytes[24] = 48; // container size
+        bytes[28] = 1; // part count
+        bytes[32] = 36; // part offset
+        bytes[40] = 4; // payload size
+        let legacy = "no DXIL part (SM5 or older)";
+        for (tag, payload, reason) in [
+            (
+                b"ACCC",
+                b"FSPX",
+                "unsupported ACCC/FSPX shader (no DXIL part)",
+            ),
+            (b"ACCC", b"TEST", "no DXIL part"),
+            (b"TEST", b"FSPX", "no DXIL part"),
+            (b"SHDR", b"TEST", legacy),
+            (b"SHEX", b"TEST", legacy),
+        ] {
+            bytes[36..40].copy_from_slice(tag);
+            bytes[44..].copy_from_slice(payload);
+            let mut tally = Tally::default();
+            translate(
+                &Source::Raw {
+                    offset: 0,
+                    data: &bytes,
+                },
+                Path::new("synthetic"),
+                &Mutex::default(),
+                &mut tally,
+                &mut Checks {
+                    keep: None,
+                    validator: None,
+                    host: None,
+                },
+            );
+            assert_eq!(tally.failed.keys().collect::<Vec<_>>(), [reason]);
+        }
+    }
 }
