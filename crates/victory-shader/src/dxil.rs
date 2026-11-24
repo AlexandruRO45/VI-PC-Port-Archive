@@ -104,6 +104,11 @@ impl<'a> DxilProgram<'a> {
             return Err(ShaderError::Malformed("missing DXIL magic"));
         }
         let dxil_version = u32_at(part, 12)?;
+        // The version is `major << 8 | minor` and DXIL began at 1.0 with
+        // shader model 6.0; a zero major is no DXIL any compiler wrote.
+        if dxil_version >> 8 == 0 {
+            return Err(ShaderError::Malformed("DXIL version below 1.0"));
+        }
         let offset = u32_at(part, 16)?;
         let len = u32_at(part, 20)? as usize;
         let start = 8 + offset as usize;
@@ -333,6 +338,19 @@ mod tests {
         for sm in [(6, 0), (6, 9), (7, 0)] {
             let bytes = build_standard(0, sm, 0x100, &fake_bitcode());
             assert_eq!(DxilProgram::parse(&bytes).unwrap().shader_model, sm);
+        }
+    }
+
+    #[test]
+    fn rejects_a_dxil_version_below_1_0() {
+        for v in [0x000, 0x001, 0x0FF] {
+            let bytes = build_standard(0, (6, 0), v, &fake_bitcode());
+            assert_eq!(malformed(&bytes), "DXIL version below 1.0", "{v:#x}");
+        }
+        // 1.0 is the floor; later versions, Xbox's 1.5 included, are kept.
+        for v in [0x100, 0x105, 0x108, 0x200] {
+            let bytes = build_standard(0, (6, 0), v, &fake_bitcode());
+            assert_eq!(DxilProgram::parse(&bytes).unwrap().dxil_version, v);
         }
     }
 }
