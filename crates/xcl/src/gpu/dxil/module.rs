@@ -900,16 +900,21 @@ impl Module {
         w.record(MODULE_CODE_VERSION, &[1]);
 
         // Attribute groups: 1 = nounwind readnone, 2 = nounwind readonly,
-        // 3 = nounwind, 4 = noduplicate nounwind.
+        // 3 = nounwind, 4 = noduplicate nounwind, 5 = the entry function: f32 denormals
+        // flushed (without it the driver chooses, per operation).
         w.enter_block(BLOCK_PARAMATTR_GROUP);
         const FN: u64 = 0xFFFF_FFFF;
         w.record(PARAMATTR_GRP_CODE_ENTRY, &[1, FN, 0, ATTR_NOUNWIND, 0, ATTR_READNONE]);
         w.record(PARAMATTR_GRP_CODE_ENTRY, &[2, FN, 0, ATTR_NOUNWIND, 0, ATTR_READONLY]);
         w.record(PARAMATTR_GRP_CODE_ENTRY, &[3, FN, 0, ATTR_NOUNWIND]);
         w.record(PARAMATTR_GRP_CODE_ENTRY, &[4, FN, 0, ATTR_NODUPLICATE, 0, ATTR_NOUNWIND]);
+        // string attribute: 4, key, 0, value, 0
+        let mut ftz = vec![5, FN, 4];
+        ftz.extend(b"fp32-denorm-mode\0ftz\0".iter().map(|&c| c as u64));
+        w.record(PARAMATTR_GRP_CODE_ENTRY, &ftz);
         w.end_block();
         w.enter_block(BLOCK_PARAMATTR);
-        for g in 1..=4 {
+        for g in 1..=5 {
             w.record(PARAMATTR_CODE_ENTRY, &[g]);
         }
         w.end_block();
@@ -934,7 +939,7 @@ impl Module {
             //  gc, unnamed_addr, prologue, dllstorage, comdat, prefix, personality]
             w.record(
                 MODULE_CODE_FUNCTION,
-                &[f.ty.0 as u64, 0, (!f.defined) as u64, LINKAGE_EXTERNAL, f.attrs.index(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[f.ty.0 as u64, 0, (!f.defined) as u64, LINKAGE_EXTERNAL, if f.defined { 5 } else { f.attrs.index() }, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             );
         }
 

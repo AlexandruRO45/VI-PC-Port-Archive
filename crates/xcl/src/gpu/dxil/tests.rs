@@ -216,3 +216,18 @@ fn batched_replacements_match_one_at_a_time() {
         panic!("validator rejected the kernel:\n{e}");
     }
 }
+
+/// The entry function asks for flushed f32 denormals, so the driver does not choose.
+#[test]
+fn the_entry_function_flushes_f32_denormals() {
+    let c = sample_kernel(32);
+    if let Err(e) = validate::validate(&c) {
+        panic!("validator: {e}");
+    }
+    let dis = validate::disassemble(&c).expect("disassembly");
+    let attrs = "\"fp32-denorm-mode\"=\"ftz\"";
+    assert!(dis.contains(attrs), "no {attrs}:\n{dis}");
+    let entry = dis.lines().find(|l| l.starts_with("define void @")).expect("entry");
+    let group = entry.rsplit('#').next().unwrap().trim_end_matches(" {").trim();
+    assert!(dis.lines().any(|l| l.starts_with(&format!("attributes #{group} ")) && l.contains(attrs)), "{entry}\n{dis}");
+}
