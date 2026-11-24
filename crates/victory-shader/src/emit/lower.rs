@@ -52,6 +52,13 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The opcode audit: the instruction (by code offset) whose refusal is
+    /// reported even when none of its results are used.
+    pub(crate) static AUDIT_OFFSET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
@@ -2252,6 +2259,12 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        #[cfg(test)]
+        if let Err(why) = r
+            && AUDIT_OFFSET.get() == Some(offset)
+        {
+            return Err(unsupported(offset, why));
+        }
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
