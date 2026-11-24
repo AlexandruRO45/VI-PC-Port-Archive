@@ -21,6 +21,12 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
+/// The cache entry's converter id and version. The build fingerprint in
+/// the input does the versioning, so this stays at 1; [`store`] must use
+/// the same pair or the runtime never finds what it wrote.
+const CONVERTER_ID: &str = "shader.dxil";
+const CONVERTER_VERSION: u32 = 1;
+
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
     match Cache::open(dir) {
@@ -29,6 +35,11 @@ pub fn use_shader_cache(dir: PathBuf) {
         }
         Err(e) => tracing::warn!(error = %e, "no shader cache"),
     }
+}
+
+/// Whether a shader cache is open, so [`store`] writes somewhere.
+pub fn ready() -> bool {
+    CACHE.get().is_some()
 }
 
 /// Shaders found in the cache and translated since the start.
@@ -67,6 +78,12 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// The input a cache entry is keyed on: the build fingerprint, then the
+/// container's bytes.
+fn key_input(build: &[u8; 32], container: &[u8]) -> Vec<u8> {
+    [&build[..], container].concat()
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
@@ -74,6 +91,44 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),
+    }
+}
+
+/// Stores `shader`, the translation of `container`, where [`host_shader`]
+/// will find it: the same key (this build, these container bytes) and the
+/// same encoding. Only the program `translate` picks is an entry, so an
+/// offline fill must give the translation of that program. Returns whether
+/// the entry was written.
+pub fn store(container: &[u8], shader: &HostShader) -> bool {
+    let Some(cache) = CACHE.get() else {
+        return false;
+    };
+    let input = key_input(build(), container);
+    match cache.store(&Entry, &input, &encode(shader)) {
+        Ok(path) => {
+            tracing::debug!(path = %path.display(), "shader stored");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot store a translation in the shader cache");
+            false
+        }
+    }
+}
+
+/// [`store`]'s converter: the translator's identity, with no translation
+/// to run (the entry's bytes are handed to [`Cache::store`]).
+struct Entry;
+
+impl Converter for Entry {
+    fn id(&self) -> &'static str {
+        CONVERTER_ID
+    }
+    fn version(&self) -> u32 {
+        CONVERTER_VERSION
+    }
+    fn convert(&self, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+        unreachable!("store publishes a translation it was given")
     }
 }
 
@@ -86,11 +141,10 @@ struct Translate<F> {
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
     fn id(&self) -> &'static str {
-        "shader.dxil"
+        CONVERTER_ID
     }
     fn version(&self) -> u32 {
-        // The build fingerprint in the input does the versioning.
-        1
+        CONVERTER_VERSION
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
@@ -105,7 +159,7 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
+    let input = key_input(build, container);
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
@@ -334,6 +388,18 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn a_stored_translation_is_what_host_shader_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        use_shader_cache(dir.path().to_path_buf());
+        assert!(ready());
+        let container = b"a console container no parser reads".as_slice();
+        assert!(host_shader(container).is_err(), "nothing is cached yet");
+        assert!(store(container, &shader()));
+        let got = host_shader(container).expect("the entry store wrote");
+        assert_eq!(got.dxil, shader().dxil, "store and host_shader key alike");
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
