@@ -733,7 +733,7 @@ fn module_of(address: usize) -> Option<String> {
 /// broke (with the module, for an image's pages). Each points at a different
 /// cause: a wild pointer, an allocation whose commit failed, a stack
 /// overrun, a write to code or constants.
-fn memory_at(address: usize) -> String {
+pub(crate) fn memory_at(address: usize) -> String {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_IMAGE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE,
         PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,

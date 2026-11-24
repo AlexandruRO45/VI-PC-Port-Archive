@@ -1,27 +1,60 @@
 //! Walks a thread's stack into return addresses by the unwind data of each
 //! image, for the crash report and the stack dump. It does not name the
 //! frames (`crash::locate` does) or suspend other threads (`stacks` does),
-//! and it stops where `rsp` lies outside the thread's stack.
+//! and it stops where `rsp` lies outside the thread's committed stack.
 
+use std::ops::Range;
 use std::ptr::null_mut;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT, RtlLookupFunctionEntry, RtlVirtualUnwind, UNW_FLAG_NHANDLER,
 };
-use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
+use windows_sys::Win32::System::Kernel::NT_TIB;
 
 /// The most frames a walk records, the starting instruction's included.
 pub(crate) const MAX_FRAMES: usize = 40;
+
+/// The committed part of the stack the NT_TIB at `tib` describes, from its
+/// stack limit up to its stack base. Below it lie the thread's guard pages
+/// and pages reserved but not committed. A reserved page faults when any
+/// thread reads it; a guard page faults when another thread reads it.
+///
+/// # Safety
+/// `tib` points at a mapped NT_TIB.
+pub(crate) unsafe fn tib_stack(tib: *const NT_TIB) -> Range<usize> {
+    // SAFETY: the caller's; the fields are read through the raw pointer.
+    let (base, limit) = unsafe { ((*tib).StackBase, (*tib).StackLimit) };
+    limit.addr()..base.addr()
+}
+
+/// This thread's committed stack, read from its own TEB: no system call, so
+/// it cannot fail.
+fn current_thread_stack() -> Range<usize> {
+    let tib: *const NT_TIB;
+    // SAFETY: on x64 Windows `gs` holds this thread's TEB, whose NT_TIB keeps
+    // its own address in `Self` (how winnt.h's `NtCurrentTeb` reads it); the
+    // read touches no stack and no flags.
+    unsafe {
+        std::arch::asm!(
+            "mov {}, gs:[{}]",
+            out(reg) tib,
+            const std::mem::offset_of!(NT_TIB, Self_),
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    // SAFETY: this thread's own TEB, mapped while it runs.
+    unsafe { tib_stack(tib) }
+}
 
 /// Return addresses of the faulting thread's frames, from the faulting
 /// instruction up, by the unwind data of each image (the Windows loader
 /// registered it for title images too). Code without unwind data (our
 /// thunks, leaf functions) is taken to have its return address at `rsp`.
+/// The stack is its committed part, so `rsp` in a reserved page ends the
+/// walk.
 pub(crate) fn unwind(context: CONTEXT) -> Vec<u64> {
-    let (mut low, mut high) = (0, 0);
-    // SAFETY: writes the current thread's stack bounds.
-    unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+    let stack = current_thread_stack();
     let mut frames = Vec::with_capacity(MAX_FRAMES);
-    unwind_into(context, low, high, &mut frames);
+    unwind_into(context, stack.start, stack.end, &mut frames);
     frames
 }
 
@@ -81,6 +114,73 @@ mod tests {
     use windows_sys::Win32::System::Diagnostics::Debug::{
         RtlCaptureContext, RtlCaptureStackBackTrace,
     };
+    use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
+
+    use crate::crash::memory_at;
+
+    /// One of this test binary's tests, run alone in a child process with
+    /// one environment variable set.
+    struct Child<'a> {
+        test: &'a str,
+        variable: &'a str,
+        value: &'a str,
+    }
+
+    impl Child<'_> {
+        /// Runs it; returns its exit code and its stderr.
+        fn run(&self) -> (Option<i32>, String) {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", self.test, "--nocapture"])
+                .env(self.variable, self.value)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stderr).into_owned();
+            (out.status.code(), text)
+        }
+    }
+
+    /// An address in the reserved, never committed part of this thread's
+    /// stack.
+    fn reserved_stack_address() -> usize {
+        let (mut low, mut high) = (0, 0);
+        // SAFETY: writes the current thread's stack bounds, its whole
+        // reservation.
+        unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+        let reserved = low + 0x2000;
+        assert_eq!(memory_at(reserved), "reserved, never committed");
+        reserved
+    }
+
+    /// In a child process of the next test: walks from `rsp` in the reserved,
+    /// uncommitted part of its stack, with `rip` where no function table
+    /// reaches, so the walk would read the return address at `rsp`; that read
+    /// ends the process if the walk's bounds allow it.
+    #[test]
+    fn stack_pointer_child() {
+        if std::env::var_os("VICTORY_STACK_POINTER_CHILD").is_none() {
+            return;
+        }
+        // SAFETY: a zeroed CONTEXT is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rip = 0x1234;
+        context.Rsp = reserved_stack_address() as u64;
+        // On stderr: libtest writes test names to stdout, without a newline
+        // before the test runs when it runs one test at a time.
+        eprintln!("{} frames", unwind(context).len());
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn a_stack_pointer_in_the_uncommitted_stack_ends_the_walk() {
+        let (code, text) = Child {
+            test: "unwind::tests::stack_pointer_child",
+            variable: "VICTORY_STACK_POINTER_CHILD",
+            value: "1",
+        }
+        .run();
+        assert_eq!(code, Some(0), "{text}");
+        assert!(text.lines().any(|l| l == "1 frames"), "{text}");
+    }
 
     /// What [`capture_frames`] saw: our [`unwind`], then the system's walk.
     type Captured = (Vec<u64>, Vec<usize>);
