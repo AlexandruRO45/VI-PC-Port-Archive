@@ -609,6 +609,16 @@ fn list_files_built_by(root: &Path, staged: bool, exe: Option<&Path>) -> Result<
         return Ok(files);
     }
     // Not a git repository: walk everything except build output.
+    //
+    // Every entry that is not a directory is listed, as git would list it:
+    // a symlink is read as the target path git would store, and a FIFO or
+    // device is refused unread. Only regular files used to be listed, so
+    // in an unpacked source tree a symlink named `game.xex`, or a FIFO,
+    // passed unseen. Nor is a name alone build output: a regular file or
+    // symlink named `target` was passed over like the directory, whatever
+    // it held. A `target` that is (or leads to) a directory still is, and
+    // anything named `.git` (a repository's directory, or the file of a
+    // worktree or submodule) is git's, not the tree's.
     let build = exe.and_then(|exe| {
         let top = build_dir_top(root, exe)?;
         Some(root.join(top.strip_prefix(root.canonicalize().ok()?).ok()?))
@@ -616,11 +626,17 @@ fn list_files_built_by(root: &Path, staged: bool, exe: Option<&Path>) -> Result<
     Ok(walkdir::WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| {
-            !matches!(e.file_name().to_str(), Some("target" | ".git"))
-                && Some(e.path()) != build.as_deref()
+            let skipped = match e.file_name().to_str() {
+                Some(".git") => true,
+                Some("target") => e.path().is_dir(),
+                _ => false,
+            };
+            !(skipped && e.depth() > 0) && Some(e.path()) != build.as_deref()
         })
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
+        // The top itself is the tree, even reached through a symlink, which
+        // the walk follows but still reports as one.
+        .filter(|e| e.depth() > 0 && !e.file_type().is_dir())
         .filter_map(|e| {
             let relative = e.path().strip_prefix(root).ok()?;
             Some(File {
@@ -2837,6 +2853,77 @@ mod tests {
                 .get_envs()
                 .all(|(key, _)| key != "GIT_CEILING_DIRECTORIES")
         );
+    }
+
+    /// Outside a repository only regular files were walked: a symlink or a
+    /// FIFO passed unseen, though git lists both, and a regular file or
+    /// symlink named `target` was passed over like the build directory. A
+    /// tree unpacked from a source archive, or checked out to a directory
+    /// named `target`, was not checked at all.
+    #[cfg(unix)]
+    #[test]
+    fn directories_outside_any_repository_list_every_entry_git_would() {
+        let dir = tempdir();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("nested/target")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::fs::write(root.join("src/a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(root.join("nested/target/game.bin"), b"MZ\x90\0build output").unwrap();
+        std::fs::write(root.join("elsewhere/lib.rs"), b"// kept\n").unwrap();
+        // Read as git stores it: the target path, under a name not allowed.
+        std::os::unix::fs::symlink("src/a.rs", root.join("game.xex")).unwrap();
+        // A regular file named after the build directory is still a file.
+        std::fs::write(root.join("src/target"), b"MZ\x90\0a game executable").unwrap();
+        // A symlink that leads to a directory is passed over like one.
+        std::os::unix::fs::symlink("elsewhere", root.join("target")).unwrap();
+        // `.git` of any kind is git's own.
+        std::fs::write(root.join("nested/.git"), b"gitdir: /nowhere\n").unwrap();
+        let fifo = std::process::Command::new("mkfifo")
+            .arg(root.join("pipe.rs"))
+            .status()
+            .unwrap();
+        assert!(fifo.success());
+
+        let mut walked = names(&root, false);
+        walked.sort();
+        assert_eq!(
+            walked,
+            [
+                "elsewhere/lib.rs",
+                "game.xex",
+                "pipe.rs",
+                "src/a.rs",
+                "src/target"
+            ]
+        );
+        // Not blocked on the FIFO, and each of the three is a violation.
+        let files = super::list_files(&root, false).unwrap();
+        let problems: Vec<_> = files
+            .iter()
+            .map(|file| (file.name.as_str(), super::read(&root, file)))
+            .collect();
+        for (name, read) in &problems {
+            match *name {
+                "pipe.rs" => assert_eq!(read.as_ref().unwrap_err(), "not a regular file"),
+                "game.xex" => {
+                    assert_eq!(read.as_ref().unwrap().as_ref().unwrap().head, b"src/a.rs")
+                }
+                _ => assert!(read.is_ok(), "{name}: {read:?}"),
+            }
+        }
+        assert!(super::run(&root, false).is_err());
+        for name in ["game.xex", "src/target", "pipe.rs"] {
+            std::fs::remove_file(root.join(name)).unwrap();
+        }
+        super::run(&root, false).unwrap();
+
+        // A tree whose own top is named `target` is walked, not skipped.
+        let top = dir.path().join("target");
+        std::fs::create_dir_all(&top).unwrap();
+        std::fs::write(top.join("game.bin"), b"MZ\x90\0a game executable").unwrap();
+        assert_eq!(names(&top, false), ["game.bin"]);
+        assert!(super::run(&top, false).is_err());
     }
 
     /// Under a TMPDIR holding `:`, the ceiling put on a temporary directory
