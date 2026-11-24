@@ -626,4 +626,64 @@ mod tests {
             }
         }
     }
+
+    /// The version word's bits 8-15, between the model nibbles and the
+    /// kind, belong to neither: whatever they hold, the kind and model read
+    /// the same.
+    #[test]
+    fn the_version_bits_between_model_and_kind_are_ignored() {
+        let base = build_standard(5, (6, 5), 0x105, &fake_bitcode());
+        for between in [0x01, 0x80, 0xAB, 0xFF] {
+            let mut bytes = base.clone();
+            bytes[1] = between;
+            let p = DxilProgram::parse(&bytes).unwrap();
+            assert_eq!(
+                (p.kind, p.shader_model),
+                (ShaderKind::Compute, (6, 5)),
+                "{between:#x}"
+            );
+        }
+    }
+
+    /// The bitcode offset need not be word-aligned: an offset of 17 puts
+    /// the bitcode one byte into the program after the header, leaving a
+    /// one-byte prefix and a three-byte trailer that still fill the
+    /// program's words, and the bitcode is read from that byte.
+    #[test]
+    fn an_unaligned_bitcode_offset_leaves_ragged_prefix_and_trailer() {
+        let bitcode = fake_bitcode();
+        let mut bytes = build_standard(0, (6, 0), 0x100, &bitcode);
+        bytes.insert(24, 0x5A);
+        bytes.extend_from_slice(&[0xEE; 3]);
+        let words = (bytes.len() / 4) as u32;
+        set_u32(&mut bytes, 4, words);
+        set_u32(&mut bytes, 16, 17);
+        let p = DxilProgram::parse(&bytes).unwrap();
+        assert_eq!(
+            (p.prefix, p.bitcode, p.trailer),
+            (&[0x5A][..], &bitcode[..], &[0xEE; 3][..])
+        );
+        assert!(std::ptr::eq(p.bitcode.as_ptr(), bytes[25..].as_ptr()));
+        assert!(!p.is_standard_layout());
+        assert_eq!(p.xbox_extras(), XboxExtras::default());
+        assert_sound(&bytes, &p, "offset 17");
+    }
+
+    /// A bitcode length at the top of its field, word-aligned or not, is
+    /// out of bounds of any program rather than wrapping past it, and so
+    /// is a length that would end exactly one byte past the program.
+    #[test]
+    fn a_bitcode_length_at_the_field_top_is_out_of_bounds() {
+        let bitcode = fake_bitcode();
+        for len in [u32::MAX, u32::MAX - 3, bitcode.len() as u32 + 1] {
+            let mut bytes = build_standard(0, (6, 0), 0x100, &bitcode);
+            set_u32(&mut bytes, 20, len);
+            assert_eq!(malformed(&bytes), "bitcode out of bounds", "{len:#x}");
+        }
+        // Both at their top: offset and length together still only fail.
+        let mut bytes = build_standard(0, (6, 0), 0x100, &bitcode);
+        set_u32(&mut bytes, 16, u32::MAX);
+        set_u32(&mut bytes, 20, u32::MAX);
+        assert_eq!(malformed(&bytes), "bitcode out of bounds");
+    }
 }
