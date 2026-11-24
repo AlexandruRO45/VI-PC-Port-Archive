@@ -199,6 +199,19 @@ const REPOSITORY_ENV: &[&str] = &[
     "GIT_COMMON_DIR",
 ];
 
+/// Variables that change how git reads a pathspec: literal, glob or
+/// case-insensitive. Tests pass pathspecs (`check-ignore -- <path>`, the
+/// hooks' `ls-files -- .githooks`), and `check-ignore` refuses to run at all
+/// under `GIT_LITERAL_PATHSPECS`, so `tempdir` would take an ignored
+/// directory for a visible one.
+#[cfg(test)]
+const PATHSPEC_ENV: &[&str] = &[
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+];
+
 /// `git`, run in `root`.
 ///
 /// The hook needs the environment it inherits: `git commit -a` and
@@ -221,13 +234,14 @@ const REPOSITORY_ENV: &[&str] = &[
 /// Nor are they made from the environment's choices: `GIT_TEMPLATE_DIR`
 /// copies its `info/exclude` and hooks into every `git init`, and
 /// `GIT_DEFAULT_HASH=sha256` makes repositories that the SHA-1 object ids
-/// tests stage are refused by.
+/// tests stage are refused by. `GIT_ATTR_SOURCE` reads attributes from a
+/// tree-ish that a new repository does not have, and every command fails.
 pub(crate) fn git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(root);
     #[cfg(test)]
     {
-        for var in REPOSITORY_ENV {
+        for var in REPOSITORY_ENV.iter().chain(PATHSPEC_ENV) {
             command.env_remove(var);
         }
         if root != crate::workspace_root() {
@@ -239,7 +253,10 @@ pub(crate) fn git_command(root: &Path) -> Command {
                 .env("XDG_CONFIG_HOME", NO_XDG_CONFIG)
                 // Empty: `git init` copies no template at all, silently.
                 .env("GIT_TEMPLATE_DIR", "")
-                .env_remove("GIT_DEFAULT_HASH");
+                .env_remove("GIT_DEFAULT_HASH")
+                // Reads `.gitattributes` from that tree-ish instead of the
+                // working tree; a fresh repository has no HEAD to read.
+                .env_remove("GIT_ATTR_SOURCE");
         }
     }
     command
@@ -501,23 +518,34 @@ mod tests {
     }
 
     /// Runs git in `root` with a throwaway identity, asserting success.
+    ///
+    /// The identity and dates are set as variables, not `user.*` config:
+    /// the `GIT_AUTHOR_*` and `GIT_COMMITTER_*` an environment sets
+    /// (`git commit --date` and `git rebase` export them to hooks) win over
+    /// config, and an empty name or a date git cannot parse fails the commit.
     #[cfg(unix)]
     fn git(root: &std::path::Path, args: &[&std::ffi::OsStr]) -> Vec<u8> {
         let out = super::git_command(root)
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "commit.gpgsign=false",
-            ])
+            .envs(IDENTITY)
+            .args(["-c", "commit.gpgsign=false"])
             .args(args)
             .output()
             .unwrap();
         assert!(out.status.success(), "git {args:?}");
         out.stdout
     }
+
+    /// A fixed author and committer, so commits in temporary repositories
+    /// neither take the environment's nor fail on it.
+    #[cfg(unix)]
+    const IDENTITY: [(&str, &str); 6] = [
+        ("GIT_AUTHOR_NAME", "t"),
+        ("GIT_AUTHOR_EMAIL", "t@t"),
+        ("GIT_AUTHOR_DATE", "@0 +0000"),
+        ("GIT_COMMITTER_NAME", "t"),
+        ("GIT_COMMITTER_EMAIL", "t@t"),
+        ("GIT_COMMITTER_DATE", "@0 +0000"),
+    ];
 
     #[cfg(unix)]
     fn git_str(root: &std::path::Path, args: &[&str]) -> Vec<u8> {
@@ -925,7 +953,7 @@ mod tests {
         // under that HOME apply.
         let mut plain = std::process::Command::new("git");
         plain.current_dir(root).env_remove("XDG_CONFIG_HOME");
-        for var in super::REPOSITORY_ENV {
+        for var in super::REPOSITORY_ENV.iter().chain(super::PATHSPEC_ENV) {
             plain.env_remove(var);
         }
         plain
@@ -994,6 +1022,70 @@ mod tests {
                 .get_envs()
                 .all(|(key, _)| key != "GIT_TEMPLATE_DIR" && key != "GIT_DEFAULT_HASH"),
         );
+    }
+
+    /// Under `GIT_ATTR_SOURCE=HEAD` every git command that reads attributes
+    /// (`add`, `check-attr`) failed in a fresh temporary repository; under a
+    /// `GIT_AUTHOR_DATE` git cannot parse, or an empty `GIT_AUTHOR_NAME`,
+    /// every test that commits did; and under `GIT_LITERAL_PATHSPECS`
+    /// `check-ignore` refused to run.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_repositories_ignore_attr_source_identity_and_pathspec_env() {
+        let tmp = tempdir();
+        let root = tmp.path();
+        git_str(root, &["init", "-q"]);
+
+        // Handed those variables, as the environment used to: git fails.
+        let refused = |var: &str, value: &str, args: &[&str]| {
+            let out = super::git_command(root)
+                .env(var, value)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(!out.status.success(), "{var}={value:?} git {args:?}");
+        };
+        refused(
+            "GIT_ATTR_SOURCE",
+            "HEAD",
+            &["check-attr", "-a", "--", "a.rs"],
+        );
+        refused(
+            "GIT_LITERAL_PATHSPECS",
+            "1",
+            &["check-ignore", "-q", "--", "a.rs"],
+        );
+        let empty_commit = [
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "c",
+        ];
+        let mut commit = super::git_command(root);
+        commit.envs(IDENTITY).env("GIT_AUTHOR_DATE", "garbage");
+        assert!(!commit.args(empty_commit).status().unwrap().success());
+
+        let command = super::git_command(root);
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_str().unwrap().to_owned())
+            .collect();
+        for var in super::PATHSPEC_ENV.iter().chain(&["GIT_ATTR_SOURCE"]) {
+            assert!(removed.iter().any(|r| r == var), "{var} is inherited");
+        }
+        // The helper's identity is its own, whatever the environment holds.
+        git_str(root, &["commit", "-q", "--allow-empty", "-m", "c"]);
+        let author = git_str(root, &["log", "-1", "--format=%an <%ae> %at|%cn <%ce> %ct"]);
+        assert_eq!(author, b"t <t@t> 0|t <t@t> 0\n");
+
+        // Pathspec variables change no full check (it passes none); the
+        // attribute source is the checkout's own business.
+        let checkout = super::git_command(&crate::workspace_root());
+        assert!(checkout.get_envs().all(|(key, _)| key != "GIT_ATTR_SOURCE"));
     }
 
     const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1\n\
