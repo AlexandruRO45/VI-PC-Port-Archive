@@ -1,10 +1,11 @@
 # Numerical Wave32 masks in mesh shaders
 
-On main `ffe310e`, an original mesh shader that takes the population count
+On main `70564ae`, an original mesh shader that takes the population count
 of a comparison mask is refused when its primitive export needs the
 numeric result. The refusal occurs during translation, before a D3D12
 device or pipeline is selected. The companion shader with the same vertex
-and primitive exports translates without the numerical mask.
+and primitive exports translates without the numerical mask. The same
+refusal was reproduced on the earlier main `ffe310e`.
 
 The mesh stage cannot declare a fixed Wave32. Shader Model 6.6 exposes the
 attribute on compute entry points, and the DXIL validator restricts wave
@@ -19,6 +20,8 @@ The helper reserves four bytes per thread and checks the combined
 28 KiB mesh groupshared limit. The first numeric use and the mask
 definition must be in the same group-uniform native entry block.
 The tracked mask must describe lanes present at its definition.
+PSV declares scratch and any emitted native LDS global. Declared native
+LDS still counts against the conservative capacity check.
 [D3D12 mesh shader limits](https://microsoft.github.io/DirectX-Specs/d3d/MeshShader.html)
 
 ## Reproduction
@@ -47,11 +50,12 @@ $env:VICTORY_MESH_MASK_TEST_ADAPTER = 'amd' # or nvidia, warp
 cargo test --locked -p victory-shader --lib mesh_numeric_wave32_masks_control_two_triangles -- --ignored --nocapture --test-threads=1
 ```
 
-The 15 cases passed on AMD Radeon Graphics, driver 32.0.22042.1 with
+The 16 cases passed on AMD Radeon Graphics, driver 32.0.22042.1 with
 32–64 lanes, and the Agility WARP renderer with four lanes. Both exposed
-mesh tier 1 and SM 6.6. The 120 pixel probes include Wave32 groups of
+mesh tier 1 and SM 6.6. The 128 pixel probes include Wave32 groups of
 17, 31, 32, 33, 47, 64, 96, and 128 threads, logical Wave64 controls at
-64 and 128 threads, and a separate native LDS allocation. AMD's actual
+64 and 128 threads, a native LDS read after the ballot, and declared but
+unused native LDS. AMD's actual
 physical mesh wave width was not measured. NVIDIA was absent from DXGI.
 
 ## Synthetic GPU cost
@@ -78,9 +82,17 @@ of the per-process medians in GPU microseconds per 2,048-group dispatch.
 | 64 | 112.03 | 115.09 | 130.67 | 172.17 |
 | 128 | 198.61 | 199.26 | 251.59 | 341.98 |
 
-The tested interval includes raster work plus mask arithmetic, shared atomics,
+These 2,048-group measurements were recorded on the `ffe310e`-based
+candidate at `95ffced`. The tested interval includes raster work plus
+mask arithmetic, shared atomics,
 and barriers. Zero-ballot timing also drifted across runs. The one-ballot
 differences were within that drift.
+
+In the separate #439 integration at `a8ee7f7`, 128-thread groups took
+4.150, 4.630, 5.455, and 6.995 µs with zero through three ballots at
+32 groups, and 34.930, 35.170, 45.315, and 60.140 µs at 256 groups.
+Each entry is the median of 15 post-warmup samples on the same AMD
+adapter with validation disabled.
 
 The separate scratch-bank experiment at `8378317` allocates two banks
 when space allows and performs two group barriers per ballot. It falls back
