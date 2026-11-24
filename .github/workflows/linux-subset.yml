@@ -95,12 +95,20 @@ jobs:
       - name: cargo check (workspace, all targets)
         run: cargo check --locked --workspace --all-targets --target x86_64-pc-windows-msvc
 
-      # victory-gpu, victory-hle and apps/victory are not clippy-clean for
-      # Windows yet; add them here once they are.
+      # victory-hle (and so apps/victory, which lints it as a dependency) is not
+      # clippy-clean for Windows yet; add it here once it is.
       - name: clippy (Windows target, clean crates)
         run: >
           cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc
           $WINDOWS_CLIPPY_CRATES -- -D warnings
+
+      # victory-gpu's library is clean; one of its tests is not yet (a missing
+      # SAFETY comment in host.rs). Lint the non-test targets so new warnings in
+      # the D3D12 code fail here; switch to --all-targets once the test is fixed.
+      - name: clippy (victory-gpu lib, Windows target)
+        run: >
+          cargo clippy --locked --lib --bins --examples --target x86_64-pc-windows-msvc
+          -p victory-gpu -- -D warnings
 
       # The hle-probe fixture is outside the workspace (load_probe builds it on
       # demand on Windows), so the steps above never compile it. It is
