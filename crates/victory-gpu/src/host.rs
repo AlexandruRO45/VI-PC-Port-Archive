@@ -1352,6 +1352,24 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
+/// Whether scratch chunks go to CPU-visible video memory
+/// (`VICTORY_SCRATCH_VRAM=1`; off by default), so shaders read them from VRAM
+/// rather than system RAM over PCIe. Needs Resizable BAR ([`Host::rebar`]).
+fn scratch_vram() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_VRAM").is_some_and(|v| v == "1"))
+}
+
+/// Whether there is video-memory room for `size` more bytes of scratch,
+/// leaving a tenth of the budget free (the card copies' rule), so texture and
+/// lighting residency is not pressed.
+fn scratch_vram_room(host: &Host, size: u64) -> bool {
+    let Some([budget, used, _, _]) = host.video_memory() else {
+        return false;
+    };
+    used.saturating_add(size) <= budget - budget / 10
+}
+
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     if scratch_pool()
@@ -1362,7 +1380,12 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    let (buffer, data) = if scratch_vram() && host.rebar() && scratch_vram_room(host, size) {
+        host.gpu_upload_buffer(size)
+            .or_else(|| host.upload_buffer(size))?
+    } else {
+        host.upload_buffer(size)?
+    };
     name(&buffer, || "list scratch".into());
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -4944,7 +4967,12 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
+            let (buffer, data) = if scratch_vram() && host.rebar() && scratch_vram_room(host, len) {
+                host.gpu_upload_buffer(len)
+                    .or_else(|| host.upload_buffer(len))?
+            } else {
+                host.upload_buffer(len)?
+            };
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5581,6 +5609,67 @@ impl Host {
                 None
             }
         }
+    }
+
+    /// Like [`upload_buffer`] but in CPU-visible video memory (write-combine,
+    /// L1 — Resizable BAR), so shaders read the scratch from VRAM rather than
+    /// system RAM over PCIe (`VICTORY_SCRATCH_VRAM`). CPU writes are
+    /// write-combined (streaming writes only; the scratch is GPU-read-only).
+    /// Falls back to `None` if the host cannot make such a heap.
+    pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L1,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a CPU-visible VRAM buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(_) => None,
+        }
+    }
+
+    /// Whether the host can make CPU-visible video-memory buffers (Resizable
+    /// BAR): probed once by creating and mapping a small write-combine L1
+    /// buffer. Without it, [`gpu_upload_buffer`] is never used.
+    pub(crate) fn rebar(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let ok = self.gpu_upload_buffer(64 << 10).is_some();
+            tracing::info!(rebar = ok, "CPU-visible video memory (Resizable BAR) probe");
+            ok
+        })
     }
 }
 
