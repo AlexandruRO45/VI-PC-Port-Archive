@@ -278,22 +278,36 @@ mod tests {
             let mut expected = vec![0; N];
             for (offset, value) in [(0, 9), (2 << 16, 37), (N - 4096, 85)] {
                 let at = base.add(offset);
-                assert_eq!(VirtualAlloc(at.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), at.cast());
+                assert_eq!(
+                    VirtualAlloc(at.cast(), 4096, MEM_COMMIT, PAGE_READWRITE),
+                    at.cast()
+                );
                 at.write_bytes(value, 4096);
                 expected[offset..offset + 4096].fill(value);
             }
             for remap in [false, true] {
                 if remap {
                     let mut old = 0;
-                    assert_ne!(VirtualProtect(base.cast(), 4096, PAGE_NOACCESS, &mut old), 0);
+                    assert_ne!(
+                        VirtualProtect(base.cast(), 4096, PAGE_NOACCESS, &mut old),
+                        0
+                    );
                     expected[..4096].fill(0);
                     let at = base.add(1 << 16);
-                    assert_eq!(VirtualAlloc(at.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), at.cast());
+                    assert_eq!(
+                        VirtualAlloc(at.cast(), 4096, MEM_COMMIT, PAGE_READWRITE),
+                        at.cast()
+                    );
                     at.write_bytes(0xc7, 4096);
                     expected[1 << 16..(1 << 16) + 4096].fill(0xc7);
                 }
                 let mut out = vec![0xee; N];
-                assert!(!super::copy_mapped(out.as_mut_ptr().add(27), base.add(27), N - 54, false));
+                assert!(!super::copy_mapped(
+                    out.as_mut_ptr().add(27),
+                    base.add(27),
+                    N - 54,
+                    false
+                ));
                 assert_eq!(out[27..N - 27], expected[27..N - 27]);
                 assert!(out[..27].iter().chain(&out[N - 27..]).all(|&v| v == 0xee));
             }
@@ -1676,8 +1690,8 @@ fn read_sparse(dst: *mut u8, src: *const u8, len: usize) -> bool {
         let at = src.wrapping_add(offset);
         let to = dst.wrapping_add(offset);
         let remaining = len - offset;
-        // SAFETY: the query inspects an address and fills a local structure.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: the query inspects an address and fills this sized structure.
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
         let n = (info.BaseAddress as usize)
             .saturating_add(info.RegionSize)
