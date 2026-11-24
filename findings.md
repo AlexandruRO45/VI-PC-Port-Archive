@@ -105,14 +105,16 @@ With them: `0` "no argument clamp" warnings, and at frame 4096
 Requirements: Rust with the `x86_64-pc-windows-msvc` target, `cargo-xwin` (plus its Windows SDK
 cache), clang/lld. On Linux the whole thing cross-compiles; no Windows machine is needed.
 
+The run below was made from the pre-split branch (`aabca38`). The code is now in:
+
+- #20 — DXC fallback for the clamp, the card compare, the in-place probe and the depth twins;
+- #364 — the watchdog hooks;
+- #28 — 512 MiB pipeline-worker stacks;
+- #363 — the copy and pipeline-library work.
+
+Build a branch that has them, or their merges:
+
 ```sh
-git clone https://github.com/fxceless/victory-gta6
-cd victory-gta6
-git checkout 6a2d9f9
-
-# #20 carries the DXC fallback; #454 carries the watchdog hooks. Both are open
-# upstream, so apply their patches if the branch you build does not have them.
-
 cargo xwin build --profile diag --features diagnostics \
     -p victory --target x86_64-pc-windows-msvc --locked
 ```
