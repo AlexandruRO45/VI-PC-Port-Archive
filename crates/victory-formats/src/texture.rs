@@ -1735,4 +1735,98 @@ mod tests {
         assert_eq!(l.offset(1, 1, 1, 1), Ok(1792 + 256 + 65 * 4));
         assert_eq!(l.offset(1, 0, 0, 2), Err(Error::Invalid));
     }
+
+    /// For random valid descriptions in every mode (addressable or not),
+    /// the layout describes itself consistently: it keeps the description,
+    /// holds one entry per mip with the halved sizes copies use, places the
+    /// slices back to back in whole alignment units, keeps every mip padded
+    /// and every mip outside the tail aligned, and marks exactly the mips
+    /// from `first_tail_mip` on as tail mips.
+    #[test]
+    fn layouts_describe_themselves_consistently() {
+        let mut seed = 0x853c_49e6_748f_ea9bu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let modes = [0, 1, 2, 5, 6, 9, 10, 17, 18, 21, 22, 23, 24, 25, 26, 27];
+        let mut checked = 0;
+        while checked < 4000 {
+            let dimension =
+                [Dimension::Tex1d, Dimension::Tex2d, Dimension::Tex3d][(next() % 3) as usize];
+            let mut extent = |n: u64| match next() % 16 {
+                0 => MAX_EXTENT - (next() % 3) as u32,
+                _ => 1 + (next() % n) as u32,
+            };
+            let width = extent(2000);
+            let height = if dimension == Dimension::Tex1d {
+                1
+            } else {
+                extent(2000)
+            };
+            let depth = extent(40);
+            let mips = 1 + (next() % u64::from(MAX_MIPS)) as u32;
+            let samples = if dimension == Dimension::Tex2d && mips == 1 {
+                [1, 1, 2, 4, 8][(next() % 5) as usize]
+            } else {
+                1
+            };
+            let d = Desc {
+                dimension,
+                width,
+                height,
+                depth,
+                mips,
+                element_bytes: 1 << (next() % 5),
+                block: [1, 4][(next() % 2) as usize],
+                samples,
+                swizzle: Swizzle(modes[(next() % modes.len() as u64) as usize]),
+            };
+            let Ok(l) = Layout::new(&d) else {
+                // Only 3D textures in thin-only modes are refused here.
+                assert_eq!(dimension, Dimension::Tex3d, "{d:?}");
+                continue;
+            };
+            checked += 1;
+            assert_eq!(Layout::new(&d).as_ref(), Ok(&l), "{d:?}");
+            assert_eq!(l.desc, d);
+            assert!(l.alignment.is_power_of_two(), "{d:?}");
+            assert_eq!(l.size, l.slice_size * u64::from(l.slices), "{d:?}");
+            assert_eq!(l.slice_size % l.alignment, 0, "{d:?}");
+            assert_eq!(l.mips.len(), d.mips as usize, "{d:?}");
+            assert!(l.first_tail_mip <= d.mips, "{d:?}");
+            if l.thick {
+                assert_eq!(l.slices, d.depth.div_ceil(l.block[2]), "{d:?}");
+            } else {
+                assert_eq!(l.slices, d.depth, "{d:?}");
+            }
+            let three_d = dimension == Dimension::Tex3d;
+            for (i, m) in l.mips.iter().enumerate() {
+                let i = i as u32;
+                let at = format!("{d:?} mip {i}");
+                assert_eq!(m.width, dim(width, i, d.block), "{at}");
+                assert_eq!(m.height, dim(height, i, d.block), "{at}");
+                assert_eq!(m.depth, if three_d { dim(depth, i, 1) } else { 1 }, "{at}");
+                assert_eq!(l.subresource_depth(i), m.depth, "{at}");
+                assert!(m.pitch >= m.width && m.rows >= m.height, "{at}");
+                assert_eq!(m.tail.is_some(), i >= l.first_tail_mip, "{at}");
+                match m.tail {
+                    Some(t) => assert!(u64::from(t.offset) < l.alignment, "{at}"),
+                    None => {
+                        assert_eq!(m.offset % l.alignment, 0, "{at}");
+                        assert!(m.offset < l.slice_size, "{at}");
+                        assert_eq!(m.pitch % l.block[0], 0, "{at}");
+                    }
+                }
+                if i > 0 {
+                    let p = &l.mips[i as usize - 1];
+                    assert!(m.width <= p.width && m.height <= p.height, "{at}");
+                    assert!(m.depth <= p.depth, "{at}");
+                }
+            }
+            assert_eq!(l.subresource_depth(d.mips), 0, "{d:?}");
+        }
+    }
 }
