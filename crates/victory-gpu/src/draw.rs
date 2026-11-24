@@ -1136,8 +1136,11 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             ResourceType::Cbv => 0x1,
             ResourceType::Srv => SHADER_RESOURCE,
             ResourceType::Uav => UNORDERED_ACCESS,
+            ResourceType::Other(_) | ResourceType::Sampler => 0,
         };
-        crate::list::ensure_shadow_state(list, &shadow, state);
+        if state != 0 {
+            crate::list::ensure_shadow_state(list, &shadow, state);
+        }
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
