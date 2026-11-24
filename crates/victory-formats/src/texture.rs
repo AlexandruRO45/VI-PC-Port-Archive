@@ -1829,4 +1829,122 @@ mod tests {
             assert_eq!(l.subresource_depth(d.mips), 0, "{d:?}");
         }
     }
+
+    /// The micro tile tables and the block bits added after them place
+    /// every address bit above the element bits exactly once, and give the
+    /// 256-byte, thin and thick block dimensions addrlib computes
+    /// (`ComputeThinBlockDimension`, `ComputeThickBlockDimension`).
+    #[test]
+    fn patterns_cover_their_blocks() {
+        for kind in 0..3 {
+            let thick = kind == 2;
+            for e in 0..5u32 {
+                // The micro tile alone is 256 bytes.
+                let micro = pattern(kind, e, 8);
+                let side = |axis: usize| 1u32 << micro[axis].len();
+                if thick {
+                    let b = BLOCK_256_3D[e as usize];
+                    assert_eq!([side(0), side(1), side(2)], b, "kind {kind} e {e}");
+                } else {
+                    assert_eq!(
+                        [side(0), side(1)],
+                        BLOCK_256_2D[e as usize],
+                        "kind {kind} e {e}"
+                    );
+                    assert!(micro[2].is_empty(), "kind {kind} e {e}");
+                }
+                let blocks: &[u32] = if thick { &[12, 16] } else { &[8, 12, 16] };
+                for &b in blocks {
+                    let axes = pattern(kind, e, b);
+                    let at = format!("kind {kind} e {e} block {b}");
+                    // Bits 0..e address bytes inside an element; the rest
+                    // are coordinate bits, each taken once.
+                    let mut seen: Vec<u32> = (0..e).collect();
+                    seen.extend(axes.iter().flatten());
+                    seen.sort_unstable();
+                    assert_eq!(seen, (0..b).collect::<Vec<_>>(), "{at}");
+                    // Coordinate bits rise within an axis, so coordinates
+                    // keep their order inside a block's rows.
+                    for axis in &axes {
+                        assert!(axis.windows(2).all(|w| w[0] < w[1]) || kind == 1, "{at}");
+                    }
+                    let dims = axes.each_ref().map(|a| 1u32 << a.len());
+                    let expected = if thick {
+                        let amp = (b - 10) / 3;
+                        let rest = (b - 10) % 3;
+                        let k = BLOCK_1K_3D[e as usize];
+                        [
+                            k[0] << amp,
+                            k[1] << (amp + rest / 2),
+                            k[2] << (amp + u32::from(rest != 0)),
+                        ]
+                    } else {
+                        let elements = b - e;
+                        let w = elements.div_ceil(2);
+                        [1 << w, 1 << (elements - w), 1]
+                    };
+                    assert_eq!(dims, expected, "{at}");
+                    assert_eq!(
+                        (u64::from(dims[0]) * u64::from(dims[1]) * u64::from(dims[2])) << e,
+                        1u64 << b,
+                        "{at}"
+                    );
+                    // Spreading each axis and adding the element byte
+                    // reaches every byte of the block once.
+                    let [sx, sy, sz] = axes.each_ref().map(|a| spread(a));
+                    let mut hit = vec![false; 1 << b];
+                    for &x in &sx {
+                        for &y in &sy {
+                            for &z in &sz {
+                                for byte in 0..1u32 << e {
+                                    let o = (x | y | z | byte) as usize;
+                                    assert_eq!(x + y + z + byte, o as u32, "{at}");
+                                    assert!(!std::mem::replace(&mut hit[o], true), "{at}");
+                                }
+                            }
+                        }
+                    }
+                    assert!(hit.iter().all(|&h| h), "{at}");
+                }
+            }
+        }
+    }
+
+    /// `spread` maps coordinate `c` to the sum of its set bits' targets.
+    #[test]
+    fn spread_places_coordinate_bits() {
+        assert_eq!(spread(&[]), vec![0]);
+        assert_eq!(spread(&[3]), vec![0, 8]);
+        assert_eq!(spread(&[4, 0]), vec![0, 16, 1, 17]);
+        assert_eq!(spread(&[1, 5, 2]), vec![0, 2, 32, 34, 4, 6, 36, 38]);
+    }
+
+    /// Mip sizes: `dim` halves texels (to at least 1) and then rounds up to
+    /// whole elements; `padded_dim` rounds to elements first and halves
+    /// those rounding up, so it is never smaller and at most one larger.
+    #[test]
+    fn mip_dimensions_round_as_addrlib() {
+        assert_eq!(dim(5, 1, 1), 2);
+        assert_eq!(padded_dim(5, 1, 1), 3);
+        assert_eq!(dim(5, 3, 1), 1);
+        assert_eq!(padded_dim(5, 3, 1), 1);
+        assert_eq!(dim(17, 0, 4), 5);
+        assert_eq!(dim(17, 1, 4), 2);
+        assert_eq!(padded_dim(17, 1, 4), 3);
+        assert_eq!(dim(1, 15, 4), 1);
+        assert_eq!(padded_dim(0, 0, 1), 1);
+        assert_eq!(dim(0, 0, 1), 1);
+        for texels in 1..=300u32 {
+            for block in [1, 4] {
+                assert_eq!(dim(texels, 0, block), padded_dim(texels, 0, block));
+                for mip in 0..MAX_MIPS {
+                    let (d, p) = (dim(texels, mip, block), padded_dim(texels, mip, block));
+                    assert!(d >= 1 && (d..=d + 1).contains(&p), "{texels} {mip} {block}");
+                    if texels.is_power_of_two() && block == 1 {
+                        assert_eq!(d, p, "{texels} {mip}");
+                    }
+                }
+            }
+        }
+    }
 }
