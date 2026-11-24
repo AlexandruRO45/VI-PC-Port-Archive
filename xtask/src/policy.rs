@@ -536,6 +536,12 @@ fn decode(root: &Path, raw: &[u8]) -> (String, bool, PathBuf) {
 }
 
 fn list_files(root: &Path, staged: bool) -> Result<Vec<File>> {
+    list_files_built_by(root, staged, std::env::current_exe().ok().as_deref())
+}
+
+/// `list_files`, passing over the untracked files of the build directory of
+/// `exe` (see `build_dir_in`).
+fn list_files_built_by(root: &Path, staged: bool, exe: Option<&Path>) -> Result<Vec<File>> {
     if staged {
         return staged_files(root);
     }
@@ -570,8 +576,10 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<File>> {
                     .push((mode.to_owned(), oid.to_owned()));
             }
         }
+        let build = exe.and_then(|exe| build_dir_in(root, exe));
         let mut files: Vec<File> = fields
             .iter()
+            .filter(|raw| index.contains_key(*raw) || !is_under(raw, build.as_deref()))
             .map(|raw| {
                 let (name, utf8_name, on_disk) = decode(root, raw);
                 let stages = index.get(raw).map(Vec::as_slice).unwrap_or_default();
@@ -598,9 +606,15 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<File>> {
         return Ok(files);
     }
     // Not a git repository: walk everything except build output.
+    let build = exe
+        .and_then(|exe| build_dir_in(root, exe))
+        .map(|dir| root.join(dir));
     Ok(walkdir::WalkDir::new(root)
         .into_iter()
-        .filter_entry(|e| !matches!(e.file_name().to_str(), Some("target" | ".git")))
+        .filter_entry(|e| {
+            !matches!(e.file_name().to_str(), Some("target" | ".git"))
+                && Some(e.path()) != build.as_deref()
+        })
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
         .filter_map(|e| {
@@ -615,6 +629,45 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<File>> {
             })
         })
         .collect())
+}
+
+/// The Cargo target directory `exe` was built in, as a `/`-separated path
+/// relative to `root`, when it lies inside `root`.
+///
+/// Cargo builds into `CARGO_TARGET_DIR` (or `build.target-dir`) wherever it
+/// points, and marks the top of it with a `CACHEDIR.TAG`. Set inside the
+/// checkout under another name than the `target` that `.gitignore` covers,
+/// for example to keep a worktree's build beside it, every object file
+/// there was listed as untracked: `cargo xtask policy` and the
+/// `repository_passes_policy` test failed on hundreds of build products,
+/// and the tests found no unseen place for their temporary repositories.
+///
+/// Only the directory this program itself runs from is passed over, and
+/// only its untracked files: what is tracked or staged there is still read,
+/// and the staged check, which decides what a commit holds, lists every
+/// staged path as before. The checkout itself is never passed over.
+fn build_dir_in(root: &Path, exe: &Path) -> Option<String> {
+    let root = root.canonicalize().ok()?;
+    let exe = exe.canonicalize().ok()?;
+    let top = exe
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| dir.starts_with(&root) && *dir != root)
+        .filter(|dir| {
+            std::fs::read(dir.join("CACHEDIR.TAG"))
+                .is_ok_and(|tag| tag.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55"))
+        })
+        .last()?;
+    let relative = top.strip_prefix(&root).ok()?.to_str()?;
+    Some(relative.replace('\\', "/"))
+}
+
+/// Whether the `/`-separated path `raw` lies under the directory `dir`.
+fn is_under(raw: &[u8], dir: Option<&str>) -> bool {
+    dir.is_some_and(|dir| {
+        raw.strip_prefix(dir.as_bytes())
+            .is_some_and(|rest| rest.first() == Some(&b'/'))
+    })
 }
 
 /// What the index holds that the next commit adds or changes.
@@ -1277,6 +1330,122 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    #[cfg(unix)]
+    const CACHEDIR_TAG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n\
+        # This file is a cache directory tag created by cargo.\n";
+
+    /// A Cargo target directory at `dir`, holding a stand-in for a program
+    /// built there and one of its object files; returns the program's path.
+    #[cfg(unix)]
+    fn fake_build_dir(dir: &std::path::Path) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir.join("debug/deps")).unwrap();
+        std::fs::write(dir.join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        std::fs::write(dir.join("debug/main.o"), b"\x7fELF\x02\x01\x01\0object").unwrap();
+        let exe = dir.join("debug/deps/xtask-0123");
+        std::fs::write(&exe, b"\x7fELF\x02\x01\x01\0program").unwrap();
+        exe
+    }
+
+    #[cfg(unix)]
+    fn names_built_by(root: &std::path::Path, exe: &std::path::Path) -> Vec<String> {
+        super::list_files_built_by(root, false, Some(exe))
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect()
+    }
+
+    /// The build directory is its outermost `CACHEDIR.TAG` carrying Cargo's
+    /// signature between the program and the checkout, never the checkout
+    /// itself, and nothing at all for a program built elsewhere.
+    #[cfg(unix)]
+    #[test]
+    fn build_directories_are_found_by_their_cache_tag() {
+        let tmp = tempdir();
+        let root = tmp.path();
+        let exe = fake_build_dir(&root.join("out/build"));
+        assert_eq!(
+            super::build_dir_in(root, &exe).as_deref(),
+            Some("out/build")
+        );
+
+        // An inner tag (cargo also tags some subdirectories) does not
+        // narrow it; an outer one widens it, up to but not past the root.
+        std::fs::write(root.join("out/build/debug/CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        assert_eq!(
+            super::build_dir_in(root, &exe).as_deref(),
+            Some("out/build")
+        );
+        std::fs::write(root.join("out/CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        assert_eq!(super::build_dir_in(root, &exe).as_deref(), Some("out"));
+        std::fs::write(root.join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        assert_eq!(super::build_dir_in(root, &exe).as_deref(), Some("out"));
+
+        // A tag without Cargo's signature is not one.
+        let other = tempdir();
+        let exe = fake_build_dir(&other.path().join("b"));
+        std::fs::write(other.path().join("b/CACHEDIR.TAG"), b"not a tag\n").unwrap();
+        assert_eq!(super::build_dir_in(other.path(), &exe), None);
+
+        // A program built outside the checkout passes nothing over.
+        assert_eq!(
+            super::build_dir_in(root, &fake_build_dir(&other.path().join("c"))),
+            None
+        );
+
+        assert!(super::is_under(b"out/x", Some("out")));
+        assert!(!super::is_under(b"output/x", Some("out")));
+        assert!(!super::is_under(b"out", Some("out")));
+        assert!(!super::is_under(b"out/x", None));
+    }
+
+    /// A CARGO_TARGET_DIR inside the checkout under another name than the
+    /// ignored `target`, such as one kept beside a worktree, made the full
+    /// check fail on every object file built there. Its untracked files are
+    /// now passed over, in a repository and outside one; a file tracked
+    /// there, or anything outside it, is still read, as is a build directory
+    /// other than the one the check runs from.
+    #[cfg(unix)]
+    #[test]
+    fn the_running_build_directory_is_passed_over() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join("a.rs"), b"fn a() {}\n").unwrap();
+        let exe = fake_build_dir(&root.join("build-out"));
+        let other = fake_build_dir(&root.join("build-other"));
+        // Not passed over: the sibling whose name extends it.
+        std::fs::create_dir(root.join("build-outer")).unwrap();
+        std::fs::write(root.join("build-outer/x.rs"), b"fn x() {}\n").unwrap();
+        let in_build = |names: &[String]| -> Vec<String> {
+            names
+                .iter()
+                .filter(|n| n.starts_with("build-out/"))
+                .cloned()
+                .collect()
+        };
+
+        let listed = names_built_by(root, &exe);
+        assert!(in_build(&listed).is_empty(), "{listed:?}");
+        assert!(listed.contains(&"a.rs".to_owned()));
+        assert!(listed.contains(&"build-outer/x.rs".to_owned()));
+        assert!(listed.contains(&"build-other/debug/main.o".to_owned()));
+        let listed = names_built_by(root, &other);
+        assert!(listed.contains(&"build-out/debug/main.o".to_owned()));
+
+        git_str(root, &["add", "-f", "build-out/debug/main.o"]);
+        let listed = names_built_by(root, &exe);
+        assert_eq!(in_build(&listed), ["build-out/debug/main.o"]);
+        assert_eq!(names(root, true), ["build-out/debug/main.o"]);
+
+        let outer = tempdir();
+        let plain = outer.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join("a.rs"), b"fn a() {}\n").unwrap();
+        let exe = fake_build_dir(&plain.join("build-out"));
+        assert_eq!(names_built_by(&plain, &exe), ["a.rs"]);
+    }
+
     /// `path` quoted for `sh`, for the scripts tests write: a TMPDIR holding
     /// `'` made the hook and filter commands built from it shell syntax
     /// errors, and the git commands running them failed.
@@ -1286,7 +1455,8 @@ mod tests {
     }
 
     /// Whether nothing under `dir` is listed by the full check of `checkout`:
-    /// it is elsewhere, inside a `.git` directory, or ignored there.
+    /// it is elsewhere, inside a `.git` directory, in the build directory the
+    /// tests run from, or ignored there.
     ///
     /// Git never lists what is under `.git`, and the walk skips it too, but
     /// `check-ignore` calls such a path not ignored: a TMPDIR kept in the
@@ -1298,6 +1468,16 @@ mod tests {
             return true;
         };
         if relative.components().any(|c| c.as_os_str() == ".git") {
+            return true;
+        }
+        // The build directory the tests run from is passed over by the full
+        // check wherever it is (see `build_dir_in`), ignored or not.
+        let build = std::env::current_exe()
+            .ok()
+            .and_then(|exe| super::build_dir_in(checkout, &exe));
+        if let Some(relative) = relative.to_str()
+            && super::is_under(relative.replace('\\', "/").as_bytes(), build.as_deref())
+        {
             return true;
         }
         let status = super::git_command(checkout)
