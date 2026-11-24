@@ -206,4 +206,58 @@ mod tests {
         let base = StaticSampler::from_words([0, 0x0010_0400, 0, 0]);
         assert_eq!((base.min_lod, base.max_lod), (0.0, 0.0));
     }
+
+    /// Each field of the sampler words maps on its own: every address mode on
+    /// each axis, the anisotropy clamp at D3D12's 16, every comparison
+    /// function, every border colour, and the reserved reduction.
+    #[test]
+    fn each_field_decodes_on_its_own() {
+        let s = |w0: u32, w2: u32, w3: u32| StaticSampler::from_words([w0, 0, w2, w3]);
+        // Wrap, mirror, clamp, mirror once; the half-border modes (4, 5) and
+        // the border modes (6, 7) become clamp, mirror once, border and
+        // mirror once.
+        let modes = [1, 2, 3, 5, 3, 5, 4, 5];
+        for (m, want) in modes.into_iter().enumerate() {
+            let m = m as u32;
+            assert_eq!(s(m, 0, 0).address, [want, 1, 1], "U mode {m}");
+            assert_eq!(s(m << 3, 0, 0).address, [1, want, 1], "V mode {m}");
+            assert_eq!(s(m << 6, 0, 0).address, [1, 1, want], "W mode {m}");
+        }
+        // log2 anisotropy 0-4 is 1-16; 5-7 would pass D3D12's 16 and clamp.
+        let aniso: Vec<u32> = (0..8).map(|n| s(n << 9, 0, 0).max_anisotropy).collect();
+        assert_eq!(aniso, [1, 2, 4, 8, 16, 16, 16, 16]);
+        // Never through always: `D3D12_COMPARISON_FUNC` counts from 1.
+        let funcs: Vec<u32> = (0..8).map(|n| s(n << 12, 0, 0).comparison).collect();
+        assert_eq!(funcs, [1, 2, 3, 4, 5, 6, 7, 8]);
+        // Transparent black, opaque black, opaque white; custom falls back to
+        // transparent black.
+        let borders: Vec<u32> = (0..4).map(|n| s(0, 0, n << 30).border).collect();
+        assert_eq!(borders, [0, 1, 2, 0]);
+        // The reserved reduction (3) filters, as 0 does, for point and
+        // anisotropic filters alike.
+        assert_eq!(s(0x6000_0000, 0, 0).filter, 0);
+        assert_eq!(s(0x6000_0000, 0x00F0_0000, 0).filter, 0x55);
+        // Fields outside the decoded bits change nothing.
+        assert_eq!(s(0x8000_0000 | 0x0FFF_8000, 0, 0x3FFF_FFFF), s(0, 0, 0));
+    }
+
+    /// A single anisotropic filter, magnification or minification, makes the
+    /// whole sampler anisotropic, and the mip filter does not change it.
+    #[test]
+    fn either_anisotropic_filter_is_anisotropic() {
+        let filter = |w2: u32| StaticSampler::from_words([0, 0, w2, 0]).filter;
+        for mag in 0..4u32 {
+            for min in 0..4u32 {
+                for mip in 0..3u32 {
+                    let f = filter(mag << 20 | min << 22 | mip << 26);
+                    if mag >= 2 || min >= 2 {
+                        assert_eq!(f, 0x55, "mag {mag} min {min} mip {mip}");
+                    } else {
+                        let want = min << 4 | mag << 2 | u32::from(mip == 2);
+                        assert_eq!(f, want, "mag {mag} min {min} mip {mip}");
+                    }
+                }
+            }
+        }
+    }
 }
