@@ -258,6 +258,11 @@ thread_local! {
 }
 
 /// Names the pipeline this thread makes next.
+/// The cache directory the library lives in, once a cache was chosen.
+pub(crate) fn cache_dir() -> Option<std::path::PathBuf> {
+    DIR.get().cloned()
+}
+
 pub(crate) fn label(text: String) {
     LABEL.with(|l| *l.borrow_mut() = text);
 }

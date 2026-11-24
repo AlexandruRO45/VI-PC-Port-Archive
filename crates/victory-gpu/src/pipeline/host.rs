@@ -591,6 +591,15 @@ impl HostPipeline {
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
+        // A module this build's compiler faults on is refused before the
+        // create: the session loses those draws, not itself.
+        if let Some((s, _)) = stages
+            .iter()
+            .find(|(s, _)| super::poison::poisoned(s.stage, &s.hash))
+        {
+            super::poison::note_refusal(s.stage, &s.hash);
+            return refuse("a module the driver's compiler faults on", shaders);
+        }
         if mesh.is_some() && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
