@@ -46,11 +46,11 @@ struct ImageData {
 }
 
 impl ImageData {
-    fn set(&self, index: u32, words: [u32; 2]) {
-        // SAFETY: a persistent mapping with two dwords per slot. Callers
+    fn set(&self, index: u32, words: [u32; 4]) {
+        // SAFETY: a persistent mapping with four dwords per slot. Callers
         // serialize writes with the same lock as descriptor mirroring.
         unsafe {
-            (self.mapped as *mut [u32; 2])
+            (self.mapped as *mut [u32; 4])
                 .add(index as usize)
                 .write(words)
         };
@@ -323,7 +323,7 @@ impl HostHeap {
             return Some((data.buffer.clone(), data.handle));
         }
         let host = host()?;
-        let elements = self.count.checked_mul(2)?;
+        let elements = self.count.checked_mul(4)?;
         let (buffer, mapped) = host.upload_buffer(u64::from(elements) * 4)?;
         let slot = self.dynamic(1)?;
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -354,7 +354,7 @@ impl HostHeap {
         };
         for (index, &key) in made.iter().enumerate() {
             let words = if key == 0 {
-                [0; 2]
+                [0; 4]
             } else {
                 image_words_at(key as u32, (key >> 32) as u32)
             };
@@ -462,7 +462,7 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.make_null(index);
                 if let Some(data) = self.image_data.get() {
-                    data.set(index, [0; 2]);
+                    data.set(index, [0; 4]);
                 }
             }
             return None;
@@ -536,13 +536,56 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     }
 }
 
-fn image_words_at(index: u32, generation: u32) -> [u32; 2] {
+fn image_words_at(index: u32, generation: u32) -> [u32; 4] {
     let views = super::VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     views
         .list
         .get(index as usize)
         .filter(|entry| entry.generation == generation)
-        .map_or([0; 2], |entry| entry.image_words)
+        .map_or([0; 4], |entry| entry.image_words)
+}
+
+/// The four dwords the shader's descriptor data holds per heap slot: for an
+/// image the packed dimensions and the first mip, for a buffer view (dword
+/// 2) its element stride, the field a console buffer descriptor keeps in
+/// dword 1 bits [29:16].
+pub(super) fn descriptor_words(view: &View) -> [u32; 4] {
+    if let Some([size, mip]) = image_words(view) {
+        return [size, mip, 0, 0];
+    }
+    [0, 0, buffer_stride(view).unwrap_or(0), 0]
+}
+
+/// Bytes per element of a buffer view: its structure stride, 4 for a raw
+/// view, the format's size for a typed one.
+fn buffer_stride(view: &View) -> Option<u32> {
+    let srv = |words: &[u32; 10]| element_size(&srv_desc(words));
+    let uav = |words: &[u32; 10]| {
+        let desc = uav_desc(words);
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        if buffer.StructureByteStride > 0 {
+            Some(u64::from(buffer.StructureByteStride))
+        } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+            Some(4)
+        } else {
+            crate::resource::element(desc.Format.0 as u32).map(|(bytes, _)| bytes)
+        }
+    };
+    let bytes = match view {
+        View::Shader(r, Some(desc)) => {
+            crate::resource::buffer_bytes(*r as crate::object::This)?;
+            srv(desc)
+        }
+        View::Placed(false, resource, desc) if resource[0] == 1 => srv(desc[..10].try_into().ok()?),
+        View::Unordered(r, _, Some(desc)) => {
+            crate::resource::buffer_bytes(*r as crate::object::This)?;
+            uav(desc)?
+        }
+        View::Placed(true, resource, desc) if resource[0] == 1 => uav(desc[..10].try_into().ok()?)?,
+        _ => return None,
+    };
+    u32::try_from(bytes).ok().filter(|&b| b < 1 << 14)
 }
 
 /// RDNA2 stores the dimensions of mip zero and the view's first mip.
@@ -1132,6 +1175,26 @@ mod tests {
         );
         resource[0] = 1; // Buffer.
         assert_eq!(image_words(&View::Placed(true, resource, uav)), None);
+    }
+
+    #[test]
+    fn descriptor_words_hold_a_buffer_view_stride() {
+        let mut resource = [0; 14];
+        resource[0] = 1; // Buffer.
+        let mut srv = [0; 16];
+        srv[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        srv[7] = 48; // StructureByteStride follows FirstElement and NumElements.
+        assert_eq!(
+            descriptor_words(&View::Placed(false, resource, srv)),
+            [0, 0, 48, 0]
+        );
+        // Raw.
+        srv[7] = 0;
+        srv[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+        assert_eq!(
+            descriptor_words(&View::Placed(false, resource, srv))[2],
+            4
+        );
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's

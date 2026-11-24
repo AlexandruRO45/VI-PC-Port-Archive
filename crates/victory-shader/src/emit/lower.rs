@@ -1441,43 +1441,64 @@ impl<'a> Lower<'a> {
                 return Err("a descriptor's address or format read as data");
             }
             let index = self.heap_index(site, 0, false)?;
-            let h = self.s.root_srv_handle(DESCRIPTOR_DATA_SLOT);
-            let c = self.cur;
-            // Two dwords per heap entry: packed height/width, then base mip.
-            let three = self.s.m.i32(3);
-            let mut at = self.s.m.bin(c, Bin::Shl, index, three);
-            if word == 3 {
-                let four = self.s.m.i32(4);
-                at = self.s.m.bin(c, Bin::Add, at, four);
-            }
-            let (unused, mask, align) = (
-                self.s.m.undef(self.s.t.i32),
-                self.s.m.i8(1),
-                self.s.m.i32(4),
-            );
-            let ret = self
-                .s
-                .m
-                .named_struct("dx.types.ResRet.i32", vec![self.s.t.i32; 5]);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.i32",
-                Attr::ReadOnly,
-                ret,
-                139,
-                &[h, at, unused, mask, align],
-            );
-            let x = self.s.m.extract(c, r, 0);
+            let x = self.slot_data(index, if word == 3 { 1 } else { 0 });
             let (op, shift) = match word {
                 1 => (Bin::Shl, 30),
                 2 => (Bin::LShr, 2),
                 3 => (Bin::Shl, 12),
                 _ => unreachable!(),
             };
+            let c = self.cur;
             let shift = self.s.m.i32(shift);
             return Ok(self.s.m.bin(c, op, x, shift));
         }
         self.operand(inst, op)
+    }
+
+    /// Dword `field` of the host's per-slot descriptor data for heap entry
+    /// `index`: four dwords per slot, the packed image height and width, the
+    /// base mip, then a buffer view's element stride.
+    fn slot_data(&mut self, index: V, field: u32) -> V {
+        let h = self.s.root_srv_handle(DESCRIPTOR_DATA_SLOT);
+        let c = self.cur;
+        let four = self.s.m.i32(4);
+        let mut at = self.s.m.bin(c, Bin::Shl, index, four);
+        if field != 0 {
+            let k = self.s.m.i32(4 * field);
+            at = self.s.m.bin(c, Bin::Add, at, k);
+        }
+        let (unused, mask, align) = (
+            self.s.m.undef(self.s.t.i32),
+            self.s.m.i8(1),
+            self.s.m.i32(4),
+        );
+        let ret = self
+            .s
+            .m
+            .named_struct("dx.types.ResRet.i32", vec![self.s.t.i32; 5]);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.i32",
+            Attr::ReadOnly,
+            ret,
+            139,
+            &[h, at, unused, mask, align],
+        );
+        self.s.m.extract(c, r, 0)
+    }
+
+    /// The byte stride of the buffer descriptor `src` for a record index
+    /// when the program's metadata does not give one: the console keeps it
+    /// in dword 1 bits [29:16], which the host mirrors for table entries.
+    fn buffer_stride(&mut self, src: &Source) -> Result<V, Why> {
+        match src {
+            Source::Loaded { load, first } => {
+                let index = self.heap_index(*load, *first, false)?;
+                Ok(self.slot_data(index, 2))
+            }
+            Source::Built { bits, .. } => Ok(self.s.m.i32(bits >> 16 & 0x3fff)),
+            _ => Err("a structured buffer of unknown stride"),
+        }
     }
 
     /// GFX10 puts an inline f16 constant in the low half of the operand.
@@ -6383,7 +6404,10 @@ impl<'a> Lower<'a> {
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            "image_gather4" | "image_gather4_l" | "image_gather4_l_o" | "image_gather4_lz"
+            | "image_gather4_lz_o" => {
+                (73, true)
+            }
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -6628,6 +6652,37 @@ impl<'a> Lower<'a> {
                     if dmask.count_ones() != 1 {
                         return Err("a gather of several channels");
                     }
+                    if name == "image_gather4_l" || name == "image_gather4_l_o" {
+                        // DXIL's gather reads the view's first level, as
+                        // the console does at level 0. Another level takes
+                        // the four texels one by one.
+                        let raw = addr_val(self, first + coords)?;
+                        let zero = self.s.m.int_value(raw).is_some_and(|bits| {
+                            bits & if *a16 { 0x7fff } else { 0x7fff_ffff } == 0
+                        });
+                        if !zero {
+                            if !matches!(kind, 2 | 6) || *d16 {
+                                return Err("a gather at a level of this kind");
+                            }
+                            let lod = to_float(self, raw);
+                            // The texel offsets, 6-bit signed fields.
+                            let mut texel_offsets = [None; 2];
+                            if offset_word {
+                                let w = addr_val(self, 0)?;
+                                for (k, at) in [(0, 26), (1, 18)] {
+                                    let left = self.s.m.i32(at);
+                                    let t = self.s.m.bin(c, Bin::Shl, w, left);
+                                    let k26 = self.s.m.i32(26);
+                                    let x = self.s.m.bin(c, Bin::AShr, t, k26);
+                                    texel_offsets[k] =
+                                        Some(self.s.m.cast(c, Cast::SiToFp, x, self.s.t.f32));
+                                }
+                            }
+                            return self.gather_at_level(
+                                inst, guard, [h, sh], cs, lod, texel_offsets, u32::from(*dmask), data,
+                            );
+                        }
+                    }
                     if offset_word {
                         let w = addr_val(self, 0)?;
                         for (k, at) in [(0, 26), (1, 18)] {
@@ -6713,6 +6768,86 @@ impl<'a> Lower<'a> {
         }
         for (k, x) in xs.into_iter().enumerate() {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
+        }
+        Ok(())
+    }
+
+    /// A gather at level `lod` (rounded to a level the view has), by
+    /// sampling the centers of the four texels the footprint covers: the
+    /// sampler's addressing applies, and a texel center filters to the
+    /// texel. Results go to the VGPRs as the gather's (x, y, z, w): the
+    /// texels (i, j+1), (i+1, j+1), (i+1, j), (i, j).
+    #[allow(clippy::too_many_arguments)]
+    fn gather_at_level(
+        &mut self,
+        inst: &Inst,
+        guard: Option<V>,
+        [h, sh]: [V; 2],
+        cs: Vec<V>,
+        lod: V,
+        offsets: [Option<V>; 2],
+        dmask: u32,
+        data: &Operand,
+    ) -> Result<(), Why> {
+        let Operand::Vector { reg, .. } = *data else {
+            return Err("an image result");
+        };
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let half = self.s.m.f32(0.5f32.to_bits());
+        let one = self.s.m.f32(1.0f32.to_bits());
+        let zero = self.s.m.i32(0);
+        // The nearest level, saturated into 0..levels.
+        let rounded = self.s.m.bin(c, Bin::Add, lod, half);
+        let rounded = self.unary(27, rounded);
+        let level = self.s.m.cast(c, Cast::FpToUi, rounded, i32t);
+        let all = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, zero]);
+        let levels = self.s.m.extract(c, all, 3);
+        let one_i = self.s.m.i32(1);
+        let last = self.s.m.bin(c, Bin::Sub, levels, one_i);
+        let inside = self.s.m.cmp(c, pred::IULT, level, levels);
+        let level = self.s.m.select(c, inside, level, last);
+        let d = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, level]);
+        let lod = self.s.m.cast(c, Cast::UiToFp, level, self.s.t.f32);
+        let mut texels = [(cs[0], cs[0]); 2];
+        for (k, texel) in texels.iter_mut().enumerate() {
+            let n = self.s.m.extract(c, d, k as u32);
+            let n = self.s.m.cast(c, Cast::UiToFp, n, self.s.t.f32);
+            let scaled = self.s.m.bin(c, Bin::Mul, cs[k], n);
+            let corner = self.s.m.bin(c, Bin::Sub, scaled, half);
+            let mut first = self.unary(27, corner);
+            if let Some(o) = offsets[k] {
+                first = self.s.m.bin(c, Bin::Add, first, o);
+            }
+            let first = self.s.m.bin(c, Bin::Add, first, half);
+            let next = self.s.m.bin(c, Bin::Add, first, one);
+            *texel = (
+                self.s.m.bin(c, Bin::SDiv, first, n),
+                self.s.m.bin(c, Bin::SDiv, next, n),
+            );
+        }
+        let iu = self.s.m.undef(i32t);
+        let channel = dmask.trailing_zeros();
+        for (k, (dx, dy)) in [(0, 1), (1, 1), (1, 0), (0, 0)].into_iter().enumerate() {
+            let x = if dx == 0 { texels[0].0 } else { texels[0].1 };
+            let y = if dy == 0 { texels[1].0 } else { texels[1].1 };
+            let args = [h, sh, x, y, cs[2], cs[3], zero, zero, iu, lod];
+            let r = self.s.op(
+                c,
+                "sampleLevel.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                62,
+                &args,
+            );
+            let v = self.s.m.extract(c, r, channel);
+            let v = self.as_int(v);
+            self.write(inst, Reg::V(reg + k as u8), v, guard);
         }
         Ok(())
     }
@@ -6885,6 +7020,17 @@ impl<'a> Lower<'a> {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
+        }
+        // Without a stride in the metadata the record index addresses bytes:
+        // a raw access at index * stride + offset.
+        if let Some(record) = index
+            && !typed
+            && !used.is_some_and(|u| u.stride >= 4 && u.stride.is_multiple_of(4))
+        {
+            let stride = self.buffer_stride(src)?;
+            let base = self.s.m.bin(c, Bin::Mul, record, stride);
+            off = self.s.m.bin(c, Bin::Add, off, base);
+            index = None;
         }
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
