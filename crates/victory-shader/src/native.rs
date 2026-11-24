@@ -1123,7 +1123,7 @@ mod tests {
         data
     }
 
-    /// Where a one-program blob's stage data starts.
+    /// Where the selected stage's data starts in the blob.
     fn stage_data_at(blob: &[u8], stage: HwStage) -> usize {
         FSSM_HEADER
             + u64_at(blob, FSSM_HEADER + slot(stage)).unwrap() as usize
@@ -2420,6 +2420,49 @@ mod tests {
         for bad in [MAX_LDS_BYTES + 1, u32::MAX] {
             assert_eq!(refused_blob(&lds(bad)), "implausible LDS size", "{bad}");
         }
+    }
+
+    #[test]
+    fn sparse_vertex_inputs_can_interleave_at_the_last_vgpr() {
+        let mut blob = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let data = stage_data_at(&blob, HwStage::Vs);
+        let regs = data - RECORD_SIZE as usize + RECORD_REGS;
+        blob[regs..][..4].copy_from_slice(&256u32.to_le_bytes());
+        blob[data + VS_INPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+        let inputs = &mut blob[data + VS_INPUTS..][..10];
+        // Both rows start at v252. Row 0 loads x and z, row 1 loads y and w.
+        inputs.copy_from_slice(&[0, 0, 0x5, 252, 0, 0, 1, 0xa, 252, 0]);
+        let parse = |blob: &[u8]| native_programs(&part(&[(KIND_NATIVE, &xbch(blob))]));
+        let programs = parse(&blob).unwrap();
+        let StageIo::Vs { inputs, .. } = &programs[0].io else {
+            panic!("expected vertex inputs");
+        };
+        assert_eq!((inputs[0].mask, inputs[1].mask), (0x5, 0xa));
+
+        // Enabling z in the second row makes both rows load v254.
+        blob[data + VS_INPUTS + 7] |= 0x4;
+        assert_eq!(why_refused(parse(&blob)), "vertex inputs overlap");
+    }
+
+    #[test]
+    fn a_vertex_input_uses_its_own_stages_vgpr_budget() {
+        // Store the pixel record first, opposite the slot traversal order.
+        let mut blob = fssm(&[(HwStage::Ps, &PS_CODE), (HwStage::Vs, &VS_CODE)]);
+        let vs = stage_data_at(&blob, HwStage::Vs);
+        let ps = stage_data_at(&blob, HwStage::Ps);
+        blob[vs + VS_INPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+        blob[vs + VS_INPUTS..][..5].copy_from_slice(&[0, 0, 0x1, 7, 0]);
+        let mut program = |vs_count: u32, ps_count: u32| {
+            for (data, count) in [(vs, vs_count), (ps, ps_count)] {
+                let regs = data - RECORD_SIZE as usize + RECORD_REGS;
+                blob[regs..][..4].copy_from_slice(&count.to_le_bytes());
+            }
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        let programs = program(8, 7).unwrap();
+        assert_eq!((programs[0].stage, programs[0].vgprs), (HwStage::Vs, 8));
+        assert_eq!((programs[1].stage, programs[1].vgprs), (HwStage::Ps, 7));
+        assert_eq!(why_refused(program(7, 8)), "vertex input outside the VGPRs");
     }
 
     #[test]
