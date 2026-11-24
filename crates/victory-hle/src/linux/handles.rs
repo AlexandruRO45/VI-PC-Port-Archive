@@ -480,9 +480,10 @@ static MUTEXES: Mutex<Vec<Weak<KMutex>>> = Mutex::new(Vec::new());
 
 impl KMutex {
     pub(crate) fn new(owned: bool) -> Arc<KMutex> {
-        let me = guest_thread::current_id();
+        // An owner needs a thread object, which abandons the mutex at its exit.
+        let me = if owned { current_thread().id() } else { 0 };
         let m = Arc::new(KMutex {
-            owner: AtomicU32::new(if owned { me } else { 0 }),
+            owner: AtomicU32::new(me),
             recursion: AtomicU32::new(owned.into()),
             abandoned: AtomicBool::new(false),
             took_abandoned: AtomicBool::new(false),
@@ -1008,6 +1009,8 @@ mod tests {
 
     #[test]
     fn mutex_is_recursive_and_abandoned_by_an_exiting_owner() {
+        let owned = std::thread::spawn(|| KMutex::new(true)).join().unwrap();
+        assert_eq!(wait(&[&*owned], false, 0), WAIT_ABANDONED_0);
         let m = KMutex::new(false);
         assert_eq!(wait(&[&*m], false, 0), WAIT_OBJECT_0);
         assert_eq!(wait(&[&*m], false, 0), WAIT_OBJECT_0);
