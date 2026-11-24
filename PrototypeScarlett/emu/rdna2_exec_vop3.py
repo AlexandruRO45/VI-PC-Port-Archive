@@ -7,6 +7,7 @@ Sémantique d'après la documentation publique d'AMD (« RDNA 2 Instruction Set 
 """
 import math
 
+from emu import rdna2_exec_f16
 from emu.rdna2_exec_ops import (MASK32, VECTOR, VECTOR_COMPARE, _float_op, _fma, bits_float, float_bits,
                                 ldexp, signed)
 
@@ -106,7 +107,7 @@ CARRY = {
 }
 LANE_OPERATIONS = frozenset({"v_readlane_b32", "v_writelane_b32", "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"})
 EXECUTABLE = frozenset(set(VECTOR) - {"v_readfirstlane_b32"} | set(VECTOR_COMPARE) | set(VECTOR3) | set(CARRY)
-                       | LANE_OPERATIONS)
+                       | LANE_OPERATIONS | set(rdna2_exec_f16.OPERATIONS))
 
 
 class Fields:
@@ -116,6 +117,7 @@ class Fields:
         self.vdst = word & 0xFF                 # VGPR, ou SGPR pour les comparaisons et readlane
         self.sdst = (word >> 8) & 0x7F          # VOP3b : destination de la retenue
         self.abs = (word >> 8) & 0x7
+        self.op_sel = (word >> 11) & 0xF         # 16 bits : moitié haute des sources 0-2, de vdst (bit 3)
         self.clamp = (word >> 15) & 1
         self.sources = ((word >> 32) & 0x1FF, (word >> 41) & 0x1FF, (word >> 50) & 0x1FF)
         self.omod = (word >> 59) & 0x3
@@ -146,6 +148,8 @@ def _output(fields, value, is_float):
 def execute(wave, name, opcode, word, literal):
     """Exécute une instruction VOP3 dont le nom est dans EXECUTABLE."""
     fields = Fields(word)
+    if name in rdna2_exec_f16.OPERATIONS:
+        return rdna2_exec_f16.execute_vop3(wave, name, fields, literal)
     if name in LANE_OPERATIONS:
         return _lane_operation(wave, name, fields, literal)
     if opcode < COMPARE_END:
