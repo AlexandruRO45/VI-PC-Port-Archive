@@ -2197,15 +2197,38 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         // In place the shaders write title memory itself: no snapshot, no
-        // compare, nothing to copy back, and no wait on its account.
+        // compare, nothing to copy back ([`Shadow::writing`] does nothing).
+        // The range is still declared: until the submission has run, title
+        // memory there is not what the title will read, so the flights'
+        // rules (late wait, the relay) must know it (`host::in_place_writes`;
+        // before, nothing was declared and late wait could let a read of it
+        // through).
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
-        if self.place.is_some() {
-            return;
-        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// Whether this is title memory in place (`crate::inplace`), not a copy.
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
+    /// For tests: title memory `[start, start + len)` in place over `placed`.
+    #[cfg(test)]
+    pub(crate) fn test_in_place(placed: crate::inplace::Placed, start: u64, len: u64) -> Arc<Shadow> {
+        crate::inplace::counted(false, len);
+        Arc::new(Shadow::placed(placed, start, len, false))
+    }
+
+    /// For tests: a copy of `[start, start + len)` in `buffer` (nothing
+    /// copied).
+    #[cfg(test)]
+    pub(crate) fn test_copy(buffer: ID3D12Resource, start: u64, len: u64) -> Arc<Shadow> {
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Arc::new(Shadow::new(buffer, std::ptr::null_mut(), gpu, start, len))
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders

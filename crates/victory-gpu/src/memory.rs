@@ -83,6 +83,24 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// The directory's offset for title address `at` (in `shadow`): its byte
+/// offset from the copy's host buffer's first byte. For title memory in
+/// place (`crate::inplace`) the buffer begins on the 64 KiB line, or at an
+/// arena's base, before the title memory: `Shadow::offset` adds that bias
+/// (design §11, bug 1: the offset from the title memory's first byte was
+/// off by the bias).
+fn entry_offset(shadow: &Shadow, at: u64) -> u32 {
+    shadow.offset(at) as u32
+}
+
+/// The bytes of a copy's raw view, from the host buffer's first byte: the
+/// title memory's end at its offset (with a bias, `len` alone cut the view
+/// `bias` bytes short of the title memory's end).
+fn view_bytes(shadow: &Shadow) -> u64 {
+    let (start, len) = shadow.span();
+    shadow.offset(start) + len
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
@@ -169,7 +187,7 @@ impl Memory {
                     // SAFETY: as above; the offset first, as below.
                     unsafe {
                         if other.read() == 0 {
-                            other.add(1).write_volatile((at - first) as u32);
+                            other.add(1).write_volatile(entry_offset(&shadow, at));
                             other.write_volatile(n as u32 + 1);
                         }
                     }
@@ -185,11 +203,11 @@ impl Memory {
                 return;
             }
         };
-        let offset = shadow.offset_in(start).unwrap_or(0);
+        let offset = entry_offset(&shadow, start);
         // The offset first: a shader that sees the number sees it too.
         // SAFETY: inside the directory's mapping.
         unsafe {
-            entry.add(1).write_volatile(offset as u32);
+            entry.add(1).write_volatile(offset);
             entry.write_volatile(n as u32 + 1);
         }
     }
@@ -286,8 +304,7 @@ pub(crate) fn ready(
         }
     };
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, view_bytes(shadow));
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
     // Once per list, and for copies numbered since: the builder alone
@@ -316,4 +333,48 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PAGE, entry_offset, view_bytes};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+    use windows_sys::Win32::System::Memory as mem;
+
+    /// Design §11, bug 1: a raw address reaches the title's byte in a copy
+    /// in place, whose buffer begins `bias` bytes before the title memory;
+    /// and the copy's view reaches its last byte. The software adapter
+    /// reads what the directory's offset names.
+    #[test]
+    fn warp_raw_addresses_into_memory_in_place_take_the_bias() {
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        // SAFETY: an allocation of the test's own.
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), 8 << 16, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
+            let (start, len) = (base as u64 + 0x1230, 3 * PAGE + 0x40);
+            for i in 0..len as usize {
+                base.add(0x1230 + i).write((i as u8).wrapping_mul(13).wrapping_add(i as u8 >> 3));
+            }
+            let placed = crate::inplace::place_part(&device, start, len).unwrap();
+            let bias = placed.bias;
+            assert_eq!(bias, 0x1230);
+            let shadow = crate::shadow::Shadow::test_in_place(placed, start, len);
+            // The first whole directory page in the copy.
+            let page = start.next_multiple_of(PAGE);
+            let offset = entry_offset(&shadow, page);
+            assert_eq!(u64::from(offset), page - start + bias, "the offset from the buffer's first byte");
+            assert_eq!(view_bytes(&shadow), len + bias, "the view reaches the title memory's end");
+            let mut rig = crate::inplace::Rig::new(&device).unwrap();
+            let got = rig.fetch(&shadow.buffer, u64::from(offset), 4096).unwrap();
+            assert_eq!(got, std::slice::from_raw_parts(page as *const u8, 4096), "the page's own bytes");
+            let last = rig.fetch(&shadow.buffer, view_bytes(&shadow) - 16, 16).unwrap();
+            assert_eq!(last, std::slice::from_raw_parts((start + len - 16) as *const u8, 16), "the last bytes are in the view");
+            drop(shadow);
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
 }

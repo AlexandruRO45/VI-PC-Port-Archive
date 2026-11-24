@@ -1963,6 +1963,8 @@ struct Sent {
     number: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// What its shaders may write in place ([`in_place_writes`]).
+    in_place: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
@@ -1978,6 +1980,8 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// What its shaders may write in place ([`in_place_writes`]).
+    in_place: Vec<(usize, usize)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -2681,7 +2685,9 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
+            if let Step::GpuWrite(shadow, address, len) = step
+                && !shadow.in_place()
+            {
                 let range = (*address, *address + *len);
                 match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
                     Some((_, ranges)) => {
@@ -2709,6 +2715,87 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 pub(crate) fn walls_trace() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WALLS_TRACE").is_some_and(|v| v == "1" || v == "2"))
+}
+
+/// The title memory the shaders of `runs` may write in place
+/// (`crate::inplace`: a buffer placed over the title's own memory), in
+/// order and joined. Nothing is copied back for it (the shaders write the
+/// title's bytes themselves), but until the submission has run the title
+/// memory there is not final: these ranges join the flights' `written`
+/// ([`Line`]) so that late wait and the relay hold back whatever reads
+/// them, as for ranges of copies (design §11, bug 2).
+fn in_place_writes(runs: &[&HostList]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for list in runs {
+        ranges.extend(in_place_ranges(&list.deferred().copies));
+    }
+    join_ranges(&mut ranges, []);
+    ranges
+}
+
+/// Of `steps`, the ranges declared written in place, in order, joined.
+fn in_place_ranges<'a>(steps: impl IntoIterator<Item = &'a Step>) -> Vec<(usize, usize)> {
+    let mut ranges: Vec<(usize, usize)> = steps
+        .into_iter()
+        .filter_map(|step| match step {
+            Step::GpuWrite(shadow, address, len) if shadow.in_place() => Some((*address, *address + *len)),
+            _ => None,
+        })
+        .collect();
+    join_ranges(&mut ranges, []);
+    ranges
+}
+
+#[cfg(test)]
+mod in_place_tests {
+    use super::{Step, in_place_ranges, join_ranges, touches};
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    /// Shader writes to title memory in place are declared (design §11,
+    /// bug 2): they come out of a submission's steps as ranges for the
+    /// flights' `written`, which late wait and the relay test reads
+    /// against; ranges of copies stay with the copy-back and are not
+    /// counted twice.
+    #[test]
+    fn warp_in_place_writes_reach_the_flights() {
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        use windows::core::Interface;
+        // SAFETY: an allocation of the test's own.
+        unsafe {
+            use windows_sys::Win32::System::Memory as mem;
+            let base = mem::VirtualAlloc(std::ptr::null(), 4 << 16, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as u64;
+            let (start, len) = (base + 0x100, 0x2_0000);
+            let placed = crate::inplace::place_part(&device, start, len).unwrap();
+            let in_place = crate::shadow::Shadow::test_in_place(placed, start, len);
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut buffer: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &crate::inplace::buffer_desc(1 << 16, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                .unwrap();
+            let copy = crate::shadow::Shadow::test_copy(buffer.unwrap(), 0x7_0000_0000, 1 << 16);
+            let s = start as usize;
+            let steps = [
+                Step::GpuWrite(in_place.clone(), s + 0x1000, 0x100),
+                Step::GpuWrite(copy.clone(), 0x7_0000_0000, 0x100),
+                Step::GpuWrite(in_place.clone(), s + 0x1080, 0x200),
+                Step::GpuWrite(in_place.clone(), s + 0x8000, 0x10),
+            ];
+            let ranges = in_place_ranges(&steps);
+            assert_eq!(ranges, [(s + 0x1000, s + 0x1280), (s + 0x8000, s + 0x8010)]);
+            // As the line joins them: a read of the written memory is seen.
+            let mut written = Vec::new();
+            join_ranges(&mut written, ranges);
+            assert!(touches(&written, s + 0x1200, s + 0x1300));
+            assert!(!touches(&written, s + 0x2000, s + 0x3000));
+            assert!(!touches(&written, 0x7_0000_0000, 0x7_0000_0100), "the copy's range is the copy-back's");
+            drop(steps);
+            drop((in_place, copy));
+            mem::VirtualFree(base as *mut std::ffi::c_void, 0, mem::MEM_RELEASE);
+        }
+    }
 }
 
 /// After `list` has run: the texels its read-backs copied into host
@@ -3572,6 +3659,7 @@ impl Host {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    ranges.extend(flight.in_place.iter().copied());
                 }
             }
             join_ranges(written, ranges);
@@ -3750,7 +3838,7 @@ impl Host {
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()).chain(sent.in_place.iter().copied()));
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -3760,6 +3848,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                in_place: sent.in_place,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -3794,7 +3883,7 @@ impl Host {
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()).chain(sent.in_place.iter().copied()));
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -3804,6 +3893,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                in_place: sent.in_place,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -4113,6 +4203,7 @@ impl Host {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
             let back = declared_writes(runs);
+            let in_place = in_place_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
@@ -4122,6 +4213,7 @@ impl Host {
                 number: this_submission,
                 card,
                 back,
+                in_place,
                 writes,
             };
             working(was_working);

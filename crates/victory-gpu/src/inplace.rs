@@ -78,10 +78,16 @@ pub(crate) fn probe_level() -> u8 {
 /// the title maps pages.
 ///
 /// What it assumes, for 2: nothing reads title memory that a submission
-/// not yet run writes through such a buffer. With every submission waited
-/// for (the default) that holds; with `VICTORY_LATE_WAIT` it does not,
-/// since the flights' rules know shader writes only by the ranges copies
-/// declare. Do not combine 2 with late wait.
+/// not yet run writes through such a buffer, except what the flights'
+/// rules hold back. Shader writes in place are declared as for copies
+/// (`Shadow::gpu_writes`; `host::in_place_writes` puts them in the flights'
+/// `written`), so late wait and the relay hold back a CPU read of them (a
+/// title buffer copy, a fill, a texture, a step of ours, a value wait)
+/// until the flight has run, exactly as for a copy's declared ranges. That
+/// makes 2 with `VICTORY_LATE_WAIT`/`VICTORY_RELAY` as safe as copies are:
+/// the same assumption (shaders write only what is declared) and the same
+/// shortcut (another host copy of the same bytes is not told). Before, the
+/// writes were not declared and the two were not to be combined.
 ///
 /// shortcut: while a window is in place the title cannot decommit, free
 /// or protect its pages (the call fails with error 87; the probe shows
@@ -153,9 +159,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     let host = crate::host::host()?;
     match place_part(&host.device, start, len) {
         Ok(placed) => {
-            let at = if window { 0 } else { 2 };
-            STATS[at].fetch_add(1, Ordering::Relaxed);
-            STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+            counted(window, len);
             Some(placed)
         }
         Err(None) => {
@@ -169,6 +173,13 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             None
         }
     }
+}
+
+/// What is in place now counts one more (undone by [`gone`]).
+pub(crate) fn counted(window: bool, bytes: u64) {
+    let at = if window { 0 } else { 2 };
+    STATS[at].fetch_add(1, Ordering::Relaxed);
+    STATS[at + 1].fetch_add(bytes, Ordering::Relaxed);
 }
 
 /// What [`place_for`] gave is gone.
@@ -1142,7 +1153,7 @@ pub(crate) fn tick() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Views as the runtime tells them: a range inside one view, or over
