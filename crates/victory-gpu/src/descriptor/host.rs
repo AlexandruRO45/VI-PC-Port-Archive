@@ -1003,19 +1003,28 @@ fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, O
 pub(crate) fn concrete_format_for(resource: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
     use crate::resource::first_concrete;
     let own = resource.Format.0 as u32;
-    match resource.Format {
+    let format = match resource.Format {
         // The shader view must identify the depth or stencil plane.
-        DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_R24G8_TYPELESS => None,
+        DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_R24G8_TYPELESS => return None,
         DXGI_FORMAT_R16_TYPELESS
             if resource.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 =>
         {
-            Some(DXGI_FORMAT_R16_UNORM)
+            DXGI_FORMAT_R16_UNORM
         }
         _ => {
             let concrete = first_concrete(own);
-            (concrete != 0).then_some(DXGI_FORMAT(concrete as i32))
+            if concrete == 0 {
+                return None;
+            }
+            DXGI_FORMAT(concrete as i32)
         }
-    }
+    };
+    once!(
+        own,
+        concrete = format.0,
+        "selected concrete format for typeless resource"
+    );
+    Some(format)
 }
 
 fn default_srv_desc(
@@ -1045,13 +1054,25 @@ fn default_srv_desc(
             }
         }
         D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            let multisampled = resource.SampleDesc.Count > 1;
             if resource.DepthOrArraySize > 1 {
-                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-                desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
-                    MipLevels: u32::MAX,
-                    ArraySize: resource.DepthOrArraySize as u32,
-                    ..Default::default()
-                };
+                if multisampled {
+                    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+                    desc.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV {
+                        ArraySize: resource.DepthOrArraySize as u32,
+                        ..Default::default()
+                    };
+                } else {
+                    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                    desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                        MipLevels: u32::MAX,
+                        ArraySize: resource.DepthOrArraySize as u32,
+                        ..Default::default()
+                    };
+                }
+            } else if multisampled {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                desc.Anonymous.Texture2DMS = D3D12_TEX2DMS_SRV::default();
             } else {
                 desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
                 desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
@@ -1068,13 +1089,25 @@ fn default_srv_desc(
             };
         }
         _ => {
-            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
-                MipLevels: u32::MAX,
-                ..Default::default()
-            };
+            let multisampled = resource.SampleDesc.Count > 1;
+            if multisampled {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                desc.Anonymous.Texture2DMS = D3D12_TEX2DMS_SRV::default();
+            } else {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                    MipLevels: u32::MAX,
+                    ..Default::default()
+                };
+            }
         }
     }
+    once!(
+        format = format.0,
+        dimension = desc.ViewDimension.0,
+        samples = resource.SampleDesc.Count,
+        "synthesized default srv for typeless texture"
+    );
     desc
 }
 
@@ -1123,6 +1156,11 @@ fn default_uav_desc(
             desc.Anonymous.Texture2D = D3D12_TEX2D_UAV::default();
         }
     }
+    once!(
+        format = format.0,
+        dimension = desc.ViewDimension.0,
+        "synthesized default uav for typeless texture"
+    );
     desc
 }
 
@@ -1166,7 +1204,7 @@ pub(crate) fn adapt_view_format(
             let Some(concrete) = concrete_format_for(resource) else {
                 return false;
             };
-            tracing::debug!(
+            once!(
                 own,
                 view,
                 concrete = concrete.0,
@@ -1844,6 +1882,48 @@ mod tests {
         assert!(!adapt_view_format(&planar_depth, None, false));
         let mut fmt = DXGI_FORMAT_UNKNOWN;
         assert!(!adapt_view_format(&planar_depth, Some(&mut fmt), false));
+    }
+
+    #[test]
+    fn default_srv_desc_handles_multisampled_textures() {
+        let single_sample = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            DepthOrArraySize: 1,
+            ..Default::default()
+        };
+        let srv = default_srv_desc(&single_sample, DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(srv.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2D);
+
+        let msaa4x = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 4,
+                Quality: 0,
+            },
+            DepthOrArraySize: 1,
+            ..Default::default()
+        };
+        let srv = default_srv_desc(&msaa4x, DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(srv.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DMS);
+
+        let msaa4x_array = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 4,
+                Quality: 0,
+            },
+            DepthOrArraySize: 4,
+            ..Default::default()
+        };
+        let srv = default_srv_desc(&msaa4x_array, DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(srv.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY);
+        // SAFETY: inspecting union field initialized for Texture2DMSArray
+        let array_size = unsafe { srv.Anonymous.Texture2DMSArray.ArraySize };
+        assert_eq!(array_size, 4);
     }
 
     #[test]
