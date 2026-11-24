@@ -4829,6 +4829,57 @@ mod tests {
         assert_eq!(vs.patched_code(), VS_CODE);
     }
 
+    #[test]
+    fn an_export_patch_is_kept_apart_from_every_earlier_mrt() {
+        // One two-dword patch per MRT at these offsets (`None`: absent) in
+        // twice as many dwords of code as there are MRTs.
+        let code = vec![0u8; 8 * MRTS * 4];
+        let ps = fssm(&[(HwStage::Ps, &code)]);
+        let e = stage_data_at(&ps, HwStage::Ps);
+        let patches = |offsets: &[Option<u32>]| {
+            let mut blob = ps.clone();
+            blob[e + PS_PATCH_SIZE..][..4].copy_from_slice(&2u32.to_le_bytes());
+            for (mrt, offset) in offsets.iter().enumerate() {
+                let at = e + PS_PATCHES + mrt * PATCH_BYTES;
+                let offset = offset.unwrap_or(u32::MAX);
+                blob[at..][..4].copy_from_slice(&offset.to_le_bytes());
+            }
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        // Every MRT side by side, last first, fits and is kept in MRT order.
+        let all: Vec<_> = (0..MRTS as u32)
+            .map(|m| Some(2 * (MRTS as u32 - 1 - m)))
+            .collect();
+        let p = &patches(&all).unwrap()[0];
+        let StageIo::Ps { patches: read, .. } = &p.io else {
+            panic!("{:?}", p.io)
+        };
+        let mrts: Vec<u8> = read.iter().map(|p| p.mrt).collect();
+        assert_eq!(mrts, (0..MRTS as u8).collect::<Vec<_>>());
+        // Absent MRTs between two patches neither part them nor hide an
+        // overlap: the last MRT is checked against the first, not only
+        // against the one before it.
+        let mut gaps = vec![None; MRTS];
+        gaps[0] = Some(4);
+        gaps[3] = Some(0);
+        for (last, ok) in [(2, true), (6, true), (3, false), (4, false), (5, false)] {
+            gaps[MRTS - 1] = Some(last);
+            let read = patches(&gaps);
+            if ok {
+                let p = &read.unwrap()[0];
+                assert!(
+                    matches!(&p.io, StageIo::Ps { patches, .. } if patches.len() == 3),
+                    "dword {last}"
+                );
+            } else {
+                assert!(
+                    matches!(read, Err(Malformed("export patches overlap"))),
+                    "dword {last}"
+                );
+            }
+        }
+    }
+
     /// The stages a blob's programs are read as, in order.
     fn stages_of(blob: &[u8]) -> Vec<HwStage> {
         native_programs(&part(&[(KIND_NATIVE, &xbch(blob))]))
