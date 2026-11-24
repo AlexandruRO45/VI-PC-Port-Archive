@@ -1338,12 +1338,13 @@ fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host:
 fn refresh_by_address(all: &mut [(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) -> usize {
     const SPAN_GAP: usize = 1 << 20;
     #[cfg(feature = "diagnostics")]
-    if {
+    {
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *OFF.get_or_init(|| std::env::var_os("VICTORY_NO_SPAN_QUESTIONS").is_some())
-    } {
-        // One question per range, as before.
-        return all.iter().map(|(s, a, e)| s.update(*a, e - a)).sum();
+        let off = *OFF.get_or_init(|| std::env::var_os("VICTORY_NO_SPAN_QUESTIONS").is_some());
+        if off {
+            // One question per range, as before.
+            return all.iter().map(|(s, a, e)| s.update(*a, e - a)).sum();
+        }
     }
     all.sort_unstable_by_key(|&(_, a, _)| a);
     let mut copied = 0;

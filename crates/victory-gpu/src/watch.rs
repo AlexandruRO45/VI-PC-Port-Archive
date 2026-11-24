@@ -123,16 +123,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ))
 }
 
+/// [`writes_split`]'s answer: this asking's number, the pages as last
+/// written, and the parts to copy whole.
+pub(crate) type SplitAnswer = (u64, Vec<(usize, u64)>, Vec<(usize, usize)>);
+
 /// [`writes`] for a span that may mix watched memory with memory that is
 /// not: the pages of `[start, end)` (whole pages) as last written, this
 /// asking's number, and the parts the kernel could not answer for (copy
 /// them whole). Asked once over the span if the kernel takes it, else
 /// allocation by allocation; guarded views (with `guarded`) are guarded.
-pub(crate) fn writes_split(
-    start: usize,
-    end: usize,
-    guarded: bool,
-) -> (u64, Vec<(usize, u64)>, Vec<(usize, usize)>) {
+pub(crate) fn writes_split(start: usize, end: usize, guarded: bool) -> SplitAnswer {
     use windows_sys::Win32::System::Memory::{
         GetWriteWatch, MEM_COMMIT, MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
