@@ -79,7 +79,7 @@ calling convention; check before you bind.
 | Workspace builds and tests on Linux | done |
 | Title-facing ABI is `win64` | done |
 | PE mapper, TEB, guest threads, TLS, entry | not started |
-| SEH, signals, unwinding | not started |
+| SEH, signals, unwinding | done: dispatcher, unwinder, signals, `Rtl*`/`RaiseException`, crash report (`linux/seh.rs`) |
 | kernel32/ntdll: handles, sync, threads, memory, heap, time, system | not started |
 | UCRT | not started |
 | GPU, window, input | not started |

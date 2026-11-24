@@ -581,8 +581,21 @@ mod host {
         std::process::exit(code as i32)
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn set_unhandled_exception_filter(filter: extern "win64" fn(*const c_void) -> i32) {
+        victory_loader::linux::seh::set_top_level_filter(filter as *const () as usize);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn report_unhandled(info: *const c_void) {
+        // SAFETY: the dispatcher's exception pointers, passed to the filter.
+        unsafe { victory_loader::linux::seh::report_unhandled(info.cast()) };
+    }
+
+    #[cfg(not(target_os = "linux"))]
     pub(super) fn set_unhandled_exception_filter(_: extern "win64" fn(*const c_void) -> i32) {}
 
+    #[cfg(not(target_os = "linux"))]
     pub(super) fn report_unhandled(_: *const c_void) {}
 
     pub(super) fn note_title_output(_: &str) {}

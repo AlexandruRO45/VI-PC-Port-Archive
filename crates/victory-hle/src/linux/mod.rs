@@ -13,9 +13,11 @@ use crate::HleModule;
 
 #[allow(dead_code)] // used by the slices as they land
 pub(crate) mod handles;
+mod kernel32_exception;
+mod ntdll_exception;
 
 fn modules() -> Vec<HleModule> {
-    vec![]
+    vec![kernel32_exception::module(), ntdll_exception::module()]
 }
 
 static MODULES: LazyLock<Vec<HleModule>> = LazyLock::new(modules);
