@@ -125,3 +125,32 @@ To compare a run, match its timestamps against
 `journalctl -k --utc -g 'NVRM: Xid'` and the title's `crashes.log` under
 `%LOCALAPPDATA%\victory\data` in the same prefix. For this build, successful
 menu and loading-screen rendering is the last verified milestone.
+
+## Opening cutscene follow-up (2026-11-24)
+
+These runs used a locally modified build based on `d2a4bae`, on the same RTX 4080. The user reached two cutscenes with audio, subtitles and HUD elements. They saw a few isolated frames with sky, silhouettes or street geometry. Most of the 3D image remained black. Continuous world rendering and playable gameplay are still unverified.
+
+| Run or check | Result |
+| --- | --- |
+| Loading and world probes | Four representative world graphics pairs and four compute pipelines were created on the device. A later check created seven scene graphics pairs, including the three affected by the cube-gradient change. Those checks predate the latest depth/gather changes. |
+| Busy-frame capture | Frame 1471 had a black final output. Frame 1480 showed subtitles. Intermediate targets contained geometry and depth. In frame 1471, 784 of 948 geometry-buffer operations were dropped. A submitted draw count alone overstates how much of the scene reached the screen. |
+| Later world runs | Two runs reached mission streaming and then hit a title breakpoint at image offset `+0x63966f` after roughly 16 and 13½ minutes. Correcting GPU copy-back handling did not eliminate that failure. |
+| Latest software checks | The revised shader code translated six captured compute programs offline for wave32. A CPU texture-sampling model passed 280 synthetic gather cases. Native Rust tests passed (27 GPU-crate tests and 81 shader-crate tests). Windows release and diagnostic executables built. GPU correctness and the effect on the cutscene remain open. |
+| Latest startup failure | The standalone scene check printed GLX `BadValue` at `X_GLXCreateContext` and was interrupted before producing results. A separately started title bound its imports, printed the same GLX error, fitted the title window to 1024×576 and took an unhandled `0x80000003` at `+0x19f4f58` during startup. This run never reached a world frame. The logs establish the order of events. The cause of the breakpoint is unresolved. |
+
+### What changed in the experimental build
+
+- **Loading and GPU setup.** Integrated work from upstream PRs #439, #177, #336 and #431, guarded unbound root descriptors and resource retirement, and adapted the indirect argument clamp (#190), packed render-target formats (#89) and bounded shader buffer views (#493).
+- **World geometry.** Ported shader and descriptor work from #307, #309 and #180, plus selected changes from #566, #437, #136, #318, #539 and #251 for per-lane buffer selection, sampling, atomics and descriptor allocation. The Proton wrapper selected native D3D12/DXGI and disabled `VK_NV_raw_access_chains` for these experiments.
+- **Tracing and capture.** Shared live texture tables (#562), captured final and intermediate targets on busy frames (#638), and traced recorded and dropped operations by attachment (#591). Paired captures made it possible to distinguish geometry reaching an intermediate target from geometry reaching the presented image.
+- **Latest local changes.** Adapted copy-back tracking and deduplication (#261 and #440), cube gradients (#563), explicit-mip texture gathers (selected work from #160), and depth/stencil view format and plane selection (#651). The six sampled compute programs accounted for 92 and 58 dropped dispatches in the two captured frames before the gather change. Rectangle draws also appear in the traces. #282 and #346 are candidates for investigation.
+
+### How to compare the next run
+
+1. In the same graphical login used for Proton, check `glxinfo -B`, `vulkaninfo --summary` and the display mode. Record the GLX renderer, Vulkan device and dimensions. An earlier native Vulkan enumeration identified the RTX 4080 even when Wine could not create a D3D12 device.
+2. Run the standalone scene probe first. On the latest local build the acceptance criteria are six compute pipelines, seven graphics pairs and a passing depth-view test. An exit code alone is insufficient if the expected output is missing.
+3. Once the probe succeeds, compare a normal run at the first cutscene with the same build and prefix. Record consecutive frames with visible world geometry alongside recorded, dropped and executed operations. If the output stays black, trace the first pass where a populated intermediate target stops contributing to the presented image. Compare startup and streaming breakpoints separately.
+
+The compatibility changes and title-derived probe inputs were local experiments. This PR provides the build guide and field results.
+
+Upstream reference: [VIctory pull requests](https://github.com/Marvisak/VIctory/pulls).
