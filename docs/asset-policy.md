@@ -47,7 +47,8 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
    `cargo xtask install-hooks`) is an allowlist: files must have an allowed
    type, be under 512 KiB, contain no binary data or known binary
    signatures, and hold no long hex/base64 runs. File names must be UTF-8,
-   and submodules are refused. Exceptions need an entry with a reason in
+   and submodules are refused. A symlink is checked as git stores it, as
+   its target path. Exceptions need an entry with a reason in
    `xtask/src/policy.rs`.
 3. At runtime, everything that writes derived data calls
    `victory_core::ensure_outside_repo`.

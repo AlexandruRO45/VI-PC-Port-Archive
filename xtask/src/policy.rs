@@ -121,15 +121,41 @@ fn read(root: &Path, file: &File) -> Result<Option<Vec<u8>>, String> {
                 Err("cannot read the staged content".to_owned())
             }
         }
-        Source::Worktree(path) => match std::fs::read(path) {
-            Ok(content) => Ok(Some(content)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(_) if path.is_dir() => {
-                Err("a directory tracked as a file (a submodule?)".to_owned())
+        Source::Worktree(path) => {
+            // Not `metadata`: that follows a symlink, and git stores a
+            // symlink's target path, not what it points to.
+            let kind = match std::fs::symlink_metadata(path) {
+                Ok(meta) => meta.file_type(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(format!("cannot read: {e}")),
+            };
+            if kind.is_symlink() {
+                let target = std::fs::read_link(path).map_err(|e| format!("cannot read: {e}"))?;
+                return Ok(Some(link_bytes(&target)));
             }
-            Err(e) => Err(format!("cannot read: {e}")),
-        },
+            if kind.is_dir() {
+                return Err("a directory tracked as a file (a submodule?)".to_owned());
+            }
+            if !kind.is_file() {
+                // A FIFO or device: reading it could block or never end.
+                return Err("not a regular file".to_owned());
+            }
+            std::fs::read(path)
+                .map(Some)
+                .map_err(|e| format!("cannot read: {e}"))
+        }
     }
+}
+
+/// A symlink's content as git stores it: the target path.
+fn link_bytes(target: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    let bytes =
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::as_bytes(target.as_os_str()).to_vec();
+    // Git for Windows stores the target as UTF-8 with `/` separators.
+    #[cfg(not(unix))]
+    let bytes = target.to_string_lossy().replace('\\', "/").into_bytes();
+    bytes
 }
 
 /// Variables through which the environment, not `root`, picks the repository
@@ -438,6 +464,43 @@ mod tests {
         git_str(root, &["add", "data.rs"]);
 
         assert_eq!(names(root, true), ["data.rs"]);
+        assert!(super::run(root, true).is_err());
+    }
+
+    /// Git stores a symlink as its target path. The full check used to
+    /// follow the link instead: it refused a link to a binary outside the
+    /// repository that the hook had accepted, passed a dangling link whose
+    /// path the hook refuses, and would block on a link to a FIFO.
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_checked_as_git_stores_them() {
+        let outside = tempfile::tempdir().unwrap();
+        let binary = outside.path().join("game.bin");
+        std::fs::write(&binary, b"MZ\x90\0binary").unwrap();
+        let fifo = outside.path().join("fifo");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(made.unwrap().success(), "mkfifo");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git_str(root, &["init", "-q"]);
+        std::os::unix::fs::symlink(&binary, root.join("binary.rs")).unwrap();
+        std::os::unix::fs::symlink(&fifo, root.join("fifo.rs")).unwrap();
+        git_str(root, &["add", "binary.rs", "fifo.rs"]);
+        super::run(root, true).unwrap();
+        super::run(root, false).unwrap();
+
+        // A path that is itself a long base64-like run, pointing nowhere.
+        let target = format!("{}/x", "a".repeat(super::MAX_ENCODED_RUN));
+        std::os::unix::fs::symlink(&target, root.join("dangling.rs")).unwrap();
+        let files = super::list_files(root, false).unwrap();
+        let dangling = files.iter().find(|f| f.name == "dangling.rs").unwrap();
+        assert_eq!(
+            super::read(root, dangling).unwrap().as_deref(),
+            Some(target.as_bytes())
+        );
+        assert!(super::run(root, false).is_err());
+        git_str(root, &["add", "dangling.rs"]);
         assert!(super::run(root, true).is_err());
     }
 
