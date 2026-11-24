@@ -765,6 +765,91 @@ type States = std::collections::HashMap<
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
 
+/// Compiles function `entry` of `source` for `target` with the system's
+/// compiler, as the indirect-argument clamp is (`crate::indirect`). Falls
+/// back to the 5_0 profile when this compiler does not know the 5_1 name
+/// at all: under Proton `d3dcompiler_47` is either Wine's builtin (a
+/// vendored vkd3d-shader) or an old Microsoft copy - winetricks installs a
+/// June 2010 one - and those reject `*_5_1` outright (`X3506`) before they
+/// look at the source. A program that really needs 5_1 fails both times,
+/// and the first error is the one reported (docs/proton.md).
+pub(crate) fn compile(
+    source: &str,
+    entry: windows::core::PCSTR,
+    target: windows::core::PCSTR,
+) -> windows::core::Result<Vec<u8>> {
+    let first = compile_at(source, entry, target);
+    if first.is_ok() || target.is_null() {
+        return first;
+    }
+    // SAFETY: `target` is a NUL-terminated profile name as we build them.
+    let name = unsafe { std::ffi::CStr::from_ptr(target.as_ptr().cast()) };
+    let Ok(name) = name.to_str() else {
+        return first;
+    };
+    let Some(head) = name.strip_suffix("_5_1") else {
+        return first;
+    };
+    let Ok(fallback) = std::ffi::CString::new(format!("{head}_5_0")) else {
+        return first;
+    };
+    match compile_at(source, entry, windows::core::PCSTR::from_raw(fallback.as_ptr().cast())) {
+        Ok(code) => {
+            let used = fallback.to_str().unwrap_or("?");
+            tracing::info!("`{name}` is beyond this compiler; using `{used}`");
+            Ok(code)
+        }
+        // The first attempt's error is the one worth reporting.
+        Err(_) => first,
+    }
+}
+
+fn compile_at(
+    source: &str,
+    entry: windows::core::PCSTR,
+    target: windows::core::PCSTR,
+) -> windows::core::Result<Vec<u8>> {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    let mut code: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
+    // SAFETY: the source and names live through the call; out pointers ours.
+    let compiled = unsafe {
+        D3DCompile(
+            source.as_ptr().cast(),
+            source.len(),
+            windows::core::s!("victory"),
+            None,
+            None,
+            entry,
+            target,
+            0,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
+    if let Err(e) = compiled {
+        if let Some(errors) = errors {
+            // SAFETY: the blob's own bytes.
+            let text = unsafe {
+                std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                )
+            };
+            tracing::warn!("a shader of ours: {}", String::from_utf8_lossy(text));
+        }
+        return Err(e);
+    }
+    let code = code.ok_or_else(windows::core::Error::empty)?;
+    // SAFETY: the blob's own bytes.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+    };
+    Ok(bytes.to_vec())
+}
+
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
 pub(crate) fn dred_on() -> bool {
