@@ -1139,7 +1139,8 @@ impl Host {
             // makes NV12 and B4G4R4A4_UNORM textures both render targets and
             // UAVs, and PC D3D12 refuses that combination for those formats,
             // so the copy is created without the flag. A null view draws
-            // nothing, which is what the console's texture would have held.
+            // nothing: its draws and clears are lost, rather than taking the
+            // device down with them.
             if !allows(resource, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
                 once_render(resource, "render target");
                 self.device.CreateRenderTargetView(None, None, handle);
