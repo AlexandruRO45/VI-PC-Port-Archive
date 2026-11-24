@@ -3,8 +3,9 @@
 //!
 //! Paths reach us as host paths spelled the Windows way (the `files`
 //! module rewrites console paths first): `\` and `/` both separate, a
-//! `\\?\` prefix is dropped, and no drive letter means the current
-//! directory. Narrow paths are UTF-8.
+//! `\\?\` prefix is dropped, no drive letter means the current
+//! directory, and names are found whatever their case. Narrow paths are
+//! UTF-8.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{CStr, c_char};
@@ -15,9 +16,10 @@ use super::ucrt_runtime::{EINVAL, errno_from_host, invalid, set_errno};
 use super::ucrt_stdio::{Stream, lock_stream, unlock_stream};
 use crate::{HleModule, hle_export};
 
+/// As kernel32 reads it (`kernel32_file::host_path`): names found
+/// whatever their case, as the CRT finds them through `CreateFile`.
 fn host_path(text: String) -> PathBuf {
-    let text = text.strip_prefix(r"\\?\").unwrap_or(&text).replace('\\', "/");
-    PathBuf::from(text)
+    super::kernel32_file::host_path(&text).unwrap_or_else(|_| PathBuf::from(text))
 }
 
 /// A narrow title path as a host path; None for null.

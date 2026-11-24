@@ -75,7 +75,12 @@ fn title_path(module: *mut c_void) -> Option<String> {
     } else {
         module as usize
     };
-    Some(runtime::image_path(base)?.to_string_lossy().into_owned())
+    let path = runtime::image_path(base)?;
+    // As our Linux layer hands out host paths: `\` separators.
+    #[cfg(target_os = "linux")]
+    return Some(crate::linux::kernel32_file::guest_path(&path));
+    #[cfg(not(target_os = "linux"))]
+    Some(path.to_string_lossy().into_owned())
 }
 
 /// `GetModuleFileName`'s contract: copy with a NUL; if it does not fit,
@@ -741,24 +746,27 @@ mod host {
 mod tests {
     use super::*;
 
+    /// A host path and how the title sees it.
+    #[cfg(windows)]
+    const TITLE_EXE: (&str, &str) = (r"C:\title\game.exe", r"C:\title\game.exe");
+    #[cfg(not(windows))]
+    const TITLE_EXE: (&str, &str) = ("/title/game.exe", r"\title\game.exe");
+
     #[test]
-    #[cfg_attr(not(windows), ignore = "title paths are Windows paths")]
     fn title_images_report_their_original_path() {
         let base = 0x7000_0000_0000;
-        runtime::set_image_path(base, std::path::Path::new(r"C:\title\game.exe"));
+        runtime::set_image_path(base, std::path::Path::new(TITLE_EXE.0));
         let module = base as *mut c_void;
         let mut buf = [0xFFFFu16; 32];
         let n = GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32);
-        assert_eq!(
-            String::from_utf16_lossy(&buf[..n as usize]),
-            r"C:\title\game.exe"
-        );
+        assert_eq!(String::from_utf16_lossy(&buf[..n as usize]), TITLE_EXE.1);
         assert_eq!(buf[n as usize], 0);
 
         // Too small: truncated, NUL-terminated, the buffer size returned.
         let mut small = [0u8; 4];
         assert_eq!(GetModuleFileNameA(module, small.as_mut_ptr(), 4), 4);
-        assert_eq!(&small, &[b'C', b':', b'\\', 0]);
+        assert_eq!(small[..3], TITLE_EXE.1.as_bytes()[..3]);
+        assert_eq!(small[3], 0);
     }
 
     fn w(text: &str) -> Vec<u16> {
@@ -801,10 +809,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(windows), ignore = "title paths are Windows paths")]
     fn title_dlls_and_pseudo_modules_are_found_by_name() {
         let base = 0x7100_0000_0000usize;
-        runtime::set_image_path(base, std::path::Path::new(r"C:\title\Mapped.dll"));
+        let path = if cfg!(windows) { r"C:\title\Mapped.dll" } else { "/title/Mapped.dll" };
+        runtime::set_image_path(base, std::path::Path::new(path));
         runtime::set_title_dll_loader(Box::new(|file| match file {
             "late.dll" => Ok(Some(0x7200_0000_0000)),
             "broken.dll" => Err("bad image".into()),

@@ -362,6 +362,40 @@ pub fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
         .filter(|p| p.is_file())
 }
 
+/// The export `name` of the PE image mapped at `base`, read from its
+/// export directory in memory (`GetProcAddress` on a module handle); a
+/// forwarder is `None`.
+///
+/// # Safety
+/// `base` is the base of a mapped PE32+ image.
+pub unsafe fn export_at(base: usize, name: &str) -> Option<usize> {
+    // SAFETY: the caller's image; every offset read is one the PE format
+    // puts inside its headers or its export directory.
+    unsafe {
+        let at = |rva: usize| base + rva;
+        let u32_at = |a: usize| (a as *const u32).read_unaligned() as usize;
+        let nt = at(u32_at(at(0x3c)));
+        // OptionalHeader at +0x18, DataDirectory[0] at +0x70 of it.
+        let (dir, dir_size) = (u32_at(nt + 0x88), u32_at(nt + 0x8c));
+        if dir == 0 {
+            return None;
+        }
+        let names = u32_at(at(dir + 0x18));
+        let (functions, name_rvas, ordinals) = (
+            u32_at(at(dir + 0x1c)),
+            u32_at(at(dir + 0x20)),
+            u32_at(at(dir + 0x24)),
+        );
+        let i = (0..names).find(|&i| {
+            let s = std::ffi::CStr::from_ptr(at(u32_at(at(name_rvas + 4 * i))) as *const _);
+            s.to_bytes() == name.as_bytes()
+        })?;
+        let ordinal = (at(ordinals + 2 * i) as *const u16).read_unaligned() as usize;
+        let rva = u32_at(at(functions + 4 * ordinal));
+        (rva != 0 && !(dir..dir + dir_size).contains(&rva)).then(|| at(rva))
+    }
+}
+
 /// Resolves through `inner`, then through the exports of the title's DLLs.
 pub struct WithTitleDlls<'a> {
     pub inner: &'a dyn ImportResolver,
