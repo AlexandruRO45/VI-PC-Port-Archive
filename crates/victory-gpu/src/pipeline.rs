@@ -63,6 +63,8 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    mesh_fallback: OnceLock<Option<(Translated, victory_shader::emit::MeshRecordLayout)>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -93,6 +95,8 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            mesh_fallback: OnceLock::new(),
         }
     }
 }
@@ -106,6 +110,17 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    pub(crate) fn mesh_fallback(
+        &self,
+    ) -> Option<&(Translated, victory_shader::emit::MeshRecordLayout)> {
+        self.mesh_fallback.get_or_init(|| {
+            let result = victory_shader::emit::translate_mesh_fallback(&self.container)
+                .map_err(|e| e.to_string())
+                .and_then(|f| with_resources(&self.container, f.compute).map(|t| (t, f.layout)));
+            result.map_err(|error| tracing::warn!(shader = ?self, %error, "mesh fallback translation failed")).ok()
+        }).as_ref()
+    }
+
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -815,10 +830,16 @@ mod tests {
             element[8 + 4 * i..12 + 4 * i].copy_from_slice(&w.to_le_bytes());
         }
         let mut stream = vec![0u8; 0x2b0];
-        let put = |s: &mut Vec<u8>, at: usize, v: u64| {
-            s[at..at + 8].copy_from_slice(&v.to_le_bytes())
-        };
-        let kinds = [(0x10, 1), (0x28, 2), (0x40, 3), (0x58, 4), (0x70, 5), (0x88, 8)];
+        let put =
+            |s: &mut Vec<u8>, at: usize, v: u64| s[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        let kinds = [
+            (0x10, 1),
+            (0x28, 2),
+            (0x40, 3),
+            (0x58, 4),
+            (0x70, 5),
+            (0x88, 8),
+        ];
         for (at, kind) in kinds.into_iter().chain([(0x210, 21), (0x250, 17)]) {
             put(&mut stream, at, kind);
         }

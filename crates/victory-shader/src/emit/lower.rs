@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
+use super::mesh_fallback::{MESH_HEADER_DWORDS, MeshRecordLayout};
 use super::shader::{Shader, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
@@ -33,6 +34,7 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
+    pub mesh_layout: Option<MeshRecordLayout>,
     /// Bit n: immediate sampler n is used for comparisons.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -81,9 +83,13 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_mesh(parts, false)
+}
+
+pub(crate) fn lower_with_mesh(parts: &Parts, fallback: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, fallback).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -101,6 +107,12 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
+
+struct MeshFallback {
+    layout: MeshRecordLayout,
+    uav: Option<V>,
+    record: Option<V>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Numeric {
@@ -224,6 +236,7 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    mesh_fallback: Option<MeshFallback>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
@@ -463,7 +476,7 @@ fn smem_dwords(name: &str) -> Option<u32> {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, fallback: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -527,15 +540,31 @@ impl<'a> Lower<'a> {
             }
         }
         let mut no_barrier = HashSet::new();
+        let mut mesh_fallback = None;
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
-            s.mesh = Some(super::shader::Mesh {
-                max_vertices: ms.max_vertices,
-                max_primitives: ms.max_primitives,
-                topology: ms.topology,
-            });
+            if fallback {
+                let layout = MeshRecordLayout::from_signatures(
+                    &s.outputs,
+                    &s.prims,
+                    ms.max_vertices,
+                    ms.max_primitives,
+                );
+                mesh_fallback = Some(MeshFallback {
+                    layout,
+                    uav: None,
+                    record: None,
+                });
+                s.wave_size = Some(if x.native.wave64 { 64 } else { 32 });
+            } else {
+                s.mesh = Some(super::shader::Mesh {
+                    max_vertices: ms.max_vertices,
+                    max_primitives: ms.max_primitives,
+                    topology: ms.topology,
+                });
+            }
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -616,6 +645,7 @@ impl<'a> Lower<'a> {
             root_memory,
             flat: None,
             no_barrier,
+            mesh_fallback,
             half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -1241,6 +1271,10 @@ impl<'a> Lower<'a> {
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
+        } else if self.mesh_fallback.is_some() {
+            self.mesh_fallback_prologue()
+                .map_err(|w| unsupported(0, w))?;
+            self.block[order[0]] = Some(self.cur);
         }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
@@ -1307,7 +1341,13 @@ impl<'a> Lower<'a> {
         let memory_writes = self.s.memory_dirty.is_some();
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
+        let mesh_layout = self.mesh_fallback.map(|f| f.layout);
+        if mesh_layout.is_some() {
+            self.s.outputs.clear();
+            self.s.prims.clear();
+        }
         Ok(Lowered {
+            mesh_layout,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -2708,8 +2748,12 @@ impl<'a> Lower<'a> {
     /// Code that depends on the lane layout: wave operations, and in compute
     /// the console's wave size (lanes are thread ids in group order there).
     /// Pixel lanes match only within a quad.
+    fn is_mesh(&self) -> bool {
+        self.s.mesh.is_some() || self.mesh_fallback.is_some()
+    }
+
     fn cross_lane(&mut self, quad: bool) -> Result<(), Why> {
-        if self.s.mesh.is_some() {
+        if self.is_mesh() {
             // shortcut: no wave size for mesh shaders in SM 6.6, so host
             // lanes cannot follow the console's; emulate through group-shared
             // memory if mesh programs turn out to need these.
@@ -2776,6 +2820,140 @@ impl<'a> Lower<'a> {
     // program's count are culled and vertices past it unused; this costs
     // the host the unused vertex and primitive slots. Pass the program's own
     // counts if that shows in frame time.
+    fn mesh_store(&mut self, uav: V, byte: V, x: V, y: Option<V>) {
+        let unused = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(if y.is_some() { 3 } else { 1 });
+        let align = self.s.m.i32(4);
+        self.s.op(
+            self.cur,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            self.s.t.void,
+            140,
+            &[
+                uav,
+                byte,
+                unused,
+                x,
+                y.unwrap_or(unused),
+                unused,
+                unused,
+                mask,
+                align,
+            ],
+        );
+    }
+
+    fn mesh_address(&mut self, record: V, index: V, stride: u32, base: u32) -> V {
+        let stride = self.s.m.i32(stride * 4);
+        let base = self.s.m.i32(base * 4);
+        let offset = self.s.m.bin(self.cur, Bin::Mul, index, stride);
+        let offset = self.s.m.bin(self.cur, Bin::Add, offset, base);
+        self.s.m.bin(self.cur, Bin::Add, record, offset)
+    }
+
+    fn mesh_guard(&mut self, index: V, limit: u32, guard: Option<V>) -> Option<(usize, usize)> {
+        let limit = self.s.m.i32(limit);
+        let inside = self.s.m.cmp(self.cur, pred::IULT, index, limit);
+        let cond = guard.map_or(inside, |g| self.s.m.bin(self.cur, Bin::And, g, inside));
+        self.begin_guarded(Some(cond))
+    }
+
+    fn mesh_fallback_prologue(&mut self) -> Result<(), Why> {
+        let StageIo::Ms(ms) = &self.x.native.io else {
+            unreachable!()
+        };
+        let layout = &self.mesh_fallback.as_ref().unwrap().layout;
+        let (nv, np, stride, index_base) = (
+            layout.max_vertices,
+            layout.max_primitives,
+            layout.record_bytes() / 4,
+            layout.prim_idx_base,
+        );
+        let threads = ms.threads;
+        if ms.topology != 2 || !(1..=128).contains(&threads) || nv > 256 || np > 256 {
+            return Err(
+                "mesh fallback requires triangles and at most 128 threads / 256 vertices / 256 primitives",
+            );
+        }
+        let uav = self.s.mesh_record_uav_handle();
+        let cbv = self.s.mesh_base_cbv_handle();
+        let zero = self.s.m.i32(0);
+        let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        let row = self.s.op(
+            self.cur,
+            "cbufferLoadLegacy.i32",
+            Attr::ReadOnly,
+            self.s.t.cbuf_ret,
+            59,
+            &[cbv, zero],
+        );
+        let base = self.s.m.extract(self.cur, row, 0);
+        let group = self.s.m.bin(self.cur, Bin::Add, group, base);
+        let record = self.mesh_address(zero, group, stride, 0);
+        let f = self.mesh_fallback.as_mut().unwrap();
+        f.uav = Some(uav);
+        f.record = Some(record);
+        let flat = self.mesh_thread();
+        let first = self.s.m.cmp(self.cur, pred::EQ, flat, zero);
+        let at = self.begin_guarded(Some(first));
+        let (max_v, max_p) = (self.s.m.i32(nv), self.s.m.i32(np));
+        self.mesh_store(uav, record, max_v, Some(max_p));
+        self.end_guarded(at, &[]);
+
+        // Mark every unexported primitive culled, even if np exceeds the
+        // thread count. All lanes finish initialization before exports.
+        let null = self.s.m.i32(1 << 31);
+        for start in (0..np).step_by(threads as usize) {
+            let start = self.s.m.i32(start);
+            let index = self.s.m.bin(self.cur, Bin::Add, flat, start);
+            let at = self.mesh_guard(index, np, None);
+            let byte = self.mesh_address(record, index, 1, index_base);
+            self.mesh_store(uav, byte, null, None);
+            self.end_guarded(at, &[]);
+        }
+        let mode = self.s.m.i32(1 | 2);
+        self.s.op(
+            self.cur,
+            "barrier",
+            Attr::NoDuplicate,
+            self.s.t.void,
+            80,
+            &[mode],
+        );
+        Ok(())
+    }
+
+    fn mesh_alloc(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let Some(f) = self.mesh_fallback.as_ref() else {
+            return Ok(());
+        };
+        let (uav, record) = (f.uav.unwrap(), f.record.unwrap());
+        let (nv, np) = (f.layout.max_vertices, f.layout.max_primitives);
+        let Some(Ok(counts)) = inst.read(Reg::S(crate::ir::M0)).map(|v| self.i32_of(v)) else {
+            return Ok(());
+        };
+        let guard = self.guard(b, i)?;
+        let at = self.begin_guarded(guard);
+        let c = self.cur;
+        let shift = self.s.m.i32(12);
+        let prims = self.s.m.bin(c, Bin::LShr, counts, shift);
+        let mask = self.s.m.i32(0x7ff);
+        let clamp = |s: &mut Self, value, limit| {
+            let value = s.s.m.bin(c, Bin::And, value, mask);
+            let limit = s.s.m.i32(limit);
+            let fits = s.s.m.cmp(c, pred::IULT, value, limit);
+            s.s.m.select(c, fits, value, limit)
+        };
+        let nv = clamp(self, counts, nv);
+        let np = clamp(self, prims, np);
+        self.mesh_store(uav, record, nv, Some(np));
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
     fn mesh_prologue(&mut self, mesh: super::shader::Mesh) -> Result<(), Why> {
         let threads = self.s.threads.expect("mesh")[0];
         if mesh.topology != 2 {
@@ -2833,7 +3011,7 @@ impl<'a> Lower<'a> {
     }
 
     fn lane_index(&mut self) -> V {
-        if self.s.mesh.is_some() {
+        if self.is_mesh() {
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.
             let f = self.mesh_thread();
@@ -2945,7 +3123,7 @@ impl<'a> Lower<'a> {
                 || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4;
             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
             // console's, so quad-local swizzles read through quad operations.
-            let mesh_quad = self.s.mesh.is_some() && quad;
+            let mesh_quad = self.is_mesh() && quad;
             if !mesh_quad {
                 self.cross_lane(quad)?;
             }
@@ -3242,6 +3420,9 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 Ok(())
+            }
+            Fields::Sopp { imm } if name == "s_sendmsg" && imm & 0xF == GS_ALLOC_REQ => {
+                self.mesh_alloc(inst, b, i)
             }
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),
@@ -5058,7 +5239,7 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
-        let mesh_quad = self.s.mesh.is_some() && quad;
+        let mesh_quad = self.is_mesh() && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
         }
@@ -6881,7 +7062,7 @@ impl<'a> Lower<'a> {
                         return Err("v_mbcnt of a mask that is no ballot (console lane layout)");
                     }
                     self.s.flags |= flags::WAVE_OPS;
-                } else if self.s.mesh.is_none() {
+                } else if !self.is_mesh() {
                     self.cross_lane(false)?;
                 }
                 let lane = self.lane_index();
@@ -8758,7 +8939,7 @@ impl<'a> Lower<'a> {
             return Err("a compressed export");
         }
         let guard = self.guard(b, i)?;
-        let mesh = self.s.mesh.is_some();
+        let mesh = self.is_mesh();
         let c = self.cur;
         // A pixel export whose lanes outside its guard the `done` export
         // after it discards: what those lanes write is lost, so it stores in
@@ -8900,6 +9081,54 @@ impl<'a> Lower<'a> {
         {
             return Err("a 16-bit output the stage data does not mark");
         }
+        if let Some(f) = self.mesh_fallback.as_ref() {
+            let (uav, record) = (f.uav.unwrap(), f.record.unwrap());
+            let (limit, base, stride, elements) = if primitive {
+                (
+                    f.layout.max_primitives,
+                    f.layout.prim_attr_base,
+                    f.layout.prim_dwords,
+                    &f.layout.prims,
+                )
+            } else {
+                (
+                    f.layout.max_vertices,
+                    MESH_HEADER_DWORDS,
+                    f.layout.vert_dwords,
+                    &f.layout.vertices,
+                )
+            };
+            let offsets: Vec<_> = stores
+                .iter()
+                .map(|&(id, col, _, _)| elements[id].offset + u32::from(col))
+                .collect();
+            let flat = self.mesh_thread();
+            let at = self.mesh_guard(flat, limit, guard);
+            let base = self.mesh_address(record, flat, stride, base);
+            for ((_, _, value, half), offset) in stores.into_iter().zip(offsets) {
+                let mut x = self.i32_of(value)?;
+                if let Some(high) = half {
+                    if high {
+                        let shift = self.s.m.i32(16);
+                        x = self.s.m.bin(self.cur, Bin::LShr, x, shift);
+                    }
+                    let f = self.s.op(
+                        self.cur,
+                        "legacyF16ToF32",
+                        Attr::ReadNone,
+                        self.s.t.f32,
+                        131,
+                        &[x],
+                    );
+                    x = self.as_int(f);
+                }
+                let offset = self.s.m.i32(offset * 4);
+                let byte = self.s.m.bin(self.cur, Bin::Add, base, offset);
+                self.mesh_store(uav, byte, x, None);
+            }
+            self.end_guarded(at, &[]);
+            return Ok(());
+        }
         // A mesh lane writes its own vertex or primitive, where it exports.
         let at = if mesh {
             self.begin_guarded(guard)
@@ -8967,13 +9196,24 @@ impl<'a> Lower<'a> {
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
+        if let Some(f) = self.mesh_fallback.as_ref() {
+            let (uav, record) = (f.uav.unwrap(), f.record.unwrap());
+            let (limit, base) = (f.layout.max_primitives, f.layout.prim_idx_base);
+            let flat = self.mesh_thread();
+            let at = self.mesh_guard(flat, limit, guard);
+            let byte = self.mesh_address(record, flat, 1, base);
+            self.mesh_store(uav, byte, x, None);
+            self.end_guarded(at, &[]);
+            return Ok(());
+        }
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
         let culled = self.s.m.cmp(c, pred::SLT, x, z);
         let mut args = vec![self.mesh_thread()];
+        let mask = self.s.m.i32(crate::io::MESH_VERTEX_INDEX_MASK);
         for k in 0..3 {
-            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
+            let shift = self.s.m.i32(10 * k);
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             args.push(self.s.m.select(c, culled, z, i));

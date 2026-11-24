@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -58,6 +58,8 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    mesh_records: Mutex<Option<(ID3D12Resource, u64)>>,
+    mesh_commands: Mutex<Option<(ID3D12Resource, u64)>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -252,6 +254,8 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            mesh_records: Mutex::new(None),
+            mesh_commands: Mutex::new(None),
         })
     }
 }
@@ -394,6 +398,13 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
     }
 }
 
+struct ScratchRegion {
+    buffer: Option<ID3D12Resource>,
+    gpu: u64,
+    offset: u64,
+    data: *mut u8,
+}
+
 /// Upload chunks handed out front to back: the chunks, the one in use and
 /// the bytes used in it.
 #[derive(Default)]
@@ -472,6 +483,9 @@ impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
+        if std::env::var("VICTORY_NO_MESH_SHADERS").is_ok_and(|v| v == "1") {
+            return false;
+        }
         static MESH: OnceLock<bool> = OnceLock::new();
         *MESH.get_or_init(|| {
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
@@ -1424,16 +1438,32 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        let region = self.scratch_region(len, false)?;
+        Some((region.gpu + region.offset, region.data))
+    }
+
+    pub(crate) fn scratch_buffer(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        let region = self.scratch_region(len, true)?;
+        Some((region.buffer?, region.offset, region.data))
+    }
+
+    fn scratch_region(&self, len: u64, keep_buffer: bool) -> Option<ScratchRegion> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
-            // SAFETY: a live buffer.
+            // SAFETY: a live upload buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let hold = keep_buffer.then(|| buffer.clone());
             self.deferred().uploads.push(buffer);
-            return Some((gpu, data));
+            return Some(ScratchRegion {
+                buffer: hold,
+                gpu,
+                offset: 0,
+                data,
+            });
         }
         if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
             (s.current, s.used) = (s.current + 1, 0);
@@ -1446,10 +1476,16 @@ impl HostList {
             s.chunks.push((buffer, data as usize, gpu));
             s.used = 0;
         }
-        let (_, data, gpu) = s.chunks[s.current];
+        let (buffer, data, gpu) = &s.chunks[s.current];
         let at = s.used;
+        let region = ScratchRegion {
+            buffer: keep_buffer.then(|| buffer.clone()),
+            gpu: *gpu,
+            offset: at,
+            data: (*data + at as usize) as *mut u8,
+        };
         s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        Some(region)
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -2374,6 +2410,96 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         text.push_str(&format!("; command {i} (op {}): {marker}", op.0));
     }
     text
+}
+
+/// Draw plus allocation cursor, followed by 16-byte dispatch records.
+pub(crate) const MESH_DRAW_BYTES: u64 = 32;
+static MESH_GROUPS_CLIPPED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn note_mesh_clipped(groups: u64) {
+    if groups != 0 {
+        let before = MESH_GROUPS_CLIPPED.fetch_add(groups, Ordering::Relaxed);
+        if before == 0 || (before + groups).ilog2() > before.ilog2() {
+            tracing::warn!(
+                groups,
+                total = before + groups,
+                "mesh groups clipped by fallback capacity"
+            );
+        }
+    }
+}
+
+impl Host {
+    /// Mesh scratch rests in UAV state and is reused on the host's single
+    /// submission queue. Lists hold the exact allocation they recorded into.
+    fn mesh_scratch(
+        &self,
+        list: &HostList,
+        cell: &Mutex<Option<(ID3D12Resource, u64)>>,
+        bytes: u64,
+        initial: u64,
+        cap: u64,
+    ) -> Option<(ID3D12Resource, u64)> {
+        let wanted = bytes.clamp(initial, cap).next_power_of_two();
+        let mut slot = cell.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_none_or(|(_, size)| *size < wanted) {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: wanted,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut made = None;
+            // SAFETY: plain committed GPU buffer, no initial contents read.
+            let result = unsafe {
+                self.device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    None,
+                    &mut made,
+                )
+            };
+            if let Err(error) = result {
+                tracing::warn!(%error, wanted, "mesh fallback scratch allocation failed");
+            } else if let Some(buffer) = made {
+                *slot = Some((buffer, wanted));
+            }
+        }
+        let (b, cap) = slot.as_ref()?;
+        list.keep(b);
+        Some((b.clone(), *cap))
+    }
+
+    pub(crate) fn mesh_records(
+        &self,
+        list: &HostList,
+        bytes: u64,
+    ) -> Option<(ID3D12Resource, u64)> {
+        self.mesh_scratch(list, &self.mesh_records, bytes, 16 << 20, 64 << 20)
+    }
+
+    pub(crate) fn mesh_commands(
+        &self,
+        list: &HostList,
+        records: u32,
+    ) -> Option<(ID3D12Resource, u32)> {
+        let size = MESH_DRAW_BYTES + u64::from(records) * 16;
+        self.mesh_scratch(list, &self.mesh_commands, size, 64 << 10, 16 << 20)
+            .map(|(buffer, cap)| (buffer, ((cap - MESH_DRAW_BYTES) / 16) as u32))
+    }
 }
 
 pub(crate) fn transition(
