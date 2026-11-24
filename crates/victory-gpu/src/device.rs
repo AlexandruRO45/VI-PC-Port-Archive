@@ -88,7 +88,9 @@ const LEVEL_IIDS: [Iid; 9] = [
     ),
 ];
 
-fn is_device(iid: *const Iid) -> bool {
+/// Any of the device's interfaces: what its children's `GetDevice` and the
+/// DXGI device answer with the device, as its own `QueryInterface` does.
+pub(crate) fn is_device(iid: *const Iid) -> bool {
     object::is(iid, &[IID]) || object::is(iid, &LEVEL_IIDS)
 }
 
@@ -443,6 +445,32 @@ mod tests {
         // A Device8 method we have not written fails without crashing.
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0x3a0);
         assert_eq!(missing(), E_NOTIMPL);
+    }
+
+    #[test]
+    fn children_and_the_dxgi_device_give_every_device_level() {
+        type Get = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+        let (null, iids) = (std::ptr::null(), [IID, LEVEL_IIDS[0], LEVEL_IIDS[8]]);
+        // A device child's GetDevice (a fence's, slot 0x38), as for the
+        // ID3D12Device11 that Grand Theft Auto VI creates.
+        let mut fence = null;
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let made = crate::fence::create(null, 1, 0, fence_iid, &mut fence);
+        assert_eq!(made, S_OK);
+        let get_device = slot::<Get>(fence, 0x38);
+        for iid in &iids {
+            let mut out = null;
+            assert_eq!(get_device(fence, iid, &mut out), S_OK);
+            assert_eq!(out, super::device());
+        }
+        slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
+        // The DXGI device's QueryInterface.
+        let dxgi = crate::dxgi::device();
+        for iid in &iids {
+            let mut out = null;
+            assert_eq!(slot::<Get>(dxgi, 0)(dxgi, iid, &mut out), S_OK);
+            assert_eq!(out, super::device());
+        }
     }
 
     #[test]

@@ -229,7 +229,7 @@ pub(crate) extern "system" fn parent_device(_: This, iid: *const Iid, out: *mut 
     answer(
         DEVICE,
         iid,
-        is(iid, &[crate::device::IID]).then_some(device),
+        crate::device::is_device(iid).then_some(device),
         out,
     )
 }
