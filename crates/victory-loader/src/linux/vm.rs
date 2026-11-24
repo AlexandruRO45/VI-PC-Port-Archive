@@ -1326,6 +1326,10 @@ pub fn phys_fd() -> Option<RawFd> {
 mod tests {
     use super::*;
 
+    /// The physical pool is one per process: tests that check which pages
+    /// they get back take turns.
+    static POOL_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn q(a: usize) -> MemoryBasicInformation {
         query(a).unwrap()
     }
@@ -1649,6 +1653,7 @@ mod tests {
 
     #[test]
     fn physical_pages_map_alias_and_free() {
+        let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let mut pages = [0u64; 3];
         phys_alloc(&mut pages).unwrap();
         assert!(phys_fd().is_some());
@@ -1682,6 +1687,7 @@ mod tests {
 
     #[test]
     fn physical_pages_map_into_a_placeholder() {
+        let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let mut pages = [0u64; 2];
         phys_alloc(&mut pages).unwrap();
         let g = PHYS_PAGE;
