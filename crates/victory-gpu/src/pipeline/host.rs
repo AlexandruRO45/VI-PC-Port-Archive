@@ -360,6 +360,16 @@ fn shader_root_bindings(t: &HostShader) -> Result<Vec<RootBinding>, &'static str
         }
         words |= bit;
     }
+    for o in &t.group_offsets {
+        if o.index >= D3D12_MAX_ROOT_COST || o.component > 2 || t.stage != HwStage::Cs {
+            return Err("invalid translated group offset constant");
+        }
+        let bit = 1 << o.index;
+        if words & bit != 0 {
+            return Err("duplicate translated root constant");
+        }
+        words |= bit;
+    }
     if words != 0 {
         roots.push(RootBinding::Constants(t.user_data_dwords()));
     }
@@ -827,6 +837,7 @@ mod root_binding_tests {
             root_uavs: Vec::new(),
             descriptor_bindings: Vec::new(),
             buffer_addresses: Vec::new(),
+            group_offsets: Vec::new(),
         }
     }
 

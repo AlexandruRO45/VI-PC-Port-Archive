@@ -559,6 +559,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_uavs: Vec::new(),
         descriptor_bindings: Vec::new(),
         buffer_addresses: Vec::new(),
+        group_offsets: Vec::new(),
     }
 }
 

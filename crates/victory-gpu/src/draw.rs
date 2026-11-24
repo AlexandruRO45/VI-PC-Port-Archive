@@ -24,6 +24,44 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::{HostPipeline, RootBinding, RootBuffer};
 
+/// One host dispatch of a split title dispatch: the first group and the
+/// group counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Chunk {
+    pub(crate) start: [u32; 3],
+    pub(crate) count: [u32; 3],
+}
+
+/// The most host dispatches one title dispatch is split into.
+const MAX_CHUNKS: usize = 4096;
+
+/// Splits `n` groups into runs of at most the host limit: (first, count).
+fn split_dimension(n: u32) -> impl Iterator<Item = (u32, u32)> {
+    const LIMIT: u32 = D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
+    (0..n.div_ceil(LIMIT)).map(move |i| (i * LIMIT, (n - i * LIMIT).min(LIMIT)))
+}
+
+/// The host dispatches covering `x*y*z` groups, none over the host limit per
+/// dimension (`None` past [`MAX_CHUNKS`]). An empty dispatch has none.
+pub(crate) fn dispatch_chunks(x: u32, y: u32, z: u32) -> Option<Vec<Chunk>> {
+    let count = |n: u32| n.div_ceil(D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION) as usize;
+    if count(x).checked_mul(count(y))?.checked_mul(count(z))? > MAX_CHUNKS {
+        return None;
+    }
+    let mut chunks = Vec::new();
+    for (sz, cz) in split_dimension(z) {
+        for (sy, cy) in split_dimension(y) {
+            for (sx, cx) in split_dimension(x) {
+                chunks.push(Chunk {
+                    start: [sx, sy, sz],
+                    count: [cx, cy, cz],
+                });
+            }
+        }
+    }
+    Some(chunks)
+}
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -994,16 +1032,11 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        if [x, y, z]
+        let split = [x, y, z]
             .into_iter()
-            .any(|n| n > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION)
-        {
-            once!(
-                x,
-                y,
-                z,
-                "dispatch dropped: group count exceeds the host limit"
-            );
+            .any(|n| n > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION);
+        if split && dispatch_chunks(x, y, z).is_none() {
+            once!(x, y, z, "dispatch dropped: too many groups to split");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -1035,6 +1068,50 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        if split {
+            // The host caps a dimension; run the range in pieces, the shader
+            // adding each piece's first group to its group id.
+            let stage = p.stages.first();
+            let param = stage.and_then(|s| {
+                s.roots
+                    .iter()
+                    .find_map(|&(param, b)| matches!(b, RootBinding::Constants(_)).then_some(param))
+            });
+            let (Some(stage), Some(param)) = (stage, param) else {
+                once!(pipeline = %p.name, x, y, z, "dispatch dropped: group count exceeds the host limit");
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            let offsets = &stage.translated().host.group_offsets;
+            if offsets.is_empty() {
+                once!(pipeline = %p.name, x, y, z,
+                    "dispatch dropped: group count exceeds the host limit and the shader reads no group id");
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            let set = |start: [u32; 3]| {
+                for o in offsets {
+                    // SAFETY: an open list with the constants bound; the
+                    // offset dwords lie inside them (checked at pipeline
+                    // creation).
+                    unsafe {
+                        list.list.SetComputeRoot32BitConstant(
+                            param,
+                            start[usize::from(o.component)],
+                            o.index,
+                        )
+                    };
+                }
+            };
+            for chunk in dispatch_chunks(x, y, z).into_iter().flatten() {
+                set(chunk.start);
+                // SAFETY: an open list with everything set.
+                unsafe { list.list.Dispatch(chunk.count[0], chunk.count[1], chunk.count[2]) };
+            }
+            set([0; 3]);
+            DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1691,4 +1768,69 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    const L: u32 = D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
+
+    #[test]
+    fn a_dimension_splits_into_runs_of_the_limit() {
+        assert_eq!(split_dimension(0).count(), 0);
+        assert_eq!(split_dimension(1).collect::<Vec<_>>(), [(0, 1)]);
+        assert_eq!(split_dimension(L).collect::<Vec<_>>(), [(0, L)]);
+        assert_eq!(
+            split_dimension(82606).collect::<Vec<_>>(),
+            [(0, 65535), (65535, 82606 - 65535)]
+        );
+        assert_eq!(
+            split_dimension(2 * L + 1).collect::<Vec<_>>(),
+            [(0, L), (L, L), (2 * L, 1)]
+        );
+    }
+
+    #[test]
+    fn the_logged_dispatch_is_two_chunks() {
+        let chunks = dispatch_chunks(82606, 1, 1).unwrap();
+        assert_eq!(
+            chunks,
+            [
+                Chunk { start: [0, 0, 0], count: [65535, 1, 1] },
+                Chunk { start: [65535, 0, 0], count: [17071, 1, 1] },
+            ]
+        );
+    }
+
+    #[test]
+    fn chunks_cover_every_group_exactly_once() {
+        for (x, y, z) in [(70000, 3, 2), (1, 140000, 1), (L + 1, L + 1, 2), (5, 6, 7)] {
+            let chunks = dispatch_chunks(x, y, z).unwrap();
+            let total: u64 = chunks
+                .iter()
+                .map(|c| c.count.iter().map(|&n| u64::from(n)).product::<u64>())
+                .sum();
+            assert_eq!(total, u64::from(x) * u64::from(y) * u64::from(z));
+            for c in &chunks {
+                assert!(c.count.iter().all(|&n| (1..=L).contains(&n)));
+                for d in 0..3 {
+                    assert!(c.start[d] + c.count[d] <= [x, y, z][d]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unsplit_dispatch_is_one_chunk_and_empty_is_none() {
+        assert_eq!(dispatch_chunks(3, 4, 5).unwrap().len(), 1);
+        assert!(dispatch_chunks(0, 4, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn absurd_counts_are_refused() {
+        assert!(dispatch_chunks(u32::MAX, u32::MAX, 1).is_none());
+        assert!(dispatch_chunks(u32::MAX, 1, 1).is_none());
+        assert_eq!(dispatch_chunks(300_000, 1, 1).unwrap().len(), 5);
+    }
 }

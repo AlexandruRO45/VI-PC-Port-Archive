@@ -14,7 +14,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{BufferAddress, DescriptorBinding, HostShader, StaticSampler, UserData};
+use victory_shader::emit::{
+    BufferAddress, DescriptorBinding, GroupOffset, HostShader, StaticSampler, UserData,
+};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -227,6 +229,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
+    word(&mut out, s.group_offsets.len() as u32);
+    for o in &s.group_offsets {
+        word(&mut out, o.index);
+        word(&mut out, u32::from(o.component));
+    }
     out
 }
 
@@ -318,6 +325,15 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             });
         }
     }
+    let mut group_offsets = Vec::new();
+    if !r.0.is_empty() {
+        for _ in 0..r.word()? {
+            group_offsets.push(GroupOffset {
+                index: r.word()?,
+                component: u8::try_from(r.word()?).ok().filter(|&c| c < 3)?,
+            });
+        }
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -329,6 +345,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_uavs,
         descriptor_bindings,
         buffer_addresses,
+        group_offsets,
     })
 }
 
@@ -366,6 +383,10 @@ mod tests {
                 table: 1,
                 byte_offset: 64,
                 high: true,
+            }],
+            group_offsets: vec![GroupOffset {
+                index: 10,
+                component: 2,
             }],
         }
     }

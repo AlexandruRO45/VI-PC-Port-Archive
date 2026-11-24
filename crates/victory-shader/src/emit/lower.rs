@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
-use super::{BufferAddress, DESCRIPTOR_DATA_SLOT, DescriptorBinding, UserData};
+use super::{BufferAddress, DESCRIPTOR_DATA_SLOT, DescriptorBinding, GroupOffset, UserData};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -50,6 +50,7 @@ pub(crate) struct Lowered {
     pub root_uavs: Vec<u8>,
     pub descriptor_bindings: Vec<DescriptorBinding>,
     pub buffer_addresses: Vec<BufferAddress>,
+    pub group_offsets: Vec<GroupOffset>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -191,6 +192,7 @@ struct Lower<'a> {
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     buffer_addresses: Vec<BufferAddress>,
+    group_offsets: Vec<GroupOffset>,
     scalar_uses: Option<HashMap<Value, Vec<ScalarUse>>>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
@@ -498,6 +500,7 @@ impl<'a> Lower<'a> {
             user_data: None,
             user_reads: BTreeMap::new(),
             buffer_addresses: Vec::new(),
+            group_offsets: Vec::new(),
             scalar_uses: None,
             samplers: Vec::new(),
             descriptors: x
@@ -1066,6 +1069,7 @@ impl<'a> Lower<'a> {
             root_uavs,
             descriptor_bindings: self.descriptor_bindings.into_iter().collect(),
             buffer_addresses: self.buffer_addresses,
+            group_offsets: self.group_offsets,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -1139,7 +1143,19 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => {
+                let Val::I32(id) = self.compute_id("groupId.i32", 94, c) else {
+                    unreachable!()
+                };
+                // A split dispatch (see `GroupOffset`) adds its offset.
+                return match self.group_offset_word(c) {
+                    Some(offset) => {
+                        let entry = self.s.entry;
+                        Val::I32(self.s.m.bin(entry, Bin::Add, id, offset))
+                    }
+                    None => Val::I32(id),
+                };
+            }
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
@@ -3714,6 +3730,41 @@ impl<'a> Lower<'a> {
         numeric
     }
 
+    /// The user-data dword past the native ones, the buffer addresses and
+    /// the group offsets that the next extra constant takes.
+    fn next_extra_index(&self) -> Option<u32> {
+        let native_end = self
+            .x
+            .native
+            .layout
+            .iter()
+            .filter(|r| matches!(r.root, RootType::Table | RootType::Constants))
+            .map(|r| u32::from(r.user_data).saturating_add(r.sgprs))
+            .max()
+            .unwrap_or(0);
+        let index = native_end
+            .checked_add(self.buffer_addresses.len() as u32)?
+            .checked_add(self.group_offsets.len() as u32)?;
+        (index < 64).then_some(index)
+    }
+
+    /// The offset dword of a compute group id component (none elsewhere, or
+    /// when the constants have no room).
+    fn group_offset_word(&mut self, component: u8) -> Option<V> {
+        if self.x.native.stage != HwStage::Cs || component > 2 {
+            return None;
+        }
+        let index = match self.group_offsets.iter().find(|o| o.component == component) {
+            Some(o) => o.index,
+            None => {
+                let index = self.next_extra_index()?;
+                self.group_offsets.push(GroupOffset { index, component });
+                index
+            }
+        };
+        Some(self.user_dword(index))
+    }
+
     fn buffer_address_word(&mut self, table: u8, byte_offset: u32, high: bool) -> Option<V> {
         let index = if let Some(a) = self
             .buffer_addresses
@@ -3722,18 +3773,7 @@ impl<'a> Lower<'a> {
         {
             a.index
         } else {
-            let native_end = self
-                .x
-                .native
-                .layout
-                .iter()
-                .filter(|r| matches!(r.root, RootType::Table | RootType::Constants))
-                .map(|r| u32::from(r.user_data).saturating_add(r.sgprs))
-                .max()?;
-            let index = native_end.checked_add(self.buffer_addresses.len() as u32)?;
-            if index >= 64 {
-                return None;
-            }
+            let index = self.next_extra_index()?;
             self.buffer_addresses.push(BufferAddress {
                 index,
                 table,
@@ -8147,6 +8187,10 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lowered(words, rsrc2).map(|_| ())
+    }
+
+    fn lowered(words: &[u32], rsrc2: u32) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter()
             .flat_map(|w| w.to_le_bytes())
             .collect();
@@ -8177,7 +8221,6 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
@@ -8934,6 +8977,39 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    #[test]
+    fn group_ids_get_a_split_dispatch_offset_constant() {
+        let words = [
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0001, // skip the overwrite
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let mut shader = lowered(&words, 1 << 7).unwrap();
+        assert_eq!(shader.group_offsets.len(), 1);
+        assert_eq!(shader.group_offsets[0].component, 0);
+        let index = shader.group_offsets[0].index;
+        assert!(index < 64);
+        // Y as well: its own dword.
+        let words = [
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (group id X)
+            0xBF06_8101, // s_cmp_eq_u32 s1, 1 (group id Y)
+            S_ENDPGM,
+        ];
+        let both = lowered(&words, 3 << 7).unwrap();
+        let mut found: Vec<_> = both.group_offsets.iter().map(|o| (o.component, o.index)).collect();
+        found.sort();
+        assert_eq!(found.len(), 2);
+        assert_ne!(found[0].1, found[1].1);
+        // No group id read: no constant.
+        let none = lowered(&[S_ENDPGM], 0).unwrap();
+        assert!(none.group_offsets.is_empty());
+        use super::super::validator::Validator;
+        if let Ok(mut validator) = Validator::load(Validator::default_path().as_deref()) {
+            validator.validate(&mut shader.dxil).unwrap();
+        }
     }
 
     #[test]

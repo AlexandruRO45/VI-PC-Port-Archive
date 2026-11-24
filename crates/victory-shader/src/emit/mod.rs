@@ -178,6 +178,18 @@ pub struct HostShader {
     pub descriptor_bindings: Vec<DescriptorBinding>,
     /// Words of title buffer addresses exposed through the user-data constants.
     pub buffer_addresses: Vec<BufferAddress>,
+    /// Compute only: dwords holding the group-id offset of a split dispatch
+    /// (D3D12 caps a dimension at 65535 groups). The shader adds each to its
+    /// workgroup id; the host writes 0 unless it splits the dispatch.
+    pub group_offsets: Vec<GroupOffset>,
+}
+
+/// One dword of user data added to a workgroup id component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupOffset {
+    pub index: u32,
+    /// 0, 1 or 2: x, y, z.
+    pub component: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +218,7 @@ impl HostShader {
             .iter()
             .map(|u| u.index)
             .chain(self.buffer_addresses.iter().map(|a| a.index))
+            .chain(self.group_offsets.iter().map(|o| o.index))
             .max()
             .map_or(0, |i| i + 1);
         n.next_multiple_of(4)
@@ -351,6 +364,7 @@ pub fn emit(
         root_uavs: l.root_uavs,
         descriptor_bindings: l.descriptor_bindings,
         buffer_addresses: l.buffer_addresses,
+        group_offsets: l.group_offsets,
     })
 }
 
@@ -748,6 +762,7 @@ mod tests {
             root_uavs: Vec::new(),
             descriptor_bindings: Vec::new(),
             buffer_addresses: Vec::new(),
+            group_offsets: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -761,6 +776,7 @@ mod tests {
                 root_uavs: Vec::new(),
                 descriptor_bindings: Vec::new(),
                 buffer_addresses: Vec::new(),
+                group_offsets: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
