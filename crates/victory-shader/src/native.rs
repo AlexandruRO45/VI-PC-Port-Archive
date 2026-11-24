@@ -119,6 +119,10 @@ const VS_OUTPUTS: usize = 0xc8;
 const VS_OUTPUT_COUNT: usize = 0x188;
 const CS_RSRC2: usize = 0x24;
 const CS_THREADS: usize = 0x28;
+/// D3D12's `numthreads` limits: x and y up to 1024, z up to 64, and at
+/// most 1024 threads in the group.
+const MAX_GROUP: [u32; 3] = [1024, 1024, 64];
+const MAX_GROUP_THREADS: u64 = 1024;
 const RECORD_LDS: usize = 0x4c;
 const MS_CLIP_CNTL: usize = 0x194;
 const MS_INFO: usize = 0x448;
@@ -531,14 +535,10 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         let stage_data = &payload[(start + RECORD_SIZE) as usize..];
         let io = match stage {
             HwStage::Ps => ps_io(stage_data, code.len())?,
-            HwStage::Vs => vs_io(stage_data)?,
+            HwStage::Vs => vs_inputs_fit(vs_io(stage_data)?)?,
             HwStage::Cs => StageIo::Cs(ComputeIo {
                 rsrc2: u32_at(stage_data, CS_RSRC2)?,
-                threads: [
-                    u32_at(stage_data, CS_THREADS)?,
-                    u32_at(stage_data, CS_THREADS + 4)?,
-                    u32_at(stage_data, CS_THREADS + 8)?,
-                ],
+                threads: group_size(stage_data)?,
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
             _ => StageIo::None,
@@ -554,6 +554,27 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         });
     }
     Ok(out)
+}
+
+/// A compute program's thread-group size. Lowering multiplies the
+/// components and writes them as the DXIL `numthreads`, so each must be one
+/// that HLSL allows: a zero or oversized group is refused here rather than
+/// overflowing that product (a debug panic) or emitting an invalid shader.
+fn group_size(data: &[u8]) -> Result<[u32; 3], ShaderError> {
+    let mut threads = [0; 3];
+    for (k, n) in threads.iter_mut().enumerate() {
+        *n = u32_at(data, CS_THREADS + 4 * k)?;
+    }
+    // Each component is checked first, so the product fits a u64.
+    if threads
+        .iter()
+        .zip(MAX_GROUP)
+        .any(|(&n, max)| n == 0 || n > max)
+        || threads.iter().map(|&n| u64::from(n)).product::<u64>() > MAX_GROUP_THREADS
+    {
+        return Err(Malformed("implausible thread-group size"));
+    }
+    Ok(threads)
 }
 
 /// The entries of `size` bytes from `at`, with their count at `count_at`.
@@ -641,6 +662,21 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
     Ok(StageIo::Vs { inputs, outputs })
 }
 
+/// Raising loads a vertex input's channel `c` from `v[vgpr + c]`, an 8-bit
+/// register number: every enabled channel must land on a VGPR.
+fn vs_inputs_fit(io: StageIo) -> Result<StageIo, ShaderError> {
+    if let StageIo::Vs { inputs, .. } = &io
+        && inputs.iter().any(|i| {
+            i.mask
+                .checked_ilog2()
+                .is_some_and(|last| u32::from(i.vgpr) + last > u32::from(u8::MAX))
+        })
+    {
+        return Err(Malformed("vertex input outside the VGPRs"));
+    }
+    Ok(io)
+}
+
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
     let StageIo::Vs { outputs, .. } = vs_io(data)? else {
         unreachable!()
@@ -649,10 +685,17 @@ fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
         .get(MS_INFO..MS_INFO + 8)
         .ok_or(Malformed("stage data out of bounds"))?;
     let half = |at: usize| u32::from(u16::from_le_bytes([info[at], info[at + 1]]));
+    // The group's lanes become the DXIL `numthreads` x and, for containers
+    // without the HLSL count, the stride of the group id: an empty group
+    // would emit `numthreads(0, 1, 1)` and give every group id 0.
+    let threads = half(0);
+    if threads == 0 {
+        return Err(Malformed("implausible thread-group size"));
+    }
     Ok(StageIo::Ms(MeshIo {
         outputs,
         clip_cntl: u32_at(data, MS_CLIP_CNTL)?,
-        threads: half(0),
+        threads,
         max_vertices: half(2),
         max_primitives: half(4),
         topology: info[7],
@@ -721,7 +764,17 @@ mod tests {
             payload.extend_from_slice(&flags.to_le_bytes());
             payload.resize(record as usize + RECORD_REGS, 0);
             payload.extend_from_slice(&(VGPRS | 31 << 20).to_le_bytes());
-            payload.extend_from_slice(&empty_stage_data());
+            let mut data = empty_stage_data();
+            // numthreads(1, 1, 1): a compute or mesh group is never empty.
+            if stage == HwStage::Cs {
+                for k in 0..3 {
+                    data[CS_THREADS + 4 * k..][..4].copy_from_slice(&1u32.to_le_bytes());
+                }
+            }
+            if stage == HwStage::Ms {
+                data[MS_INFO..][..2].copy_from_slice(&1u16.to_le_bytes());
+            }
+            payload.extend_from_slice(&data);
             payload.extend_from_slice(code);
         }
         let mut out = b"FSSM".to_vec();
@@ -1170,6 +1223,26 @@ mod tests {
             blob[e + count_at..][..4].copy_from_slice(&(MAX_SEMANTICS + 1).to_le_bytes());
             assert_eq!(refused_blob(&xbch(&blob)), "implausible semantic count");
         }
+        // One input in v252 or v253: x-w of v252 end at v255 and fit; from
+        // v253, w would be v256.
+        let input = |vgpr: u8, mask: u8| {
+            let mut blob = vs.clone();
+            blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+            blob[e + VS_INPUTS..][..5].copy_from_slice(&[0, 0, mask, vgpr, 0]);
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        assert!(input(252, 0xf).is_ok());
+        assert!(input(255, 0x1).is_ok());
+        assert!(input(255, 0).is_ok(), "no channel is loaded");
+        for (vgpr, mask) in [(253, 0xf), (255, 0x2)] {
+            assert!(
+                matches!(
+                    input(vgpr, mask),
+                    Err(Malformed("vertex input outside the VGPRs"))
+                ),
+                "v{vgpr} mask {mask:#x}"
+            );
+        }
 
         let ps = fssm(&[(HwStage::Ps, &PS_CODE)]);
         let e = stage_data_at(&ps, HwStage::Ps);
@@ -1188,5 +1261,47 @@ mod tests {
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_ok());
         blob[e + PS_PATCHES..][..4].copy_from_slice(&last.to_le_bytes());
         assert_eq!(refused_blob(&xbch(&blob)), "export patch outside the code");
+
+        // numthreads at each limit fits; past one, or a zero component, does
+        // not. 65536 x 65536 would overflow lowering's u32 thread count.
+        let cs = fssm(&[(HwStage::Cs, &VS_CODE)]);
+        let e = stage_data_at(&cs, HwStage::Cs);
+        let group = |threads: [u32; 3]| {
+            let mut blob = cs.clone();
+            for (k, n) in threads.into_iter().enumerate() {
+                blob[e + CS_THREADS + 4 * k..][..4].copy_from_slice(&n.to_le_bytes());
+            }
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        for fits in [[1024, 1, 1], [1, 1024, 1], [1, 16, 64], [32, 32, 1]] {
+            let p = group(fits).unwrap();
+            assert!(
+                matches!(p[0].io, StageIo::Cs(ComputeIo { threads, .. }) if threads == fits),
+                "{fits:?}"
+            );
+        }
+        for bad in [
+            [0, 1, 1],
+            [1, 1, 0],
+            [1025, 1, 1],
+            [1, 1, 65],
+            [64, 32, 1],
+            [65536, 65536, 1],
+            [u32::MAX, u32::MAX, u32::MAX],
+        ] {
+            assert!(
+                matches!(group(bad), Err(Malformed("implausible thread-group size"))),
+                "{bad:?}"
+            );
+        }
+
+        // A mesh group of one lane fits; an empty one does not.
+        let ms = fssm(&[(HwStage::Ms, &VS_CODE)]);
+        let e = stage_data_at(&ms, HwStage::Ms);
+        let p = native_programs(&part(&[(KIND_NATIVE, &xbch(&ms))])).unwrap();
+        assert!(matches!(&p[0].io, StageIo::Ms(m) if m.threads == 1));
+        let mut blob = ms.clone();
+        blob[e + MS_INFO..][..2].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(refused_blob(&xbch(&blob)), "implausible thread-group size");
     }
 }
