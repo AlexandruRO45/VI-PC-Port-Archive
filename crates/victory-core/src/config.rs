@@ -601,7 +601,23 @@ fn config_file_or(explicit: Option<PathBuf>, default: &Path) -> Result<Option<Pa
             }
             return Err(err).context(checking);
         }
+        // A chain of links that comes back to one of its own names (`ln -s
+        // victory.toml victory.toml`, or two profiles linked to each
+        // other): the OS says only "Too many levels of symbolic links",
+        // which names neither link. Say where each leads and which one it
+        // loops back to, keeping the OS error underneath.
         Err(err) => {
+            if let Some((hops, back)) = link_cycle(&plain) {
+                let hops: Vec<String> = hops
+                    .iter()
+                    .map(|target| format!("a link to {}", target.display()))
+                    .collect();
+                return Err(err).context(format!(
+                    "{checking}: {}, which loops back to {}",
+                    hops.join(", "),
+                    back.display()
+                ));
+            }
             return Err(err).context(checking);
         }
     };
@@ -710,6 +726,50 @@ fn link_hops(path: &Path) -> Vec<PathBuf> {
         hops.push(target);
     }
     hops
+}
+
+/// For a chain of links from `path` (as [`link_hops`] follows it) that
+/// comes back to a name already on it: the hops as written, up to and with
+/// the one that closes the loop, and that name as the chain reached it
+/// first (`path` itself for a link to itself). Names are compared with `.`
+/// and `..` folded (see [`lexical`]) and the match is confirmed on disk as
+/// the same link, so two spellings of one link are one name. `None` when
+/// the chain ends, or loops only through a folder link on the way.
+fn link_cycle(path: &Path) -> Option<(Vec<PathBuf>, PathBuf)> {
+    let same = |a: &Path, b: &Path| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+                (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+                _ => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            lexical(a) == lexical(b)
+        }
+    };
+    let mut seen = vec![path.to_path_buf()];
+    let mut hops = Vec::new();
+    let mut at = path.to_path_buf();
+    while hops.len() < 40 {
+        let plain: PathBuf = at.components().collect();
+        let Ok(target) = std::fs::read_link(&plain) else {
+            return None;
+        };
+        at = at.parent().unwrap_or(Path::new("")).join(&target);
+        hops.push(target);
+        let here: PathBuf = at.components().collect();
+        if let Some(back) = seen
+            .iter()
+            .find(|name| lexical(name) == lexical(&here) && same(name, &here))
+        {
+            return Some((hops, back.clone()));
+        }
+        seen.push(here);
+    }
+    None
 }
 
 /// Refuses a cache or data folder that is the root of a drive, the home
@@ -3367,6 +3427,102 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_config_link_loop_names_its_hops_and_where_it_closes() {
+        // A short scratch folder under the system temp folder, never the
+        // repository or the working directory; removed at the end.
+        let dir = std::env::temp_dir().join(format!("vcl-cycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let default = dir.join("victory.toml");
+        let link = |target: &str, name: &str| {
+            let at = dir.join(name);
+            let _ = std::fs::remove_file(&at);
+            std::os::unix::fs::symlink(target, at).unwrap();
+        };
+        let checking = |path: &Path| {
+            let err = config_file_or(None, path).unwrap_err();
+            // The OS error stays underneath for callers that look at it.
+            assert!(err.downcast_ref::<std::io::Error>().is_some(), "{err:#}");
+            err.to_string()
+        };
+        let shown = default.display().to_string();
+
+        // A relative link to itself spelt `./`: the same link, so it is
+        // named as the default the chain started from.
+        link("./victory.toml", "victory.toml");
+        assert_eq!(
+            checking(&default),
+            format!(
+                "checking the config file {shown}: a link to ./victory.toml, \
+                 which loops back to {shown}"
+            )
+        );
+
+        // A lead-in to a loop that does not include the default: every hop
+        // is named, and the loop closes on the first link inside it, as the
+        // chain reached it, not on the default.
+        link("a.toml", "victory.toml");
+        link("b.toml", "a.toml");
+        link("c.toml", "b.toml");
+        link("b.toml", "c.toml");
+        assert_eq!(
+            checking(&default),
+            format!(
+                "checking the config file {shown}: a link to a.toml, a link to b.toml, \
+                 a link to c.toml, a link to b.toml, which loops back to {}",
+                dir.join("b.toml").display()
+            )
+        );
+
+        // A hop with `..` through a real folder is still the same link.
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        link("sub/../victory.toml", "victory.toml");
+        assert_eq!(
+            checking(&default),
+            format!(
+                "checking the config file {shown}: a link to sub/../victory.toml, \
+                 which loops back to {shown}"
+            )
+        );
+
+        // Through VICTORY_CONFIG, the variable is named the same way.
+        let err = config_file(Some(default.clone())).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "checking VICTORY_CONFIG at {shown}: a link to sub/../victory.toml, \
+                 which loops back to {shown}"
+            )
+        );
+
+        // A loop only through a folder link on the way (`back` leads to the
+        // scratch folder itself, so `back/back/...` never ends as a name
+        // but never repeats one either): no cycle of links is claimed, only
+        // the OS error with what was being checked.
+        link(".", "back");
+        let deep = dir.join(["back"; 45].join("/")).join("x.toml");
+        let err = config_file_or(Some(deep.clone()), &default).unwrap_err();
+        assert!(!err.to_string().contains("loops back"), "{err:#}");
+        assert_eq!(
+            err.to_string(),
+            format!("checking VICTORY_CONFIG at {}", deep.display())
+        );
+
+        // A link that loops beside a real file is not a loop once fixed.
+        std::fs::write(dir.join("real.toml"), "").unwrap();
+        link("real.toml", "b.toml");
+        link("a.toml", "victory.toml");
+        assert_eq!(
+            config_file_or(None, &default).unwrap(),
+            Some(default.clone())
+        );
+        assert_eq!(link_cycle(&default), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_config_link_that_loops_is_refused_not_skipped() {
         // A scratch folder under the system temp folder, never the
         // repository or the working directory; removed at the end.
@@ -3396,6 +3552,22 @@ mod tests {
                 "{text}"
             );
             assert!(!text.contains("does not exist"), "{text}");
+            // Each hop is named as written, ending with the name it loops
+            // back to: the default itself, whichever link closes the loop.
+            let expected = if first == second {
+                format!(
+                    "checking the config file {0}: a link to {0}, which loops back to {0}",
+                    default.display()
+                )
+            } else {
+                format!(
+                    "checking the config file {0}: a link to {1}, a link to {0}, \
+                     which loops back to {0}",
+                    default.display(),
+                    other.display()
+                )
+            };
+            assert_eq!(text, expected);
 
             // The same through VICTORY_CONFIG, naming the variable.
             let err = config_file(Some(default.clone())).unwrap_err().to_string();
