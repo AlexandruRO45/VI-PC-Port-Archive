@@ -19,6 +19,7 @@ pub fn run(
     shaders: Option<PathBuf>,
     cache: Option<PathBuf>,
     save_every: Option<usize>,
+    jobs: Option<usize>,
     dry_run: bool,
 ) -> Result<()> {
     let shaders = shaders
@@ -48,11 +49,16 @@ pub fn run(
         None => cfg.cache_subdir("pipelines")?,
     };
     println!("library        {}", cache.display());
+    let jobs = jobs.unwrap_or_else(|| {
+        std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 8)
+    });
+    println!("workers        {jobs}");
     let report = victory_gpu::pipeline::precompile::precompile(
         &dump,
         &shaders,
         &cache,
         save_every.unwrap_or(50),
+        jobs,
     )
     .with_context(|| format!("replaying {}", dump.display()))?;
     println!();

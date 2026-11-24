@@ -110,6 +110,11 @@ enum Command {
         /// it stored (default 50).
         #[arg(long)]
         save_every: Option<usize>,
+        /// Pipelines replayed at once (default: half the logical cores, 2 to
+        /// 8). Each line's driver compile is seconds long, so a serial replay
+        /// of the world's ~1,950 takes two hours.
+        #[arg(long)]
+        jobs: Option<usize>,
         /// Read the dump and say what could be replayed: no device, no library.
         #[arg(long)]
         dry_run: bool,
@@ -197,15 +202,16 @@ fn main() -> Result<()> {
             shaders,
             cache,
             save_every,
+            jobs,
             dry_run,
         } => {
             #[cfg(windows)]
             {
-                precompile::run(dump, shaders, cache, save_every, dry_run)
+                precompile::run(dump, shaders, cache, save_every, jobs, dry_run)
             }
             #[cfg(not(windows))]
             {
-                let _ = (dump, shaders, cache, save_every, dry_run);
+                let _ = (dump, shaders, cache, save_every, jobs, dry_run);
                 anyhow::bail!("precompile needs a D3D12 host: it is a Windows command")
             }
         }
