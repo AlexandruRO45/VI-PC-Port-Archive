@@ -1687,6 +1687,73 @@ mod tests {
     }
 
     #[test]
+    fn a_relative_victory_config_anchors_at_its_folder_then_the_working_directory() {
+        // `VICTORY_CONFIG=conf/victory.toml`: its folder is `conf`, itself
+        // relative, so the file's relative settings become `conf/...` and
+        // only then are joined to the working directory, not dropped there.
+        let text = "[paths]\ngame_dir = './~gta'\ncache_dir = '../shared/cache'\n\
+                    data_dir = '~/saves'\ntest_titles = ['t/one']\n";
+        let parsed: FileConfig = toml::from_str(text).unwrap();
+        let home = PathBuf::from(abs("home"));
+        let config = Path::new("conf").join("victory.toml");
+        let dir = config.parent().unwrap();
+        let paths = parsed.anchored_at(dir, Some(&home)).unwrap();
+        // `./~gta` is a folder named `~gta` beside the file, not a home.
+        assert_eq!(paths.game_dir.as_deref(), Some(&*dir.join("./~gta")));
+        // `..` is kept for the lexical checks, not resolved against disk.
+        assert_eq!(
+            paths.cache_dir.as_deref(),
+            Some(&*dir.join("../shared/cache"))
+        );
+        // `~` in the file is home even when the file's folder is relative.
+        assert_eq!(paths.data_dir.as_deref(), Some(&*home.join("saves")));
+
+        let cwd = PathBuf::from(abs("work"));
+        let env = |k: &str| match k {
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        let cfg = Config::resolve_in(paths, Some(config.clone()), env, Some(&cwd)).unwrap();
+        assert_eq!(cfg.game_dir.unwrap(), cwd.join("conf/./~gta"));
+        assert_eq!(cfg.cache_dir, cwd.join("conf/../shared/cache"));
+        assert_eq!(cfg.data_dir, home.join("saves"));
+        assert_eq!(cfg.test_titles, vec![cwd.join("conf/t/one")]);
+        assert_eq!(cfg.source, Some(config));
+        assert_eq!(cfg.origins.game_dir, Origin::File);
+        assert_eq!(cfg.origins.cache_dir, Origin::File);
+        assert_eq!(cfg.origins.data_dir, Origin::File);
+        assert_eq!(cfg.origins.test_titles, Origin::File);
+    }
+
+    #[test]
+    fn a_config_file_at_the_root_anchors_at_the_root() {
+        // `VICTORY_CONFIG=/victory.toml` has `/` as its folder, not the
+        // empty path, so relative settings land under the root and are not
+        // left relative to the working directory.
+        let root = PathBuf::from(abs(""));
+        let config = root.join("victory.toml");
+        let dir = config.parent().unwrap();
+        assert_eq!(dir, root);
+        let parsed: FileConfig =
+            toml::from_str("[paths]\ngame_dir = 'gta'\ncache_dir = 'srv/cache'\n").unwrap();
+        let paths = parsed.anchored_at(dir, None).unwrap();
+        assert_eq!(paths.game_dir.unwrap(), root.join("gta"));
+        assert_eq!(paths.cache_dir.unwrap(), root.join("srv/cache"));
+        // Only a relative path is anchored: `cache_dir = '.'` is the root
+        // itself, which the folder checks then refuse as a cache.
+        let parsed: FileConfig = toml::from_str("[paths]\ncache_dir = '.'\n").unwrap();
+        let paths = parsed.anchored_at(dir, None).unwrap();
+        let env = |k: &str| match k {
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        let err = Config::resolve(paths, Some(config), env)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[paths].cache_dir"), "{err}");
+    }
+
+    #[test]
     fn the_default_config_file_keeps_paths_as_written() {
         // `./victory.toml` has an empty parent, so nothing changes.
         let parsed: FileConfig = toml::from_str("[paths]\ngame_dir = 'game'\n").unwrap();
