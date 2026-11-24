@@ -72,6 +72,34 @@ Three statements this fork can stand behind today:
   menus on an RX 6700 XT; the 2–4 fps above is the base's prologue on an RTX
   4070. Neither number describes the merged tree, which has not been measured.
 
+### What this file did not check itself
+
+Kept deliberately, because a claim you cannot reproduce is worth less than the
+fact that you said so:
+
+- The **545 → 0 mesh pipeline refusals with 338 modules** are the graphics lane's
+  keyed soak as this crew's notes record it. Its log is not on the machine this
+  was written on under any name that could be found, so it has not been
+  recounted. The offline counts in the same table come from
+  [docs/emit-gaps.md](docs/emit-gaps.md), which was measured.
+- The **three `no host texture` failures a session** come from the review lane's
+  handoff to whoever performed the merge, not from a log read here.
+- The **base's** cutscene, prologue and frame-rate numbers are its own README's,
+  on its own machine. Nothing in this repository reproduces them, and its report
+  says so in its own words.
+- The **world-frame crash** is described from this crew's crash logs on this PC,
+  which are not committed because they name title addresses. The only
+  `crashes.log` on disk while this was written belongs to the adoption attempt
+  and carries different offsets, so the `+0x8f92a` signature is quoted from the
+  crew's record rather than re-read.
+- The **cutscene window's numbers** are this file's own: measured from the five
+  dumped PNGs with a histogram, not quoted from anywhere.
+
+The in-host instruments in [Debugging](#debugging) — `VICTORY_GPU_CHECK`,
+`VICTORY_D3D12_VALIDATE`, `VICTORY_INDIRECT_RECORD`, `VICTORY_SERIAL_PIPELINES`,
+the crumb ring and the frame log — are this fork's own work, and reach the tree
+with the re-application of its fixes onto the adopted base.
+
 ## Known problems
 
 - **Anything the sun does not hit directly is black** in the base's tree: the
