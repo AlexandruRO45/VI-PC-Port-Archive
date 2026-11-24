@@ -18,6 +18,7 @@
 #include "startup_stubs/draw_dump_tracking.h"
 
 #include <d3d12.h>
+#include "null_texture_view.h"
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
@@ -1764,6 +1765,20 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             std::memcpy(desc_copy, &mapped, sizeof(mapped));
             args[desc_index] = reinterpret_cast<u64>(desc_copy);
         }
+    }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC null_uav{};
+    D3D12_RENDER_TARGET_VIEW_DESC null_rtv{};
+    if constexpr (N == 19) {
+        if (c && x2w_local::readable(reinterpret_cast<const void*>(c), sizeof(null_uav)) &&
+            x2w_local::adapt_null_view(device_of(self), a != 0, b != 0,
+                *reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(c), null_uav))
+            args[2] = reinterpret_cast<u64>(&null_uav);
+    }
+    if constexpr (N == 20) {
+        if (b && x2w_local::readable(reinterpret_cast<const void*>(b), sizeof(null_rtv)) &&
+            x2w_local::adapt_null_view(device_of(self), a != 0,
+                *reinterpret_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(b), null_rtv))
+            args[1] = reinterpret_cast<u64>(&null_rtv);
     }
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
     if (N == 20 && args[0]) note_view_target(args[D], reinterpret_cast<ID3D12Resource*>(args[0]));

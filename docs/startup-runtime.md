@@ -8,6 +8,14 @@ This is not a port and not an emulator. No executable is playable. Every stand-i
 most answers are shortcuts that are logged as such. The open problems are tracked in the issues
 whose titles start with `startup-runtime:`.
 
+## Null Texture2D descriptors
+
+When the adapter lacks typed UAV support for B5G5R5A1_UNORM or render-target support for
+B4G4R4A4_UNORM, the wrapper uses an R8G8B8A8_UNORM null descriptor if that format supports the
+requested view. This applies only to Texture2D views with no resource or counter. Run
+`ctest --test-dir out/bin --no-tests=error -R "^startup_null_views_" -V` against your build
+directory to exercise both slots on hardware and WARP.
+
 ## What is measured
 
 With the switches below, an x64 console executable on an AMD RDNA4 GPU (Windows 11, release
