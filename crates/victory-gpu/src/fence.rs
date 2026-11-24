@@ -54,6 +54,18 @@ pub(crate) extern "win64" fn create(
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
 
+/// What signals a title event on Linux, where events live in
+/// `victory-hle`'s handle table.
+#[cfg(not(windows))]
+static SET_EVENT: std::sync::OnceLock<fn(usize)> = std::sync::OnceLock::new();
+
+/// Sets what signals a title event handle (Linux: the handle table's
+/// `SetEvent`). Until set, fence events are not signalled.
+#[cfg(not(windows))]
+pub fn on_set_event(set: fn(usize)) {
+    let _ = SET_EVENT.set(set);
+}
+
 fn set_event(event: usize) {
     #[cfg(windows)]
     // SAFETY: the title passed an event handle.
@@ -61,7 +73,10 @@ fn set_event(event: usize) {
         windows_sys::Win32::System::Threading::SetEvent(event as *mut c_void)
     };
     #[cfg(not(windows))]
-    let _ = event;
+    match SET_EVENT.get() {
+        Some(set) => set(event),
+        None => tracing::warn!(event, "no event handle table; fence event not signalled"),
+    }
 }
 
 extern "win64" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -133,12 +148,11 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use crate::object::slot;
 
-    #[cfg(windows)]
     #[test]
     fn signals_set_waiting_events() {
         use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};

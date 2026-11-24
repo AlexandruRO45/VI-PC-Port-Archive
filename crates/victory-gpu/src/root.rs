@@ -3,7 +3,9 @@
 //! Serializing goes to the host's `D3D12SerializeRootSignature` (or its
 //! versioned form): the description is laid out as on PC, and the blob it
 //! returns works as the console's, whose two methods sit in the same slots.
-//! The console's own flags (bit 24 and up) are dropped first.
+//! The console's own flags (bit 24 and up) are dropped first. On Linux the
+//! host's objects are SysV COM, so what it returns is copied into objects
+//! of ours with the title's calling convention ([`title`]).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{CStr, c_void};
@@ -46,13 +48,22 @@ pub struct VersionedDesc {
 }
 
 type Serialize =
-    unsafe extern "win64" fn(*const Desc, u32, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
+    unsafe extern "system" fn(*const Desc, u32, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
 type SerializeVersioned =
-    unsafe extern "win64" fn(*const VersionedDesc, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
+    unsafe extern "system" fn(*const VersionedDesc, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
 
-/// An export of the host's `d3d12.dll` in System32, looked up once.
+/// An export of the host's `d3d12.dll` in System32 (Linux: vkd3d-proton),
+/// looked up once.
 fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
     *cache.get_or_init(|| {
+        #[cfg(not(windows))]
+        return match victory_shader::hostlib::d3d12_export(name) {
+            Ok(f) => Some(f as usize),
+            Err(e) => {
+                tracing::warn!("{e}");
+                None
+            }
+        };
         #[cfg(windows)]
         {
             use windows_sys::Win32::System::LibraryLoader::{
@@ -73,8 +84,6 @@ fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
             // SAFETY: a loaded module and a NUL-terminated name.
             unsafe { GetProcAddress(module, name.as_ptr().cast()) }.map(|f| f as usize)
         }
-        #[cfg(not(windows))]
-        None
     })
 }
 
@@ -108,14 +117,20 @@ pub extern "win64" fn serialize(
         return E_NOTIMPL;
     };
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe {
+    let hr = unsafe {
         std::mem::transmute::<usize, Serialize>(address)(
             &without_console_flags(desc),
             version,
             blob,
             error,
         )
-    }
+    };
+    #[cfg(not(windows))]
+    // SAFETY: the host filled in (or left null) the title's out pointers.
+    unsafe {
+        title::blobs(blob, error)
+    };
+    hr
 }
 
 /// `d3d12_xs!D3D12SerializeVersionedRootSignature`.
@@ -138,11 +153,18 @@ pub extern "win64" fn serialize_versioned(
         ..desc
     };
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) }
+    let hr =
+        unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) };
+    #[cfg(not(windows))]
+    // SAFETY: the host filled in (or left null) the title's out pointers.
+    unsafe {
+        title::blobs(blob, error)
+    };
+    hr
 }
 
 type Deserialize =
-    unsafe extern "win64" fn(*const u8, usize, *const Iid, *mut *mut c_void) -> HRESULT;
+    unsafe extern "system" fn(*const u8, usize, *const Iid, *mut *mut c_void) -> HRESULT;
 
 /// `d3d12_xs!D3D12CreateRootSignatureDeserializer`: our blobs are the
 /// host's serialization, so the host's deserializer reads them, and its
@@ -163,7 +185,158 @@ pub extern "win64" fn create_deserializer(
         return E_NOTIMPL;
     };
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe { std::mem::transmute::<usize, Deserialize>(address)(blob, size, iid, out) }
+    let hr = unsafe { std::mem::transmute::<usize, Deserialize>(address)(blob, size, iid, out) };
+    #[cfg(not(windows))]
+    // SAFETY: the host filled in (or left null) the title's out pointer.
+    unsafe {
+        title::deserializer(out)
+    };
+    hr
+}
+
+/// The host's blobs and deserializers as objects the title can call
+/// (`win64`), on Linux where the host's are SysV.
+#[cfg(not(windows))]
+mod title {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::Win32::Graphics::Direct3D12::ID3D12RootSignatureDeserializer;
+    use windows::core::Interface;
+
+    use crate::object::{HRESULT, S_OK};
+
+    /// IUnknown, then the object's one getter (the blob's two).
+    #[repr(C)]
+    struct Vtable {
+        query: extern "win64" fn(*mut Title, *const c_void, *mut *mut c_void) -> HRESULT,
+        add_ref: extern "win64" fn(*mut Title) -> u32,
+        release: extern "win64" fn(*mut Title) -> u32,
+        first: extern "win64" fn(*mut Title) -> *const c_void,
+        second: extern "win64" fn(*mut Title) -> usize,
+    }
+
+    #[repr(C)]
+    struct Title {
+        vtable: &'static Vtable,
+        refs: AtomicU32,
+        /// The blob's bytes; empty for a deserializer.
+        bytes: Vec<u8>,
+        /// The deserializer's description, which `host` owns.
+        desc: *const c_void,
+        _host: Option<ID3D12RootSignatureDeserializer>,
+    }
+
+    extern "win64" fn query(this: *mut Title, _: *const c_void, out: *mut *mut c_void) -> HRESULT {
+        // Any interface: the title only asks for the one it was given.
+        add_ref(this);
+        // SAFETY: the title's out pointer.
+        unsafe { *out = this.cast() };
+        S_OK
+    }
+
+    extern "win64" fn add_ref(this: *mut Title) -> u32 {
+        // SAFETY: a live object of ours.
+        unsafe { (*this).refs.fetch_add(1, Ordering::Relaxed) + 1 }
+    }
+
+    extern "win64" fn release(this: *mut Title) -> u32 {
+        // SAFETY: a live object of ours; the last reference frees it.
+        unsafe {
+            let left = (*this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+            if left == 0 {
+                drop(Box::from_raw(this));
+            }
+            left
+        }
+    }
+
+    extern "win64" fn pointer(this: *mut Title) -> *const c_void {
+        // SAFETY: a live object of ours.
+        unsafe { (*this).bytes.as_ptr().cast() }
+    }
+
+    extern "win64" fn size(this: *mut Title) -> usize {
+        // SAFETY: as above.
+        unsafe { (*this).bytes.len() }
+    }
+
+    extern "win64" fn desc(this: *mut Title) -> *const c_void {
+        // SAFETY: as above.
+        unsafe { (*this).desc }
+    }
+
+    static BLOB: Vtable = Vtable {
+        query,
+        add_ref,
+        release,
+        first: pointer,
+        second: size,
+    };
+
+    static DESERIALIZER: Vtable = Vtable {
+        query,
+        add_ref,
+        release,
+        first: desc,
+        second: size,
+    };
+
+    fn hand_out(title: Title) -> *mut c_void {
+        Box::into_raw(Box::new(title)).cast()
+    }
+
+    /// Replaces the host blobs at `blob` and `error` (each null or not)
+    /// with copies of ours.
+    ///
+    /// # Safety
+    ///
+    /// Each is null or points at null or a host blob reference, now ours.
+    pub(super) unsafe fn blobs(blob: *mut *mut c_void, error: *mut *mut c_void) {
+        for at in [blob, error] {
+            // SAFETY: the caller's pointers.
+            let Some(host) = (unsafe { at.as_mut() }).filter(|h| !h.is_null()) else {
+                continue;
+            };
+            // SAFETY: a host blob reference, now released by the drop.
+            let blob = unsafe { ID3DBlob::from_raw(*host) };
+            // SAFETY: the blob's own bytes.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+            };
+            *host = hand_out(Title {
+                vtable: &BLOB,
+                refs: AtomicU32::new(1),
+                bytes: bytes.to_vec(),
+                desc: std::ptr::null(),
+                _host: None,
+            });
+        }
+    }
+
+    /// Replaces the host deserializer at `out` with one of ours.
+    ///
+    /// # Safety
+    ///
+    /// As for [`blobs`], with a deserializer.
+    pub(super) unsafe fn deserializer(out: *mut *mut c_void) {
+        // SAFETY: the caller's pointer.
+        let Some(host) = (unsafe { out.as_mut() }).filter(|h| !h.is_null()) else {
+            return;
+        };
+        // SAFETY: a host deserializer reference, now held by our object.
+        let host_object = unsafe { ID3D12RootSignatureDeserializer::from_raw(*host) };
+        // SAFETY: a plain getter; the description lives as long as the object.
+        let desc = unsafe { host_object.GetRootSignatureDesc() }.cast();
+        *host = hand_out(Title {
+            vtable: &DESERIALIZER,
+            refs: AtomicU32::new(1),
+            bytes: Vec::new(),
+            desc,
+            _host: Some(host_object),
+        });
+    }
 }
 
 #[repr(C)]
@@ -217,10 +390,22 @@ mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
+    /// Without vkd3d-proton (Linux) there is no host to serialize on.
+    fn no_host() -> bool {
+        #[cfg(not(windows))]
+        if let Err(e) = victory_shader::hostlib::d3d12() {
+            eprintln!("{e}; skipped");
+            return true;
+        }
+        false
+    }
+
     /// One 32-bit constant at b0, serialized by the host, then created.
-    #[cfg(windows)]
     #[test]
     fn host_serialized_blobs_create_root_signatures() {
+        if no_host() {
+            return;
+        }
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_ROOT_CONSTANTS, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
             D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_SHADER_VISIBILITY_ALL,
@@ -260,10 +445,14 @@ mod tests {
     }
 
     /// The host's deserializer reads our blobs back (the upscaler's call).
-    #[cfg(windows)]
     #[test]
     fn our_blobs_deserialize_on_the_host() {
-        use windows::Win32::Graphics::Direct3D12::ID3D12RootSignatureDeserializer;
+        if no_host() {
+            return;
+        }
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_ROOT_SIGNATURE_DESC, ID3D12RootSignatureDeserializer,
+        };
         use windows::core::Interface;
         let desc = VersionedDesc {
             version: 1,
@@ -289,18 +478,22 @@ mod tests {
         );
         let mut out = std::ptr::null_mut();
         assert_eq!(create_deserializer(data, size, &iid, &mut out), S_OK);
-        // SAFETY: the host handed out this interface.
-        let deserializer = unsafe { ID3D12RootSignatureDeserializer::from_raw(out) };
+        // As the title calls it: the description getter, then Release.
+        let out = out.cast_const().cast::<Object>();
+        let get = slot::<extern "win64" fn(This) -> *const D3D12_ROOT_SIGNATURE_DESC>(out, 0x18);
         // SAFETY: valid while the deserializer lives.
-        let read = unsafe { &*deserializer.GetRootSignatureDesc() };
+        let read = unsafe { &*get(out) };
         assert_eq!((read.NumParameters, read.Flags.0), (0, 1));
+        assert_eq!(slot::<extern "win64" fn(This) -> u32>(out, 0x10)(out), 0);
         slot::<extern "win64" fn(This) -> u32>(blob, 0x10)(blob);
     }
 
     /// Version 1.0 through the versioned entry point, with a console flag.
-    #[cfg(windows)]
     #[test]
     fn versioned_descriptions_serialize_on_the_host() {
+        if no_host() {
+            return;
+        }
         let desc = VersionedDesc {
             version: 1,
             desc: Desc {

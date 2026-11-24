@@ -279,7 +279,6 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
-#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
     let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
@@ -748,7 +747,6 @@ struct Resource {
     backing: Backing,
     /// Textures also live on the host GPU (decision 0007); buffers do not
     /// yet.
-    #[cfg(windows)]
     host: Option<std::sync::Arc<HostTexture>>,
 }
 
@@ -758,7 +756,6 @@ struct Resource {
 /// may release a resource whose commands it recorded but not yet submitted
 /// (console memory outlives the object; a host texture must outlive the
 /// lists that name it).
-#[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
@@ -766,7 +763,6 @@ pub(crate) struct HostTexture {
 
 /// Moves the host texture to `wanted` (a host texture state); the host
 /// resource and the state it leaves, if that is a change.
-#[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let host = resource(this).host.as_ref()?;
@@ -777,7 +773,6 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
 }
 
 /// The host GPU's copy of a title resource, if it has one.
-#[cfg(windows)]
 pub(crate) fn host_resource<'a>(
     this: This,
 ) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
@@ -788,7 +783,6 @@ pub(crate) fn host_resource<'a>(
 }
 
 /// A title texture's host copy, shared, for a list to hold.
-#[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
@@ -798,7 +792,6 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
-#[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
@@ -926,9 +919,6 @@ fn hand_out_resource(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    #[cfg(not(windows))]
-    let _ = (state, clear);
-    #[cfg(windows)]
     let host = host_texture(&desc, state, clear);
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
@@ -936,7 +926,6 @@ fn hand_out_resource(
         heap,
         heap_flags,
         backing,
-        #[cfg(windows)]
         host: host.map(|texture| {
             let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
             std::sync::Arc::new(HostTexture {
@@ -945,7 +934,6 @@ fn hand_out_resource(
             })
         }),
     });
-    #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
@@ -953,7 +941,6 @@ fn hand_out_resource(
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
 
-#[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
         #[cfg(feature = "diagnostics")]
@@ -1144,13 +1131,11 @@ pub(crate) extern "win64" fn create_at_address(
 /// shortcut: never released (one host texture per distinct address and
 /// description viewed); release them when the title unmaps or reuses the
 /// memory once streaming grows VRAM use.
-#[cfg(windows)]
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
-#[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&r) = map.get(&(address, *desc)) {
@@ -1588,7 +1573,6 @@ mod tests {
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
-    #[cfg(windows)]
     #[test]
     fn buffer_data_reaches_the_host_texture() {
         use windows::Win32::Graphics::Direct3D12::*;

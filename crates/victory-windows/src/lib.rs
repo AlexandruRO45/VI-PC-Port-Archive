@@ -62,6 +62,22 @@ pub mod core {
         pub const fn null() -> Self {
             Self(std::ptr::null())
         }
+
+        /// The text up to the NUL.
+        ///
+        /// # Safety
+        ///
+        /// The pointer is a live NUL-terminated string.
+        pub unsafe fn to_string(&self) -> std::result::Result<String, std::string::FromUtf16Error> {
+            let mut len = 0;
+            // SAFETY: the caller's string, read up to its NUL.
+            unsafe {
+                while *self.0.add(len) != 0 {
+                    len += 1;
+                }
+                String::from_utf16(std::slice::from_raw_parts(self.0, len))
+            }
+        }
         pub const fn as_ptr(&self) -> *const u16 {
             self.0
         }
@@ -81,6 +97,34 @@ pub mod core {
     }
     impl TypeKind for PWSTR {
         type TypeKind = CopyType;
+    }
+
+    /// An owned NUL-terminated UTF-16 string (the WinRT string on Windows).
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct HSTRING(Vec<u16>);
+
+    impl HSTRING {
+        pub fn as_ptr(&self) -> *const u16 {
+            self.0.as_ptr()
+        }
+    }
+
+    impl From<&str> for HSTRING {
+        fn from(text: &str) -> Self {
+            Self(text.encode_utf16().chain([0]).collect())
+        }
+    }
+
+    impl From<String> for HSTRING {
+        fn from(text: String) -> Self {
+            text.as_str().into()
+        }
+    }
+
+    impl Param<PCWSTR> for &HSTRING {
+        unsafe fn param(self) -> ParamValue<PCWSTR> {
+            ParamValue::Owned(PCWSTR(self.as_ptr()))
+        }
     }
 
     /// Closes a handle (`windows_core::Free` on Windows).
