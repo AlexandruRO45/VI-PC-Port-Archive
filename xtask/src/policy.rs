@@ -843,9 +843,9 @@ fn longest_printable_run(content: &[u8]) -> usize {
     longest
 }
 
-/// Longest list of numeric literals separated by commas, or run of `\xHH`
-/// or `\u{..}` escapes (across string boundaries, as `string_join_len`
-/// describes), in `content`.
+/// Longest list of numeric literals separated by commas, or run of byte
+/// escapes (`\xHH`, `\u{..}`, `\uHHHH`, octal: see `escape_len`), across
+/// string boundaries as `string_join_len` describes, in `content`.
 ///
 /// Neither is a hex/base64 run: `xxd -i` and `bin2c` write a file as
 /// `0x4d, 0x5a, 0x90, ...`, and a byte string as `"\x4d\x5a\x90..."`,
@@ -910,14 +910,30 @@ fn longest_literal_run(content: &[u8]) -> usize {
 }
 
 /// Length of the byte escape at the start of `rest`: `\xHH` (Rust, C,
-/// HLSL) or `\u{H}` to `\u{HHHHHH}` (Rust), which `escape_default` and
-/// `{:?}` write for any character outside printable ASCII.
+/// HLSL), `\u{H}` to `\u{HHHHHH}` (Rust), which `escape_default` and
+/// `{:?}` write for any character outside printable ASCII, `\uHHHH` and
+/// `\UHHHHHHHH` (JSON, JavaScript, Java, C, Python: `json.dumps` writes
+/// every byte over 0x7F so), or `\N` to `\NNN` in octal (C, HLSL, Python,
+/// shell `printf`, and `od -b` or `repr` output pasted into a string).
 fn escape_len(rest: &[u8]) -> Option<usize> {
+    let hex_digits = |digits: &[u8], n: usize| {
+        digits.len() >= n && digits[..n].iter().all(u8::is_ascii_hexdigit)
+    };
     match rest {
         [b'\\', b'x', h, l, ..] if h.is_ascii_hexdigit() && l.is_ascii_hexdigit() => Some(4),
         [b'\\', b'u', b'{', digits @ ..] => {
             let n = digits.iter().take_while(|b| b.is_ascii_hexdigit()).count();
             ((1..=6).contains(&n) && digits.get(n) == Some(&b'}')).then_some(n + 4)
+        }
+        [b'\\', b'u', digits @ ..] if hex_digits(digits, 4) => Some(6),
+        [b'\\', b'U', digits @ ..] if hex_digits(digits, 8) => Some(10),
+        [b'\\', digits @ ..] => {
+            let n = digits
+                .iter()
+                .take(3)
+                .take_while(|b| (b'0'..=b'7').contains(*b))
+                .count();
+            (n > 0).then_some(n + 1)
         }
         _ => None,
     }
@@ -2516,6 +2532,74 @@ mod tests {
                 "{blob:.80}"
             );
         }
+    }
+
+    /// Octal and fixed-width Unicode escapes, which C, Python, shell
+    /// `printf` and JSON write, split into short strings as above: each
+    /// string is a short printable run, and none was a `\xHH` escape.
+    #[test]
+    fn rejects_octal_and_fixed_width_unicode_escapes() {
+        let bytes: Vec<u8> = (0..MAX_LITERAL_RUN * 2).map(|i| (i * 37) as u8).collect();
+        let rows = |escape: &dyn Fn(u8) -> String, join: &str| -> String {
+            bytes
+                .chunks(40)
+                .map(|row| row.iter().map(|&b| escape(b)).collect::<String>())
+                .collect::<Vec<_>>()
+                .join(join)
+        };
+        let octal = |b: u8| format!("\\{b:o}");
+        let octal3 = |b: u8| format!("\\{b:03o}");
+        let u4 = |b: u8| format!("\\u{:04x}", u16::from(b) + 0x80);
+        let u8_ = |b: u8| format!("\\U{:08X}", u32::from(b) + 0x10000);
+        for (path, blob) in [
+            (
+                "src/data.h",
+                format!(
+                    "static const char data[] =\n    \"{}\";\n",
+                    rows(&octal, "\"\n    \"")
+                ),
+            ),
+            (
+                "tools/data.py",
+                format!("DATA = (\n    b\"{}\"\n)\n", rows(&octal3, "\"\n    b\"")),
+            ),
+            (
+                "data/strings.json",
+                format!("[\n  \"{}\"\n]\n", rows(&u4, "\",\n  \"")),
+            ),
+            (
+                "tools/wide.py",
+                format!("DATA = \"{}\"\n", rows(&u8_, "\" \"")),
+            ),
+        ] {
+            assert!(
+                super::longest_printable_run(blob.as_bytes()) <= MAX_ENCODED_RUN,
+                "{path}: each string is short"
+            );
+            assert_eq!(
+                super::longest_literal_run(blob.as_bytes()),
+                bytes.len(),
+                "{path}: {blob:.80}"
+            );
+            assert!(
+                check(path, blob.as_bytes())
+                    .iter()
+                    .any(|p| p.contains("byte-escape string")),
+                "{path}: {blob:.80}"
+            );
+        }
+
+        let run = super::longest_literal_run;
+        assert_eq!(run(br#""\0""#), 1, "a NUL terminator is one escape");
+        assert_eq!(run(br#""\1234""#), 1, "at most three octal digits");
+        assert_eq!(run(br#""\u00e9\u00""#), 1, "\\u takes exactly four digits");
+        assert_eq!(run(br#""\U0001F600\U1F600""#), 1, "\\U takes exactly eight");
+        assert_eq!(run(br#""caf\u00e9", "na\u00efve""#), 1);
+        assert_eq!(
+            run(br#""\u{1F600}\u00e9\101""#),
+            3,
+            "escapes of all kinds join"
+        );
     }
 
     /// Strings of escapes join only when nothing but a string boundary lies
