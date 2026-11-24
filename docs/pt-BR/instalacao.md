@@ -17,6 +17,7 @@ VIctory compilado e testado no seu PC. Os comandos são os mesmos do
 | Windows 10 ou 11, 64 bits | **Configurações → Sistema → Sobre**: "Tipo de sistema" deve dizer 64 bits |
 | Processador com AVX2 | Praticamente todo Intel Core de 4ª geração (2013) em diante e todo AMD Ryzen têm |
 | Placa de vídeo com DirectX 12, shader model 6.6 e mesh shaders | Na prática, placas "DirectX 12 Ultimate": NVIDIA RTX 20 ou mais nova, AMD Radeon RX 6000 ou mais nova, Intel Arc. Mantenha o driver de vídeo atualizado |
+| Memória suficiente para rodar o jogo | Não há um mínimo oficial, mas hoje o jogo renderiza em 4K, e com 16 GB de RAM e 8 GB na placa de vídeo pode faltar memória (issue [#203](https://github.com/Marvisak/VIctory/issues/203)). Para compilar e rodar os testes, isso não importa |
 | Alguns GB livres em disco | A compilação e o cache ocupam bastante espaço |
 
 Os menus funcionam sem mesh shaders; o mundo do jogo precisa deles.
@@ -92,6 +93,12 @@ próximas vezes são bem mais rápidas.
 No final deve aparecer `test result: ok` para cada parte do projeto. Testes
 que precisam de arquivos que você não configurou são pulados, e isso é normal.
 
+> **No Windows 10**, o teste `only_loopback_is_reachable` falha com a
+> mensagem `winhttp.dll lacks WinHttpGetProxySettingsEx`. É um problema
+> conhecido do próprio teste (issue
+> [#118](https://github.com/Marvisak/VIctory/issues/118)), não da sua
+> instalação: pode seguir em frente.
+
 Agora compile o programa em si:
 
 ```powershell
@@ -162,6 +169,8 @@ cargo build --release -p victory
 | `git` ou `cargo` "não é reconhecido" | Feche e abra o PowerShell. Se continuar, reinstale a ferramenta |
 | Erro falando de `link.exe` ou do linker | Faltam as ferramentas de C++: instale o Build Tools com **Desenvolvimento para desktop com C++** (passo 2.2) |
 | A compilação parece travada | A primeira compilação demora mesmo. Espere enquanto o processador estiver em uso |
+| Só o teste `only_loopback_is_reachable` falha, no Windows 10 | Problema conhecido do teste, não da instalação (issue [#118](https://github.com/Marvisak/VIctory/issues/118)) |
+| O jogo fecha logo no início com `0xc000001d` (instrução ilegal) | Acontecia em processadores sem a instrução CLWB (Intel até a geração Broadwell e alguns AMD) e já foi corrigido. Atualize (passo 7) e compile de novo |
 | `crashes.log` mostra o erro 1455 do Windows | Falta memória confirmada. Feche outros programas ou aumente o arquivo de paginação do Windows e tente de novo. Veja em **Gerenciador de Tarefas → Desempenho → Memória → Confirmada** |
 | Os monitores piscam pretos ao entrar no mundo | É o travamento de GPU descrito no passo 6. Para investigar sem travar, há um modo de diagnóstico que usa o processador no lugar da placa de vídeo; veja "Depuração" no README |
 | Onde ficam saves, configurações e o `crashes.log` | Em `%LOCALAPPDATA%\victory\data`. Cole esse caminho na barra de endereço do Explorador de Arquivos |
