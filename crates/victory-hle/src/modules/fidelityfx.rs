@@ -20,6 +20,12 @@
 //! an output is moved to `COPY_DEST` instead; the upscaler writes an FP16
 //! texture of ours, which is then packed into the title's
 //! (`victory_gpu::rgb9e5`).
+//!
+//! With `VICTORY_DLSS_DIR` (NVIDIA's Streamline SDK, see
+//! `victory_gpu::dlss`) DLSS answers instead of AMD's DLL: the same
+//! translation of the dispatch, the same output bridge, then
+//! `victory_gpu::dlss` records DLSS; the jitter and render-size queries are
+//! answered with FSR's formulas.
 #![allow(non_snake_case)]
 // Title code calls these through its import table.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -153,6 +159,13 @@ unsafe impl Sync for Host {}
 
 static HOST: OnceLock<Host> = OnceLock::new();
 
+/// Whether DLSS serves the title's calls (`VICTORY_DLSS_DIR`).
+static DLSS: OnceLock<bool> = OnceLock::new();
+
+fn dlss() -> bool {
+    DLSS.get().copied().unwrap_or(false)
+}
+
 macro_rules! once {
     ($level:ident, $($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -165,6 +178,17 @@ macro_rules! once {
 /// title's own DLLs run. Call once, before the import registry is first
 /// used: it holds this module only when serving.
 pub fn use_host_dir(dir: Option<&Path>) {
+    if victory_gpu::dlss::enabled() {
+        if victory_gpu::external::host_device().is_none() {
+            tracing::warn!(
+                "FidelityFX: VICTORY_DLSS_DIR set, but there is no host GPU; the title's own DLLs run"
+            );
+            return;
+        }
+        tracing::info!("FidelityFX: DLSS serves the title's upscaler (VICTORY_DLSS_DIR)");
+        let _ = DLSS.set(true);
+        return;
+    }
     let Some(dir) = dir else {
         tracing::info!(
             "no FidelityFX folder (VICTORY_FIDELITYFX_DIR): a title's own FidelityFX DLLs run"
@@ -185,7 +209,7 @@ pub fn use_host_dir(dir: Option<&Path>) {
 
 /// Whether the host's FidelityFX serves the title's.
 pub(crate) fn serving() -> bool {
-    HOST.get().is_some()
+    HOST.get().is_some() || dlss()
 }
 
 fn load(dir: &Path) -> Result<(Host, String), String> {
@@ -305,14 +329,18 @@ extern "C" fn ffxCreateContext(
     desc: *mut Header,
     memory: *const c_void,
 ) -> u32 {
-    let Some(host) = HOST.get() else {
-        return NO_PROVIDER;
-    };
     if context.is_null() || desc.is_null() {
         return PARAMETER;
     }
     // SAFETY: the title passes a chain of descriptions.
     let kind = unsafe { (*desc).kind };
+    if dlss() && kind == CREATE_UPSCALE {
+        // SAFETY: an upscaler description, by its type.
+        return unsafe { victory_gpu::dlss::create(context, desc.cast()) };
+    }
+    let Some(host) = HOST.get() else {
+        return NO_PROVIDER;
+    };
     if kind != CREATE_UPSCALE {
         once!(
             warn,
@@ -362,6 +390,10 @@ extern "C" fn ffxCreateContext(
 }
 
 extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void) -> u32 {
+    if dlss() {
+        // SAFETY: the title passes the context DLSS made.
+        return unsafe { victory_gpu::dlss::destroy(context) };
+    }
     // SAFETY: the title passes its context.
     HOST.get()
         .map_or(NO_PROVIDER, |h| unsafe { (h.destroy)(context, memory) })
@@ -369,18 +401,25 @@ extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void
 
 /// Settings (key-value pairs, debug messages) name nothing console-specific.
 extern "C" fn ffxConfigure(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if dlss() {
+        return OK;
+    }
     // SAFETY: the title passes its context and descriptions.
     HOST.get()
         .map_or(NO_PROVIDER, |h| unsafe { (h.configure)(context, desc) })
 }
 
 extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
-    let Some(host) = HOST.get() else {
-        return NO_PROVIDER;
-    };
     if desc.is_null() {
         return PARAMETER;
     }
+    if dlss() {
+        // SAFETY: the title passes a description with its outputs.
+        return unsafe { victory_gpu::dlss::query(desc.cast()) }.unwrap_or(PARAMETER);
+    }
+    let Some(host) = HOST.get() else {
+        return NO_PROVIDER;
+    };
     // SAFETY: the title passes a description.
     let kind = unsafe { (*desc).kind };
     // These carry the console device.
@@ -397,9 +436,10 @@ extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
 }
 
 extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
-    let Some(host) = HOST.get() else {
+    let host = HOST.get();
+    if host.is_none() && !dlss() {
         return NO_PROVIDER;
-    };
+    }
     if desc.is_null() {
         return PARAMETER;
     }
@@ -465,8 +505,12 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     }).collect::<Vec<_>>(), "FidelityFX: first upscaling, host formats of its textures");
     victory_gpu::external::record(list, |host_list| {
         dispatch.list = host_list.as_raw();
-        // SAFETY: the PC dispatch on host objects; the context is the host's.
-        let code = unsafe { (host.dispatch)(context, &raw mut dispatch.header) };
+        let code = match host {
+            // SAFETY: the PC dispatch on host objects; the context is the host's.
+            Some(host) => unsafe { (host.dispatch)(context, &raw mut dispatch.header) },
+            // SAFETY: as above; the context is DLSS's.
+            None => unsafe { victory_gpu::dlss::dispatch(context, (&raw const dispatch).cast()) },
+        };
         if code == OK
             && let Some((bridge, title)) = &packed
         {
