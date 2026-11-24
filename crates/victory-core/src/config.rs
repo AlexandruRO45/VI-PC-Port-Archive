@@ -3791,6 +3791,47 @@ mod tests {
         assert!(cfg.cache_subdir("x").is_err());
     }
 
+    #[test]
+    fn subfolders_are_created_nested_and_again_without_error() {
+        // A scratch folder under the system temp folder, never the
+        // repository. `TMPDIR` may point inside the checkout (a worktree's
+        // own scratch folder); the asset policy then refuses every subfolder,
+        // which is right, so check that instead of creating anything.
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-subdir-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let cfg = Config {
+            cache_dir: scratch.join("cache"),
+            data_dir: scratch.join("data"),
+            ..Default::default()
+        };
+        if ensure_outside_repo(&scratch).is_err() {
+            assert!(cfg.cache_subdir("images").is_err());
+            assert!(!scratch.join("cache").exists());
+            return;
+        }
+        // Nested parts are created in one go, and asking again is not an error.
+        for _ in 0..2 {
+            let dir = cfg.cache_subdir("0000ABCD/shaders").unwrap();
+            assert_eq!(dir, scratch.join("cache").join("0000ABCD/shaders"));
+            assert!(dir.is_dir());
+            let dir = cfg.data_subdir("0000ABCD/storage").unwrap();
+            assert_eq!(dir, scratch.join("data").join("0000ABCD/storage"));
+            assert!(dir.is_dir());
+        }
+        // A file where a subfolder goes is an error naming that path, and is
+        // left as it was.
+        let blocker = scratch.join("cache").join("blocked");
+        std::fs::write(&blocker, b"x").unwrap();
+        let err = format!("{:#}", cfg.cache_subdir("blocked/inner").unwrap_err());
+        assert!(err.contains("creating"), "{err}");
+        assert!(err.contains("blocked"), "{err}");
+        assert!(blocker.is_file());
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
     /// A path that is absolute on the host (`/x` is not absolute on Windows).
     #[test]
     fn folder_overlap_folds_case_only_when_asked() {
