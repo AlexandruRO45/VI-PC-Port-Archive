@@ -33,6 +33,20 @@ impl Record<'_> {
             .ok()
             .filter(|out| out.len() == self.unpacked_size)
     }
+
+    /// The file bytes from the marker to the end of the packed stream.
+    pub fn span(&self) -> std::ops::Range<usize> {
+        self.offset..self.offset + 12 + self.packed.len()
+    }
+}
+
+/// Whether `offset` lies inside one of `records`, taken in the order
+/// [`records`] yields them (file order, disjoint). Bytes there belong to a
+/// record: a container stored as is inside its packed stream (deflate stored
+/// blocks) is that record's container, not another one.
+pub fn in_record(records: &[Record<'_>], offset: usize) -> bool {
+    let i = records.partition_point(|r| r.span().end <= offset);
+    records.get(i).is_some_and(|r| r.span().contains(&offset))
 }
 
 /// An SGD5 file, or a file holding one (an archive: records are found by
@@ -59,7 +73,7 @@ pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
             let at = from + found;
             if let Some(r) = record(&file[floor..], at - floor) {
                 let r = Record { offset: at, ..r };
-                floor = at + 12 + r.packed.len();
+                floor = r.span().end;
                 from = floor + 6;
                 return Some(r);
             }
@@ -173,6 +187,41 @@ mod tests {
     }
 
     #[test]
+    fn offsets_inside_records() {
+        // A container stored as is (level 0) inside a record's packed bytes.
+        let container = b"DXBC stored as is";
+        let mut file = MAGIC.to_vec();
+        file.extend_from_slice(b"\x05PS_a\0\x32");
+        let packed = miniz_oxide::deflate::compress_to_vec(container, 0);
+        let n = (packed.len() + 12) as u32;
+        for v in [n, 0x000D_DCE7, n, container.len() as u32] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&packed);
+        let between = file.len();
+        file.extend_from_slice(b"DXBC between records");
+        file.extend(record_bytes("PS_b", 0x32, b"second"));
+        let after = file.len();
+        file.extend_from_slice(b"DXBC after");
+
+        let found: Vec<_> = records(&file).collect();
+        assert_eq!(found.len(), 2);
+        let stored = memchr::memmem::find(&file, b"DXBC").unwrap();
+        assert!(stored < between);
+        assert!(in_record(&found, stored));
+        assert!(!in_record(&found, 0), "the magic");
+        assert!(!in_record(&found, between));
+        assert!(!in_record(&found, after));
+        for r in &found {
+            let span = r.span();
+            assert!(in_record(&found, span.start));
+            assert!(in_record(&found, span.end - 1));
+            assert!(!in_record(&found, span.start - 1), "the header");
+        }
+        assert!(!in_record(&[], stored));
+    }
+
+    #[test]
     fn header_inside_a_record_is_not_another_record() {
         // The record's packed bytes end (after the deflate stream, which
         // ignores them) with what would be the next header: NUL, kind, `n`.
@@ -255,7 +304,7 @@ mod tests {
                 for r in records(&damaged) {
                     let start = r.offset - 6;
                     assert!(start >= end, "byte {at} = {value:#x}: records overlap");
-                    end = r.offset + 12 + r.packed.len();
+                    end = r.span().end;
                     assert!(end <= damaged.len());
                     let _ = r.unpack();
                 }
