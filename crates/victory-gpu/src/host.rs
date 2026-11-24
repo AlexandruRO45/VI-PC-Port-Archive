@@ -490,6 +490,30 @@ impl Host {
     }
 
     /// Runs closed lists and waits for them.
+    /// Local build: maps all `tiles` tiles of reserved texture `texture` to `heap` from its
+    /// start, or (no heap) to nothing: reads then return zeros, writes are dropped.
+    pub(crate) fn map_whole(&self, texture: &ID3D12Resource, heap: Option<&ID3D12Heap>, tiles: u32) {
+        let coord = D3D12_TILED_RESOURCE_COORDINATE { X: 0, Y: 0, Z: 0, Subresource: 0 };
+        let size = D3D12_TILE_REGION_SIZE { NumTiles: tiles, UseBox: false.into(), ..Default::default() };
+        let flags = if heap.is_some() { D3D12_TILE_RANGE_FLAG_NONE } else { D3D12_TILE_RANGE_FLAG_NULL };
+        let start = 0u32;
+        // SAFETY: our queue; a reserved texture and a heap of ours.
+        unsafe {
+            self.queue.UpdateTileMappings(
+                texture,
+                1,
+                Some(&coord),
+                Some(&size),
+                heap,
+                1,
+                Some(&flags),
+                heap.map(|_| std::ptr::from_ref(&start)),
+                Some(&tiles),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+    }
+
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.

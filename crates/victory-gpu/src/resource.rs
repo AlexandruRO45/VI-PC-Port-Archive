@@ -773,6 +773,8 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// Local build: a reserved texture's own heap and its tile count (see `host_texture`).
+    pub(crate) tiles: std::sync::Mutex<Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u32)>>,
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -814,7 +816,7 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u32)>)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -854,6 +856,47 @@ fn host_texture(
         value[0] = pc_format(value[0]);
         value
     });
+    // Local build: sampled textures (no target, depth or UAV use, one sample, 2D) are reserved
+    // textures on a heap of their own: when the title releases one, its memory goes and the
+    // texture stays, reading zeros (the title kept drawing with views of textures it released
+    // long before; freed, they removed the device). `VICTORY_RESERVED_TEXTURES=0` turns it off.
+    static RESERVED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let reserved_on = *RESERVED.get_or_init(|| std::env::var("VICTORY_RESERVED_TEXTURES").map_or(true, |v| v.trim() != "0"));
+    if reserved_on && d.flags & 0x7 == 0 && d.sample_count <= 1 && d.dimension == 3 && clear_value.is_none() {
+        let mut rd = d;
+        rd.layout = 2; // 64KB_UNDEFINED_SWIZZLE
+        let initial = D3D12_RESOURCE_STATES(crate::host::legal_for(rd.flags, crate::host::texture_state(state)) as i32);
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: as below, a reserved texture.
+        let made = unsafe { host.device.CreateReservedResource((&raw const rd).cast(), initial, None, &mut texture) };
+        if made.is_ok()
+            && let Some(t) = texture
+        {
+            let mut tiles = 0u32;
+            // SAFETY: plain queries and creation.
+            let heap = unsafe {
+                host.device.GetResourceTiling(&t, Some(&mut tiles), None, None, None, 0, std::ptr::null_mut());
+                let desc = D3D12_HEAP_DESC {
+                    SizeInBytes: u64::from(tiles) << 16,
+                    Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    Alignment: 0,
+                    Flags: D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES,
+                };
+                let mut heap: Option<ID3D12Heap> = None;
+                (tiles > 0).then(|| host.device.CreateHeap(&desc, &mut heap).ok().and(heap)).flatten()
+            };
+            if let Some(heap) = heap {
+                host.map_whole(&t, Some(&heap), tiles);
+                crate::host::name(&t, || format!("reserved texture {}x{} f{}", d.width, d.height, d.format));
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n == 1 || n.is_power_of_two() && n >= 1024 {
+                    tracing::info!(n, tiles, "sampled host textures made reserved");
+                }
+                return Some((t, Some((heap, tiles))));
+            }
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -882,7 +925,7 @@ fn host_texture(
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
     }
-    texture
+    texture.map(|t| (t, None))
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -948,11 +991,12 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|texture| {
+        host: host.map(|(texture, tiles)| {
             let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
             std::sync::Arc::new(HostTexture {
                 texture,
                 state: state.into(),
+                tiles: std::sync::Mutex::new(tiles),
             })
         }),
     });
@@ -1899,6 +1943,36 @@ fn graveyard(host: std::sync::Arc<HostTexture>) {
         }
         dead
     };
-    // released outside the lock
-    drop(dead);
+    // released outside the lock; a reserved texture keeps its object (stale views read zeros)
+    // and gives its memory back: tiles unmapped now, the heap released a few seconds later
+    // (the queue unmaps it first)
+    static KEPT: std::sync::Mutex<Vec<std::sync::Arc<HostTexture>>> = std::sync::Mutex::new(Vec::new());
+    static HEAPS: std::sync::Mutex<std::collections::VecDeque<(Instant, windows::Win32::Graphics::Direct3D12::ID3D12Heap)>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+    let mut kept = Vec::new();
+    for t in dead {
+        let tiles = t.tiles.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match (tiles, crate::host::host()) {
+            (Some((heap, n)), Some(h)) => {
+                h.map_whole(&t.texture, None, n);
+                HEAPS.lock().unwrap_or_else(|e| e.into_inner()).push_back((now, heap));
+                kept.push(t);
+            }
+            // a committed texture (target, depth, UAV) is never freed: stale views of one
+            // removed the device too
+            _ => kept.push(t),
+        }
+    }
+    if !kept.is_empty() {
+        KEPT.lock().unwrap_or_else(|e| e.into_inner()).extend(kept);
+    }
+    let old: Vec<_> = {
+        let mut h = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut old = Vec::new();
+        while h.front().is_some_and(|(at, _)| now.duration_since(*at) > Duration::from_secs(5)) {
+            old.extend(h.pop_front());
+        }
+        old
+    };
+    drop(old);
 }

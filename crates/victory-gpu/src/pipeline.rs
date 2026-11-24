@@ -107,7 +107,22 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                // Local build: `VICTORY_SHADER_DENY=<hash>,...` drops shaders whose translation
+                // is known to hang the GPU (their draws are dropped as untranslated ones).
+                static DENY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+                let deny = DENY.get_or_init(|| {
+                    std::env::var("VICTORY_SHADER_DENY")
+                        .unwrap_or_else(|_| "b37565055f2f7d3b".into())
+                        .split(',')
+                        .map(|h| h.trim().to_ascii_lowercase())
+                        .filter(|h| !h.is_empty())
+                        .collect()
+                });
+                let done = if deny.iter().any(|h| self.hash.to_string().starts_with(h.as_str())) {
+                    Err("denied: its translation hangs the GPU (VICTORY_SHADER_DENY)".to_string())
+                } else {
+                    translate(&self.container)
+                };
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
