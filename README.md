@@ -27,7 +27,7 @@ histories merge rather than being grafted: this fork's commit log contains
 fxceless's own commits and upstream's, unsquashed. See
 [Sources and attribution](#sources-and-attribution) for what came from where.
 
-## Status, checked against `b3b8533`
+## Status, checked against `214f670`
 
 **Not playable.** The menus and the opening cutscene draw; a world frame has
 never been captured. The base this fork adopted reports a cutscene and a
@@ -36,7 +36,8 @@ adopted base now draws the cutscene too. Those are two different claims and the
 table keeps them apart.
 
 Every claim in this file carries one of three marks, and the file is re-checked
-whenever `main` moves. At **`b3b8533`** (2026-11-24):
+whenever `main` moves. At **`214f670`** (2026-11-24), and re-run with the same
+verdicts after the move from `b3b8533`:
 
 - **verified** — read in the code at that sha, or measured by this fork and
   reproduced from the artefact it rests on;
@@ -201,7 +202,7 @@ tree. A row marked *carried by the base* kept its effect without our commit, and
 *unverified* means nobody has checked whether the base's own form does the same
 thing.
 
-| Change | Where | In `b3b8533`? | Measurement, with its conditions |
+| Change | Where | In `214f670`? | Measurement, with its conditions |
 |---|---|---|---|
 | An optimized clear value only on a texture that can take one | `crates/victory-gpu/src/resource.rs` (`host_texture_desc` → `keep_clear`) | **No** — `host_texture_desc` and `keep_clear` are absent; re-apply pending | A WARP probe: D3D12 answers `E_INVALIDARG` (`0x80070057`) for a clear value on a resource whose render-target flag the format's rules removed. Before the fix, three `no host texture` failures a session for NV12 (format 86) at 1024x4096 and B4G4R4A4_UNORM (115) at 2560x1440 |
 | A view needs its resource's permission, and a clear it cannot serve is skipped | `crates/victory-gpu/src/host.rs` (`allows`, `once_render`, `clears_render_target`), `list.rs` (both clears) | **No** — `once_render` and `clears_render_target` are absent, and the base's own `allows` is a different gate; re-apply pending | The `op=clear_rtv` device removal at frame 1494, named by the breadcrumb ring (barrier, transition, resource_create, indirect, execute, dispatch, clear_rtv), is gone: a skipped clear records `b=1` instead of handing a null view to the runtime. Test: `a_depth_target_takes_no_unordered_view` |
@@ -321,7 +322,7 @@ The switches are grouped by what you would reach for. Everything marked
 tree**: `VICTORY_GPU_CHECK`, `VICTORY_D3D12_VALIDATE` and
 `VICTORY_SERIAL_PIPELINES` are this fork's own instruments, written and used,
 which the adoption merge dropped — they describe what the re-apply restores,
-not switches you can set against `b3b8533` today. The base carries about a
+not switches you can set against `214f670` today. The base carries about a
 hundred more of its own, mostly experiments, each described in a comment where
 it is read; its README is the index for those.
 
@@ -340,15 +341,13 @@ it is read; its README is the index for those.
 | `VICTORY_GPU_CHECK=1` | **Not in this tree** (re-apply pending). *diagnostics.* Asks the device after every recorded host operation whether it has been removed, so the first operation after which it has names itself: `the device was removed right after op=clear_rtv a=… b=…`. One device query per operation, so it is very slow — never compare frame times with it on |
 | `VICTORY_D3D12_VALIDATE=1` | **Not in this tree** (re-apply pending). One submission per command list, each asked for the removal reason as it lands; the first that comes back removed is logged as the submission that removed the device with that list's newest operations. It removes the overlap between lists, so a removal needing two lists in flight will not reproduce under it: take the list it names as guilty, not the whole story |
 | `VICTORY_INDIRECT_RECORD=1` | *diagnostics.* Logs an indirect execution's record: kind, stride, count, the words the title left, the thread count or draw count they name, and whether the range fits the buffer. The first 64 executions and then every 256th, so the log stays readable |
-| `VICTORY_NO_ARGS_REFRESH=1` | **A probe, never an option.** Stops the host uploading its copy of the title's argument buffer over the GPU copy before an indirect execution (`crates/victory-gpu/src/draw.rs`, `host.rs`: `no_args_refresh`). With it set, 102 of 102 summary lines read 0 groups asked per frame against a control's 11,879 — the measurement that proved this upload is the **only** path the title's records take to a dispatch, since nothing else moved a record to the card. Leave it off: it disables every indirect dispatch in the title. Its other result is about the instrument rather than the title: the clamp's counters are trustworthy, while a per-record decode of a skipped upload prints impossible counts (`counts=(1065353216,…)`, thread count 1.8e19), so read the counters and not the words |
 | `VICTORY_GPU_TIMING=1` | *diagnostics.* Runs and times each list of a submission on its own, and logs slow ones with their slowest commands |
 | `VICTORY_SKIP_PIPELINES=<hash>,…` | *diagnostics.* Omits draws and dispatches, indirect ones included, whose pipeline contains a listed 16-digit shader hash — the way to subtract a suspect pipeline and confirm cause rather than neighbour |
 | `VICTORY_D3D12_DRED=1` | *diagnostics.* Enables device-removed data: the allocation a fault hit and the commands in flight |
 | `VICTORY_D3D12_DEBUG=1` | *diagnostics.* The host debug layer (needs Windows' Graphics Tools) |
 | `VICTORY_D3D12_GBV=1` | *diagnostics.* With the debug layer: GPU-based validation without state tracking, so out-of-range descriptor indices become messages naming the command instead of page faults. Slow |
 | `VICTORY_INDIRECT_RECORD=1` | logs an indirect execution's record: kind, stride, count, the words, the thread count they name, and whether the range fits the buffer. The first 64 and then every 256th. Reads the host copy as uploaded; the clamp's own counters, not this log, are the trustworthy group count |
-| `VICTORY_LOG_FLUSH=1` | flushes after every event, so a log cut by a kill or by the machine going away ends at its real last event rather than at a buffer boundary. The watchdog wrapper sets it by default |
-| `VICTORY_NO_ARGS_REFRESH=1` | **a probe, never an option:** skips the upload of the host copy over a title argument buffer before an indirect execution. That copy is the only path a title-written record has to the GPU, so with it off every mesh dispatch asks for zero groups (measured: 102 of 102 summaries at zero, against 11,879 groups a frame with it on). It answered whether we overwrite records the title wrote: we do not |
+| `VICTORY_NO_ARGS_REFRESH=1` | **A probe, never an option, and unreachable from a release build** — `host.rs` returns false without the `diagnostics` feature, so a variable inherited from a wrapper cannot switch it on: skips the upload of the host copy over a title argument buffer before an indirect execution. That copy is the only path a title-written record has to the GPU, so with it off every mesh dispatch asks for zero groups (measured: 102 of 102 summaries at zero, against 11,879 groups a frame with it on). It answered whether we overwrite records the title wrote: we do not |
 | `VICTORY_D3D12_WARP=1` | *diagnostics.* The host device on the software adapter: a shader's wild access becomes an access violation in this process instead of a GPU fault and driver reset. Slow, and it cannot black the machine, which is why soaks and unattended runs use it |
 
 ### What the shaders did
@@ -363,6 +362,7 @@ it is read; its README is the index for those.
 
 | Variable | Effect |
 |---|---|
+| `VICTORY_LOG_FLUSH=1` | Flushes after every event, so a log cut short by a kill or a device loss ends at its real last event instead of at a buffer boundary — which is where the operations just before a removal used to disappear. Costs a write per line. No wrapper in this crew's run harness sets it, so set it yourself on any run whose log matters |
 | `VICTORY_LOG=<target>=<level>,…` | Log filter, e.g. `VICTORY_LOG=victory_loader=trace,info`; falls back to `RUST_LOG`. A release build cannot log below info whatever the filter asks |
 | `VICTORY_STACKS=<s>,<s>` | Every thread's unwound stack as `module+rva`, that many seconds after start, to see what a title waits on |
 | `VICTORY_WATCH=<rva>,…` | Polls the u32 at each title address (hex) every 5 ms and logs it whenever it changes — an engine's state, say |
