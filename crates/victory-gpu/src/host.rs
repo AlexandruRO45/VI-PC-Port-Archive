@@ -276,6 +276,51 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    /// The chunk sizes of `list`'s scratch, in order.
+    fn chunk_sizes(list: &HostList) -> Vec<u64> {
+        let s = list.scratch.lock().unwrap();
+        s.chunks.iter().map(|c| c.3).collect()
+    }
+
+    #[test]
+    fn scratch_starts_small_grows_by_big_chunks_and_keeps_its_first() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        // A few KiB fit the small first chunk, side by side.
+        let (a, _) = list.scratch(1000).unwrap();
+        let (b, _) = list.scratch(1000).unwrap();
+        assert_eq!(b - a, 1024, "requests are 256-byte aligned and packed");
+        assert_eq!(chunk_sizes(&list), [SCRATCH_FIRST]);
+        // A request the first chunk cannot hold takes a big one after it.
+        let (c, _) = list.scratch(SCRATCH_FIRST).unwrap();
+        assert_eq!(chunk_sizes(&list), [SCRATCH_FIRST, SCRATCH_CHUNK]);
+        assert!(c < a || c >= a + SCRATCH_FIRST, "not inside the first chunk");
+        // Requests past a chunk's end move on, never overlap.
+        let (d, _) = list.scratch(SCRATCH_CHUNK - SCRATCH_FIRST).unwrap();
+        assert_eq!(d, c + SCRATCH_FIRST);
+        // Bigger than a chunk: a buffer of its own, no chunk.
+        list.scratch(SCRATCH_CHUNK + 1).unwrap();
+        assert_eq!(chunk_sizes(&list), [SCRATCH_FIRST, SCRATCH_CHUNK]);
+        // A reset keeps the first chunk only, and hands it out again.
+        // SAFETY: an open list of ours, never submitted.
+        unsafe { list.list.Close() }.unwrap();
+        list.reset();
+        assert_eq!(chunk_sizes(&list), [SCRATCH_FIRST]);
+        assert_eq!(list.scratch(16).unwrap().0, a);
+    }
+
+    #[test]
+    fn a_first_request_bigger_than_the_small_chunk_takes_a_big_one() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        list.scratch(SCRATCH_FIRST + 256).unwrap();
+        assert_eq!(chunk_sizes(&list), [SCRATCH_CHUNK]);
+    }
 }
 
 /// A host command list and its allocator, always used together.
