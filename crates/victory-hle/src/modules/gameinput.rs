@@ -573,6 +573,28 @@ pub(crate) fn union<const N: usize>(sources: [Vec<u8>; N]) -> Vec<u8> {
     keys
 }
 
+/// A press from the window's key messages presses the stand-in pad's button,
+/// with no feature in the build and no XInput slot involved: this is the path
+/// a phantom pad (a virtual controller, a wheel, a sleeping pad on a dongle)
+/// used to close. It is a pure function of the sources and the pad table, so
+/// it runs in a release build and needs no card.
+#[test]
+fn a_window_key_press_presses_the_stand_in_pads_a() {
+    let held = union([Vec::new(), vec![0x0D], Vec::new()]);
+    let button = crate::modules::gameinput::FALLBACK_BUTTONS
+        .iter()
+        .find(|(key, _)| held.contains(key))
+        .map(|&(_, button)| button);
+    assert_eq!(
+        button,
+        Some(crate::modules::gameinput::A),
+        "Enter must press the stand-in pad's A"
+    );
+    // And the async source alone is enough, which is a person's own keyboard.
+    let held = union([Vec::new(), Vec::new(), vec![0x0D]]);
+    assert!(held.contains(&0x0D), "{held:?}");
+}
+
 /// A person holds a key and a bot injects the same one; the bot releases it.
 /// The person's hold survives, so a session cannot end with a key the bot
 /// thinks it released still down, and cannot lose a press the person made.
@@ -1509,18 +1531,33 @@ mod host {
         (XINPUT_GAMEPAD_RIGHT_THUMB, RIGHT_STICK),
     ];
 
-    /// Every key any source reports held, before the host's async state is
-    /// added: the scripted presses (diagnostics only) and the title window's
-    /// own key messages. The window source is the one a bot can reach, and it
-    /// is read in a release build too.
-    fn key_sources() -> Vec<u8> {
+    /// Every key held by any source: the scripted presses (diagnostics only),
+    /// the title window's own key messages, and the host's async state while
+    /// the window is foreground.
+    ///
+    /// One definition, used by the keyboard device and by the stand-in pad
+    /// alike. The pad's merge used to read the scripted presses only, under
+    /// `diagnostics`, so with a pad present a keyboard press could not press A
+    /// in a release build — a person and a bot both stuck, and only in the
+    /// build the person runs.
+    fn held_keys() -> Vec<u8> {
         #[cfg(feature = "diagnostics")]
         let scripted = super::script::down();
         #[cfg(not(feature = "diagnostics"))]
         let scripted = Vec::new();
         // Only while the window is foreground does it receive key messages, so
-        // this needs no focus check of its own.
-        super::union([scripted, victory_gpu::keys::pressed()])
+        // the window source needs no focus check of its own; the async state
+        // is the one a person's keyboard writes.
+        let held: Vec<u8> = if focused() {
+            (0x08..=0xFE_u8)
+                .filter(|vk| !(0x10..=0x12).contains(vk))
+                // SAFETY: plain queries.
+                .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        super::union([scripted, victory_gpu::keys::pressed(), held])
     }
 
     /// Raw values, no dead zone: titles apply their own.
@@ -1566,7 +1603,7 @@ mod host {
             // path for a person and for an injected press, and it is not
             // behind diagnostics, because the window's key messages are not.
             if slot == 0 {
-                for vk in key_sources() {
+                for vk in held_keys() {
                     if let Some(&(_, button)) =
                         super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk)
                     {
@@ -1578,23 +1615,8 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            let focused = focused();
-            // The async state is the one a person's keyboard writes and an
-            // injected key cannot reach, so it is read only while we are the
-            // foreground window.
-            let held: Vec<u8> = if focused {
-                // Left/right modifier keys only, as devices report them; no
-                // mouse buttons (below 0x08).
-                (0x08..=0xFE_u8)
-                    .filter(|vk| !(0x10..=0x12).contains(vk))
-                    // SAFETY: plain queries.
-                    .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let down = super::union([key_sources(), held]);
-            tracing::trace!(focused, ?down, "keyboard poll");
+            let down = held_keys();
+            tracing::trace!(?down, "keyboard poll");
             down.into_iter()
                 .map(|vk| KeyState {
                     // SAFETY: plain query.
