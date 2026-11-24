@@ -101,6 +101,18 @@ pub enum Error {
     TooSmall,
 }
 
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Error::Invalid => "texture: the description makes no texture",
+            Error::Unsupported => "texture: layout addressing not implemented",
+            Error::TooSmall => "texture: buffer smaller than the copy needs",
+        })
+    }
+}
+
+impl std::error::Error for Error {}
+
 /// One plane of a texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Desc {
@@ -969,6 +981,19 @@ mod tests {
 
     /// Sizes past the hardware's 16384 texels per side are refused instead
     /// of overflowing the size arithmetic (found by random-input testing).
+    /// Like the XMA and BCPack errors, texture errors name the format and
+    /// can be boxed as `std::error::Error`.
+    #[test]
+    fn errors_name_the_format() {
+        for e in [Error::Invalid, Error::Unsupported, Error::TooSmall] {
+            let text = e.to_string();
+            assert!(text.starts_with("texture: "), "{text}");
+            let boxed: Box<dyn std::error::Error> = Box::new(e);
+            assert_eq!(boxed.to_string(), text);
+        }
+        assert_ne!(Error::Invalid.to_string(), Error::TooSmall.to_string());
+    }
+
     #[test]
     fn extents_past_the_hardware_limit_are_invalid() {
         for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_D_X] {
