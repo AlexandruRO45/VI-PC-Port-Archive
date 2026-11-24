@@ -118,7 +118,15 @@ impl Shadow {
 
     /// Offset of a title address in `buffer` (a mirrored copy's from its first page).
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        if self.pages.is_empty() { address - self.start } else { address - (self.start & !(crate::mirror::TILE - 1)) }
+        if self.direct {
+            // SAFETY: the placed resource is retained by this shadow.
+            let base = unsafe { self.buffer.GetGPUVirtualAddress() };
+            self.gpu(address) - base
+        } else if self.pages.is_empty() {
+            address - self.start
+        } else {
+            address - (self.start & !(crate::mirror::TILE - 1))
+        }
     }
 
     /// CPU address of byte `off` of the copy; valid up to the end of its 64 KiB title page.

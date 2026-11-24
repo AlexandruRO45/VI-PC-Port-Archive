@@ -10,7 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use victory_shader::emit::{DESCRIPTOR_DATA_SLOT, TITLE_MEMORY_SLOT};
+use victory_shader::emit::{DescriptorBinding, TITLE_MEMORY_VIEWS};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -22,7 +22,7 @@ use windows::core::Interface;
 
 use crate::host::HostList;
 use crate::object::This;
-use crate::pipeline::host::HostPipeline;
+use crate::pipeline::host::{HostPipeline, RootBinding, RootBuffer};
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -31,9 +31,9 @@ enum Root {
     None,
     /// A descriptor table's first descriptor (an address in a heap).
     Table(u64),
-    Constants(Vec<u32>),
+    Constants(Vec<Option<u32>>),
     /// A root view's GPU address.
-    View(u64),
+    View(RootBuffer, u64),
 }
 
 #[repr(C)]
@@ -71,6 +71,7 @@ pub(crate) struct State {
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
+    title_roots: [usize; 2],
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
@@ -78,8 +79,6 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
-    /// A fresh table of the stage being bound could not be made.
-    table_failed: bool,
 }
 
 impl Drop for State {
@@ -139,22 +138,24 @@ macro_rules! once {
     }};
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RootBuffer {
-    Cbv,
-    Srv,
-    Uav,
-}
-
 struct RootView {
     gpu: u64,
-    copy: Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+    copy: RootCopy,
 }
 
-/// A valid range in the resource that supplies the GPU address. Mirrored
-/// shadows own an alias for resource operations, but their root VA belongs
-/// to the main mirror allocation.
-fn validate_root_buffer(
+enum RootCopy {
+    Shadow(std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+    Upload { to: *mut u8, address: u64, len: u64 },
+}
+
+enum RootArgument {
+    Constants(Vec<u32>),
+    Buffer(RootBuffer, RootView),
+    Table(D3D12_GPU_DESCRIPTOR_HANDLE),
+}
+
+/// Validates the resource and the actual GPU address supplied to a setter.
+pub(crate) fn validate_root_buffer(
     kind: RootBuffer,
     gpu: u64,
     buffer_base: u64,
@@ -164,7 +165,8 @@ fn validate_root_buffer(
     if desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER {
         return Err("the host resource is not a buffer");
     }
-    if gpu == 0
+    if len == 0
+        || gpu == 0
         || buffer_base == 0
         || gpu
             .checked_sub(buffer_base)
@@ -181,10 +183,14 @@ fn validate_root_buffer(
     if kind == RootBuffer::Srv && desc.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) {
         return Err("the host buffer does not support shader reads");
     }
-    // Use the raw-view alignment floor for root SRVs/UAVs as well. The
-    // console can supply offsets aligned only to a dword.
-    if kind != RootBuffer::Cbv && !gpu.is_multiple_of(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
-        return Err("the raw root GPU address is misaligned");
+    let alignment = match kind {
+        RootBuffer::Cbv => D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+        // Keep the conservative raw-view floor that guarded the first
+        // reported failing dispatch.
+        RootBuffer::Srv | RootBuffer::Uav => D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT,
+    };
+    if !gpu.is_multiple_of(u64::from(alignment)) {
+        return Err("the root GPU address is misaligned");
     }
     Ok(())
 }
@@ -213,6 +219,57 @@ mod root_view_tests {
         };
         assert!(validate_root_buffer(RootBuffer::Uav, base, base, read_only, 4).is_err());
     }
+
+    #[test]
+    fn root_buffer_requires_alignment_extent_and_resource_type() {
+        let base = 0x1000;
+        let mut desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 512,
+            ..Default::default()
+        };
+        assert!(validate_root_buffer(RootBuffer::Cbv, base + 256, base, desc, 256).is_ok());
+        assert!(validate_root_buffer(RootBuffer::Cbv, base + 16, base, desc, 256).is_err());
+        assert!(validate_root_buffer(RootBuffer::Cbv, base + 256, base, desc, 257).is_err());
+        assert!(validate_root_buffer(RootBuffer::Srv, base, base, desc, 0).is_err());
+        desc.Flags = D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+        assert!(validate_root_buffer(RootBuffer::Srv, base, base, desc, 4).is_err());
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        assert!(validate_root_buffer(RootBuffer::Cbv, base, base, desc, 256).is_err());
+    }
+
+    #[test]
+    fn root_views_require_matching_title_setter_and_stage() {
+        let mut state = State::default();
+        state.set_root_signature(false, 1);
+        state.set_root_signature(true, 2);
+        state.set_view(false, 0, RootBuffer::Srv, 0x1000);
+        state.set_view(true, 0, RootBuffer::Uav, 0x2000);
+        assert_eq!(
+            root_address(state.roots_ref(true).first(), RootBuffer::Uav),
+            Ok(0x2000)
+        );
+        assert!(root_address(state.roots_ref(false).first(), RootBuffer::Uav).is_err());
+        state.set_root_signature(true, 2);
+        assert_eq!(
+            root_address(state.roots_ref(true).first(), RootBuffer::Uav),
+            Ok(0x2000)
+        );
+        state.set_root_signature(true, 3);
+        assert!(root_address(state.roots_ref(true).first(), RootBuffer::Uav).is_err());
+        assert_eq!(
+            root_address(state.roots_ref(false).first(), RootBuffer::Srv),
+            Ok(0x1000)
+        );
+    }
+}
+
+fn root_address(root: Option<&Root>, kind: RootBuffer) -> Result<u64, &'static str> {
+    match root {
+        Some(&Root::View(actual, address)) if actual == kind => Ok(address),
+        Some(Root::None) | None => Err("unset title root view"),
+        _ => Err("wrong type of title root view"),
+    }
 }
 
 fn root_view(list: &HostList, address: u64, kind: RootBuffer) -> Result<RootView, &'static str> {
@@ -228,28 +285,38 @@ fn root_view(list: &HostList, address: u64, kind: RootBuffer) -> Result<RootView
         RootBuffer::Uav => u64::MAX,
     };
     let len = shadow.left(address).min(limit);
-    let gpu = shadow.gpu(address);
     let resource = if shadow.is_mirrored() {
         &crate::mirror::get().ok_or("no title memory mirror")?.buffer
     } else {
         &shadow.buffer
     };
-    // SAFETY: the shadow or mirror retains the live resource.
+    // SAFETY: the shadow or mirror retains the live buffer.
     let (base, desc) = unsafe { (resource.GetGPUVirtualAddress(), resource.GetDesc()) };
-    validate_root_buffer(kind, gpu, base, desc, len)?;
-    if kind == RootBuffer::Cbv
-        && !gpu.is_multiple_of(u64::from(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT))
-    {
-        let (gpu, to) = list.scratch(len).ok_or("no aligned constant-buffer upload")?;
-        if gpu == 0 || !gpu.is_multiple_of(u64::from(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT)) {
+    let gpu = shadow.gpu(address);
+    let span = if kind == RootBuffer::Cbv {
+        len.next_multiple_of(256)
+    } else {
+        len
+    };
+    if kind == RootBuffer::Cbv && validate_root_buffer(kind, gpu, base, desc, span).is_err() {
+        let (gpu, to) = list
+            .scratch(len)
+            .ok_or("no aligned constant-buffer upload")?;
+        if gpu == 0
+            || to.is_null()
+            || !gpu.is_multiple_of(u64::from(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT))
+        {
             return Err("the constant-buffer upload GPU address is invalid");
         }
-        list.defer_fill(to, address as *const u8, len as usize);
-        return Ok(RootView { gpu, copy: None });
+        return Ok(RootView {
+            gpu,
+            copy: RootCopy::Upload { to, address, len },
+        });
     }
+    validate_root_buffer(kind, gpu, base, desc, span)?;
     Ok(RootView {
         gpu,
-        copy: Some((shadow, address, len)),
+        copy: RootCopy::Shadow(shadow, address, len),
     })
 }
 
@@ -312,8 +379,16 @@ impl State {
         set(self.roots(compute), slot, Root::Table(handle));
     }
 
-    pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) {
-        set(self.roots(compute), slot, Root::View(address));
+    pub(crate) fn set_view(&mut self, compute: bool, slot: u32, kind: RootBuffer, address: u64) {
+        set(self.roots(compute), slot, Root::View(kind, address));
+    }
+
+    pub(crate) fn set_root_signature(&mut self, compute: bool, signature: usize) {
+        let current = &mut self.title_roots[usize::from(compute)];
+        if *current != signature {
+            *current = signature;
+            self.roots(compute).clear();
+        }
     }
 
     pub(crate) fn set_constants(&mut self, compute: bool, slot: u32, values: &[u32], offset: u32) {
@@ -323,11 +398,15 @@ impl State {
             set(roots, slot, Root::Constants(Vec::new()));
         }
         if let Root::Constants(c) = &mut roots[s] {
-            let end = offset as usize + values.len();
+            let Some(end) = (offset as usize).checked_add(values.len()) else {
+                return;
+            };
             if c.len() < end {
-                c.resize(end, 0);
+                c.resize(end, None);
             }
-            c[offset as usize..end].copy_from_slice(values);
+            for (dst, &value) in c[offset as usize..end].iter_mut().zip(values) {
+                *dst = Some(value);
+            }
         }
     }
 
@@ -406,7 +485,7 @@ impl State {
                 }
             },
             (Some(Root::Constants(c)), RootType::Constants) => {
-                c.get(dword as usize).copied().unwrap_or(0)
+                c.get(dword as usize).copied().flatten().unwrap_or(0)
             }
             _ => {
                 once!(
@@ -419,14 +498,99 @@ impl State {
         }
     }
 
-    /// Table `slot` starts at a title slot the host heap does not have.
-    fn past_host_heap(&self, compute: bool, slot: u8) -> bool {
-        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
-            return false;
+    fn table_base(
+        &self,
+        compute: bool,
+        slot: u8,
+    ) -> Option<(u64, &'static crate::descriptor::Heap)> {
+        let Root::Table(table) = *self.roots_ref(compute).get(usize::from(slot))? else {
+            return None;
         };
-        self.heap_of(table)
-            .and_then(|heap| Some((heap.host()?, heap.index(table)?)))
-            .is_some_and(|(host, index)| index >= host.count())
+        let heap = self.heap_of(table)?;
+        let step = if heap.samplers() { 16 } else { 32 };
+        (table != 0 && (table - heap.start).is_multiple_of(step)).then_some((table, heap))
+    }
+
+    fn table_offset(&self, compute: bool, slot: u8) -> Option<u32> {
+        let (table, heap) = self.table_base(compute, slot)?;
+        let index = heap.index(table)?;
+        (index < heap.host()?.count())
+            .then(|| u32::try_from(table - heap.start).ok())
+            .flatten()
+    }
+
+    fn descriptor_entries(
+        &self,
+        list: &HostList,
+        used: &[UsedResource],
+        bindings: &[DescriptorBinding],
+        compute: bool,
+    ) -> Result<std::collections::BTreeMap<u8, Vec<(u32, ResourceType)>>, &'static str> {
+        let mut tables = std::collections::BTreeMap::<u8, Vec<(u32, ResourceType)>>::new();
+        for u in used.iter().filter(|u| u.root == RootType::Table) {
+            let step = if u.kind == ResourceType::Sampler {
+                16
+            } else {
+                32
+            };
+            let offset = u
+                .table_offset_dwords
+                .checked_mul(4)
+                .ok_or("table offset overflow")?;
+            tables
+                .entry(u.slot)
+                .or_default()
+                .push((offset / step * step, u.kind));
+        }
+        for binding in bindings {
+            let (properties, _) = binding.properties;
+            let kind = match (properties & 0xff, properties & 0x1000 != 0) {
+                (14, _) => ResourceType::Sampler,
+                (13, _) => ResourceType::Cbv,
+                (_, true) => ResourceType::Uav,
+                _ => ResourceType::Srv,
+            };
+            let sampler = kind == ResourceType::Sampler;
+            let (base, heap) = match binding.table {
+                Some(slot) => self
+                    .table_base(compute, slot)
+                    .ok_or("invalid title table base")?,
+                None => {
+                    let title_heap = self.heaps[usize::from(sampler)];
+                    if title_heap == 0 {
+                        return Err("missing title heap");
+                    }
+                    let heap = crate::descriptor::heap(title_heap as This);
+                    (heap.start, heap)
+                }
+            };
+            if heap.samplers() != sampler {
+                return Err("wrong heap type for descriptor");
+            }
+            let step = if sampler { 16 } else { 32 };
+            let offset = binding.byte_offset & !(step - 1);
+            let handle = base
+                .checked_add(u64::from(offset))
+                .ok_or("descriptor address overflow")?;
+            let index = heap
+                .index(handle)
+                .ok_or("descriptor outside the title heap")?;
+            let view = crate::descriptor::view(handle).ok_or("descriptor is unset")?;
+            crate::descriptor::host::validate_binding(&view, binding.properties)?;
+            if let Some(slot) = binding.table {
+                let entries = tables.entry(slot).or_default();
+                if !entries.contains(&(offset, kind)) {
+                    entries.push((offset, kind));
+                }
+            } else {
+                let host = heap.host().ok_or("missing host heap")?;
+                if host.mirror(index, handle, true).is_none() {
+                    return Err("no host descriptor for direct heap access");
+                }
+                readable(list, kind, &view);
+            }
+        }
+        Ok(tables)
     }
 
     /// The bound heap holding `handle`.
@@ -536,38 +700,179 @@ impl State {
                 return false;
             }
         }
-        let needs_title_memory = p
-            .stages
-            .iter()
-            .any(|s| s.root_srvs.iter().any(|&(slot, _)| slot == TITLE_MEMORY_SLOT));
-        let mut bound_heaps = self.heaps;
+        let has_root = |kind| {
+            p.stages
+                .iter()
+                .any(|s| s.roots.iter().any(|&(_, b)| b == kind))
+        };
+        let mut heaps = title_heaps.map(|h| h.map(|h| h.heap.clone()));
         let mut title_memory = None;
-        let mut fallback = None;
-        if needs_title_memory {
-            title_memory = if self.heaps[0] != 0 {
-                title_heaps[0].and_then(|heap| heap.title_memory())
+        if has_root(RootBinding::TitleMemory) {
+            title_memory = if let Some(heap) = title_heaps[0] {
+                heap.title_memory()
+                    .filter(|&handle| heap.valid_table(handle, TITLE_MEMORY_VIEWS))
+            } else if self.heaps[0] == 0 {
+                crate::mirror::read_heap().and_then(|heap| {
+                    let host = crate::host::host()?;
+                    // SAFETY: the fallback is a live view heap.
+                    let (handle, step) = unsafe {
+                        (
+                            heap.GetGPUDescriptorHandleForHeapStart(),
+                            host.device.GetDescriptorHandleIncrementSize(
+                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            ),
+                        )
+                    };
+                    if !crate::descriptor::host::valid_view_table(
+                        heap,
+                        handle,
+                        step,
+                        TITLE_MEMORY_VIEWS,
+                    ) {
+                        return None;
+                    }
+                    heaps[0] = Some(heap.clone());
+                    Some(handle)
+                })
             } else {
-                fallback = crate::mirror::read_heap();
-                bound_heaps[0] = usize::MAX;
-                // SAFETY: the fallback is a live shader-visible heap.
-                fallback.map(|heap| unsafe { heap.GetGPUDescriptorHandleForHeapStart() })
+                None
             };
             if title_memory.is_none() {
-                once!("a dispatch dropped: no title memory SRV table");
+                once!(pipeline = %p.name, "dispatch dropped: no valid title memory SRV table");
                 return false;
             }
         }
+        let image_data = if has_root(RootBinding::DescriptorData) {
+            let data = title_heaps[0].and_then(|heap| {
+                let (buffer, handle) = heap.image_data()?;
+                heap.valid_table(handle, 1).then_some((buffer, handle))
+            });
+            if data.is_none() {
+                once!(pipeline = %p.name, "draw or dispatch dropped: no valid image descriptor data table");
+                return false;
+            }
+            data
+        } else {
+            None
+        };
+        for (i, heap) in heaps.iter().enumerate() {
+            if let Some(heap) = heap {
+                // SAFETY: a live heap.
+                let (desc, gpu) =
+                    unsafe { (heap.GetDesc(), heap.GetGPUDescriptorHandleForHeapStart()) };
+                let kind = [
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                ][i];
+                if desc.Type != kind
+                    || !desc
+                        .Flags
+                        .contains(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+                    || desc.NumDescriptors == 0
+                    || gpu.ptr == 0
+                {
+                    once!(pipeline = %p.name, heap = i, "draw or dispatch dropped: invalid host heap");
+                    return false;
+                }
+            }
+        }
+        let mut arguments = Vec::new();
+        let mut mirror_reads = title_memory.is_some();
+        let mut mirror_writes = false;
+        for stage in &p.stages {
+            let t = stage.translated();
+            let made = match self.tables(list, &t.used, &t.host.descriptor_bindings, compute) {
+                Ok(made) => made,
+                Err(reason) => {
+                    once!(pipeline = %p.name, reason, "draw or dispatch dropped: invalid descriptor table");
+                    #[cfg(feature = "diagnostics")]
+                    crate::pipeline::note_why(format!(
+                        "{} invalid descriptor table: {reason}",
+                        p.name
+                    ));
+                    return false;
+                }
+            };
+            for &(param, binding) in &stage.roots {
+                let arg = match binding {
+                    RootBinding::Constants(dwords) => {
+                        let mut values = vec![0u32; dwords as usize];
+                        for u in &t.host.user_data {
+                            let fresh = made
+                                .iter()
+                                .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                            let value = match fresh {
+                                Some(&(_, offset)) => Some(offset),
+                                None if u.root == RootType::Table => {
+                                    self.table_offset(compute, u.slot)
+                                }
+                                None => match self.roots_ref(compute).get(usize::from(u.slot)) {
+                                    Some(Root::Constants(words)) => {
+                                        words.get(u.dword as usize).copied().flatten()
+                                    }
+                                    _ => None,
+                                },
+                            };
+                            let Some(value) = value else {
+                                once!(pipeline = %p.name, slot = u.slot, ?u.root, u.dword,
+                                    "draw or dispatch dropped: missing or invalid root data");
+                                return false;
+                            };
+                            values[u.index as usize] = value;
+                        }
+                        RootArgument::Constants(values)
+                    }
+                    RootBinding::Buffer { slot, kind } => {
+                        let view =
+                            root_address(self.roots_ref(compute).get(usize::from(slot)), kind)
+                                .and_then(|address| root_view(list, address, kind));
+                        let view = match view {
+                            Ok(view) => view,
+                            Err(reason) => {
+                                once!(pipeline = %p.name, slot, ?kind, reason,
+                                    "draw or dispatch dropped: invalid root view");
+                                return false;
+                            }
+                        };
+                        if matches!(&view.copy, RootCopy::Shadow(shadow, ..) if shadow.is_mirrored())
+                        {
+                            mirror_writes |= kind == RootBuffer::Uav;
+                            mirror_reads |= kind != RootBuffer::Uav;
+                        }
+                        RootArgument::Buffer(kind, view)
+                    }
+                    RootBinding::TitleMemory => {
+                        let Some(handle) = title_memory else {
+                            return false;
+                        };
+                        RootArgument::Table(handle)
+                    }
+                    RootBinding::DescriptorData => {
+                        let Some((_, handle)) = &image_data else {
+                            return false;
+                        };
+                        RootArgument::Table(*handle)
+                    }
+                };
+                arguments.push((param, arg));
+            }
+        }
+        if mirror_reads && mirror_writes {
+            once!(pipeline = %p.name, "draw or dispatch dropped: conflicting root access to the title memory mirror");
+            return false;
+        }
+        if let Some((buffer, _)) = image_data {
+            if list.first_use(buffer.as_raw() as usize) {
+                list.keep(&buffer);
+            }
+        }
+        let bound_heaps = heaps
+            .each_ref()
+            .map(|h| h.as_ref().map_or(0, |h| h.as_raw() as usize));
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != bound_heaps {
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = title_heaps
-                .into_iter()
-                .flatten()
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            if let Some(heap) = fallback {
-                heaps.push(Some(heap.clone()));
-            }
+            let heaps: Vec<_> = heaps.into_iter().flatten().map(Some).collect();
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
@@ -597,132 +902,73 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
-        let mut root_views = Vec::new();
-        for stage in &p.stages {
-            let t = stage.translated();
-            self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
-            if self.table_failed {
-                static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
-                let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_power_of_two() {
-                    tracing::warn!(
-                        dropped = n,
-                        "a draw or dispatch dropped: no dynamic slots for its tables"
-                    );
-                }
-                return false;
-            }
-            if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
-                for u in &t.host.user_data {
-                    let fresh = made
-                        .iter()
-                        .find(|m| m.0 == u.slot && u.root == RootType::Table);
-                    values[u.index as usize] = match fresh {
-                        Some(&(_, offset)) => offset,
-                        // The title's slots past a capped host heap have no
-                        // host slot: a shader given that offset reads past
-                        // the heap's end (garbage descriptors on NVIDIA; the
-                        // device hangs, #71).
-                        None if u.root == RootType::Table
-                            && self.past_host_heap(compute, u.slot) =>
-                        {
-                            once!(
-                                slot = u.slot,
-                                "a draw or dispatch dropped: its table lies past the host heap"
+        for (param, arg) in arguments {
+            match arg {
+                RootArgument::Constants(values) => {
+                    // SAFETY: preflight checked the parameter's type and size.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRoot32BitConstants(
+                                param,
+                                values.len() as u32,
+                                values.as_ptr().cast(),
+                                0,
                             );
-                            return false;
+                        } else {
+                            l.SetGraphicsRoot32BitConstants(
+                                param,
+                                values.len() as u32,
+                                values.as_ptr().cast(),
+                                0,
+                            );
                         }
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
-                    };
-                }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     }
                 }
-            }
-            for (views, kind) in [
-                (&stage.root_cbvs, RootBuffer::Cbv),
-                (&stage.root_srvs, RootBuffer::Srv),
-                (&stage.root_uavs, RootBuffer::Uav),
-            ] {
-                for &(slot, param) in views {
-                    if kind == RootBuffer::Srv && slot == TITLE_MEMORY_SLOT {
-                        let Some(handle) = title_memory else {
-                            return false;
-                        };
-                        // SAFETY: the range lives in the current view heap.
-                        unsafe {
-                            if compute {
-                                l.SetComputeRootDescriptorTable(param, handle);
-                            } else {
-                                l.SetGraphicsRootDescriptorTable(param, handle);
+                RootArgument::Table(handle) => {
+                    // SAFETY: preflight checked the full range in the bound view heap.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootDescriptorTable(param, handle);
+                        } else {
+                            l.SetGraphicsRootDescriptorTable(param, handle);
+                        }
+                    }
+                }
+                RootArgument::Buffer(kind, RootView { gpu, copy }) => {
+                    match copy {
+                        RootCopy::Shadow(shadow, address, len) => {
+                            shadow.refresh(list, address, len);
+                            if kind == RootBuffer::Uav {
+                                shadow.gpu_writes(list, address, len);
                             }
                         }
-                        continue;
-                    }
-                    if kind == RootBuffer::Srv && slot == DESCRIPTOR_DATA_SLOT {
-                        let data = (self.heaps[0] != 0)
-                            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-                            .flatten()
-                            .and_then(|heap| heap.image_data());
-                        let Some((buffer, handle)) = data else {
-                            once!("a draw or dispatch dropped: no image descriptor data");
-                            return false;
-                        };
-                        if list.first_use(buffer.as_raw() as usize) {
-                            list.keep(&buffer);
+                        RootCopy::Upload { to, address, len } => {
+                            list.defer_fill(to, address as *const u8, len as usize);
                         }
-                        // SAFETY: an open list and a slot of its view heap.
-                        unsafe {
-                            if compute {
-                                l.SetComputeRootDescriptorTable(param, handle);
-                            } else {
-                                l.SetGraphicsRootDescriptorTable(param, handle);
+                    }
+                    // SAFETY: preflight checked the GPU address and binding kind.
+                    unsafe {
+                        match (compute, kind) {
+                            (false, RootBuffer::Cbv) => {
+                                l.SetGraphicsRootConstantBufferView(param, gpu)
+                            }
+                            (false, RootBuffer::Srv) => {
+                                l.SetGraphicsRootShaderResourceView(param, gpu)
+                            }
+                            (false, RootBuffer::Uav) => {
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu)
+                            }
+                            (true, RootBuffer::Cbv) => {
+                                l.SetComputeRootConstantBufferView(param, gpu)
+                            }
+                            (true, RootBuffer::Srv) => {
+                                l.SetComputeRootShaderResourceView(param, gpu)
+                            }
+                            (true, RootBuffer::Uav) => {
+                                l.SetComputeRootUnorderedAccessView(param, gpu)
                             }
                         }
-                        continue;
                     }
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                    else {
-                        once!(pipeline = %p.name, slot, ?kind, "draw or dispatch dropped: unset root view");
-                        return false;
-                    };
-                    let view = match root_view(list, *address, kind) {
-                        Ok(view) => view,
-                        Err(reason) => {
-                            once!(pipeline = %p.name, slot, ?kind, reason, "draw or dispatch dropped: invalid root view");
-                            return false;
-                        }
-                    };
-                    root_views.push((param, kind, view));
-                }
-            }
-        }
-        // Resolve every required view before recording any root descriptor
-        // setter. Earlier valid views cannot leak into a rejected dispatch.
-        for (param, kind, RootView { gpu, copy }) in root_views {
-            if let Some((shadow, address, len)) = copy {
-                shadow.refresh(list, address, len);
-                if kind == RootBuffer::Uav {
-                    shadow.gpu_writes(list, address, len);
-                }
-            }
-            // SAFETY: an open list, a valid GPU address, and the parameter
-            // type installed for this view by the pipeline's root signature.
-            unsafe {
-                match (compute, kind) {
-                    (false, RootBuffer::Cbv) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                    (false, RootBuffer::Srv) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                    (false, RootBuffer::Uav) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
-                    (true, RootBuffer::Cbv) => l.SetComputeRootConstantBufferView(param, gpu),
-                    (true, RootBuffer::Srv) => l.SetComputeRootShaderResourceView(param, gpu),
-                    (true, RootBuffer::Uav) => l.SetComputeRootUnorderedAccessView(param, gpu),
                 }
             }
         }
@@ -731,6 +977,19 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        if [x, y, z]
+            .into_iter()
+            .any(|n| n > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION)
+        {
+            once!(
+                x,
+                y,
+                z,
+                "dispatch dropped: group count exceeds the host limit"
+            );
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -753,6 +1012,8 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -787,11 +1048,22 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs) {
-                if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
-                    let host = crate::shadow::find(*address, 1)
-                        .map(|s| (s.gpu(*address), s.left(*address)));
-                    let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
+            for &(param, binding) in &stage.roots {
+                match binding {
+                    RootBinding::Buffer { slot, kind } => {
+                        if let Ok(address) =
+                            root_address(self.roots_ref(compute).get(usize::from(slot)), kind)
+                        {
+                            let host = crate::shadow::find(address, 1)
+                                .map(|s| (s.gpu(address), s.left(address)));
+                            let _ =
+                                write!(text, " root{slot} {kind:?}={address:#x} host {host:#x?}");
+                        }
+                    }
+                    RootBinding::DescriptorData | RootBinding::TitleMemory => {
+                        let _ = write!(text, " root{param}={binding:?}");
+                    }
+                    RootBinding::Constants(_) => {}
                 }
             }
         }
@@ -831,154 +1103,129 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
-        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-            return;
-        };
-        let handle = table + u64::from(u.table_offset_dwords) * 4;
-        let Some(heap) = self.heap_of(handle) else {
-            return;
-        };
-        let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
-            return;
-        };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view);
-        }
-    }
-
-    /// The descriptors a shader reads through tables. Tables holding a
-    /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
-    ///
-    /// Within a list, the same table holding the same descriptors is made
-    /// once: its constant data is copied at submission either way, and the
-    /// big tables the world binds would otherwise take hundreds of slots per
-    /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
-        let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
-        // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
-        for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
-                continue;
-            }
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-                continue;
-            };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
-            let Some(heap) = self.heap_of(table) else {
-                continue;
-            };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
-                continue;
-            };
-            if index >= host.count() {
-                fresh.push(u.slot);
-            }
-        }
-        fresh.sort_unstable();
-        fresh.dedup();
-        for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
-            }
-        }
+    /// Prepares the entries indexed by the shader. Fresh tables keep their
+    /// title layout and copy constant buffers into aligned list uploads.
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        bindings: &[DescriptorBinding],
+        compute: bool,
+    ) -> Result<Vec<(u8, u32)>, &'static str> {
+        let tables = self.descriptor_entries(list, used, bindings, compute)?;
         let mut made = Vec::new();
-        for slot in fresh {
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+        for (slot, entries) in tables {
+            let (table, heap) = self
+                .table_base(compute, slot)
+                .ok_or("invalid title table base")?;
+            let host = heap.host().ok_or("missing host heap")?;
+            let step = if heap.samplers() { 16 } else { 32 };
+            let mut fresh = false;
+            let mut required = std::collections::BTreeMap::new();
+            for (offset, kind) in entries {
+                if heap.samplers() != (kind == ResourceType::Sampler) {
+                    return Err("wrong heap type for table");
+                }
+                let handle = table
+                    .checked_add(u64::from(offset))
+                    .ok_or("table address overflow")?;
+                let index = heap
+                    .index(handle)
+                    .ok_or("table entry outside the title heap")?;
+                let view =
+                    crate::descriptor::view(handle).ok_or("required table entry is unset")?;
+                if crate::descriptor::host::view_kind(&view) != kind {
+                    return Err("wrong descriptor class in title table");
+                }
+                fresh |= kind == ResourceType::Cbv || index >= host.count();
+                required.insert(offset / step, (index, kind, handle, view));
+            }
+            if !fresh {
+                for (_, (index, kind, handle, view)) in required {
+                    if host.mirror(index, handle, true).is_none() {
+                        return Err("no valid host descriptor for table entry");
+                    }
+                    readable(list, kind, &view);
+                }
                 continue;
-            };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
-            let Some(heap) = self.heap_of(table) else {
-                continue;
-            };
-            let Some(host) = heap.host() else {
-                continue;
-            };
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8 + 1)
-                .max()
-                .unwrap_or(1);
-            // The table and what its entries hold (record words).
+            }
+            let n = required.last_key_value().map_or(0, |(k, _)| k + 1);
+            if heap.samplers() || n > host.dynamic_capacity() {
+                return Err("no host range for remapped table");
+            }
+            // The last required entry was checked against the title heap,
+            // so all intervening slots are in the same live heap.
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
+                    let at = table + u64::from(k) * u64::from(step);
+                    // SAFETY: a descriptor slot in the validated title range.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
                 (table, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
-                    }
-                }
-                made.push((slot, first * 32));
-                continue;
-            }
-            let Some(first) = host.dynamic(n) else {
-                // Without its fresh table the shader would read the title's
-                // slots, which for constant buffer tables hold no constant
-                // view: a texture or null descriptor read as a buffer gives
-                // a wild address on AMD and the device is removed (#59).
-                // The draw or dispatch is dropped instead.
-                self.table_failed = true;
-                continue;
-            };
-            self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
-            // The whole range: a shader may index past the entries its
-            // used-resource list names (descriptor arrays).
-            for k in 0..n {
-                let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
-                            continue;
+            let first = if let Some(&first) = self.fresh_tables.get(&key) {
+                first
+            } else {
+                let first = host
+                    .dynamic(n)
+                    .ok_or("no free host range for remapped table")?;
+                let prepared = (|| {
+                    for k in 0..n {
+                        let index = first + k;
+                        let view = crate::descriptor::view(table + u64::from(k) * u64::from(step));
+                        let valid = match view {
+                            Some(View::Constant(address, size)) => {
+                                if address == 0
+                                    || crate::descriptor::host::cbv_size(size).is_none()
+                                    || !crate::texture::committed(
+                                        address as *const u8,
+                                        size as usize,
+                                    )
+                                {
+                                    return Err("invalid constant buffer in remapped table");
+                                }
+                                let (gpu, to) =
+                                    list.scratch(u64::from(size)).ok_or("no constant upload")?;
+                                if to.is_null() || !host.constant_at(index, gpu, size) {
+                                    return Err("invalid constant-buffer upload in remapped table");
+                                }
+                                list.defer_fill(to, address as *const u8, size as usize);
+                                true
+                            }
+                            Some(view) => host.make_at(index, &view),
+                            None => {
+                                host.make_null(index);
+                                false
+                            }
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at(index, gpu, size);
-                    }
-                    Some(view) => {
-                        host.make_at(index, &view);
-                        if let Some(u) = used {
-                            readable(list, u, &view);
+                        if !valid && required.contains_key(&k) {
+                            return Err("no valid host descriptor for remapped table entry");
                         }
                     }
-                    None => {
-                        host.make_null(index);
-                        if used.is_some() {
-                            once!(slot, "a table entry without a view");
-                        }
-                    }
+                    Ok(())
+                })();
+                if let Err(reason) = prepared {
+                    host.release(first, n);
+                    return Err(reason);
                 }
+                self.fresh_tables.insert(key, first);
+                self.dynamic
+                    .push((std::ptr::from_ref(heap) as usize, first, n));
+                first
+            };
+            for (_, (_, kind, _, view)) in required {
+                readable(list, kind, &view);
             }
-            made.push((slot, first * 32));
+            made.push((
+                slot,
+                first
+                    .checked_mul(step)
+                    .ok_or("remapped table offset overflow")?,
+            ));
         }
-        made
+        Ok(made)
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -1315,7 +1562,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View) {
+fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -1327,11 +1574,11 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         && let Some(shadow) = crate::shadow::find(address, len)
     {
         shadow.refresh(list, address, len);
-        if u.kind == ResourceType::Uav {
+        if kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
         }
     }
-    match (view, u.kind) {
+    match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
             if let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)

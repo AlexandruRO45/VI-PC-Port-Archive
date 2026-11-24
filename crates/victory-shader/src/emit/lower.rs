@@ -6,12 +6,12 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
-use super::{DESCRIPTOR_DATA_SLOT, UserData};
+use super::{DESCRIPTOR_DATA_SLOT, DescriptorBinding, UserData};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -48,6 +48,7 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    pub descriptor_bindings: Vec<DescriptorBinding>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -192,7 +193,9 @@ struct Lower<'a> {
     image_fields: HashMap<Value, (Site, u8)>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    descriptor_bindings: BTreeSet<DescriptorBinding>,
+    dynamic_buffer_types: HashMap<(usize, Value, u32), u32>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -500,6 +503,8 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            descriptor_bindings: BTreeSet::new(),
+            dynamic_buffer_types: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -1033,6 +1038,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            descriptor_bindings: self.descriptor_bindings.into_iter().collect(),
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -3776,9 +3782,48 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        for leaf in src.leaves() {
+            let (Source::Loaded { load, first } | Source::Fetched { load, first }) = *leaf else {
+                continue;
+            };
+            let Some(a) = self.scalar.get(&load) else {
+                continue;
+            };
+            let Some(rp) = self.x.native.layout.get(a.param) else {
+                continue;
+            };
+            let table = match rp.root {
+                RootType::Table => Some(rp.slot),
+                RootType::ResourceHeap | RootType::SamplerHeap => None,
+                _ => continue,
+            };
+            let byte_offset = a.offset.wrapping_add(4 * u32::from(first));
+            if let Some(dynamic) = a.dynamic {
+                // A GPU-derived buffer heap index cannot be checked during
+                // binding. A CBV and a raw SRV need distinct descriptors
+                // even if the console stored both views in the same SRD.
+                if self.x.native.stage == crate::HwStage::Cs
+                    && rp.root == RootType::ResourceHeap
+                    && matches!(props.0, 11 | 13)
+                    && self.heap_index_from_buffer(dynamic)
+                {
+                    let key = (a.param, dynamic, byte_offset);
+                    let previous = self.dynamic_buffer_types.entry(key).or_insert(props.0);
+                    if *previous != props.0 {
+                        return Err("one GPU-indexed buffer needs both a CBV and a raw SRV");
+                    }
+                }
+                continue;
+            }
+            self.descriptor_bindings.insert(DescriptorBinding {
+                table,
+                byte_offset,
+                properties: props,
+            });
+        }
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -3888,6 +3933,33 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// A scalar dword loaded from GPU memory and shifted into descriptor bytes.
+    fn heap_index_from_buffer(&self, value: Value) -> bool {
+        let def = |v| {
+            let &b = self.def_block.get(&v)?;
+            self.x.p.blocks[b]
+                .insts
+                .iter()
+                .find(|i| i.writes.iter().any(|w| w.1 == v))
+        };
+        let Some(shift) = def(value).filter(|i| i.name() == "s_lshl_b32") else {
+            return false;
+        };
+        let Fields::Sop { src, .. } = &shift.fields else {
+            return false;
+        };
+        let Some(&Operand::Scalar { code, .. }) = src.first() else {
+            return false;
+        };
+        let Some(index) = shift
+            .read(Reg::S(code))
+            .filter(|v| !self.params.contains_key(v))
+        else {
+            return false;
+        };
+        def(index).is_some_and(|i| matches!(i.name(), "s_buffer_load_dword" | "s_load_dword"))
     }
 
     /// The heap index of a descriptor that may differ between lanes,
@@ -8141,7 +8213,70 @@ mod tests {
                 slot: 0,
             }]
         };
-        lower_with(&words, layout(), used()).unwrap();
+        let lowered = lower_with(&words, layout(), used()).unwrap();
+        assert_eq!(
+            lowered.descriptor_bindings,
+            [
+                super::DescriptorBinding {
+                    table: Some(0),
+                    byte_offset: 0,
+                    properties: (12, 4)
+                },
+                super::DescriptorBinding {
+                    table: Some(0),
+                    byte_offset: 16,
+                    properties: (12, 4)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn one_dynamic_heap_slot_cannot_be_both_a_cbv_and_a_raw_srv() {
+        let words = [
+            0xBE84_0301, // s_mov_b32 s4, s1
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0302,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], null
+            0xF420_0046,
+            0xFA00_0000, // s_buffer_load_dword s1, s[12:15], null
+            0x8F02_8501, // s_lshl_b32 s2, s1, 5
+            0x8002_0200, // s_add_u32 s2, s0, s2
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0201,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], null
+            0xF420_0404,
+            0xFA00_0000, // s_buffer_load_dword s16, s[8:11], null
+            0x7E02_0210, // v_mov_b32 v1, s16
+            0xE030_1000,
+            0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 offen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xD834_0004,
+            0x0000_0200, // ds_write_b32 v0, v2 offset:4
+            S_ENDPGM,
+        ];
+        let layout = vec![
+            root(RootType::ResourceHeap, 0, 0),
+            root(RootType::Table, 1, 1),
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 1,
+            dwords: 4,
+            user_data: 1,
+            slot: 1,
+        }];
+        assert!(matches!(
+            lower_with(&words, layout, used),
+            Err(crate::ShaderError::Unsupported {
+                what: "one GPU-indexed buffer needs both a CBV and a raw SRV",
+                ..
+            })
+        ));
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.

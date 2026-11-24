@@ -144,7 +144,14 @@ impl Mirror {
             return None;
         }
         let elements = 1 << (TITLE_MEMORY_VIEW_SHIFT - 2);
-        debug_assert_eq!(u64::from(elements) * 4 * u64::from(TITLE_MEMORY_VIEWS), BYTES);
+        let size = u64::from(elements) * 4 * u64::from(TITLE_MEMORY_VIEWS);
+        if size != BYTES
+            || first.ptr == 0
+            || step == 0
+            || !crate::descriptor::host::valid_raw_srv(&self.buffer, size)
+        {
+            return None;
+        }
         for index in 0..TITLE_MEMORY_VIEWS {
             let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,

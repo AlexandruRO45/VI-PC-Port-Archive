@@ -11,7 +11,9 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
+use crate::draw::validate_root_buffer;
 use crate::host::host;
+use crate::pipeline::host::RootBuffer;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -43,6 +45,53 @@ struct ImageData {
     buffer: ID3D12Resource,
     mapped: usize,
     handle: D3D12_GPU_DESCRIPTOR_HANDLE,
+}
+
+fn table_in_heap(
+    desc: D3D12_DESCRIPTOR_HEAP_DESC,
+    start: u64,
+    handle: u64,
+    step: u32,
+    count: u32,
+) -> bool {
+    if desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+        || !desc
+            .Flags
+            .contains(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+        || start == 0
+        || step == 0
+        || count == 0
+    {
+        return false;
+    }
+    let step = u64::from(step);
+    handle.checked_sub(start).is_some_and(|offset| {
+        offset.is_multiple_of(step)
+            && (offset / step)
+                .checked_add(u64::from(count))
+                .is_some_and(|end| end <= u64::from(desc.NumDescriptors))
+    })
+}
+
+pub(crate) fn valid_view_table(
+    heap: &ID3D12DescriptorHeap,
+    handle: D3D12_GPU_DESCRIPTOR_HANDLE,
+    step: u32,
+    count: u32,
+) -> bool {
+    // SAFETY: a live descriptor heap.
+    let (desc, start) = unsafe { (heap.GetDesc(), heap.GetGPUDescriptorHandleForHeapStart()) };
+    table_in_heap(desc, start.ptr, handle.ptr, step, count)
+}
+
+pub(crate) fn valid_raw_srv(buffer: &ID3D12Resource, size: u64) -> bool {
+    // SAFETY: a live resource.
+    let (base, desc) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc()) };
+    validate_root_buffer(RootBuffer::Srv, base, base, desc, size).is_ok()
+}
+
+pub(crate) fn cbv_size(size: u32) -> Option<u32> {
+    (size > 0 && size <= 65536).then(|| size.next_multiple_of(256))
 }
 
 impl ImageData {
@@ -287,6 +336,14 @@ impl HostHeap {
         self.count
     }
 
+    pub(crate) fn dynamic_capacity(&self) -> u32 {
+        self.dynamic
+    }
+
+    pub(crate) fn valid_table(&self, handle: D3D12_GPU_DESCRIPTOR_HANDLE, count: u32) -> bool {
+        valid_view_table(&self.heap, handle, self.step, count)
+    }
+
     pub(crate) fn title_memory(&self) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
         use victory_shader::emit::TITLE_MEMORY_VIEWS;
 
@@ -296,15 +353,17 @@ impl HostHeap {
         }
         let mirror = crate::mirror::get()?;
         let slot = self.dynamic(TITLE_MEMORY_VIEWS)?;
-        if mirror.read_views(self.cpu(slot), self.step).is_none() {
-            self.release(slot, TITLE_MEMORY_VIEWS);
-            return None;
-        }
         // SAFETY: this is a live shader-visible heap with the reserved slots.
         let base = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
         let start = D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: base.ptr + u64::from(self.step) * u64::from(slot),
         };
+        if !self.valid_table(start, TITLE_MEMORY_VIEWS)
+            || mirror.read_views(self.cpu(slot), self.step).is_none()
+        {
+            self.release(slot, TITLE_MEMORY_VIEWS);
+            return None;
+        }
         *handle = Some(start);
         Some(start)
     }
@@ -325,6 +384,9 @@ impl HostHeap {
         let host = host()?;
         let elements = self.count.checked_mul(2)?;
         let (buffer, mapped) = host.upload_buffer(u64::from(elements) * 4)?;
+        if mapped.is_null() || !valid_raw_srv(&buffer, u64::from(elements) * 4) {
+            return None;
+        }
         let slot = self.dynamic(1)?;
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
@@ -338,14 +400,19 @@ impl HostHeap {
                 },
             },
         };
-        // SAFETY: the buffer and the slot reserved above are live.
-        let gpu = unsafe {
-            host.device
-                .CreateShaderResourceView(&buffer, Some(&desc), self.cpu(slot));
-            self.heap.GetGPUDescriptorHandleForHeapStart().ptr
-        };
+        // SAFETY: a live shader-visible descriptor heap.
+        let gpu = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         let handle = D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: gpu + u64::from(self.step) * u64::from(slot),
+        };
+        if !self.valid_table(handle, 1) {
+            self.release(slot, 1);
+            return None;
+        }
+        // SAFETY: checked raw buffer and reserved slot in a live view heap.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(&buffer, Some(&desc), self.cpu(slot))
         };
         let made_data = ImageData {
             buffer,
@@ -382,12 +449,14 @@ impl HostHeap {
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
+    pub(crate) fn make_at(&self, index: u32, view: &View) -> bool {
         let kept = make(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
+        let valid = kept.is_some();
         self.keep(index, kept.flatten());
+        valid
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -410,18 +479,28 @@ impl HostHeap {
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
-    pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
+    pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) -> bool {
+        let (Some(size), Some(host)) = (cbv_size(size), host()) else {
+            return false;
+        };
+        if gpu == 0
+            || !gpu.is_multiple_of(256)
+            || self.sampler
+            || index >= self.count + self.dynamic
+        {
+            return false;
+        }
         self.keep(index, None);
-        let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: size,
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
             host.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))
         };
+        true
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -469,18 +548,22 @@ impl HostHeap {
         };
         if made[index as usize] != key {
             let later = !for_draw && view.is_buffer();
-            made[index as usize] = if later { 0 } else { key };
             let kept = if later {
                 None
             } else {
                 make(&view, self.cpu(index))
             };
+            let valid = kept.is_some();
+            made[index as usize] = if valid { key } else { 0 };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
             if let Some(data) = self.image_data.get() {
                 data.set(index, image_words_at(i, generation));
+            }
+            if for_draw && !valid {
+                return None;
             }
         }
         Some(view)
@@ -534,6 +617,204 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
             .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
             .read_unaligned()
     }
+}
+
+pub(crate) fn view_kind(view: &View) -> victory_shader::ResourceType {
+    use victory_shader::ResourceType::*;
+    match view {
+        View::Constant(..) => Cbv,
+        View::Shader(..) | View::Placed(false, ..) => Srv,
+        View::Unordered(..) | View::Placed(true, ..) => Uav,
+        View::Sampler(..) | View::ConsoleSampler(..) => Sampler,
+    }
+}
+
+/// Checks the DXIL resource kind and element type against the view that
+/// will supply a statically addressed descriptor.
+pub(crate) fn validate_binding(
+    view: &View,
+    (properties, element): (u32, u32),
+) -> Result<(), &'static str> {
+    if let Some(placed) = placed_texture(view) {
+        return validate_binding(&placed, (properties, element));
+    }
+    let kind = properties & 0xff;
+    let writable = properties & 0x1000 != 0;
+    let shape = match view {
+        View::Constant(..) if kind == 13 && !writable => return Ok(()),
+        View::Sampler(..) | View::ConsoleSampler(..) if kind == 14 => return Ok(()),
+        View::Shader(resource, desc) if !writable && *resource != 0 => desc.as_ref().map(srv_shape),
+        View::Unordered(resource, counter, desc) if writable && *resource != 0 && *counter == 0 => {
+            desc.as_ref().map(uav_shape)
+        }
+        View::Placed(uav, _, desc) if *uav == writable => {
+            let words = desc[..10].try_into().expect("ten descriptor words");
+            Some(if *uav {
+                uav_shape(words)
+            } else {
+                srv_shape(words)
+            })
+        }
+        _ => return Err("descriptor class does not match the shader"),
+    };
+    let Some((actual, mut format, stride)) = shape else {
+        // Default views get their format and dimension from a live resource.
+        let resource = match view {
+            View::Shader(r, None) | View::Unordered(r, _, None) => *r,
+            _ => return Err("no descriptor shape"),
+        };
+        let texture = crate::resource::host_resource(resource as crate::object::This)
+            .ok_or("no resource for default descriptor")?;
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        let actual = match (d.Dimension, d.DepthOrArraySize > 1, d.SampleDesc.Count > 1) {
+            (D3D12_RESOURCE_DIMENSION_TEXTURE1D, false, _) => 1,
+            (D3D12_RESOURCE_DIMENSION_TEXTURE1D, true, _) => 6,
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, false, false) => 2,
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, false, true) => 3,
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, true, false) => 7,
+            (D3D12_RESOURCE_DIMENSION_TEXTURE2D, true, true) => 8,
+            (D3D12_RESOURCE_DIMENSION_TEXTURE3D, _, _) => 4,
+            _ => 0,
+        };
+        return check_shape(kind, element, actual, d.Format, 0);
+    };
+    if let View::Shader(resource, _) | View::Unordered(resource, _, _) = view
+        && let Some(texture) = crate::resource::host_resource(*resource as crate::object::This)
+    {
+        // SAFETY: a live texture.
+        let resource = unsafe { texture.GetDesc() };
+        if !texture_view_fits(resource, actual) || !fits(texture, Some(&mut format), writable) {
+            return Err("host resource does not permit the descriptor");
+        }
+    }
+    check_shape(kind, element, actual, format, stride)
+}
+
+fn check_shape(
+    kind: u32,
+    element: u32,
+    actual: u32,
+    format: DXGI_FORMAT,
+    stride: u32,
+) -> Result<(), &'static str> {
+    if actual != kind {
+        return Err("descriptor shape does not match the shader");
+    }
+    match kind {
+        11 => Ok(()), // Raw buffer.
+        12 if element == stride => Ok(()),
+        12 => Err("structured descriptor stride does not match the shader"),
+        1..=10 if component_matches(format, element & 0xff) => Ok(()),
+        _ => Err("typed descriptor format does not match the shader"),
+    }
+}
+
+fn component_matches(format: DXGI_FORMAT, component: u32) -> bool {
+    let class = match format {
+        DXGI_FORMAT_R32G32B32A32_UINT
+        | DXGI_FORMAT_R32G32B32_UINT
+        | DXGI_FORMAT_R16G16B16A16_UINT
+        | DXGI_FORMAT_R32G32_UINT
+        | DXGI_FORMAT_R10G10B10A2_UINT
+        | DXGI_FORMAT_R8G8B8A8_UINT
+        | DXGI_FORMAT_R16G16_UINT
+        | DXGI_FORMAT_R32_UINT
+        | DXGI_FORMAT_R8G8_UINT
+        | DXGI_FORMAT_R16_UINT
+        | DXGI_FORMAT_R8_UINT
+        | DXGI_FORMAT_X24_TYPELESS_G8_UINT
+        | DXGI_FORMAT_X32_TYPELESS_G8X24_UINT => 5,
+        DXGI_FORMAT_R32G32B32A32_SINT
+        | DXGI_FORMAT_R32G32B32_SINT
+        | DXGI_FORMAT_R16G16B16A16_SINT
+        | DXGI_FORMAT_R32G32_SINT
+        | DXGI_FORMAT_R8G8B8A8_SINT
+        | DXGI_FORMAT_R16G16_SINT
+        | DXGI_FORMAT_R32_SINT
+        | DXGI_FORMAT_R8G8_SINT
+        | DXGI_FORMAT_R16_SINT
+        | DXGI_FORMAT_R8_SINT => 4,
+        _ => 9,
+    };
+    // Float instructions also accept the normalized float view formats.
+    match component {
+        2 | 4 => class == 4,
+        3 | 5 => class == 5,
+        8..=10 | 11..=16 => class == 9 && format != DXGI_FORMAT_UNKNOWN,
+        _ => false,
+    }
+}
+
+fn srv_shape(words: &[u32; 10]) -> (u32, DXGI_FORMAT, u32) {
+    let d = srv_desc(words);
+    if d.ViewDimension == D3D12_SRV_DIMENSION_BUFFER {
+        // SAFETY: selected by the view dimension.
+        let b = unsafe { d.Anonymous.Buffer };
+        return buffer_shape(
+            d.Format,
+            b.StructureByteStride,
+            b.Flags == D3D12_BUFFER_SRV_FLAG_RAW,
+        );
+    }
+    let kind = match d.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE1D => 1,
+        D3D12_SRV_DIMENSION_TEXTURE2D => 2,
+        D3D12_SRV_DIMENSION_TEXTURE2DMS => 3,
+        D3D12_SRV_DIMENSION_TEXTURE3D => 4,
+        D3D12_SRV_DIMENSION_TEXTURECUBE => 5,
+        D3D12_SRV_DIMENSION_TEXTURE1DARRAY => 6,
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => 7,
+        D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => 8,
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => 9,
+        _ => 0,
+    };
+    (kind, d.Format, 0)
+}
+
+fn uav_shape(words: &[u32; 10]) -> (u32, DXGI_FORMAT, u32) {
+    let d = uav_desc(words);
+    if d.ViewDimension == D3D12_UAV_DIMENSION_BUFFER {
+        // SAFETY: selected by the view dimension.
+        let b = unsafe { d.Anonymous.Buffer };
+        return buffer_shape(
+            d.Format,
+            b.StructureByteStride,
+            b.Flags == D3D12_BUFFER_UAV_FLAG_RAW,
+        );
+    }
+    let kind = match d.ViewDimension {
+        D3D12_UAV_DIMENSION_TEXTURE1D => 1,
+        D3D12_UAV_DIMENSION_TEXTURE2D => 2,
+        D3D12_UAV_DIMENSION_TEXTURE3D => 4,
+        D3D12_UAV_DIMENSION_TEXTURE1DARRAY => 6,
+        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => 7,
+        _ => 0,
+    };
+    (kind, d.Format, 0)
+}
+
+fn buffer_shape(format: DXGI_FORMAT, stride: u32, raw: bool) -> (u32, DXGI_FORMAT, u32) {
+    let kind = match (format, stride, raw) {
+        (DXGI_FORMAT_R32_TYPELESS, 0, true) => 11,
+        (DXGI_FORMAT_UNKNOWN, 1.., false) => 12,
+        (f, 0, false) if f != DXGI_FORMAT_UNKNOWN && f != DXGI_FORMAT_R32_TYPELESS => 10,
+        _ => 0,
+    };
+    (kind, format, stride)
+}
+
+fn texture_view_fits(resource: D3D12_RESOURCE_DESC, kind: u32) -> bool {
+    let dimension = match kind {
+        1 | 6 => D3D12_RESOURCE_DIMENSION_TEXTURE1D,
+        2 | 3 | 5 | 7..=9 => D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        4 => D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+        _ => return false,
+    };
+    let multisampled = matches!(kind, 3 | 8);
+    resource.Dimension == dimension
+        && (resource.SampleDesc.Count > 1) == multisampled
+        && (!matches!(kind, 5 | 9) || resource.DepthOrArraySize >= 6)
 }
 
 fn image_words_at(index: u32, generation: u32) -> [u32; 2] {
@@ -650,11 +931,14 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         _ => return None,
     };
     let desc = srv_desc(words);
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
     Some((
-        base + buffer.FirstElement * element,
+        base.checked_add(buffer.FirstElement.checked_mul(element)?)?,
         u64::from(buffer.NumElements) * element,
     ))
 }
@@ -662,6 +946,9 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// [`buffer_range`] of an unordered access view of memory at `base`.
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return None;
+    }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -672,7 +959,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
     Some((
-        base + buffer.FirstElement * element,
+        base.checked_add(buffer.FirstElement.checked_mul(element)?)?,
         u64::from(buffer.NumElements) * element,
     ))
 }
@@ -686,20 +973,35 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER || address == 0 {
+        return None;
+    }
     let shadow = crate::shadow::find(address, len)?;
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    let offset = shadow.offset(address);
-    if element == 0 || offset % element != 0 {
-        once!(
-            offset,
-            element,
-            "buffer view not on an element of its host copy"
-        );
+    if !matches!(
+        buffer.Flags,
+        D3D12_BUFFER_SRV_FLAG_NONE | D3D12_BUFFER_SRV_FLAG_RAW
+    ) {
         return None;
     }
-    buffer.FirstElement += offset / element;
+    let kind = buffer_shape(
+        desc.Format,
+        buffer.StructureByteStride,
+        buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW,
+    )
+    .0;
+    buffer.FirstElement = buffer_view_start(
+        &shadow,
+        address,
+        len,
+        element,
+        buffer.FirstElement,
+        buffer.NumElements,
+        kind,
+        false,
+    )?;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -720,13 +1022,10 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
-    // SAFETY: a live buffer.
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
-    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-        once!("unordered access to a buffer whose host copy shaders cannot write");
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER || address == 0 {
         return None;
     }
+    let shadow = crate::shadow::find(address, len)?;
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -736,13 +1035,30 @@ fn buffer_uav(
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     };
-    let offset = shadow.offset(address);
-    if element == 0 || offset % element != 0 {
-        once!(offset, element, "unordered buffer view not on an element of its host copy");
+    if buffer.CounterOffsetInBytes != 0
+        || !matches!(
+            buffer.Flags,
+            D3D12_BUFFER_UAV_FLAG_NONE | D3D12_BUFFER_UAV_FLAG_RAW
+        )
+    {
         return None;
     }
-    buffer.FirstElement += offset / element;
-    buffer.CounterOffsetInBytes = 0;
+    let kind = buffer_shape(
+        desc.Format,
+        buffer.StructureByteStride,
+        buffer.Flags == D3D12_BUFFER_UAV_FLAG_RAW,
+    )
+    .0;
+    buffer.FirstElement = buffer_view_start(
+        &shadow,
+        address,
+        len,
+        element,
+        buffer.FirstElement,
+        buffer.NumElements,
+        kind,
+        true,
+    )?;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -750,6 +1066,62 @@ fn buffer_uav(
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
     Some(Some(shadow.buffer.clone()))
+}
+
+/// Rebase a bounded buffer view onto its host resource before calling a
+/// descriptor creator. The element interval must fit the title view too.
+fn buffer_view_start(
+    shadow: &crate::shadow::Shadow,
+    title: u64,
+    len: u64,
+    element: u64,
+    first: u64,
+    count: u32,
+    kind: u32,
+    writable: bool,
+) -> Option<u64> {
+    if title == 0
+        || element == 0
+        || kind == 0
+        || count == 0
+        || count > 1 << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP
+        || kind == 12 && (!element.is_multiple_of(4) || element > 2048)
+        || first.checked_add(u64::from(count))? > len / element
+    {
+        return None;
+    }
+    // SAFETY: the shadow owns a live buffer.
+    let (gpu, desc) = unsafe {
+        (
+            shadow.buffer.GetGPUVirtualAddress(),
+            shadow.buffer.GetDesc(),
+        )
+    };
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+        || gpu == 0
+        || writable
+            && !desc
+                .Flags
+                .contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+        || !writable
+            && desc
+                .Flags
+                .contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+    {
+        return None;
+    }
+    let base = shadow.offset(title);
+    let offset = base.checked_add(first.checked_mul(element)?)?;
+    if !offset.is_multiple_of(element)
+        || offset.checked_add(u64::from(count).checked_mul(element)?)? > desc.Width
+        || kind == 11
+            && !gpu
+                .checked_add(offset)?
+                .is_multiple_of(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT))
+    {
+        return None;
+    }
+    Some(offset / element)
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -812,18 +1184,23 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
-            let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
+            if address == 0 {
                 return None;
             }
+            let rounded = cbv_size(size)?;
+            let shadow = crate::shadow::find(address, u64::from(size))?;
+            // SAFETY: the shadow retains the live resource.
+            let (base, resource) = unsafe {
+                (
+                    shadow.buffer.GetGPUVirtualAddress(),
+                    shadow.buffer.GetDesc(),
+                )
+            };
+            let gpu = base.checked_add(shadow.offset(address))?;
+            validate_root_buffer(RootBuffer::Cbv, gpu, base, resource, u64::from(rounded)).ok()?;
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: rounded,
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -832,6 +1209,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
+                // SAFETY: a live texture.
+                let resource = unsafe { texture.GetDesc() };
+                if desc
+                    .as_ref()
+                    .is_some_and(|words| !texture_view_fits(resource, srv_shape(words).0))
+                {
+                    return None;
+                }
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
@@ -853,7 +1238,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 None
             }
         }
-        View::Unordered(resource, _counter, desc) => {
+        View::Unordered(resource, counter, desc) => {
+            if *counter != 0 {
+                return None;
+            }
             let resource = *resource as crate::object::This;
             let Some(texture) = crate::resource::host_resource(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
@@ -863,6 +1251,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     _ => None,
                 };
             };
+            // SAFETY: a live texture.
+            let resource = unsafe { texture.GetDesc() };
+            if desc
+                .as_ref()
+                .is_some_and(|words| !texture_view_fits(resource, uav_shape(words).0))
+            {
+                return None;
+            }
             let mut desc = desc.as_ref().map(uav_desc);
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
@@ -973,6 +1369,12 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_UINT,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    NumElements: 1,
+                    ..Default::default()
+                },
+            },
             ..Default::default()
         }
     } else {
@@ -1183,5 +1585,82 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    #[test]
+    fn indexed_views_must_match_the_shader_annotation() {
+        let mut resource = [0; 14];
+        resource[0] = D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
+        let mut words = [0; 16];
+        words[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        words[6] = 2400;
+        words[7] = 416;
+        let structured = View::Placed(false, resource, words);
+        assert!(validate_binding(&structured, (11, 0)).is_err());
+        assert!(validate_binding(&structured, (12, 336)).is_err());
+        assert!(validate_binding(&structured, (12, 416)).is_ok());
+
+        words[0] = DXGI_FORMAT_R8_UINT.0 as u32;
+        words[1] = D3D12_UAV_DIMENSION_BUFFER.0 as u32;
+        words[6] = 393216;
+        words[7] = 0;
+        let uint = View::Placed(true, resource, words);
+        assert!(validate_binding(&uint, (0x100a, 0x409)).is_err());
+        assert!(validate_binding(&uint, (0x100a, 0x105)).is_ok());
+        assert!(validate_binding(&uint, (10, 0x105)).is_err());
+    }
+
+    #[test]
+    fn metadata_and_mirror_tables_fit_the_bound_view_heap() {
+        let mut desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NumDescriptors: 257,
+            NodeMask: 0,
+        };
+        let start = 0x1000;
+        let step = 32;
+        assert!(table_in_heap(desc, start, start, step, 1));
+        assert!(table_in_heap(desc, start, start + 32, step, 256));
+        assert!(!table_in_heap(desc, start, start + 64, step, 256));
+        assert!(!table_in_heap(desc, start, start + 1, step, 1));
+        assert!(!table_in_heap(desc, start, 0, step, 1));
+        assert!(!table_in_heap(desc, start, u64::MAX, 1, 10000));
+        desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        assert!(!table_in_heap(desc, start, start, step, 1));
+        desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        assert!(!table_in_heap(desc, start, start, step, 1));
+    }
+
+    #[test]
+    fn constant_view_size_is_bounded_and_rounded() {
+        assert_eq!(cbv_size(0), None);
+        assert_eq!(cbv_size(16), Some(256));
+        assert_eq!(cbv_size(65535), Some(65536));
+        assert_eq!(cbv_size(65537), None);
+        assert_eq!(cbv_size(u32::MAX), None);
+    }
+
+    #[test]
+    fn texture_resource_cannot_supply_a_raw_buffer_or_another_dimension() {
+        let texture = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            DepthOrArraySize: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        assert!(texture_view_fits(texture, 2));
+        assert!(!texture_view_fits(texture, 4));
+        assert!(!texture_view_fits(texture, 5));
+        assert!(!texture_view_fits(texture, 11));
     }
 }

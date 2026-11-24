@@ -174,6 +174,17 @@ pub struct HostShader {
     pub root_srvs: Vec<u8>,
     /// Raw buffer UAVs bound as root descriptors by title root slot.
     pub root_uavs: Vec<u8>,
+    /// Descriptor heap entries whose indices can be checked by the host.
+    pub descriptor_bindings: Vec<DescriptorBinding>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DescriptorBinding {
+    /// Title table slot, or the start of the corresponding heap.
+    pub table: Option<u8>,
+    pub byte_offset: u32,
+    /// DXIL AnnotateHandle properties, shared with the emitted instruction.
+    pub properties: (u32, u32),
 }
 
 impl HostShader {
@@ -327,6 +338,7 @@ pub fn emit(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        descriptor_bindings: l.descriptor_bindings,
     })
 }
 
@@ -722,6 +734,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            descriptor_bindings: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -733,6 +746,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                descriptor_bindings: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
