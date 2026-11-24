@@ -483,23 +483,23 @@ pub extern "win64" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
 
 // The C runtime (ucrtbase, which the title's CRT imports bind to).
 
-pub extern "C" fn _wfopen(path: *const u16, mode: *const u16) -> File {
+pub extern "win64" fn _wfopen(path: *const u16, mode: *const u16) -> File {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(p.ptr(), mode)
+    host!("ucrtbase.dll", "_wfopen": extern "win64" fn(*const u16, *const u16) -> File)(p.ptr(), mode)
 }
 
-pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) -> i32 {
+pub extern "win64" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) -> i32 {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
+    host!("ucrtbase.dll", "_wfopen_s": extern "win64" fn(*mut File, *const u16, *const u16) -> i32)(
         out,
         p.ptr(),
         mode,
     )
 }
 
-pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> File {
+pub extern "win64" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> File {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
+    host!("ucrtbase.dll", "_wfsopen": extern "win64" fn(*const u16, *const u16, i32) -> File)(
         p.ptr(),
         mode,
         share,
@@ -527,29 +527,29 @@ pub extern "win64" fn ReadFile(
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.
-pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
+pub extern "win64" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
     victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
-    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
+    host!("ucrtbase.dll", "fread": extern "win64" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
     )
 }
 
-pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
+pub extern "win64" fn fopen(path: *const c_char, mode: *const c_char) -> File {
     match narrow(path) {
         Some(p) => _wfopen(p.as_ptr(), widen(mode).as_ptr()),
         None => {
-            host!("ucrtbase.dll", "fopen": extern "C" fn(*const c_char, *const c_char) -> File)(
+            host!("ucrtbase.dll", "fopen": extern "win64" fn(*const c_char, *const c_char) -> File)(
                 path, mode,
             )
         }
     }
 }
 
-pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_char) -> i32 {
+pub extern "win64" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_char) -> i32 {
     match narrow(path) {
         Some(p) => _wfopen_s(out, p.as_ptr(), widen(mode).as_ptr()),
         None => {
-            host!("ucrtbase.dll", "fopen_s": extern "C" fn(*mut File, *const c_char, *const c_char) -> i32)(
+            host!("ucrtbase.dll", "fopen_s": extern "win64" fn(*mut File, *const c_char, *const c_char) -> i32)(
                 out, path, mode,
             )
         }
@@ -558,65 +558,65 @@ pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_ch
 
 /// `_open(path, flags[, mode])` is variadic; on x64 the optional integer
 /// travels in the same register either way, so it is passed on as is.
-pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
+pub extern "win64" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
     match narrow(path) {
-        Some(p) => host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
+        Some(p) => host!("ucrtbase.dll", "_wopen": extern "win64" fn(*const u16, i32, i32) -> i32)(
             p.as_ptr(),
             flags,
             mode,
         ),
-        None => host!("ucrtbase.dll", "_open": extern "C" fn(*const c_char, i32, i32) -> i32)(
+        None => host!("ucrtbase.dll", "_open": extern "win64" fn(*const c_char, i32, i32) -> i32)(
             path, flags, mode,
         ),
     }
 }
 
 /// See [`_open`]; used by libHttpClient.
-pub extern "C" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
+pub extern "win64" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
+    host!("ucrtbase.dll", "_wopen": extern "win64" fn(*const u16, i32, i32) -> i32)(
         p.ptr(),
         flags,
         mode,
     )
 }
 
-pub extern "C" fn _wstat64(path: *const u16, stat: *mut c_void) -> i32 {
+pub extern "win64" fn _wstat64(path: *const u16, stat: *mut c_void) -> i32 {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wstat64": extern "C" fn(*const u16, *mut c_void) -> i32)(p.ptr(), stat)
+    host!("ucrtbase.dll", "_wstat64": extern "win64" fn(*const u16, *mut c_void) -> i32)(p.ptr(), stat)
 }
 
-pub extern "C" fn _stat64i32(path: *const c_char, stat: *mut c_void) -> i32 {
+pub extern "win64" fn _stat64i32(path: *const c_char, stat: *mut c_void) -> i32 {
     match narrow(path) {
         Some(p) => {
-            host!("ucrtbase.dll", "_wstat64i32": extern "C" fn(*const u16, *mut c_void) -> i32)(
+            host!("ucrtbase.dll", "_wstat64i32": extern "win64" fn(*const u16, *mut c_void) -> i32)(
                 p.as_ptr(),
                 stat,
             )
         }
         None => {
-            host!("ucrtbase.dll", "_stat64i32": extern "C" fn(*const c_char, *mut c_void) -> i32)(
+            host!("ucrtbase.dll", "_stat64i32": extern "win64" fn(*const c_char, *mut c_void) -> i32)(
                 path, stat,
             )
         }
     }
 }
 
-pub extern "C" fn remove(path: *const c_char) -> i32 {
+pub extern "win64" fn remove(path: *const c_char) -> i32 {
     match narrow(path) {
-        Some(p) => host!("ucrtbase.dll", "_wremove": extern "C" fn(*const u16) -> i32)(p.as_ptr()),
-        None => host!("ucrtbase.dll", "remove": extern "C" fn(*const c_char) -> i32)(path),
+        Some(p) => host!("ucrtbase.dll", "_wremove": extern "win64" fn(*const u16) -> i32)(p.as_ptr()),
+        None => host!("ucrtbase.dll", "remove": extern "win64" fn(*const c_char) -> i32)(path),
     }
 }
 
-pub extern "C" fn _wchmod(path: *const u16, mode: i32) -> i32 {
+pub extern "win64" fn _wchmod(path: *const u16, mode: i32) -> i32 {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wchmod": extern "C" fn(*const u16, i32) -> i32)(p.ptr(), mode)
+    host!("ucrtbase.dll", "_wchmod": extern "win64" fn(*const u16, i32) -> i32)(p.ptr(), mode)
 }
 
-pub extern "C" fn _wutime64(path: *const u16, times: *mut c_void) -> i32 {
+pub extern "win64" fn _wutime64(path: *const u16, times: *mut c_void) -> i32 {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wutime64": extern "C" fn(*const u16, *mut c_void) -> i32)(
+    host!("ucrtbase.dll", "_wutime64": extern "win64" fn(*const u16, *mut c_void) -> i32)(
         p.ptr(),
         times,
     )
@@ -628,9 +628,9 @@ const FIOPEN: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z";
 const FIOPEN_WIDE: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z";
 
 /// `_Fiopen(const wchar_t* path, ios_base::openmode, int protection)`.
-extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File {
+extern "win64" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File {
     let p = wide(path);
-    host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
+    host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "win64" fn(*const u16, i32, i32) -> File)(
         p.ptr(),
         mode,
         protection,
@@ -638,11 +638,11 @@ extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File 
 }
 
 /// `_Fiopen(const char* path, ios_base::openmode, int protection)`.
-extern "C" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
+extern "win64" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
     match narrow(path) {
         Some(p) => fiopen_wide(p.as_ptr(), mode, protection),
         None => {
-            host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z": extern "C" fn(*const c_char, i32, i32) -> File)(
+            host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z": extern "win64" fn(*const c_char, i32, i32) -> File)(
                 path, mode, protection,
             )
         }
@@ -793,7 +793,7 @@ mod tests {
         let file = format!("{deep}/../{}/f.txt", "b".repeat(100));
         let f = _wfopen(w(&file).as_ptr(), w("wb").as_ptr());
         assert!(!f.is_null(), "{file}");
-        host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(f);
+        host!("ucrtbase.dll", "fclose": extern "win64" fn(File) -> i32)(f);
         assert_ne!(DeleteFileW(w(&format!("{deep}/f.txt")).as_ptr()), 0);
         assert_ne!(RemoveDirectoryW(w(&deep).as_ptr()), 0);
     }
@@ -805,7 +805,7 @@ mod tests {
         const GENERIC_WRITE: u32 = 0x4000_0000;
         const CREATE_ALWAYS: u32 = 2;
         let close = host!("kernel32.dll", "CloseHandle": extern "win64" fn(Handle) -> i32);
-        let fclose = host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32);
+        let fclose = host!("ucrtbase.dll", "fclose": extern "win64" fn(File) -> i32);
 
         let path = w(&format!(r"{letter}:\created.bin"));
         let null = std::ptr::null_mut();
@@ -856,7 +856,7 @@ mod tests {
         let path = format!("{letter}:/low.bin\0");
         let fd = _open(path.as_ptr().cast(), O_WRONLY | O_CREAT, S_IWRITE);
         assert!(fd >= 0);
-        host!("ucrtbase.dll", "_close": extern "C" fn(i32) -> i32)(fd);
+        host!("ucrtbase.dll", "_close": extern "win64" fn(i32) -> i32)(fd);
         assert!(dir.path().join("low.bin").is_file());
 
         // Other paths pass through untouched.

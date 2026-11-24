@@ -28,7 +28,7 @@ mod ucrt_format;
 mod ucrt_heap;
 mod ucrt_locale;
 mod ucrt_math;
-mod ucrt_runtime;
+pub(crate) mod ucrt_runtime;
 mod ucrt_scan;
 mod ucrt_stdio;
 mod ucrt_string;

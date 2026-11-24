@@ -507,7 +507,7 @@ pub extern "win64" fn _register_thread_local_exe_atexit_callback(callback: usize
 
 /// What `exit` owes the title before the process ends, once: the EXE's
 /// thread_local destructors, the atexit table newest first, then every
-/// stream's buffer. `_cexit` runs it; the `kernel` module's `exit` should.
+/// stream's buffer. `_cexit` and the `kernel` module's `exit` run it.
 pub(crate) fn shutdown() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::AcqRel) {

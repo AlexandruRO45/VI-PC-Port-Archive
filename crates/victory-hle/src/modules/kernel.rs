@@ -231,26 +231,30 @@ pub extern "win64" fn OutputDebugStringW(text: *const u16) {
 
 /// The CRT's `exit`, through which the title's entry point returns: logs
 /// the code and the caller, then exits on the host.
-pub extern "C" fn exit(code: i32) -> ! {
+pub extern "win64" fn exit(code: i32) -> ! {
     tracing::warn!(code, from = %host::callers(), "title exits");
+    // Our UCRT: the title's atexit table and stream buffers (the host CRT's
+    // `exit` does this on Windows).
+    #[cfg(target_os = "linux")]
+    crate::linux::ucrt_runtime::shutdown();
     host::exit(code)
 }
 
 /// The CRT's `abort` (also reached from `terminate`): logged like [`exit`].
-pub extern "C" fn abort() -> ! {
+pub extern "win64" fn abort() -> ! {
     tracing::error!(from = %host::callers(), "title aborts");
     host::abort()
 }
 
 /// The CRT's `terminate` and the STL's invalid-argument exit: logged, then
 /// the host's `abort`.
-pub extern "C" fn terminate() -> ! {
+pub extern "win64" fn terminate() -> ! {
     tracing::error!(from = %host::callers(), "title calls terminate");
     host::abort()
 }
 
 /// See [`terminate`].
-pub extern "C" fn _invalid_parameter_noinfo_noreturn() -> ! {
+pub extern "win64" fn _invalid_parameter_noinfo_noreturn() -> ! {
     tracing::error!(from = %host::callers(), "title passed an invalid parameter");
     host::abort()
 }
