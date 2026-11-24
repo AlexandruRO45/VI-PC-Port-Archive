@@ -20,6 +20,10 @@ const SEARCH_STEPS: u32 = 16;
 /// there read zero and write nothing, even a node's dwords after it.
 const OUTSIDE: u32 = 0x8000_0000;
 
+/// What reading a sampler's console words stops with: no host buffer
+/// keeps them.
+pub(super) const SAMPLER_WORDS: Why = "a sampler descriptor read as data";
+
 impl Lower<'_> {
     /// Whether the access at `site` reads title memory through the map.
     pub(super) fn is_global(&self, site: Site) -> bool {
@@ -443,7 +447,7 @@ impl Lower<'_> {
                 Val::Bit(_) => return Err("a table offset"),
             },
             RootType::ResourceHeap => self.s.m.i32(0),
-            _ => return Err("a sampler descriptor read as data"),
+            _ => return Err(SAMPLER_WORDS),
         };
         let c = self.cur;
         let off = self.s.m.i32(a.offset);

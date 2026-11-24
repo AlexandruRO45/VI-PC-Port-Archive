@@ -7027,21 +7027,25 @@ impl<'a> Lower<'a> {
                 // A number joined with a lane mask (a traversal keeps lane
                 // masks as numbers on its stack): in compute the mask as a
                 // number is its ballot, bit for bit.
-                // shortcut: elsewhere it is the host wave's ballot. There the
-                // join is a register the compiler reused on a path that does
-                // not read it; a program that did would read the host's lanes.
+                // shortcut: in graphics, and for a sampler's words, the join
+                // is a register the compiler reused on a path that does not
+                // read it (the other side unpacks constant buffer bytes); it
+                // is zero there. Reading the mask or the words directly still
+                // stops.
+                let mask = !bit
+                    && self.read_phis.contains(&phi.value)
+                    && (self.x.st.masks.contains_key(&arg) || self.x.st.highs.contains_key(&arg));
                 let val = match self.vals.get(&arg).copied() {
                     Some(Val::I32(x)) => Some(Val::I32(x)),
-                    other
-                        if !bit
-                            && self.read_phis.contains(&phi.value)
-                            && (self.x.st.masks.contains_key(&arg)
-                                || self.x.st.highs.contains_key(&arg)) =>
-                    {
+                    other if mask && self.mask_data == MaskData::Console => {
                         match self.mask_dword(arg) {
                             Ok(x) => Some(Val::I32(x)),
                             Err(_) => other,
                         }
+                    }
+                    _ if mask => Some(Val::I32(self.s.m.i32(0))),
+                    Some(Val::Missing(global::SAMPLER_WORDS)) if !bit => {
+                        Some(Val::I32(self.s.m.i32(0)))
                     }
                     other => other,
                 };
