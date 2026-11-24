@@ -841,6 +841,112 @@ impl Texture {
             alignment,
         })
     }
+
+    /// Mips in each plane's chain (every plane has the same count).
+    pub fn mips(&self) -> u32 {
+        self.planes[0].layout.mips.len() as u32
+    }
+
+    /// Array slices of each plane: 1 for a 3D texture, whose depth slices
+    /// belong to each mip's single subresource.
+    pub fn array_size(&self) -> u32 {
+        let d = &self.planes[0].layout.desc;
+        if d.dimension == Dimension::Tex3d {
+            1
+        } else {
+            d.depth
+        }
+    }
+
+    /// Subresources across every plane: mips × array slices × planes.
+    pub fn subresource_count(&self) -> u32 {
+        self.mips() * self.array_size() * self.planes.len() as u32
+    }
+
+    /// The plane, mip and array slice of a D3D12 subresource index
+    /// (`mip + slice * mips + plane * mips * array_size`). `None` past
+    /// the last subresource.
+    pub fn subresource(&self, index: u32) -> Option<Subresource> {
+        if index >= self.subresource_count() {
+            return None;
+        }
+        let mips = self.mips();
+        let per_plane = mips * self.array_size();
+        Some(Subresource {
+            plane: index / per_plane,
+            mip: index % mips,
+            slice: index % per_plane / mips,
+        })
+    }
+
+    /// The tightly packed linear rows of subresource `index` (see
+    /// [`Layout::footprint`]).
+    pub fn footprint(&self, index: u32) -> Option<Footprint> {
+        let s = self.subresource(index)?;
+        self.planes[s.plane as usize].layout.footprint(s.mip)
+    }
+
+    /// Copies subresource `index` out of the whole texture's memory
+    /// ([`Texture::size`] bytes) into linear rows, as [`Layout::detile`]
+    /// does for its plane.
+    pub fn detile(
+        &self,
+        tiled: &[u8],
+        index: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        let (p, s) = self.plane_of(tiled.len(), index)?;
+        let at = p.offset as usize;
+        p.layout.detile(
+            &tiled[at..at + p.layout.size as usize],
+            s.mip,
+            s.slice,
+            linear,
+            row_pitch,
+            depth_pitch,
+        )
+    }
+
+    /// The reverse of [`Texture::detile`]: linear rows into the texture.
+    pub fn tile(
+        &self,
+        tiled: &mut [u8],
+        index: u32,
+        linear: &[u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        let (p, s) = self.plane_of(tiled.len(), index)?;
+        let at = p.offset as usize;
+        p.layout.tile(
+            &mut tiled[at..at + p.layout.size as usize],
+            s.mip,
+            s.slice,
+            linear,
+            row_pitch,
+            depth_pitch,
+        )
+    }
+
+    fn plane_of(&self, tiled_len: usize, index: u32) -> Result<(&Plane, Subresource), Error> {
+        let s = self.subresource(index).ok_or(Error::Invalid)?;
+        if (tiled_len as u64) < self.size {
+            return Err(Error::TooSmall);
+        }
+        Ok((&self.planes[s.plane as usize], s))
+    }
+}
+
+/// Where a D3D12 subresource index lands in a [`Texture`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Subresource {
+    /// 0 data or depth, 1 stencil.
+    pub plane: u32,
+    pub mip: u32,
+    /// Array slice (0 for a 3D texture).
+    pub slice: u32,
 }
 
 #[cfg(test)]
@@ -2128,5 +2234,116 @@ mod tests {
             }
         }
         assert!(checked >= 40, "{checked}");
+    }
+
+    /// D3D12 subresource indices run mip-fastest, then array slice, then
+    /// plane, and copies by index land in their own plane: filling every
+    /// subresource of a depth-stencil array through `Texture::tile` reads
+    /// each back unchanged, and the two planes never overlap.
+    #[test]
+    fn subresource_indices_cover_every_plane() {
+        for (dxgi, dimension, array, swizzle) in [
+            (20, Dimension::Tex2d, 3, Swizzle::SW_4KB_S),
+            (45, Dimension::Tex2d, 2, Swizzle::SW_64KB_D),
+            (118, Dimension::Tex2d, 4, Swizzle::LINEAR),
+            (28, Dimension::Tex2d, 5, Swizzle::SW_64KB_S),
+            (71, Dimension::Tex2d, 2, Swizzle::SW_4KB_S),
+            (10, Dimension::Tex3d, 6, Swizzle::SW_4KB_S),
+            (28, Dimension::Tex1d, 3, Swizzle::LINEAR),
+        ] {
+            let t = Texture::new(&TextureDesc {
+                dimension,
+                width: 37,
+                height: if dimension == Dimension::Tex1d { 1 } else { 23 },
+                depth_or_array: array,
+                mips: 0,
+                format: dxgi,
+                samples: 1,
+                swizzle,
+            })
+            .unwrap();
+            let at = format!("format {dxgi} {dimension:?} {swizzle:?}");
+            let planes = t.planes.len() as u32;
+            assert_eq!(
+                planes,
+                if format(dxgi).unwrap().stencil { 2 } else { 1 },
+                "{at}"
+            );
+            let mips = t.mips();
+            // 37 texels wide: the full chain is 37, 18, 9, 4, 2, 1.
+            assert_eq!(mips, 6, "{at}");
+            let slices = if dimension == Dimension::Tex3d {
+                1
+            } else {
+                array
+            };
+            assert_eq!(t.array_size(), slices, "{at}");
+            assert_eq!(t.subresource_count(), mips * slices * planes, "{at}");
+            assert_eq!(t.subresource(t.subresource_count()), None, "{at}");
+            assert_eq!(t.footprint(t.subresource_count()), None, "{at}");
+
+            let mut tiled = vec![0u8; t.size as usize];
+            let mut fills = Vec::new();
+            let mut index = 0;
+            for plane in 0..planes {
+                for slice in 0..slices {
+                    for mip in 0..mips {
+                        let s = t.subresource(index).unwrap();
+                        assert_eq!(s, Subresource { plane, mip, slice }, "{at} {index}");
+                        let f = t.footprint(index).unwrap();
+                        let l = &t.planes[plane as usize].layout;
+                        assert_eq!(Some(f), l.footprint(mip), "{at} {index}");
+                        let fill: Vec<u8> = (0..f.size)
+                            .map(|i| (i as u32 * 31 + index * 97 + 1) as u8)
+                            .collect();
+                        t.tile(&mut tiled, index, &fill, f.row_pitch, f.depth_pitch)
+                            .unwrap();
+                        fills.push(fill);
+                        index += 1;
+                    }
+                }
+            }
+            for (index, fill) in fills.iter().enumerate() {
+                let index = index as u32;
+                let f = t.footprint(index).unwrap();
+                let mut back = vec![0; f.size];
+                t.detile(&tiled, index, &mut back, f.row_pitch, f.depth_pitch)
+                    .unwrap();
+                assert_eq!(&back, fill, "{at} subresource {index}");
+            }
+            // The stencil plane's bytes sit past the depth plane's.
+            if planes == 2 {
+                let depth_end = t.planes[0].layout.size as usize;
+                assert!(t.planes[1].offset as usize >= depth_end, "{at}");
+                let mut copy = tiled.clone();
+                copy[t.planes[1].offset as usize..].fill(0);
+                for index in 0..mips * slices {
+                    let f = t.footprint(index).unwrap();
+                    let mut back = vec![0; f.size];
+                    t.detile(&copy, index, &mut back, f.row_pitch, f.depth_pitch)
+                        .unwrap();
+                    assert_eq!(back, fills[index as usize], "{at} depth {index}");
+                }
+            }
+            // Past the end, a short texture buffer, and a short linear one.
+            let f = t.footprint(0).unwrap();
+            let mut back = vec![0; f.size];
+            let n = t.subresource_count();
+            assert_eq!(
+                t.detile(&tiled, n, &mut back, f.row_pitch, f.depth_pitch),
+                Err(Error::Invalid),
+                "{at}"
+            );
+            assert_eq!(
+                t.detile(&tiled[1..], 0, &mut back, f.row_pitch, f.depth_pitch),
+                Err(Error::TooSmall),
+                "{at}"
+            );
+            assert_eq!(
+                t.tile(&mut tiled, 0, &back[1..], f.row_pitch, f.depth_pitch),
+                Err(Error::TooSmall),
+                "{at}"
+            );
+        }
     }
 }
