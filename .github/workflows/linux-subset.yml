@@ -36,6 +36,12 @@ env:
   WINDOWS_CLIPPY_CRATES: >-
     -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
     -p victory-game -p victory-loader -p victory-shader
+  # Packages that are rustfmt-clean today. The rest (victory-formats,
+  # victory-loader, victory-gpu, victory-hle) are not yet; add each one
+  # once it is, and switch to `cargo fmt --all --check` when all are.
+  RUSTFMT_CRATES: >-
+    -p victory-core -p victory-pe -p victory-pipeline -p victory-game
+    -p victory-shader -p victory -p xtask
 
 jobs:
   linux:
@@ -60,6 +66,13 @@ jobs:
 
       - name: Asset policy
         run: cargo xtask policy
+
+      # Fast, needs no build: keep the clean packages clean. load_probe.rs is
+      # checked by itself, since the rest of victory-loader is not clean yet.
+      - name: rustfmt (clean packages)
+        run: |
+          cargo fmt --check $RUSTFMT_CRATES
+          rustfmt --check --edition 2024 crates/victory-loader/tests/load_probe.rs
 
       - name: clippy (all targets)
         run: cargo clippy --all-targets --locked $LINUX_CRATES -- -D warnings
