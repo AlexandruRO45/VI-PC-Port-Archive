@@ -108,15 +108,17 @@ struct Guards {
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
-    /// Blocks with announced kernel writes still to land, and how many:
-    /// left open until they have, however many refreshes come first.
-    announced: BTreeMap<usize, u32>,
+    /// Announced kernel writes still to land, as block ranges `[first,
+    /// end)`, one per announcement: their blocks are left open until they
+    /// have, however many refreshes come first. Ranges, not blocks, since
+    /// an announced length can be the title's saturated `fread` size.
+    announced: Vec<(usize, usize)>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
-    announced: BTreeMap::new(),
+    announced: Vec::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -147,7 +149,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
-            } else if !g.announced.contains_key(&block) {
+            } else if !g.announced.iter().any(|&(a, e)| (a..e).contains(&block)) {
                 run.get_or_insert(block);
                 continue;
             }
@@ -226,23 +228,16 @@ pub fn kernel_will_write(at: usize, len: usize) {
     let end = at.saturating_add(len);
     let mut g = guards();
     open(&mut g, at, end);
-    for block in at / BLOCK..end.div_ceil(BLOCK) {
-        *g.announced.entry(block).or_default() += 1;
-    }
+    g.announced.push((at / BLOCK, end.div_ceil(BLOCK)));
 }
 
 /// The kernel write [`kernel_will_write`] announced for `[at, at + len)`
 /// has landed (or failed); its blocks can be guarded again.
 pub fn kernel_wrote(at: usize, len: usize) {
-    let end = at.saturating_add(len);
+    let blocks = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = guards();
-    for block in at / BLOCK..end.div_ceil(BLOCK) {
-        if let Some(n) = g.announced.get_mut(&block) {
-            *n -= 1;
-            if *n == 0 {
-                g.announced.remove(&block);
-            }
-        }
+    if let Some(i) = g.announced.iter().position(|&r| r == blocks) {
+        g.announced.swap_remove(i);
     }
 }
 
@@ -409,6 +404,17 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// A kernel read announced with the title's saturated length (`fread`'s
+    /// size times count) costs what a short one does. Above user space, so
+    /// no other test's blocks are in it.
+    #[test]
+    fn an_announcement_as_long_as_the_address_space_is_cheap() {
+        let high = usize::MAX / 2;
+        kernel_will_write(high, usize::MAX);
+        kernel_wrote(high, usize::MAX);
+        assert!(!guards().announced.contains(&(high / BLOCK, usize::MAX.div_ceil(BLOCK))));
     }
 
     /// A kernel read announced with `kernel_will_write` survives a refresh
