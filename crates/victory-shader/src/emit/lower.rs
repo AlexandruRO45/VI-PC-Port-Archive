@@ -633,6 +633,24 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = *dst else {
             return Err("a global load result");
         };
+        if a.param == CODE && a.dynamic.is_none() && sub.is_none() {
+            let code_bytes = &self.x.native.code;
+            let start = a.offset as usize;
+            let end = start + n as usize * 4;
+            if end <= code_bytes.len() {
+                for k in 0..n {
+                    let byte_idx = start + k as usize * 4;
+                    let word = u32::from_le_bytes(
+                        code_bytes[byte_idx..byte_idx + 4]
+                            .try_into()
+                            .expect("4 bytes"),
+                    );
+                    let val = self.s.m.i32(word);
+                    self.write(inst, Reg::V(reg + k as u8), val, guard);
+                }
+                return Ok(());
+            }
+        }
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
         if let Some(d) = a.dynamic {
@@ -2935,6 +2953,14 @@ impl<'a> Lower<'a> {
                     }
                     Ok(())
                 }
+                "s_getpc_b64" => {
+                    let next_pc = inst.machine.offset as u64 + 4;
+                    let lo_val = self.s.m.i32(next_pc as u32);
+                    let hi_val = self.s.m.i32((next_pc >> 32) as u32);
+                    self.set(lo, Val::I32(lo_val));
+                    self.set(hi, Val::I32(hi_val));
+                    Ok(())
+                }
                 _ => Err(name),
             };
         }
@@ -3574,6 +3600,24 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar load from the code"),
         };
+        if a.dynamic.is_none() {
+            let code_bytes = &self.x.native.code;
+            let start = a.offset as usize;
+            let end = start + count as usize * 4;
+            if end <= code_bytes.len() {
+                for k in 0..count {
+                    let byte_idx = start + k as usize * 4;
+                    let word = u32::from_le_bytes(
+                        code_bytes[byte_idx..byte_idx + 4]
+                            .try_into()
+                            .expect("4 bytes"),
+                    );
+                    let val = self.s.m.i32(word);
+                    self.write(inst, Reg::S(code + k as u8), val, None);
+                }
+                return Ok(());
+            }
+        }
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
         if let Some(d) = a.dynamic {
@@ -8185,6 +8229,28 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn s_getpc_b64_embedded_constant_load_validates() {
+        let words = [
+            0xBE88_1F00, // s_getpc_b64 s[8:9] (offset 0, next PC = 4)
+            0x8008_FF08,
+            36,          // s_add_u32 s8, s8, 36 -> 4 + 36 = 40
+            0x8209_8009, // s_addc_u32 s9, s9, 0
+            0xF400_0184,
+            0xFA00_0000, // s_load_dword s6, s[8:9], null
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,    // offset 36
+            0x1234_5678, // embedded constant table at byte offset 40
+        ];
+        let lowered = lower_with(&words, vec![], vec![]).unwrap();
+        use super::super::validator::Validator;
+        if let Ok(mut validator) = Validator::load(Validator::default_path().as_deref()) {
+            validator.validate(&mut lowered.dxil.clone()).unwrap();
+        }
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.

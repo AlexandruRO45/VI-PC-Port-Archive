@@ -640,6 +640,20 @@ impl<'a> Tracer<'a> {
             .map(|(_, t)| t)
             .or_else(|| self.vadd(v))
         else {
+            if let Some((_, [a, b])) = self.sop2(v, &["s_sub_u32", "s_sub_i32"]) {
+                let (x, y) = (self.sum(a), self.sum(b));
+                if !(x.base.is_some() && y.base.is_some()
+                    || x.dynamic.is_some() && y.dynamic.is_some())
+                    && x.base.is_some()
+                    && y.dynamic.is_none()
+                {
+                    return Sum {
+                        base: x.base,
+                        offset: x.offset.wrapping_sub(y.offset),
+                        dynamic: x.dynamic,
+                    };
+                }
+            }
             return dynamic;
         };
         let (x, y) = (self.sum(a), self.sum(b));
@@ -766,7 +780,10 @@ impl<'a> Tracer<'a> {
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
-            if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
+            if !self.high_half(hi, high)
+                && !high.is_some_and(|h| self.carried(hi, h))
+                && !self.high_half(hi, None)
+            {
                 return Err("an address with an untracked high half");
             }
             return Ok(Address {
