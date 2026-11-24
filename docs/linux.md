@@ -130,6 +130,13 @@ for `victory translate --validate`, `VICTORY_DXCOMPILER` names
 execution is dropped, as when the clamp fails on Windows). Arch's
 `directx-shader-compiler` 1.10.2605 asserts on every shader it compiles
 and its validator traps on some of ours, so neither is loaded unasked.
+Microsoft's own Linux release works (tested: v1.9.2609):
+
+```sh
+gh release download v1.9.2609 -R microsoft/DirectXShaderCompiler -p 'linux_dxc_*.tar.gz'
+mkdir -p ~/.local/dxc && tar xzf linux_dxc_*.tar.gz -C ~/.local/dxc
+export VICTORY_DXIL=~/.local/dxc/lib/libdxil.so VICTORY_DXCOMPILER=~/.local/dxc/lib/libdxcompiler.so
+```
 
 Tests with a device: `VICTORY_VKD3D=... cargo test -p victory-shader
 --features host -p victory-gpu`; `VICTORY_TEST_WINDOW=1` also presents
@@ -146,6 +153,6 @@ to a window.
 | kernel32: handles, waits, sync objects and locks, threads, TLS/FLS, thread pool, time, system, process | done (`victory-hle/src/linux/handles.rs`, `kernel32_*.rs`; SuspendThread uses `SIGRTMIN+6`) |
 | Region table (`vm.rs`), kernel32 memory, heap, files at host level, text, locale | done: `kernel32_{memory,heap,file,io,path,text,locale}.rs`; overlapped I/O completes inside the call |
 | UCRT | every import the title and its DLLs take (`ucrt_*.rs`); C locale only |
-| GPU, window, input | device, pipelines, window, pads and keyboard on vkd3d-proton and SDL3; no write watching or default DXC |
+| GPU, window, input | device, pipelines, window, pads and keyboard on vkd3d-proton and SDL3; every vertex, pixel and mesh program of the title makes a pipeline; no write watching yet |
 | Audio, network (offline), crypto, COM and the other host DLLs | done: every import of these DLLs resolves. Sound through PulseAudio/PipeWire (`libpulse-simple`, loaded at run time): the game's Spatial Audio stream (`mmdevapi.rs`) and Bink's XAudio2 (`xaudio2.rs`); loopback-only Winsock, WinHTTP that cannot connect, Media Foundation without sources, an empty registry |
 | Windows-only `victory-hle` modules (files, xmem, lifecycle, ...) | not started |
