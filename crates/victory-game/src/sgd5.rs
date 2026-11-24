@@ -96,9 +96,10 @@ pub fn is_sgd5(file: &[u8]) -> bool {
 /// Sizes that no deflate stream of the stated unpacked size could have (too
 /// many packed bytes, or too few) do not form a record, and neither do bytes
 /// running past the end that do not start a deflate stream, nor bytes that
-/// are no deflate stream laid over a record that is one, so such bytes
-/// neither end the search nor hide records. A corrupt record that covers no
-/// other record is still yielded (its [`Record::unpack`] is `None`).
+/// are no deflate stream laid over a record that is one (whole or cut off),
+/// so such bytes neither end the search nor hide records. A corrupt record
+/// that covers no other record is still yielded (its [`Record::unpack`] is
+/// `None`).
 pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     let finder = memchr::memmem::Finder::new(&MARKER);
     // Where the next record may start: after the magic, then after each
@@ -181,11 +182,14 @@ fn record(file: &[u8], at: usize) -> Found<'_> {
     })
 }
 
-/// Whether a record whose packed bytes are a deflate stream starts (its
-/// header, 6 bytes before its marker) inside `r`'s span. Such a record inside
-/// a real one is that record's (stored deflate blocks); but if `r`'s own
-/// bytes are no deflate stream, `r` is bytes that look like a marker (in a
-/// container stored between records, say) and the record it covers is real.
+/// Whether a record whose packed bytes are a deflate stream (or, cut off by
+/// the end of the file, start one) starts (its header, 6 bytes before its
+/// marker) inside `r`'s span. Such a record inside a real one is that
+/// record's (stored deflate blocks); but if `r`'s own bytes are no deflate
+/// stream, `r` is bytes that look like a marker (in a container stored
+/// between records, say) and the record it covers is real. A cut-off record
+/// counts too: were `r` taken for a record, the search would go on inside
+/// the cut-off one and find the records it stores.
 fn covers_a_record(file: &[u8], r: &Record<'_>, streams: &mut Streams) -> bool {
     let span = r.span();
     // Its header must be after `r`'s marker, and a marker from
@@ -194,7 +198,8 @@ fn covers_a_record(file: &[u8], r: &Record<'_>, streams: &mut Streams) -> bool {
     streams.any_in(file, r.offset + 7, hi)
 }
 
-/// Which markers start a record whose packed bytes are a deflate stream, as
+/// Which markers start a record whose packed bytes are (or, cut off, start)
+/// a deflate stream, as
 /// far as [`records`] has asked. Its questions move forward through the
 /// file, and markers in bytes that only look like records may each cover
 /// all the rest of it: asking each of them anew rescans and reinflates the
@@ -224,8 +229,12 @@ impl Streams {
             let window = file.get(self.to..hi).unwrap_or_default();
             match memchr::memmem::find_iter(window, &MARKER)
                 .map(|m| self.to + m)
-                .find(|&at| matches!(record(&file[at - 6..], 6), Found::Record(inner) if inner.is_stream()))
-            {
+                .find(|&at| match record(&file[at - 6..], 6) {
+                    Found::Record(inner) => inner.is_stream(),
+                    // Cut off, its bytes so far a deflate stream.
+                    Found::Truncated => true,
+                    Found::Nothing => false,
+                }) {
                 Some(at) => (self.to, self.hit) = (at, true),
                 // Markers at offsets up to `hi - 4` have been looked at.
                 None => self.to = self.to.max(hi.saturating_sub(MARKER.len() - 1)),
@@ -500,6 +509,52 @@ mod tests {
         // Before: [PS_first, PS_inner].
         let names: Vec<_> = records(&file[..inner_end]).map(|r| r.name).collect();
         assert_eq!(names, [Some("PS_first")]);
+    }
+
+    #[test]
+    fn marker_without_a_stream_over_a_cut_off_record_hides_nothing() {
+        // Bytes that read as a marker with sizes that fit, then bytes that
+        // are no deflate stream (block type 3 is reserved), laid over the
+        // header of a record whose packed bytes (stored blocks) hold a whole
+        // record; the file then cut off after that inner record.
+        let inner = record_bytes("PS_inner", 0x32, b"inner container");
+        let mut payload = inner.clone();
+        payload.extend_from_slice(&[0x55; 64]);
+        let packed = miniz_oxide::deflate::compress_to_vec(&payload, 0);
+        let n = (packed.len() + 12) as u32;
+        let mut outer = b"\x09PS_outer\0\x32".to_vec();
+        for v in [n, 0x000D_DCE7, n, payload.len() as u32] {
+            outer.extend_from_slice(&v.to_le_bytes());
+        }
+        let stored = outer.len();
+        outer.extend_from_slice(&packed);
+
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("PS_first", 0x32, b"first"));
+        file.extend_from_slice(b"DXBC");
+        // 16 bytes of no stream, then the outer record's header and the
+        // start of its packed bytes.
+        let phantom = 16 + stored + 8;
+        let m = (12 + phantom) as u32;
+        for v in [m, 0x000D_DCE7, m, 64] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&[0x07; 16]);
+        let outer_at = file.len();
+        file.extend_from_slice(&outer);
+        let inner_end =
+            outer_at + stored + memchr::memmem::find(&packed, &inner).unwrap() + inner.len();
+        let names: Vec<_> = records(&file).map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_first"), Some("PS_outer")]);
+
+        // Cut off: the phantom covers a record whose bytes so far are a
+        // deflate stream, so it is not the record. Before: [PS_first, None,
+        // PS_inner] (the phantom was yielded and the search went on inside
+        // the outer record, exposing the record it stores).
+        for cut in [inner_end, inner_end + 10] {
+            let names: Vec<_> = records(&file[..cut]).map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_first")], "cut at {cut}");
+        }
     }
 
     #[test]
