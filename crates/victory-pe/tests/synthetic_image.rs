@@ -2975,3 +2975,91 @@ fn names_that_run_to_the_end_of_the_section_without_a_nul_are_malformed() {
     put32(&mut d, at(IMPORT_DESCRIPTORS) + 12, end - 4);
     assert_eq!(ImageInfo::parse(&d).unwrap().imports[0].dll, "ABC");
 }
+
+/// Everything `ImageInfo::parse` read from `d`, as text to compare.
+fn parsed(d: &[u8]) -> String {
+    format!("{:?}", ImageInfo::parse(d).unwrap())
+}
+
+#[test]
+fn parsing_the_same_bytes_twice_gives_the_same_result() {
+    let mut d = image();
+    add_delay_import(&mut d);
+    add_codeview(&mut d, b"RSDS");
+    add_exports(&mut d);
+    let first = ImageInfo::parse(&d).unwrap();
+    assert_eq!(format!("{first:?}"), parsed(&d));
+    // A clone carries every field.
+    assert_eq!(format!("{:?}", first.clone()), format!("{first:?}"));
+}
+
+#[test]
+fn only_the_callbacks_field_of_the_tls_directory_is_read() {
+    // The raw data start and end and the index address are VAs below the
+    // image base, which would be malformed if converted; zero fill and
+    // characteristics are arbitrary. None of them changes what is read.
+    let before = parsed(&image());
+    let mut d = image();
+    let tls = at(TLS_DIRECTORY);
+    put64(&mut d, tls, 0x10); // StartAddressOfRawData
+    put64(&mut d, tls + 8, 0x8); // EndAddressOfRawData
+    put64(&mut d, tls + 16, u64::MAX); // AddressOfIndex
+    put32(&mut d, tls + 32, u32::MAX); // SizeOfZeroFill
+    put32(&mut d, tls + 36, 0x00F0_0000); // Characteristics (alignment)
+    assert_eq!(parsed(&d), before);
+}
+
+#[test]
+fn delay_descriptor_handle_bound_unload_and_timestamp_fields_are_not_read() {
+    // The module handle, bound IAT and unload IAT RVAs point far outside
+    // the image; only the name, IAT and name table RVAs are followed.
+    let mut d = image();
+    add_delay_import(&mut d);
+    let before = parsed(&d);
+    let desc = at(DELAY_DESCRIPTORS);
+    for field in [8, 20, 24, 28] {
+        put32(&mut d, desc + field, 0xFFFF_FFF0);
+    }
+    assert_eq!(parsed(&d), before);
+}
+
+#[test]
+fn export_directory_header_fields_before_the_name_are_not_read() {
+    // Characteristics, the timestamp and the version words.
+    let mut d = image();
+    add_exports(&mut d);
+    let before = parsed(&d);
+    let ed = at(EXPORT_DIRECTORY);
+    put32(&mut d, ed, u32::MAX);
+    put32(&mut d, ed + 4, u32::MAX);
+    put16(&mut d, ed + 8, u16::MAX);
+    put16(&mut d, ed + 10, u16::MAX);
+    assert_eq!(parsed(&d), before);
+}
+
+#[test]
+fn debug_entry_header_fields_besides_the_type_and_data_are_not_read() {
+    // Characteristics, the timestamp and the version words of the CodeView
+    // entry; its type, size and file pointer are what find the record.
+    let mut d = image();
+    add_codeview(&mut d, b"RSDS");
+    let before = parsed(&d);
+    let dbg = at(DEBUG_DIRECTORY);
+    put32(&mut d, dbg, u32::MAX);
+    put32(&mut d, dbg + 4, u32::MAX);
+    put16(&mut d, dbg + 8, u16::MAX);
+    put16(&mut d, dbg + 10, u16::MAX);
+    assert_eq!(parsed(&d), before);
+}
+
+#[test]
+fn bytes_no_directory_points_at_do_not_change_what_is_read() {
+    // Fill every byte of the section that the image does not use (between
+    // the ret and the import data, and past the zero slot that ends the TLS
+    // callback array) with 0xEE.
+    let before = parsed(&image());
+    let mut d = image();
+    d[at(ENTRY) + 1..at(IMPORT_DESCRIPTORS)].fill(0xEE);
+    d[at(TLS_CALLBACKS) + 24..at(SECTION_RVA + SECTION_SIZE)].fill(0xEE);
+    assert_eq!(parsed(&d), before);
+}
