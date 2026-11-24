@@ -3,7 +3,8 @@
 //!
 //! Covers RDNA2 hardware semantics that differ from naive DXIL lowering:
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
-//! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
+//! near `1.0`, turn-range reduction for `v_sin_*`/`v_cos_*`, and VOP3B
+//! multiply-add with a 64-bit result and a lane mask.
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -65,10 +66,14 @@ const fn vgpr(n: u8) -> u16 {
     256 + n as u16
 }
 
-/// Builds and lowers a 1-thread synthetic RDNA2 compute shader that receives
-/// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
-/// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_cs_with_outputs(body, &[0])
+}
+
+/// Builds and lowers a 1-thread synthetic RDNA2 compute shader that receives
+/// 4 dwords of root constants in `s0..s3`, runs `body`, and stores `outputs`
+/// (VGPR numbers) to consecutive dwords of the raw UAV at heap index 0.
+fn build_valu_cs_with_outputs(body: &[u32], outputs: &[u8]) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -79,7 +84,9 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    for (i, &vgpr) in outputs.iter().enumerate() {
+        words.extend_from_slice(&buffer_store_dword(vgpr, 8, 4 * i as u16));
+    }
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -167,12 +174,22 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// modules take this lock too.
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
-/// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_cases_with_outputs(shader, cases, |label, i, inputs, [out]| {
+        check(label, i, inputs, out);
+    });
+}
+
+/// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP)
+/// for each 4-dword input set and checks the UAV readback.
+fn run_cases_with_outputs<const N: usize>(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    mut check: impl FnMut(&str, usize, [u32; 4], [u32; N]),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
@@ -199,17 +216,145 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(N as u32)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            check(label, i, inputs, out[0][0]);
+            check(label, i, inputs, out[0].as_slice().try_into().unwrap());
         }
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+fn mad64_words(op: u16, clamp: bool, src2: u16) -> [u32; 2] {
+    let mut words = vop3(op, 3, vgpr(1), vgpr(2), src2);
+    words[0] |= 6 << 8 | u32::from(clamp) << 15; // VOP3B sdst = s6.
+    words
+}
+
+fn build_mad64_cs(body: &[u32]) -> HostShader {
+    let mut body = body.to_vec();
+    // Read the SDST bit for this shader's single lane via v_cndmask_b32.
+    body.extend_from_slice(&vop3(0x101, 7, 128, 129, sgpr(6)));
+    let shader = build_valu_cs_with_outputs(&body, &[3, 4, 7]);
+    let container = crate::Container::parse(&shader.dxil).expect("DXIL container");
+    let features = container.part(crate::FourCC::SFI0).expect("SFI0");
+    let flags = u64::from_le_bytes(features.data.try_into().unwrap());
+    assert_eq!(flags & 0x8000, 0, "MAD shader requires INT64");
+    shader
+}
+
+#[test]
+fn v_mad_u64_u32_writes_both_dwords_and_carry() {
+    let max = u32::MAX;
+    let cases = [
+        [0, 0, 0, 0],
+        [7, 9, 11, 3],
+        [1, 1, max, 0],               // Low dword carry only.
+        [max, max, 0, 0],             // Full-width product.
+        [1, 1, max, max],             // The low carry alone overflows the high dword.
+        [0x1_0000, 0x1_0000, 0, max], // High overflow with no low carry.
+        [max, max, max, max],         // Both dwords carry.
+    ];
+    for clamp in [false, true] {
+        let shader = build_mad64_cs(&mad64_words(0x176, clamp, vgpr(3)));
+        run_cases_with_outputs(&shader, &cases, |backend, _, inputs, got| {
+            let [a, b, add_lo, add_hi] = inputs.map(u128::from);
+            let sum = a * b + ((add_hi << 32) | add_lo);
+            let result = if clamp {
+                sum.min(u128::from(u64::MAX))
+            } else {
+                sum
+            };
+            let expected = [result as u32, (result >> 32) as u32, (sum >> 64) as u32];
+            assert_eq!(
+                got, expected,
+                "{backend}: clamp={clamp} inputs={inputs:08x?}"
+            );
+        });
+    }
+}
+
+#[test]
+fn v_mad_i64_i32_writes_both_dwords_and_bit_64() {
+    let min = i32::MIN as u32;
+    let max = u32::MAX;
+    let cases = [
+        [0, 0, 0, 0],
+        [7, 9, 11, 3],
+        [1, 1, max, 0], // Low dword carry only.
+        [(-3i32) as u32, (-7i32) as u32, 5, 0],
+        [(-3i32) as u32, 7, 5, 0], // Negative sum within range sets bit 64.
+        [7, max, 8, 0],            // Positive sum clears bit 64 despite the raw carry.
+        [0, 0, 1, min],            // Negative addend supplies the sign.
+        [min, min, 0, 0],          // INT_MIN squared.
+        [1, 1, max, min - 1],      // Positive overflow clears bit 64.
+        [max, 1, 0, min],          // Negative overflow sets bit 64.
+    ];
+    for clamp in [false, true] {
+        let shader = build_mad64_cs(&mad64_words(0x177, clamp, vgpr(3)));
+        run_cases_with_outputs(&shader, &cases, |backend, _, inputs, got| {
+            let [a, b, add_lo, add_hi] = inputs;
+            let addend = (u64::from(add_hi) << 32) | u64::from(add_lo);
+            let sum = i128::from(a as i32) * i128::from(b as i32) + i128::from(addend as i64);
+            let result = if clamp {
+                sum.clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+            } else {
+                sum
+            };
+            let expected = [result as u32, (result >> 32) as u32, u32::from(sum < 0)];
+            assert_eq!(
+                got, expected,
+                "{backend}: clamp={clamp} inputs={inputs:08x?}"
+            );
+        });
+    }
+}
+
+#[test]
+fn v_mad_64_reads_scalar_pairs_and_expands_immediates() {
+    let max = u32::MAX;
+    let literal = 0x8000_002A;
+    let cases = [
+        (0x177, sgpr(2), None, [0x0123_4567, 0x89AB_CDEF, 1]),
+        (0x176, 255, Some(literal), [literal, 0, 0]),
+        (0x177, 255, Some(literal), [literal, max, 1]),
+        (0x176, 193, None, [max, max, 0]), // Inline integer -1.
+        (0x177, 242, None, [0, 0x3FF0_0000, 0]), // Inline float 1.0.
+    ];
+    for (op, src2, literal, expected) in cases {
+        let mut words = Vec::from(mad64_words(op, false, src2));
+        words.extend(literal);
+        let shader = build_mad64_cs(&words);
+        run_cases_with_outputs(
+            &shader,
+            &[[0, 0, 0x0123_4567, 0x89AB_CDEF]],
+            |backend, _, _, got| {
+                assert_eq!(got, expected, "{backend}: opcode={op:#x} src2={src2}");
+            },
+        );
+    }
+}
+
+#[test]
+fn v_mad_64_respects_exec() {
+    let [first, second] = mad64_words(0x176, false, vgpr(3));
+    let shader = build_mad64_cs(&[
+        s_mov_b32(7, 126),
+        0x7DAA_0281, // v_cmpx_ne_u32_e32 1, v1
+        first,
+        second,
+        s_mov_b32(126, 7),
+    ]);
+    let max = u32::MAX;
+    let cases = [[1, 1, max, max], [2, 1, max, max]];
+    let expected = [[max, max, 0], [1, 0, 1]];
+    run_cases_with_outputs(&shader, &cases, |backend, i, inputs, got| {
+        assert_eq!(got, expected[i], "{backend}: inputs={inputs:08x?}");
+    });
 }
 
 fn is_f16_nan(bits: u16) -> bool {

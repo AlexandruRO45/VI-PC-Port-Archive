@@ -4169,6 +4169,7 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, cond, bb, a);
                 int(self, r)
             }
+            "v_mad_u64_u32" | "v_mad_i64_i32" => self.mad64(inst, guard),
             "v_add_co_u32" | "v_sub_co_u32" | "v_subrev_co_u32" | "v_add_co_ci_u32"
             | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => {
                 // The carry (borrow) out is a lane mask: this lane's bit.
@@ -4190,16 +4191,7 @@ impl<'a> Lower<'a> {
                 };
                 let (r, carry) = self.add_sub_carry(c, name.starts_with("v_add"), a, bb, cin);
                 int(self, r)?;
-                if let Some(Operand::Scalar { code, .. }) = v.carry
-                    && let Some(w) = inst.write(Reg::S(code))
-                {
-                    self.lane_bits.insert(w, carry);
-                }
-                for &(_, w) in &inst.writes {
-                    self.vals
-                        .entry(w)
-                        .or_insert(Val::Missing("a lane mask read as data"));
-                }
+                self.write_mask(inst, carry);
                 Ok(())
             }
             "v_readlane_b32" => {
@@ -4260,6 +4252,103 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn mad64(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("a 64-bit multiply-add destination");
+        };
+        if v.neg != 0 || v.omod != 0 {
+            return Err("integer modifiers on a 64-bit multiply-add");
+        }
+
+        let signed = inst.name() == "v_mad_i64_i32";
+        let (a, b) = (self.src(inst, 0)?, self.src(inst, 1)?);
+        let src2 = *v.src.get(2).ok_or("a missing operand")?;
+        let (add_lo, add_hi) = self.mad64_addend(inst, src2, signed)?;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let ret = self.s.m.named_struct("dx.types.twoi32", vec![i32t; 2]);
+        let op = if signed { 41 } else { 42 }; // IMul/UMul return {high, low}.
+        let product = self
+            .s
+            .op(c, "binaryWithTwoOuts.i32", Attr::ReadNone, ret, op, &[a, b]);
+        let mul_hi = self.s.m.extract(c, product, 0);
+        let mul_lo = self.s.m.extract(c, product, 1);
+        let (mut lo, carry_lo) = self.add_sub_carry(c, true, mul_lo, add_lo, None);
+        let (mut hi, carry_hi) = self.add_sub_carry(c, true, mul_hi, add_hi, Some(carry_lo));
+
+        let zero = self.s.m.i32(0);
+        let bit64 = if signed {
+            // RDNA2 ISA §12.12 concatenates SDST and the 64-bit sum. Bit 64
+            // adds the sign extensions of the two terms and the dword carry.
+            let mul_sign = self.s.m.cmp(c, pred::SLT, mul_hi, zero);
+            let add_sign = self.s.m.cmp(c, pred::SLT, add_hi, zero);
+            let extension = self.s.m.bin(c, Bin::Xor, mul_sign, add_sign);
+            self.s.m.bin(c, Bin::Xor, extension, carry_hi)
+        } else {
+            carry_hi
+        };
+
+        if v.clamp {
+            let ones = self.s.m.i32(u32::MAX);
+            let (overflow, limit_lo, limit_hi) = if signed {
+                let wrapped_sign = self.s.m.cmp(c, pred::SLT, hi, zero);
+                let overflow = self.s.m.bin(c, Bin::Xor, bit64, wrapped_sign);
+                let min_hi = self.s.m.i32(0x8000_0000);
+                let max_hi = self.s.m.i32(0x7FFF_FFFF);
+                let limit_lo = self.s.m.select(c, bit64, zero, ones);
+                let limit_hi = self.s.m.select(c, bit64, min_hi, max_hi);
+                (overflow, limit_lo, limit_hi)
+            } else {
+                (bit64, ones, ones)
+            };
+            lo = self.s.m.select(c, overflow, limit_lo, lo);
+            hi = self.s.m.select(c, overflow, limit_hi, hi);
+        }
+
+        self.write(inst, Reg::V(reg), lo, guard);
+        self.write(inst, Reg::V(reg + 1), hi, guard);
+        self.write_mask(inst, bit64);
+        Ok(())
+    }
+
+    /// The two dwords of a MAD addend, including RDNA2's literal expansion.
+    fn mad64_addend(&mut self, inst: &Inst, op: Operand, signed: bool) -> Result<(V, V), Why> {
+        match op {
+            Operand::Vector { reg, .. } => self.read_pair(inst, Reg::V(reg), Reg::V(reg + 1)),
+            Operand::Scalar { code, .. } if code != NULL => {
+                self.read_pair(inst, Reg::S(code), Reg::S(code + 1))
+            }
+            Operand::Const(code @ 240..=248) => {
+                let f = if code == 248 {
+                    std::f64::consts::FRAC_1_PI * 0.5
+                } else {
+                    let bits = crate::resource::inline(code).ok_or("a special operand")?;
+                    f64::from(f32::from_bits(bits))
+                };
+                let bits = f.to_bits();
+                Ok((self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32)))
+            }
+            _ => {
+                let lo = self.operand(inst, &op)?;
+                let hi = match op {
+                    Operand::Const(193..=208) => u32::MAX,
+                    Operand::Literal(bits) if signed => ((bits as i32) >> 31) as u32,
+                    _ => 0,
+                };
+                Ok((lo, self.s.m.i32(hi)))
+            }
+        }
+    }
+
+    fn read_pair(&mut self, inst: &Inst, lo: Reg, hi: Reg) -> Result<(V, V), Why> {
+        let lo = self.i32_of(inst.read(lo).ok_or("an unread operand")?)?;
+        let hi = self.i32_of(inst.read(hi).ok_or("an unread operand")?)?;
+        Ok((lo, hi))
+    }
+
     /// A 64-bit source (a register pair; inline constants sign-extend).
     fn src64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
@@ -4273,8 +4362,7 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::INT64;
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
-            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
-            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            let (lo, hi) = l.read_pair(inst, r, r1)?;
             let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
             let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
             let k32 = l.s.m.int_const(i64t, 32);
@@ -5419,34 +5507,32 @@ impl<'a> Lower<'a> {
             }
             _ => return Err(inst.name()),
         };
-        self.lane_bits_for(inst, r);
+        self.write_mask(inst, r);
         Ok(())
     }
 
     fn lane(&mut self, inst: &Inst, value: Option<bool>) {
         let b = self.s.m.bool(value == Some(true));
-        self.lane_bits_for(inst, b);
+        self.write_mask(inst, b);
     }
 
-    fn lane_bits_for(&mut self, inst: &Inst, r: V) {
+    fn write_mask(&mut self, inst: &Inst, bit: V) {
         let Fields::Valu(v) = &inst.fields else {
             return;
         };
         let code = if inst.name().starts_with("v_cmpx") {
             Some(EXEC)
         } else {
-            match v.dst {
+            match v.carry.or(v.dst) {
                 Some(Operand::Scalar { code, .. }) => Some(code),
                 _ => None,
             }
         };
         if let Some(lo) = code.and_then(|c| inst.write(Reg::S(c))) {
-            self.lane_bits.insert(lo, r);
+            self.lane_bits.insert(lo, bit);
         }
         for &(_, w) in &inst.writes {
-            self.vals
-                .entry(w)
-                .or_insert(Val::Missing("a lane mask read as data"));
+            self.vals.entry(w).or_insert(Val::Missing(LANE_MASK));
         }
     }
 
