@@ -1418,7 +1418,8 @@ fn recognize_whole_wave_reductions(insts: &[Decoded]) -> (BTreeMap<u64, &'static
             continue;
         }
         let mut op: Option<&'static str> = None;
-        // 3 × DPP8 op
+        // 3 × DPP8 op, each an xor step (1, 2, 4)
+        const XOR: [[u64; 8]; 3] = [[1, 0, 3, 2, 5, 4, 7, 6], [2, 3, 0, 1, 6, 7, 4, 5], [4, 5, 6, 7, 0, 1, 2, 3]];
         for k in 1..=3 {
             let d = &insts[i + k];
             let o = reduction_op(d.inst.name);
@@ -1431,6 +1432,12 @@ fn recognize_whole_wave_reductions(insts: &[Decoded]) -> (BTreeMap<u64, &'static
                 }
             }
             op = o;
+            let Some(e) = emit::ext_encoding(d) else { continue 'outer };
+            for (idx, want) in XOR[k - 1].iter().enumerate() {
+                if rdna2::field_value(e, &d.words, &format!("LANE_SEL_{idx}")) != Some(*want) {
+                    continue 'outer;
+                }
+            }
             let (r, w) = rdna2::vgpr_uses(d);
             if w != vec![s] || !r.contains(&s) {
                 continue 'outer;
@@ -1441,6 +1448,9 @@ fn recognize_whole_wave_reductions(insts: &[Decoded]) -> (BTreeMap<u64, &'static
             let d = &insts[i + 4];
             let o = reduction_op(d.inst.name);
             if o.is_none() || o.unwrap() != op.unwrap() || d.variant != rdna2::Variant::Dpp16 {
+                continue 'outer;
+            }
+            if emit::ext_encoding(d).and_then(|e| rdna2::field_value(e, &d.words, "DPP_CTRL")) != Some(0x140) {
                 continue 'outer;
             }
             let (r, w) = rdna2::vgpr_uses(d);
@@ -1477,6 +1487,9 @@ fn recognize_whole_wave_reductions(insts: &[Decoded]) -> (BTreeMap<u64, &'static
             if d.inst.name != "V_READLANE_B32" {
                 continue 'outer;
             }
+            if rdna2::field_value(d.enc, &d.words, "SRC1").map(|v| v & 63) != Some(32) {
+                continue 'outer;
+            }
             let (r, _w) = rdna2::vgpr_uses(d);
             if !r.contains(&s) {
                 continue 'outer;
@@ -1498,6 +1511,9 @@ fn recognize_whole_wave_reductions(insts: &[Decoded]) -> (BTreeMap<u64, &'static
         {
             let d = &insts[i + 9];
             if d.inst.name != "V_READLANE_B32" {
+                continue 'outer;
+            }
+            if rdna2::field_value(d.enc, &d.words, "SRC1").map(|v| v & 63) != Some(0) {
                 continue 'outer;
             }
             let (r, _w) = rdna2::vgpr_uses(d);
