@@ -3598,7 +3598,8 @@ impl Em {
             return Err("VOPC");
         }
         let (mut ua, mut ub) = (u[0].clone(), u[1].clone());
-        let half = |i: u64, s: &str| if m.opsel >> i & 1 == 1 { format!("(({s}) >> 16)") } else { format!("(({s}) & 0xFFFFu)") };
+        let lo16 = |s: &str| format!("(({s}) & 0xFFFFu)");
+        let half = |i: u64, s: &str| if m.opsel >> i & 1 == 1 { format!("(({s}) >> 16)") } else { lo16(s) };
         let ty = match ty {
             "f16" => {
                 // compare in f32: exact for every f16 value (class keeps the f16 view)
@@ -3613,18 +3614,19 @@ impl Em {
                     let cond = format!("((({c}) >> fclass16({h})) & 1u) != 0u");
                     return self.vopc_write(d, cmpx, outs, &cond);
                 }
-                ua = format!("asuint(f16tof32({}))", half(0, &ua));
-                ub = format!("asuint(f16tof32({}))", half(1, &ub));
+                // RDNA2 hardware ignores VOP3 op_sel on 16-bit compares and always reads [15:0].
+                ua = format!("asuint(f16tof32({}))", lo16(&ua));
+                ub = format!("asuint(f16tof32({}))", lo16(&ub));
                 "f32"
             }
             "u16" => {
-                ua = half(0, &ua);
-                ub = half(1, &ub);
+                ua = lo16(&ua);
+                ub = lo16(&ub);
                 "u32"
             }
             "i16" => {
-                ua = format!("(uint)(((int)({} << 16)) >> 16)", half(0, &ua));
-                ub = format!("(uint)(((int)({} << 16)) >> 16)", half(1, &ub));
+                ua = format!("(uint)(((int)({} << 16)) >> 16)", lo16(&ua));
+                ub = format!("(uint)(((int)({} << 16)) >> 16)", lo16(&ub));
                 "i32"
             }
             t => t,

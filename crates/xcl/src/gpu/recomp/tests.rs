@@ -7245,6 +7245,64 @@ fn gpu_cmp_class_f16_preserves_snan() {
 }
 
 #[test]
+fn vopc_16bit_ignores_vop3_opsel_and_reads_low_halves() {
+    let p = prog(&[
+        ("V_CMP_LT_F16", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL", 0b001)], None),
+        ("V_CMP_LT_U16", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b010)], None),
+        ("V_CMP_GT_I16", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 4), ("SRC1", V + 5), ("OP_SEL", 0b011)], None),
+        ("V_ADD_NC_U16", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b001)], None),
+    ]);
+    let t = translate(&p, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(!t.hlsl.contains("v0) >> 16"), "v_cmp_lt_f16 must read low 16 bits despite OP_SEL:\n{}", t.hlsl);
+    assert!(!t.hlsl.contains("v3) >> 16"), "v_cmp_lt_u16 must read low 16 bits despite OP_SEL:\n{}", t.hlsl);
+    assert!(!t.hlsl.contains("v4) >> 16"), "v_cmp_gt_i16 must read low 16 bits despite OP_SEL:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("v2 >> 16") || t.hlsl.contains("(v2) >> 16"), "control v_add_nc_u16 must still honor OP_SEL:\n{}", t.hlsl);
+}
+
+#[test]
+fn gpu_vopc_16bit_ignores_vop3_opsel() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // RDNA2 ignores op_sel on 16-bit compares: always reads bits [15:0].
+            // v0 = hi 2.0 / lo 1.0, v1 = hi 1.0 / lo 1.5; op_sel=[1,0]: hardware 1.0 < 1.5 (true)
+            ("V_CMP_LT_F16", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL", 0b001)], None),
+            // v2 = hi 1 / lo 10, v3 = hi 5 / lo 20; op_sel=[0,1]: hardware 10 < 20 (true)
+            ("V_CMP_LT_U16", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b010)], None),
+            // v4 = hi -1 / lo 5, v5 = hi 2 / lo -2; op_sel=[1,1]: hardware 5 > -2 (true)
+            ("V_CMP_GT_I16", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 4), ("SRC1", V + 5), ("OP_SEL", 0b011)], None),
+            // Control VALU16: v_add_nc_u16 honors op_sel=[1,0] -> hi(v2) + lo(v3) = 1 + 20 = 21
+            ("V_ADD_NC_U16", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b001)], None),
+            // v6 = hi 1 / lo 7, v7 = hi 9 / lo 7; op_sel=[1,0]: v_cmpx_eq_u16 hardware 7 == 7 (EXEC stays active)
+            ("V_CMPX_EQ_U16", "ENC_VOP3", &[("VDST", 126), ("SRC0", V + 6), ("SRC1", V + 7), ("OP_SEL", 0b001)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 255)], Some(0x5A5A)),
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[0] = 0x4000_3C00; // hi=2.0, lo=1.0
+            r[1] = 0x3C00_3E00; // hi=1.0, lo=1.5
+            r[2] = 0x0001_000A; // hi=1, lo=10
+            r[3] = 0x0005_0014; // hi=5, lo=20
+            r[4] = 0xFFFF_0005; // hi=-1, lo=5
+            r[5] = 0x0002_FFFE; // hi=2, lo=-2
+            r[6] = 0x0001_0007; // hi=1, lo=7
+            r[7] = 0x0009_0007; // hi=9, lo=7
+            r[8] = 0xCAFE_0000;
+            r[9] = 0x1111;
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        let all = (u32::MAX, if wave64 { u32::MAX } else { 0 });
+        assert_eq!((r.sgpr[0], r.sgpr[1]), all, "wave{lanes} v_cmp_lt_f16 ignores op_sel");
+        assert_eq!((r.sgpr[2], r.sgpr[3]), all, "wave{lanes} v_cmp_lt_u16 ignores op_sel");
+        assert_eq!((r.sgpr[4], r.sgpr[5]), all, "wave{lanes} v_cmp_gt_i16 ignores op_sel");
+        for l in 0..lanes as usize {
+            assert_eq!(r.vgpr[l][8], 0xCAFE_0015, "lane {l}: v_add_nc_u16 still honors op_sel");
+            assert_eq!(r.vgpr[l][9], 0x5A5A, "lane {l}: v_cmpx_eq_u16 ignores op_sel and keeps EXEC");
+        }
+    }
+}
+
+#[test]
 fn wave32_src_vccz_execz_and_saveexec_b32_hlsl() {
     let w32_code = prog(&[
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 251)], None),
