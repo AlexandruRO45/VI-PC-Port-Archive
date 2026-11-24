@@ -3803,6 +3803,58 @@ mod tests {
     }
 
     #[test]
+    fn each_misspelling_is_checked_against_its_own_variable() {
+        let names =
+            |list: &[&str]| -> Vec<std::ffi::OsString> { list.iter().map(Into::into).collect() };
+        // Another real variable being set does not excuse a near miss.
+        let err = ensure_no_misspelled_variables(names(&["VICTORY_GAMEDIR"]), |k| {
+            (k == "VICTORY_DATA_DIR").then(|| "/d".into())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("VICTORY_GAMEDIR is set, but Victory reads VICTORY_GAME_DIR"),
+            "{err}"
+        );
+        // An excused near miss does not hide a later one.
+        let err = ensure_no_misspelled_variables(
+            names(&["VICTORY_DATA_PATH", "PATH", "VICTORY_CONFIG_FILE"]),
+            |k| (k == "VICTORY_DATA_DIR").then(|| "/d".into()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("rename VICTORY_CONFIG_FILE to VICTORY_CONFIG"),
+            "{err}"
+        );
+        assert!(!err.contains("VICTORY_DATA_PATH"), "{err}");
+        // With several unexcused, the first in the environment is named.
+        let err =
+            ensure_no_misspelled_variables(names(&["VICTORY_TITLES", "VICTORY_CACHE"]), |_| None)
+                .unwrap_err()
+                .to_string();
+        assert!(err.starts_with("VICTORY_TITLES is set"), "{err}");
+        // Every real variable set: nothing to report.
+        ensure_no_misspelled_variables(
+            names(&["VICTORY_GAMEDIR", "VICTORY_TITLES", "VICTORY_CONFIG_PATH"]),
+            |k| SETTINGS.contains(&k).then(|| "/x".into()),
+        )
+        .unwrap();
+        // Mixed case and hyphens are near misses too (not on Windows,
+        // where the real names already match case-insensitively).
+        if !cfg!(windows) {
+            for (name, meant) in [
+                ("Victory_Data_Dir", "VICTORY_DATA_DIR"),
+                ("victory_config", "VICTORY_CONFIG"),
+                ("victory-test-title", "VICTORY_TEST_TITLES"),
+                ("VICTORY_Game_Folder", "VICTORY_GAME_DIR"),
+            ] {
+                assert_eq!(misspelling_of(name), Some(meant), "{name}");
+            }
+        }
+    }
+
+    #[test]
     fn misspellings_ignore_doubled_separators_and_other_suffixes() {
         for (name, meant) in [
             ("VICTORY__GAME__DIR", "VICTORY_GAME_DIR"),
