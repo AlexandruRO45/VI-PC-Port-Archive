@@ -1249,6 +1249,10 @@ mod tests {
             SLOT_HITS.fetch_add(1, Ordering::SeqCst);
             S_OK
         }
+        unsafe extern "system" fn trap_status(_o: usize, _block: *mut XAsyncBlock, _wait: bool) -> HRESULT {
+            SLOT_HITS.fetch_add(1, Ordering::SeqCst);
+            S_OK
+        }
         unsafe extern "system" fn trap_void(_o: usize, _a: usize, _b: usize, _c: usize) {
             SLOT_HITS.fetch_add(1, Ordering::SeqCst);
         }
@@ -1261,7 +1265,8 @@ mod tests {
         }
 
         let mut vtable = [0usize; 12];
-        for s in [3usize, 4, 6, 7, 9, 11] {
+        vtable[3] = trap_status as *const () as usize;
+        for s in [4usize, 6, 7, 9, 11] {
             vtable[s] = trap_hr as *const () as usize;
         }
         for s in [5usize, 10] {
