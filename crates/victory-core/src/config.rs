@@ -942,7 +942,14 @@ fn home_dir(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf>
 
 /// `~` and `~/rest` (`~\rest` on Windows) under `home`. Neither TOML nor a
 /// quoted shell value expands `~`, so without this `game_dir = "~/games"`
-/// would name a folder called `~`. `~user` is left alone.
+/// would name a folder called `~`.
+///
+/// `~user` (another user's home, as a shell would read it) is refused, not
+/// kept: kept, it is a relative folder literally named `~user` under the
+/// config file's folder or the working directory, which a quoted value or
+/// a TOML string reaches us as. Looking up another user's home is not
+/// worth it here; the error asks for the full path, or `./~name` for a
+/// folder that really is named that way.
 ///
 /// With no home directory (`HOME` and `USERPROFILE` unset or relative, as
 /// under `env -i`, a bare systemd service or some containers) a leading `~`
@@ -967,6 +974,15 @@ fn expand_home(what: &str, path: PathBuf, home: Option<&Path>) -> Result<PathBuf
             } else {
                 home.join(rest)
             })
+        }
+        Some(Component::Normal(first)) if first.to_string_lossy().starts_with('~') => {
+            anyhow::bail!(
+                "{what} is {}, but only a bare `~` is expanded, not `{}` (another user's \
+                 home); write the full path, or `./{}` for a folder with that name",
+                path.display(),
+                first.to_string_lossy(),
+                path.display()
+            );
         }
         _ => Ok(path),
     }
@@ -1202,12 +1218,39 @@ mod tests {
         let ex = |p: &str, h| expand_home("VICTORY_GAME_DIR", p.into(), h).unwrap();
         assert_eq!(ex("~", h), home);
         assert_eq!(ex("~/games/gta", h), home.join("games/gta"));
-        // Only a whole leading `~` component counts.
-        assert_eq!(ex("~user/x", h), PathBuf::from("~user/x"));
+        // Only a leading `~` counts; `./~user` names a folder called `~user`.
         assert_eq!(ex("a/~/b", h), PathBuf::from("a/~/b"));
+        assert_eq!(ex("./~user/x", h), PathBuf::from("./~user/x"));
         // Without a home directory, paths without a leading `~` are kept.
         assert_eq!(ex("/x/~", None), PathBuf::from("/x/~"));
-        assert_eq!(ex("~user/x", None), PathBuf::from("~user/x"));
+    }
+
+    #[test]
+    fn a_leading_tilde_user_is_refused() {
+        // `~user` is not expanded; kept, it would be a relative folder named
+        // `~user` under the working directory or the config file's folder.
+        let home = PathBuf::from(abs("home"));
+        for h in [Some(home.as_path()), None] {
+            for p in ["~user", "~user/games/gta", "~root"] {
+                let err = expand_home("VICTORY_GAME_DIR", p.into(), h)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("VICTORY_GAME_DIR"), "{err}");
+                assert!(err.contains("another user's"), "{err}");
+                assert!(err.contains(&format!("./{p}")), "{err}");
+            }
+        }
+        let parsed: FileConfig = toml::from_str("[paths]\ncache_dir = '~steam/c'\n").unwrap();
+        let err = parsed
+            .anchored_at(&PathBuf::from(abs("configs")), Some(&home))
+            .unwrap_err();
+        assert!(err.to_string().contains("[paths].cache_dir"), "{err}");
+        let env = |k: &str| match k {
+            "VICTORY_CONFIG" => Some(OsString::from("~other/victory.toml")),
+            _ => None,
+        };
+        let err = explicit_config(env, Some(&home)).unwrap_err();
+        assert!(err.to_string().contains("VICTORY_CONFIG"), "{err}");
     }
 
     #[test]
