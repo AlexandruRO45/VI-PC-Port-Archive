@@ -917,6 +917,12 @@ OperationResult run_descriptor_heap_paging(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_wave64_emulate(const OperationContext& ctx)
+{
+    check_wave64_emulate(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
 constexpr CapabilityGate kNoGate{};
 constexpr CapabilityGate kGateSm60BufferOps{
     D3D_SHADER_MODEL_6_0, false, false, 0,
@@ -1065,6 +1071,7 @@ const OperationSpec kOperations[] = {
     {"--descriptor-heap-paging", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<false>},
     {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
+    {"--wave64-emulate", 3, 3, nullptr, kNoGate, run_wave64_emulate},
 };
 
 struct DiagnosticTarget {

@@ -73,6 +73,7 @@ verified on the host, without loading an EXE or DLL. [Scope and synthetic tests]
 - **DXC validation.** `shader_metadata_probe` skips when the validator lacks module-only validation. DXC 1.8.2502 is the first verified release that passes. To use a separate DXC installation, configure with `cmake --preset dev -DDXC_EXECUTABLE=C:/path/to/dxc/bin/x64/dxc.exe`. [Results by release](docs/experiments.md#module-only-validation-by-dxc-release) · [Original report](https://github.com/R0Y00/Xbox2Windows/issues/98) · [DXC download](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.8.2502)
 - **Windows 10.** The source-built BVH buffer operations run on in-box WARP at SM 6.0. For WARP checks that require SM 6.5 or DXR, use the app-local Agility SDK and WARP packages. [BVH buffer operations](docs/experiments.md#bvh-buffer-operations-on-in-box-warp) · [Windows 10 setup](docs/experiments.md#windows-10-with-the-app-local-agility-sdk-and-warp)
 - **Independent build.** A Windows 11 contributor reproduced the three smoke tests from a clean checkout at `71bb9f4` and again after an incremental rebuild at `2465837`. [Toolchain, full-suite results and capability skips](https://github.com/R0Y00/Xbox2Windows/issues/2#issuecomment-7063351821)
+- **Zig cache.** The two Zig fixtures are built by `python -m ziglang build-exe`. If that step stops the build with `error: AccessDenied`, point both Zig caches at writable directories before configuring: `$env:ZIG_GLOBAL_CACHE_DIR = 'out/zig-global'` and `$env:ZIG_LOCAL_CACHE_DIR = 'out/zig-local'`. [Reproduction and measured before/after](docs/experiments.md#two-record-archive-reader-from-standard-startup)
 
 ## Choose an experiment
 
@@ -89,6 +90,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | GPU-produced texture through the SM 6.0 mesh fallback | `ctest --preset dev --no-tests=error -R '^compute_mesh_texture_fallback_' -V` |
 | Compute shader buffer writes on WARP | `ctest --preset dev --no-tests=error -R '^compute_store_aot_warp$' -V` |
 | SPIR-V sampler views at Shader Model 6.0 | `ctest --preset dev --no-tests=error -R '^spirv_sampler_views_' -V` |
+| SPIR-V standalone sampler split for 1D and cube images, including arrays (SPIRV-Tools) | `python3 -B tests/spirv_window/check.py` |
 | PE 32/64-bit base fixups against Windows | `ctest --preset dev --no-tests=error -R '^cpu_native_highlow$' -V` · [scope and controls](docs/experiments.md#highlow-and-mixed-width-base-relocations) |
 | [Experimental startup stand-ins and debugger (trap-by-default DLLs)](docs/startup-runtime.md) | `ctest --preset release --no-tests=error -R '^startup_stubs$' -V` |
 

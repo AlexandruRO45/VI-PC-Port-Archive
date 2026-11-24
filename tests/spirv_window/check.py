@@ -1,4 +1,4 @@
-"""Validate the logical-window shaders, composed ballot lowering, and rejection paths."""
+"""Validate window and sampler lowering, composed ballot lowering, and rejection paths."""
 from pathlib import Path
 import subprocess
 import sys
@@ -7,6 +7,54 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 import spirv_address_window as window
+from spirv_sampler_split import split_comparison_sampler
+
+
+def validate_sampler(directory, name, source):
+    assembly = directory / f"{name}.spvasm"
+    binary = directory / f"{name}.spv"
+    assembly.write_text(source, encoding="utf-8")
+    subprocess.run(["spirv-as", "--target-env", "vulkan1.2", assembly, "-o", binary], check=True)
+    subprocess.run(["spirv-val", "--target-env", "vulkan1.2", binary], check=True)
+
+
+def check_sampler_dimensions(directory):
+    shared = Path(__file__).with_name("shared_sampler.spvasm").read_text(encoding="utf-8")
+    for dimension, arrayed, width, capability, texture in (
+        ("1D", 0, 1, "Sampled1D", "Texture1D"),
+        ("1D", 1, 2, "Sampled1D", "Texture1DArray"),
+        ("Cube", 0, 3, None, "TextureCube"),
+        ("Cube", 1, 4, "SampledCubeArray", "TextureCubeArray"),
+    ):
+        image_type = f"OpTypeImage %float {dimension} 2 {arrayed} 0 1 Unknown"
+        source = shared.replace("OpTypeImage %float 2D 2 0 0 1 Unknown", image_type)
+        if capability:
+            source = source.replace("OpCapability Shader", f"OpCapability Shader\nOpCapability {capability}")
+        if width == 1:
+            source = source.replace(" %15 %float_", " %float_0_25 %float_")
+            source = source.replace(" %15 Lod", " %float_0_25 Lod")
+        else:
+            coordinate = " ".join(["%float_0_25"] * width)
+            source = source.replace("OpTypeVector %float 2", f"OpTypeVector %float {width}")
+            source = source.replace("OpConstantComposite %v2float %float_0_25 %float_0_25",
+                                    f"OpConstantComposite %v2float {coordinate}")
+            if width == 4:
+                source = source.replace("%v4float = OpTypeVector %float 4", "")
+                source = source.replace("%v2float", "%v4float")
+
+        validate_sampler(directory, texture, source)
+        lowered, mapping = split_comparison_sampler(source, 5)
+        assert mapping == {"descriptor_set": 0, "comparison_binding": 2, "ordinary_binding": 5}, texture
+        lines = {line.strip() for line in lowered.splitlines()}
+        assert f"%type_2d_image = {image_type}" in lines, texture
+        assert "%33 = OpLoad %type_sampler %cmpSampler" in lines, texture
+        assert "%34 = OpSampledImage %type_sampled_image %32 %33" in lines, texture
+        assert "%37 = OpSampledImage %type_sampled_image %32 %33" in lines, texture
+        assert "%x2w_plain_sampler_0 = OpLoad %type_sampler %x2w_plain_sampler" in lines, texture
+        assert "%42 = OpSampledImage %type_sampled_image %40 %x2w_plain_sampler_0" in lines, texture
+        assert "OpDecorate %x2w_plain_sampler Binding 5" in lines, texture
+        validate_sampler(directory, f"{texture}_split", lowered)
+        print(f"{texture}: shared and split SPIR-V validated")
 
 fixture = Path(__file__).with_name("subtract.spvasm")
 original = fixture.read_text(encoding="utf-8")
@@ -67,7 +115,10 @@ for source, reason in (
     else:
         raise AssertionError(f"accepted invalid profile: {reason}")
 
-with tempfile.TemporaryDirectory() as directory:
+output = ROOT / "out"
+output.mkdir(exist_ok=True)
+with tempfile.TemporaryDirectory(dir=output) as directory:
+    check_sampler_dimensions(Path(directory))
     target = Path(directory) / "window.spv"
     tool = [sys.executable, "-B", str(ROOT / "tools" / "spirv_address_window.py")]
     subprocess.run([*tool, fixture, target], check=True)

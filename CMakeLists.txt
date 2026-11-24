@@ -437,6 +437,22 @@ foreach(width IN ITEMS 0 16 32 64)
         BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso" VERBATIM)
     target_sources(offscreen_check PRIVATE "${header}")
 endforeach()
+# 64-lane wave operations emulated with group-shared memory (src/wave64_emulate.hlsli).
+target_sources(offscreen_check PRIVATE tests/wave64_emulate.cpp)
+foreach(entry IN ITEMS Wave64Emulate Wave64Emulate64 Wave64EmulateSkew)
+    set(emulate_args -T cs_6_0)
+    if(entry STREQUAL "Wave64Emulate64")
+        set(emulate_args -T cs_6_6 -D WAVE_SIZE=64)
+    elseif(entry STREQUAL "Wave64EmulateSkew")
+        list(APPEND emulate_args -D SKEW=1)
+    endif()
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/${entry}.h")
+    add_custom_command(OUTPUT "${header}" COMMAND "${DXC_EXECUTABLE}" ${emulate_args} -E Emulate -Vn ${entry}
+        -I "${CMAKE_CURRENT_SOURCE_DIR}/src" -Fh "${header}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/wave64_emulate.hlsl" DEPENDS tests/wave64_emulate.hlsl src/wave64_emulate.hlsli
+        BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${entry}.cso" VERBATIM)
+    target_sources(offscreen_check PRIVATE "${header}")
+endforeach()
 foreach(entry IN ITEMS CopyBlocks FillBlocks NumberBlocks CopySpan ResetBounds)
     set(header "${CMAKE_CURRENT_BINARY_DIR}/${entry}.h")
     add_custom_command(OUTPUT "${header}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E ${entry} -Vn ${entry}
@@ -672,6 +688,8 @@ foreach(adapter IN ITEMS hardware warp)
     set_tests_properties(bvh_wave64_${adapter} bvh_differential_${adapter} PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME wave_shuffle_${adapter} COMMAND offscreen_check ${adapter} --wave-shuffle)
     set_tests_properties(wave_shuffle_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    add_test(NAME wave64_emulate_${adapter} COMMAND offscreen_check ${adapter} --wave64-emulate)
+    set_tests_properties(wave64_emulate_${adapter} PROPERTIES TIMEOUT 45)
     set_tests_properties(bvh_buffer_ops_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(dxr_query_${adapter} dxr_pipeline_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(offscreen_${adapter} PROPERTIES TIMEOUT 45)
@@ -4014,6 +4032,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/gfx10_texture_roundtrip_check.py" roundtrip)
     add_test(NAME gfx10_texture_roundtrip_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/gfx10_texture_roundtrip_check.py" controls)
+    add_test(NAME texture_bc_volume COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/texture_bc_volume_check.py")
     add_test(NAME resource_range_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/resource_ranges_check.py")
     add_test(NAME ttpf_batch_export COMMAND "${INTAKE_PYTHON}" -B

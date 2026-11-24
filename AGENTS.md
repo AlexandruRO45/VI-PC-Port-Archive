@@ -79,7 +79,7 @@ List the registered tests with `ctest --preset dev -N`. Use
 |---|---|
 | CPU translation | `ctest --preset dev --no-tests=error -R '^cpu_' -V` |
 | Script states | `ctest --preset dev --no-tests=error -R '^script_(state_literals\|path_links)$' -V` |
-| Textures | `ctest --preset dev --no-tests=error -R '^(bcpack_prefix_and_mip_tail\|bc7_tile_swizzle\|bc7_draw_warp)$' -V` |
+| Textures | `ctest --preset dev --no-tests=error -R '^(bcpack_prefix_and_mip_tail\|bc7_tile_swizzle\|bc7_draw_warp\|texture_bc_volume)$' -V` |
 | Shader translation | `ctest --preset dev -R '^pixel_aot_' -V` |
 | D3D12 and ray tracing | `ctest --preset dev -R '^bvh_(differential\|wave64)_hardware$' -V` |
 | Windows runtime | `ctest --preset dev -R 'era_heap\|desktop_memory_query'` |
@@ -105,6 +105,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/bc7_blocks_check.py
 ./out/pe-env/bin/python -B tests/bc7_tiles_check.py
 ./out/pe-env/bin/python -B tests/gfx10_texture_roundtrip_check.py
+./out/pe-env/bin/python -B tests/texture_bc_volume_check.py
 ./out/pe-env/bin/python -B tests/form_coverage_check.py
 ./out/pe-env/bin/python -B tests/resource_ranges_check.py
 ./out/pe-env/bin/python -B tests/ttpf_batch_export_check.py

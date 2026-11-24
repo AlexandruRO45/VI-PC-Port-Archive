@@ -10,9 +10,9 @@ sampler there.
 The pass first looks for a standalone UniformConstant sampler, loaded directly, whose sampled
 images feed both kinds of sampling. Modules without one, including indexed sampler tables and
 unrelated sampling, are returned byte-for-byte unchanged. For the sampler being split, the profile
-is limited to direct float32 Texture2D or Texture2DArray sampling in a single compute entry point, at a
-constant LOD of zero, with the sampler listed in the entry-point interface. Any other use of that
-sampler is rejected with a specific diagnostic.
+is limited to direct float32 Texture1D, Texture2D and TextureCube sampling, including their array
+forms, in a single compute entry point at constant LOD zero. The sampler must appear in the
+entry-point interface. Any other use of that sampler is rejected with a specific diagnostic.
 """
 import argparse
 from collections import defaultdict
@@ -102,11 +102,13 @@ def split_comparison_sampler(assembly, ordinary_binding):
     for image in images:
         sampled = definitions.get(definitions[image][1], [])
         texture = definitions.get(sampled[1], []) if sampled[:1] == ["OpTypeSampledImage"] else []
-        # OpTypeImage <sampled type> 2D <depth> <arrayed 0|1> <ms> <sampled> <format>
+        # OpTypeImage <sampled type> <dim> <depth> <arrayed 0|1> <ms> <sampled> <format>
         if (len(texture) != 8 or texture[0] != "OpTypeImage"
                 or definitions.get(texture[1]) != ["OpTypeFloat", "32"]
-                or texture[2] != "2D" or texture[4] not in ("0", "1") or texture[5:] != ["0", "1", "Unknown"]):
-            raise ValueError(f"{image}: only float32 Texture2D and Texture2DArray sampling is supported")
+                or texture[2] not in ("1D", "2D", "Cube") or texture[4] not in ("0", "1")
+                or texture[5:] != ["0", "1", "Unknown"]):
+            raise ValueError(f"{image}: only float32 Texture1D, Texture2D and TextureCube sampling "
+                             "(including their array forms) is supported")
         kinds = set()
         for _, use in uses[image]:
             ordinary = use[0] == "OpImageSampleExplicitLod" and len(use) == 6

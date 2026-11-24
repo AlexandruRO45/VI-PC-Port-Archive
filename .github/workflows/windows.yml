@@ -63,6 +63,7 @@ jobs:
           python -B tests/bc7_blocks_check.py
           python -B tests/bc7_tiles_check.py
           python -B tests/gfx10_texture_roundtrip_check.py
+          python -B tests/texture_bc_volume_check.py
           python -B tests/form_coverage_check.py
           python -B tests/resource_ranges_check.py
           python -B tests/ttpf_batch_export_check.py

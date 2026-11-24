@@ -93,13 +93,14 @@ def controls(directory):
     rejected(SHARED, -1, "Ordinary sampler binding must be nonnegative")
     rejected(substitute(SHARED, "OpEntryPoint GLCompute", "OpEntryPoint Fragment"),
              ORDINARY_BINDING, "requires a single GLCompute entry point")
-    # Only Texture2D and Texture2DArray are in the profile: multisampled and 3D images stay rejected.
+    # Multisampled and 3D images stay outside the profile.
+    profile = "only float32 Texture1D, Texture2D and TextureCube sampling (including their array forms) is supported"
     for image in ("OpTypeImage %float 2D 2 0 1 1 Unknown", "OpTypeImage %float 3D 2 0 0 1 Unknown"):
         rejected(substitute(SHARED, "OpTypeImage %float 2D 2 0 0 1 Unknown", image),
-                 ORDINARY_BINDING, "only float32 Texture2D and Texture2DArray sampling is supported")
+                 ORDINARY_BINDING, profile)
     rejected(substitute(SHARED_ARRAY, "OpTypeImage %float 2D 2 1 0 1 Unknown",
                         "OpTypeImage %float 2D 2 1 1 1 Unknown"),
-             ORDINARY_BINDING, "only float32 Texture2D and Texture2DArray sampling is supported")
+             ORDINARY_BINDING, profile)
     rejected(substitute(SHARED, " %cmpSampler %plainSampler %results", " %plainSampler %results"),
              ORDINARY_BINDING, "sampler must be listed in the entry-point interface")
     rejected(substitute(SHARED, "%float_0 = OpConstant %float 0",
