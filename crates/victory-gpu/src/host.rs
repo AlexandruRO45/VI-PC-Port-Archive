@@ -647,6 +647,18 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// The argument-upload probe switches off the only path a title-written
+    /// record has to the GPU, so a release build must not be able to reach it
+    /// whatever its environment says.
+    #[test]
+    fn the_argument_upload_probe_needs_a_diagnostics_build() {
+        assert_eq!(
+            super::no_args_refresh(),
+            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_NO_ARGS_REFRESH").is_some(),
+            "a release build must ignore VICTORY_NO_ARGS_REFRESH"
+        );
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -1224,6 +1236,13 @@ static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 /// It exists to ask whether we overwrite records the title wrote — the answer
 /// was no — and must never be on outside that question.
 pub(crate) fn no_args_refresh() -> bool {
+    // Diagnostics builds only. In a release build this probe must not exist at
+    // all: a variable inherited from a wrapper's environment would otherwise
+    // switch off the only path a title-written record has to the GPU, and the
+    // world would dispatch nothing with no log line and no refusal.
+    if !cfg!(feature = "diagnostics") {
+        return false;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_NO_ARGS_REFRESH").is_some())
 }
