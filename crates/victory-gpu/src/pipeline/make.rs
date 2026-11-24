@@ -165,6 +165,8 @@ fn queue(p: Arc<Pending>) {
         let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
         let receiver = Arc::new(Mutex::new(receiver));
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        #[cfg(feature = "diagnostics")]
+        let mut spawned_workers = 0u64;
         for i in 0..workers {
             let receiver = receiver.clone();
             let spawned = std::thread::Builder::new()
@@ -194,10 +196,18 @@ fn queue(p: Arc<Pending>) {
                         }
                     }
                 });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
+            match spawned {
+                Ok(_worker) => {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        spawned_workers += 1;
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "no pipeline worker"),
             }
         }
+        #[cfg(feature = "diagnostics")]
+        super::scheduler_metrics::pool_ready(spawned_workers);
         sender
     });
     #[cfg(feature = "diagnostics")]
