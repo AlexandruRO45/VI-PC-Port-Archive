@@ -6559,11 +6559,131 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, Parts, buffer_format, lower};
+    use std::collections::HashMap;
+
+    use super::super::container::SigElement;
+    use super::{Lower, MaskData, Numeric, Parts, buffer_format, lower};
     use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// Lowers a single-block program through `Lower` without finishing bitcode,
+    /// so tests can inspect the emitted `Module` and `ballots`.
+    fn lower_inspect<'a>(parts: &'a Parts<'a>, bad: &'a HashMap<crate::ir::Value, &'static str>) -> Lower<'a> {
+        let mut l = Lower::new(parts, bad);
+        let p = l.x.p;
+        let order = ir::reverse_postorder(&p.blocks);
+        for (n, &b) in order.iter().enumerate() {
+            l.rpo[b] = n;
+            l.block[b] = Some(if n == 0 {
+                l.s.entry
+            } else {
+                l.s.m.new_block()
+            });
+        }
+        l.cur = l.s.entry;
+        l.find_sections();
+        l.inputs().unwrap_or_else(|_| panic!("inputs failed"));
+        for &b in &order {
+            l.cur = l.block[b].expect("reachable");
+            l.cur_ir = b;
+            for i in 0..p.blocks[b].insts.len() {
+                l.inst(b, i).unwrap_or_else(|_| panic!("inst ({b}, {i}) failed"));
+            }
+            l.mask_ok = l.mask_data == MaskData::Console;
+            l.tail[b] = Some(l.cur);
+            l.exit(b).unwrap_or_else(|_| panic!("exit ({b}) failed"));
+        }
+        l.fill_phis().unwrap_or_else(|_| panic!("fill_phis failed"));
+        l
+    }
+
+    #[test]
+    fn host_wave32_mask_ops_use_both_ballot_halves() {
+        let words: &[u32] = &[
+            0xBE80_0F7E,              // s_bcnt1_i32_b32 s0, exec_lo
+            0xBE81_137E,              // s_ff1_i32_b32 s1, exec_lo
+            0xD765_0002, 0x0001_007E, // v_mbcnt_lo_u32_b32 v2, exec_lo, 0
+            0xD765_0003, 0x0001_00C1, // v_mbcnt_lo_u32_b32 v3, -1, 0
+            0x7E00_0200,              // v_mov_b32 v0, s0
+            0x7E02_0201,              // v_mov_b32 v1, s1
+            0xF800_180F, 0x0302_0100, // exp mrt0, v0, v1, v2, v3 done vm
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code,
+        };
+        let p = ir::build(&native.code, false, 8).unwrap();
+        let names: Vec<&str> = p.blocks[0].insts.iter().map(|i| i.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "s_bcnt1_i32_b32",
+                "s_ff1_i32_b32",
+                "v_mbcnt_lo_u32_b32",
+                "v_mbcnt_lo_u32_b32",
+                "v_mov_b32",
+                "v_mov_b32",
+                "exp",
+                "s_endpgm",
+            ]
+        );
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let outputs = vec![SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 5,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }];
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs,
+            prims: vec![],
+            mesh_stride: 0,
+        };
+        let bad = HashMap::new();
+        let l = lower_inspect(&parts, &bad);
+        assert_eq!(l.mask_data, MaskData::Host);
+        assert_eq!(l.s.wave_size, None);
+        assert_eq!(l.ballots.len(), 1);
+        let &(lo, hi) = l.ballots.values().next().unwrap();
+        let lo_uses = l.s.m.uses_of(lo);
+        let hi_uses = l.s.m.uses_of(hi);
+        assert!(
+            lo_uses >= 3,
+            "expected low ballot half to be used >= 3 times, got {lo_uses}"
+        );
+        assert!(
+            hi_uses >= 3,
+            "expected high ballot half to be used by s_bcnt1_i32_b32, s_ff1_i32_b32, and v_mbcnt_lo_u32_b32 (>= 3 uses), got {hi_uses}"
+        );
+    }
 
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {

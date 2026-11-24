@@ -963,6 +963,45 @@ impl Writer {
 }
 
 #[cfg(test)]
+impl Module {
+    /// Number of instruction and terminator operands referring to `v`.
+    pub(super) fn uses_of(&self, v: V) -> usize {
+        let mut n = 0;
+        let mut count = |x: V| {
+            if x == v {
+                n += 1;
+            }
+        };
+        for inst in &self.insts {
+            match &inst.op {
+                Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
+                    count(*a);
+                    count(*b);
+                }
+                Op::Cast(_, a) | Op::Extract(a, _) | Op::Load(a) => count(*a),
+                Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
+                    count(*a);
+                    count(*b);
+                    count(*c);
+                }
+                Op::Call(_, args) => args.iter().copied().for_each(&mut count),
+                Op::Phi(args) => args.iter().map(|&(a, _)| a).for_each(&mut count),
+                Op::Gep(_, p, idx) => {
+                    count(*p);
+                    idx.iter().copied().for_each(&mut count);
+                }
+            }
+        }
+        for b in &self.blocks {
+            if let Some(Term::CondBr(cond, _, _)) = b.term {
+                count(cond);
+            }
+        }
+        n
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
