@@ -44,10 +44,15 @@ export VKD3D_SHADER_CACHE_PATH=/path/to/vkd3d-cache
 export MESA_VK_WSI_PRESENT_MODE=fifo              # keep 30 fps video/menu presentation in order on RADV/Xwayland
 ```
 
-Then launch:
+Then launch using `proton runinprefix` (with `STEAM_COMPAT_DATA_PATH` and
+`STEAM_COMPAT_CLIENT_INSTALL_PATH` set) or Proton's `wine` binary directly:
 
 ```sh
-"$PROTON_DIR/proton" run victory.exe run 'Z:\path\to\game\<title.exe>' --execute
+export STEAM_COMPAT_DATA_PATH=/path/to/compatdata
+export STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/.local/share/Steam"
+"$PROTON_DIR/proton" runinprefix victory.exe run 'Z:\path\to\game\<title.exe>' --execute
+# or directly with Proton's wine:
+# WINEPREFIX="$STEAM_COMPAT_DATA_PATH/pfx" "$PROTON_DIR/files/bin/wine64" victory.exe run 'Z:\path\to\game\<title.exe>' --execute
 ```
 
 ### Bubblewrap (`bwrap`) note
