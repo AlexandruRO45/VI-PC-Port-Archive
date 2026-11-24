@@ -3,6 +3,11 @@
 Archived copies of four open-source projects that worked on running GTA VI on PC, saved on 2026-11-23 and 2026-11-24.
 No game files are included: each project kept game data out of its repository.
 
+## Important links
+
+- [portwatch-vi.xyz](https://portwatch-vi.xyz)
+- [leonida.now](https://leonida.now)
+
 | Folder | Project | Original | License |
 |---|---|---|---|
 | [`leonida/`](leonida) | Leonida: native PC recompilation of the Xbox version | `ItsNotRexed/Leonida` (removed from GitHub on 2026-11-23) | GPL-3.0 |
