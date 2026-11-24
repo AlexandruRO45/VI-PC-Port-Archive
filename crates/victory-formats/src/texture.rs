@@ -581,6 +581,21 @@ impl Layout {
         self.mips.get(mip as usize).map_or(0, |m| m.depth)
     }
 
+    /// The tightly packed linear rows of one subresource of mip `mip`: the
+    /// smallest row pitch and buffer [`Layout::detile`] and [`Layout::tile`]
+    /// accept for it, with depth slices one after the other. `None` past
+    /// the chain.
+    pub fn footprint(&self, mip: u32) -> Option<Footprint> {
+        let m = self.mips.get(mip as usize)?;
+        let row_pitch = m.width as usize * self.desc.element_bytes as usize;
+        let depth_pitch = row_pitch * m.height as usize;
+        Some(Footprint {
+            row_pitch,
+            depth_pitch,
+            size: depth_pitch * self.subresource_depth(mip) as usize,
+        })
+    }
+
     /// Copies one subresource out of tiled memory (the whole texture,
     /// [`Layout::size`] bytes) into linear rows: mip `mip` of array slice
     /// `slice` (3D: every depth slice of the mip, `slice` 0). Rows are
@@ -689,6 +704,17 @@ impl Layout {
         }
         Ok(())
     }
+}
+
+/// Linear rows of one subresource, packed without padding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Footprint {
+    /// Bytes from one row of elements to the next.
+    pub row_pitch: usize,
+    /// Bytes from one depth slice to the next.
+    pub depth_pitch: usize,
+    /// Bytes of the whole subresource.
+    pub size: usize,
 }
 
 /// What a DXGI format stores per element: bytes, texels per element side
@@ -2027,5 +2053,80 @@ mod tests {
             }
         }
         assert!(checked >= 30, "{checked}");
+    }
+    /// Every mip of 2D arrays and 3D textures, linear and tiled: copies
+    /// into exactly a mip's footprint succeed and round trip, while one
+    /// byte less of buffer or of row pitch is refused.
+    #[test]
+    fn footprints_are_the_smallest_copies() {
+        let mut checked = 0;
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
+            for dimension in [Dimension::Tex2d, Dimension::Tex3d] {
+                for (w, h, depth, bpe, mips) in [(37, 19, 3, 4, 6), (9, 70, 2, 16, 7)] {
+                    let d = Desc {
+                        dimension,
+                        depth,
+                        ..desc(w, h, mips, bpe, swizzle)
+                    };
+                    let Ok(l) = Layout::new(&d) else {
+                        assert_eq!(dimension, Dimension::Tex3d, "{d:?}");
+                        continue;
+                    };
+                    let three_d = dimension == Dimension::Tex3d;
+                    let slices = if three_d { 1 } else { depth };
+                    let mut tiled = vec![0u8; l.size as usize];
+                    for mip in 0..mips {
+                        let f = l.footprint(mip).unwrap();
+                        let m = l.mips[mip as usize];
+                        let at = format!("{d:?} mip {mip}");
+                        assert_eq!(f.row_pitch, (m.width * bpe) as usize, "{at}");
+                        assert_eq!(f.depth_pitch, f.row_pitch * m.height as usize, "{at}");
+                        assert_eq!(
+                            f.size,
+                            f.depth_pitch * l.subresource_depth(mip) as usize,
+                            "{at}"
+                        );
+                        for slice in 0..slices {
+                            let fill: Vec<u8> = (0..f.size)
+                                .map(|i| (i as u32 * 7 + mip * 13 + slice * 29) as u8)
+                                .collect();
+                            l.tile(&mut tiled, mip, slice, &fill, f.row_pitch, f.depth_pitch)
+                                .unwrap();
+                            let mut back = vec![0; f.size];
+                            l.detile(&tiled, mip, slice, &mut back, f.row_pitch, f.depth_pitch)
+                                .unwrap();
+                            assert_eq!(back, fill, "{at} slice {slice}");
+                            assert_eq!(
+                                l.detile(
+                                    &tiled,
+                                    mip,
+                                    slice,
+                                    &mut back[1..],
+                                    f.row_pitch,
+                                    f.depth_pitch
+                                ),
+                                Err(Error::TooSmall),
+                                "{at}"
+                            );
+                            assert_eq!(
+                                l.detile(
+                                    &tiled,
+                                    mip,
+                                    slice,
+                                    &mut back,
+                                    f.row_pitch - 1,
+                                    f.depth_pitch
+                                ),
+                                Err(Error::TooSmall),
+                                "{at}"
+                            );
+                        }
+                        checked += 1;
+                    }
+                    assert_eq!(l.footprint(mips), None, "{d:?}");
+                }
+            }
+        }
+        assert!(checked >= 40, "{checked}");
     }
 }
