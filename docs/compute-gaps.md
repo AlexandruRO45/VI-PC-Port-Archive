@@ -24,6 +24,12 @@ stage:
 The two columns count different things — a program can refuse one pass and be emitted
 by a later one — so they are not meant to add up to one denominator.
 
+Against the same corpus on `e3dac6e` before PR #5, the branch moved **five programs**:
+compute 2,452 → 2,457 of 2,611, with `emit: an LDS operation` (4) and
+`emit: LDS the program does not allocate` (1) gone. Vertex-and-pixel and mesh are
+unchanged at 13,022 and 8,381. The five split descriptor refusals moved 815 programs
+between buckets without changing the count — they are diagnostics, not fixes.
+
 A refusal is an attempt, not an absence. A program refused at one emit pass can be
 reached again by a later one, and a pipeline refused at creation may come into
 existence on a later attempt — so this column measures failed attempts, not programs
