@@ -189,6 +189,10 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Single-wave64 compute shader with LDS and uniform control flow:
+    /// lowered without `WaveSize(64)` and fenced around LDS operations so
+    /// wave32 GPUs run it safely.
+    sync_lds: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -360,6 +364,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut sync_lds = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -398,9 +403,20 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
+            let uniform_cf = x.st.exits.iter().all(|e| match *e {
+                LaneExit::Branch { when, .. } => x
+                    .st
+                    .bools
+                    .support(when)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(_))),
+                _ => true,
+            });
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            if !console_lanes && x.native.wave64 && one_wave && s.lds_dwords > 0 && uniform_cf {
+                sync_lds = true;
+            } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
         }
@@ -486,6 +502,7 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            sync_lds,
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -2191,6 +2208,9 @@ impl<'a> Lower<'a> {
                     n += 1;
                 }
             }
+            if self.sync_lds {
+                self.emit_lds_barrier();
+            }
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("ds_write") {
@@ -2214,6 +2234,9 @@ impl<'a> Lower<'a> {
                 self.s.m.store(self.cur, p, x);
             }
             self.end_guarded(at, &[]);
+            if self.sync_lds {
+                self.emit_lds_barrier();
+            }
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -2257,10 +2280,20 @@ impl<'a> Lower<'a> {
                 .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
         };
         let r = self.end_guarded(at, &[(r, outside)])[0];
+        if self.sync_lds {
+            self.emit_lds_barrier();
+        }
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);
         }
         Ok(())
+    }
+
+    fn emit_lds_barrier(&mut self) {
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
     // ---- instructions ----
