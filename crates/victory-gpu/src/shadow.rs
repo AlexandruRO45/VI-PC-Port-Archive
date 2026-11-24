@@ -100,6 +100,22 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+/// Merges overlapping or directly touching `[from, to)` byte intervals into
+/// sorted disjoint spans (without bridging gaps, so each span stays within one
+/// pre-write snapshot segment).
+pub(crate) fn merge_touching_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, b)| a < b).collect();
+    out.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(out.len());
+    for (from, to) in out {
+        match merged.last_mut() {
+            Some((_, prev_to)) if from <= *prev_to => *prev_to = (*prev_to).max(to),
+            _ => merged.push((from, to)),
+        }
+    }
+    merged
+}
+
 /// Merges `[from, to)` into sorted disjoint pre-write snapshot segments,
 /// copying newly covered bytes from `source` while keeping prior bytes intact.
 fn record_snapshot(
@@ -237,77 +253,89 @@ impl Shadow {
         record_snapshot(&mut before, from, to, source);
     }
 
-    /// After the submission ran: copies the bytes its shaders wrote back
-    /// into title memory (unmapped pages left alone), and only those: the
-    /// title's threads write the same buffers while the GPU runs (its
-    /// command memory shares the big GPU heap with what shaders write), and
-    /// putting back the copy's older bytes there broke the title's own
-    /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
-    /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+    /// After the submission ran: copies the bytes its shaders wrote across
+    /// `ranges` (`(address, len)`) back into title memory (unmapped pages left
+    /// alone), coalescing overlapping or touching spans per buffer so each
+    /// region is read/written once per submission. Returns the bytes written.
+    pub(crate) fn copy_back_ranges(&self, ranges: &[(usize, usize)]) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
-        let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if from < to
-            && let Some((taken, before)) = snapshot
-                .iter()
-                .find(|(taken, bytes)| *taken <= from && to <= taken + bytes.len())
-        {
-            let before = &before[from - *taken..to - *taken];
-            // By 64 KiB piece: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
+        let raw: Vec<(usize, usize)> = ranges
+            .iter()
+            .map(|&(address, len)| (address, address + len))
+            .collect();
+        let clamped: Vec<(usize, usize)> = ranges
+            .iter()
+            .map(|&(address, len)| self.inside(address, len))
+            .collect();
+        let merged = merge_touching_ranges(&clamped);
+        if !merged.is_empty() {
             const PIECE: usize = 64 << 10;
             let mut title = vec![0u8; PIECE];
-            let mut synced = Vec::new();
-            let mut at = from;
-            while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
+            let mut synced: Vec<usize> = Vec::new();
+            let mut whole_ranges: Vec<(usize, usize)> = Vec::new();
+            for &(from, to) in &merged {
+                let Some((taken, before)) = snapshot
+                    .iter()
+                    .find(|(taken, bytes)| *taken <= from && to <= taken + bytes.len())
+                else {
+                    continue;
+                };
+                let before = &before[from - *taken..to - *taken];
+                let mut at = from;
+                while at < to {
+                    let n = (PIECE - (start + at) % PIECE).min(to - at);
+                    // SAFETY: inside the mapping; only the submitting thread
+                    // writes it.
+                    let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    let old = &before[at - from..at - from + n];
+                    let title = &mut title[..n];
+                    if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                        let mut changed = false;
+                        for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                            if *h != *o && *t != *h {
+                                *t = *h;
+                                changed = true;
+                            }
+                            *h = *t;
                         }
-                        *h = *t;
+                        if changed {
+                            crate::watch::writing(start + at, n);
+                            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                            written += n;
+                        }
+                        synced.push((start + at) / PAGE);
                     }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
+                    at += n;
                 }
-                at += n;
+                let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
+                if first < last {
+                    whole_ranges.push((first, last));
+                }
             }
-            // Pages made equal to title memory are current in the copy, so
-            // our own write is not taken for the title's; others keep what
-            // they had (a title write there shows at the next refresh).
-            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            if first < last
-                && !synced.is_empty()
+            if !synced.is_empty()
+                && !whole_ranges.is_empty()
                 && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
+                && let (Some(min_p), Some(max_p)) = (
+                    whole_ranges.iter().map(|&(f, _)| f).min(),
+                    whole_ranges.iter().map(|&(_, l)| l).max(),
+                )
+                && let Some((now, _)) = crate::watch::writes(min_p * PAGE, max_p * PAGE, true)
             {
                 let base = start / PAGE;
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
+                synced.sort_unstable();
+                synced.dedup();
+                for page in synced {
+                    if whole_ranges.iter().any(|&(f, l)| (f..l).contains(&page)) {
+                        copied[page - base] = now;
+                    }
                 }
             }
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
+        pending.retain(|r| !raw.contains(r));
         if pending.is_empty() {
             for (_, bytes) in snapshot.drain(..) {
                 give_back(bytes);
@@ -570,7 +598,23 @@ pub(crate) fn near(va: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{COALESCE_GAP, record_snapshot};
+    use super::{COALESCE_GAP, merge_touching_ranges, record_snapshot};
+
+    #[test]
+    fn merge_touching_ranges_coalesces_overlapping_and_nested_spans() {
+        assert_eq!(merge_touching_ranges(&[(5, 5), (10, 10)]), Vec::<(usize, usize)>::new());
+        assert_eq!(
+            merge_touching_ranges(&[
+                (100, 200),
+                (50, 120),
+                (60, 80),
+                (200, 250),
+                (300, 320),
+                (300, 320),
+            ]),
+            vec![(50, 250), (300, 320)]
+        );
+    }
 
     #[test]
     fn snapshots_keep_disjoint_ranges_and_preserve_prior_bytes_on_merge() {
