@@ -5,6 +5,9 @@
 
 use super::*;
 
+const ORIGINAL_SIZE: (u32, u32) = (384, 216);
+const RESIZED_SIZE: (u32, u32) = (320, 180);
+
 #[test]
 #[ignore = "requires an interactive Windows desktop and D3D12"]
 fn synthetic_presentx() {
@@ -54,30 +57,35 @@ fn synthetic_presentx() {
         VisibleNodeMask: 1,
         ..Default::default()
     };
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-        Width: 384,
-        Height: 216,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-        ..Default::default()
-    };
     // SAFETY: the console heap descriptor has the PC layout.
     let heap: HeapProperties = unsafe { std::mem::transmute(heap) };
-    // SAFETY: the console resource descriptor has the PC layout.
-    let desc: ResourceDesc = unsafe { std::mem::transmute(desc) };
-    let mut target = null();
-    assert_eq!(
-        crate::resource::create_committed(device, &heap, 0, &desc, 0, null(), iid, &mut target),
-        S_OK
-    );
-    assert!(crate::resource::host_resource(target).is_some());
+    let make_target = |(width, height)| {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(width),
+            Height: height,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        // SAFETY: the console resource descriptor has the PC layout.
+        let desc: ResourceDesc = unsafe { std::mem::transmute(desc) };
+        let mut target = null();
+        assert_eq!(
+            crate::resource::create_committed(device, &heap, 0, &desc, 0, null(), iid, &mut target),
+            S_OK
+        );
+        assert!(crate::resource::host_resource(target).is_some());
+        target
+    };
+    let original = make_target(ORIGINAL_SIZE);
+    let resized = make_target(RESIZED_SIZE);
 
     let vs = shader(true);
     let ps = shader(false);
@@ -113,26 +121,33 @@ fn synthetic_presentx() {
     assert!(!pipeline.is_null());
     let mut view = [0u64; 14];
     let handle = view.as_mut_ptr() as u64;
-    crate::descriptor::create_rtv(device, target, null(), handle);
-    for frame in 0..2 {
+    for (frame, (target, (width, height))) in [
+        (original, ORIGINAL_SIZE),
+        (original, ORIGINAL_SIZE),
+        (resized, RESIZED_SIZE),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         if frame != 0 {
             assert_eq!(reset(list, allocator, null(), 0), S_OK);
         }
+        crate::descriptor::create_rtv(device, target, null(), handle);
         clear(list, handle, &[1.0, 0.0, 1.0, 1.0], 0, null());
-        if frame == 1 {
+        if frame != 0 {
             let viewport = D3D12_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
-                Width: 384.0,
-                Height: 216.0,
+                Width: width as f32,
+                Height: height as f32,
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             };
             let scissor = RECT {
                 left: 0,
                 top: 0,
-                right: 384,
-                bottom: 216,
+                right: width as i32,
+                bottom: height as i32,
             };
             slot::<extern "system" fn(This, u32)>(list, 20 * 8)(list, 4);
             slot::<extern "system" fn(This, u32, *const D3D12_VIEWPORT)>(list, 21 * 8)(
@@ -177,11 +192,12 @@ fn synthetic_presentx() {
             let presenter = guard.as_ref().expect("swap chain created");
             // SAFETY: the presenter owns the live swap chain.
             let next = unsafe { presenter.swap_chain.GetCurrentBackBufferIndex() };
-            assert_eq!(next, (frame as u32 + 1) % BUFFERS);
+            let previous = if frame == 2 { 0 } else { frame as u32 };
+            assert_eq!(next, (previous + 1) % BUFFERS);
         }
     }
     ACTIVE.set(false);
-    for object in [list, queue, allocator, target, pipeline] {
+    for object in [list, queue, allocator, original, resized, pipeline] {
         slot::<extern "system" fn(This) -> u32>(object, 16)(object);
     }
 }
@@ -227,11 +243,16 @@ pub(super) fn check_pixels(
 ) {
     let expected = match frame {
         1 => [255, 0, 255, 255],
-        2 => [0, 255, 0, 255],
+        2 | 3 => [0, 255, 0, 255],
         _ => panic!("unexpected frame {frame}"),
     };
     let layout = footprint.Footprint;
-    assert_eq!((layout.Width, layout.Height), (384, 216));
+    let size = if frame == 3 {
+        RESIZED_SIZE
+    } else {
+        ORIGINAL_SIZE
+    };
+    assert_eq!((layout.Width, layout.Height), size);
     let mut data = std::ptr::null_mut();
     // SAFETY: the readback copy has completed; the footprint describes the allocation.
     unsafe {
