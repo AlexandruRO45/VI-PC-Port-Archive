@@ -1596,7 +1596,14 @@ mod tests {
             let mut st = XAudio2VoiceState { current_buffer_context: std::ptr::null_mut(), buffers_queued: 0, samples_played: 0 };
             get_st(voice, &mut st, 0);
             assert_eq!({ st.buffers_queued }, 2);
-            assert_eq!({ st.current_buffer_context } as usize, CTX_VALID);
+            // Windows' XAudio2 reports the head buffer's context before Start. Wine's (FAudio)
+            // reports none until the voice runs. Either way it must never be the internal token.
+            let cur = { st.current_buffer_context } as usize;
+            if crate::util::under_wine() {
+                assert!(cur == 0 || cur == CTX_VALID, "context {cur:#x} before Start");
+            } else {
+                assert_eq!(cur, CTX_VALID);
+            }
 
             let set_vol: unsafe extern "system" fn(*mut c_void, f32, u32) -> HRESULT = std::mem::transmute(vt_v.add(12).read());
             let _ = set_vol(voice, 0.0, 0);
@@ -1606,6 +1613,9 @@ mod tests {
             while (ENDED.load(Ordering::SeqCst) != CTX_VALID + CTX_BAD || STREAM_END.load(Ordering::SeqCst) < 2)
                 && t0.elapsed() < std::time::Duration::from_secs(3)
             {
+                get_st(voice, &mut st, 0);
+                let cur = { st.current_buffer_context } as usize;
+                assert!(cur == 0 || cur == CTX_VALID || cur == CTX_BAD, "context {cur:#x} while playing");
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             assert_eq!(STARTED.load(Ordering::SeqCst), CTX_VALID + CTX_BAD);
