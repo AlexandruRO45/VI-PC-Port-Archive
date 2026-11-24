@@ -5,7 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -33,6 +33,27 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
+    image_data: OnceLock<ImageData>,
+}
+
+/// Image dimensions and base mip at the slot indices used by the shader.
+/// The mapped upload buffer also stays live in any list that binds it.
+struct ImageData {
+    buffer: ID3D12Resource,
+    mapped: usize,
+    handle: D3D12_GPU_DESCRIPTOR_HANDLE,
+}
+
+impl ImageData {
+    fn set(&self, index: u32, words: [u32; 2]) {
+        // SAFETY: a persistent mapping with two dwords per slot. Callers
+        // serialize writes with the same lock as descriptor mirroring.
+        unsafe {
+            (self.mapped as *mut [u32; 2])
+                .add(index as usize)
+                .write(words)
+        };
+    }
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -146,6 +167,7 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
+            image_data: OnceLock::new(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -263,6 +285,62 @@ impl HostHeap {
         self.count
     }
 
+    /// A bounded raw view of the image fields. Allocate it on first use,
+    /// seeding it while the mirrored descriptor slots are locked.
+    pub(crate) fn image_data(&self) -> Option<(ID3D12Resource, D3D12_GPU_DESCRIPTOR_HANDLE)> {
+        if let Some(data) = self.image_data.get() {
+            return Some((data.buffer.clone(), data.handle));
+        }
+        if self.sampler || self.count == 0 {
+            return None;
+        }
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(data) = self.image_data.get() {
+            return Some((data.buffer.clone(), data.handle));
+        }
+        let host = host()?;
+        let elements = self.count.checked_mul(2)?;
+        let (buffer, mapped) = host.upload_buffer(u64::from(elements) * 4)?;
+        let slot = self.dynamic(1)?;
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: elements,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: the buffer and the slot reserved above are live.
+        let gpu = unsafe {
+            host.device
+                .CreateShaderResourceView(&buffer, Some(&desc), self.cpu(slot));
+            self.heap.GetGPUDescriptorHandleForHeapStart().ptr
+        };
+        let handle = D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: gpu + u64::from(self.step) * u64::from(slot),
+        };
+        let made_data = ImageData {
+            buffer,
+            mapped: mapped as usize,
+            handle,
+        };
+        for (index, &key) in made.iter().enumerate() {
+            let words = if key == 0 {
+                [0; 2]
+            } else {
+                image_words_at(key as u32, (key >> 32) as u32)
+            };
+            made_data.set(index as u32, words);
+        }
+        let result = (made_data.buffer.clone(), handle);
+        let _ = self.image_data.set(made_data);
+        Some(result)
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///
@@ -359,6 +437,9 @@ impl HostHeap {
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
                 self.make_null(index);
+                if let Some(data) = self.image_data.get() {
+                    data.set(index, [0; 2]);
+                }
             }
             return None;
         };
@@ -374,6 +455,9 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
+            if let Some(data) = self.image_data.get() {
+                data.set(index, image_words_at(i, generation));
+            }
         }
         Some(view)
     }
@@ -426,6 +510,82 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
             .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
             .read_unaligned()
     }
+}
+
+fn image_words_at(index: u32, generation: u32) -> [u32; 2] {
+    let views = super::VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    views
+        .list
+        .get(index as usize)
+        .filter(|entry| entry.generation == generation)
+        .map_or([0; 2], |entry| entry.image_words)
+}
+
+/// RDNA2 stores the dimensions of mip zero and the view's first mip.
+pub(super) fn image_words(view: &View) -> Option<[u32; 2]> {
+    let placed_size = |resource: &[u32; 14]| {
+        (2..=4).contains(&resource[0]).then_some((
+            u64::from(resource[4]) | u64::from(resource[5]) << 32,
+            resource[6],
+        ))
+    };
+    let (size, mip) = match view {
+        View::Shader(resource, desc) => (
+            crate::resource::texture_dimensions(*resource as crate::object::This)?,
+            desc.as_ref().map_or(Some(0), image_srv_mip)?,
+        ),
+        View::Unordered(resource, _, desc) => (
+            crate::resource::texture_dimensions(*resource as crate::object::This)?,
+            desc.as_ref().map_or(Some(0), image_uav_mip)?,
+        ),
+        View::Placed(false, resource, desc) => (
+            placed_size(resource)?,
+            image_srv_mip(desc[..10].try_into().ok()?)?,
+        ),
+        View::Placed(true, resource, desc) => (
+            placed_size(resource)?,
+            image_uav_mip(desc[..10].try_into().ok()?)?,
+        ),
+        _ => return None,
+    };
+    let (width, height) = size;
+    if width == 0 || width > 1 << 14 || height == 0 || height > 1 << 14 || mip > 15 {
+        return None;
+    }
+    Some([(height - 1) << 16 | (width as u32 - 1), mip])
+}
+
+fn image_srv_mip(words: &[u32; 10]) -> Option<u32> {
+    let d = srv_desc(words);
+    // SAFETY: the view dimension names the union member read here.
+    Some(unsafe {
+        match d.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE1D => d.Anonymous.Texture1D.MostDetailedMip,
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY => d.Anonymous.Texture1DArray.MostDetailedMip,
+            D3D12_SRV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.MostDetailedMip,
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => d.Anonymous.Texture2DArray.MostDetailedMip,
+            D3D12_SRV_DIMENSION_TEXTURE2DMS | D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => 0,
+            D3D12_SRV_DIMENSION_TEXTURE3D => d.Anonymous.Texture3D.MostDetailedMip,
+            D3D12_SRV_DIMENSION_TEXTURECUBE => d.Anonymous.TextureCube.MostDetailedMip,
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => d.Anonymous.TextureCubeArray.MostDetailedMip,
+            _ => return None,
+        }
+    })
+}
+
+fn image_uav_mip(words: &[u32; 10]) -> Option<u32> {
+    let d = uav_desc(words);
+    // SAFETY: the view dimension names the union member read here.
+    Some(unsafe {
+        match d.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE1D => d.Anonymous.Texture1D.MipSlice,
+            D3D12_UAV_DIMENSION_TEXTURE1DARRAY => d.Anonymous.Texture1DArray.MipSlice,
+            D3D12_UAV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.MipSlice,
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => d.Anonymous.Texture2DArray.MipSlice,
+            D3D12_UAV_DIMENSION_TEXTURE3D => d.Anonymous.Texture3D.MipSlice,
+            _ => return None,
+        }
+    })
 }
 
 /// A buffer view of title memory at `address` on its host copy: the first
@@ -922,6 +1082,33 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_data_keeps_mip_zero_dimensions_and_view_mip() {
+        let mut resource = [0; 14];
+        resource[0] = 3; // Texture2D.
+        resource[4] = 257;
+        resource[6] = 129;
+        let mut srv = [0; 16];
+        srv[0] = DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32;
+        srv[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+        srv[4] = 3;
+        assert_eq!(
+            image_words(&View::Placed(false, resource, srv)),
+            Some([128 << 16 | 256, 3])
+        );
+
+        let mut uav = [0; 16];
+        uav[0] = srv[0];
+        uav[1] = D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32;
+        uav[2] = 5;
+        assert_eq!(
+            image_words(&View::Placed(true, resource, uav)),
+            Some([128 << 16 | 256, 5])
+        );
+        resource[0] = 1; // Buffer.
+        assert_eq!(image_words(&View::Placed(true, resource, uav)), None);
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

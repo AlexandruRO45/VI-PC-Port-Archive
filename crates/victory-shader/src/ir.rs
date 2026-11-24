@@ -15,6 +15,8 @@
 //! operand's whole possible range: from the encoded register up to the
 //! program's VGPR count, all read (and all written, for a destination).
 
+use std::collections::HashSet;
+
 use crate::ShaderError;
 use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
 
@@ -116,6 +118,82 @@ impl Inst {
     /// The value this instruction writes to `reg`.
     pub fn write(&self, reg: Reg) -> Option<Value> {
         self.writes.iter().find(|w| w.0 == reg).map(|w| w.1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScalarDword {
+    Const(u32),
+    Value(Value),
+}
+
+/// A constant lane read can recover an SGPR spilled by `v_writelane_b32`.
+/// Both operations ignore EXEC. Follow writes to that lane through the VGPR
+/// SSA graph, requiring every incoming path to supply the same scalar.
+pub(crate) fn restored_scalar<'a>(
+    inst: &Inst,
+    wave64: bool,
+    def: impl Fn(Value) -> Option<&'a Inst>,
+    phi: impl Fn(Value) -> Option<&'a Phi>,
+) -> Option<ScalarDword> {
+    let Fields::Valu(read) = &inst.fields else {
+        return None;
+    };
+    if inst.name() != "v_readlane_b32" {
+        return None;
+    }
+    let [Operand::Vector { reg, .. }, lane] = read.src[..] else {
+        return None;
+    };
+    let bits = if wave64 { 63 } else { 31 };
+    let lane = scalar_immediate(lane)? & bits;
+    let mut work = vec![inst.read(Reg::V(reg))?];
+    let mut seen = HashSet::new();
+    let mut found = None;
+    while let Some(v) = work.pop() {
+        if !seen.insert(v) {
+            continue;
+        }
+        if let Some(q) = phi(v) {
+            work.extend(&q.args);
+            continue;
+        }
+        let writer = def(v)?;
+        let Fields::Valu(write) = &writer.fields else {
+            return None;
+        };
+        if writer.name() != "v_writelane_b32" {
+            return None;
+        }
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (write.dst, &write.src[..]) else {
+            return None;
+        };
+        if scalar_immediate(*at)? & bits != lane {
+            work.push(writer.read(Reg::V(reg))?);
+            continue;
+        }
+        let scalar = match *value {
+            Operand::Scalar { code, .. } if code != gfx10::NULL => {
+                ScalarDword::Value(writer.read(Reg::S(code))?)
+            }
+            operand => ScalarDword::Const(scalar_immediate(operand)?),
+        };
+        if found.is_some_and(|f| f != scalar) {
+            return None;
+        }
+        found = Some(scalar);
+    }
+    found
+}
+
+fn scalar_immediate(op: Operand) -> Option<u32> {
+    match op {
+        Operand::Scalar {
+            code: gfx10::NULL, ..
+        } => Some(0),
+        Operand::Literal(x) => Some(x),
+        Operand::Const(c) => gfx10::inline(c),
+        _ => None,
     }
 }
 

@@ -99,6 +99,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
+/// The raw SRV carrying image size and base mip for each slot of the
+/// resource heap. The register is outside the title's possible root slots.
+pub const DESCRIPTOR_DATA_SLOT: u8 = u8::MAX;
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
@@ -153,8 +157,9 @@ pub struct HostShader {
     /// Root CBVs the shader reads: root parameter indices, each bound as
     /// `b<index>` in [`ROOT_CBV_SPACE`].
     pub root_cbvs: Vec<u8>,
-    /// Root SRVs (raw buffers) the shader reads: `t<index>` in
-    /// [`ROOT_CBV_SPACE`].
+    /// Raw buffer SRVs the shader reads: `t<index>` in [`ROOT_CBV_SPACE`].
+    /// The host binds [`DESCRIPTOR_DATA_SLOT`] through a descriptor table
+    /// and the title's root SRVs as root descriptors.
     pub root_srvs: Vec<u8>,
 }
 
