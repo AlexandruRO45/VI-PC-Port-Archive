@@ -128,10 +128,8 @@ pub fn run(
     // ends it (on Windows, the window close is caught by its procedure).
     #[cfg(target_os = "linux")]
     victory_hle::modules::lifecycle::end_on_signals();
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(all(any(windows, target_os = "linux"), feature = "diagnostics"))]
     diagnostics(&image, &cfg);
-    #[cfg(all(target_os = "linux", feature = "diagnostics"))]
-    victory_loader::dump_stacks_on_schedule();
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
@@ -154,9 +152,10 @@ pub fn run(
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
 /// memory saved on a crash.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(any(windows, target_os = "linux"), feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
+    #[cfg(windows)]
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
@@ -180,7 +179,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
 
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each
 /// title+rva whenever it changes, polled every 5 ms (an engine's state, say).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(any(windows, target_os = "linux"), feature = "diagnostics"))]
 fn watch(base: usize, size: usize) {
     let Ok(list) = std::env::var("VICTORY_WATCH") else {
         return;
