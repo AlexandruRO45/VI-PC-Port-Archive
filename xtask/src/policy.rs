@@ -2642,6 +2642,60 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// A rule's metacharacters are never also read literally: `/[ab]/`
+    /// takes `a` but leaves a directory named `[ab]` visible, so that is
+    /// refused, while the escaped `/\[cd]/` takes `[cd]` and refuses `c`; a
+    /// `*` matches itself as well as anything else, so `/q*z/` takes `q*z`
+    /// and `qxz`. Bracket classes and ranges are case-sensitive until
+    /// `core.ignoreCase=true`: `/[[:upper:]]up/` and `/[A-C]rng/` take `Xup`
+    /// and `Arng` but refuse `yup` and `crng`, which they take once case is
+    /// ignored; `[ab]` and `c` are refused either way.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_matched_by_metacharacters_never_literally() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        git_str(root, &["config", "core.ignoreCase", "false"]);
+        std::fs::write(
+            root.join(".gitignore"),
+            "/[ab]/\n/\\[cd]/\n/q*z/\n/[[:upper:]]up/\n/[A-C]rng/\n",
+        )
+        .unwrap();
+        let taken = ["a", "[cd]", "q*z", "qxz", "Xup", "Arng"].map(|d| root.join(d));
+        let refused = ["[ab]", "c"].map(|d| root.join(d));
+        let cased = ["yup", "crng"].map(|d| root.join(d));
+        for dir in taken.iter().chain(&refused).chain(&cased) {
+            std::fs::create_dir(dir).unwrap();
+        }
+
+        let in_first = |hidden: &std::path::PathBuf, also_refused: &[std::path::PathBuf]| {
+            let mut candidates = refused.to_vec();
+            candidates.extend_from_slice(also_refused);
+            candidates.push(hidden.clone());
+            let tmp = tempdir_in_first(root, candidates);
+            assert_eq!(tmp.path().parent(), Some(hidden.as_path()));
+            std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+            tmp
+        };
+        let mut tmps: Vec<_> = taken.iter().map(|d| in_first(d, &cased)).collect();
+        for dir in refused.iter().chain(&cased) {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+
+        git_str(root, &["config", "core.ignoreCase", "true"]);
+        tmps.extend(cased.iter().map(|d| in_first(d, &[])));
+        assert_eq!(tmps.len(), taken.len() + cased.len());
+        for dir in &refused {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        for (i, dir) in refused.iter().enumerate() {
+            std::fs::write(dir.join(format!("f{i}.rs")), b"fn f() {}\n").unwrap();
+        }
+        assert_eq!(names(root, false), [".gitignore", "[ab]/f0.rs", "c/f1.rs"]);
+        super::run(root, false).unwrap();
+    }
+
     /// A TMPDIR spelled with `.` or `..` is judged by the directory it
     /// names, not by its spelling: `visible/../ignored` and `ignored/.` are
     /// taken in `ignored`, while `ignored/../visible`, which passes through
