@@ -275,9 +275,12 @@ pub extern "system" fn CreateFileW(
     );
     if p.1.is_some() {
         // Releasing the translated path can change the thread's last error.
-        let error = unsafe { GetLastError() };
-        drop(p);
-        unsafe { SetLastError(error) };
+        // SAFETY: both functions operate on the calling thread's error slot.
+        unsafe {
+            let error = GetLastError();
+            drop(p);
+            SetLastError(error);
+        }
     }
     handle
 }
