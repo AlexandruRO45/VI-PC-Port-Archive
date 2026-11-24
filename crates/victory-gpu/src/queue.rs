@@ -167,13 +167,20 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
 extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
     if fence.is_null() { E_INVALIDARG } else { S_OK }
 }
-/// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
+/// Ticks per second of GPU timestamps (real host queue frequency when running
+/// on host D3D12, falling back to [`TIMESTAMP_FREQUENCY`] when headless).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    let freq = crate::host::host()
+        .and_then(|h| h.timestamp_frequency())
+        .unwrap_or(TIMESTAMP_FREQUENCY);
+    #[cfg(not(windows))]
+    let freq = TIMESTAMP_FREQUENCY;
     // SAFETY: checked non-null.
-    unsafe { out.write(TIMESTAMP_FREQUENCY) };
+    unsafe { out.write(freq) };
     S_OK
 }
 const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
@@ -209,6 +216,7 @@ impl Written {
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     }
 }
 

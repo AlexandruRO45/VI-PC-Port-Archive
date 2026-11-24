@@ -17,7 +17,7 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -814,26 +814,57 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        if options & PAGE_DESTINATION != 0 {
+            let offset = (request.page_offset & 0xffff) as usize;
+            // SAFETY: the title passes a page number per 64 KiB of destination,
+            // which holds at least `size` bytes from `offset`.
+            let pages = unsafe {
+                std::slice::from_raw_parts(
+                    request.destination.cast::<usize>(),
+                    (offset + size).div_ceil(PAGE),
+                )
+            };
+            // Stream directly into each contiguous physical-page run without
+            // allocating a staging copy or zero-filling multi-MiB buffers.
+            let ok = super::xmem::write_physical_with(pages, offset, size, |done, dst| {
+                read_into_at(request, done as u64, dst)
+            })
+            .map_err(|hr| fail(hr, "copying"))?;
+            return if ok {
+                Ok(())
+            } else {
+                Err(fail(E_INVALIDARG, "copying"))
+            };
+        }
+        return into_destination(request, size, |out| {
+            read_into_at(request, 0, out).map(|()| size)
+        })
+        .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
-    // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
-    } else {
-        source
-    };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
-    })?;
+    with_source(request, |raw_source| {
+        // The console's order: zlib first, then BCPack.
+        if bc != 0 && options & ZLIB != 0 {
+            let inter_size = request.intermediate_size as usize;
+            with_scratch(&SCRATCH_INTER, inter_size, |packed| {
+                let n = inflate(raw_source, packed).map_err(|hr| fail(hr, "zlib"))?;
+                let packed = &packed[..n];
+                into_destination(request, size, |out| {
+                    bcpack::decode(bc, packed, out, tables.unwrap())
+                        .map(|()| out.len())
+                        .map_err(|e| fail(INVALID_DATA, &e.to_string()))
+                })
+            })
+        } else {
+            into_destination(request, size, |out| match tables {
+                Some(tables) => bcpack::decode(bc, raw_source, out, tables)
+                    .map(|()| out.len())
+                    .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+                None => inflate(raw_source, out).map_err(|hr| fail(hr, "zlib")),
+            })
+        }
+    })
+    .map_err(|hr| fail(hr, "reading or decompressing the source"))?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
@@ -894,28 +925,70 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// Cap on per-worker reusable scratch buffer retention (16 MiB); larger
+/// one-off chunks are released back to the OS once completed.
+const MAX_SCRATCH_RETAIN: usize = 16 << 20;
+
+thread_local! {
+    static SCRATCH_SRC: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static SCRATCH_INTER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static SCRATCH_DST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Lends a reusable per-worker `len`-byte buffer to `f`, avoiding per-request
+/// heap allocations and OS zero-page faults during bulk world streaming.
+fn with_scratch<R>(
+    slot: &'static std::thread::LocalKey<RefCell<Vec<u8>>>,
+    len: usize,
+    f: impl FnOnce(&mut [u8]) -> R,
+) -> R {
+    slot.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        let result = f(&mut buf[..len]);
+        if buf.capacity() > MAX_SCRATCH_RETAIN {
+            buf.clear();
+            buf.shrink_to_fit();
+        }
+        result
+    })
+}
+
+/// Borrows a compressed request's source from memory or reads it from the file
+/// into the worker's reusable source scratch buffer.
+fn with_source<R>(
+    request: &Request,
+    f: impl FnOnce(&[u8]) -> Result<R, HRESULT>,
+) -> Result<R, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return f(bytes);
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    with_scratch(&SCRATCH_SRC, size, |buf| {
+        read_into_at(request, 0, buf)?;
+        f(buf)
+    })
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
-/// Fills `out` (the source size) from the request's file or memory.
-fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+/// Fills `out` starting `rel_offset` bytes into the request's file or memory
+/// source.
+fn read_into_at(request: &Request, rel_offset: u64, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
-        // SAFETY: the title's source holds `out.len()` bytes until completion.
-        out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
+        // SAFETY: the title's source holds at least `rel_offset + out.len()` bytes until completion.
+        let src = unsafe {
+            std::slice::from_raw_parts(
+                request.source.cast::<u8>().wrapping_add(rel_offset as usize),
+                out.len(),
+            )
+        };
+        out.copy_from_slice(src);
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
@@ -924,11 +997,12 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         .file;
     let started = std::time::Instant::now();
     let mut done = 0;
+    let base = request.offset + rel_offset;
     let result = loop {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        match file.seek_read(&mut out[done..], base + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
@@ -942,7 +1016,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
 /// physical pages are too when they are consecutive pages of one
-/// allocation, and otherwise go through a buffer.
+/// allocation, and otherwise reuse the worker's scratch buffer.
 fn into_destination(
     request: &Request,
     len: usize,
@@ -971,13 +1045,14 @@ fn into_destination(
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
-        Ok(())
-    } else {
-        Err(E_INVALIDARG)
-    }
+    with_scratch(&SCRATCH_DST, len, |data| {
+        let n = fill(data)?;
+        if super::xmem::write_physical(pages, offset, &data[..n]) {
+            Ok(())
+        } else {
+            Err(E_INVALIDARG)
+        }
+    })
 }
 
 /// Slots by the 2020 order, which the argument shapes at Grand Theft Auto

@@ -95,7 +95,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{CONST_VIEW_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -137,6 +137,16 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// A 64-bit GPU address passed in two adjacent 32-bit root constants
+/// `(slot, dword)` and `(slot, dword + 1)`, bound as a root descriptor at
+/// register `register` in [`CONST_VIEW_SPACE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConstRootView {
+    pub slot: u8,
+    pub dword: u32,
+    pub register: u32,
+}
+
 pub struct HostShader {
     pub stage: HwStage,
     /// The DXIL container, hashed as D3D12 expects.
@@ -154,6 +164,20 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
+    /// [`ROOT_CBV_SPACE`].
+    pub root_uavs: Vec<u8>,
+    /// Root CBVs carried in adjacent root-constant pairs: `b<register>` in
+    /// [`CONST_VIEW_SPACE`].
+    pub const_cbvs: Vec<ConstRootView>,
+    /// Root SRVs (raw buffers) carried in adjacent root-constant pairs:
+    /// `t<register>` in [`CONST_VIEW_SPACE`].
+    pub const_srvs: Vec<ConstRootView>,
+    /// Root UAVs (raw buffers) carried in adjacent root-constant pairs:
+    /// `u<register>` in [`CONST_VIEW_SPACE`].
+    pub const_uavs: Vec<ConstRootView>,
+    /// Declared DXIL compute `WaveSize`, if any (32 or 64).
+    pub wave_size: Option<u32>,
 }
 
 impl HostShader {
@@ -183,33 +207,51 @@ pub struct UserData {
     pub dword: u32,
 }
 
-/// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// Translates the vertex, pixel, compute, mesh or merged geometry program of
+/// a console shader container, assuming a 64-lane capable host GPU.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_for(container, 64)
+}
+
+/// Like [`translate`], tailored for a host GPU whose maximum supported wave
+/// width is `max_wave_size` (32 on 32-lane GPUs, 64 on RDNA/Intel GPUs).
+pub fn translate_for(container: &[u8], max_wave_size: u32) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
-        .into_iter()
+    let progs = crate::native_programs(dxil.data)?;
+    let native = progs
+        .iter()
         .find(|p| {
             matches!(
                 p.stage,
                 HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
             )
         })
+        .or_else(|| {
+            // Fall back to merged geometry front-end/NGG stages (`Es`, `Ls`,
+            // `Gs`) when the container has no standalone `Vs`/`Ms` variant.
+            progs.iter().find(|p| {
+                matches!(
+                    (p.stage, &p.io),
+                    (HwStage::Es | HwStage::Ls, crate::native::StageIo::Vs { .. })
+                        | (HwStage::Gs, crate::native::StageIo::Ms(_))
+                )
+            })
+        })
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, pixel, compute, mesh or merged geometry program",
         })?;
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     let res = resource::track(&p, &native.layout, native.stage)?;
-    let io = io::raise(&p, &native)?;
+    let io = io::raise(&p, native)?;
     let st = structure::structure(&p)?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_for(&c, native, &p, &st, &io, &res, max_wave_size)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran, assuming a 64-lane host.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -217,6 +259,19 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_for(c, native, p, st, io, res, 64)
+}
+
+/// Like [`emit`], tailored to a host GPU's maximum wave lane count.
+pub fn emit_for(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    max_wave_size: u32,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -276,6 +331,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        max_wave_size,
     })?;
     Ok(HostShader {
         stage: native.stage,
@@ -296,6 +352,11 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        const_cbvs: l.const_cbvs,
+        const_srvs: l.const_srvs,
+        const_uavs: l.const_uavs,
+        wave_size: l.wave_size,
     })
 }
 
@@ -447,6 +508,7 @@ mod tests {
     }
 
     /// A pixel shader writing a constant colour.
+    #[cfg(windows)]
     fn constant_color() -> Vec<u8> {
         let mut s = Shader::new(true);
         s.outputs.push(SigElement {
@@ -490,6 +552,11 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            const_cbvs: Vec::new(),
+            const_srvs: Vec::new(),
+            const_uavs: Vec::new(),
+            wave_size: None,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -500,6 +567,11 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                const_cbvs: Vec::new(),
+                const_srvs: Vec::new(),
+                const_uavs: Vec::new(),
+                wave_size: None,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
