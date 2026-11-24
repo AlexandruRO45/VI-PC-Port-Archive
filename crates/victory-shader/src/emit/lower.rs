@@ -16,7 +16,9 @@ use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
-use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
+use crate::native::{
+    HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, Usage, UsedResource,
+};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
@@ -3658,6 +3660,12 @@ impl<'a> Lower<'a> {
             return self.code_smem(inst, a);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
+            if let Some(a) = self.scalar.get(&site).copied()
+                && let Some(rp) = self.x.native.layout.get(a.param).copied()
+                && rp.root == RootType::Descriptor
+            {
+                return self.root_descriptor_smem(inst, &a, rp);
+            }
             return self.descriptor_data(inst, site);
         };
         let count = match rest {
@@ -3700,23 +3708,7 @@ impl<'a> Lower<'a> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
-            for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
-                self.write(inst, Reg::S(code + k as u8), x, None);
-            }
+            self.scalar_srv_load(inst, code, count, h, addr);
             return Ok(());
         }
         let h = self.handle(site, src, false, (13, 0x1_0000))?;
@@ -3728,6 +3720,41 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
+        self.scalar_cbv_load(inst, code, count, h, addr, constant);
+        Ok(())
+    }
+
+    fn scalar_srv_load(&mut self, inst: &Inst, code: u8, count: u32, h: V, addr: V) {
+        let c = self.cur;
+        let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let mask = self.s.m.i8(1);
+        for k in 0..count {
+            let off = self.s.m.i32(4 * k);
+            let a = self.s.m.bin(c, Bin::Add, addr, off);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, a, u, mask, al],
+            );
+            let x = self.s.m.extract(c, r, 0);
+            let x = self.as_int(x);
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+    }
+
+    fn scalar_cbv_load(
+        &mut self,
+        inst: &Inst,
+        code: u8,
+        count: u32,
+        h: V,
+        addr: V,
+        constant: Option<u32>,
+    ) {
+        let c = self.cur;
         let mut rows: HashMap<u32, V> = HashMap::new();
         for k in 0..count {
             let x = match constant {
@@ -3759,7 +3786,57 @@ impl<'a> Lower<'a> {
             };
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
-        Ok(())
+    }
+
+    /// `s_load_dword*` directly from a root CBV or root SRV address.
+    fn root_descriptor_smem(
+        &mut self,
+        inst: &Inst,
+        a: &Address,
+        rp: RootParam,
+    ) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar load");
+        };
+        let count = match inst.name().strip_prefix("s_load_dword") {
+            Some("") => 1u32,
+            Some("x2") => 2,
+            Some("x4") => 4,
+            Some("x8") => 8,
+            Some("x16") => 16,
+            _ => return Err("a scalar load"),
+        };
+        let c = self.cur;
+        let mut addr = self.s.m.i32(a.offset);
+        let constant = a.dynamic.is_none().then_some(a.offset);
+        if let Some(d) = a.dynamic {
+            let d = self.i32_of(d)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, d);
+        }
+        let used = self
+            .x
+            .native
+            .used
+            .iter()
+            .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data);
+        match used.map(|u| u.kind) {
+            Some(ResourceType::Srv) => {
+                let h = self.s.root_srv_handle(rp.slot);
+                self.scalar_srv_load(inst, code, count, h, addr);
+                Ok(())
+            }
+            Some(ResourceType::Cbv) | None => {
+                let h = self.s.root_cbv_handle(rp.slot);
+                self.scalar_cbv_load(inst, code, count, h, addr, constant);
+                Ok(())
+            }
+            Some(ResourceType::Uav) => Err("a scalar load from a root UAV"),
+            Some(_) => Err("a scalar load from a root descriptor"),
+        }
     }
 
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
@@ -3804,58 +3881,112 @@ impl<'a> Lower<'a> {
                     _ => None,
                 })
             });
-        let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
-        };
-        let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
+        let (src, uav, props, image, rel_bias) = match use_at {
+            Some((at, first)) => {
+                let src = Source::Loaded { load: site, first };
+                let used = self.used_kind(&src);
+                let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+                let un = ui.name();
+                let uav = un.contains("store")
+                    || un.contains("atomic")
+                    || used.is_some_and(|u| u.kind == ResourceType::Uav);
+                let u = if uav { 0x1000 } else { 0 };
+                let (props, image) = match &ui.fields {
+                    Fields::Image { dim, .. } => {
+                        let kind = match dim {
+                            0 => 1,
+                            1 => 2,
+                            2 => 4,
+                            4 => 6,
+                            5 => 7,
+                            _ => return Err("an image dimension (cube or MSAA)"),
+                        };
+                        ((kind | u, 0x409), Some(kind))
+                    }
+                    Fields::Buffer { idxen, format, .. } => {
+                        let stride = used.map_or(0, |u| u.stride);
+                        let props = if un.starts_with("buffer_load_format")
+                            || un.starts_with("buffer_store_format")
+                        {
+                            (10 | u, 0x409)
+                        } else if *idxen
+                            && format.is_none()
+                            && stride >= 4
+                            && stride.is_multiple_of(4)
+                        {
+                            (12 | u, stride)
+                        } else {
+                            (11 | u, 0)
+                        };
+                        if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                            return Err("a constant buffer's descriptor read as data");
+                        }
+                        (props, None)
+                    }
+                    Fields::Smem { .. } if un.starts_with("s_buffer_") => {
+                        if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                            return Err("a constant buffer's descriptor read as data");
+                        }
+                        let stride = used.map_or(0, |u| u.stride);
+                        let props = if stride >= 4 && stride.is_multiple_of(4) {
+                            (12 | u, stride)
+                        } else {
+                            (11 | u, 0)
+                        };
+                        (props, None)
+                    }
+                    _ => return Err("a scalar memory read as data"),
                 };
-                ((kind | u, 0x409), Some(kind))
+                (src, uav, props, image, u32::from(first).wrapping_neg())
             }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
+            None => {
+                let Some(a) = self.scalar.get(&site).copied() else {
+                    return Err("a descriptor read only as data");
+                };
+                let Some(rp) = self.x.native.layout.get(a.param).copied() else {
+                    return Err("a descriptor read only as data");
+                };
+                if rp.root != RootType::Table || !a.offset.is_multiple_of(4) {
+                    return Err("a descriptor read only as data");
+                }
+                let a_dword = a.offset / 4;
+                let Some(used) = self
+                    .x
+                    .native
+                    .used
+                    .iter()
+                    .filter(|u| {
+                        u.root == RootType::Table
+                            && u.user_data == rp.user_data
+                            && u.table_offset_dwords <= a_dword
+                    })
+                    .max_by_key(|u| u.table_offset_dwords)
+                    .copied()
+                else {
+                    return Err("a descriptor read only as data");
+                };
+                if used.dwords != 4 || !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
+                    return Err("a descriptor read only as data");
+                }
+                let rel_start = (a_dword - used.table_offset_dwords) % 8;
+                let uav = used.kind == ResourceType::Uav;
+                let u = if uav { 0x1000 } else { 0 };
+                let props = if used.stride >= 4 && used.stride.is_multiple_of(4) {
+                    (12 | u, used.stride)
                 } else {
                     (11 | u, 0)
                 };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
-                }
-                (props, None)
+                (
+                    Source::Loaded {
+                        load: site,
+                        first: 0,
+                    },
+                    uav,
+                    props,
+                    None,
+                    rel_start,
+                )
             }
-            Fields::Smem { .. } if un.starts_with("s_buffer_") => {
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
-                }
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                (props, None)
-            }
-            _ => return Err("a scalar memory read as data"),
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -3910,7 +4041,7 @@ impl<'a> Lower<'a> {
             None => vec![(2, field(self, 0))],
         };
         for k in 0..count {
-            let rel = k.wrapping_sub(u32::from(first));
+            let rel = k.wrapping_add(rel_bias);
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
