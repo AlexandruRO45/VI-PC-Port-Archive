@@ -328,11 +328,97 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyFootprintError {
+    UnalignedPitch(u32),
+    UnalignedOffset(u64),
+    InvalidFormat(u32),
+    ZeroDimensions,
+}
+
+/// Computes and validates a placed footprint for texture <-> buffer copies.
+/// Requires the row pitch to be a multiple of 256 (D3D12 requirement).
+/// If row pitch is 0, it computes the aligned row pitch from the width and format.
+/// Returns the validated `PlacedFootprint` and the total bytes spanned.
+pub(crate) fn compute_copy_footprint(
+    footprint: &PlacedFootprint,
+    src_desc: Option<&ResourceDesc>,
+) -> Result<(PlacedFootprint, u64), CopyFootprintError> {
+    const PITCH_ALIGNMENT: u32 = 256;
+    const OFFSET_ALIGNMENT: u64 = 512;
+
+    if footprint.offset % OFFSET_ALIGNMENT != 0 {
+        return Err(CopyFootprintError::UnalignedOffset(footprint.offset));
+    }
+
+    let format = if footprint.format != 0 {
+        footprint.format
+    } else if let Some(d) = src_desc {
+        d.format
+    } else {
+        0
+    };
+    let format = pc_format(format);
+    let (element, block) = element(format).ok_or(CopyFootprintError::InvalidFormat(format))?;
+
+    let width = if footprint.width != 0 {
+        footprint.width
+    } else if let Some(d) = src_desc {
+        u32::try_from(d.width).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let height = if footprint.height != 0 {
+        footprint.height
+    } else if let Some(d) = src_desc {
+        d.height
+    } else {
+        0
+    };
+
+    let depth = if footprint.depth != 0 {
+        footprint.depth
+    } else if let Some(d) = src_desc && d.dimension == TEXTURE_3D {
+        u32::from(d.depth_or_array_size).max(1)
+    } else {
+        1
+    };
+
+    if width == 0 || height == 0 || depth == 0 {
+        return Err(CopyFootprintError::ZeroDimensions);
+    }
+
+    let width_blocks = u64::from(width).div_ceil(block);
+    let row_size = width_blocks * element;
+
+    let row_pitch = if footprint.row_pitch != 0 {
+        if footprint.row_pitch % PITCH_ALIGNMENT != 0 {
+            return Err(CopyFootprintError::UnalignedPitch(footprint.row_pitch));
+        }
+        footprint.row_pitch
+    } else {
+        let aligned = row_size.next_multiple_of(u64::from(PITCH_ALIGNMENT));
+        u32::try_from(aligned).map_err(|_| CopyFootprintError::UnalignedPitch(0))?
+    };
+
+    let fp = PlacedFootprint {
+        offset: footprint.offset,
+        format,
+        width,
+        height,
+        depth,
+        row_pitch,
+    };
+    let bytes = fp.bytes().ok_or(CopyFootprintError::InvalidFormat(format))?;
+    Ok((fp, bytes))
 }
 
 impl PlacedFootprint {
@@ -1902,6 +1988,133 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn copy_footprint_and_pitch_computation() {
+        // 1. Valid RGBA8 (4 bytes per pixel) with aligned pitch (256 bytes)
+        let fp = PlacedFootprint {
+            offset: 0,
+            format: 28, // DXGI_FORMAT_R8G8B8A8_UNORM
+            width: 4,
+            height: 4,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let (computed, bytes) = compute_copy_footprint(&fp, None).expect("valid footprint");
+        assert_eq!(computed.row_pitch, 256);
+        assert_eq!(computed.width, 4);
+        assert_eq!(computed.height, 4);
+        assert_eq!(computed.depth, 1);
+        assert_eq!(computed.offset, 0);
+        // 4 rows: 3 * 256 + 4 * 4 = 768 + 16 = 784 bytes
+        assert_eq!(bytes, 784);
+
+        // 2. Row pitch auto-computation when row_pitch is 0:
+        // 100x100 RGBA8: row size is 400 bytes, next multiple of 256 is 512.
+        let fp_auto = PlacedFootprint {
+            offset: 512,
+            format: 28,
+            width: 100,
+            height: 100,
+            depth: 1,
+            row_pitch: 0,
+        };
+        let (computed_auto, bytes_auto) = compute_copy_footprint(&fp_auto, None).expect("auto pitch");
+        assert_eq!(computed_auto.row_pitch, 512);
+        assert_eq!(computed_auto.offset, 512);
+        // 100 rows: 99 * 512 + 400 = 50688 + 400 = 51088 bytes
+        assert_eq!(bytes_auto, 51088);
+
+        // 3. Fallback to ResourceDesc when footprint dimensions/format are 0
+        let desc = ResourceDesc {
+            dimension: 3, // TEXTURE_2D
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        let fp_desc = PlacedFootprint {
+            offset: 1024,
+            format: 0,
+            width: 0,
+            height: 0,
+            depth: 0,
+            row_pitch: 0,
+        };
+        let (computed_desc, bytes_desc) =
+            compute_copy_footprint(&fp_desc, Some(&desc)).expect("desc fallback");
+        assert_eq!(computed_desc.format, 28);
+        assert_eq!(computed_desc.width, 64);
+        assert_eq!(computed_desc.height, 64);
+        assert_eq!(computed_desc.depth, 1);
+        // row_size = 64 * 4 = 256, aligned to 256 is 256
+        assert_eq!(computed_desc.row_pitch, 256);
+        // 64 rows: 63 * 256 + 256 = 16384 bytes
+        assert_eq!(bytes_desc, 16384);
+
+        // 4. Block compressed format (BC1: 8 bytes per 4x4 block)
+        // 16x16 texels = 4x4 blocks. row_size = 4 * 8 = 32 bytes, aligned to 256 is 256.
+        let fp_bc1 = PlacedFootprint {
+            offset: 0,
+            format: 71, // DXGI_FORMAT_BC1_UNORM
+            width: 16,
+            height: 16,
+            depth: 1,
+            row_pitch: 0,
+        };
+        let (computed_bc1, bytes_bc1) = compute_copy_footprint(&fp_bc1, None).expect("bc1");
+        assert_eq!(computed_bc1.row_pitch, 256);
+        // 4 block rows: 3 * 256 + 32 = 800 bytes
+        assert_eq!(bytes_bc1, 800);
+
+        // 5. Unaligned row pitch is rejected
+        let fp_unaligned_pitch = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 4,
+            height: 4,
+            depth: 1,
+            row_pitch: 100, // not a multiple of 256
+        };
+        assert_eq!(
+            compute_copy_footprint(&fp_unaligned_pitch, None),
+            Err(CopyFootprintError::UnalignedPitch(100))
+        );
+
+        // 6. Unaligned offset is rejected (must be multiple of 512)
+        let fp_unaligned_offset = PlacedFootprint {
+            offset: 256, // not a multiple of 512
+            format: 28,
+            width: 4,
+            height: 4,
+            depth: 1,
+            row_pitch: 256,
+        };
+        assert_eq!(
+            compute_copy_footprint(&fp_unaligned_offset, None),
+            Err(CopyFootprintError::UnalignedOffset(256))
+        );
+
+        // 7. Zero dimensions with no ResourceDesc is rejected
+        let fp_zero = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 0,
+            height: 0,
+            depth: 0,
+            row_pitch: 0,
+        };
+        assert_eq!(
+            compute_copy_footprint(&fp_zero, None),
+            Err(CopyFootprintError::ZeroDimensions)
+        );
     }
 }
 
