@@ -743,10 +743,103 @@ mod tests {
     fn unpaired_or_unknown_interpolation_fails() {
         // p2 alone: its old dst is no p1's result.
         let lone = program(&[0xC809_0001, S_ENDPGM]); // v_interp_p2_f32 v2, v1, attr0.x
-        assert!(raise(&lone, &pixel(vec![TEXCOORD], 2)).is_err());
+        assert_eq!(
+            raise(&lone, &pixel(vec![TEXCOORD], 2)),
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "an interpolation without its first half"
+            })
+        );
         // attr1 is not in the stage data.
         let other = program(&[0xC808_0400, S_ENDPGM]); // v_interp_p1_f32 v2, v0, attr1.x
-        assert!(raise(&other, &pixel(vec![TEXCOORD], 2)).is_err());
+        let unlisted = Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "an interpolated attribute the stage data does not list",
+        });
+        assert_eq!(raise(&other, &pixel(vec![TEXCOORD], 2)), unlisted);
+        // A vertex read of an unlisted attribute is refused the same way,
+        // before its vertex is looked at.
+        let mov = program(&[0xC80A_0403, S_ENDPGM]); // v_interp_mov_f32 v2, 3, attr1.x
+        assert_eq!(raise(&mov, &pixel(vec![TEXCOORD], 2)), unlisted);
+        // With no inputs listed at all, attr0 is unlisted too.
+        let pair = program(&[0xC808_0000, 0xC809_0001, S_ENDPGM]);
+        assert_eq!(raise(&pair, &pixel(vec![], 2)), unlisted);
+    }
+
+    /// The 16-bit interpolation pairs `v_interp_p1ll_f16` (i) with
+    /// `v_interp_p2_f16` (j, then the first half's result); other VOP3
+    /// interpolation forms are refused where they stand.
+    #[test]
+    fn half_precision_interpolation_pairs_or_is_refused() {
+        let ps = pixel(vec![TEXCOORD], 2);
+        // v_interp_p1ll_f16 v4, attr0.y, v0
+        // v_interp_p2_f16 v4, attr0.y, v1, v4
+        let p = program(&[0xD742_0004, 0x0002_0040, 0xD75A_0004, 0x0412_0240, S_ENDPGM]);
+        let io = raise(&p, &ps).unwrap();
+        assert_eq!(
+            io.interps,
+            [(
+                (0, 1),
+                Interp::Interpolated {
+                    attribute: Attribute {
+                        usage: Usage::Generic,
+                        row: 1,
+                        channel: 1,
+                        high: false
+                    },
+                    barycentric: Barycentric::PerspectiveCenter,
+                    first: vec![(0, 0)],
+                }
+            )]
+        );
+        // The second half alone has no first half to pair with.
+        let lone = program(&[0xD75A_0004, 0x0412_0240, S_ENDPGM]);
+        assert_eq!(
+            raise(&lone, &ps),
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "an interpolation without its first half"
+            })
+        );
+        // i and j swapped between the halves is no barycentric pair.
+        let swapped = program(&[
+            0xD742_0004,
+            0x0002_0240, // v_interp_p1ll_f16 v4, attr0.y, v1
+            0xD75A_0004,
+            0x0412_0040, // v_interp_p2_f16 v4, attr0.y, v0, v4
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            raise(&swapped, &ps),
+            Err(ShaderError::Unsupported {
+                offset: 8,
+                what: "an interpolation with computed barycentrics"
+            })
+        );
+        // The halves of different channels do not make one interpolation.
+        let mixed = program(&[
+            0xD742_0004,
+            0x0002_0000, // v_interp_p1ll_f16 v4, attr0.x, v0
+            0xD75A_0004,
+            0x0412_0240, // v_interp_p2_f16 v4, attr0.y, v1, v4
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            raise(&mixed, &ps),
+            Err(ShaderError::Unsupported {
+                offset: 8,
+                what: "interpolation halves of different attributes"
+            })
+        );
+        // v_interp_p1lv_f16 v4, attr0.x, v0, v1: a form not raised yet.
+        let lv = program(&[0xD743_0004, 0x0406_0000, S_ENDPGM]);
+        assert_eq!(
+            raise(&lv, &ps),
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "an interpolation form"
+            })
+        );
     }
 
     #[test]
