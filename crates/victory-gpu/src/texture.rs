@@ -314,8 +314,8 @@ fn fast_digest_128(data: &[u8]) -> [u64; 2] {
     let mut s1 = K1;
     let mut s2 = K2;
     let mut s3 = K3;
-    let mut chunks = data.chunks_exact(32);
-    for c in &mut chunks {
+    let (chunks, rem) = data.as_chunks::<32>();
+    for c in chunks {
         let a = u64::from_le_bytes(c[0..8].try_into().unwrap());
         let b = u64::from_le_bytes(c[8..16].try_into().unwrap());
         let x = u64::from_le_bytes(c[16..24].try_into().unwrap());
@@ -325,18 +325,17 @@ fn fast_digest_128(data: &[u8]) -> [u64; 2] {
         s2 = (s2 ^ x).wrapping_mul(K3).rotate_left(23);
         s3 = (s3 ^ y).wrapping_mul(K0).rotate_left(29);
     }
-    let rem = chunks.remainder();
-    let mut tail = rem.chunks_exact(8);
-    for t in &mut tail {
-        let w = u64::from_le_bytes(t.try_into().unwrap());
+    let (tail, last_bytes) = rem.as_chunks::<8>();
+    for t in tail {
+        let w = u64::from_le_bytes(*t);
         s0 = (s0 ^ w).wrapping_mul(K1).rotate_left(27);
         std::mem::swap(&mut s0, &mut s1);
     }
     let mut last = 0u64;
-    for (i, &b) in tail.remainder().iter().enumerate() {
+    for (i, &b) in last_bytes.iter().enumerate() {
         last |= u64::from(b) << (i * 8);
     }
-    if !tail.remainder().is_empty() {
+    if !last_bytes.is_empty() {
         s2 = (s2 ^ last).wrapping_mul(K2).rotate_left(23);
     }
     let mix = |mut x: u64| {

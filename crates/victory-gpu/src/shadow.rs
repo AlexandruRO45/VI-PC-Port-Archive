@@ -594,6 +594,7 @@ fn committed_span(address: u64, max: u64) -> u64 {
     while total < max {
         // SAFETY: plain struct filled by `VirtualQuery`.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid out pointer of the exact `MEMORY_BASIC_INFORMATION` size.
         let ok = unsafe {
             VirtualQuery(
                 cur as *const _,
@@ -610,10 +611,10 @@ fn committed_span(address: u64, max: u64) -> u64 {
         }
         let step = ((region_end - cur) as u64).min(max - total);
         total += step;
-        cur = match cur.checked_add(step as usize) {
-            Some(next) => next,
-            None => break,
+        let Some(next) = cur.checked_add(step as usize) else {
+            break;
         };
+        cur = next;
     }
     total
 }

@@ -1343,9 +1343,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], unordered: bool) -> Opt
     if made != S_OK {
         return None;
     }
-    if resource(out).host.is_none() {
-        return None;
-    }
+    resource(out).host.as_ref()?;
     if unordered {
         crate::texture::host_written(out);
     }
