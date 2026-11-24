@@ -307,7 +307,20 @@ fn config_file(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
 /// `~/victory/tmp/..` would not be seen to hold `~/victory/data`. The error
 /// says where each folder came from, so it is clear which setting caused it.
 fn ensure_data_outside_cache(cache_dir: &Path, data_dir: &Path, origins: &Origins) -> Result<()> {
-    if lexical(data_dir).starts_with(lexical(cache_dir)) {
+    if is_within(data_dir, cache_dir, FOLD_CASE) {
+        if origins.cache_dir == Origin::Default && origins.data_dir == Origin::Default {
+            // Both defaults: XDG_CACHE_HOME and XDG_DATA_HOME (or one under
+            // the other) are the cause, and the generic advice would not
+            // say so.
+            anyhow::bail!(
+                "the default data folder {} is inside the default cache folder {}, which \
+                 may be deleted at any time, because XDG_DATA_HOME is inside (or the same \
+                 as) XDG_CACHE_HOME; point them at different folders, or set \
+                 VICTORY_DATA_DIR or [paths].data_dir to a folder outside the cache",
+                data_dir.display(),
+                cache_dir.display()
+            );
+        }
         anyhow::bail!(
             "the data folder {} (from {}) is inside the cache folder {} (from {}), which may \
              be deleted at any time; set VICTORY_DATA_DIR or [paths].data_dir to a folder \
@@ -331,9 +344,7 @@ fn ensure_data_outside_cache(cache_dir: &Path, data_dir: &Path, origins: &Origin
 /// `[paths].cache_dir = "cache"` in a `victory.toml` kept inside the dump.
 /// Compared like [`ensure_data_outside_cache`]: lexically, without the disk.
 fn ensure_game_apart(game: &Path, cache: &Path, data: &Path, origins: &Origins) -> Result<()> {
-    let g = lexical(game);
-    let c = lexical(cache);
-    if g.starts_with(&c) {
+    if is_within(game, cache, FOLD_CASE) {
         anyhow::bail!(
             "the game folder {} (from {}) is inside the cache folder {} (from {}), which may \
              be deleted at any time; set VICTORY_CACHE_DIR or [paths].cache_dir to a folder \
@@ -358,7 +369,7 @@ fn ensure_game_apart(game: &Path, cache: &Path, data: &Path, origins: &Origins) 
             "VICTORY_DATA_DIR or [paths].data_dir",
         ),
     ] {
-        if lexical(dir).starts_with(&g) {
+        if is_within(dir, game, FOLD_CASE) {
             anyhow::bail!(
                 "the {name} folder {} (from {origin}) is inside the game folder {} (from {}), \
                  which holds your dump and is only read; set {setting} to a folder outside it",
@@ -369,6 +380,33 @@ fn ensure_game_apart(game: &Path, cache: &Path, data: &Path, origins: &Origins) 
         }
     }
     Ok(())
+}
+
+/// Whether folder names differ only by case on the usual file systems of
+/// this host: NTFS (Windows) and APFS (macOS) ignore case by default, so
+/// there `C:\Victory\cache` holds `c:\victory\cache\data`.
+const FOLD_CASE: bool = cfg!(any(windows, target_os = "macos"));
+
+/// Whether `path` is `parent` or inside it, compared like
+/// [`ensure_data_outside_cache`] says: lexically (see [`lexical`]), and
+/// ignoring ASCII case when `fold_case` (a parameter so both behaviours can
+/// be tested on any host). Without folding, a cache of `C:\Victory` and a
+/// data folder of `c:\victory\data` would be taken as unrelated on Windows
+/// although they are one folder and its child.
+fn is_within(path: &Path, parent: &Path, fold_case: bool) -> bool {
+    let path = lexical(path);
+    let parent = lexical(parent);
+    if !fold_case {
+        return path.starts_with(&parent);
+    }
+    let mut inner = path.components();
+    parent.components().all(|p| {
+        inner.next().is_some_and(|c| {
+            c.as_os_str()
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(p.as_os_str().as_encoded_bytes())
+        })
+    })
 }
 
 /// `path` with `.` dropped and each `..` removing the component before it,
@@ -1109,6 +1147,42 @@ mod tests {
     }
 
     /// A path that is absolute on the host (`/x` is not absolute on Windows).
+    #[test]
+    fn folder_overlap_folds_case_only_when_asked() {
+        let cache = Path::new("/Victory/Cache");
+        assert!(is_within(Path::new("/victory/cache/data"), cache, true));
+        assert!(is_within(Path::new("/VICTORY/CACHE"), cache, true));
+        assert!(!is_within(Path::new("/victory/cache/data"), cache, false));
+        assert!(is_within(Path::new("/Victory/Cache/data"), cache, false));
+        // Still whole components, and still with `..` folded first.
+        assert!(!is_within(Path::new("/victory/cachex"), cache, true));
+        assert!(!is_within(Path::new("/victory/cache/../data"), cache, true));
+        assert!(!is_within(Path::new("/victory"), cache, true));
+    }
+
+    #[test]
+    fn shared_xdg_base_names_the_xdg_variables() {
+        let base = abs("shared");
+        let env = |k: &str| match k {
+            "XDG_CACHE_HOME" | "XDG_DATA_HOME" => Some(base.clone()),
+            _ => None,
+        };
+        let err = Config::resolve(FilePaths::default(), None, env)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("XDG_DATA_HOME is inside"), "{err}");
+        assert!(err.contains("VICTORY_DATA_DIR"), "{err}");
+        // Overriding either folder is the way out.
+        let data = abs("elsewhere");
+        let env = |k: &str| match k {
+            "XDG_CACHE_HOME" | "XDG_DATA_HOME" => Some(base.clone()),
+            "VICTORY_DATA_DIR" => Some(data.clone()),
+            _ => None,
+        };
+        let cfg = Config::resolve(FilePaths::default(), None, env).unwrap();
+        assert_eq!(cfg.data_dir, PathBuf::from(&data));
+    }
+
     fn abs(p: &str) -> OsString {
         if cfg!(windows) {
             format!("C:\\{p}").into()
