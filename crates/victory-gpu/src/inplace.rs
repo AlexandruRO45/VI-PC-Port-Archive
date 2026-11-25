@@ -112,6 +112,42 @@ fn most() -> u64 {
     *MOST.get_or_init(|| std::env::var("VICTORY_INPLACE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4096) << 20)
 }
 
+/// Title buffers smaller than this many bytes are not put in place: they
+/// stay copies, as without `VICTORY_INPLACE` (`VICTORY_INPLACE_MIN_KB`,
+/// 1024 by default; 0: no floor). Windows are not affected.
+///
+/// Shaders reach memory in place across the bus. Three compute passes that
+/// run once a frame went 1-6 ms -> 19-67 ms of card time with the tiny
+/// buffers they write with atomics (52 B, 480 B, 56 KB) in place; kept as
+/// copies, title lists took 100-129 ms of card time a frame against
+/// 222-244 ms, and the frame 234.6 ms against 495 ms (the control: 240 ms).
+/// Such buffers are 42 MB in all: copying them costs little.
+pub(crate) fn min_bytes() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| min_from(std::env::var("VICTORY_INPLACE_MIN_KB").ok().as_deref()))
+}
+
+/// The floor in bytes for a `VICTORY_INPLACE_MIN_KB` setting in KiB.
+fn min_from(kb: Option<&str>) -> u64 {
+    kb.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024).saturating_mul(1 << 10)
+}
+
+#[cfg(test)]
+mod min_tests {
+    use super::min_from;
+
+    #[test]
+    fn floor_defaults_to_one_mib_and_zero_turns_it_off() {
+        assert_eq!(min_from(None), 1 << 20);
+        assert_eq!(min_from(Some("0")), 0);
+        assert_eq!(min_from(Some(" 64 ")), 64 << 10);
+        assert_eq!(min_from(Some("nonsense")), 1 << 20);
+    }
+}
+
+/// Title buffers kept as copies by [`min_bytes`], since the start: count, bytes.
+pub(crate) static BELOW_MIN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// In place now: windows and their bytes, title buffers and their bytes;
 /// then, since the start: asks turned down because the memory is a view
 /// or not private memory committed whole, because the host refused,

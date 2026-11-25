@@ -1486,6 +1486,68 @@ pub(crate) fn back_line(frames: f64) {
     );
 }
 
+/// For the frame-rate line: where the copies alive now are (T1's census),
+/// title buffers and windows apart, as count and MB by kind: in a
+/// resident, in place in the PC's memory, a copy in the card's memory, a
+/// copy in system memory. Of the buffers in place, those under 64 KiB
+/// apart (what card atomics would cross the bus for). Then the buffers
+/// `VICTORY_INPLACE_MIN_KB` kept as copies since the start.
+pub(crate) fn placement_line() {
+    if crate::inplace::level() < 2 {
+        return;
+    }
+    // [resident, in place, card copy, system copy, in place < 64 KiB] x (count, bytes)
+    let mut census = [[[0u64; 2]; 5]; 2];
+    let add = |at: &mut [[u64; 2]; 5], s: &Shadow| {
+        // Kind 0, in a resident, is Stage 2's (`VICTORY_INPLACE=4`).
+        let kind = if s.place.is_some() {
+            1
+        } else if s.card.is_some() {
+            2
+        } else {
+            3
+        };
+        at[kind][0] += 1;
+        at[kind][1] += s.len;
+        if kind == 1 && s.len < 64 << 10 {
+            at[4][0] += 1;
+            at[4][1] += s.len;
+        }
+    };
+    for entry in buffers().values() {
+        if let Some(s) = entry.shadow.as_deref() {
+            add(&mut census[0], s);
+        }
+    }
+    for s in LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values() {
+        add(&mut census[1], s);
+    }
+    let mb = |b: u64| b as f64 / (1 << 20) as f64;
+    let part = |c: &[[u64; 2]; 5]| {
+        format!(
+            "resident {} ({:.1} MB), in place {} ({:.1} MB; under 64 KiB {}, {:.2} MB), card copy {} ({:.1} MB), system copy {} ({:.1} MB)",
+            c[0][0],
+            mb(c[0][1]),
+            c[1][0],
+            mb(c[1][1]),
+            c[4][0],
+            mb(c[4][1]),
+            c[2][0],
+            mb(c[2][1]),
+            c[3][0],
+            mb(c[3][1]),
+        )
+    };
+    tracing::info!(
+        "placement census: title buffers: {}; windows: {}; kept as copies by VICTORY_INPLACE_MIN_KB={} since the start: {} buffers ({:.2} MB)",
+        part(&census[0]),
+        part(&census[1]),
+        crate::inplace::min_bytes() >> 10,
+        crate::inplace::BELOW_MIN[0].load(Ordering::Relaxed),
+        mb(crate::inplace::BELOW_MIN[1].load(Ordering::Relaxed)),
+    );
+}
+
 #[cfg(test)]
 mod wide_tests {
     use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
@@ -3438,7 +3500,13 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && size >= card_limits().0;
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+        // Small buffers stay copies below `VICTORY_INPLACE_MIN_KB` (T1).
+        let small = len < crate::inplace::min_bytes();
+        if small && crate::inplace::level() >= 2 {
+            crate::inplace::BELOW_MIN[0].fetch_add(1, Ordering::Relaxed);
+            crate::inplace::BELOW_MIN[1].fetch_add(len, Ordering::Relaxed);
+        }
+        if !big && !small && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
