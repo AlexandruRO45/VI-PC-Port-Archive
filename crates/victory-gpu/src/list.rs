@@ -1197,16 +1197,18 @@ mod state {
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
-        if y * z != 1 {
+        if y.checked_mul(z) != Some(1) {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// Dispatches whose group count is in GPU memory (`indirect != 0`)
+    /// Inferred from `dispatch_mesh` and standard D3D12 `DispatchMesh`:
+    /// dispatches whose group count is in GPU memory (`indirect != 0`)
     /// are routed through `State::execute_indirect` as a single `MESH`
-    /// (kind 10) command with 12-byte `D3D12_DISPATCH_MESH_ARGUMENTS`.
+    /// (kind 10) command with a 12-byte `D3D12_DISPATCH_MESH_ARGUMENTS`
+    /// `(x, y, z)` record (`x`, `flags`, and `payload` ignored).
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
@@ -1759,11 +1761,13 @@ mod tests {
             create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
             S_OK
         );
-        // Drain any prior indirect drop counter.
+        // Drain any prior indirect drop counter, then verify `indirect == 0`
+        // takes the direct path (does not increment `INDIRECT`) while
+        // `indirect != 0` routes through `execute_indirect` (which returns
+        // `false` here because no pipeline is bound, incrementing `INDIRECT`).
         let _ = take_indirect();
-        // `u64::MAX` overflows `indirect + 12`, so `shadow::find` rejects it
-        // cleanly without allocating a loose shadow buffer, proving the call
-        // routed through `execute_indirect` and incremented `INDIRECT`.
+        state::dispatch_mesh_x(list, 1, 0, 0, 0);
+        assert_eq!(take_indirect(), 0);
         state::dispatch_mesh_x(list, 0, 0, u64::MAX, 0);
         assert!(take_indirect() >= 1);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
