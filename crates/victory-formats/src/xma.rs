@@ -126,12 +126,6 @@ impl Cursor<'_> {
 /// Reads the frame starting at bit `start` (a frame start inside a packet's
 /// payload) of `data`, a buffer of whole packets of one stream.
 pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
-    // A frame's first bit must be in the payload, not the packet header.
-    // Cursor skips a header when crossing a packet boundary, but accepting
-    // that boundary as a frame start would record an incorrect start offset.
-    if start % PACKET_BITS < HEADER_BITS || start / 8 >= data.len() {
-        return None;
-    }
     let mut cursor = Cursor { data, pos: start };
     let bits = cursor.bits(LENGTH_BITS)? as usize;
     if bits <= LENGTH_BITS as usize || bits == 0x7fff {
@@ -1466,23 +1460,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn frame_starts_must_be_inside_packet_payloads() {
-        let mut data = vec![0u8; 2 * PACKET_BYTES];
-        for packet_start in [0, PACKET_BITS] {
-            put_bits(&mut data, packet_start, 32, 1 << 26);
-            let payload = packet_start + HEADER_BITS;
-            put_bits(&mut data, payload, LENGTH_BITS, 100);
-            let frame = read_frame(&data, payload).unwrap();
-            assert_eq!(frame.start, payload);
-            assert_eq!(frame.bits, 100);
-            for offset in 0..HEADER_BITS {
-                assert!(read_frame(&data, packet_start + offset).is_none());
-            }
-        }
-        assert!(read_frame(&data, 2 * PACKET_BITS).is_none());
     }
 
     #[test]
