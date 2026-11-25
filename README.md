@@ -53,12 +53,20 @@ for the rendering settings and implementation.
 
 ## Credits
 
-- [VIctory](https://github.com/Marvisak/VIctory), by Marvisak and contributors,
-  provides the loader, runtime services, Direct3D 12 back end and shader
-  recompiler. The project is licensed GPL-3.0-or-later.
-- [XCL](https://github.com/ivall/xcl), by ivall and contributors, was a
-  reference for title behavior. The corresponding changes here were written
-  in VIctory's code.
+- Marvisak and the VIctory contributors built the original compatibility
+  layer, including the loader, runtime services, Direct3D 12 backend, and
+  shader recompiler. [VIctory](https://github.com/Marvisak/VIctory)
+- fxceless and the contributors to the Windows rendering fork developed
+  rendering, shader translation, and texture upload improvements used here.
+  [VIctory rendering fork](https://github.com/fxceless/victory-fork)
+- ivall and the XCL contributors provided a reference for title behavior.
+  The related changes in this repository are implemented in VIctory.
+  [XCL](https://github.com/ivall/xcl)
+- TaynanGT maintains this repository and documents testing on the development
+  PC. Individual code contributions are credited in the
+  [commit history](https://github.com/TaynanGT/victory-windows/commits/local/fxceless-render).
+
+The compatibility code is licensed GPL-3.0-or-later. See [LICENSE](LICENSE).
 
 ## Getting started
 

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   pull_request:
   push:
-    branches: [main, 'local/fxceless-render']
+    branches: ['local/fxceless-render']
 
 permissions:
   contents: read
