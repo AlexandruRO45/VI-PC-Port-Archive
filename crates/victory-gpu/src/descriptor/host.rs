@@ -971,15 +971,11 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        return !typeless && stores(own, unordered);
     }
     let cast = castable.contains(&view);
     if family(view) != family(own) && !cast {
         once!(view, own, "view format of another family");
-        return false;
-    }
-    if cast && family(view) != family(own) && unordered && !typed_store(view) {
-        once!(view, own, "an unordered view in a format the host cannot store");
         return false;
     }
     if let Some(format) = format
@@ -987,8 +983,21 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         && !cast
     {
         *format = d.Format;
+        return stores(own, unordered);
     }
-    true
+    stores(view, unordered)
+}
+
+/// Whether a view in `format` can be made: any shader view can, an unordered
+/// one only in a format the host uses as a typed UAV. A host asked for one it
+/// cannot make removes the device (NVIDIA and B5G5R5A1_UNORM); a null view
+/// is made instead, and its writes are dropped.
+fn stores(format: u32, unordered: bool) -> bool {
+    if !unordered || crate::resource::typed_uav(format) {
+        return true;
+    }
+    once!(format, "an unordered view in a format the host cannot store");
+    false
 }
 
 /// Whether a view without a description of `resource` (a title texture)
@@ -1003,33 +1012,6 @@ fn default_view(resource: crate::object::This) -> bool {
         once!(format = other, "a view without a description of a texture whose host texture has another format");
     }
     other.is_none()
-}
-
-/// Whether the host stores to typed unordered views of `format`.
-fn typed_store(format: u32) -> bool {
-    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
-    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
-        return ok;
-    }
-    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
-        Format: DXGI_FORMAT(format as i32),
-        ..Default::default()
-    };
-    let ok = host().is_some_and(|h| {
-        // SAFETY: a plain query into a struct of its size.
-        unsafe {
-            h.device.CheckFeatureSupport(
-                D3D12_FEATURE_FORMAT_SUPPORT,
-                (&raw mut support).cast(),
-                size_of_val(&support) as u32,
-            )
-        }
-        .is_ok()
-            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
-    });
-    known.push((format, ok));
-    ok
 }
 
 /// Makes the host descriptor for `view` at `at` (in any host view heap):

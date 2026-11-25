@@ -236,6 +236,39 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// Whether the host can make a typed unordered access view of `format`.
+/// A host that cannot removes the device when one is made anyway: NVIDIA
+/// and `B5G5R5A1_UNORM` (the title's 2560x1440 target), among others.
+/// Formats the host does not know at all answer no.
+pub(crate) fn typed_uav(format: u32) -> bool {
+    static KNOWN: std::sync::Mutex<Vec<(u32, bool)>> = std::sync::Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|&&(f, _)| f == format) {
+        return ok;
+    }
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    let mut support = windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: a plain query into a structure of the size given.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_FORMAT_SUPPORT,
+            std::ptr::from_mut(&mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    };
+    let ok = asked.is_ok()
+        && support.Support1.0
+            & windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0
+            != 0;
+    known.push((format, ok));
+    ok
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -1015,6 +1048,25 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     // their unordered access views plain UNORM.
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
+    }
+    // D3D12 refuses a description that asks for unordered access in a format
+    // it cannot use as a typed UAV, and with the debug layer on that call
+    // removes the device ("A texture that has
+    // D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS ... must be created with a
+    // format that either can be used as unordered access"; NVIDIA and
+    // B5G5R5A1_UNORM). The permission goes before any call names it; such
+    // textures' UAVs are null views (descriptor::host).
+    if d.flags & UNORDERED != 0 && !typed_uav(d.format) {
+        d.flags &= !UNORDERED;
+        static NOTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
+        if !noted.contains(&d.format) {
+            noted.push(d.format);
+            tracing::warn!(
+                format = d.format,
+                "the host cannot use this format as a typed UAV: its unordered-access permission is dropped"
+            );
+        }
     }
     Some(d)
 }
@@ -1880,6 +1932,38 @@ mod tests {
         assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { layout: 0x102, ..a }));
         assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { flags: 2, format: 40, ..a }));
         assert_eq!(memory_key(0x1_0000, &buffer(256)), None);
+    }
+
+    /// A description asking for unordered access gets the permission only
+    /// where the host can make a typed UAV of the format: on NVIDIA it cannot
+    /// for B5G5R5A1_UNORM, and creating the texture with the flag removes the
+    /// device. The check is the host's, not a list of formats.
+    /// `cargo test -p victory-gpu -- --ignored unordered_access_follows_typed_uav`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs the host GPU"]
+    fn unordered_access_follows_typed_uav() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        for format in [28u32, 86, 115] {
+            let desc = ResourceDesc {
+                dimension: 3,
+                alignment: 0,
+                width: 2560,
+                height: 1440,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                format,
+                sample_count: 1,
+                sample_quality: 0,
+                layout: 0,
+                flags: 5, // render target and unordered access
+            };
+            let made = host_desc(&desc).expect("a host description");
+            let expected = if typed_uav(format) { 5 } else { 1 };
+            assert_eq!(made.flags, expected, "format {format}");
+        }
     }
 
     /// Castable formats: every format of the same element but typeless and
