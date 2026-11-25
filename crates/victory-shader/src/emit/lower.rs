@@ -368,7 +368,10 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
 /// until the driver resets it. A lane that reaches the limit leaves the
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+// 2^20 per lane still hung the host (a compute pass reading null views on
+// a host that caps its heaps leaves many slots null): 2^12 bounds a full
+// dispatch to seconds.
+pub(super) const LOOP_LIMIT: u32 = 1 << 12;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -5582,7 +5585,7 @@ impl<'a> Lower<'a> {
             return index;
         }
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let last = self.s.m.i32(super::heap_views() - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
@@ -5595,7 +5598,7 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
-        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
+        let null = super::null_buffer_view() - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
     }

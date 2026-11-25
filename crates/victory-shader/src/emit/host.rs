@@ -145,8 +145,18 @@ fn on_software_adapter(device: &ID3D12Device) -> bool {
 fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapter1> {
     // SAFETY: plain DXGI adapter enumeration.
     unsafe {
+        // The fastest first (a laptop's discrete GPU, which the default
+        // order leaves second); the default order without IDXGIFactory6.
+        let preferred = factory.cast::<IDXGIFactory6>().ok();
         for index in 0.. {
-            let Ok(adapter) = factory.EnumAdapters1(index) else {
+            let adapter = match &preferred {
+                Some(f) => f.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                    index,
+                    DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                ),
+                None => factory.EnumAdapters1(index),
+            };
+            let Ok(adapter) = adapter else {
                 break;
             };
             let desc = adapter.GetDesc1()?;
@@ -1392,8 +1402,8 @@ pub enum View<'a> {
     NullPair,
     /// The second slot of a [`View::Memory`] or [`View::NullPair`].
     Pair,
-    /// Last in the heap, which then has [`super::HEAP_VIEWS`] slots: the
-    /// host's null raw buffer SRV at [`super::NULL_BUFFER_VIEW`] and UAV
+    /// Last in the heap, which then has [`super::heap_views`] slots: the
+    /// host's null raw buffer SRV at [`super::null_buffer_view`] and UAV
     /// below it.
     NullBuffers,
 }
@@ -1599,7 +1609,7 @@ impl Host {
                 Ok::<_, String>(zeros)
             };
             let slots = match d.views.last() {
-                Some(View::NullBuffers) => super::HEAP_VIEWS as usize,
+                Some(View::NullBuffers) => super::heap_views() as usize,
                 _ => d.views.len(),
             };
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
@@ -1935,7 +1945,7 @@ impl Host {
                     }
                     View::Pair => {}
                     View::NullBuffers => {
-                        let null = super::NULL_BUFFER_VIEW as usize;
+                        let null = super::null_buffer_view() as usize;
                         let (mut srv_at, mut uav_at) = (at, at);
                         srv_at.ptr += (null - i) * view_size;
                         uav_at.ptr += (null - 1 - i) * view_size;

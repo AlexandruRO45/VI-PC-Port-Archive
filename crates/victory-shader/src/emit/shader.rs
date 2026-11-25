@@ -27,16 +27,48 @@ pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
-/// Heap indices are clamped below these (views, samplers): the host's heaps
-/// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
-pub const HEAP_VIEWS: u32 = 1 << 21;
+/// The most view-heap slots a translated shader indexes: [`heap_views`]
+/// where the host takes a heap this large.
+pub const HEAP_VIEWS_MAX: u32 = 1 << 21;
+/// Sampler heap indices are clamped below this (`emit`, "Heap indices").
 pub const HEAP_SAMPLERS: u32 = 2048;
+
+static HEAP_VIEWS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(HEAP_VIEWS_MAX);
+static HEAP_VIEWS_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// View heap indices are clamped below this: the host's view heap is at
+/// least this large, the slots past its own null (`emit`, "Heap indices").
+/// [`HEAP_VIEWS_MAX`] unless the host caps its heaps lower
+/// ([`set_heap_views`]). Part of every translation, so the shader cache
+/// keys on it.
+pub fn heap_views() -> u32 {
+    HEAP_VIEWS_READ.store(true, std::sync::atomic::Ordering::Relaxed);
+    HEAP_VIEWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets [`heap_views`] to the host's largest view heap (at most
+/// [`HEAP_VIEWS_MAX`], at least 2^17), before any shader is translated.
+/// False (and nothing changed) if a translation may already have used
+/// another value.
+pub fn set_heap_views(n: u32) -> bool {
+    let n = n.clamp(1 << 17, HEAP_VIEWS_MAX);
+    if HEAP_VIEWS_READ.load(std::sync::atomic::Ordering::Relaxed)
+        && HEAP_VIEWS.load(std::sync::atomic::Ordering::Relaxed) != n
+    {
+        return false;
+    }
+    HEAP_VIEWS.store(n, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes
 /// (`emit`, "Buffer views at computed heap indices").
-pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+pub fn null_buffer_view() -> u32 {
+    heap_views() - 2
+}
 /// The view-mark table's register: `t2` (a raw root SRV) in
 /// [`MEMORY_SPACE`] (`emit`, "Write marks").
 pub const VIEW_MARKS: u32 = 2;
@@ -50,7 +82,7 @@ pub const VIEW_MARK_NONE: u32 = u32::MAX;
 pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// The first bit of the read marks of texture views (`emit`, "Read
 /// marks"), after the written pages in the same bitmap: one bit per
-/// resource-heap index, [`HEAP_VIEWS`] of them.
+/// resource-heap index, [`HEAP_VIEWS_MAX`] of them.
 pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
@@ -542,7 +574,7 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { heap_views() } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
