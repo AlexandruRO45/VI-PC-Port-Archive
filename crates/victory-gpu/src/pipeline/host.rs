@@ -100,16 +100,22 @@ enum DepthEqualRelax {
     GreaterEqual,
 }
 
-/// `VICTORY_DEPTH_EQUAL_RELAX=1` widens a depth-writing-off EQUAL test to
-/// LESS_EQUAL; `=reversed` selects GREATER_EQUAL for a reversed-Z title.
+/// Depth-writing-off EQUAL tests are widened to LESS_EQUAL by default:
+/// the title's depth prepass and its G-buffer disagree by a few ULPs.
+/// `VICTORY_DEPTH_EQUAL_RELAX=0` restores EQUAL; `=reversed` selects
+/// GREATER_EQUAL for a reversed-Z title.
+fn depth_equal_relax_from(value: Option<&str>) -> Option<DepthEqualRelax> {
+    match value.unwrap_or("1") {
+        "0" | "off" | "none" => None,
+        "reversed" | "greater" | "greater_equal" => Some(DepthEqualRelax::GreaterEqual),
+        _ => Some(DepthEqualRelax::LessEqual),
+    }
+}
+
 fn depth_equal_relax() -> Option<DepthEqualRelax> {
     static MODE: OnceLock<Option<DepthEqualRelax>> = OnceLock::new();
     *MODE.get_or_init(|| {
-        match std::env::var("VICTORY_DEPTH_EQUAL_RELAX").ok()?.as_str() {
-            "1" | "less" | "less_equal" => Some(DepthEqualRelax::LessEqual),
-            "reversed" | "greater" | "greater_equal" => Some(DepthEqualRelax::GreaterEqual),
-            _ => None,
-        }
+        depth_equal_relax_from(std::env::var("VICTORY_DEPTH_EQUAL_RELAX").ok().as_deref())
     })
 }
 
@@ -120,6 +126,10 @@ fn relax_depth_equal(depth: &mut D3D12_DEPTH_STENCIL_DESC, mode: Option<DepthEqu
         return false;
     }
     let Some(mode) = mode else { return false };
+    let name = match mode {
+        DepthEqualRelax::LessEqual => "less_equal",
+        DepthEqualRelax::GreaterEqual => "greater_equal",
+    };
     depth.DepthFunc = match mode {
         DepthEqualRelax::LessEqual => D3D12_COMPARISON_FUNC_LESS_EQUAL,
         DepthEqualRelax::GreaterEqual => D3D12_COMPARISON_FUNC_GREATER_EQUAL,
@@ -127,6 +137,7 @@ fn relax_depth_equal(depth: &mut D3D12_DEPTH_STENCIL_DESC, mode: Option<DepthEqu
     tracing::info!(
         from = D3D12_COMPARISON_FUNC_EQUAL.0,
         to = depth.DepthFunc.0,
+        mode = name,
         "VICTORY_DEPTH_EQUAL_RELAX: widened a depth-read-only EQUAL test"
     );
     true
@@ -394,6 +405,24 @@ fn native_barycentrics_need_the_device_feature() {
     ps.dxil[bit] |= 2;
     assert!(!pixel_features_supported(&ps.dxil, || false));
     assert!(pixel_features_supported(&ps.dxil, || true));
+}
+
+#[cfg(test)]
+#[test]
+fn depth_equal_relax_defaults_on_and_can_be_disabled() {
+    assert!(matches!(
+        depth_equal_relax_from(None),
+        Some(DepthEqualRelax::LessEqual)
+    ));
+    assert!(matches!(
+        depth_equal_relax_from(Some("1")),
+        Some(DepthEqualRelax::LessEqual)
+    ));
+    assert!(depth_equal_relax_from(Some("0")).is_none());
+    assert!(matches!(
+        depth_equal_relax_from(Some("reversed")),
+        Some(DepthEqualRelax::GreaterEqual)
+    ));
 }
 
 #[cfg(test)]
