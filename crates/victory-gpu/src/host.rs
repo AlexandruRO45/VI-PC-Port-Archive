@@ -1854,16 +1854,24 @@ fn rehash_runs() -> bool {
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether what shaders wrote to copies in the card's memory is merged
-/// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
-/// default). The pieces the card's compare found differing come down in
+/// into title memory on several threads (`VICTORY_WIDE_MERGE`; on by
+/// default, `=0`: one after the other, as before), by the settle and by
+/// the relay's landings. The pieces the card's compare found differing come down in
 /// one fetch and were then merged one after the other on the thread that
 /// settles: about 630 pieces and 40 MB a frame (run 104), each compared
 /// with the copy's CPU side byte by byte and put into title memory through
 /// the kernel. A piece is its own bytes of its copy and of title memory,
 /// so eight threads take an eighth of them each.
+///
+/// On by default, for the relay's landings too, since an RTX 4070 / Ryzen 5
+/// 7500F run: some 1,250 pieces of 64 KiB a frame, 96 % of them with bytes
+/// shaders wrote (34 MB of 78), merged one after the other on the thread
+/// that lands flights, 45-60 ms a frame; the title's fences are set only
+/// once their flights have landed. A merge takes the locks of its own
+/// blocks only (`crate::shadow::side_locks`).
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0"))
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -3577,13 +3585,12 @@ fn late_line(frames: f64) {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         let why = crate::shadow::merge_why_stats().map(|n| n as f64 / frames);
         let [masked_pages, masked_runs] = crate::shadow::masked_stats().map(|n| n as f64 / frames);
-        let [landed, landed_mb, differ, span_mb, differ_mb] = crate::shadow::card_landed_stats().map(|n| n as f64 / frames);
+        let [landed, landed_mb, differ, span_mb, _] = crate::shadow::card_landed_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "card pieces merged by the copy-back per frame: {landed:.0} pieces, {:.1} MB; {differ:.0} of them with a byte that \
-             differs, {:.2} MB from first to last difference, {:.3} MB that differ",
+             differs, {:.2} MB from first to last difference",
             landed_mb / (1 << 20) as f64,
-            span_mb / (1 << 20) as f64,
-            differ_mb / (1 << 20) as f64
+            span_mb / (1 << 20) as f64
         );
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
@@ -4889,16 +4896,48 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            shadow.walls_merged(gpu.len(), merged);
-            written += merged;
-        }
+        let written = if wide_merge() && pieces.len() >= 8 {
+            // On several threads ([`wide_merge`]): each piece's merge takes
+            // the locks of its own blocks only (`crate::shadow::side_locks`).
+            use std::sync::atomic::AtomicUsize;
+            let written = std::sync::Arc::new(AtomicUsize::new(0));
+            let per_job = pieces.len().div_ceil(8);
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
+                .chunks(per_job)
+                .map(|chunk| {
+                    let chunk: Vec<_> = chunk.iter().map(|(s, lo, hi, at)| (s.clone(), *lo, *hi, *at)).collect();
+                    let written = written.clone();
+                    Box::new(move || {
+                        let mut title = Vec::new();
+                        let mut sum = 0;
+                        for (shadow, lo, hi, at) in &chunk {
+                            // SAFETY: the mapping of the fetched bytes, `total`
+                            // of them; the copy into it has run, and it is not
+                            // given out again before this landing is done.
+                            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                            shadow.walls_merged(gpu.len(), merged);
+                            sum += merged;
+                        }
+                        written.fetch_add(sum, Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            written.load(Ordering::Relaxed)
+        } else {
+            let mut title = Vec::new();
+            let mut written = 0;
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                shadow.walls_merged(gpu.len(), merged);
+                written += merged;
+            }
+            written
+        };
         copy_back(1, written as u64);
         // Sends up to `after` are of no use to any later merge; with the
         // fetch inside flights only those up to these plans' are

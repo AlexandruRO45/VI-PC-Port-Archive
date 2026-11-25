@@ -189,14 +189,37 @@ static MASKED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Since the last frame-rate line, of the relay's merges of fetched card
 /// pieces ([`Shadow::card_merge_relay`]): pieces landed and their bytes;
-/// of them, pieces with a byte that differs from the CPU's side, the bytes
-/// from their first to their last difference, and the bytes that differ.
-/// Whether smaller pieces would fetch much less.
+/// of them, pieces with a byte that differs from the CPU's side, and the
+/// bytes from their first to their last difference. (An RTX 4070 run also
+/// counted the bytes that differ: 34 MB of 78 fetched, in 96 % of the
+/// pieces, so smaller pieces would not fetch much less.)
 static CARD_LANDED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// [`CARD_LANDED`], taken.
 pub(crate) fn card_landed_stats() -> [u64; 5] {
     [0, 1, 2, 3, 4].map(|i| CARD_LANDED[i].swap(0, Ordering::Relaxed))
+}
+
+/// The locks of the CPU's side of copies in the card's memory, by 64 KiB
+/// block of title memory (the block's number modulo their count): the
+/// title's bytes put in under flights' shader writes
+/// ([`Shadow::merge_under_writes`]) and the copy-back's merge of what the
+/// card wrote ([`Shadow::card_merge_relay`]) each take those of the bytes
+/// they read and write, from before title memory is read until the bytes
+/// are in. One lock for the whole copy (its snapshot's) made every merge of
+/// the copy-back wait for the one before, and most pieces are of one copy.
+static SIDE_LOCKS: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
+
+/// The [`SIDE_LOCKS`] of title memory `[from, to)`, taken in their order.
+fn side_locks(from: usize, to: usize) -> Vec<std::sync::MutexGuard<'static, ()>> {
+    const BLOCK: usize = 64 << 10;
+    let mut locks: Vec<usize> = (from / BLOCK..to.div_ceil(BLOCK).max(from / BLOCK + 1))
+        .take(SIDE_LOCKS.len())
+        .map(|b| b % SIDE_LOCKS.len())
+        .collect();
+    locks.sort_unstable();
+    locks.dedup();
+    locks.into_iter().map(|i| SIDE_LOCKS[i].lock().unwrap_or_else(|e| e.into_inner())).collect()
 }
 
 /// [`MASKED`], taken.
@@ -3068,7 +3091,11 @@ impl Shadow {
                 // reference under the same lock, and a page read before
                 // such a merge and compared after it would take the card's
                 // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                // For a copy in the card's memory that is the lock of these
+                // bytes' 64 KiB blocks ([`side_locks`]), so that the
+                // copy-back can merge other pieces of the copy meanwhile.
+                let _side = if self.card.is_some() { side_locks(lo, hi) } else { Vec::new() };
+                let mut before = self.card.is_none().then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
                 // A page that is not there is left as it is, and looked at
                 // again next time.
                 if !crate::host::read_into(lo as *const u8, title) {
@@ -3105,7 +3132,7 @@ impl Shadow {
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }
                 } else {
-                    let Some(snapshot) = before.as_mut() else {
+                    let Some(snapshot) = before.as_mut().and_then(|b| b.as_mut()) else {
                         MERGE_WHY[3].fetch_add(1, Ordering::Relaxed);
                         return true;
                     };
@@ -3522,7 +3549,7 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let _side = side_locks(start + at, start + at + gpu.len());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
@@ -3536,7 +3563,6 @@ impl Shadow {
         let last = last_difference(gpu, held).unwrap_or(first);
         CARD_LANDED[2].fetch_add(1, Ordering::Relaxed);
         CARD_LANDED[3].fetch_add((last + 1 - first) as u64, Ordering::Relaxed);
-        CARD_LANDED[4].fetch_add(changed_runs(gpu, held).iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         let skip: Vec<(usize, usize)> = {
