@@ -29,6 +29,10 @@
   variables as the game (the cache key depends on them). Measured on 2026-11-25 (RTX 4070 Super): 25,689 shaders in
   about 4.5 min, 296 refused, 13 GB in %LOCALAPPDATA%\victory\cache. Later launches reuse that cache.
 
+.PARAMETER BatchCardRehash
+  Optional. Sets VICTORY_CARD_REHASH_RUNS=1 so VIctory hashes adjacent or overlapping GPU memory ranges in batches
+  after uploading them. Without this switch the launcher leaves the environment variable as inherited.
+
 .NOTES
   The first cold launch may crash while the pipelines compile; launch again once the cache is filled.
   Settings measured on 2026-11-24 with the submodule's pinned commit (fxceless/victory-gta6).
@@ -47,7 +51,8 @@ param(
     [switch]$Dred,
     [switch]$Precompile,
     [string]$XgDll,
-    [ValidateSet('real', 'compare')][string]$XgMode = 'real'
+    [ValidateSet('real', 'compare')][string]$XgMode = 'real',
+    [switch]$BatchCardRehash
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,6 +107,9 @@ if (-not $NoTunedSettings) {
 # VIctory turns DRED on when the variable exists, whatever its value: only set it when asked.
 if ($Dred) {
     $env:VICTORY_D3D12_DRED = '1'
+}
+if ($BatchCardRehash) {
+    $env:VICTORY_CARD_REHASH_RUNS = '1'
 }
 if ($PSBoundParameters.ContainsKey('SkipPipelines') -and $SkipPipelines) {
     $env:VICTORY_SKIP_PIPELINES = $SkipPipelines

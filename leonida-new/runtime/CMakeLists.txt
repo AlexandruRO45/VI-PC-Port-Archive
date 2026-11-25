@@ -196,6 +196,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/library_loader.cpp
     shims/process.cpp
     shims/com_shim.cpp
+    shims/silent_audio.cpp
     shims/bcrypt_rng.cpp
     shims/xapu_chad.cpp
     shims/dstorage.cpp
@@ -460,12 +461,26 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_executable(com_shim_test
     test/com_shim_test.cpp
     shims/com_shim.cpp
+    shims/silent_audio.cpp
     shims/registry.cpp
   )
   target_include_directories(com_shim_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(com_shim_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(com_shim_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(com_shim_test PRIVATE /OPT:NOREF)
+
+  # The silent output endpoint (MMDeviceEnumerator through CoCreateInstance): stand-in hosts, a render stream on
+  # its clock, and the CoCreateInstance hook with LEONIDA_AUDIO=silent. No host audio device is opened.
+  add_executable(silent_audio_test
+    test/silent_audio_test.cpp
+    shims/silent_audio.cpp
+    shims/com_shim.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(silent_audio_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(silent_audio_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(silent_audio_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(silent_audio_test PRIVATE /OPT:NOREF)
 
   # BCrypt RNG and algorithm provider shims.
   add_executable(bcrypt_rng_test
@@ -1503,6 +1518,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET com_shim_test)
     add_test(NAME com_shim COMMAND com_shim_test)
+  endif()
+  if(WIN32 AND TARGET silent_audio_test)
+    add_test(NAME silent_audio COMMAND silent_audio_test)
   endif()
   if(WIN32 AND TARGET bcrypt_rng_test)
     add_test(NAME bcrypt_rng COMMAND bcrypt_rng_test)

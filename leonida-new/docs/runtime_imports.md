@@ -228,6 +228,45 @@ calls succeed and do nothing: there is no audio processor, so the game gets no s
 fail hard, which is why every call succeeds. `acphal_test` covers the call shapes.
 The table under [The retail executable](#the-retail-executable-rt-5) was measured before this shim and still lists these nine as unimplemented; they are served now.
 
+## Audio output off the console (WASAPI)
+
+Off the console the title's sound goes out through WASAPI, not through the `AcpHal` path above: it creates an
+`MMDeviceEnumerator` with `CoCreateInstance` (one call, `CLSCTX_ALL`, `IID_IMMDeviceEnumerator`), asks it for the
+default render endpoint and activates `ISpatialAudioClient` on it (measured: the first interface the title asks the
+device for). A console always has an output. A host with none
+answers `GetDefaultAudioEndpoint(eRender, ...)` with `0x80070490` (`ERROR_NOT_FOUND`), and the title's device start
+then takes an error path that leaves its own output-device lock held by a job worker: the audio engine never mixes, a
+main-thread command buffer fills up, and the title stops on an `int3` about 47 s into the boot (measured under Wine with
+its audio drivers disabled; refusing the enumerator itself stops it the same way, and a host null sink removes the stop).
+
+So `CoCreateInstance` of that class goes to `runtime/shims/silent_audio.cpp` (hooked in `shims/com_shim.cpp`). When
+the host's enumerator has a default render endpoint it is returned unchanged. When it has none, or cannot be made, or
+`LEONIDA_AUDIO=silent` is set, the title gets an enumerator whose render answers are a **silent output endpoint** of the
+runtime's own: `GetDefaultAudioEndpoint(eRender)`, `EnumAudioEndpoints(eRender)` (active devices) and `GetDevice` with
+its ID give an active `IMMDevice` whose property store has a friendly name and the device format; `Activate` gives
+`ISpatialAudioClient`, `ISpatialAudioClient2`, `IAudioClient`, `IAudioClient2` or `IAudioClient3` (any other interface
+is `E_NOINTERFACE`, logged once). The spatial client has a 7.1 bed of static objects and no dynamic objects, as an
+endpoint with no spatial sound format turned on; its objects are mono 48 kHz float, and its
+`ISpatialAudioObjectRenderStream` signals the stream's event every 10 ms pass (480 frames) while it runs and hands
+each object a scratch buffer between `BeginUpdatingAudioObjects` and `EndUpdatingAudioObjects`. The client
+takes any PCM or float format in shared mode (event-driven or polled), and `GetService` gives `IAudioRenderClient`
+(a scratch buffer), `IAudioClock`, `ISimpleAudioVolume` and `IAudioStreamVolume`. A clock consumes the written frames
+in real time, so `GetCurrentPadding` drains, and an event-driven stream's event is signalled every 10 ms period
+while it runs, so a title that paces its mixer on the event keeps running. Capture questions keep the host's answer
+(with `LEONIDA_AUDIO=silent` the host's enumerator is only made when one comes). Endpoint notification callbacks are
+accepted and never called. Nothing opens or touches a host audio device, and every sample is discarded. The first
+silent device handed out prints one `[rt] audio: serving the silent output endpoint (<reason>)` line, the reason being
+the host's failed call or `LEONIDA_AUDIO=silent`.
+
+The mix format is 48 kHz, 32-bit float, 7.1 (eight channels, mask `0x63F`). 48 kHz float is the shared-mode
+format of the Windows audio engine and of the console's. 7.1 is the console's case, and a hypothesis, not measured
+here: the console's system mixer takes a 7.1 bed whatever output is plugged in and downmixes it for stereo, so a
+console title is built for eight channels, where stereo would be the usual answer of a PC with headphones. The stream
+itself takes any channel count, so a title that asks for fewer is not refused. `silent_audio_test`
+covers the enumerator over stand-in hosts with and without an endpoint and with none, a render stream run for a
+few periods with its event and padding checked, a spatial stream run for ten passes, and the `CoCreateInstance` hook
+with `LEONIDA_AUDIO=silent`.
+
 ## Console paths and the write overlay
 
 A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file inside the installed game folder.
