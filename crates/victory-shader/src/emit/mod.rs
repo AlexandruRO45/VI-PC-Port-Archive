@@ -270,8 +270,6 @@ pub struct UserData {
     pub dword: u32,
 }
 
-/// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
 thread_local! {
     // Whether this thread's translation may take the wave-wide form
     // ([`with_wave_wide`]).
@@ -292,6 +290,8 @@ pub fn with_wave_wide<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Translates the vertex, pixel, compute or mesh program of a console
+/// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
