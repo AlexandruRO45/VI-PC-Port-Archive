@@ -845,7 +845,7 @@ fn mesh_fallback(
             },
         },
     };
-    let mut make = || -> windows::core::Result<Option<HostPipeline>> {
+    let make = || -> windows::core::Result<Option<HostPipeline>> {
         let pass1 = if let Some(pass1) = compile.mesh_pass1.take() {
             pass1
         } else {
