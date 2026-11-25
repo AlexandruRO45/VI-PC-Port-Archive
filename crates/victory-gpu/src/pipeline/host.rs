@@ -206,7 +206,11 @@ impl GraphicsState {
         let integer = |i: usize| crate::twin::integer(self.targets.RTFormats[i].0 as u32);
         let independent = blend.IndependentBlendEnable.as_bool();
         // Without independent blending, target 0's description is every target's.
-        let blended = |i: usize| blend.RenderTarget[if independent { i } else { 0 }].BlendEnable.as_bool();
+        let blended = |i: usize| {
+            blend.RenderTarget[if independent { i } else { 0 }]
+                .BlendEnable
+                .as_bool()
+        };
         if !(0..count).any(|i| integer(i) && blended(i)) {
             return blend;
         }
@@ -896,11 +900,13 @@ mod tests {
 
     /// A title's graphics state blending (MAX, which the console allows on
     /// integer formats) into three targets, the last `R8_UINT`; with
-    /// `independent` false, target 0's description stands for all three.
+    /// `independent` false, target 0's description stands for all three and
+    /// the others keep their defaults (unblended), as a title's need not match.
     fn blending_into_an_integer_target(independent: bool) -> GraphicsState {
         let mut g = GraphicsState::default();
         g.blend.IndependentBlendEnable = independent.into();
-        for t in &mut g.blend.RenderTarget {
+        let described = if independent { 8 } else { 1 };
+        for t in &mut g.blend.RenderTarget[..described] {
             t.BlendEnable = true.into();
             t.BlendOp = D3D12_BLEND_OP_MAX;
             t.BlendOpAlpha = D3D12_BLEND_OP_MAX;
@@ -920,11 +926,17 @@ mod tests {
     fn integer_targets_write_unblended() {
         for independent in [true, false] {
             let blend = blending_into_an_integer_target(independent).host_blend();
-            assert!(blend.IndependentBlendEnable.as_bool(), "independent: {independent}");
+            assert!(
+                blend.IndependentBlendEnable.as_bool(),
+                "independent: {independent}"
+            );
             assert!(blend.RenderTarget[0].BlendEnable.as_bool());
             assert!(blend.RenderTarget[1].BlendEnable.as_bool());
             assert_eq!(blend.RenderTarget[1].BlendOp, D3D12_BLEND_OP_MAX);
-            assert!(!blend.RenderTarget[2].BlendEnable.as_bool(), "independent: {independent}");
+            assert!(
+                !blend.RenderTarget[2].BlendEnable.as_bool(),
+                "independent: {independent}"
+            );
         }
         // No integer target: the title's description as it was.
         let mut g = blending_into_an_integer_target(false);
@@ -953,7 +965,19 @@ Out ps() { Out o; o.a = 1; o.b = 1; o.c = 1; return o; }
             let mut code: Option<ID3DBlob> = None;
             // SAFETY: the source and names outlive the call.
             unsafe {
-                D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("blend"), None, None, entry, target, 0, 0, &mut code, None)
+                D3DCompile(
+                    SOURCE.as_ptr().cast(),
+                    SOURCE.len(),
+                    s!("blend"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )
             }
             .unwrap();
             code.unwrap()
@@ -961,11 +985,17 @@ Out ps() { Out o; o.a = 1; o.b = 1; o.c = 1; return o; }
         let (vs, ps) = (blob(s!("vs"), s!("vs_5_1")), blob(s!("ps"), s!("ps_5_1")));
         // SAFETY: the blobs' own bytes.
         let bytes = |b: &ID3DBlob| unsafe {
-            D3D12_SHADER_BYTECODE { pShaderBytecode: b.GetBufferPointer(), BytecodeLength: b.GetBufferSize() }
+            D3D12_SHADER_BYTECODE {
+                pShaderBytecode: b.GetBufferPointer(),
+                BytecodeLength: b.GetBufferSize(),
+            }
         };
         // SAFETY: a compiled shader with its root signature inside.
         let root: ID3D12RootSignature = unsafe {
-            host.device.CreateRootSignature(0, std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize()))
+            host.device.CreateRootSignature(
+                0,
+                std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize()),
+            )
         }
         .unwrap();
         for independent in [true, false] {
