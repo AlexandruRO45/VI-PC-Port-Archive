@@ -834,6 +834,12 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    // No pages: nothing changes, wherever `to` is (a count of 0 next to a
+    // reservation shown whole would otherwise be refused as inside it).
+    // From #99 (ySKELLETONX); keeps the parallel test run deterministic.
+    if len == 0 {
+        return true;
+    }
     let mut physical = physical();
     if in_whole(&physical, to, len) {
         tracing::warn!(to = format_args!("{to:#x}"), len, "page mappings into a reservation shown whole");
@@ -1416,7 +1422,6 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 
-    /// `n` pages of one new allocation.
     /// A run above the tiny-reservation threshold still takes the whole
     /// view; a mutation that disables `map_whole` must not pass the suite.
     #[test]
@@ -1447,6 +1452,13 @@ mod tests {
         );
         drop(physical);
 
+        // No pages into a reservation shown whole: a no-op, not a refusal.
+        assert!(map_alias(
+            reservation as u64 + PAGE as u64,
+            reservation as u64,
+            0
+        ));
+
         // SAFETY: the whole reservation is mapped read-write.
         unsafe {
             reservation.cast::<u8>().write(5);
@@ -1455,6 +1467,7 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
     }
 
+    /// `n` pages of one new allocation.
     fn allocate(n: usize) -> Vec<usize> {
         let (mut pages, mut given) = (vec![0; n], n);
         assert_eq!(
