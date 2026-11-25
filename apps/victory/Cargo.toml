@@ -20,6 +20,10 @@ memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
 
+[build-dependencies]
+# Reads the Agility SDK version a D3D12Core.dll beside the executable exports.
+victory-pe.workspace = true
+
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.

@@ -220,6 +220,19 @@ impl ImageInfo {
         })
     }
 
+    /// The value of an exported `u32` variable, read from the file `data` this
+    /// image was parsed from: `None` without such an export, for a forwarded
+    /// one, or when its four bytes are not backed by file data.
+    pub fn exported_u32(&self, data: &[u8], name: &str) -> Option<u32> {
+        let export = self
+            .exports
+            .iter()
+            .find(|e| e.name.as_deref() == Some(name))?;
+        let at = self.rva_to_file_offset(export.rva?)? as usize;
+        let bytes = data.get(at..at.checked_add(4)?)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    }
+
     pub fn import_count(&self) -> usize {
         self.imports.iter().map(|m| m.entries.len()).sum()
     }
@@ -543,5 +556,37 @@ mod tests {
                 (Some("gamma"), 3, Some(0x1204))
             ]
         );
+    }
+
+    #[test]
+    fn an_exported_u32_is_read_from_the_file() {
+        // Two exports: "version", a u32 inside the section, and "far", past
+        // the bytes the file backs.
+        let mut body = vec![0u8; 0x110];
+        let put32 =
+            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put32(&mut body, 12, 0x1040); // name of the DLL
+        put32(&mut body, 16, 1); // ordinal base
+        put32(&mut body, 20, 2); // number of functions
+        put32(&mut body, 24, 2); // number of names
+        put32(&mut body, 28, 0x1028); // address table
+        put32(&mut body, 32, 0x1030); // name pointer table
+        put32(&mut body, 36, 0x1038); // name ordinal table
+        put32(&mut body, 0x28, 0x1100);
+        put32(&mut body, 0x2C, 0x1300);
+        put32(&mut body, 0x30, 0x104C);
+        put32(&mut body, 0x34, 0x1044);
+        body[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+        body[0x3A..0x3C].copy_from_slice(&0u16.to_le_bytes());
+        body[0x40..0x44].copy_from_slice(b"t.dl");
+        body[0x44..0x4C].copy_from_slice(b"version\0");
+        body[0x4C..0x50].copy_from_slice(b"far\0");
+        put32(&mut body, 0x100, 620);
+
+        let data = synthetic_image(&body);
+        let info = ImageInfo::parse(&data).unwrap();
+        assert_eq!(info.exported_u32(&data, "version"), Some(620));
+        assert_eq!(info.exported_u32(&data, "far"), None);
+        assert_eq!(info.exported_u32(&data, "missing"), None);
     }
 }

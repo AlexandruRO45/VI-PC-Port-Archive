@@ -31,6 +31,15 @@ Tested on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
 cargo build --release -p victory
 ```
 
+**Windows 10:** its built-in D3D12 runtime stops at shader model 6.5, so the
+game crashes a few seconds after start ("root signature flags c01" in the
+log). Use Microsoft's Agility SDK runtime instead: download the
+`Microsoft.Direct3D.D3D12` package from NuGet (a `.nupkg` is a zip), copy
+`build\native\bin\x64\D3D12Core.dll` to the repository's `D3D12\` folder, then
+build. The build reads the runtime's version, makes `victory.exe` load it and
+copies it beside the executable; it prints a warning naming the version it
+uses. Without that file nothing changes.
+
 ## Play
 
 ```powershell

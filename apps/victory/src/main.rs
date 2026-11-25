@@ -121,8 +121,51 @@ enum Console {
     SeriesS,
 }
 
+/// The Agility SDK opt-in (`build.rs`): the system's `d3d12.dll` reads these
+/// two exports and loads `D3D12\D3D12Core.dll` beside the executable instead
+/// of the inbox runtime. Compiled only when that runtime was there at build
+/// time.
+#[cfg(victory_agility)]
+mod agility {
+    /// The SDK version the runtime beside the executable exports.
+    #[unsafe(no_mangle)]
+    pub static D3D12SDKVersion: u32 = decimal(env!("VICTORY_AGILITY_SDK_VERSION"));
+
+    /// A pointer to a NUL-terminated path, relative to the executable.
+    #[unsafe(no_mangle)]
+    pub static D3D12SDKPath: &u8 = &b".\\D3D12\\\0"[0];
+
+    const fn decimal(s: &str) -> u32 {
+        let digits = s.as_bytes();
+        let mut value = 0;
+        let mut i = 0;
+        while i < digits.len() {
+            value = value * 10 + (digits[i] - b'0') as u32;
+            i += 1;
+        }
+        value
+    }
+
+    /// A build that opts in, run without the runtime beside it (the
+    /// executable was copied elsewhere), says so: the system runtime is used.
+    pub fn check_runtime() {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let runtime = exe.with_file_name("D3D12").join("D3D12Core.dll");
+        if !runtime.is_file() {
+            eprintln!(
+                "victory: this build opts into the Agility SDK runtime {D3D12SDKVersion}, but {} is missing: the system's D3D12 runtime is used",
+                runtime.display()
+            );
+        }
+    }
+}
+
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    #[cfg(victory_agility)]
+    agility::check_runtime();
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
