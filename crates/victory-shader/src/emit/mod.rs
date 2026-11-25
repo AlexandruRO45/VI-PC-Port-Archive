@@ -1190,7 +1190,7 @@ mod tests {
         let operands = 257 | 258 << 9 | 259 << 18;
         let vop3 = |op: u32| [0x35 << 26 | op << 16 | 4, operands];
         let vop3p = |op: u32| [0x33 << 26 | op << 16 | 1 << 14 | 4, operands | 3 << 27];
-        let cases: [(&str, [u32; 2]); 10] = [
+        let cases: [(&str, [u32; 2]); 11] = [
             ("v_mul_hi_i32_i24", vop3(0x10a)),
             ("v_mul_hi_u32_u24", vop3(0x10c)),
             ("v_ldexp_f32", vop3(0x362)),
@@ -1200,6 +1200,7 @@ mod tests {
             ("v_dot2_u32_u16", vop3p(0x15)),
             ("v_dot4_i32_i8", vop3p(0x16)),
             ("v_dot4_u32_u8", vop3p(0x17)),
+            ("v_dot8_i32_i4", vop3p(0x18)),
             ("v_dot8_u32_u4", vop3p(0x19)),
         ];
         let target = SigElement {

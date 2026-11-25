@@ -1165,6 +1165,7 @@ fn v_dot_products_of_packed_fields() {
         (0x15, 16, false),
         (0x16, 8, true),
         (0x17, 8, false),
+        (0x18, 4, true),
         (0x19, 4, false),
     ] {
         let shader = build_valu_cs(&vop3p(op, 0, vgpr(1), vgpr(2), vgpr(3)));

@@ -7510,7 +7510,7 @@ impl<'a> Lower<'a> {
                 float(self, x)
             }
             "v_dot2_i32_i16" | "v_dot2_u32_u16" | "v_dot4_i32_i8" | "v_dot4c_i32_i8"
-            | "v_dot4_u32_u8" | "v_dot8_u32_u4" => self.integer_dot(inst, guard),
+            | "v_dot4_u32_u8" | "v_dot8_i32_i4" | "v_dot8_u32_u4" => self.integer_dot(inst, guard),
             "v_mad_u64_u32" | "v_mad_i64_i32" => self.wide_mad(inst, guard),
             "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" | "v_mqsad_u32_u8" => {
                 if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 || v.opsel != 0 {
@@ -9553,7 +9553,7 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Or, halves[0], hi)
             }
             "v_dot2_i32_i16" | "v_dot2_u32_u16" | "v_dot4_i32_i8" | "v_dot4_u32_u8"
-            | "v_dot8_u32_u4" => {
+            | "v_dot8_i32_i4" | "v_dot8_u32_u4" => {
                 // The products of the packed fields of src0 and src1, summed
                 // into src2, wrapping (clamp is refused with the other
                 // integer output modifiers).
@@ -9568,6 +9568,7 @@ impl<'a> Lower<'a> {
                     "v_dot2_u32_u16" => (16, false),
                     "v_dot4_i32_i8" => (8, true),
                     "v_dot4_u32_u8" => (8, false),
+                    "v_dot8_i32_i4" => (4, true),
                     _ => (4, false),
                 };
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
