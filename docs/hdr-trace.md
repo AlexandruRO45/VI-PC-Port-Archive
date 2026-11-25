@@ -6,7 +6,8 @@ switches once at first use, and records nothing unless all of the following
 hold: `VICTORY_HDR_TRACE=1`, `VICTORY_CAPTURE_WORLD` is set, and
 `VICTORY_CAPTURE_LISTED_ONLY=1`. A TiledLighting draw also flushes the kept
 lines, the Present line and the presented PNG on its own: the first frame
-where that draw executes, or the `VICTORY_HDR_TRACE_AFTER`-th one (default 1),
+where that draw executes, or the frames named by `VICTORY_HDR_TRACE_AFTER` (a comma list
+of post-world frames with that draw; default 1),
 so a frame offset a slow world never reaches is not needed. Copies and lines
 are made only for that trigger frame (and for explicitly listed frames). Recording is armed for the run (the title
 records a frame's commands before presenting it, so filtering by the
@@ -56,8 +57,8 @@ $env:VICTORY_CAPTURE_WORLD    = '2'
 $env:VICTORY_LOG              = 'info,victory_gpu::hdr_trace=info'
 ```
 
-`$env:VICTORY_HDR_TRACE_AFTER = '8'` flushes the 8th frame with a
-TiledLighting draw instead of the first (more settled), and is optional.
+`$env:VICTORY_HDR_TRACE_AFTER = '1,2,3,4'` keeps the first four frames with a TiledLighting draw (one PNG and one
+sample set each), so a card frame and the scene after it can be compared.
 
 Do not set `VICTORY_DUMP_TARGETS`, `VICTORY_DUMP_WRITERS`, `VICTORY_SHOW_TARGET`,
 `VICTORY_GPU_TIMING`, `VICTORY_D3D12_DRED` or `VICTORY_D3D12_DEBUG` for this

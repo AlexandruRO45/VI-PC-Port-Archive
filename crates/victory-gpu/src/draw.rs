@@ -2045,12 +2045,16 @@ pub(crate) mod hdr_trace {
     pub(crate) fn auto_frame(_n: u64) -> bool {
         if !enabled() || !crate::capture::world_started() { return false; }
         TILED.load(std::sync::atomic::Ordering::Relaxed) > 0
-            && WITH_TILED.load(std::sync::atomic::Ordering::Relaxed) + 1 == auto_after()
+            && auto_after().contains(&(WITH_TILED.load(std::sync::atomic::Ordering::Relaxed) + 1))
     }
 
-    fn auto_after() -> u32 {
-        static AFTER: OnceLock<u32> = OnceLock::new();
-        *AFTER.get_or_init(|| std::env::var("VICTORY_HDR_TRACE_AFTER").ok().and_then(|v| v.parse().ok()).unwrap_or(1))
+    fn auto_after() -> &'static [u32] {
+        static AFTER: OnceLock<Vec<u32>> = OnceLock::new();
+        AFTER.get_or_init(|| {
+            let raw = std::env::var("VICTORY_HDR_TRACE_AFTER").unwrap_or_default();
+            let list: Vec<u32> = raw.split(',').filter_map(|v| v.trim().parse().ok()).filter(|&n| n > 0).collect();
+            if list.is_empty() { vec![1] } else { list }
+        })
     }
 
     /// Recording is armed for the whole run: the title records a frame's
@@ -2211,7 +2215,7 @@ pub(crate) mod hdr_trace {
         let listed_now = crate::capture::listed(crate::queue::presented() + 1);
         let candidate = listed_now
             || (first_tiled && crate::capture::world_started()
-                && WITH_TILED.load(Relaxed) + 1 == auto_after());
+                && auto_after().contains(&(WITH_TILED.load(Relaxed) + 1)));
         if !candidate { return None; }
         let mut q = QUOTA.lock().unwrap_or_else(|e| e.into_inner());
         let seen = &mut q.seen[program as usize];
@@ -2306,7 +2310,7 @@ pub(crate) mod hdr_trace {
         let tiled = TILED.swap(0, Relaxed) > 0 && crate::capture::world_started();
         let listed = frame_is_selected(frame);
         let with = if tiled { WITH_TILED.fetch_add(1, Relaxed) + 1 } else { WITH_TILED.load(Relaxed) };
-        let auto = tiled && with == auto_after();
+        let auto = tiled && auto_after().contains(&with);
         let selected = listed || auto;
         let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
         if selected {
