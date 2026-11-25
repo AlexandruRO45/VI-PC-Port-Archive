@@ -17,6 +17,21 @@ pub struct Host {
     pub device: ID3D12Device,
 }
 
+/// What a GPU check does when no device ran it: a local machine without the
+/// capability skips it, but CI must prove that some device runs these checks,
+/// so a runner image that loses SM 6.6 fails instead of passing silently.
+pub(crate) fn no_device(what: &str, errors: &[String]) {
+    let why = if errors.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", errors.join("; "))
+    };
+    if std::env::var_os("CI").is_some() {
+        panic!("{what}: no device on CI{why}");
+    }
+    eprintln!("{what}; skipped{why}");
+}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;

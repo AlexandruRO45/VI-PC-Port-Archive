@@ -319,7 +319,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
         ran += 1;
     }
     if ran == 0 {
-        eprintln!("no device ran these cases (no SM 6.6 device); skipped");
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
     }
 }
 
@@ -487,7 +487,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         ran += 1;
     }
     if ran == 0 {
-        eprintln!("no device ran these cases (no SM 6.6 device); skipped");
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
     }
 }
 
@@ -628,7 +628,7 @@ fn writes_through_views_mark_their_pages() {
         ran += 1;
     }
     if ran == 0 {
-        eprintln!("no device ran these cases (no SM 6.6 device); skipped");
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
     }
 }
 

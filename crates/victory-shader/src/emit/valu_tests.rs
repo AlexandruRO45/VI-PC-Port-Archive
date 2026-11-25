@@ -223,7 +223,7 @@ fn run_cases(
         ran += 1;
     }
     if ran == 0 {
-        eprintln!("no device ran these cases (no SM 6.6 device); skipped");
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
     }
 }
 

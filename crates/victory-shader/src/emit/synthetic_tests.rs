@@ -273,7 +273,7 @@ fn gathers_at_a_level_match_the_hardware() {
         }
     }
     if ran == 0 {
-        eprintln!("no device ran the permute; skipped");
+        crate::emit::host::no_device("no SM 6.6 device for the gather", &[]);
     }
 }
 

@@ -301,7 +301,7 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
         ran += 1;
     }
     if ran == 0 {
-        eprintln!("no device ran these cases (no SM 6.6 device); skipped");
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
     }
 }
 
@@ -354,7 +354,7 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         ran += 1;
     }
     if ran == 0 {
-        eprintln!("no device ran these cases (no SM 6.6 device); skipped");
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
     }
 }
 
@@ -421,7 +421,7 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
         ran += 1;
     }
     if ran == 0 {
-        eprintln!("no device ran these cases (no SM 6.6 device); skipped");
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
     }
 }
 
@@ -479,7 +479,7 @@ fn a_half_buffer_load_reads_the_half_at_its_address() {
         ran += 1;
     }
     if ran == 0 {
-        eprintln!("no device ran these cases (no SM 6.6 device); skipped");
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
     }
 }
 
@@ -524,7 +524,7 @@ fn half_buffer_stores_leave_the_other_half_alone() {
         ran += 1;
     }
     if ran == 0 {
-        eprintln!("no device ran these cases (no SM 6.6 device); skipped");
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
     }
 }
 
@@ -588,7 +588,7 @@ fn a_sampler_chosen_by_a_uniform_branch_samples_as_chosen() {
         ran += 1;
     }
     if ran == 0 {
-        eprintln!("no device ran these cases (no SM 6.6 device); skipped");
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
     }
 }
 /// User data: s0 a table with a typed buffer UAV, s1 a table with a raw

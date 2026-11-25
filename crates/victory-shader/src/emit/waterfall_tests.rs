@@ -153,7 +153,7 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
         out.push((label, words[0].clone()));
     }
     if out.is_empty() {
-        eprintln!("no device ran the waterfall (no SM 6.6 device); skipped");
+        crate::emit::host::no_device("no SM 6.6 device for the waterfall", &[]);
     }
     out
 }
