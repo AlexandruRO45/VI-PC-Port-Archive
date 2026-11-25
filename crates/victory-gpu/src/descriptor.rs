@@ -542,16 +542,17 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     (*current == generation).then(|| view.clone())
 }
 
-/// For each record (tag, index, generation): whether it names a view that
-/// is current, as [`view_at`] would find it (one lock for them all).
-fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
+/// For each record (tag, index, generation), into `out`: whether it names a
+/// view that is current, as [`view_at`] would find it (one lock for them
+/// all, and no buffer of its own: heap syncs ask about hundreds of
+/// thousands of records a frame).
+fn views_current(records: &[[u32; 3]], out: &mut [bool]) {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    records
-        .iter()
-        .map(|&[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
-        })
-        .collect()
+    for (record, out) in records.iter().zip(out.iter_mut()) {
+        let &[tag, i, generation] = record;
+        *out = tag == VIEW_TAG
+            && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation);
+    }
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
