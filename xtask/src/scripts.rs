@@ -40,7 +40,7 @@ mod tests {
                getcompatpath) printf 'Z:%s\\n' \"$2\" ;;\n\
                waitforexitandrun)\n\
                  shift\n\
-                 printf 'launched %s %s umu=%s overrides=%s copy=%s nowatchdog=%s\\n' \"$0\" \"$*\" \"${{UMU_ID:-}}\" \"${{WINEDLLOVERRIDES:-}}\" \"${{VICTORY_COPY_MEMORY:-}}\" \"${{VICTORY_NO_WATCHDOG:-}}\"\n\
+                 printf 'launched %s %s umu=%s overrides=%s copy=%s nowatchdog=%s mangohud=%s\\n' \"$0\" \"$*\" \"${{UMU_ID:-}}\" \"${{WINEDLLOVERRIDES:-}}\" \"${{VICTORY_COPY_MEMORY:-}}\" \"${{VICTORY_NO_WATCHDOG:-}}\" \"${{MANGOHUD:-}}\"\n\
                  ;;\n\
                *) printf 'unexpected verb %s\\n' \"$1\" >&2; exit 2 ;;\n\
              esac\n"
@@ -99,6 +99,7 @@ mod tests {
             "--d3dcompiler",
             "--texture-wait",
             "--watchdog",
+            "--no-mangohud",
         ] {
             assert!(text.contains(flag), "usage misses {flag}");
         }
@@ -205,7 +206,8 @@ mod tests {
                 .args(["--", "config"])
                 .current_dir(root())
                 .env_remove("VICTORY_COPY_MEMORY")
-                .env_remove("VICTORY_NO_WATCHDOG");
+                .env_remove("VICTORY_NO_WATCHDOG")
+                .env_remove("MANGOHUD");
             for (key, value) in env {
                 cmd.env(key, value);
             }
@@ -232,6 +234,21 @@ mod tests {
             stdout.contains("nowatchdog=1"),
             "the watchdog hooks must default on: {stdout}"
         );
+        assert!(
+            stdout.contains("mangohud=1"),
+            "the MangoHud overlay must default on: {stdout}"
+        );
+
+        // --no-mangohud leaves the overlay off; the other defaults stay.
+        let stdout = stdout_of(&run(&["--no-mangohud"], &[]));
+        assert!(
+            stdout.contains("mangohud=\n"),
+            "--no-mangohud must leave MANGOHUD unset: {stdout}"
+        );
+        assert!(
+            stdout.contains("copy=1"),
+            "the copy default must stay: {stdout}"
+        );
 
         // --watchdog keeps the title's watchdog; the copy default stays.
         let stdout = stdout_of(&run(&["--watchdog"], &[]));
@@ -240,23 +257,32 @@ mod tests {
             "the copy default must stay: {stdout}"
         );
         assert!(
-            stdout.contains("nowatchdog=\n"),
+            stdout.contains("nowatchdog= "),
             "--watchdog must leave VICTORY_NO_WATCHDOG unset: {stdout}"
         );
 
-        // The environment opts out of both (0 keeps the memory in place
-        // once #53 lands, and keeps the watchdog armed).
+        // The environment opts out of all three (0 keeps the memory in
+        // place once #53 lands, keeps the watchdog armed, and the overlay
+        // off).
         let stdout = stdout_of(&run(
             &[],
-            &[("VICTORY_COPY_MEMORY", "0"), ("VICTORY_NO_WATCHDOG", "0")],
+            &[
+                ("VICTORY_COPY_MEMORY", "0"),
+                ("VICTORY_NO_WATCHDOG", "0"),
+                ("MANGOHUD", "0"),
+            ],
         ));
         assert!(
             stdout.contains("copy=0"),
             "the env must override the copy: {stdout}"
         );
         assert!(
-            stdout.contains("nowatchdog=\n"),
+            stdout.contains("nowatchdog= "),
             "VICTORY_NO_WATCHDOG=0 must keep the watchdog: {stdout}"
+        );
+        assert!(
+            stdout.contains("mangohud=0"),
+            "MANGOHUD=0 must keep the overlay off: {stdout}"
         );
         let _ = fs::remove_dir_all(&tmp);
     }

@@ -45,7 +45,14 @@ proton/run.sh --z /mnt/games run "Z:\\games\\x64\\final.exe" --execute
 `Proton-*`, keeps its prefix at `$XDG_DATA_HOME/victory/proton`
 (idempotent), and takes `--prefix`, `--exe`, `--proton` (a specific Proton
 dir or plain `wine`), `--z`, `--config`, `--d3dcompiler`, `--texture-wait`,
-`--texture-no-wait`, `--watchdog` and `--no-watchdog`.
+`--texture-no-wait`, `--watchdog`, `--no-watchdog`, `--mangohud` and
+`--no-mangohud`.
+
+MangoHud defaults on (`MANGOHUD=1`, Proton bundles the layer): fps,
+frametimes and GPU load on screen, which is the only view of the world's
+pace while the mesh layer presents black. `MANGOHUD_CONFIG` passes
+through untouched; the overlay is on screen only, never in the
+`VICTORY_CAPTURE` frames. `--no-mangohud` or `MANGOHUD=0` leaves it off.
 
 The first run creates the prefix and its `dosdevices/`; on a plain-Wine
 or pre-10 prefix it links `z:` to `../drive_z`, and a second run reuses

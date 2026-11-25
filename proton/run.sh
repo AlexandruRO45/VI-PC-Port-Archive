@@ -29,6 +29,8 @@ usage: proton/run.sh [options] [--] [victory args...]
   --watchdog     keep the title's stall watchdog (the default disarms it
                  with the VICTORY_NO_WATCHDOG hooks; docs/proton.md)
   --no-watchdog  accepted for compatibility; the default is already on
+  --mangohud     accepted for compatibility; the default is already on
+  --no-mangohud  leave MANGOHUD unset (no fps/frametime overlay)
 
 Notes:
   VICTORY_COPY_MEMORY defaults to 1: under Wine the title memory used in
@@ -54,6 +56,7 @@ config=""
 d3dcompiler=""
 texture_no_wait=1
 watchdog=""
+mangohud=1
 
 while [[ $# -gt 0 && $1 != -- ]]; do
     case "$1" in
@@ -67,6 +70,8 @@ while [[ $# -gt 0 && $1 != -- ]]; do
         --texture-no-wait) texture_no_wait=1; shift ;;
         --watchdog)    watchdog=1; shift ;;
         --no-watchdog) watchdog=""; shift ;;
+        --mangohud)    mangohud=1; shift ;;
+        --no-mangohud) mangohud=""; shift ;;
         -h|--help) usage; exit 0 ;;
         *)      break ;;
     esac
@@ -200,6 +205,18 @@ if [[ -n $watchdog || $no_watchdog == 0 ]]; then
     unset VICTORY_NO_WATCHDOG
 else
     export VICTORY_NO_WATCHDOG=$no_watchdog
+fi
+
+# MangoHud's Vulkan layer puts fps, frametimes and GPU load on screen —
+# the only view of the world's pace while the mesh layer presents black
+# (docs/proton.md). Proton bundles the layer, so MANGOHUD=1 needs nothing
+# installed; MANGOHUD_CONFIG passes through untouched. The overlay is on
+# screen only: VICTORY_CAPTURE reads the presented buffer without it.
+# --no-mangohud (or MANGOHUD=0) leaves it off.
+if [[ -n $mangohud ]]; then
+    export MANGOHUD=${MANGOHUD:-1}
+else
+    unset MANGOHUD
 fi
 
 # Wine resolves the process' Unix cwd through its Z: mapping, so a config
