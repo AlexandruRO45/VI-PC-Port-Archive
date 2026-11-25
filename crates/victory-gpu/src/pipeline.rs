@@ -67,6 +67,9 @@ pub(crate) struct Shader {
     /// Its result gets the least indirect light ([`crate::ambient`]).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
+    /// The program that writes the title's exposure (`ambient::EXPOSURE`).
+    #[cfg(windows)]
+    pub(crate) calculates_exposure: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -189,6 +192,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 resolves_light: bytes
                     .windows(crate::ambient::PROGRAM.len())
                     .any(|w| w == crate::ambient::PROGRAM),
+                #[cfg(windows)]
+                calculates_exposure: bytes
+                    .windows(crate::ambient::EXPOSURE.len())
+                    .any(|w| w == crate::ambient::EXPOSURE),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
