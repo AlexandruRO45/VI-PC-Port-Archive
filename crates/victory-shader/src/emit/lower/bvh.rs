@@ -122,28 +122,49 @@ impl Lower<'_> {
         // The node's byte offset from the BVH's base: (pointer & !7) * 8.
         let not7 = self.s.m.i32(!7);
         let lo = self.s.m.bin(c, Bin::And, node, not7);
+        let raw = |l: &mut Self, base: V| {
+            let zero = l.s.m.i32(0);
+            let ptr = wide64(l, lo, node_hi.unwrap_or(zero));
+            let k3 = l.s.m.int_const(i64t, 3);
+            let off = l.s.m.bin(c, Bin::Shl, ptr, k3);
+            Nodes::Raw(l.s.m.bin(c, Bin::Add, base, off))
+        };
         let nodes = match self.descriptors.get(&((b, i), false)).copied() {
             Some(src) if matches!(src, Source::Built { .. }) => {
-                // shortcut: the root address is taken to be 256-byte aligned
-                // (the descriptor drops its low byte, not known here).
                 let (k, dynamic) = self.built_offset(src)?;
-                let three = self.s.m.i32(3);
-                let mut at = self.s.m.bin(c, Bin::Shl, lo, three);
-                let k = self.s.m.i32(k);
-                at = self.s.m.bin(c, Bin::Add, at, k);
-                if let Some(d) = dynamic {
-                    at = self.s.m.bin(c, Bin::Add, at, d);
-                }
                 // A root view is title memory there (bounds-checked).
                 match self.root_address(src) {
                     Some((root_lo, root_hi)) => {
                         self.s.flags |= super::flags::INT64;
-                        let base = wide64(self, root_lo, root_hi);
-                        let zero = self.s.m.i32(0);
-                        let at = wide64(self, at, zero);
-                        Nodes::Raw(self.s.m.bin(c, Bin::Add, base, at))
+                        let mut base = wide64(self, root_lo, root_hi);
+                        if k != 0 {
+                            let off = self.s.m.int_const(i64t, i64::from(k));
+                            base = self.s.m.bin(c, Bin::Add, base, off);
+                        }
+                        if let Some(d) = dynamic {
+                            let d = self.s.m.cast(c, Cast::ZExt, d, i64t);
+                            base = self.s.m.bin(c, Bin::Add, base, d);
+                        }
+                        let mask = self.s.m.int_const(i64t, 0x0000_FFFF_FFFF_FF00);
+                        let base = self.s.m.bin(c, Bin::And, base, mask);
+                        raw(self, base)
                     }
-                    None => Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at),
+                    None if node_hi.is_some() => {
+                        return Err("a 64-bit BVH pointer in a buffer view");
+                    }
+                    None => {
+                        // shortcut: a buffer view's base is taken to be
+                        // 256-byte aligned (the descriptor drops the address's
+                        // low byte, not known here).
+                        let mut off = self.s.m.i32(k);
+                        if let Some(d) = dynamic {
+                            off = self.s.m.bin(c, Bin::Add, off, d);
+                        }
+                        let three = self.s.m.i32(3);
+                        let at = self.s.m.bin(c, Bin::Shl, lo, three);
+                        let at = self.s.m.bin(c, Bin::Add, off, at);
+                        Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at)
+                    }
                 }
             }
             Some(_) => return Err("a BVH descriptor"),
@@ -163,25 +184,12 @@ impl Lower<'_> {
                 let base = wide64(self, d[0], hi);
                 let k8 = self.s.m.int_const(i64t, 8);
                 let base = self.s.m.bin(c, Bin::Shl, base, k8);
-                let zero = self.s.m.i32(0);
-                let ptr = wide64(self, lo, node_hi.unwrap_or(zero));
-                let k3 = self.s.m.int_const(i64t, 3);
-                let off = self.s.m.bin(c, Bin::Shl, ptr, k3);
-                Nodes::Raw(self.s.m.bin(c, Bin::Add, base, off))
+                raw(self, base)
             }
         };
-        // Inactive lanes may hold any pointer: they read nothing.
-        let at = self.begin_guarded(guard);
-        let r = self.bvh_lanes(&nodes, node, &ray);
-        let r = match r {
-            Ok(r) => r,
-            Err(why) => {
-                self.end_guarded(at, &[]);
-                return Err(why);
-            }
-        };
-        let zero = self.s.m.i32(0);
-        let r = self.end_guarded(at, &r.map(|x| (x, zero)));
+        // Inactive lanes may hold any pointer: the page table maps misses to
+        // its null view, and only active lanes mark them.
+        let r = self.bvh_lanes(&nodes, node, &ray, guard)?;
         for (k, &x) in r.iter().enumerate() {
             self.write(inst, Reg::V(out + k as u8), x, guard);
         }
@@ -189,25 +197,32 @@ impl Lower<'_> {
     }
 
     /// The four result dwords of `ray` against the node `node` points to.
-    fn bvh_lanes(&mut self, nodes: &Nodes, node: V, ray: &Ray) -> Result<[V; 4], Why> {
-        let w = self.node_dwords(nodes, 0, 16)?;
+    fn bvh_lanes(
+        &mut self,
+        nodes: &Nodes,
+        node: V,
+        ray: &Ray,
+        guard: Option<V>,
+    ) -> Result<[V; 4], Why> {
+        let w = self.node_dwords(nodes, None, 16, guard)?;
         let c = self.cur;
         let seven = self.s.m.i32(7);
         let ty = self.s.m.bin(c, Bin::And, node, seven);
-        // The rest of a box32 node, read only for one.
+        // The rest of a box32 node; other lanes re-read byte 0 so a 64-byte
+        // node never looks past its page or buffer, and a divergent branch
+        // never splits the heap handle's block on WARP.
         let five = self.s.m.i32(5);
         let is32 = self.s.m.cmp(c, pred::EQ, ty, five);
-        let at = self.begin_guarded(Some(is32));
-        let tail = match self.node_dwords(nodes, 16, 12) {
-            Ok(t) => t,
-            Err(why) => {
-                self.end_guarded(at, &[]);
-                return Err(why);
-            }
+        let (zero, k64) = (self.s.m.i32(0), self.s.m.i32(64));
+        let from = self.s.m.select(c, is32, k64, zero);
+        let active = match guard {
+            Some(g) => Some(self.s.m.bin(c, Bin::And, g, is32)),
+            None => Some(is32),
         };
+        let tail = self.node_dwords(nodes, Some(from), 12, active)?;
+        let c = self.cur;
         let zero = self.s.m.i32(0);
-        let pairs: Vec<(V, V)> = tail.iter().map(|&t| (t, zero)).collect();
-        let tail = self.end_guarded(at, &pairs);
+        let tail = tail.into_iter().map(|t| self.s.m.select(c, is32, t, zero));
         let w: Vec<V> = w.into_iter().chain(tail).collect();
         let boxes = self.bvh_box(&w, ty, ray);
         let tri = self.bvh_triangle(&w, ty, ray);
@@ -224,18 +239,28 @@ impl Lower<'_> {
         }))
     }
 
-    /// `n` dwords of the node from dword `from`.
-    fn node_dwords(&mut self, nodes: &Nodes, from: u32, n: u32) -> Result<Vec<V>, Why> {
+    /// `n` dwords of the node from byte `from` (a 64-byte multiple).
+    fn node_dwords(
+        &mut self,
+        nodes: &Nodes,
+        from: Option<V>,
+        n: u32,
+        active: Option<V>,
+    ) -> Result<Vec<V>, Why> {
         let (h, at) = match *nodes {
             Nodes::Buffer(h, at) => (h, at),
-            Nodes::Raw(address) => return self.raw_load(address, 4 * from, n),
+            Nodes::Raw(address) => return self.raw_load(address, from, n, active),
         };
         let c = self.cur;
+        let at = match from {
+            Some(off) => self.s.m.bin(c, Bin::Add, at, off),
+            None => at,
+        };
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let mut out = Vec::new();
         for k in (0..n).step_by(4) {
             let m = (n - k).min(4);
-            let off = self.s.m.i32(4 * (from + k));
+            let off = self.s.m.i32(4 * k);
             let off = self.s.m.bin(c, Bin::Add, at, off);
             let mask = self.s.m.i8((1u8 << m) - 1);
             let r = self.s.op(
@@ -256,11 +281,22 @@ impl Lower<'_> {
 
     /// `dwords` dwords at byte `offset` past `address`, a 64-bit GPU address
     /// (`i64`), from title memory ([`Lower::memory`]).
-    fn raw_load(&mut self, address: V, offset: u32, dwords: u32) -> Result<Vec<V>, Why> {
+    fn raw_load(
+        &mut self,
+        address: V,
+        offset: Option<V>,
+        dwords: u32,
+        active: Option<V>,
+    ) -> Result<Vec<V>, Why> {
         let c = self.cur;
         let i64t = self.s.m.int(64);
-        let off = self.s.m.int_const(i64t, i64::from(offset));
-        let a = self.s.m.bin(c, Bin::Add, address, off);
+        let a = match offset {
+            Some(off) => {
+                let off = self.s.m.cast(c, Cast::ZExt, off, i64t);
+                self.s.m.bin(c, Bin::Add, address, off)
+            }
+            None => address,
+        };
         let k32 = self.s.m.int_const(i64t, 32);
         let lo = self.s.m.cast(c, Cast::Trunc, a, self.s.t.i32);
         let hi = self.s.m.bin(c, Bin::LShr, a, k32);
@@ -268,8 +304,8 @@ impl Lower<'_> {
         // Address bits 32-47, as the hardware takes them.
         let mask = self.s.m.i32(0xFFFF);
         let hi = self.s.m.bin(c, Bin::And, hi, mask);
-        // A node (64 bytes, 64-byte aligned) lies in one 64 KiB page.
-        let (h, at) = self.memory(lo, hi, 4 * dwords, false, None);
+        // Each 64-byte half (64-byte aligned) lies in one 64 KiB page.
+        let (h, at) = self.memory(lo, hi, 4 * dwords, false, active);
         let c = self.cur;
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let mut out = Vec::new();
