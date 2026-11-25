@@ -477,6 +477,19 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+fn has_side_effect(inst: &Inst) -> bool {
+    let name = inst.name();
+    matches!(inst.fields, Fields::Exp { .. })
+        || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
+        || name.contains("store")
+        || name.contains("atomic")
+        || name == "s_barrier"
+        || matches!(inst.fields, Fields::Ds { .. })
+            && !(name.starts_with("ds_read")
+                || name.starts_with("ds_swizzle")
+                || name.contains("permute"))
+}
+
 /// The scalar instruction defining an SSA value in this block and its operands.
 fn scalar_def<'a, const N: usize>(
     block: &'a Block,
@@ -1113,9 +1126,15 @@ impl<'a> Lower<'a> {
 
     /// An instruction inside a whole-wave section: the values that leave
     /// the section are made from what the simulation found them to be.
-    fn section_inst(&mut self, b: usize, i: usize, start: usize) {
+    fn section_inst(&mut self, b: usize, i: usize, start: usize) -> Result<(), Stop> {
         const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
         let inst = &self.x.p.blocks[b].insts[i];
+        if has_side_effect(inst) || self.x.st.discards.contains_key(&(b, i)) {
+            return Err(unsupported(
+                inst.machine.offset,
+                "a side effect in a whole-wave section",
+            ));
+        }
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
@@ -1128,6 +1147,7 @@ impl<'a> Lower<'a> {
             };
             self.vals.insert(w, val);
         }
+        Ok(())
     }
 
     /// A value a whole-wave section leaves, as DXIL wave operations over the
@@ -1368,7 +1388,7 @@ impl<'a> Lower<'a> {
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
-                        self.section_inst(b, j, i);
+                        self.section_inst(b, j, i)?;
                     }
                     i = end;
                     continue;
@@ -3516,15 +3536,6 @@ impl<'a> Lower<'a> {
             }
             MaskData::None => name == "s_bcnt1_i32_b64",
         };
-        let effect = matches!(inst.fields, Fields::Exp { .. })
-            || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
-            || name.contains("store")
-            || name.contains("atomic")
-            || name == "s_barrier"
-            || matches!(inst.fields, Fields::Ds { .. })
-                && !(name.starts_with("ds_read")
-                    || name.starts_with("ds_swizzle")
-                    || name.contains("permute"));
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -3553,7 +3564,7 @@ impl<'a> Lower<'a> {
         };
         match r {
             Ok(()) => Ok(()),
-            Err(why) if effect => Err(unsupported(offset, why)),
+            Err(why) if has_side_effect(inst) => Err(unsupported(offset, why)),
             Err(why) => {
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
@@ -11089,6 +11100,34 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn whole_wave_sections_reject_side_effects() {
+        let save = 0xBE86_3DC1; // s_or_saveexec_b32 s6, -1
+        let restore = 0xBEFE_0306; // s_mov_b32 exec_lo, s6
+        let barrier = [0xBF8A_0000]; // s_barrier
+        let store = [0xE070_0000, 0x8002_0000]; // buffer_store_dword v0, off, s[8:11], 0
+        let mov = 0x7E00_0301; // v_mov_b32 v0, v1
+
+        for effect in [barrier.as_slice(), store.as_slice()] {
+            let outside = [&[mov, save, restore], effect].concat();
+            lowers_valu(&outside).unwrap();
+
+            let inside = [&[mov, save], effect, &[restore]].concat();
+            let error =
+                lowers_valu(&inside).expect_err("the translator cannot preserve this effect");
+            assert!(
+                matches!(
+                    error,
+                    crate::ShaderError::Unsupported {
+                        offset: 36,
+                        what: "a side effect in a whole-wave section",
+                    }
+                ),
+                "{error}"
+            );
+        }
     }
 
     #[test]
