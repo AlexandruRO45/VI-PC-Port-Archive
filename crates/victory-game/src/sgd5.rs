@@ -146,34 +146,45 @@ pub fn records(file: &[u8]) -> Vec<Record<'_>> {
 
 fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
     let u32_at = |o: usize| {
-        file.get(o..o + 4)
+        file.get(o..o.checked_add(4)?)
             .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize)
     };
     let n = u32_at(at.checked_sub(4)?)?;
-    let unpacked_size = u32_at(at + 8)?;
-    if u32_at(at + 4)? != n || n < 12 || unpacked_size > MAX_UNPACKED {
+    let unpacked_size = u32_at(at.checked_add(8)?)?;
+    if u32_at(at.checked_add(4)?)? != n || n < 12 || unpacked_size > MAX_UNPACKED {
         return None;
     }
     let nul = at.checked_sub(6)?;
+    let kind = *file.get(at.checked_sub(5)?)?;
+    let start = at.checked_add(12)?;
+    let end = at.checked_add(n)?;
     Some(Record {
         offset: at,
-        name: (file[nul] == 0).then(|| name_before(file, nul)).flatten(),
-        kind: file[at - 5],
-        packed: file.get(at + 12..at + n)?,
+        name: (file.get(nul) == Some(&0))
+            .then(|| name_before(file, nul))
+            .flatten(),
+        kind,
+        packed: file.get(start..end)?,
         unpacked_size,
     })
 }
 
 /// The printable name that ends at `nul` and follows its length byte.
 fn name_before(file: &[u8], nul: usize) -> Option<&str> {
-    let run = file[..nul]
+    let prefix = file.get(..nul)?;
+    let run = prefix
         .iter()
         .rposition(|b| !b.is_ascii_graphic())
         .map_or(0, |p| p + 1);
     // From 32 characters on, the length byte is printable too.
     (run.saturating_sub(1)..nul)
-        .find(|&l| usize::from(file[l]) == nul - l)
-        .and_then(|l| std::str::from_utf8(&file[l + 1..nul]).ok())
+        .find(|&l| {
+            prefix
+                .get(l)
+                .is_some_and(|&len| nul.checked_sub(l) == Some(usize::from(len)))
+        })
+        .and_then(|l| prefix.get(l.checked_add(1)?..nul))
+        .and_then(|s| std::str::from_utf8(s).ok())
 }
 
 struct Cursor<'a> {
@@ -568,5 +579,55 @@ mod tests {
         let found = records(&file);
         assert_eq!(found.len(), 4);
         assert_eq!(found[1].name, Some("PS_a"));
+    }
+
+    #[test]
+    fn rejects_boundary_and_malformed_records() {
+        fn header(prefix: &[u8], n1: u32, n2: u32, unpacked: u32, body: &[u8]) -> Vec<u8> {
+            let mut out = prefix.to_vec();
+            for v in [n1, 0x000D_DCE7, n2, unpacked] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(body);
+            out
+        }
+
+        // Marker at offsets 0..6 lacks room for `nul`, `kind`, and leading `n`.
+        assert!(records(&MARKER).is_empty());
+        for pad in 0..2 {
+            let near_start = header(&vec![0; pad], 12, 12, 0, &[]);
+            assert!(records(&near_start).is_empty());
+        }
+
+        // Truncated right after the marker.
+        let mut cut = 12u32.to_le_bytes().to_vec();
+        cut.extend_from_slice(&MARKER);
+        assert!(records(&cut).is_empty());
+
+        // `n < 12`, mismatched `n`, oversized `unpacked_size`, and truncated payload.
+        assert!(records(&header(&[0, 0x32], 11, 11, 0, &[])).is_empty());
+        assert!(records(&header(&[0, 0x32], 16, 20, 4, &[0; 8])).is_empty());
+        let too_big = (MAX_UNPACKED as u32) + 1;
+        assert!(records(&header(&[0, 0x32], 12, 12, too_big, &[])).is_empty());
+        assert!(records(&header(&[0, 0x32], 24, 24, 4, &[0; 4])).is_empty());
+        assert!(records(&header(&[0, 0x32], u32::MAX, u32::MAX, 4, &[0; 4])).is_empty());
+
+        // Extreme synthetic offsets on internal helpers do not panic or overflow.
+        assert_eq!(record(&MARKER, usize::MAX), None);
+        assert_eq!(record(&MARKER, usize::MAX - 2), None);
+        assert_eq!(name_before(&[0], 5), None);
+
+        // Missing NUL or mismatched name length leaves `name` as `None` while keeping the record.
+        let unnamed = header(&[0x7f, 0x32], 12, 12, 0, &[]);
+        let parsed = records(&unnamed);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, None);
+        assert_eq!(parsed[0].kind, 0x32);
+
+        let bad_len = header(&[99, b'P', b'S', 0, 0x40], 12, 12, 0, &[]);
+        let parsed = records(&bad_len);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, None);
+        assert_eq!(parsed[0].kind, 0x40);
     }
 }
