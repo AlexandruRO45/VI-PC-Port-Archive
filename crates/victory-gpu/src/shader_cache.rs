@@ -65,6 +65,9 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
+                    "VICTORY_WAVE_LOCAL",
+                    "VICTORY_STRICT_JOINS",
+                    "VICTORY_MESH_OUTPUT_STRICT",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
@@ -96,13 +99,24 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     match CACHE.get() {
         Some(cache) => cached(
             cache,
-            build(),
+            &for_view_limit(build(), victory_shader::emit::view_heap_limit()),
             victory_shader::emit::host_uses_wave32(),
             container,
             translate,
         ),
         None => translate(container),
     }
+}
+
+/// The build as the cache knows it on a host whose view heap ends at
+/// `limit`: translations clamp view indices to it (none for 0), so one made
+/// for another host's heap is not this host's. (The cache folder is one for
+/// all adapters; a card that caps its heap hangs on a read past the end.)
+fn for_view_limit(build: &[u8; 32], limit: u32) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(build);
+    hasher.update(&limit.to_le_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 /// A translator assertion is a failure of this shader, like an unsupported instruction.
@@ -429,6 +443,16 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, false, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn each_view_heap_limit_has_its_own_translations() {
+        let build = [7u8; 32];
+        let capped = for_view_limit(&build, 999_999);
+        assert_ne!(capped, for_view_limit(&build, 0));
+        assert_ne!(capped, for_view_limit(&build, 999_998));
+        assert_ne!(capped, for_view_limit(&[8; 32], 999_999));
+        assert_eq!(capped, for_view_limit(&build, 999_999));
     }
 
     #[test]

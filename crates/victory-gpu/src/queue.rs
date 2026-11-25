@@ -309,6 +309,9 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
 pub(crate) fn release_held(all: bool) {
     // One caller at a time, so a queue's submissions keep their order.
     static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The events waiting for fences first: a write into a fence is not a
+    // signal, and nothing else sets them.
+    crate::fence::wake_reached();
     if lock(&WAITING).is_empty() {
         return;
     }

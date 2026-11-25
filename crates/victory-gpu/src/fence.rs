@@ -32,6 +32,41 @@ struct Fence {
     waiters: Mutex<Vec<(u64, usize)>>,
 }
 
+/// The fences that may have events waiting. A list can write a fence's
+/// value at its GPU address, which is no call of ours: the events of these
+/// are looked at wherever such a write may have landed ([`wake_reached`]).
+/// Locked before a fence's `waiters`.
+static WAITED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+impl Drop for Fence {
+    fn drop(&mut self) {
+        let at = std::ptr::from_ref::<Fence>(self) as usize;
+        let mut waited = WAITED.lock().unwrap_or_else(|e| e.into_inner());
+        waited.retain(|&f| f != at);
+    }
+}
+
+/// Sets the events whose fences have reached their values by a write to the
+/// fence's memory (a list's bottom-of-pipe write), as [`set`] does for a
+/// signal. Called where the queues look at their own fence waits again.
+pub(crate) fn wake_reached() {
+    let mut waited = WAITED.lock().unwrap_or_else(|e| e.into_inner());
+    waited.retain(|&f| {
+        // SAFETY: a live fence: one released is taken off the list.
+        let fence = unsafe { &*(f as *const Fence) };
+        let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        let value = fence.value.load(Ordering::Acquire);
+        waiters.retain(|&(wanted, event)| {
+            let reached = wanted <= value;
+            if reached {
+                set_event(event);
+            }
+            !reached
+        });
+        !waiters.is_empty()
+    });
+}
+
 fn fence<'a>(this: This) -> &'a Fence {
     // SAFETY: called from fence methods only.
     unsafe { &*this.cast::<Fence>() }
@@ -80,6 +115,7 @@ pub(crate) extern "system" fn completed(this: This) -> u64 {
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
+    let mut waited = WAITED.lock().unwrap_or_else(|e| e.into_inner());
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
         if !event.is_null() {
@@ -94,6 +130,7 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         #[cfg(windows)]
         if crate::host::late() {
             drop(waiters);
+            drop(waited);
             crate::host::settle_for_fence();
             if fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
@@ -107,6 +144,9 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return E_NOTIMPL;
     }
     waiters.push((value, event as usize));
+    if !waited.contains(&(this as usize)) {
+        waited.push(this as usize);
+    }
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
@@ -186,8 +226,26 @@ mod tests {
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
         assert_eq!(unsafe { *(at as *const u64) }, 5);
+        // A list writes the value at that address: the events waiting for
+        // it are set where such a write may have landed.
+        assert_eq!(wait(f, 8, event), S_OK);
+        wake_reached();
+        // SAFETY: as above.
+        assert_ne!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+        // SAFETY: the fence's value.
+        unsafe { (at as *mut u64).write(8) };
+        wake_reached();
+        // SAFETY: as above.
+        assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+        // Once: the waiter is gone.
+        wake_reached();
+        // SAFETY: as above.
+        assert_ne!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+        // A fence released with a waiter is not looked at again.
+        assert_eq!(wait(f, 20, event), S_OK);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+        wake_reached();
     }
 }
