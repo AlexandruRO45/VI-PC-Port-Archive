@@ -208,16 +208,16 @@ fi
 
 printf 'Starting %s; output is also saved to %s\n' "$action" "$log_file"
 if ((warm)); then
-    command=(umu-run "$runtime" warm "$game_parent_wine")
+    command=(umu-run start.exe /b /wait /unix "$runtime" warm "$game_parent_wine")
 else
-    command=(umu-run "$runtime" run "$game_wine" --execute --console series-x --unimplemented trap)
+    command=(umu-run start.exe /b /wait /unix "$runtime" run "$game_wine" --execute --console series-x --unimplemented trap)
 fi
 
 cd -- "$install_dir" || fail "Could not enter the install directory: $install_dir"
-# Give Proton a PTY so console-subsystem programs use this terminal instead
-# of asking Wine to open a separate console window. script(1) runs its command
-# through $SHELL, so quote argv for Bash explicitly; output remains streamed
-# here and is copied into the run log.
+# Proton's umu.exe helper detaches console-subsystem programs. Start the Linux
+# executable through Wine's start.exe instead; /b avoids a new console, /wait
+# keeps the launch attached and returns the runtime's status, and /unix handles
+# the Linux executable path. script supplies a PTY and streams output to the log.
 printf -v command_line '%q ' "${command[@]}"
 SHELL="$BASH" script --quiet --return --flush --command "$command_line" /dev/null \
     2>&1 | tee -a "$log_file"

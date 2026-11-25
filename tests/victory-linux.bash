@@ -36,6 +36,22 @@ assert_path_arg() {
     fail "umu-run arguments did not include the configured path '$expected_path'"
 }
 
+assert_argv_prefix() {
+    local args_file=$1 expected arg index=0
+    shift
+    local -a expected_args=("$@")
+    while IFS= read -r arg; do
+        if ((index >= ${#expected_args[@]})); then
+            return 0
+        fi
+        expected=${expected_args[index]}
+        [[ $arg == "$expected" ]] ||
+            fail "umu-run argument $index was '$arg', expected '$expected'"
+        ((index += 1))
+    done < "$args_file"
+    fail "umu-run arguments ended before the expected prefix"
+}
+
 has_line() {
     local file=$1 expected=$2 line
     [[ -f $file ]] || return 1
@@ -166,7 +182,7 @@ assert_equal "yes" "$(cat "$capture_dir/stdout-tty")" \
     "umu-run stdout is attached to a PTY"
 assert_equal "yes" "$(cat "$capture_dir/stderr-tty")" \
     "umu-run stderr is attached to a PTY"
-assert_arg "$capture_dir/args" "$expected_runtime"
+assert_argv_prefix "$capture_dir/args" start.exe /b /wait /unix "$expected_runtime" run
 assert_path_arg "$capture_dir/args" "$expected_game"
 has_line "$tmp/default-output" "mock-umu-stdout" ||
     fail "umu-run stdout was not passed through"
@@ -176,11 +192,12 @@ for flag in --rt --warp --warm; do
     clear_capture
     run_launcher "$install_one" "$flag" > "$tmp/flag-output" 2>&1
     [[ -e $capture_dir/called ]] || fail "umu-run was not invoked for $flag"
-    assert_arg "$capture_dir/args" "$expected_runtime"
+    assert_argv_prefix "$capture_dir/args" start.exe /b /wait /unix "$expected_runtime"
     if [[ $flag == --warm ]]; then
         assert_arg "$capture_dir/args" "warm"
         assert_path_arg "$capture_dir/args" "${expected_game%/*}"
     else
+        assert_arg "$capture_dir/args" "run"
         assert_path_arg "$capture_dir/args" "$expected_game"
     fi
     assert_equal "GE-Proton" "$(cat "$capture_dir/protonpath")" "PROTONPATH for $flag"
