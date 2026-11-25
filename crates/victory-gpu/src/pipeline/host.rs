@@ -272,7 +272,8 @@ impl GraphicsState {
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
                     for f in &mut self.targets.RTFormats {
-                        f.0 = crate::resource::pc_format(f.0 as u32) as i32;
+                        // Pipeline output formats must agree with the effective RTVs.
+                        f.0 = crate::resource::host_color_format(f.0 as u32, 1) as i32;
                     }
                 }
                 16 => {

@@ -237,6 +237,31 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// Both packed RGB formats are four bytes and convert to float in shaders.
+/// Raw copies/CPU readback do NOT convert: a substituted target contains
+/// R11G11B10 bits, not the title's shared-exponent encoding.
+fn rgb9e5_format(format: u32, flags: u32, enabled: bool) -> u32 {
+    if enabled && format == 67 && flags & (1 | 4) != 0 { 26 } else { pc_format(format) }
+}
+
+pub(crate) fn host_color_format(format: u32, flags: u32) -> u32 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if format != 67 { return pc_format(format); }
+    rgb9e5_format(format, flags, *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_RGB9E5_AS_R11G11B10").is_some_and(|v| v == "1")
+    }))
+}
+
+/// Translate explicit views only for the resource whose encoding changed.
+#[cfg(windows)]
+pub(crate) fn host_view_format(this: This, format: u32) -> u32 {
+    if format == 67 && !this.is_null() {
+        let d = &resource(this).desc;
+        if d.format == 67 && d.dimension != BUFFER { return host_color_format(format, d.flags); }
+    }
+    pc_format(format)
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -300,7 +325,7 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
 pub(crate) fn view_format(this: This) -> Option<u32> {
-    let own = pc_format(resource(this).desc.format);
+    let own = host_view_format(this, resource(this).desc.format);
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
@@ -822,7 +847,13 @@ impl Resource {
     fn materialize(&self) -> Option<&std::sync::Arc<HostTexture>> {
         let desc = host_desc(&self.desc)?;
         self.host.get_or_init(|| {
-            let clear = self.initial.clear.as_ref().map_or(std::ptr::null(), |v| std::ptr::from_ref(v).cast());
+            let mut clear = self.initial.clear;
+            if self.desc.format == 67 && desc.format == 26 {
+                tracing::info!(old_format = 67, new_format = 26, width = desc.width, height = desc.height,
+                    flags = self.desc.flags, "substituting host RGB9E5 renderable texture");
+                if let Some(v) = &mut clear && v[0] == 67 { v[0] = 26; }
+            }
+            let clear = clear.as_ref().map_or(std::ptr::null(), |v| std::ptr::from_ref(v).cast());
             shared_texture(self.data() as u64, &self.desc, &desc, self.initial.state, clear)
         }).as_ref()
     }
@@ -1085,7 +1116,7 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
+    d.format = host_color_format(d.format, d.flags);
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1209,14 +1240,17 @@ fn shared_texture(
             let own = host_desc(&r.desc)?;
             let compatible = family(own.format) == family(d.format)
                 || castable(own.format).into_iter().any(|f| family(f) == family(d.format));
+            let mut clear = r.initial.clear;
+            if r.desc.format == 67 && own.format == 26 && let Some(v) = &mut clear && v[0] == 67 { v[0] = 26; }
             (own.flags & USES != 0 && compatible && r.key == Some(key))
-                .then_some((own, r.initial.state, r.initial.clear))
+                .then_some((own, r.initial.state, clear))
         })
     });
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
     let live = key.and_then(|k| map.get(&k)?.upgrade());
     if let Some(t) = &live
+        && (desc.format != 67 || d.format != 26 || unsafe { t.texture.GetDesc() }.Format.0 == 26)
         && takes(t, d)
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2007,6 +2041,16 @@ mod tests {
     /// Castable formats: every format of the same element but typeless and
     /// depth ones; block formats among block formats of their block size.
     #[test]
+    fn rgb9e5_substitution_is_scoped_to_writable_targets() {
+        for flags in [1, 4, 5] {
+            assert_eq!(rgb9e5_format(67, flags, true), 26);
+            assert_eq!(rgb9e5_format(67, flags, false), 67);
+        }
+        assert_eq!(rgb9e5_format(67, 0, true), 67);
+        assert_eq!(rgb9e5_format(28, 5, true), 28);
+    }
+
+    #[test]
     fn castable_formats_share_the_element() {
         let c = castable(42);
         for f in [67, 28, 29, 41, 24, 26, 87, 35] {
@@ -2487,6 +2531,34 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_hdr_target_creates_host_views() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(h) = crate::host::host() else { return };
+        let mut d = texture(64, 64, 67, 1);
+        d.flags = 5;
+        d.format = rgb9e5_format(d.format, d.flags, true);
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT::default();
+        support.Format.0 = d.format as i32;
+        // SAFETY: sized output; descriptors below name live objects, with one slot each.
+        unsafe {
+            h.device.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut support).cast(), size_of_val(&support) as u32).unwrap();
+            if !support.Support1.contains(D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) { return; }
+            let tex = make_texture(&d, 0, std::ptr::null()).expect("packed HDR target");
+            for (i, kind) in [D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV].into_iter().enumerate() {
+                let heap: ID3D12DescriptorHeap = h.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: kind, NumDescriptors: 1, ..Default::default() }).unwrap();
+                let at = heap.GetCPUDescriptorHandleForHeapStart();
+                match i {
+                    0 => h.device.CreateRenderTargetView(&tex.texture, None, at),
+                    1 => h.device.CreateShaderResourceView(&tex.texture, None, at),
+                    _ => h.device.CreateUnorderedAccessView(&tex.texture, None::<&ID3D12Resource>, None, at),
+                }
+            }
+            h.device.GetDeviceRemovedReason().unwrap();
+        }
     }
 
     #[cfg(windows)]
