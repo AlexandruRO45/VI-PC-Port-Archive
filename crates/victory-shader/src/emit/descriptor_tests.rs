@@ -1,5 +1,5 @@
 use super::*;
-use crate::native::{ComputeIo, RootParam, StageIo};
+use crate::native::{ComputeIo, ResourceType, RootParam, StageIo, UsedResource};
 
 /// Read the size dword of a 2D texture SRV and store it with the red
 /// channel of its first texel. The scalar read comes before the image use.
@@ -74,6 +74,116 @@ fn texture_size_word_of_another_entry_is_refused() {
             ..
         })
     ));
+}
+
+fn indexed_pixel_descriptor(
+    word: u32,
+    root: RootType,
+    kind: ResourceType,
+) -> Result<HostShader, ShaderError> {
+    let words = [
+        0xBE81_0380, // s_mov_b32 s1, 0
+        0x8F04_8502, // s_lshl_b32 s4, s2, 5
+        0xF40C_0200,
+        0x0800_0000,        // s_load_dwordx8 s[8:15], s[0:1], s4
+        0x7E00_0208 | word, // v_mov_b32 v0, s[8 + word]
+        0xF800_180F,
+        0x0000_0000, // exp mrt0, v0, v0, v0, v0
+        0xBF81_0000,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 1,
+        layout: vec![
+            RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Ps {
+            inputs: vec![],
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let target = super::container::SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 15,
+        half: false,
+    };
+    let outputs = super::container::signature(&[target], false);
+    let bytes = crate::dxbc::build(&[(FourCC::OSG1, &outputs)]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let io = io::raise(&p, &native)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    assert!(res.descriptors.is_empty());
+    assert!(res.scalar.iter().any(|(_, a)| a.dynamic.is_some()));
+    emit(&Container::parse(&bytes)?, &native, &p, &st, &io, &res)
+}
+
+#[test]
+fn indexed_pixel_texture_can_be_used_for_size_alone() {
+    for root in [RootType::Table, RootType::ResourceHeap] {
+        let shader = indexed_pixel_descriptor(2, root, ResourceType::Srv).unwrap();
+        assert!(
+            shader
+                .user_data
+                .iter()
+                .any(|u| u.root == RootType::Constants)
+        );
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil.clone()).unwrap();
+        }
+    }
+}
+
+#[test]
+fn size_only_fallback_requires_a_size_read_and_a_compatible_resource() {
+    for (word, kind) in [(0, ResourceType::Srv), (2, ResourceType::Uav)] {
+        assert!(matches!(
+            indexed_pixel_descriptor(word, RootType::Table, kind),
+            Err(ShaderError::Unsupported {
+                what: "a descriptor read only as data",
+                ..
+            })
+        ));
+    }
 }
 
 #[cfg(windows)]
