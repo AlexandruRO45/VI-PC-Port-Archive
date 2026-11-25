@@ -402,7 +402,147 @@ fn crash_logs() -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn run(log: &Path, crashes: Option<PathBuf>, draft: Option<usize>, repo: &str) -> Result<()> {
+/// `s` as a JSON string.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32).unwrap_or(()),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_list(items: &[String]) -> String {
+    let v: Vec<String> = items.iter().map(|s| json_str(s)).collect();
+    format!("[{}]", v.join(","))
+}
+
+/// The failures as JSON, one object each: for scripts and agents that
+/// triage run reports.
+pub fn to_json(repo: &str, log: &Path, found: &[Failure]) -> String {
+    let items: Vec<String> = found
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let kind = ["crash", "fatal", "error", "warning"][usize::from(f.severity.min(3))];
+            let link = search_link(repo, f).map_or("null".to_owned(), |l| json_str(&l));
+            format!(
+                "{{\"number\":{},\"kind\":\"{kind}\",\"key\":{},\"title\":{},\"count\":{},\"search_terms\":{},\"shaders\":{},\"search_url\":{link},\"excerpt\":{}}}",
+                i + 1,
+                json_str(&f.key),
+                json_str(&f.title),
+                f.count,
+                json_list(&f.terms),
+                json_list(&f.shaders),
+                json_list(&f.excerpt)
+            )
+        })
+        .collect();
+    format!(
+        "{{\"log\":{},\"repo\":{},\"failures\":[{}]}}\n",
+        json_str(&redact(&log.display().to_string())),
+        json_str(repo),
+        items.join(",")
+    )
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// A page to open in a browser: one card per failure with its search link,
+/// its log lines, a copyable issue draft and GitHub's issue form filled in.
+/// Self-contained (no scripts or styles from elsewhere).
+pub fn to_html(repo: &str, log: &Path, found: &[Failure]) -> String {
+    let mut cards = String::new();
+    for (i, f) in found.iter().enumerate() {
+        let kind = ["crash", "fatal", "error", "warning"][usize::from(f.severity.min(3))];
+        let draft = issue_draft(repo, f);
+        let body = draft.split_once("\n\n").map_or(draft.as_str(), |(_, b)| b);
+        let mut body: String = body.chars().take(6000).collect();
+        if body.len() < draft.len() - f.title.len() - 9 {
+            body.push_str("\n(cut: the whole draft is in `victory doctor --draft`)");
+        }
+        let new_issue = format!(
+            "https://github.com/{repo}/issues/new?title={}&body={}",
+            encode(&f.title),
+            encode(&body)
+        );
+        let search = search_link(repo, f).map_or(String::new(), |l| {
+            format!(
+                r#"<a class="btn" href="{}" target="_blank">Who else reported it?</a>"#,
+                html_escape(&l)
+            )
+        });
+        let shaders = if f.shaders.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<p class="muted">Shaders (for you; title shader hashes stay out of posts): {}</p>"#,
+                html_escape(&f.shaders.join(", "))
+            )
+        };
+        write!(
+            cards,
+            r#"<div class="card {kind}"><div class="head"><span class="badge">{kind}</span><b>{n}. {title}</b><span class="muted">x{count}</span></div>
+{shaders}<div class="row">{search}<a class="btn ghost" href="{new_issue}" target="_blank">Open a new issue (filled in)</a><button class="btn ghost" onclick="copy('d{n}')">Copy the draft</button></div>
+<details><summary>Log lines (for you: they can hold values from title memory, so they are not in the draft)</summary><pre>{excerpt}</pre></details>
+<details><summary>Issue draft</summary><pre id="d{n}">{draft}</pre></details></div>
+"#,
+            n = i + 1,
+            title = html_escape(&f.title),
+            count = f.count,
+            new_issue = html_escape(&new_issue),
+            excerpt = html_escape(&f.excerpt.join("\n")),
+            draft = html_escape(&draft),
+        )
+        .ok();
+    }
+    if found.is_empty() {
+        cards.push_str(r#"<div class="card">No failures in this run.</div>"#);
+    }
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>victory doctor</title><style>
+:root{{--bg:#f6f7f9;--card:#fff;--fg:#16181d;--muted:#5b6270;--line:#e3e6eb;--acc:#2f6fed}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#111318;--card:#1a1d24;--fg:#e8eaee;--muted:#9aa1ad;--line:#2a2f39;--acc:#6c9bff}}}}
+body{{margin:0;font:14px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--fg)}}main{{max-width:980px;margin:0 auto;padding:20px 16px}}
+.card{{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--line);border-radius:10px;padding:12px 14px;margin:10px 0}}
+.crash{{border-left-color:#c0392b}}.fatal{{border-left-color:#d35400}}.error{{border-left-color:#b7791f}}.warning{{border-left-color:#6b7280}}
+.head,.row{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}.row{{margin:8px 0}}.muted{{color:var(--muted)}}
+.badge{{font-size:12px;font-weight:600;padding:1px 8px;border-radius:999px;background:var(--line)}}
+.btn{{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:5px 10px;font:inherit;text-decoration:none;cursor:pointer}}
+.ghost{{background:none;color:var(--fg);border:1px solid var(--line)}}
+pre{{white-space:pre-wrap;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px;font-size:12px;max-height:320px;overflow:auto}}
+</style></head><body><main><h1>victory doctor</h1>
+<p class="muted">{log}: {n} kinds of failure, most severe first. Check who else reported each before opening a new issue; if one matches, add your setup there.</p>
+{cards}</main><script>function copy(id){{navigator.clipboard.writeText(document.getElementById(id).textContent)}}</script></body></html>
+"#,
+        log = html_escape(&redact(&log.display().to_string())),
+        n = found.len(),
+    )
+}
+
+pub fn run(
+    log: &Path,
+    crashes: Option<PathBuf>,
+    draft: Option<usize>,
+    repo: &str,
+    json: bool,
+    html: Option<PathBuf>,
+) -> Result<()> {
     let text =
         std::fs::read_to_string(log).with_context(|| format!("reading {}", log.display()))?;
     let stamps: Vec<i64> = text
@@ -423,6 +563,20 @@ pub fn run(log: &Path, crashes: Option<PathBuf>, draft: Option<usize>, repo: &st
         }
     }
     let found = failures(lines.iter().map(String::as_str));
+    if json {
+        print!("{}", to_json(repo, log, &found));
+        return Ok(());
+    }
+    if let Some(page) = html {
+        std::fs::write(&page, to_html(repo, log, &found))
+            .with_context(|| format!("writing {}", page.display()))?;
+        println!(
+            "{} kinds of failure; open {} in a browser.",
+            found.len(),
+            page.display()
+        );
+        return Ok(());
+    }
     if let Some(n) = draft {
         let f = found
             .get(n.wrapping_sub(1))
@@ -462,26 +616,58 @@ pub fn run(log: &Path, crashes: Option<PathBuf>, draft: Option<usize>, repo: &st
     Ok(())
 }
 
+/// A failure's title as a draft may carry it: a crash keeps its code,
+/// module-relative offsets and the kind of access, not the address it
+/// touched (only whether it was null). Messages are our own text.
+fn public_title(f: &Failure) -> String {
+    if f.severity != 0 {
+        return f.title.clone();
+    }
+    for access in ["read", "write", "execute"] {
+        let mark = format!(" ({access} 0x");
+        if let Some(at) = f.title.rfind(&mark) {
+            let null = f.title[at + mark.len()..].starts_with("0)");
+            let what = if null {
+                format!(" ({access} at address 0)")
+            } else {
+                format!(" ({access})")
+            };
+            return format!("{}{what}", &f.title[..at]);
+        }
+    }
+    f.title.clone()
+}
+
+/// The paste-ready issue text. It carries an allowlist of fields only: what
+/// kind of failure, its title (our message text, or a crash's code and
+/// module-relative offsets), how often, and a search made of the same. Log
+/// lines and shader hashes stay in the local output: lines near a failure
+/// can hold values read from title memory (`VICTORY_PEEK`), and title
+/// shader hashes do not go in comments (rule 7 of #1633).
 fn issue_draft(repo: &str, f: &Failure) -> String {
+    let kind = ["crash", "fatal", "error", "warning"][usize::from(f.severity.min(3))];
+    let title = public_title(f);
     let mut s = String::new();
-    writeln!(s, "Title: {}\n", f.title).ok();
+    writeln!(s, "Title: {title}\n").ok();
     writeln!(
         s,
-        "### What happened\n\n{} ({} time(s) in one run).\n",
-        f.title, f.count
+        "### What happened\n\n- Kind: {kind}\n- Failure: {title}\n- Times in one run: {}\n",
+        f.count
     )
     .ok();
-    writeln!(s, "```\n{}\n```\n", f.excerpt.join("\n")).ok();
-    if !f.shaders.is_empty() {
-        writeln!(s, "Shaders: {}\n", f.shaders.join(", ")).ok();
-    }
     writeln!(s, "### Environment\n\n- Windows version:\n- GPU and driver:\n- CPU, RAM:\n- VIctory commit:\n- Console mode and `VICTORY_*` settings:\n").ok();
-    if let Some(link) = search_link(repo, f) {
-        writeln!(s, "Searched first: {link}\n").ok();
+    if !f.terms.is_empty() {
+        let terms = Failure {
+            shaders: Vec::new(),
+            ..f.clone()
+        };
+        if let Some(link) = search_link(repo, &terms) {
+            writeln!(s, "Searched first: {link}\n").ok();
+        }
     }
     writeln!(
         s,
-        "No game data; user names are taken out of the paths above."
+        "Written by `victory doctor --draft`: no log lines, shader hashes or memory values."
     )
     .ok();
     s
@@ -590,6 +776,84 @@ VIctory: Windows commit limit reached while committing 6538919936 bytes (os erro
             redact(r"C:\Users\someone\AppData\x and D:\users\other/y"),
             r"C:\Users\<user>\AppData\x and D:\users\<user>/y"
         );
-        assert!(issue_draft("Marvisak/VIctory", &f).contains("No game data"));
+        assert!(
+            issue_draft("Marvisak/VIctory", &f).contains("Written by `victory doctor --draft`")
+        );
+    }
+
+    /// A shader hash and a peek line next to a failure (title-derived data)
+    /// reach neither the draft nor the page's filled-in issue form.
+    #[test]
+    fn drafts_carry_no_log_lines_hashes_or_memory_values() {
+        let log = "\
+2026-11-25T10:24:00.000000Z  INFO victory_gpu::capture: peek frame 0x1a2b3c4d00: 11223344 55667788 99aabbcc ddeeff00
+2026-11-25T10:24:00.100000Z  WARN victory_gpu::pipeline::host: host pipeline refused error=The parameter is incorrect. (0x80070057) shaders=[compute 6f225b641c5b0708]
+unix time 1795602452, process 9072
+VIctory: unhandled exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x23cf683 (write 0x7ffe12345678: nothing mapped there)
+  #0  victory-image-b99f876b74d4a77f.dll+0x23cf683
+";
+        let found = failures(log.lines());
+        assert!(
+            found
+                .iter()
+                .any(|f| f.shaders.contains(&"6f225b641c5b0708".to_owned())),
+            "kept for local output"
+        );
+        for f in &found {
+            let draft = issue_draft("Marvisak/VIctory", f);
+            for secret in [
+                "6f225b641c5b0708",
+                "11223344",
+                "0x1a2b3c4d00",
+                "0x7ffe12345678",
+                "peek",
+            ] {
+                assert!(!draft.contains(secret), "{secret} in the draft:\n{draft}");
+            }
+        }
+        let crash = found.iter().find(|f| f.severity == 0).unwrap();
+        assert!(issue_draft("Marvisak/VIctory", crash).contains("image+0x23cf683 (write)"));
+        let page = to_html("Marvisak/VIctory", Path::new("run.log"), &found);
+        let forms: Vec<&str> = page
+            .split("issues/new?")
+            .skip(1)
+            .map(|s| s.split('"').next().unwrap())
+            .collect();
+        assert_eq!(forms.len(), found.len());
+        for form in forms {
+            assert!(
+                !form.contains("6f225b641c5b0708")
+                    && !form.contains("11223344")
+                    && !form.contains("peek")
+            );
+        }
+    }
+
+    #[test]
+    fn the_page_escapes_log_text_and_links_each_failure() {
+        let found = failures(
+            "2026-11-25T10:24:00.000000Z  WARN victory_gpu::draw: a view <script>alert(1)</script> was refused slot=0x10"
+                .lines(),
+        );
+        let page = to_html("Marvisak/VIctory", Path::new("run.log"), &found);
+        assert!(!page.contains("<script>alert"), "log text is escaped");
+        assert!(page.contains("&lt;script&gt;"));
+        assert!(page.contains("https://github.com/Marvisak/VIctory/issues/new?title="));
+        assert_eq!(page.matches(r#"class="card "#).count(), found.len());
+    }
+
+    #[test]
+    fn json_output_is_escaped_and_complete() {
+        assert_eq!(json_str("a\"b\\c\nd\u{1}"), r#""a\"b\\c\nd\u0001""#);
+        let found = failures(RUN.lines().chain(CRASHES.lines()));
+        let out = to_json(
+            "Marvisak/VIctory",
+            Path::new(r"C:\Users\someone\run.log"),
+            &found,
+        );
+        assert!(out.starts_with(r#"{"log":"C:\\Users\\<user>\\run.log","repo":"Marvisak/VIctory","failures":[{"number":1,"kind":"crash""#), "{out}");
+        assert_eq!(out.matches("\"number\":").count(), found.len());
+        assert!(out.contains(r#""shaders":["6f225b641c5b0708","2da4beb386509b77"]"#));
+        assert!(out.trim_end().ends_with("]}"));
     }
 }

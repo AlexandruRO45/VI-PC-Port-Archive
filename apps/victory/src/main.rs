@@ -135,6 +135,15 @@ enum Command {
         /// The repository the links search.
         #[arg(long, default_value = "Marvisak/VIctory")]
         repo: String,
+        /// Print the failures as JSON (for scripts and agents that triage
+        /// run reports): number, kind, key, title, count, search terms,
+        /// shaders, search URL, excerpt.
+        #[arg(long)]
+        json: bool,
+        /// Write a page to open in a browser: each failure with its search
+        /// link, log lines, a copyable issue draft and GitHub's form filled in.
+        #[arg(long, value_name = "FILE")]
+        html: Option<PathBuf>,
     },
     /// Show the resolved configuration and check it.
     Config,
@@ -218,7 +227,9 @@ fn main() -> Result<()> {
             crashes,
             draft,
             repo,
-        } => doctor::run(&log, crashes, draft, &repo),
+            json,
+            html,
+        } => doctor::run(&log, crashes, draft, &repo, json, html),
         Command::Config => show_config(),
     }
 }
