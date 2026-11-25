@@ -321,6 +321,7 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        let _timed = crate::cpuprof::time(crate::cpuprof::Stage::SetTargets);
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -429,13 +430,16 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        let _timed = crate::cpuprof::time(crate::cpuprof::Stage::Draw);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
+        let looked_up = crate::cpuprof::time(crate::cpuprof::Stage::PipelineLookup);
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
+        drop(looked_up);
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             not_run("another kind of pipeline");
@@ -445,11 +449,40 @@ impl State {
             return false;
         }
         let l = &list.list;
+        let buffers = crate::cpuprof::time(crate::cpuprof::Stage::VertexIndex);
+        if !self.vertex_index(list, p.slots, indexed) {
+            return false;
+        }
+        drop(buffers);
+        let _states = crate::cpuprof::time(crate::cpuprof::Stage::TargetStates);
+        const RENDER_TARGET: u32 = 0x4;
+        const DEPTH_WRITE: u32 = 0x10;
+        for &t in &self.targets {
+            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+        }
+        if self.depth != 0 {
+            crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+        }
+        // A depth copy of ours (`crate::twin`) ran a compute pipeline.
+        if list.take_rebind() {
+            // SAFETY: an open list and a live pipeline.
+            unsafe { l.SetPipelineState(&p.pso) };
+            (self.host_pipeline, self.host_roots[1]) = (p.pso.as_raw() as usize, 0);
+        }
+        true
+    }
+
+    /// The vertex buffers the input layout reads (`slots`, a bit per slot)
+    /// and, for indexed draws, the index buffer: their host copies brought
+    /// up to date at submission and set on the host list. False if an
+    /// indexed draw's index buffer lies outside title buffers.
+    fn vertex_index(&self, list: &HostList, slots: u32, indexed: bool) -> bool {
+        let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
         for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
-            if p.slots & 1 << slot == 0 {
+            if slots & 1 << slot == 0 {
                 continue;
             }
             count = slot + 1;
@@ -487,20 +520,6 @@ impl State {
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
-        const RENDER_TARGET: u32 = 0x4;
-        const DEPTH_WRITE: u32 = 0x10;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
-        }
-        if self.depth != 0 {
-            crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
-        }
-        // A depth copy of ours (`crate::twin`) ran a compute pipeline.
-        if list.take_rebind() {
-            // SAFETY: an open list and a live pipeline.
-            unsafe { l.SetPipelineState(&p.pso) };
-            (self.host_pipeline, self.host_roots[1]) = (p.pso.as_raw() as usize, 0);
-        }
         true
     }
 
@@ -512,6 +531,7 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let _timed = crate::cpuprof::time(crate::cpuprof::Stage::Bind);
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
@@ -523,7 +543,10 @@ impl State {
         // the title binds none (the BVH builder's dispatches may not).
         let memory_heap = self.heaps[0] == 0
             && p.stages.iter().any(|s| s.memory.is_some() || has_root_views(&s.translated().host));
+        let heaps = crate::cpuprof::time(crate::cpuprof::Stage::BindHeaps);
         self.bind_heaps(list, memory_heap);
+        drop(heaps);
+        let set_pipeline = crate::cpuprof::time(crate::cpuprof::Stage::BindPipeline);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
@@ -547,6 +570,7 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        drop(set_pipeline);
         #[cfg(feature = "diagnostics")]
         crate::capture::binding(&p.name);
         // The bound view heap's mark table and the bitmap shaders mark
@@ -591,7 +615,9 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
+            let tables = crate::cpuprof::time(crate::cpuprof::Stage::Tables);
             let made = self.tables(list, &t.used, compute);
+            drop(tables);
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
             // (root arguments are set below).
@@ -621,6 +647,7 @@ impl State {
             // Root views a shader reads as title memory: the copies holding
             // their addresses go into the page table.
             let mut roots = Vec::new();
+            let user_data = crate::cpuprof::time(crate::cpuprof::Stage::UserData);
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -656,6 +683,7 @@ impl State {
                         }
                         None if is_root_view(u) => {
                             let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
+                            let _slots = crate::cpuprof::time(crate::cpuprof::Stage::RootViewSlots);
                             match self.root_view(list, compute, u.slot, uav) {
                                 Some((slot, _)) => slot,
                                 None => return false,
@@ -673,6 +701,8 @@ impl State {
                     }
                 }
             }
+            drop(user_data);
+            let root_views = crate::cpuprof::time(crate::cpuprof::Stage::RootParamViews);
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
                     if kind == 1 && slot == victory_shader::emit::VIEW_STRIDES {
@@ -720,6 +750,7 @@ impl State {
                     }
                 }
             }
+            drop(root_views);
             if let Some(param) = stage.view_addresses {
                 let gpu = (self.heaps[0] != 0)
                     .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
@@ -740,6 +771,7 @@ impl State {
                 }
             }
             if let Some(param) = stage.memory {
+                let _memory = crate::cpuprof::time(crate::cpuprof::Stage::MemoryTable);
                 let Some((table, dirty)) = self.memory_map(list) else {
                     once!("a shader reading title memory dropped: no view heap or page table");
                     not_run("title memory without a view heap or page table");
@@ -946,6 +978,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        let _timed = crate::cpuprof::time(crate::cpuprof::Stage::Dispatch);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1101,6 +1134,7 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
+        crate::cpuprof::count(crate::cpuprof::Count::Mirror);
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u, &view, true);
         }
@@ -1141,12 +1175,15 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
+        let entries = crate::cpuprof::time(crate::cpuprof::Stage::TableEntries);
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
+        drop(entries);
         let mut made = Vec::new();
+        let _fresh = (!fresh.is_empty()).then(|| crate::cpuprof::time(crate::cpuprof::Stage::FreshTables));
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
@@ -1599,6 +1636,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        let _timed = crate::cpuprof::time(crate::cpuprof::Stage::Indirect);
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -1776,6 +1814,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 /// writes through the view mark their pages (every translated shader's do);
 /// the host's own (clears) do not.
 fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
+    let _timed = crate::cpuprof::time(crate::cpuprof::Stage::Readable);
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -2579,6 +2618,110 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+
+    /// A world-like draw sequence without the title, timed by stage
+    /// (`crate::cpuprof`): `DRAWS` draws over 1024 material tables of 8
+    /// views (2 constant buffers, 6 raw buffer views) in a 16384-slot heap,
+    /// a shared table, a root constant buffer, a vertex and an index buffer,
+    /// recorded as the draw path binds them (tables, mirrors, readable,
+    /// buffer refreshes) and submitted. Round 0 makes the host copies and
+    /// views; round 1 is measured. Ignored: run with
+    /// `cargo test --release -p victory-gpu --lib draw_sequence_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn draw_sequence_bench() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const DRAWS: u64 = 5000;
+        const MATERIALS: u64 = 1024;
+        const MIB: u64 = 1 << 20;
+        let null = std::ptr::null();
+        let (vb, ib, cb, data) = (buffer(64 * MIB), buffer(16 * MIB), buffer(8 * MIB), buffer(32 * MIB));
+        let [vb, ib, cb, data] = [vb, ib, cb, data].map(|b| crate::resource::buffer_bytes(b).unwrap().0 as u64);
+        let data_object = buffer(4 * MIB);
+        let heap_desc: [u32; 8] = [0, 16384, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let slot = |i: u64| title_heap.start + 32 * i;
+        let textures: Vec<View> = (0..64)
+            .map(|_| placed_view(title_memory(1 << 16), texture_words(64, 64, 28, 0x105, 0)))
+            .collect();
+        for m in 0..MATERIALS {
+            for k in 0..2 {
+                let at = cb + (m * 2 + k) * 1024;
+                crate::descriptor::create_cbv(null, &[at as u32, (at >> 32) as u32, 512, 0], slot(m * 8 + k));
+            }
+            for k in 2..5u64 {
+                // Raw views of 256 dwords at their own offsets.
+                let first = ((m * 6 + k) * 256 % (1 << 20)) as u32;
+                let srv: [u32; 10] = [39, 1, 0x1688, 0, first, 0, 256, 0, 1, 0];
+                crate::descriptor::create_srv(null, data_object, &srv, slot(m * 8 + k));
+            }
+            // Placed views of 64x64 textures the title placed itself.
+            for k in 5..8u64 {
+                let View::Placed(_, words, desc) = &textures[((m * 3 + k) % 64) as usize] else { unreachable!() };
+                crate::descriptor::create_placed_srv(null, words, desc, slot(m * 8 + k));
+            }
+        }
+        crate::descriptor::create_cbv(null, &[cb as u32, (cb >> 32) as u32, 4096, 0], slot(16000));
+        let used: Vec<UsedResource> = (0..8u32)
+            .map(|k| UsedResource {
+                table_offset_dwords: 8 * k,
+                ..used(if k < 2 { ResourceType::Cbv } else { ResourceType::Srv })
+            })
+            .chain([UsedResource { slot: 1, ..used(ResourceType::Cbv) }])
+            .collect();
+        let _ = data;
+        let list = host.new_list().unwrap();
+        for round in 0..2 {
+            if round > 0 {
+                list.reset();
+            }
+            crate::cpuprof::force(true);
+            let _ = crate::cpuprof::take();
+            let mut state = State::default();
+            state.set_heaps(&[heap]);
+            let started = std::time::Instant::now();
+            for d in 0..DRAWS {
+                let _draw = crate::cpuprof::time(crate::cpuprof::Stage::Draw);
+                state.set_table(false, 0, slot(d % MATERIALS * 8));
+                state.set_table(false, 1, slot(16000));
+                state.set_view(false, 2, cb + 4 * MIB + (d % 4096) * 256);
+                let vertices = vb + (d % 512) * (128 << 10);
+                state.set_vertex_buffers(0, &[VertexView { address: vertices, size: 128 << 10, stride: 32 }]);
+                state.set_index_buffer(Some(&IndexView { address: ib + (d % 512) * (32 << 10), size: 32 << 10, format: 42 }));
+                {
+                    let _bind = crate::cpuprof::time(crate::cpuprof::Stage::Bind);
+                    let tables = crate::cpuprof::time(crate::cpuprof::Stage::Tables);
+                    let made = state.tables(&list, &used, false);
+                    drop(tables);
+                    assert!(made.is_empty() && !state.table_failed);
+                    let _views = crate::cpuprof::time(crate::cpuprof::Stage::RootParamViews);
+                    assert!(root_view(&list, cb + 4 * MIB + (d % 4096) * 256, false, false).is_some());
+                }
+                let _buffers = crate::cpuprof::time(crate::cpuprof::Stage::VertexIndex);
+                assert!(state.vertex_index(&list, 1, true));
+            }
+            let recorded = started.elapsed();
+            list.close();
+            let submitted = std::time::Instant::now();
+            host.execute(&[&list]);
+            let executed = submitted.elapsed();
+            if round == 1 {
+                println!(
+                    "{DRAWS} draws: recorded in {:.2} ms ({:.2} us/draw), submitted and run in {:.2} ms\n{}",
+                    recorded.as_secs_f64() * 1e3,
+                    recorded.as_secs_f64() * 1e6 / DRAWS as f64,
+                    executed.as_secs_f64() * 1e3,
+                    crate::cpuprof::report(1.0, DRAWS as f64)
+                );
+            }
+        }
+        crate::cpuprof::force(false);
     }
 
     #[cfg(feature = "diagnostics")]

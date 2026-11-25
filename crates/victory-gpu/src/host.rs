@@ -827,13 +827,16 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
+        let preparing = crate::cpuprof::time(crate::cpuprof::Stage::Prepare);
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
+        let syncing = crate::cpuprof::time(crate::cpuprof::Stage::SyncHeaps);
         crate::descriptor::sync_heaps();
+        drop(syncing);
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -851,9 +854,11 @@ impl Host {
             .collect();
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
+        let uploading_cpu = crate::cpuprof::time(crate::cpuprof::Stage::BindlessUploads);
         let uploads = (!heaps.is_empty())
             .then(|| crate::bindless::uploads(&heaps))
             .flatten();
+        drop(uploading_cpu);
         #[cfg(feature = "diagnostics")]
         drop(uploading);
         let runs: Vec<&HostList> = uploads
@@ -890,16 +895,21 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
+            let deferred = crate::cpuprof::time(crate::cpuprof::Stage::RunDeferred);
             list.run_deferred(&mut batch);
+            drop(deferred);
             firsts.push(if firsts.is_empty() && has_reset { 0 } else { lists.len() });
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
+            let prelude = crate::cpuprof::time(crate::cpuprof::Stage::Prelude);
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
+            drop(prelude);
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        drop(preparing);
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1672,6 +1682,7 @@ impl HostList {
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
+        crate::cpuprof::count(crate::cpuprof::Count::DeferredLock);
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -1871,6 +1882,7 @@ impl HostList {
 
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
+        crate::cpuprof::count(crate::cpuprof::Count::Kept);
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
@@ -1908,6 +1920,16 @@ impl HostList {
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
+            crate::cpuprof::count(crate::cpuprof::Count::Steps);
+            let _step = crate::cpuprof::time(match step {
+                Step::Refresh(..) => crate::cpuprof::Stage::StepRefresh,
+                Step::Copy(..) | Step::Fill(..) => crate::cpuprof::Stage::StepCopy,
+                Step::Run(_) | Step::Host(_) => crate::cpuprof::Stage::StepWork,
+                Step::GpuWrite(..) => crate::cpuprof::Stage::StepGpuWrite,
+                Step::Texture(_) => crate::cpuprof::Stage::StepTexture,
+                Step::Heap(_) => crate::cpuprof::Stage::StepHeap,
+                Step::Memory(_) => crate::cpuprof::Stage::StepMemory,
+            });
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
                 started,
@@ -2052,6 +2074,7 @@ impl Batch {
 
     /// Does the refreshes; returns the bytes copied.
     fn flush(&mut self) -> usize {
+        let _flush = (!self.refreshes.is_empty()).then(|| crate::cpuprof::time(crate::cpuprof::Stage::BatchFlush));
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
@@ -2587,6 +2610,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
+        crate::cpuprof::presented();
         #[cfg(feature = "diagnostics")]
         crate::profile::presented();
         crate::memory::log_frame();
