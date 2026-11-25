@@ -1148,6 +1148,13 @@ void main() {
         }
     }
 
+    fn each_card_compare(mut check: impl FnMut(&str, fn(u32) -> u32, usize)) {
+        for bytes in [4 << 10, 16 << 10, 64 << 10] {
+            check(crate::host::CARD_COMPARE, |pieces| pieces.div_ceil(64), bytes);
+            check(crate::host::CARD_COMPARE_WIDE, |pieces| pieces, bytes);
+        }
+    }
+
     /// The compare of copies in the card's memory (`crate::host`), on the
     /// software adapter. Told 1 it flags the pieces whose bytes are not
     /// what was hashed last and leaves the hashes: a piece a shader changed
@@ -1158,9 +1165,7 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
-        // Both forms: a thread a piece, and a group a piece (the default).
-        card_compare_on_warp(crate::host::CARD_COMPARE, |pieces| pieces.div_ceil(64));
-        card_compare_on_warp(crate::host::CARD_COMPARE_WIDE, |pieces| pieces);
+        each_card_compare(card_compare_on_warp);
     }
 
     /// Every one-byte change is found, in the piece it is in, with a copy
@@ -1168,15 +1173,11 @@ void main() {
     /// does not start at piece 0: both forms of the compare.
     #[test]
     fn warp_card_compare_finds_every_byte_with_skew() {
-        for (source, groups) in [
-            (crate::host::CARD_COMPARE, (|p: u32| p.div_ceil(64)) as fn(u32) -> u32),
-            (crate::host::CARD_COMPARE_WIDE, |p| p),
-        ] {
+        each_card_compare(|source, groups, piece_bytes| {
             let Some(mut warp) = WarpHarness::new() else {
                 return;
             };
-            let compare = compile_cs(&warp.device, &crate::host::card_shader(source)).expect("the card compare must compile on WARP");
-            let piece_bytes = crate::shadow::card_piece_bytes();
+            let compare = compile_cs(&warp.device, &crate::host::card_shader(source, piece_bytes)).expect("the card compare must compile on WARP");
             let skew = 0x3450 % piece_bytes as u32;
             const FIRST: u32 = 1;
             const PIECES: u32 = 4;
@@ -1212,7 +1213,7 @@ void main() {
             // compare cuts them; a byte there changed flags that piece alone.
             for (k, step) in [0usize, 1, 15, 16, 1023, 1024, 4095, 30001, 65535].iter().enumerate() {
                 let i = (k % PIECES as usize) as u32;
-                let lo = ((FIRST + i) as usize * PIECE).saturating_sub(skew as usize);
+                let lo = ((FIRST + i) as usize * piece_bytes).saturating_sub(skew as usize);
                 let at = lo + step % (piece_bytes - 16);
                 // SAFETY: inside the mapping.
                 unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x5a) };
@@ -1222,15 +1223,14 @@ void main() {
                 unsafe { now_ptr.add(at).write_volatile(content[at]) };
                 assert_eq!(run(&mut warp, 1), vec![0; PIECES as usize]);
             }
-        }
+        });
     }
 
-    fn card_compare_on_warp(source: &str, groups: fn(u32) -> u32) {
+    fn card_compare_on_warp(source: &str, groups: fn(u32) -> u32, piece_bytes: usize) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, &crate::host::card_shader(source)).expect("the card compare must compile on WARP");
-        let piece_bytes = crate::shadow::card_piece_bytes();
+        let compare = compile_cs(&warp.device, &crate::host::card_shader(source, piece_bytes)).expect("the card compare must compile on WARP");
         const PIECES: u32 = 3;
         let size = piece_bytes * PIECES as usize;
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
@@ -1293,13 +1293,16 @@ void main() {
     /// slots is written but copies nothing.
     #[test]
     fn warp_card_fetch_copies_flagged_pieces_to_their_slots() {
-        use crate::host::{CARD_COMPARE, CARD_FETCH, INFLIGHT_NONE, INFLIGHT_SLOT};
+        each_card_compare(check_card_fetch);
+    }
+
+    fn check_card_fetch(source: &str, groups: fn(u32) -> u32, piece_bytes: usize) {
+        use crate::host::{CARD_FETCH, INFLIGHT_NONE, INFLIGHT_SLOT};
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, &crate::host::card_shader(CARD_COMPARE)).expect("the card compare must compile on WARP");
-        let fetch = compile_cs(&warp.device, &crate::host::card_shader(CARD_FETCH)).expect("the card fetch must compile on WARP");
-        let piece_bytes = crate::shadow::card_piece_bytes();
+        let compare = compile_cs(&warp.device, &crate::host::card_shader(source, piece_bytes)).expect("the card compare must compile on WARP");
+        let fetch = compile_cs(&warp.device, &crate::host::card_shader(CARD_FETCH, piece_bytes)).expect("the card fetch must compile on WARP");
         const PIECES: u32 = 3;
         // The copy starts 40 bytes into its piece 0: piece 0 is short, the
         // others straddle title pieces and start off a multiple of 16.
@@ -1329,7 +1332,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(1, 1, 1);
+                warp.list.Dispatch(groups(pieces), 1, 1);
                 if mode == 2 {
                     warp.list.ResourceBarrier(&[uav_barrier()]);
                     warp.list.SetComputeRootSignature(&fetch.root);
