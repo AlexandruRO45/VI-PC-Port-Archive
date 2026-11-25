@@ -1023,6 +1023,14 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // The host refuses to create a resource flagged for unordered access whose
+    // format (and castable family) cannot be a UAV — e.g. B5G5R5A1_UNORM — even
+    // though the console allows it. Such a texture is made without the flag;
+    // its unordered views are then refused, the same as any other use the host
+    // does not take.
+    if d.flags & UNORDERED != 0 && !crate::host::uav_format(d.format) {
+        d.flags &= !UNORDERED;
+    }
     Some(d)
 }
 
