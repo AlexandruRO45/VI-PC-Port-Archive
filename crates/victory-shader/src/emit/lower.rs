@@ -5478,6 +5478,7 @@ impl<'a> Lower<'a> {
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         const OTHER: Why = "a descriptor's address or format read as data";
+        const IMAGE_SIZE_DWORD: u32 = 2;
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -5529,8 +5530,39 @@ impl<'a> Lower<'a> {
                 .filter(|(s, b)| *s != site && *b == a && same(*s))
                 .find_map(|(s, _)| use_of(*s))
         };
-        let use_at = use_of(site).or_else(twin);
-        let Some((at, first)) = use_at else {
+        // A scalar load can also read just dword 2 (the width and height)
+        // of a 2D image descriptor. Require a full descriptor use at the
+        // same root and computed offset to know what is in that entry.
+        let image_size_word = || {
+            if count != 1 || x.res.lane_copied.contains(&site) {
+                return None;
+            }
+            let a = address?;
+            x.res.descriptors.iter().find_map(|d| {
+                let Source::Loaded { load, first } = d.source else {
+                    return None;
+                };
+                let image = &x.p.blocks[d.site.0].insts[d.site.1];
+                if d.role != Role::Resource
+                    || !matches!(image.fields, Fields::Image { dim: 1, r128: false, .. })
+                    || image.name().starts_with("image_bvh")
+                    || x.res.waterfall.loads.contains(&load)
+                {
+                    return None;
+                }
+                let base = *self.scalar.get(&load)?;
+                let word = Address {
+                    offset: base.offset.wrapping_add(4 * (u32::from(first) + IMAGE_SIZE_DWORD)),
+                    ..base
+                };
+                (a == word).then_some((d.site, load, first))
+            })
+        };
+        let use_at = use_of(site)
+            .or_else(twin)
+            .map(|(at, first)| (at, site, first))
+            .or_else(image_size_word);
+        let Some((at, load, first)) = use_at else {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
             // that reaches those lanes reads one address. Each dword stands in as its place
@@ -5580,7 +5612,7 @@ impl<'a> Lower<'a> {
             }
             return Err("a descriptor read only as data");
         };
-        let src = Source::Loaded { load: site, first };
+        let src = Source::Loaded { load, first };
         let used = self.used_kind(&src);
         let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
         let un = ui.name();
@@ -5630,8 +5662,16 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
-        let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
+        let partial = load != site;
+        let h = if partial {
+            // Recover the entry from the current load's operands, which
+            // are available here even if the full load is in a later block.
+            let index = self.heap_index_at(site, 0u32.wrapping_sub(4 * IMAGE_SIZE_DWORD), false)?;
+            self.s.heap_handle(c, index, false, false, props)
+        } else {
+            self.handle(site, &src, false, props)?
+        };
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
         let mip = if image.is_some() && !uav {
@@ -5678,7 +5718,7 @@ impl<'a> Lower<'a> {
                 let base = k(self, 0xFAC | ty << 28);
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth)]
+                vec![(1, d1), (IMAGE_SIZE_DWORD, d2), (3, d3), (4, depth)]
             }
             None => {
                 // A raw view counts bytes; the descriptor's record count is in elements.
@@ -5707,7 +5747,11 @@ impl<'a> Lower<'a> {
             }
         };
         for k in 0..count {
-            let rel = k.wrapping_sub(u32::from(first));
+            let rel = if partial {
+                IMAGE_SIZE_DWORD
+            } else {
+                k.wrapping_sub(u32::from(first))
+            };
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
@@ -6307,6 +6351,10 @@ impl<'a> Lower<'a> {
     /// The heap index of the descriptor at dword `first` of what the scalar
     /// load at `load` reads, computed in the current block.
     fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
+        self.heap_index_at(load, 4 * u32::from(first), sampler)
+    }
+
+    fn heap_index_at(&mut self, load: Site, adjust: u32, sampler: bool) -> Result<V, Why> {
         let a = *self
             .scalar
             .get(&load)
@@ -6334,7 +6382,7 @@ impl<'a> Lower<'a> {
         let k = self
             .s
             .m
-            .i32((*offset as u32).wrapping_add(4 * u32::from(first)));
+            .i32((*offset as u32).wrapping_add(adjust));
         addr = self.s.m.bin(c, Bin::Add, addr, k);
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(li, soffset)?;
