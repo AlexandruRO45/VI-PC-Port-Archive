@@ -169,9 +169,13 @@ impl Lower<'_> {
     /// until the count reaches 2k + 2. The counter only grows, so a wave that already left
     /// for the next meeting does not confuse one still spinning here. LDS fences before and
     /// after order the halves' LDS accesses as a barrier would. After `PAIR_SPINS` reads the
-    /// wave goes on regardless: wrong values rather than a hung card.
+    /// wave goes on regardless: wrong values rather than a hung card. Such a wait also sets
+    /// `PAIR_GONE` in the counter (the other host wave left the program, at the loop limit
+    /// say), and every later wait of the console wave passes at once instead of spinning out
+    /// again at every other meeting.
     fn pair_wait(&mut self) {
         const PAIR_SPINS: u32 = 1 << 18;
+        const PAIR_GONE: u32 = 1 << 31;
         let index = self.pair_counter();
         let after = self.cur;
         let pre = self.s.m.split_before(after);
@@ -212,12 +216,26 @@ impl Lower<'_> {
         let next = self.s.m.bin(c, Bin::Add, spins, one);
         let limit = self.s.m.i32(PAIR_SPINS);
         let over = self.s.m.cmp(c, pred::IUGE, next, limit);
+        let gone_bit = self.s.m.i32(PAIR_GONE);
+        let gone = self.s.m.bin(c, Bin::And, now, gone_bit);
+        let gone = self.s.m.cmp(c, pred::NE, gone, zero);
         let done = self.s.m.bin(c, Bin::Or, both, over);
+        let done = self.s.m.bin(c, Bin::Or, done, gone);
+        // (ran out here: the other host wave is taken to be gone)
+        let alone = self.s.m.cmp(c, pred::SLT, since, two);
+        let alone = self.s.m.bin(c, Bin::And, alone, over);
         let exit = self.s.m.new_block();
         self.s.m.terminate(c, Term::CondBr(done, exit, head));
         self.s.m.set_phi(spins, vec![(zero, before), (next, c)]);
-        self.s.op(exit, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
-        self.s.m.terminate(exit, Term::Br(after));
+        self.cur = exit;
+        let mark = self.s.m.bin(exit, Bin::And, alone, first);
+        let at = self.begin_guarded(Some(mark));
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(self.cur, lds, index);
+        self.s.m.atomic(self.cur, Rmw::Or, ptr, gone_bit);
+        self.end_guarded(at, &[]);
+        self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        self.s.m.terminate(self.cur, Term::Br(after));
         self.cur = after;
     }
 
