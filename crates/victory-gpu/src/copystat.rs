@@ -173,10 +173,20 @@ pub(crate) enum C {
     CbAsked,
     CbDistinct,
     CbStageBytes,
+    /// Fresh tables because they hold a constant buffer, and because they
+    /// reach past the host heap: the tables made, and the slots copied, for
+    /// each reason. (A new counter goes here, at the end, so the length
+    /// below is the one that has to be renamed with it.)
+    TableCbvMade,
+    TableCbvSlots,
+    TableOtherMade,
+    TableOtherSlots,
 }
-/// One slot per [`C`], so a counter added to the enum cannot index past the
-/// array that holds it (it did: 80 slots for 82 variants aborted the title).
-const COUNTERS: usize = C::CbStageBytes as usize + 1;
+/// One slot per [`C`]: the array is as long as the enum because this names
+/// its last variant, and a counter inserted anywhere but the end is a
+/// compile error here rather than an abort at run time (a literal 80 against
+/// 82 variants aborted three boots once; so did a middle insertion later).
+const COUNTERS: usize = C::TableOtherSlots as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1144,7 +1154,9 @@ pub(crate) fn log(frames: f64) {
           same contents, {:.0} made, {:.0} slots hashed in {:.2} ms and {:.0} slots copied in \
           {:.2} ms; entries brought up to date: {:.0} in {:.2} ms; host views made: {:.0} of a \
           constant buffer, {:.0} of a resource, {:.0} unordered, {:.0} samplers, {:.0} other, in \
-          {:.2} ms; placed-memory views {:.0} asked, {:.0} already asked this frame; constant \
+          {:.2} ms; the tables made: {:.0} because of a constant buffer ({:.0} slots) and {:.0} \
+          because they reach past the heap ({:.0} slots); placed-memory views {:.0} asked, {:.0} \
+          already asked this frame; constant \
           buffers {:.0} asked as {:.0} distinct ranges, {:.1} MB to stage each once; notes {:.1} ms; \
           shader-written ranges: {:.0} steps in {:.1} submissions, \
           snapshots {:.1} ms, {:.1} MB \
@@ -1172,6 +1184,10 @@ pub(crate) fn log(frames: f64) {
         c[C::ViewsSampler as usize],
         c[C::ViewsOther as usize],
         c[C::ViewsNs as usize] / 1e6,
+        c[C::TableCbvMade as usize],
+        c[C::TableCbvSlots as usize],
+        c[C::TableOtherMade as usize],
+        c[C::TableOtherSlots as usize],
         c[C::PlacedAsked as usize],
         c[C::PlacedRepeat as usize],
         c[C::CbAsked as usize],

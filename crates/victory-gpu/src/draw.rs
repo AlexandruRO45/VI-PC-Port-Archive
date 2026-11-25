@@ -1909,6 +1909,17 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
+        // Why each fresh table is fresh: it holds a constant buffer (whose
+        // 16-byte alignment the host cannot take), or it reaches past the
+        // host heap. The first kind is what a staging arena would remove.
+        #[cfg(feature = "diagnostics")]
+        let cbv_fresh: Vec<bool> = fresh
+            .iter()
+            .map(|slot| {
+                used.iter()
+                    .any(|u| u.root == RootType::Table && u.slot == *slot && u.kind == ResourceType::Cbv)
+            })
+            .collect();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
@@ -1922,7 +1933,18 @@ impl State {
             heading.elapsed().as_nanos() as u64,
         );
         let mut made = Vec::new();
-        for slot in fresh {
+        for (fresh_at, slot) in fresh.into_iter().enumerate() {
+            #[allow(unused_variables)]
+            let was_cbv = {
+                #[cfg(feature = "diagnostics")]
+                {
+                    cbv_fresh.get(fresh_at).copied().unwrap_or(false)
+                }
+                #[cfg(not(feature = "diagnostics"))]
+                {
+                    false
+                }
+            };
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
@@ -2078,6 +2100,15 @@ impl State {
             {
                 crate::copystat::add(crate::copystat::C::TableMade, 1);
                 crate::copystat::add(crate::copystat::C::TableCopied, n as u64);
+                let cbv = cbv_fresh.first().is_some();
+                let _ = cbv;
+                if was_cbv {
+                    crate::copystat::add(crate::copystat::C::TableCbvMade, 1);
+                    crate::copystat::add(crate::copystat::C::TableCbvSlots, n as u64);
+                } else {
+                    crate::copystat::add(crate::copystat::C::TableOtherMade, 1);
+                    crate::copystat::add(crate::copystat::C::TableOtherSlots, n as u64);
+                }
                 crate::copystat::add(
                     crate::copystat::C::TableCopyNs,
                     copying.elapsed().as_nanos() as u64,
