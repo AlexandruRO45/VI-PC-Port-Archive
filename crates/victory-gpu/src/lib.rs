@@ -57,7 +57,7 @@ mod texture;
 mod watch;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{GpuInfo, gpu_info, on_failure};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]

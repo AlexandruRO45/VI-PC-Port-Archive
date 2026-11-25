@@ -27,6 +27,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Show the renderer's selected D3D12 adapter and check its graphics requirements.
+    GpuInfo,
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {
         file: PathBuf,
@@ -130,6 +132,7 @@ fn main() -> Result<()> {
     }
     let cli = Cli::parse();
     match cli.command {
+        Command::GpuInfo => gpu_info(),
         Command::Inspect {
             file,
             imports,
@@ -173,6 +176,19 @@ fn main() -> Result<()> {
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
     }
+}
+
+#[cfg(windows)]
+fn gpu_info() -> Result<()> {
+    let info = victory_gpu::gpu_info()?;
+    println!("{info}");
+    anyhow::ensure!(info.meets_requirements(), "could not confirm all hardware rendering requirements for the selected adapter");
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn gpu_info() -> Result<()> {
+    anyhow::bail!("gpu-info requires the Windows D3D12 renderer")
 }
 
 fn show_config() -> Result<()> {

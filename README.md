@@ -31,6 +31,11 @@ Tested on Windows 11 with an **NVIDIA GeForce RTX 3050** (8 GB):
 cargo build --release -p victory
 ```
 
+Run `target\release\victory.exe gpu-info` to see which adapter the renderer
+uses and check its D3D12, shader-model and mesh-shader requirements. This
+command needs no game files and returns a nonzero exit code if the requirements
+cannot be confirmed.
+
 ## Play
 
 ```powershell

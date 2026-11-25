@@ -18,6 +18,9 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+mod capabilities;
+pub use capabilities::{GpuInfo, gpu_info};
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -484,15 +487,16 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
-    HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
-        Err(e) => {
-            tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
-            None
-        }
-    })
-    .as_ref()
+    host_result().as_ref().ok()
+}
+
+/// Keep the native failure for diagnostics while regular renderer callers
+/// continue using the optional host.
+fn host_result() -> &'static windows::core::Result<Host> {
+    static HOST: OnceLock<windows::core::Result<Host>> = OnceLock::new();
+    HOST.get_or_init(|| create().inspect_err(|e| {
+        tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
+    }))
 }
 
 fn create() -> windows::core::Result<Host> {
@@ -2732,31 +2736,7 @@ impl Host {
     pub(crate) fn mesh_shaders(&self) -> bool {
         static MESH: OnceLock<bool> = OnceLock::new();
         *MESH.get_or_init(|| {
-            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
-            let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
-            };
-            // SAFETY: each query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS7,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
-                    )
-                    .is_ok()
-                    && self
-                        .device
-                        .CheckFeatureSupport(
-                            D3D12_FEATURE_SHADER_MODEL,
-                            (&raw mut model).cast(),
-                            size_of_val(&model) as u32,
-                        )
-                        .is_ok()
-            };
-            let mesh = ok
-                && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
-                && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+            let mesh = capabilities::MeshSupport::query(&self.device).supported();
             tracing::info!(mesh, "host mesh shader support");
             mesh
         })
