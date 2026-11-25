@@ -22,6 +22,18 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
 
+/// The sampling operation of a stage, and its `dx.op` number: a compute
+/// shader has no derivatives to take, so its implicit sampling is level 0
+/// (`sampleLevel`, 62) — `dx.op.sample` (60) is not a legal operation there
+/// and the validator refuses the module with "uses features incompatible
+/// with the shader stage" (#1987).
+fn sample_op(compute: bool) -> (&'static str, u32) {
+    if compute {
+        ("sampleLevel.f32", 62)
+    } else {
+        ("sample.f32", 60)
+    }
+}
 type Why = &'static str;
 
 #[derive(Debug, Clone, Copy)]
@@ -8824,9 +8836,14 @@ impl<'a> Lower<'a> {
                         }
                     }
                     args.extend(&os);
-                    args.push(fu);
+                    let (name, opcode) = sample_op(self.s.threads.is_some());
+                    args.push(if opcode == 62 {
+                        self.s.m.f32(0.0f32.to_bits())
+                    } else {
+                        fu
+                    });
                     self.s
-                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, opcode, &args)
                 }
                 61 => {
                     let bias = addr_val(self, 0)?;
@@ -12207,5 +12224,12 @@ mod tests {
             lowers(&words, 0),
             Err(crate::ShaderError::Unsupported { what: "GDS", .. })
         ));
+
+    /// A compute shader cannot sample with implicit derivatives: the stage
+    /// has none, and DXIL has no `dx.op.sample` for it (#1987).
+    #[test]
+    fn a_compute_shader_samples_at_level_zero() {
+        assert_eq!(super::sample_op(true), ("sampleLevel.f32", 62));
+        assert_eq!(super::sample_op(false), ("sample.f32", 60));
     }
 }
