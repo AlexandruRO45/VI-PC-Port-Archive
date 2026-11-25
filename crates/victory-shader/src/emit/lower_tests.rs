@@ -223,6 +223,25 @@ fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
 }
 
 #[test]
+fn readlane_ignores_an_untracked_exec_mask() {
+    // s6 holds zero on the skip edge and the saved EXEC on the other edge.
+    // The resulting EXEC is only in effect during the explicit lane read.
+    let words = [
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE84_3C6A, // s_and_saveexec_b32 s4, vcc_lo
+        0xBF88_0001, // s_cbranch_execz +1
+        0xBE86_0304, // s_mov_b32 s6, s4
+        0xBEFE_0306, // s_mov_b32 exec_lo, s6
+        0xD760_0002, // v_readlane_b32 s2, v0, 3
+        0x0001_0700,
+        0xBEFE_0304, // s_mov_b32 exec_lo, s4
+        S_ENDPGM,
+    ];
+    lowers(&words, 1 << 7).expect("an explicit lane read does not require an EXEC mask");
+}
+
+#[test]
 fn buffer_cache_invalidations_lower_as_no_ops() {
     // MUBUF opcode 0x071/0x072 with no data operand: the title asks the
     // host to invalidate its cached view of a buffer.

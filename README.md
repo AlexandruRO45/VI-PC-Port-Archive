@@ -61,6 +61,27 @@ The synthetic shader comparisons across triangle edges use
 See [Windows CI](https://github.com/TaynanGT/Vice-Tay/actions/workflows/ci.yml)
 for the result on each revision.
 
+## VIctory synchronization
+
+Vice-Tay merges the history of
+[VIctory main at `13f91ca`](https://github.com/Marvisak/VIctory/commit/13f91caee25f2fdf2c062be5f7a27f058e51cbca)
+and keeps the existing Vice-Tay commits in its history. The merge
+resolves differences in descriptor handling, texture uploads, GPU queues,
+and shader lowering using the fork's existing interfaces. Related upstream
+GPU changes that depend on the original interfaces still need individual
+ports and tests.
+
+- DirectStorage's halfway auto-submit holds requests that write to
+  physical pages. Explicit submission releases them, and a full queue
+  can release them to keep enqueueing from blocking.
+  [VIctory `eddde73`](https://github.com/Marvisak/VIctory/commit/eddde73)
+- `v_readlane_b32` writes its scalar result independently of EXEC. The
+  active mask still selects the first lane for `v_readfirstlane_b32`.
+  [VIctory `889b871`](https://github.com/Marvisak/VIctory/commit/889b871)
+- Texture reads larger than 32 MiB use temporary scratch storage.
+  Smaller reads keep the fork's per-thread buffer.
+  [VIctory `8f2a6f1`](https://github.com/Marvisak/VIctory/commit/8f2a6f1)
+
 ## Development PC
 
 | Component | Configuration |

@@ -345,9 +345,13 @@ thread_local! {
     static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Calls `f` with `size` bytes of this thread's read buffer (their
-/// contents are whatever the last texture left).
+/// Calls `f` with `size` bytes of scratch memory, reusing the thread's
+/// read buffer for ordinary textures. Larger reads release their storage
+/// when the callback returns.
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    if size > 32 << 20 {
+        return f(&mut vec![0; size]);
+    }
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if read.len() < size {
@@ -1216,7 +1220,20 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod title_memory_tests {
-    use super::{fingerprint, with_title};
+    use super::{READ, fingerprint, with_read, with_title};
+
+    #[test]
+    fn large_texture_reads_do_not_grow_the_thread_buffer() {
+        with_read(4096, |bytes| bytes.fill(7));
+        let capacity = READ.with(|read| read.borrow().capacity());
+        let large = (32 << 20) + 1;
+        with_read(large, |bytes| {
+            assert_eq!(bytes.len(), large);
+            bytes[0] = 2;
+        });
+        assert_eq!(READ.with(|read| read.borrow().capacity()), capacity);
+        with_read(4096, |bytes| assert_eq!(bytes[0], 7));
+    }
 
     #[test]
     fn the_texture_fingerprint_changes_when_streamed_bytes_arrive() {

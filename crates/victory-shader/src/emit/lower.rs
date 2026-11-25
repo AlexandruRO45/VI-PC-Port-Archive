@@ -7136,7 +7136,13 @@ impl<'a> Lower<'a> {
             }
             return r;
         }
-        let mut guard = self.guard(b, i)?;
+        // An explicit lane read writes its scalar result regardless of EXEC.
+        // A first-lane read still needs the mask to select the first active lane.
+        let mut guard = if name == "v_readlane_b32" {
+            None
+        } else {
+            self.guard(b, i)?
+        };
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d)?;
             guard = match (guard, enable) {

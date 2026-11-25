@@ -383,6 +383,8 @@ struct Lane {
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
     reads: VecDeque<(u64, Request)>,
+    /// Reads whose page lists the title may still be filling.
+    held_reads: VecDeque<(u64, Request)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -618,6 +620,12 @@ impl Lanes {
 
     /// Moves a queue's enqueued commands to the workers.
     fn submit(&mut self, id: u64) {
+        self.submit_as(id, true);
+    }
+
+    /// Automatic submission leaves physical page reads waiting for the
+    /// title, which may update their page lists immediately before Submit.
+    fn submit_as(&mut self, id: u64, explicit: bool) {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return;
         };
@@ -636,10 +644,17 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
+        if explicit && !lane.held_reads.is_empty() {
+            lane.reads.append(&mut lane.held_reads);
+            lane.reads.make_contiguous().sort_unstable_by_key(|r| r.0);
+        }
         for command in std::mem::take(&mut lane.unsubmitted) {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
+                Command::Read(request) if !explicit && request.options & PAGE_DESTINATION != 0 => {
+                    lane.held_reads.push_back((seq, request));
+                }
                 Command::Read(request) => lane.reads.push_back((seq, request)),
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
@@ -656,6 +671,7 @@ impl Lane {
             clock: 0,
             unsubmitted: Vec::new(),
             reads: VecDeque::new(),
+            held_reads: VecDeque::new(),
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
             failures: BTreeMap::new(),
@@ -665,7 +681,11 @@ impl Lane {
 
     /// Requests and status entries held, submitted or not.
     fn entries(&self) -> usize {
-        self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
+        self.unsubmitted.len()
+            + self.reads.len()
+            + self.held_reads.len()
+            + self.statuses.len()
+            + self.running.len()
     }
 
     /// Writes the status entries whose earlier reads have all finished.
@@ -674,6 +694,7 @@ impl Lane {
             let waiting = self.reads.front().map(|r| r.0);
             if waiting
                 .into_iter()
+                .chain(self.held_reads.front().map(|r| r.0))
                 .chain(self.running.first().copied())
                 .any(|s| s < seq)
             {
@@ -718,6 +739,7 @@ fn close_lane(id: u64) {
     lane.closed = true;
     lane.unsubmitted.clear();
     lane.reads.clear();
+    lane.held_reads.clear();
     lane.statuses.clear(); // releases their arrays
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
         lanes = scheduler
@@ -827,6 +849,11 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        // The title may be blocked here before it can call Submit.
+        if !lane.held_reads.is_empty() {
+            lanes.submit(id);
+            scheduler.work.notify_all();
+        }
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -837,7 +864,7 @@ fn queue(this: QueueRef, command: Command) {
     };
     lane.unsubmitted.push(command);
     if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        lanes.submit(id);
+        lanes.submit_as(id, false);
         scheduler.work.notify_all();
     }
 }
@@ -849,7 +876,7 @@ extern "system" fn submit(this: QueueRef) {
         return;
     };
     let mut lanes = scheduler.lock();
-    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len());
+    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len() + l.held_reads.len());
     tracing::debug!(commands = pending, "dstorage: submit");
     lanes.submit(id);
     scheduler.work.notify_all();
@@ -1079,7 +1106,7 @@ fn into_destination(
     }
     // A list naming page 0 (no page: numbers start at 0x10_0000) may not be
     // filled yet: the title can write a request's pages after enqueueing
-    // it, and a queue half full is submitted on its own. Read the list
+    // it, and a full queue may need to start all its reads. Read the list
     // again for a few milliseconds before failing, and count both cases.
     if pages.contains(&0) {
         static LATE: AtomicU32 = AtomicU32::new(0);
@@ -1216,11 +1243,15 @@ mod tests {
     }
 
     fn new_queue(source_type: u64) -> *mut c_void {
+        new_queue_with_capacity(source_type, 0x80)
+    }
+
+    fn new_queue_with_capacity(source_type: u64, capacity: u16) -> *mut c_void {
         let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
         let desc = QueueDesc {
             source_type,
-            capacity: 0x80,
+            capacity,
             priority: 0,
             name: c"test".as_ptr(),
             unknown: 1,
@@ -1514,6 +1545,75 @@ mod tests {
         assert_eq!(results(), (E_PENDING, E_PENDING));
         l.finish(&jobs[1], Err(INVALID_DATA));
         assert_eq!(results(), (INVALID_DATA, S_OK));
+    }
+
+    #[test]
+    fn automatic_submit_holds_page_reads_and_preserves_status_order() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let array = status_array(2).cast::<Instance<StatusArray>>();
+        let status = |index| {
+            add_ref_instance(array);
+            let status = Status { array, index };
+            status.entry().store(E_PENDING, Ordering::Release);
+            Command::Status(status)
+        };
+        let results = || (result(array.cast(), 0), result(array.cast(), 1));
+
+        read(&mut l, 0, PAGE_DESTINATION, 16);
+        l.lanes.get_mut(&0).unwrap().unsubmitted.push(status(0));
+        l.submit_as(0, false);
+        read(&mut l, 0, 0, 16);
+        l.lanes.get_mut(&0).unwrap().unsubmitted.push(status(1));
+        l.submit_as(0, false);
+
+        let plain = l.start().unwrap();
+        assert_eq!(plain.request.options, 0);
+        assert!(l.start().is_none());
+        l.finish(&plain, Err(INVALID_DATA));
+        assert_eq!(results(), (E_PENDING, E_PENDING));
+
+        l.submit(0);
+        let paged = l.start().unwrap();
+        assert_eq!(paged.request.options, PAGE_DESTINATION);
+        assert_eq!(results(), (E_PENDING, E_PENDING));
+        l.finish(&paged, Ok(()));
+        assert_eq!(results(), (S_OK, INVALID_DATA));
+        release(array);
+    }
+
+    #[test]
+    fn a_full_queue_releases_a_held_page_read() {
+        let (done, completed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let queue = new_queue_with_capacity(1, 2);
+            let array = status_array(1);
+            let bytes = [0u8; 16];
+            let mut pages = [usize::MAX];
+            enqueue(
+                queue,
+                &request(
+                    PAGE_DESTINATION | MEMORY_SOURCE,
+                    pages.as_mut_ptr().cast(),
+                    bytes.len(),
+                    bytes.as_ptr().cast(),
+                    0,
+                    bytes.len(),
+                ),
+            );
+            enqueue_status(queue, array, 0); // one usable slot: this waits for the read
+            let status = wait(array, 0);
+            void(queue, 0x40);
+            release(queue.cast::<Instance<Queue>>());
+            release(array.cast::<Instance<StatusArray>>());
+            done.send(status).unwrap();
+        });
+        // A full queue must make progress even if the caller cannot reach Submit.
+        assert_eq!(
+            completed.recv_timeout(Duration::from_secs(10)).unwrap(),
+            E_INVALIDARG
+        );
+        worker.join().unwrap();
     }
 
     #[test]
