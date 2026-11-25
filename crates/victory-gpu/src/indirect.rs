@@ -1113,7 +1113,7 @@ void main() {
         }
     }
 
-    fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    pub(super) fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: source and entry names outlive `D3DCompile`.
         unsafe {
@@ -2414,6 +2414,9 @@ void main() {
 #[cfg(test)]
 mod bench;
 
+#[cfg(test)]
+mod card_compare_bench;
+
 /// What one small draw costs this card, bare and with one thing changed
 /// between every two draws: a measurement, not a check (it asserts only
 /// that the card answered). The timing run of the lit scene (run 187) has
@@ -2557,7 +2560,7 @@ void work() {
         out.unwrap()
     }
 
-    fn buffer(
+    pub(super) fn buffer(
         device: &ID3D12Device,
         size: u64,
         kind: D3D12_HEAP_TYPE,
