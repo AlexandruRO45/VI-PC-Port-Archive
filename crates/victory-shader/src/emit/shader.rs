@@ -146,6 +146,8 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// View descriptor slots in the host's heap.
+    pub host_heap_views: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -208,6 +210,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            host_heap_views: HEAP_VIEWS,
             lds: None,
             main,
             entry,
@@ -545,7 +548,7 @@ impl Shader {
         let last = self.m.i32(if sampler {
             HEAP_SAMPLERS
         } else {
-            super::host_heap_views()
+            self.host_heap_views
         } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
