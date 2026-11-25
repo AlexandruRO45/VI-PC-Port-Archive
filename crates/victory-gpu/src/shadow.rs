@@ -631,16 +631,16 @@ fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
 /// avoid redundant writes to write-combined GPU shadow memory.
 fn merge_host_into_title(title: &mut [u8], host: &mut [u8], before: &[u8]) -> bool {
     let mut changed = false;
-    let mut t_chunks = title.chunks_exact_mut(8);
-    let mut h_chunks = host.chunks_exact_mut(8);
-    let mut b_chunks = before.chunks_exact(8);
-    for ((t, h), b) in (&mut t_chunks).zip(&mut h_chunks).zip(&mut b_chunks) {
-        let hw = u64::from_ne_bytes(h.try_into().unwrap());
-        let bw = u64::from_ne_bytes(b.try_into().unwrap());
+    let (t_words, t_rest) = title.as_chunks_mut::<8>();
+    let (h_words, h_rest) = host.as_chunks_mut::<8>();
+    let (b_words, b_rest) = before.as_chunks::<8>();
+    for ((t, h), b) in t_words.iter_mut().zip(h_words.iter_mut()).zip(b_words) {
+        let hw = u64::from_ne_bytes(*h);
+        let bw = u64::from_ne_bytes(*b);
         if hw == bw {
-            let tw = u64::from_ne_bytes(t.try_into().unwrap());
+            let tw = u64::from_ne_bytes(*t);
             if tw != hw {
-                h.copy_from_slice(t);
+                *h = *t;
             }
             continue;
         }
@@ -653,12 +653,7 @@ fn merge_host_into_title(title: &mut [u8], host: &mut [u8], before: &[u8]) -> bo
             h[i] = t[i];
         }
     }
-    for ((t, h), b) in t_chunks
-        .into_remainder()
-        .iter_mut()
-        .zip(h_chunks.into_remainder().iter_mut())
-        .zip(b_chunks.remainder())
-    {
+    for ((t, h), b) in t_rest.iter_mut().zip(h_rest.iter_mut()).zip(b_rest) {
         if *h != *b && *t != *h {
             *t = *h;
             changed = true;

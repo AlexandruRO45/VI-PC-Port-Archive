@@ -1897,17 +1897,17 @@ impl HostList {
 /// title memory asks for every copy whole. What the title's threads write
 /// meanwhile is for later submissions (on the console it would race the
 /// GPU).
+/// A copy with ranges of it (start, end).
+type Ranges = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
+    refreshes: Vec<Ranges>,
     /// Where each copy's refresh entry is in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
     /// Disjoint ranges of each copy brought up to date since the last title
     /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<
-        usize,
-        (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>),
-    >,
+    current: std::collections::HashMap<usize, Ranges>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
@@ -2161,6 +2161,9 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
             // `recover_copy` to return 0.
             return unsafe { victory_copy_fast(dst, src, len) != 0 };
         }
+        // Reserved first so that an absurd length falls back to the kernel's
+        // copy where `vec![0; len]` would abort.
+        #[allow(clippy::slow_vector_initialization)]
         let mut tmp = Vec::new();
         if tmp.try_reserve_exact(len).is_ok() {
             tmp.resize(len, 0);
