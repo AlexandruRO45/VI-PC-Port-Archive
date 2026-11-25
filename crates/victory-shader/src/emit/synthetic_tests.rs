@@ -1110,7 +1110,11 @@ fn widened_exec_in_divergent_block_counts_all_lanes() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
     for (label, warp) in [("hardware", false), ("warp", true)] {
+        if !warp && warp_only {
+            continue;
+        }
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -1118,6 +1122,7 @@ fn widened_exec_in_divergent_block_counts_all_lanes() {
         for (name, shader, expected) in &shaders {
             let Ok((root, pso)) = host.compute_pipeline(shader) else {
                 assert!(warp, "{label}/{name}: no pipeline for a wave of 32");
+                eprintln!("{label}/{name}: no pipeline for a wave of 32; skipped");
                 continue;
             };
             let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
