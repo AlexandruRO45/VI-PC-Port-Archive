@@ -1228,6 +1228,86 @@ mod tests {
         Ok(out)
     }
 
+    fn emit_sgpr_test_pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        let isg1 = if input_addr == 0 {
+            rows(&[], true)
+        } else {
+            rows(&[("SV_Position", 3, false)], true)
+        };
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        emit_pixel(words, vec![], input_addr, &isg1, &osg1)
+    }
+
+    #[test]
+    fn hardware_sgpr_input_refusal_names_the_register_at_the_export() {
+        let refusals = [5, 7].map(|sgpr| {
+            let words = [
+                0x7E00_0200 | sgpr, // v_mov_b32 v0, sN
+                0xF800_180F,
+                0x0000_0000, // exp mrt0, v0, v0, v0, v0 done vm
+                0xBF81_0000, // s_endpgm
+            ];
+            let error = emit_sgpr_test_pixel(&words, 0).unwrap_err();
+            println!("s{sgpr}: {error}");
+            error.to_string()
+        });
+        assert_eq!(
+            refusals,
+            [5, 7].map(|sgpr| format!(
+                "GFX10 code at 0x4: a hardware SGPR input is not supported (s{sgpr})"
+            ))
+        );
+    }
+
+    #[test]
+    fn hardware_sgpr_input_refusal_at_a_dynamic_join_stays_generic() {
+        for (left, right) in [(5, 7), (7, 5)] {
+            let words = [
+                0x7D84_0080,         // v_cmp_eq_u32 vcc, 0, v0
+                0xBF86_0002,         // s_cbranch_vccz +2
+                0x7E02_0200 | left,  // v_mov_b32 v1, sN
+                0xBF82_0001,         // s_branch +1
+                0x7E02_0200 | right, // v_mov_b32 v1, sM
+                0xF800_180F,
+                0x0101_0101, // exp mrt0, v1, v1, v1, v1 done vm
+                0xBF81_0000, // s_endpgm
+            ];
+            // v0 is the first position component.
+            let error = emit_sgpr_test_pixel(&words, 1 << 8).unwrap_err();
+            println!("s{left}/s{right}: {error}");
+            assert_eq!(
+                error,
+                ShaderError::Unsupported {
+                    offset: 0x14,
+                    what: "a hardware SGPR input"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn hardware_sgpr_input_read_without_a_consumer_still_translates() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let mut words = [
+            0x7E02_0207, // v_mov_b32 v1, s7 (dead)
+            0x7E00_02F2, // v_mov_b32 v0, 1.0
+            0xF800_180F,
+            0x0000_0000, // exp mrt0, v0, v0, v0, v0 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let dxil = emit_sgpr_test_pixel(&words, 0).unwrap().dxil;
+        words[0] = 0x7E02_0280; // v_mov_b32 v1, 0 (dead)
+        assert_eq!(dxil, emit_sgpr_test_pixel(&words, 0).unwrap().dxil);
+        let mut hasher = DefaultHasher::new();
+        dxil.hash(&mut hasher);
+        println!(
+            "control DXIL: {} bytes, {:016x}",
+            dxil.len(),
+            hasher.finish()
+        );
+    }
+
     /// A float4 element per row (16-bit ones declared so in the part).
     fn rows(elements: &[(&str, u8, bool)], input: bool) -> Vec<u8> {
         let els: Vec<SigElement> = elements

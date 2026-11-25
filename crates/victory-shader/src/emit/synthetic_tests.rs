@@ -434,8 +434,11 @@ fn ordered_pixel_sections_use_rasterizer_ordered_views() {
             .expect("DXIL validation failed");
     }
     // Without the ordered mode the collision id is no value the host has.
-    let Err(crate::ShaderError::Unsupported { what, .. }) = lowered(&native(0)) else {
-        panic!("translated a collision id outside an ordered section");
-    };
-    assert_eq!(what, "a hardware SGPR input");
+    assert!(matches!(
+        lowered(&native(0)),
+        Err(crate::ShaderError::UnsupportedHardwareSgprInput {
+            offset: 0x30,
+            sgpr: 10,
+        })
+    ));
 }

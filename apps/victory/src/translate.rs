@@ -578,6 +578,10 @@ fn translate(
                             .fail(format!("emit: {what}"), || {
                                 format!("{} at {offset:#x}", label())
                             }),
+                        Err(ShaderError::UnsupportedHardwareSgprInput { offset, sgpr }) => t.fail(
+                            format!("emit: {}", ShaderError::HARDWARE_SGPR_INPUT),
+                            || format!("{} at {offset:#x} (s{sgpr})", label()),
+                        ),
                         Err(e) => t.fail(format!("emit: {e}"), label),
                     }
                 }

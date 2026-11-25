@@ -7,6 +7,7 @@
 //! program when something with an effect (an export, a branch) needs it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::OnceLock;
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
@@ -23,6 +24,15 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 mod bvh;
 
 type Why = &'static str;
+
+// Keep the input number through the existing missing-value propagation.
+const SGPR_INPUT_PREFIX: &str = "hardware SGPR input s";
+
+fn sgpr_input_reason(sgpr: u8) -> Why {
+    static REASONS: [OnceLock<String>; u8::MAX as usize + 1] =
+        [const { OnceLock::new() }; u8::MAX as usize + 1];
+    REASONS[usize::from(sgpr)].get_or_init(|| format!("{SGPR_INPUT_PREFIX}{sgpr}"))
+}
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -452,7 +462,16 @@ fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
 }
 
 fn unsupported(offset: usize, what: Why) -> Stop {
-    Stop::Fail(ShaderError::Unsupported { offset, what })
+    let error = match what.strip_prefix(SGPR_INPUT_PREFIX) {
+        Some(register) => ShaderError::UnsupportedHardwareSgprInput {
+            offset,
+            sgpr: register
+                .parse()
+                .expect("SGPR input reason contains a register"),
+        },
+        None => ShaderError::Unsupported { offset, what },
+    };
+    Stop::Fail(error)
 }
 
 /// The dwords an `s_load_dword*` reads.
@@ -1375,7 +1394,7 @@ impl<'a> Lower<'a> {
                     None if self.pops && self.x.io.initialized_sgprs == Some(n + 1) => {
                         Val::I32(self.s.m.i32(0))
                     }
-                    None => Val::Missing("a hardware SGPR input"),
+                    None => Val::Missing(sgpr_input_reason(n)),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
@@ -9871,6 +9890,12 @@ impl<'a> Lower<'a> {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
                     (Some(Val::Missing(why)), _) if read => {
+                        // The first missing arm need not identify a register common to the join.
+                        let why = if why.starts_with(SGPR_INPUT_PREFIX) {
+                            ShaderError::HARDWARE_SGPR_INPUT
+                        } else {
+                            why
+                        };
                         return Err(Stop::Retry(phi.value, why));
                     }
                     _ if read => {
