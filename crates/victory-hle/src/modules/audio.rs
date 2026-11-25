@@ -1284,3 +1284,33 @@ mod tests {
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
     }
 }
+
+#[cfg(test)]
+mod audio_hash_tests {
+    use super::audio_hash;
+
+    #[test]
+    fn fnv1a_reference_vectors() {
+        // FNV-1a, 64-bit offset basis and prime: the published vectors.
+        assert_eq!(audio_hash(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(audio_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(audio_hash(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn only_the_first_sixty_four_bytes_are_read() {
+        let mut a = vec![0u8; 64];
+        let mut b = vec![0u8; 64];
+        a.extend_from_slice(b"tail");
+        b.extend_from_slice(b"different tail");
+        assert_eq!(audio_hash(&a), audio_hash(&b));
+    }
+
+    #[test]
+    fn a_difference_inside_the_window_changes_the_hash() {
+        let a = vec![1u8; 64];
+        let mut b = a.clone();
+        b[63] = 2;
+        assert_ne!(audio_hash(&a), audio_hash(&b));
+    }
+}
