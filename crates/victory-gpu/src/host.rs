@@ -7431,9 +7431,7 @@ impl PresentTimes {
         let mut sorted = self.intervals.clone();
         sorted.sort_unstable();
         // Nearest-rank cumulative percentiles; the first frame has no interval.
-        let percentile = |p: usize| {
-            sorted.get((sorted.len() * p).div_ceil(100).saturating_sub(1)).copied().unwrap_or(0)
-        };
+        let percentile = |p: usize| percentile_of(&sorted, p);
         let (p50, p95, p99, max) = (percentile(50), percentile(95), percentile(99), percentile(100));
         let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
         writeln!(out, "frame,interval_us,p50_us,p95_us,p99_us,max_us,dropped_estimate")?;
@@ -7454,8 +7452,7 @@ impl PresentTimes {
             if to - from + 1 >= 300 || window_us >= 5_000_000 {
                 window.sort_unstable();
                 let stalls = window.iter().filter(|&&us| us > 100_000).count();
-                let p99 = window.get((window.len() * 99).div_ceil(100).saturating_sub(1))
-                    .copied().unwrap_or(0);
+                let p99 = percentile_of(&window, 99);
                 let max = window.last().copied().unwrap_or(0);
                 writeln!(out, "window,{from},{to},{stalls},{p99},{max}")?;
                 out.flush()?;
@@ -8886,5 +8883,53 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+}
+
+/// Nearest-rank cumulative percentile over an ascending slice.
+///
+/// Used for the interval summaries written by the present log: p50, p95,
+/// p99 and the maximum. Empty input answers zero rather than panicking, so
+/// a run that ends before the first interval still writes a usable file.
+fn percentile_of(sorted: &[u64], p: usize) -> u64 {
+    sorted
+        .get((sorted.len() * p).div_ceil(100).saturating_sub(1))
+        .copied()
+        .unwrap_or(0)
+}
+#[cfg(test)]
+mod percentile_tests {
+    use super::percentile_of;
+
+    #[test]
+    fn empty_answers_zero() {
+        assert_eq!(percentile_of(&[], 50), 0);
+        assert_eq!(percentile_of(&[], 100), 0);
+    }
+
+    #[test]
+    fn a_single_sample_is_every_percentile() {
+        assert_eq!(percentile_of(&[7], 50), 7);
+        assert_eq!(percentile_of(&[7], 99), 7);
+        assert_eq!(percentile_of(&[7], 100), 7);
+    }
+
+    #[test]
+    fn nearest_rank_on_a_hundred_samples() {
+        let v: Vec<u64> = (1..=100).collect();
+        assert_eq!(percentile_of(&v, 50), 50);
+        assert_eq!(percentile_of(&v, 95), 95);
+        assert_eq!(percentile_of(&v, 99), 99);
+        assert_eq!(percentile_of(&v, 100), 100);
+    }
+
+    #[test]
+    fn a_short_run_still_lands_on_a_sample() {
+        // Three intervals: the 99th percentile must be the largest one, not a
+        // zero and not an index past the end.
+        let v = [33_300u64, 33_400, 900_000];
+        assert_eq!(percentile_of(&v, 50), 33_400);
+        assert_eq!(percentile_of(&v, 99), 900_000);
+        assert_eq!(percentile_of(&v, 100), 900_000);
     }
 }
