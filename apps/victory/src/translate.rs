@@ -380,7 +380,7 @@ fn translate(
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    translate_programs(&container, programs, &example, t, checks);
+    translate_programs(&container, programs, &hash, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
@@ -393,7 +393,7 @@ fn translate(
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(container: &Container, programs: Vec<NativeProgram>, _hash: &str, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -463,10 +463,24 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
                         }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("emit: {what}"), || {
-                                format!("{} at {offset:#x}", label())
-                            }),
+                        Err(ShaderError::Unsupported { offset, what }) => {
+                            #[cfg(feature = "diagnostics")]
+                            if std::env::var_os("VICTORY_REFUSAL_CONTEXT").is_some()
+                                && let Some(sources) =
+                                    emit::refusal_sources(&program, &i, &r, &p.layout, offset, what)
+                            {
+                                let detail = if sources.is_empty() {
+                                    "no matching producer in SSA".to_owned()
+                                } else {
+                                    sources.join(" | ")
+                                };
+                                eprintln!(
+                                    "shader refusal #{_hash} {:?} consumer={offset:#x}: {detail}",
+                                    p.stage,
+                                );
+                            }
+                            t.fail(format!("emit: {what}"), || format!("{} at {offset:#x}", label()));
+                        }
                         Err(e) => t.fail(format!("emit: {e}"), label),
                     }
                 }

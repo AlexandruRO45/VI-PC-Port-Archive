@@ -91,6 +91,8 @@ pub mod host;
 mod lower;
 mod own_bits;
 mod rect;
+#[cfg(feature = "diagnostics")]
+mod refusal;
 mod sampler;
 mod shader;
 mod threading;
@@ -112,6 +114,8 @@ pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
+#[cfg(feature = "diagnostics")]
+pub use refusal::refusal_sources;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
