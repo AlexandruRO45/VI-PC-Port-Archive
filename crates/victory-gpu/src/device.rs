@@ -390,9 +390,11 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 ///   (0x184, 0x18c or 0x200 bytes, then 0x50 to 0xbc), then groups of four
 ///   words (code, length, metadata, length), zero for an absent group;
 ///   neighbouring calls can share groups. How many groups there are, and
-///   which stage each is, are not known (the log shows 16 words);
+///   which stage each is, were not known (that run logged 16 words; this
+///   build logs 40, [`unknown_dump`]);
 /// * code lies on 256-byte boundaries, in lengths of 64-byte units, as
-///   GFX10 programs would (not checked: no code bytes are logged).
+///   GFX10 programs would (not checked in that run, which logged no code
+///   bytes; this build logs the first 64 bytes of each blob and a hash).
 ///   Metadata are 0x18 (0x218) or 0x10 (0x1c8) bytes plus 32-byte units:
 ///   not the layout of the `FSSM` records of a container
 ///   ([`victory_shader::native`]), whose 20-byte tables would not keep
@@ -429,12 +431,12 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         );
     }
     if calls <= 4 || calls.is_power_of_two() {
-        // Sixteen 64-bit words at `at`, read through the kernel: neither
-        // pointer is known to be mapped.
+        // Sixteen 64-bit words at `at`: neither pointer is known to be mapped,
+        // and a guard page is not read ([`unknown_dump::plain`]).
         #[cfg(windows)]
         let words = |at: usize| -> Option<Vec<u64>> {
             let mut bytes = [0u8; 128];
-            (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then(|| {
+            (at != 0 && unknown_dump::plain(at as u64, bytes.len()) && crate::host::read_into(at as *const u8, &mut bytes)).then(|| {
                 bytes
                     .as_chunks::<8>().0.iter()
                     .map(|c| c.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b)))
@@ -469,24 +471,32 @@ thread_local! {
 }
 
 /// A title pipeline made through standard method `method` (0x50, 0x58,
-/// 0x1f0, 0x2b0), counted; and counted apart, by how soon (under 20 µs,
-/// 200 µs, 2 ms, later), when this thread's last unknown pipeline call
-/// came before it: a title that falls back to the standard methods shows
-/// about one per failed call, soon after it.
-pub(crate) fn standard_pipeline(method: usize) {
+/// 0x1f0, 0x2b0), the title having called at `asked`: counted; and counted
+/// apart, by how soon (under 20 µs, 200 µs, 2 ms, later), when this
+/// thread's last unknown pipeline call came before it: a title that falls
+/// back to the standard methods shows about one per failed call, soon
+/// after it. Called once the method made the pipeline, so calls that fail
+/// count nothing and leave the last unknown call for the next.
+pub(crate) fn standard_pipeline(method: usize, asked: Instant) {
     const SOON: [Duration; 3] = [Duration::from_micros(20), Duration::from_micros(200), Duration::from_millis(2)];
     static MADE: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
     /// method * 8 + slot (0 0x1c8, 1 0x218) * 4 + how soon
     static AFTER: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];
+    /// Per method, how many of its pipelines came after an unknown call.
+    static AFTER_ANY: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
     let Some(m) = [0x50, 0x58, 0x1f0, 0x2b0].iter().position(|&x| x == method) else {
         return;
     };
     let made = MADE[m].fetch_add(1, Ordering::Relaxed) + 1;
+    let mut after_any = 0;
     if let Some((slot, at)) = LAST_UNKNOWN.with(Cell::take) {
-        let soon = SOON.iter().position(|&l| at.elapsed() < l).unwrap_or(3);
+        let soon = SOON.iter().position(|&l| asked.saturating_duration_since(at) < l).unwrap_or(3);
         AFTER[m * 8 + usize::from(slot == 0x218) * 4 + soon].fetch_add(1, Ordering::Relaxed);
+        after_any = AFTER_ANY[m].fetch_add(1, Ordering::Relaxed) + 1;
     }
-    if made.is_power_of_two() && made >= 16 || made.is_multiple_of(4096) {
+    // (also the first pipelines, and each power of two of those after an
+    // unknown call: a method that makes few still says whether it follows one)
+    if made <= 4 || made.is_power_of_two() && made >= 16 || made.is_multiple_of(4096) || after_any.is_power_of_two() {
         let after = |s: usize| (0..4).map(|k| AFTER[m * 8 + s * 4 + k].load(Ordering::Relaxed)).collect::<Vec<_>>();
         tracing::info!(
             method = format_args!("{method:#x}"),
@@ -503,7 +513,8 @@ pub(crate) fn standard_pipeline(method: usize) {
 /// What [`unknown_pipeline`]'s descriptions point at, byte by byte: for the
 /// first 4 calls of each slot and the first 2 of each layout, every blob as
 /// little-endian dwords (512 bytes of state and metadata, 64 of code) and a
-/// hash of all of it. At most `MOST` calls per slot; release builds log it.
+/// hash of all of it. At most `MOST` calls per slot, among its first
+/// `LOOKED`; release builds log it.
 #[cfg(windows)]
 mod unknown_dump {
     use std::collections::HashMap;
@@ -520,16 +531,72 @@ mod unknown_dump {
     /// Longest blob read whole (longest seen: code of 0x1f9c0 bytes).
     const LONGEST: u64 = 4 << 20;
     const MOST: u32 = 48;
+    /// Calls looked at per slot: past them a call costs nothing here, even
+    /// when the title has fewer layouts than `MOST` dumps would take.
+    const LOOKED: u32 = 256;
+    /// Graphics groups a short read (`MIN_BYTES`) covers in full; the layout
+    /// key names only these, so the length read does not change it.
+    const KEY_GROUPS: u32 = 2;
 
     static DUMPED: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
     static LAYOUTS: Mutex<Option<HashMap<(usize, [u64; 3]), u32>>> = Mutex::new(None);
+
+    /// Whether `[at, at + len)` is committed memory that can be read and has
+    /// no guard page. What the dump reads is guessed, and the in-process copy
+    /// (`crate::host::read_into`) takes a guard page's one-shot exception,
+    /// which disarms the title's guard (a stack that can then not grow).
+    pub(super) fn plain(at: u64, len: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+        };
+        let end = at.saturating_add(len as u64);
+        let mut p = at;
+        while p < end {
+            // SAFETY: a query of an address into a local structure.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: as above.
+            let got = unsafe { VirtualQuery(p as usize as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+            if got == 0 || info.State != MEM_COMMIT || info.Protect == 0 || info.Protect & (PAGE_GUARD | PAGE_NOACCESS) != 0 {
+                return false;
+            }
+            p = (info.BaseAddress as u64).saturating_add(info.RegionSize as u64);
+        }
+        true
+    }
 
     fn read(at: u64, len: u64, most: usize) -> Option<Vec<u8>> {
         if at == 0 || len == 0 || len > LONGEST {
             return None;
         }
         let mut bytes = vec![0; (len as usize).min(most)];
-        crate::host::read_into(at as usize as *const u8, &mut bytes).then_some(bytes)
+        (plain(at, bytes.len()) && crate::host::read_into(at as usize as *const u8, &mut bytes)).then_some(bytes)
+    }
+
+    #[test]
+    fn a_guessed_read_leaves_a_guard_page_armed() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree, VirtualQuery,
+        };
+        // SAFETY: fresh pages of our own, freed below.
+        let (guarded, open) = unsafe {
+            (
+                VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE | PAGE_GUARD),
+                VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE),
+            )
+        };
+        assert!(!guarded.is_null() && !open.is_null());
+        assert!(read(guarded as u64, 64, 64).is_none(), "a guard page is not read");
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query into a local structure.
+        unsafe { VirtualQuery(guarded, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+        assert_ne!(info.Protect & PAGE_GUARD, 0, "the title's guard is still armed");
+        assert_eq!(read(open as u64, 64, 64).map(|b| b.len()), Some(64), "plain memory is read");
+        // SAFETY: the pages allocated above.
+        unsafe {
+            VirtualFree(guarded, 0, MEM_RELEASE);
+            VirtualFree(open, 0, MEM_RELEASE);
+        }
     }
 
     fn dwords(bytes: &[u8]) -> String {
@@ -557,14 +624,18 @@ mod unknown_dump {
     pub(super) fn dump<const SLOT: usize>(desc: *const u8, calls: u32) {
         let compute = SLOT == 0x218;
         let dumped = &DUMPED[usize::from(compute)];
-        if desc.is_null() || dumped.load(Relaxed) >= MOST {
+        if desc.is_null() || calls > LOOKED || dumped.load(Relaxed) >= MOST {
             return;
         }
+        // A 0x218 element is 12 words; 0x1c8 has at least a root, two blobs
+        // and two groups (13 words), read as 16.
+        let min_words = if compute { 12 } else { 16 };
         let mut bytes = [0u8; WORDS * 8];
-        let n = if crate::host::read_into(desc, &mut bytes) {
+        let readable = |n: usize, bytes: &mut [u8]| plain(desc as u64, n * 8) && crate::host::read_into(desc, &mut bytes[..n * 8]);
+        let n = if readable(WORDS, &mut bytes) {
             WORDS
-        } else if crate::host::read_into(desc, &mut bytes[..128]) {
-            16
+        } else if readable(min_words, &mut bytes) {
+            min_words
         } else {
             return;
         };
@@ -578,20 +649,23 @@ mod unknown_dump {
             blobs.push(("metadata".into(), 7));
             (12, class(w[8]) << 8 | class(w[6]))
         } else {
-            let (mut at, mut i) = (5, 0);
+            // (zeroed memory past the description reads as absent groups: the
+            // description ends with its last present group)
+            let (mut at, mut i, mut last) = (5, 0, 5);
             while let Some(here) = group(&w, at) {
                 if here {
                     filled |= 1 << i;
                     blobs.push((format!("code {i}"), at));
                     blobs.push((format!("metadata {i}"), at + 2));
+                    last = at + 4;
                 }
                 at += 4;
                 i += 1;
             }
-            (at, filled)
+            (last, filled & ((1 << KEY_GROUPS) - 1))
         };
-        // (for graphics, not the end: memory past the description could make
-        // one layout look like two)
+        // (for graphics, not the end and only the first groups: memory past
+        // the description, or a short read, could make one layout look like two)
         let layout = [w[2], w[4], if compute { sizes | (end as u64) << 32 } else { sizes }];
         {
             let mut layouts = LAYOUTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -605,9 +679,15 @@ mod unknown_dump {
             return;
         }
         let slot = format!("{SLOT:#x}");
-        tracing::warn!(slot = %slot, calls, words = end, groups = format_args!("{filled:#b}"),
-            description = format_args!("{:x?}", &w[..n]),
-            "a pipeline creation method that is not implemented: its description");
+        if compute {
+            tracing::warn!(slot = %slot, calls, words = end, description = format_args!("{:x?}", &w[..n]),
+                "a pipeline creation method that is not implemented: its description");
+        } else {
+            // (`words`: up to the last present group; `read`: how many were read)
+            tracing::warn!(slot = %slot, calls, words = end, read = n, groups = format_args!("{filled:#b}"),
+                description = format_args!("{:x?}", &w[..n]),
+                "a pipeline creation method that is not implemented: its description");
+        }
         for (name, at) in &blobs {
             let (to, len) = (w[*at], w[*at + 1]);
             let most = if name.starts_with("code") { SHOWN_CODE } else { SHOWN };

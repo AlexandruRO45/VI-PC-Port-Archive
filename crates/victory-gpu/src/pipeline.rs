@@ -162,7 +162,9 @@ impl Shader {
                 let wide = wave_wide_only().contains(&self.hash);
                 // `VICTORY_WAVE_WHY`: the translator's lines about a wave64 program's forms
                 // carry no hash and come from translations on several threads; with the
-                // switch, one at a time, each between two lines that name its shader
+                // switch, one at a time, each between two lines that name its shader.
+                // That makes pipelines more slowly (cache hits wait too), so more draws
+                // are dropped while pipelines are made than in a run without it.
                 let done = if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
                     static ONE: Mutex<()> = Mutex::new(());
                     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
@@ -638,20 +640,33 @@ pub(crate) extern "system" fn create_graphics(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    crate::device::standard_pipeline(0x50);
+    let asked = std::time::Instant::now();
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
     let stages = GRAPHICS_STAGES.iter().zip(&desc.stages);
     let shaders = stages.filter_map(|(s, c)| copy(s, c)).collect();
-    hand_out(
-        shaders,
-        #[cfg(windows)]
-        None,
-        iid,
-        out,
+    counted(
+        0x50,
+        asked,
+        hand_out(
+            shaders,
+            #[cfg(windows)]
+            None,
+            iid,
+            out,
+        ),
     )
+}
+
+/// `made`, the result of standard pipeline method `method` called at
+/// `asked`, counted when it made a pipeline ([`crate::device::standard_pipeline`]).
+fn counted(method: usize, asked: std::time::Instant, made: HRESULT) -> HRESULT {
+    if made >= 0 {
+        crate::device::standard_pipeline(method, asked);
+    }
+    made
 }
 
 /// Device method.
@@ -661,8 +676,8 @@ pub(crate) extern "system" fn create_compute(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    crate::device::standard_pipeline(0x58);
-    compute(desc, iid, out)
+    let asked = std::time::Instant::now();
+    counted(0x58, asked, compute(desc, iid, out))
 }
 
 /// What the two compute methods make.
@@ -692,8 +707,8 @@ pub(crate) extern "system" fn create_compute_x(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    crate::device::standard_pipeline(0x1f0);
-    compute(desc, iid, out)
+    let asked = std::time::Instant::now();
+    counted(0x1f0, asked, compute(desc, iid, out))
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a
@@ -740,7 +755,7 @@ pub(crate) extern "system" fn create_stream(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    crate::device::standard_pipeline(0x2b0);
+    let asked = std::time::Instant::now();
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -753,12 +768,16 @@ pub(crate) extern "system" fn create_stream(
     let (shaders, graphics) = read_stream(stream, copy);
     #[cfg(not(windows))]
     let _ = graphics;
-    hand_out(
-        shaders,
-        #[cfg(windows)]
-        Some(Box::new(graphics)),
-        iid,
-        out,
+    counted(
+        0x2b0,
+        asked,
+        hand_out(
+            shaders,
+            #[cfg(windows)]
+            Some(Box::new(graphics)),
+            iid,
+            out,
+        ),
     )
 }
 

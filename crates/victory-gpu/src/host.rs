@@ -9866,7 +9866,7 @@ impl Meter {
                     .iter()
                     .zip(crate::draw::DROP_REASONS)
                     .filter(|(n, _)| **n > 0)
-                    .map(|(&n, what)| format!("{:.1} {what}", n as f64 / frames))
+                    .map(|(&n, what)| format!("{:.1} {what} ({n} in all)", n as f64 / frames))
                     .collect();
                 tracing::info!("draws and dispatches dropped per frame, by reason: {}", parts.join(", "));
             }
@@ -10045,7 +10045,7 @@ impl Meter {
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
-                 dropped {dropped:.0} without a host pipeline ({making} being made) and \
+                 dropped {dropped:.0} (reasons on their own line; {making} pipelines being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",

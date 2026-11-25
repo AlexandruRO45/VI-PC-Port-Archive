@@ -743,14 +743,16 @@ pub(crate) const NULL_VIEW_KINDS: usize = 9;
 pub(crate) static NULL_BUFFER_VIEWS: [std::sync::atomic::AtomicU64; NULL_VIEW_KINDS] =
     [const { std::sync::atomic::AtomicU64::new(0) }; NULL_VIEW_KINDS];
 
-/// A buffer view left null for `why`: counted; true the first time for that
-/// reason (the caller then logs the view).
-fn left_null(why: NullView) -> bool {
+/// A buffer view (an unordered one if `unordered`) left null for `why`:
+/// counted; true the first time for that reason and kind of view (the
+/// caller then logs the view).
+fn left_null(why: NullView, unordered: bool) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     NULL_BUFFER_VIEWS[why as usize].fetch_add(1, Relaxed);
-    static LOGGED: [std::sync::atomic::AtomicBool; NULL_VIEW_KINDS] =
-        [const { std::sync::atomic::AtomicBool::new(false) }; NULL_VIEW_KINDS];
-    !LOGGED[why as usize].swap(true, Relaxed)
+    static LOGGED: [[std::sync::atomic::AtomicBool; NULL_VIEW_KINDS]; 2] =
+        [const { [const { std::sync::atomic::AtomicBool::new(false) }; NULL_VIEW_KINDS] }; 2];
+    let logged = &LOGGED[usize::from(unordered)][why as usize];
+    !logged.load(Relaxed) && !logged.swap(true, Relaxed)
 }
 
 /// Whether the host device is gone, and why (the first time it is asked
@@ -2058,8 +2060,16 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    // (first: an empty view loses nothing, whatever else it says)
+    // SAFETY: a buffer view's union member.
+    if unsafe { desc.Anonymous.Buffer }.NumElements == 0 {
+        if left_null(NullView::Empty, false) {
+            tracing::warn!(address, "empty buffer view left null");
+        }
+        return None;
+    }
     let Some(shadow) = crate::shadow::find(address, len) else {
-        if left_null(NullView::NoCopy) {
+        if left_null(NullView::NoCopy, false) {
             tracing::warn!(address, len, "buffer view of memory with no host copy left null");
         }
         return None;
@@ -2084,8 +2094,14 @@ fn buffer_srv(
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     if window.is_none() {
-        if element == 0 || offset % element != 0 {
-            if left_null(NullView::OffElement) {
+        if element == 0 {
+            if left_null(NullView::Typed, false) {
+                tracing::warn!(format = desc.Format.0, "buffer view of a format with no element size left null");
+            }
+            return None;
+        }
+        if offset % element != 0 {
+            if left_null(NullView::OffElement, false) {
                 tracing::warn!(offset, element, "buffer view not on an element of its host copy left null");
             }
             return None;
@@ -2097,7 +2113,7 @@ fn buffer_srv(
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if let Some(why) = buffer_view_refusal(desc.Format, first, count, stride, raw, width) {
-        if left_null(why) {
+        if left_null(why, false) {
             tracing::warn!(
                 ?why,
                 format = desc.Format.0,
@@ -2135,8 +2151,16 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    // (first: an empty view loses nothing, whatever else it says)
+    // SAFETY: a buffer view's union member.
+    if unsafe { desc.Anonymous.Buffer }.NumElements == 0 {
+        if left_null(NullView::Empty, true) {
+            tracing::warn!(address, "empty unordered buffer view left null");
+        }
+        return None;
+    }
     let Some(shadow) = crate::shadow::find(address, len) else {
-        if left_null(NullView::NoCopy) {
+        if left_null(NullView::NoCopy, true) {
             tracing::warn!(address, len, "unordered buffer view of memory with no host copy left null");
         }
         return None;
@@ -2144,7 +2168,7 @@ fn buffer_uav(
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-        if left_null(NullView::Unwritable) {
+        if left_null(NullView::Unwritable, true) {
             tracing::warn!("unordered access to a buffer whose host copy shaders cannot write left null");
         }
         return None;
@@ -2169,8 +2193,14 @@ fn buffer_uav(
         buffer.StructureByteStride = 0;
         buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     } else {
-        if element == 0 || offset % element != 0 {
-            if left_null(NullView::OffElement) {
+        if element == 0 {
+            if left_null(NullView::Typed, true) {
+                tracing::warn!(format = desc.Format.0, "unordered buffer view of a format with no element size left null");
+            }
+            return None;
+        }
+        if offset % element != 0 {
+            if left_null(NullView::OffElement, true) {
                 tracing::warn!(offset, element, "unordered buffer view not on an element of its host copy left null");
             }
             return None;
@@ -2188,7 +2218,7 @@ fn buffer_uav(
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if let Some(why) = buffer_view_refusal(desc.Format, first, count, stride, raw, width) {
-        if left_null(why) {
+        if left_null(why, true) {
             tracing::warn!(
                 ?why,
                 format = desc.Format.0,

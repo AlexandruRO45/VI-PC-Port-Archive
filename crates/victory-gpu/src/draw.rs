@@ -334,7 +334,7 @@ pub(crate) fn take_frame() -> Vec<String> {
 }
 
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
-/// (no host pipeline) since the last call.
+/// since the last call, for any reason ([`take_dropped_why`]).
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
@@ -470,7 +470,7 @@ pub(crate) static HEAP_TEXTURES_UNANNOUNCED: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Why draws and dispatches were dropped, since the last frame line (their
 /// sum is [`take_dropped`]'s): the words the frame line names them by.
-pub(crate) const DROP_REASONS: [&str; 8] = [
+pub(crate) const DROP_REASONS: [&str; 9] = [
     "no host pipeline",
     "a stage of the structure builder, which is off",
     "a pipeline of another kind",
@@ -479,6 +479,7 @@ pub(crate) const DROP_REASONS: [&str; 8] = [
     "rectangles not expanded",
     "mesh dispatches switched off",
     "skipped (VICTORY_SKIP_PIPELINES)",
+    "a host list without mesh dispatches",
 ];
 const NO_PIPELINE: usize = 0;
 const BUILDER_OFF: usize = 1;
@@ -489,7 +490,8 @@ const RECTS: usize = 5;
 const MESH_OFF: usize = 6;
 #[cfg(feature = "diagnostics")]
 const SKIPPED: usize = 7;
-static DROPPED_WHY: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+const NO_MESH_LIST: usize = 8;
+static DROPPED_WHY: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 thread_local! {
     /// Why the last [`State::prepare_for`] on this thread gave up.
     static PREPARE_WHY: std::cell::Cell<usize> = const { std::cell::Cell::new(NO_PIPELINE) };
@@ -502,7 +504,7 @@ fn drop_as(why: usize) {
 }
 
 /// The drops since the last call, by reason ([`DROP_REASONS`]).
-pub(crate) fn take_dropped_why() -> [u64; 8] {
+pub(crate) fn take_dropped_why() -> [u64; 9] {
     DROPPED_WHY.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
 }
 
@@ -2170,6 +2172,7 @@ impl State {
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            drop_as(OTHER_KIND);
             return;
         }
         if !self.bind(list, p, true) {
@@ -2459,7 +2462,10 @@ impl State {
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
-                Err(_) => false,
+                Err(_) => {
+                    PREPARE_WHY.set(NO_MESH_LIST);
+                    false
+                }
             };
         if !ran {
             drop_as(PREPARE_WHY.get());
@@ -2960,8 +2966,11 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
-        // alone (nothing expands them on the CPU).
-        let lost = self.topology == RECTANGLES && !self.completes_rects();
+        // alone (nothing expands them on the CPU). Without a host pipeline
+        // the draw is lost to that instead (`prepare` says so).
+        let lost = self.topology == RECTANGLES
+            && crate::pipeline::host_pipeline(self.pipeline as This).is_some()
+            && !self.completes_rects();
         if lost {
             once!("indexed rectangles not drawn");
         }
