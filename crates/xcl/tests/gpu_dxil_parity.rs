@@ -58,7 +58,7 @@ fn prog(list: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<u8> {
 }
 
 fn tsharp(idx: u32, dfmt: u32, rtype: u32) -> [u32; 8] {
-    [0x2000_0000 | (idx << 4), 0, 0, (dfmt << 20) | (rtype << 28), 0, 0, 0, 0]
+    [idx, dfmt << 20, 0, rtype << 28, 0, 0, 0, 0]
 }
 
 fn assert_parity(
@@ -276,7 +276,7 @@ fn direct_dxil_mimg_image_ops_and_atomics_parity() {
     st.sgpr[32..40].copy_from_slice(&tsharp(4, 20, 9)); // R32_UINT
     st.sgpr[40..48].copy_from_slice(&tsharp(6, 21, 9)); // R32_SINT
     st.sgpr[48..56].copy_from_slice(&tsharp(8, 20, 9));
-    st.sgpr[56..60].copy_from_slice(&[0x3000_0000, 0, 0, 0]); // sampler 0
+    st.sgpr[56..60].copy_from_slice(&[0, 0, 0, 0]); // sampler 0
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         let lu = l as u32;
         r[0] = lu % 16;
