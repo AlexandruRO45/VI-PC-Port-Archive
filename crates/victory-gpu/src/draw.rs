@@ -3007,6 +3007,8 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        crate::indirect_stats::STATS.host_call();
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

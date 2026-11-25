@@ -385,6 +385,8 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
+            #[cfg(feature = "diagnostics")]
+            crate::indirect_stats::STATS.clamp_dispatch();
         }
         l.ResourceBarrier(&second[skip..]);
     }

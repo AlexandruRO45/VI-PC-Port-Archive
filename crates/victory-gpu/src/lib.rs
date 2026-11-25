@@ -31,6 +31,8 @@ pub mod frame;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod indirect_stats;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
