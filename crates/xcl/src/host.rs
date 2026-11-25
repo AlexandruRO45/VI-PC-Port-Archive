@@ -2,11 +2,54 @@
 //! logging, the VFS, hooks and HLE, maps the title and jumps to its entry point.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::config::Boot;
 
 pub static HOST_MODE: AtomicBool = AtomicBool::new(false);
+static ACTIVE_COMMIT_CAP_MB: AtomicU64 = AtomicU64::new(0);
+
+/// Active `XCL_TITLE_COMMIT_CAP_MB` limit in MiB (`0` when disabled or not applied).
+pub fn active_commit_cap_mb() -> u64 {
+    ACTIVE_COMMIT_CAP_MB.load(Ordering::Acquire)
+}
+
+/// Current process private commit in bytes (`PrivateUsage`, falling back to `PagefileUsage`
+/// on Wine). Returns `0` if the query fails.
+pub fn current_process_commit_bytes() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    unsafe {
+        let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+        c.cb = std::mem::size_of_val(&c) as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb) != 0 {
+            if c.PrivateUsage != 0 { c.PrivateUsage as u64 } else { c.PagefileUsage as u64 }
+        } else {
+            0
+        }
+    }
+}
+
+/// Current process private commit in MiB.
+pub fn current_process_commit_mb() -> u64 {
+    current_process_commit_bytes() >> 20
+}
+
+pub fn format_commit_cap_oom(site: &str, cap_mb: u64, commit_mb: u64) -> String {
+    format!(
+        "{site}: allocation failed while {}={cap_mb} MB is active (process commit {commit_mb} MB)",
+        crate::config::ENV_TITLE_COMMIT_CAP_MB
+    )
+}
+
+/// When `XCL_TITLE_COMMIT_CAP_MB` is active, logs the cap and current process commit in MiB.
+pub fn log_commit_cap_if_active(site: &str) {
+    let cap_mb = active_commit_cap_mb();
+    if cap_mb > 0 {
+        let commit_mb = current_process_commit_mb();
+        crate::xlog_warn!("{}", format_commit_cap_oom(site, cap_mb, commit_mb));
+    }
+}
 
 pub fn host_main(boot_path: &Path) -> i32 {
     let boot: Boot = match std::fs::read_to_string(boot_path).map_err(|e| e.to_string()).and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())) {
@@ -48,6 +91,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+    crate::report::init_emergency_meta(&boot);
+    crate::eh::install_alloc_error_hook();
     // `XCL_ACTIVITY=1`: every 2 s what the title did since (a timeline of where it stops)
     if std::env::var_os("XCL_ACTIVITY").is_some() {
         let _ = std::thread::Builder::new().name("xcl-activity".into()).spawn(|| {
@@ -68,13 +113,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
                 );
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
-                let private = unsafe {
-                    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
-                    let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
-                    c.cb = std::mem::size_of_val(&c) as u32;
-                    K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
-                    c.PrivateUsage
-                };
+                let private = current_process_commit_bytes();
                 let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
@@ -174,6 +213,7 @@ unsafe impl Sync for CommitCapJob {}
 
 impl Drop for CommitCapJob {
     fn drop(&mut self) {
+        ACTIVE_COMMIT_CAP_MB.store(0, Ordering::Release);
         if !self.0.is_null() {
             unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
         }
@@ -235,6 +275,7 @@ pub fn apply_commit_cap_mb(cap_mb: u64) -> Result<CommitCapJob, String> {
             ));
         }
 
+        ACTIVE_COMMIT_CAP_MB.store(cap_mb, Ordering::Release);
         Ok(job)
     }
 }
@@ -256,6 +297,16 @@ mod tests {
     fn rejects_zero_and_overflow_commit_cap() {
         assert!(apply_commit_cap_mb(0).is_err());
         assert!(apply_commit_cap_mb(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn commit_cap_query_and_oom_formatting() {
+        assert_eq!(active_commit_cap_mb(), 0);
+        assert!(current_process_commit_mb() > 0);
+        assert_eq!(
+            format_commit_cap_oom("D3D12.X: title-texture page pool CreateHeap", 24_000, 23_980),
+            "D3D12.X: title-texture page pool CreateHeap: allocation failed while XCL_TITLE_COMMIT_CAP_MB=24000 MB is active (process commit 23980 MB)"
+        );
     }
 
     #[test]
