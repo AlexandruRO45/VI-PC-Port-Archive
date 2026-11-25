@@ -478,13 +478,11 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> (HashMap<Value, Shape>, 
         let mut writes = exec;
         let fetched: Option<Vec<Sym>> = match (v.dpp, &src0) {
             (Some(d), Some(s)) => {
-                if exec != all {
-                    vec.insert(dst, vec![Sym::Unknown; wave as usize]);
-                    unknown.get_or_insert(
-                        "a whole-wave section step the simulation does not follow: a DPP step over lanes it has not named",
-                    );
-                    continue;
-                }
+                // Every lane of the section ran at its entry (exec was all)
+                // and only a constant lane set narrows it since, so each
+                // lane's registers hold its value whether it is active:
+                // a DPP step over the lanes the set names is followed, with
+                // the lanes outside keeping their value.
                 let mut f = Vec::with_capacity(wave as usize);
                 let mut ok = true;
                 for l in 0..wave {
@@ -498,6 +496,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> (HashMap<Value, Shape>, 
                         _ => ok = false,
                     }
                 }
+                writes &= exec;
                 if !ok {
                     unknown.get_or_insert(
                         "a whole-wave section step the simulation does not follow: a DPP step it does not model",
@@ -1044,6 +1043,44 @@ mod tests {
         let sec = &sections(&p, 0)[&0];
         assert_eq!(sec.shapes.get(&v2_val), Some(&Shape::K(7)));
         assert_eq!(sec.shapes.get(&v3_val), Some(&Shape::K(7)));
+    }
+
+    /// A DPP step over a lane set the section named by a constant
+    /// (H-6.3: prefix scans narrow exec) is followed: every lane ran at
+    /// the section's entry, so the lanes the set leaves out keep their
+    /// value and the lanes it names take the fetched one.
+    #[test]
+    fn dpp_over_a_lane_set_the_section_names_stays_followed() {
+        // s_or_saveexec s0, -1; v_mov_b32 v1, 7; s_mov_b32 exec, -2;
+        // v_mov_b32 v2, v1 dpp16 quad-perm sel 0xE4 (identity);
+        // s_mov_b32 exec, s0.
+        for (wave64, saveexec, mov_exec) in [(true, 0x25, 0x04), (false, 0x3D, 0x03)] {
+            let mut section = |narrow: bool| {
+                let mut w = vec![sop1(0, saveexec, 193), vop1(1, 0x01, 135)];
+                if narrow {
+                    w.push(sop1(EXEC, mov_exec, 194));
+                }
+                w.extend([
+                    vop1(2, 0x01, 0xFA),
+                    dpp16(1, 0xE4, 0xF, 0xF, false),
+                    sop1(EXEC, mov_exec, 0),
+                ]);
+                let p = build(&w, wave64);
+                let value = p.blocks[0].insts[if narrow { 3 } else { 2 }]
+                    .write(Reg::V(2))
+                    .unwrap();
+                let sec = &sections(&p, 0)[&0];
+                (sec.unknown, sec.shapes.get(&value).copied())
+            };
+            // All lanes active: one constant shape.
+            let (unknown, shape) = section(false);
+            assert_eq!(unknown, None);
+            assert_eq!(shape, Some(Shape::K(7)));
+            // Lane 0 left out: it keeps its own value, the rest the move's.
+            let (unknown, shape) = section(true);
+            assert_eq!(unknown, None, "the DPP step stays followed");
+            assert_eq!(shape, None, "lane 0 kept its own value");
+        }
     }
 
     /// A section whose every step the simulation follows leaves no
