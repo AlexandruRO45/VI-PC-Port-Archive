@@ -1356,6 +1356,18 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
             }
         }
     }
+    if !castable_formats.is_empty() && !host.device10() {
+        // The castable list takes `CreateCommittedResource3` (D3D12 1.7):
+        // the runtime in Windows 10 before the Agility SDK has no
+        // `ID3D12Device10`, and every view in another format then gets its
+        // own host texture and a copy at the read.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::info!(
+                "no ID3D12Device10 (D3D12 1.7): textures are made without castable formats; a view in another format gets its own host texture and a copy"
+            );
+        });
+    }
     if texture.is_none()
         && !castable_formats.is_empty()
         && let Ok(device) = host.device.cast::<ID3D12Device10>()

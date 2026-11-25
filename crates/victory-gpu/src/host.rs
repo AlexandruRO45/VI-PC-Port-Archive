@@ -3176,6 +3176,14 @@ impl Host {
         })
     }
 
+    /// Whether the runtime has `ID3D12Device10` (D3D12 1.7): textures are
+    /// made with their castable formats through `CreateCommittedResource3`
+    /// only then. Windows 10 before the Agility SDK has no such interface,
+    /// so a view in another format gets its own host texture and a copy.
+    pub(crate) fn device10(&self) -> bool {
+        self.device.cast::<ID3D12Device10>().is_ok()
+    }
+
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
