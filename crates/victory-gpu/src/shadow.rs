@@ -1779,9 +1779,40 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
     })
 }
 
+/// Whether copies of title memory go in sparse buffers. Under Wine they do
+/// not by default: vkd3d-proton turns each tile mapping into a sparse bind
+/// on the queue, and with the world loading, frames took 6 to 9 s on the
+/// GPU, submissions up to 17 s, until the driver reset the card (on RADV
+/// the desktop went down with it). Without them, as before `cc4d18d`, each
+/// title buffer or window gets its own copy. `VICTORY_SPARSE=1` keeps them
+/// under Wine, `VICTORY_SPARSE=0` turns them off everywhere.
+fn sparse_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let wine = on_wine_host();
+        let on = match std::env::var_os("VICTORY_SPARSE") {
+            None => !wine,
+            Some(v) => v != "0",
+        };
+        tracing::info!(on, wine, "copies of title memory in sparse buffers");
+        on
+    })
+}
+
+/// Whether we run under Wine (its ntdll exports `wine_get_version`), as
+/// `victory-hle`'s `xmem::on_wine` tells.
+fn on_wine_host() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: plain lookups in ntdll, always loaded.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
+}
+
 /// The sparse copy `[address, end)` lies in.
 fn sparse(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    if cfg!(test) || (end - 1) / CHUNK != address / CHUNK {
+    if cfg!(test) || (end - 1) / CHUNK != address / CHUNK || !sparse_on() {
         return None;
     }
     SPARSE
