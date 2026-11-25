@@ -410,8 +410,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // frame, each time paying that failed call before the guards answer.
     let known_view = guarded && known_view(first * PAGE);
     // Their walk (`VirtualProtect` on what was written, page-table queries)
-    // is done without the journal's lock (`VICTORY_WATCH_SPLIT=0`: under it,
-    // as before): its askings waited for each other there, 18 ms a frame of
+    // is done without the journal's lock with `VICTORY_WATCH_SPLIT=1` (off by
+    // default): its askings waited for each other there, 18 ms a frame of
     // the submitting thread in a gameplay profile, the wide refreshes too.
     // The asking's number is taken first; what the walk finds is noted in
     // the guards (`Guards::recent`) until the journal has it, so that a walk
@@ -899,10 +899,11 @@ pub(crate) fn release(at: usize) -> bool {
 }
 
 /// Whether [`writes`] walks the guards without the journal's lock
-/// (`VICTORY_WATCH_SPLIT`; on by default, `=0`: under it, as before).
+/// (`VICTORY_WATCH_SPLIT=1`; off by default: an RTX 4070 / Ryzen 5 7500F
+/// A/B gave the same frame, 114-117 ms with it, 112-116 without).
 fn split() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_SPLIT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_SPLIT").is_some_and(|v| v == "1"))
 }
 
 /// Views of one page past which its views are not guarded together.
