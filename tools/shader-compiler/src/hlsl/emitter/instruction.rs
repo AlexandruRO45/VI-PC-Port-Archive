@@ -4,6 +4,9 @@ use super::*;
 impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn emit_insn(&mut self, idx: usize, ins: &Insn, is_ps: bool, br: Option<usize>) -> Result<(), String> {
         self.emit_insn_body(idx, ins, is_ps, br)?;
+        for line in mask_ballots::capture(self, idx) {
+            self.line(&line);
+        }
         if let Some(vote) = self.lockstep.as_ref().and_then(|votes| votes.get(&idx)).cloned() {
             let mask = r(&vote.mask)?;
             let not = if vote.none { "!" } else { "" };
