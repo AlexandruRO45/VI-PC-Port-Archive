@@ -443,6 +443,8 @@ pub(crate) struct StreamDesc {
     stream: *const u8,
 }
 
+const VIEW_INSTANCING: u32 = 22;
+
 /// A subobject type's size (type included), and the stage it is if it is a
 /// shader. The console numbers amplification and mesh shaders 23 and 24
 /// (PC: 24 and 25); its own types from 25 on are not sized yet.
@@ -465,7 +467,7 @@ fn subobject(kind: u32) -> Option<(usize, Option<&'static str>)> {
         11 => Some((56, None)),
         17 => Some((16, None)),
         21 => Some((64, None)),
-        22 => Some((32, None)),
+        VIEW_INSTANCING => Some((32, None)),
         9 | 13 | 14 | 16 | 18 | 20 => Some((8, None)),
         _ => None,
     }
@@ -505,8 +507,8 @@ type Graphics = host::GraphicsState;
 type Graphics = ();
 
 /// A stream's shaders (each made by `shader` from its stage and bytecode)
-/// and graphics state. Its pointers (shader code, input elements) must be
-/// valid: the title's own, or the pre-build's.
+/// and graphics state. Its pointers (shader code, input elements and view
+/// locations) must be valid: the title's own, or the pre-build's.
 fn read_stream(
     stream: &[u8],
     shader: impl Fn(&'static str, &Bytecode) -> Option<Arc<Shader>>,
@@ -514,6 +516,8 @@ fn read_stream(
     let mut shaders = Vec::new();
     #[allow(unused_mut, clippy::let_unit_value)]
     let mut graphics = Graphics::default();
+    #[cfg(windows)]
+    let mut views = None;
     let mut at = 0;
     while at + 8 <= stream.len() {
         let kind = u32::from_le_bytes(stream[at..at + 4].try_into().expect("4 bytes"));
@@ -534,11 +538,22 @@ fn read_stream(
             shaders.extend(shader(stage, code));
         }
         #[cfg(windows)]
-        // SAFETY: a whole subobject of this kind lies at `at`.
-        unsafe {
-            graphics.read(kind, stream.as_ptr().add(at))
-        };
+        if kind == VIEW_INSTANCING {
+            views = Some(at);
+        } else {
+            // SAFETY: a whole subobject of this kind lies at the offset.
+            unsafe { graphics.read(kind, stream.as_ptr().add(at)) };
+        }
         at += size;
+    }
+    // The view subobject may precede the shaders in the stream.
+    #[cfg(windows)]
+    if let Some(at) = views
+        && shaders.iter().any(|s| s.stage == "vertex")
+        && shaders.iter().all(|s| matches!(s.stage, "vertex" | "pixel"))
+    {
+        // SAFETY: the subobject is complete and its locations live through this call.
+        unsafe { graphics.read_views(stream.as_ptr().add(at)) };
     }
     (shaders, graphics)
 }
@@ -600,7 +615,7 @@ impl Prebuild {
     /// the device.
     ///
     /// # Safety
-    /// The stream's pointers point at live shader code and input elements.
+    /// The stream's pointers point at live shader code, input elements and view locations.
     pub unsafe fn graphics(stream: &[u8]) -> Prebuild {
         // Shaders of their own: a pre-build must not keep every container.
         let own = |stage, code: &Bytecode| {

@@ -12,7 +12,7 @@ use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DAT
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::core::PCSTR;
+use windows::core::{Interface, PCSTR};
 
 use super::{Shader, Translated};
 use crate::host::host;
@@ -32,6 +32,7 @@ pub(crate) struct GraphicsState {
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
     depth_format: DXGI_FORMAT,
     samples: DXGI_SAMPLE_DESC,
+    views: Vec<D3D12_VIEW_INSTANCE_LOCATION>,
 }
 
 impl Default for GraphicsState {
@@ -85,6 +86,7 @@ impl Default for GraphicsState {
                 Count: 1,
                 Quality: 0,
             },
+            views: Vec::new(),
         }
     }
 }
@@ -169,9 +171,32 @@ impl GraphicsState {
         }
     }
 
+    /// Copies static view locations. Masked views require command-list support.
+    ///
+    /// # Safety
+    /// The full subobject and its declared locations must live through this call.
+    pub(crate) unsafe fn read_views(&mut self, at: *const u8) {
+        // SAFETY: a whole pointer-aligned payload follows the tag at +8.
+        let desc = unsafe { at.add(8).cast::<D3D12_VIEW_INSTANCING_DESC>().read_unaligned() };
+        if desc.Flags != D3D12_VIEW_INSTANCING_FLAG_NONE
+            || !(1..=D3D12_MAX_VIEW_INSTANCE_COUNT).contains(&desc.ViewInstanceCount)
+            || desc.pViewInstanceLocations.is_null()
+        {
+            return;
+        }
+        // SAFETY: the caller supplies this many live locations.
+        self.views = (0..desc.ViewInstanceCount as usize)
+            .map(|i| unsafe { desc.pViewInstanceLocations.add(i).read_unaligned() })
+            .collect();
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
+        self.describe_with_views(&self.views)
+    }
+
+    fn describe_with_views(&self, views: &[D3D12_VIEW_INSTANCE_LOCATION]) -> String {
         let inputs: Vec<String> = self
             .inputs
             .iter()
@@ -183,7 +208,7 @@ impl GraphicsState {
                 )
             })
             .collect();
-        format!(
+        let mut state = format!(
             "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}",
             self.blend,
             self.sample_mask,
@@ -194,7 +219,26 @@ impl GraphicsState {
             self.targets,
             self.depth_format.0,
             self.samples
-        )
+        );
+        if !views.is_empty() {
+            use std::fmt::Write;
+            write!(state, " views {views:?}").expect("writing to a String cannot fail");
+        }
+        state
+    }
+
+    fn effective_views(
+        &self,
+        query_tier: impl FnOnce() -> Option<D3D12_VIEW_INSTANCING_TIER>,
+    ) -> &[D3D12_VIEW_INSTANCE_LOCATION] {
+        // D3D12 permits one explicit view even on adapters without multiview.
+        if self.views.len() <= 1
+            || query_tier().is_some_and(|tier| tier.0 >= D3D12_VIEW_INSTANCING_TIER_1.0)
+        {
+            &self.views
+        } else {
+            &[]
+        }
     }
 
     /// The vertex buffer slots the input layout reads.
@@ -567,13 +611,12 @@ impl HostPipeline {
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
         };
-        let state = g.describe();
         if mesh.is_some() {
             let name = super::library::name(
                 "mesh",
                 &root_blob,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                &state,
+                &g.describe(),
             );
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
                 Ok(pso) => pso,
@@ -637,20 +680,37 @@ impl HostPipeline {
             SampleDesc: g.samples,
             ..Default::default()
         };
+        let views = g.effective_views(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: Options3 expects a writable structure of this size.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS3,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .ok()
+            .map(|()| options.ViewInstancingTier)
+        });
         let name = super::library::name(
             "graphics",
             &root_blob,
             &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs],
-            &state,
+            &g.describe_with_views(views),
         );
         let started = std::time::Instant::now();
-        let made = super::library::pipeline(
-            &name,
-            // SAFETY: the description points at live data.
-            |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
-            // SAFETY: as above.
-            || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
-        );
+        let made = if views.is_empty() {
+            super::library::pipeline(
+                &name,
+                // SAFETY: the description points at live data.
+                |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
+                // SAFETY: as above.
+                || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
+            )
+        } else {
+            graphics_view_pipeline(&host.device, &root, &desc, views, &name)
+        };
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
@@ -694,6 +754,80 @@ fn host_topology(g: &GraphicsState) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
     }
 }
 
+/// A stream subobject consists of its tag and payload, padded to pointer alignment.
+#[repr(C, align(8))]
+struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
+
+fn graphics_view_pipeline(
+    device: &ID3D12Device,
+    root: &ID3D12RootSignature,
+    d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+    views: &[D3D12_VIEW_INSTANCE_LOCATION],
+    name: &str,
+) -> windows::core::Result<ID3D12PipelineState> {
+    #[repr(C)]
+    struct Stream {
+        root: Sub<*mut std::ffi::c_void>,
+        vs: Sub<D3D12_SHADER_BYTECODE>,
+        ps: Sub<D3D12_SHADER_BYTECODE>,
+        blend: Sub<D3D12_BLEND_DESC>,
+        mask: Sub<u32>,
+        raster: Sub<D3D12_RASTERIZER_DESC>,
+        depth: Sub<D3D12_DEPTH_STENCIL_DESC>,
+        input: Sub<D3D12_INPUT_LAYOUT_DESC>,
+        strip: Sub<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>,
+        topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+        targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+        dsv: Sub<DXGI_FORMAT>,
+        samples: Sub<DXGI_SAMPLE_DESC>,
+        views: Sub<D3D12_VIEW_INSTANCING_DESC>,
+    }
+    #[repr(C)]
+    struct StreamWithGeometry {
+        base: Stream,
+        gs: Sub<D3D12_SHADER_BYTECODE>,
+    }
+
+    let mut base = Stream {
+        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+        vs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, d.VS),
+        ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, d.PS),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, d.BlendState),
+        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, d.SampleMask),
+        raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, d.RasterizerState),
+        depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, d.DepthStencilState),
+        input: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, d.InputLayout),
+        strip: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE, d.IBStripCutValue),
+        topology: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, d.PrimitiveTopologyType),
+        targets: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+            D3D12_RT_FORMAT_ARRAY {
+                RTFormats: d.RTVFormats,
+                NumRenderTargets: d.NumRenderTargets,
+            },
+        ),
+        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, d.DSVFormat),
+        samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, d.SampleDesc),
+        views: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING,
+            D3D12_VIEW_INSTANCING_DESC {
+                ViewInstanceCount: views.len() as u32,
+                pViewInstanceLocations: views.as_ptr(),
+                Flags: D3D12_VIEW_INSTANCING_FLAG_NONE,
+            },
+        ),
+    };
+    if d.GS.pShaderBytecode.is_null() {
+        stream_pipeline(device, &mut base, name)
+    } else {
+        let mut stream = StreamWithGeometry {
+            base,
+            gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, d.GS),
+        };
+        stream_pipeline(device, &mut stream, name)
+    }
+}
+
 /// A mesh pipeline from the title's graphics state: the pipeline-state
 /// stream form (no input layout).
 fn mesh_pipeline(
@@ -704,10 +838,6 @@ fn mesh_pipeline(
     g: &GraphicsState,
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
-    use windows::core::Interface;
-    /// A stream subobject: its type, then its description, pointer-aligned.
-    #[repr(C, align(8))]
-    struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
     #[repr(C)]
     struct Stream {
         root: Sub<*mut std::ffi::c_void>,
@@ -738,9 +868,17 @@ fn mesh_pipeline(
         // made from a stream without it.
         topology: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, host_topology(g)),
     };
+    stream_pipeline(device, &mut stream, name)
+}
+
+fn stream_pipeline<S>(
+    device: &ID3D12Device,
+    stream: &mut S,
+    name: &str,
+) -> windows::core::Result<ID3D12PipelineState> {
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
-        SizeInBytes: size_of::<Stream>(),
-        pPipelineStateSubobjectStream: (&raw mut stream).cast(),
+        SizeInBytes: size_of::<S>(),
+        pPipelineStateSubobjectStream: (stream as *mut S).cast(),
     };
     let device = device.cast::<ID3D12Device2>()?;
     super::library::pipeline(
@@ -871,3 +1009,7 @@ mod tests {
         let _ = offsets(&inputs);
     }
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+#[path = "view_instancing_test.rs"]
+mod view_instancing_test;
