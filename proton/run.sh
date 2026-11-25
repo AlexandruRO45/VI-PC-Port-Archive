@@ -29,8 +29,10 @@ usage: proton/run.sh [options] [--] [victory args...]
   --watchdog     keep the title's stall watchdog (the default disarms it
                  with the VICTORY_NO_WATCHDOG hooks; docs/proton.md)
   --no-watchdog  accepted for compatibility; the default is already on
-  --mangohud     accepted for compatibility; the default is already on
-  --no-mangohud  leave MANGOHUD unset (no fps/frametime overlay)
+  --mangohud     force the fps/frametime overlay on (default: on under
+                 GE-Proton, off elsewhere — MangoHud cannot present
+                 through the Valve family's shared present mode)
+  --no-mangohud  leave MANGOHUD unset (no overlay)
 
 Notes:
   VICTORY_COPY_MEMORY defaults to 1: under Wine the title memory used in
@@ -57,6 +59,7 @@ d3dcompiler=""
 texture_no_wait=1
 watchdog=""
 mangohud=1
+mangohud_forced=""
 
 while [[ $# -gt 0 && $1 != -- ]]; do
     case "$1" in
@@ -70,8 +73,8 @@ while [[ $# -gt 0 && $1 != -- ]]; do
         --texture-no-wait) texture_no_wait=1; shift ;;
         --watchdog)    watchdog=1; shift ;;
         --no-watchdog) watchdog=""; shift ;;
-        --mangohud)    mangohud=1; shift ;;
-        --no-mangohud) mangohud=""; shift ;;
+        --mangohud)    mangohud=1; mangohud_forced=1; shift ;;
+        --no-mangohud) mangohud=""; mangohud_forced=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *)      break ;;
     esac
@@ -101,6 +104,17 @@ fi
 [[ -x "$proton/proton" || -x "$proton" ]] || die "$proton is neither a Proton directory nor an executable"
 [[ -f $exe ]] || die "no $exe — build it with: cargo win"
 exe=$(readlink -f -- "$exe")
+
+# MangoHud 0.8.x cannot present through VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR,
+# which the Valve Proton family's vkd3d uses: there the overlay ends the run
+# early (exit code 5). GE-Proton tolerates the same warning, so the overlay
+# defaults on under GE and off elsewhere; the flags and MANGOHUD override.
+if [[ -z $mangohud_forced && -z ${MANGOHUD:-} ]]; then
+    case "$(basename -- "$proton")" in
+        GE-Proton*) ;;
+        *) mangohud="" ;;
+    esac
+fi
 
 # Steam uses these when launching Proton; the proton script wants them even
 # when driven by hand. Export them before probing the prefix: getnativepath
@@ -209,10 +223,10 @@ fi
 
 # MangoHud's Vulkan layer puts fps, frametimes and GPU load on screen —
 # the only view of the world's pace while the mesh layer presents black
-# (docs/proton.md). Proton bundles the layer, so MANGOHUD=1 needs nothing
-# installed; MANGOHUD_CONFIG passes through untouched. The overlay is on
-# screen only: VICTORY_CAPTURE reads the presented buffer without it.
-# --no-mangohud (or MANGOHUD=0) leaves it off.
+# (docs/proton.md). The system layer answers MANGOHUD=1; MANGOHUD_CONFIG
+# passes through untouched. The overlay is on screen only: VICTORY_CAPTURE
+# reads the presented buffer without it. The default is family-conditional
+# (above); --no-mangohud or MANGOHUD=0 leaves it off.
 if [[ -n $mangohud ]]; then
     export MANGOHUD=${MANGOHUD:-1}
 else

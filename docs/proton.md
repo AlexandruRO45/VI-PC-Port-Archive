@@ -48,11 +48,15 @@ dir or plain `wine`), `--z`, `--config`, `--d3dcompiler`, `--texture-wait`,
 `--texture-no-wait`, `--watchdog`, `--no-watchdog`, `--mangohud` and
 `--no-mangohud`.
 
-MangoHud defaults on (`MANGOHUD=1`, Proton bundles the layer): fps,
-frametimes and GPU load on screen, which is the only view of the world's
-pace while the mesh layer presents black. `MANGOHUD_CONFIG` passes
-through untouched; the overlay is on screen only, never in the
-`VICTORY_CAPTURE` frames. `--no-mangohud` or `MANGOHUD=0` leaves it off.
+MangoHud defaults on under GE-Proton (`MANGOHUD=1`; the system layer
+answers it): fps, frametimes and GPU load on screen, the only view of the
+world's pace while the mesh layer presents black. Under the Valve Proton
+family (Proton 11.0, Hotfix, Experimental) it defaults off: their vkd3d
+presents with `VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR`, which MangoHud
+0.8.x cannot present through — the overlay ends such runs early with exit
+code 5 (2026-11-25 runs). `--mangohud` forces it on anyway, `--no-mangohud`
+or `MANGOHUD=0` off; `MANGOHUD_CONFIG` passes through untouched. The
+overlay is on screen only, never in the `VICTORY_CAPTURE` frames.
 
 The first run creates the prefix and its `dosdevices/`; on a plain-Wine
 or pre-10 prefix it links `z:` to `../drive_z`, and a second run reuses
@@ -185,7 +189,9 @@ Known gaps and unverified areas (file an issue if you hit one):
   (Experimental-line vkd3d) creates the same pipelines and runs the world
   — dialogue audio plays and cutscene subtitles render, while the
   mesh-drawn world behind them presents black: the non-mesh UI layer
-  draws, the mesh layer does not. The `victory-gpu` suite
+  draws, the mesh layer does not. A minute or two into the world the
+  process ends itself with exit code 5 (three runs); GE-Proton never gets
+  that far. The `victory-gpu` suite
   has no mesh test, so this path had no Wine coverage; the world-streaming
   numbers quoted below were measured on the Proton Experimental of their
   day (#41). Menus, intro and loading are verified here; treat world

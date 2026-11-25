@@ -190,7 +190,7 @@ mod tests {
     fn proton_launcher_defaults_the_wine_workarounds() {
         let tmp = temp_dir("wine-defaults");
         let prefix = tmp.join("prefix");
-        let proton = fake_proton(&tmp.join("proton"), &prefix, true);
+        let proton = fake_proton(&tmp.join("GE-Proton99-99"), &prefix, true);
         let exe = tmp.join("victory.exe");
         fs::write(&exe, b"not a real exe").expect("stand-in exe");
 
@@ -283,6 +283,56 @@ mod tests {
         assert!(
             stdout.contains("mangohud=0"),
             "MANGOHUD=0 must keep the overlay off: {stdout}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn proton_launcher_mangohud_is_family_conditional() {
+        let tmp = temp_dir("mangohud-family");
+        let prefix = tmp.join("prefix");
+        let exe = tmp.join("victory.exe");
+        fs::write(&exe, b"not a real exe").expect("stand-in exe");
+        let run = |proton: &Path, extra: &[&str]| {
+            let out = Command::new("bash")
+                .args(["proton/run.sh", "--prefix"])
+                .arg(&prefix)
+                .arg("--proton")
+                .arg(proton)
+                .arg("--exe")
+                .arg(&exe)
+                .args(extra)
+                .args(["--", "config"])
+                .current_dir(root())
+                .env_remove("MANGOHUD")
+                .output()
+                .expect("bash");
+            assert!(
+                out.status.success(),
+                "run failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let ge = fake_proton(&tmp.join("GE-Proton99-99"), &prefix, true);
+        let valve = fake_proton(&tmp.join("Proton Hotfix"), &prefix, true);
+
+        // GE-Proton tolerates MangoHud's shared-present warning; the Valve
+        // family's vkd3d present mode ends such runs early (exit 5).
+        let stdout = run(&ge, &[]);
+        assert!(
+            stdout.contains("mangohud=1"),
+            "GE-Proton must default the overlay on: {stdout}"
+        );
+        let stdout = run(&valve, &[]);
+        assert!(
+            stdout.contains("mangohud=\n"),
+            "the Valve family must default the overlay off: {stdout}"
+        );
+        let stdout = run(&valve, &["--mangohud"]);
+        assert!(
+            stdout.contains("mangohud=1"),
+            "--mangohud must force the overlay on: {stdout}"
         );
         let _ = fs::remove_dir_all(&tmp);
     }
