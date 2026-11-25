@@ -16,6 +16,9 @@ pub struct Options {
     /// A folder holding vkd3d-proton's x64 `d3d12.dll` and `d3d12core.dll`,
     /// put in the prefix in place of Wine's own D3D12.
     pub vkd3d_proton: Option<PathBuf>,
+    /// A folder holding DXVK's x64 `dxgi.dll`, put in the prefix in place
+    /// of Wine's own DXGI.
+    pub dxvk: Option<PathBuf>,
     /// Arguments for `cargo test`; the whole workspace but xtask without.
     pub args: Vec<OsString>,
 }
@@ -81,7 +84,7 @@ pub fn run(root: &Path, o: Options) -> Result<()> {
         c
     };
 
-    // Wine makes the prefix on first use; D3D12 goes into it after that.
+    // Wine makes the prefix on first use; native DLLs go into it after that.
     let system32 = prefix.join("drive_c/windows/system32");
     if !system32.is_dir() {
         let status = command(&"wineboot".into())
@@ -90,17 +93,48 @@ pub fn run(root: &Path, o: Options) -> Result<()> {
             .context("running wineboot (is Wine installed?)")?;
         ensure!(status.success(), "wineboot failed");
     }
-    let mut overrides = None;
+    // A crashing test must die, not wait for a debugger dialog forever.
+    let reg_add = |args: &[&str]| -> Result<()> {
+        let status = command(&"wine".into())
+            .arg("reg")
+            .arg("add")
+            .args(args)
+            .status()
+            .context("running wine reg (is Wine installed?)")?;
+        ensure!(status.success(), "wine reg add failed");
+        Ok(())
+    };
+    reg_add(&[
+        r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\AeDebug",
+        "/v",
+        "Auto",
+        "/t",
+        "REG_SZ",
+        "/d",
+        "1",
+        "/f",
+    ])?;
+    // WineDbg would still show its own dialog; off prints a backtrace.
+    reg_add(&[
+        r"HKCU\Software\Wine\WineDbg",
+        "/v",
+        "ShowCrashDialog",
+        "/t",
+        "REG_DWORD",
+        "/d",
+        "0",
+        "/f",
+    ])?;
+
+    let vkd3d = o.vkd3d_proton.is_some();
+    let mut overrides = Vec::new();
     if let Some(dir) = o.vkd3d_proton {
-        for dll in ["d3d12.dll", "d3d12core.dll"] {
-            // A copy keeps the source's permissions (read-only in Proton),
-            // so the one from an earlier run is removed, not overwritten.
-            let (from, to) = (dir.join(dll), system32.join(dll));
-            let _ = std::fs::remove_file(&to);
-            std::fs::copy(&from, &to)
-                .with_context(|| format!("copying {} into the prefix", from.display()))?;
-        }
-        overrides = Some("d3d12,d3d12core=n");
+        copy_dlls(&dir, &system32, &["d3d12.dll", "d3d12core.dll"])?;
+        overrides.extend(["d3d12", "d3d12core"]);
+    }
+    if let Some(dir) = o.dxvk {
+        copy_dlls(&dir, &system32, &["dxgi.dll"])?;
+        overrides.push("dxgi");
     }
 
     // The loader's end-to-end test cannot start cargo from inside Wine:
@@ -123,14 +157,17 @@ pub fn run(root: &Path, o: Options) -> Result<()> {
             "WINEDEBUG",
             std::env::var_os("WINEDEBUG").unwrap_or_else(|| "-all".into()),
         );
-    if let Some(overrides) = overrides {
-        // vkd3d-proton writes its pipeline cache to the working directory
-        // (the crate's, in tests), which the asset policy refuses.
-        test.env("WINEDLLOVERRIDES", overrides).env(
-            "VKD3D_SHADER_CACHE_PATH",
-            wine_path(&target_dir.join("vkd3d-proton-cache")),
-        );
-        std::fs::create_dir_all(target_dir.join("vkd3d-proton-cache"))?;
+    if !overrides.is_empty() {
+        test.env("WINEDLLOVERRIDES", format!("{}=n", overrides.join(",")));
+        if vkd3d {
+            // vkd3d-proton writes its pipeline cache to the working directory
+            // (the crate's, in tests), which the asset policy refuses.
+            test.env(
+                "VKD3D_SHADER_CACHE_PATH",
+                wine_path(&target_dir.join("vkd3d-proton-cache")),
+            );
+            std::fs::create_dir_all(target_dir.join("vkd3d-proton-cache"))?;
+        }
     }
     if o.args.is_empty() {
         // xtask is a host tool (it runs git); it is not tested under Wine.
@@ -140,6 +177,19 @@ pub fn run(root: &Path, o: Options) -> Result<()> {
     }
     let status = test.status().context("running cargo")?;
     ensure!(status.success(), "tests failed under Wine");
+    Ok(())
+}
+
+/// Copies native DLLs into the prefix, replacing copies from earlier runs.
+fn copy_dlls(dir: &Path, system32: &Path, dlls: &[&str]) -> Result<()> {
+    for dll in dlls {
+        // A copy keeps the source's permissions (read-only in Proton),
+        // so the one from an earlier run is removed, not overwritten.
+        let (from, to) = (dir.join(dll), system32.join(dll));
+        let _ = std::fs::remove_file(&to);
+        std::fs::copy(&from, &to)
+            .with_context(|| format!("copying {} into the prefix", from.display()))?;
+    }
     Ok(())
 }
 

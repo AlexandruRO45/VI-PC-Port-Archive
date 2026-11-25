@@ -37,6 +37,9 @@ enum Cmd {
         /// instead of Wine's own D3D12 (which lacks shader model 6.6).
         #[arg(long)]
         vkd3d_proton: Option<PathBuf>,
+        /// Folder with DXVK's x64 dxgi.dll, used instead of Wine's own DXGI.
+        #[arg(long)]
+        dxvk: Option<PathBuf>,
         /// Arguments for `cargo test` (default: the workspace but xtask).
         #[arg(last = true)]
         args: Vec<std::ffi::OsString>,
@@ -63,12 +66,14 @@ fn main() -> Result<()> {
         Cmd::WineTest {
             xwin,
             vkd3d_proton,
+            dxvk,
             args,
         } => wine::run(
             &root,
             wine::Options {
                 xwin,
                 vkd3d_proton,
+                dxvk,
                 args,
             },
         ),
