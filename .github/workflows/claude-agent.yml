@@ -1,0 +1,124 @@
+name: Claude issue agent
+
+# Every 6 hours: take the oldest open issue labelled `claude-ok`, claim it,
+# let Claude Code fix it, run the tests, open a pull request. Never merges.
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  actions: write # to start CI on the new branch (pushes made with GITHUB_TOKEN start no workflows)
+
+concurrency:
+  group: claude-agent
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fix:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Pick and claim an issue
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for l in claude-ok claude-wip claude-failed; do gh label create "$l" --force >/dev/null; done
+          n=$(gh issue list --state open --label claude-ok --search "-label:claude-wip -label:claude-failed sort:created-asc" \
+                --limit 1 --json number --jq '.[0].number // empty')
+          if [ -z "$n" ]; then echo "No issue to take."; exit 0; fi
+          gh issue edit "$n" --add-label claude-wip
+          gh issue comment "$n" --body "🤖 Claimed by the Claude agent ([run](${{ github.server_url }}/$GH_REPO/actions/runs/${{ github.run_id }}))."
+          echo "number=$n" >> "$GITHUB_OUTPUT"
+          gh issue view "$n" --json number,title,body,comments \
+            --jq '"# Issue #\(.number): \(.title)\n\n\(.body)\n\n## Comments\n\(.comments | map("**\(.author.login)**: \(.body)") | join("\n\n"))"' \
+            > "$RUNNER_TEMP/issue.md"
+
+      - if: steps.pick.outputs.number
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false # Claude's step gets no GitHub token
+
+      - if: steps.pick.outputs.number
+        run: rustup toolchain install
+
+      - if: steps.pick.outputs.number
+        uses: Swatinem/rust-cache@v2
+
+      - name: Claude Code fixes the issue
+        if: steps.pick.outputs.number
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ISSUE_FILE: ${{ runner.temp }}/issue.md
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          git config user.name "claude-agent[bot]"
+          git config user.email "claude-agent@users.noreply.github.com"
+          git switch -c "claude/issue-${{ steps.pick.outputs.number }}"
+          echo CLAUDE_REPORT.md >> .git/info/exclude
+          # Claude may only read, edit, run cargo and commit: no push, no gh, no network tools.
+          claude -p "Fix the GitHub issue described in the file $ISSUE_FILE (read it first) in this repository.
+          Read README.md and docs/ for the project's conventions. Make the smallest change that fixes the root cause,
+          add or update a test when the fix is testable without the game's data or a GPU,
+          then run: cargo clippy --workspace --all-targets --locked -- -D warnings  and  cargo test --workspace --locked.
+          Commit with a message in the style of 'git log' that ends with 'Fixes #${{ steps.pick.outputs.number }}'.
+          If the issue cannot be fixed or reproduced on this CI machine (it needs the game, a GPU or AMD hardware),
+          commit nothing and write the reason to CLAUDE_REPORT.md instead.
+          Always finish by writing a short summary of what you did and the test results to CLAUDE_REPORT.md (do not commit that file)." \
+            --max-turns 80 \
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(cargo build:*),Bash(cargo check:*),Bash(cargo test:*),Bash(cargo clippy:*),Bash(cargo fmt:*),Bash(cargo xtask:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git add:*),Bash(git commit:*)" \
+            --disallowedTools "WebFetch,WebSearch,Bash(git push:*),Bash(gh:*),Bash(curl:*)" \
+            || echo "Claude exited with an error." >> CLAUDE_REPORT.md
+
+      - name: Run the tests
+        id: test
+        if: steps.pick.outputs.number
+        run: |
+          # Actions' bash runs with pipefail, so cargo's failure survives the pipe
+          if cargo test --workspace --locked 2>&1 | tail -40 > "$RUNNER_TEMP/test.log"; then r=passed; else r=failed; fi
+          echo "result=$r" >> "$GITHUB_OUTPUT"
+
+      - name: Open the pull request (never merged here)
+        if: steps.pick.outputs.number
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          N: ${{ steps.pick.outputs.number }}
+        run: |
+          report=$(cat CLAUDE_REPORT.md 2>/dev/null || echo "(no report)")
+          if [ "$(git rev-list --count origin/main..HEAD)" = 0 ]; then
+            gh issue edit "$N" --remove-label claude-wip --add-label claude-failed
+            gh issue comment "$N" --body "🤖 No fix proposed.
+
+          $report"
+            exit 0
+          fi
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" "HEAD:refs/heads/claude/issue-$N" --force
+          draft=""; [ "${{ steps.test.outputs.result }}" = passed ] || draft="--draft"
+          gh pr create $draft --base main --head "claude/issue-$N" \
+            --title "$(git log -1 --format=%s)" \
+            --body "Proposed by the Claude agent for #$N. **Review before merging; the agent never merges.**
+
+          Tests on the runner: **${{ steps.test.outputs.result }}**
+
+          $report
+
+          <details><summary>cargo test (last lines)</summary>
+
+          \`\`\`
+          $(cat "$RUNNER_TEMP/test.log")
+          \`\`\`
+          </details>"
+          gh workflow run ci.yml --ref "claude/issue-$N"

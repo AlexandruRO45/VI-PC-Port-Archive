@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch: # started by claude-agent.yml on its branches
   pull_request:
   push:
     branches: [main]
