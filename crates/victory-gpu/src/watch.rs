@@ -333,13 +333,24 @@ impl Tracked {
 /// now guarded or with nothing mapped (taken either way); a page that is
 /// mapped but cannot be guarded is left out (it stays changed).
 fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
+    protect_with(g, pages, lazy_covers, |at, len| {
+        LAZY_RESERVED.get().is_some_and(|lazy| lazy(at, len))
+    })
+}
+
+fn protect_with(
+    g: &mut Guards,
+    pages: &[usize],
+    covers: impl Fn(usize, usize) -> bool,
+    overlaps: impl Fn(usize, usize) -> bool,
+) -> Vec<usize> {
     #[cfg(feature = "diagnostics")]
     let counted = |calls: u64, pages: u64| {
         crate::copystat::add(crate::copystat::C::ProtectCalls, calls);
         crate::copystat::add(crate::copystat::C::ProtectPages, pages);
     };
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect, VirtualQuery,
+        MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect, VirtualQuery,
     };
     #[cfg(feature = "diagnostics")]
     let _timed = Timed(std::time::Instant::now(), crate::copystat::C::ProtectUs);
@@ -348,13 +359,11 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
         // SAFETY: title memory; only its protection changes.
         unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
     };
-    let unmapped = |page: usize| {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
-        (n == 0 || info.State != MEM_COMMIT)
-            && !LAZY_RESERVED.get().is_some_and(|lazy| lazy(page * PAGE, PAGE))
+    let query = |at: usize| {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: only querying address metadata; `info` is writable.
+        let result = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        (result != 0).then_some(info)
     };
     let mut taken = Vec::with_capacity(pages.len());
     let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
@@ -380,16 +389,55 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
             taken.extend(run);
             continue;
         }
-        for &page in run {
+        let mut rest = run;
+        while let Some((&page, tail)) = rest.split_first() {
+            #[cfg(feature = "diagnostics")]
+            counted(1, 1);
             if set(page, page + 1) {
                 g.protected.insert(page);
                 taken.push(page);
-            } else if unmapped(page) {
+                rest = tail;
+                continue;
+            }
+            let at = page * PAGE;
+            let info = query(at);
+            let reserved_end = info
+                .as_ref()
+                .filter(|i| i.State == MEM_RESERVE)
+                .map(|i| (i.BaseAddress as usize).saturating_add(i.RegionSize));
+            if let Some(end) = lazy_probe_end(at, rest.len(), reserved_end, &covers) {
+                let skipped = end / PAGE - page;
+                // These pages stay dirty. A lazy fault can commit memory
+                // without notifying the journal, even after this query.
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::LazyProtectSkipped, (skipped - 1) as u64);
+                rest = &rest[skipped..];
+                continue;
+            }
+            if info.is_none_or(|i| i.State != MEM_COMMIT) && !overlaps(at, PAGE) {
                 taken.push(page);
             }
+            rest = tail;
         }
     }
     taken
+}
+
+/// The end of full lazy-reserved journal pages at the start of a failed
+/// protect run. No cached VQ state, and never includes a partly committed
+/// page. Small/non-lazy runs keep the current per-page fallback.
+fn lazy_probe_end(
+    at: usize,
+    pages: usize,
+    reserve_end: Option<usize>,
+    covers: impl Fn(usize, usize) -> bool,
+) -> Option<usize> {
+    if pages < 2 {
+        return None;
+    }
+    let end = reserve_end?.min(at.checked_add(pages.checked_mul(PAGE)?)?) / PAGE * PAGE;
+    let len = end.checked_sub(at)?;
+    (len >= 2 * PAGE && covers(at, len)).then_some(end)
 }
 
 /// Pages `[first, last)` changed, and so the pages showing the same memory
@@ -637,6 +685,56 @@ pub(crate) mod tests {
     pub(crate) fn free(p: usize) {
         // SAFETY: an allocation of ours.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn lazy_guard_probe_skips_only_whole_registered_pages() {
+        let at = 16 * PAGE;
+        let covers = |a: usize, n: usize| {
+            (at..=at + 256 * PAGE).contains(&a) && a + n <= at + 256 * PAGE
+        };
+        assert_eq!(
+            lazy_probe_end(at, 256, Some(at + 128 * PAGE + 4096), covers),
+            Some(at + 128 * PAGE)
+        );
+        assert_eq!(lazy_probe_end(at, 2, Some(at + PAGE + 4096), covers), None);
+        assert_eq!(lazy_probe_end(at, 256, None, covers), None);
+        assert_eq!(lazy_probe_end(at, 256, Some(at + 256 * PAGE), |_, _| false), None);
+    }
+
+    #[test]
+    fn lazy_guard_keeps_reservation_dirty_and_protects_first_commit() {
+        const PAGES: usize = 1024;
+        let len = PAGES * PAGE;
+        // SAFETY: an owned reservation used only for this test.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        let covers = |at: usize, size: usize| at >= base && at.saturating_add(size) <= base + len;
+        let pages: Vec<_> = (base / PAGE..base / PAGE + PAGES).collect();
+        let mut g = guards();
+        let began = std::time::Instant::now();
+        for _ in 0..16 {
+            assert!(protect_with(&mut g, &pages, |_, _| false, covers).is_empty());
+        }
+        let legacy = began.elapsed();
+        let began = std::time::Instant::now();
+        for _ in 0..16 {
+            assert!(protect_with(&mut g, &pages, covers, covers).is_empty());
+        }
+        let grouped = began.elapsed();
+        // The first actual commit was not cached as inaccessible. Guard it
+        // now, while a neighboring partly committed page stays dirty.
+        let middle = base + PAGES / 2 * PAGE;
+        // SAFETY: two nonoverlapping spans in this test's reservation.
+        unsafe {
+            assert!(!VirtualAlloc(middle as _, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(!VirtualAlloc((middle + PAGE) as _, 4096, MEM_COMMIT, PAGE_READWRITE).is_null());
+        }
+        assert_eq!(protect_with(&mut g, &pages, covers, covers), [middle / PAGE]);
+        assert!(open(&mut g, middle / PAGE));
+        drop(g);
+        free(base);
+        eprintln!("lazy guard fixture: {PAGES} untouched pages per pass; single-page attempts {PAGES} -> 1; 16 passes {legacy:?} -> {grouped:?}");
     }
 
     /// Everything is changed at first; after taking, only what is written

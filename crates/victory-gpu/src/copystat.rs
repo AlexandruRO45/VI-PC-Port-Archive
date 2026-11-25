@@ -87,8 +87,9 @@ pub(crate) enum C {
     CompareUs,
     ReservedBytesKept,
     TexIdentical,
+    LazyProtectSkipped,
 }
-const COUNTERS: usize = C::TexIdentical as usize + 1;
+const COUNTERS: usize = C::LazyProtectSkipped as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -213,6 +214,7 @@ pub(crate) fn log(frames: f64) {
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched/read, \
          {:.1} MB of those identical; {:.1} MB untracked/hashed, {:.1} MB uploaded;  watch time: kernel {:.1} ms, view queries {:.1} ms, protecting {:.1} ms; copied whole (not tracked) {:.1} MB in {:.1} ms; snapshots {:.1} MB in {:.1} ms; page faults {:.0} preparing, {:.0} copying back; {:.0} tracked pages marked through another mapping; \
          guards: {:.2} ms in the handler, {:.0} protect calls for {:.0} pages, {:.0} pages opened; \
+         {:.0} lazy reserved pages bypassed per-page protection; \
          {:.0} tracked pages written ({:.0} of them the frame before too); change checks: {:.1} ms \
          asking for other mappings, {:.1} ms waiting for the guard lock; preparing: {:.1} ms in \
          refresh batches, steps (each with the batch it flushes): refresh {:.1} ms, copy {:.1} ms, \
@@ -258,6 +260,7 @@ pub(crate) fn log(frames: f64) {
         c[C::ProtectCalls as usize],
         c[C::ProtectPages as usize],
         c[C::OpenPages as usize],
+        c[C::LazyProtectSkipped as usize],
         c[C::WrittenPages as usize],
         c[C::WrittenAgain as usize],
         ms(c[C::AliasUs as usize]),
