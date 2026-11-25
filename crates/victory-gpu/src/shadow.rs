@@ -783,10 +783,57 @@ struct Entry {
     shadow: Option<Arc<Shadow>>,
 }
 
-/// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+struct Buffers {
+    map: BTreeMap<(u64, usize), Entry>,
+    /// Maximum registered buffer size in `map`, bounding backward scans on misses.
+    max_size: u64,
+}
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
+impl Buffers {
+    const fn new() -> Self {
+        Self {
+            map: BTreeMap::new(),
+            max_size: 0,
+        }
+    }
+
+    fn insert(&mut self, resource: usize, start: u64, len: u64) {
+        if let Some(prev) = self.map.insert(
+            (start, resource),
+            Entry {
+                end: start + len,
+                shadow: None,
+            },
+        ) && prev.end - start == self.max_size
+            && len < self.max_size
+        {
+            self.recompute_max_size();
+        }
+        self.max_size = self.max_size.max(len);
+    }
+
+    fn remove(&mut self, resource: usize, start: u64) -> Option<Entry> {
+        let removed = self.map.remove(&(start, resource))?;
+        if removed.end - start == self.max_size {
+            self.recompute_max_size();
+        }
+        Some(removed)
+    }
+
+    fn recompute_max_size(&mut self) {
+        self.max_size = self
+            .map
+            .iter()
+            .map(|(&(start, _), e)| e.end - start)
+            .max()
+            .unwrap_or(0);
+    }
+}
+
+/// Title buffers by (start address, resource), with their copy once made.
+static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers::new());
+
+fn buffers() -> std::sync::MutexGuard<'static, Buffers> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -805,38 +852,42 @@ fn changed() {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
-        (start, resource),
-        Entry {
-            end: start + len,
-            shadow: None,
-        },
-    );
+    buffers().insert(resource, start, len);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
+    if buffers().remove(resource, start).is_some_and(|e| e.shadow.is_some()) {
         changed();
     }
+}
+
+fn find_buffer(
+    map: &BTreeMap<(u64, usize), Entry>,
+    max_size: u64,
+    address: u64,
+    end: u64,
+) -> Option<(u64, usize)> {
+    let lowest = end.saturating_sub(max_size);
+    if lowest > address {
+        return None;
+    }
+    map.range((lowest, 0)..=(address, usize::MAX))
+        .rev()
+        .find(|(_, e)| e.end >= end)
+        .map(|(k, _)| *k)
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
-        drop(map);
+    let mut state = buffers();
+    let Some(key) = find_buffer(&state.map, state.max_size, address, end) else {
+        drop(state);
         return loose(address, end);
     };
-    let entry = map.get_mut(&key)?;
+    let entry = state.map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -981,7 +1032,7 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
-    let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
+    let mut all: Vec<Arc<Shadow>> = buffers().map.values().filter_map(|e| e.shadow.clone()).collect();
     all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all
 }
@@ -990,6 +1041,7 @@ pub(crate) fn all() -> Vec<Arc<Shadow>> {
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
     let mut all: Vec<(u64, u64, u64)> = buffers()
+        .map
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
@@ -1157,5 +1209,75 @@ mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    #[test]
+    fn find_reaches_covering_buffer_past_many_inner_buffers() {
+        let p = crate::watch::tests::pool(4);
+        let base = p as u64;
+        let outer_len = (4 * PAGE) as u64;
+
+        register(p, base, outer_len);
+        for i in 0..128 {
+            register(p + 1 + i, base + (i as u64) * 256, 128);
+        }
+
+        let target = base + (3 * PAGE) as u64;
+        {
+            let state = buffers();
+            assert_eq!(
+                find_buffer(&state.map, state.max_size, target, target + 64),
+                Some((base, p))
+            );
+        }
+        if let Some(outer) = find(target, 64) {
+            assert_eq!(outer.range(), (base, outer_len));
+        }
+
+        for i in 0..128 {
+            unregister(p + 1 + i, base + (i as u64) * 256);
+        }
+        unregister(p, base);
+    }
+
+    #[test]
+    fn find_stops_at_max_size_bound_and_tightens_on_unregister() {
+        let mut state = Buffers::new();
+        let base = 0x7e00_0000_0000_u64;
+        let huge = 64 << 20;
+        let small = 256;
+
+        state.insert(1, base, huge);
+        state.insert(2, base + 0x1000, small);
+        assert_eq!(state.max_size, huge);
+        assert_eq!(
+            find_buffer(&state.map, state.max_size, base + 0x2000, base + 0x2040),
+            Some((base, 1))
+        );
+
+        // Removing the largest buffer tightens `max_size` to the remaining buffers.
+        assert!(state.remove(1, base).is_some());
+        assert_eq!(state.max_size, small);
+        assert_eq!(
+            find_buffer(&state.map, state.max_size, base + 0x2000, base + 0x2040),
+            None
+        );
+
+        // Entries starting further back than `max_size` are not visited on a miss.
+        let mut stale = BTreeMap::new();
+        stale.insert(
+            (base, 3),
+            Entry {
+                end: base + 1024,
+                shadow: None,
+            },
+        );
+        assert_eq!(find_buffer(&stale, small, base + 512, base + 576), None);
+
+        // Also exercise global `register` / `unregister` tightening `max_size`.
+        register(0x7e00_0001, base, huge);
+        assert!(buffers().max_size >= huge);
+        unregister(0x7e00_0001, base);
+        assert!(buffers().max_size < huge);
     }
 }
