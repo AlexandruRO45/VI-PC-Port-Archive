@@ -916,6 +916,8 @@ struct Deferred {
     copies: Vec<Step>,
     /// Post-submission readbacks from GPU textures into title buffers.
     readbacks: Vec<Readback>,
+    #[cfg(feature = "diagnostics")]
+    after: Vec<Box<dyn Fn() + Send>>,
     uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -1267,6 +1269,10 @@ impl Host {
             && cpu_back.is_empty()
             && runs.iter().all(|list| {
                 let d = list.deferred();
+                #[cfg(feature = "diagnostics")]
+                if !d.after.is_empty() {
+                    return false;
+                }
                 d.readbacks.is_empty() && d.writes[d.early..].is_empty()
             });
         if let Some(first) = first {
@@ -1481,6 +1487,12 @@ impl Host {
         let mut clock = None;
         for list in runs {
             let mut deferred = list.deferred();
+            #[cfg(feature = "diagnostics")]
+            if !no_work() {
+                for work in &deferred.after {
+                    work();
+                }
+            }
             for &(at, what, bytes) in &deferred.writes[deferred.early..] {
                 let what = match what {
                     crate::queue::Written::HostTimestamp(raw) => match clock.get_or_insert_with(|| self.clock()) {
@@ -1915,6 +1927,10 @@ impl HostList {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
         let wanted = legal_state(texture, wanted);
+        self.track(copy, wanted).map(|before| (texture, before))
+    }
+
+    fn track(&self, copy: std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -1923,9 +1939,25 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some(before)
             }
         }
+    }
+
+    /// Records the desired state of a host texture independently of the title object.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn move_texture(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<D3D12_RESOURCE_BARRIER> {
+        let wanted = legal_state(&copy.texture, wanted);
+        let before = self.track(copy.clone(), wanted)?;
+        Some(transition(
+            &copy.texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(wanted as i32),
+        ))
     }
 
     /// Records that this list starts and ends with `copy` in `wanted` state
@@ -2114,6 +2146,12 @@ impl HostList {
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Runs work after each GPU submission of this list finishes.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().after.push(Box::new(work));
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
@@ -3350,6 +3388,36 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    #[cfg(feature = "diagnostics")]
+    framegen: Option<crate::framegen::Presentation>,
+}
+
+#[cfg(feature = "diagnostics")]
+impl Presenter {
+    fn disable_frame_generation(&mut self) {
+        if let Some(fg) = &mut self.framegen {
+            fg.disable(&self.swap_chain);
+        }
+    }
+
+    fn prepare_frame_generation(&mut self, device: &ID3D12Device, frame: u64) -> bool {
+        self.framegen.as_mut().is_some_and(|fg| {
+            fg.prepare(&self.swap_chain, device, &self.copy, [self.width, self.height], frame)
+        })
+    }
+
+    fn present_frame(&mut self, generated: bool, frame: u64) {
+        // SAFETY: the copy or composite was queued into the current backbuffer.
+        let result = unsafe { self.swap_chain.Present(u32::from(generated), DXGI_PRESENT(0)) };
+        if generated && let Some(fg) = &mut self.framegen {
+            if result.is_ok() {
+                fg.presented(&self.swap_chain, frame);
+            } else {
+                tracing::warn!(?result, frame, "FidelityFX frame generation: present failed; off");
+                fg.disable(&self.swap_chain);
+            }
+        }
+    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -3510,6 +3578,8 @@ impl Host {
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
+            #[cfg(feature = "diagnostics")]
+            p.disable_frame_generation();
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
@@ -3557,12 +3627,17 @@ impl Host {
                     D3D12_RESOURCE_STATE_PRESENT,
                 ),
             ]);
+            #[cfg(feature = "diagnostics")]
+            let generated = p.prepare_frame_generation(&self.device, frame);
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            #[cfg(feature = "diagnostics")]
+            p.present_frame(generated, frame);
+            #[cfg(not(feature = "diagnostics"))]
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
@@ -3595,6 +3670,8 @@ impl Host {
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
+            #[cfg(feature = "diagnostics")]
+            p.disable_frame_generation();
             // SAFETY: no back buffer is held; every submission was waited for.
             unsafe {
                 p.swap_chain
@@ -3639,12 +3716,17 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             list.ResourceBarrier(&out);
+            #[cfg(feature = "diagnostics")]
+            let generated = p.prepare_frame_generation(&self.device, frame);
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            #[cfg(feature = "diagnostics")]
+            p.present_frame(generated, frame);
+            #[cfg(not(feature = "diagnostics"))]
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
         }
@@ -3677,6 +3759,19 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
+            #[cfg(feature = "diagnostics")]
+            let (swap_chain, framegen) = match crate::framegen::enabled()
+                .then(|| crate::framegen::Presentation::create(&factory, &self.queue, hwnd, &desc))
+                .flatten()
+            {
+                Some((swap_chain, fg)) => (swap_chain, Some(fg)),
+                None => (
+                    factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                        .cast::<IDXGISwapChain3>()?,
+                    None,
+                ),
+            };
+            #[cfg(not(feature = "diagnostics"))]
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
@@ -3691,6 +3786,8 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                #[cfg(feature = "diagnostics")]
+                framegen,
             })
         }
     }
