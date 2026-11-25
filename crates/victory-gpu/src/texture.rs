@@ -565,7 +565,12 @@ impl Staging {
             if t.clean() {
                 return (0, None);
             }
-            let ranges = t.take(start, start + size);
+            let mut ranges = t.take(start, start + size);
+            // Parts of the memory that touch other than the runtime's are
+            // copied whole at each use (`watch.rs`): the take leaves them
+            // out, and a subresource lying only in them would never be
+            // uploaded.
+            ranges.extend(t.untracked(start, start + size));
             if ranges.is_empty() {
                 return (0, None);
             }
@@ -877,5 +882,138 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    /// A subresource whose bytes lie only in memory the tracker leaves
+    /// untracked (it touches allocation other than the runtime's) is read
+    /// and uploaded at each refresh; the changed pages alone never touch it.
+    #[test]
+    fn a_subresource_lying_only_in_untracked_memory_is_uploaded() {
+        use crate::watch::tests::{MEM_WRITE_WATCH, free};
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let page = crate::watch::PAGE;
+        // A write-watched pool page and a plain one right after it, in two
+        // pages found free (other tests allocate meanwhile: tried again if
+        // taken).
+        let (pool, plain) = (0..8)
+            .find_map(|_| {
+                // SAFETY: a fresh reservation, released at once; then
+                // allocations where it was, freed below.
+                unsafe {
+                    let p = VirtualAlloc(std::ptr::null(), 2 * page, MEM_RESERVE, PAGE_READWRITE)
+                        as usize;
+                    VirtualFree(p as *mut _, 0, MEM_RELEASE);
+                    let at = |q: usize, kind: u32| {
+                        VirtualAlloc(
+                            q as *const _,
+                            page,
+                            MEM_RESERVE | MEM_COMMIT | kind,
+                            PAGE_READWRITE,
+                        ) as usize
+                    };
+                    let (pool, plain) = (at(p, MEM_WRITE_WATCH), at(p + page, 0));
+                    if p != 0 && pool == p && plain == p + page {
+                        return Some((pool, plain));
+                    }
+                    [pool, plain].into_iter().filter(|&q| q != 0).for_each(free);
+                    None
+                }
+            })
+            .expect("two free pages");
+        let cleanup = || {
+            free(pool);
+            free(plain);
+        };
+        let desc = Desc {
+            dimension: Dimension::Tex2d,
+            width: 128,
+            height: 128,
+            depth: 1,
+            mips: 2,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        };
+        let layout = Layout::new(&desc).expect("a linear layout");
+        // 128x128 RGBA8 with two mips: 64 KiB and 16 KiB, placed 48 KiB into
+        // the pair: mip 1 (16 KiB, last in the layout) lies wholly in the
+        // plain page, mip 0 straddles both.
+        if layout.size as usize + 48 * 1024 > 2 * page {
+            cleanup();
+            return;
+        }
+        let memory = pool + 48 * 1024;
+        let Some(tracked) = crate::watch::track(memory, layout.size as usize, true) else {
+            cleanup();
+            return;
+        };
+        if crate::host::host().is_none() {
+            cleanup();
+            return;
+        }
+        let count = 2u32;
+        // The copyable footprints D3D12 gives these mips: 512- and 256-byte
+        // rows, the smaller mip after the larger.
+        let footprint = |offset, width, height, pitch| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: offset,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                Width: width,
+                Height: height,
+                Depth: 1,
+                RowPitch: pitch,
+            },
+        };
+        let footprints = vec![
+            footprint(0, 128, 128, 512),
+            footprint(64 * 1024, 64, 64, 256),
+        ];
+        let rows = vec![128u32, 64];
+        let total = layout.size;
+        let spans = spans(&layout, count, 2);
+        let target = (0..count as usize)
+            .find(|&i| {
+                let (a, b) = spans[i];
+                (memory + a) >= plain && (memory + b) <= plain + page
+            })
+            .expect("a subresource wholly in the plain page");
+        let target_span = spans[target];
+        let write = |byte: u8| {
+            for k in target_span.0..target_span.1 {
+                // SAFETY: bytes of our plain allocation.
+                unsafe { ((memory + k) as *mut u8).write_volatile(byte) };
+            }
+        };
+        write(0x5a);
+        let s = Staging {
+            size: total,
+            footprints,
+            rows,
+            layout,
+            mips: 2,
+            memory: memory as *const u8,
+            tracked: Some(tracked),
+            spans,
+            last: Mutex::default(),
+            uploads: Default::default(),
+            copied: Default::default(),
+        };
+        let upload = s.refresh().expect("a subresource is uploaded");
+        assert!(
+            upload.2.contains(&(target as u32)),
+            "the subresource wholly in untracked memory is uploaded"
+        );
+        // A write to the same bytes reaches the next refresh too (the
+        // untracked part is read whole at each use, not only at the first).
+        write(0xa5);
+        let upload = s.refresh().expect("the changed subresource is uploaded");
+        assert!(upload.2.contains(&(target as u32)));
+        drop(s);
+        cleanup();
     }
 }
