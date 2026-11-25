@@ -1587,12 +1587,15 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    const IDLE_MS: u64 = 10_000;
     const IDLE_FRAMES: u64 = 4;
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return;
+        }
+        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
         // A window may be stored under multiple keys in `LOOSE`, so its
         // map-only refcount equals the number of keys pointing to it.
         let mut counts: std::collections::HashMap<usize, usize> =
@@ -1605,7 +1608,7 @@ pub(crate) fn let_go_idle() {
             .filter(|(_, s)| {
                 let ptr = Arc::as_ptr(s) as usize;
                 Arc::strong_count(s) == counts[&ptr]
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
                     && !s.writes_pending()
             })
@@ -1638,13 +1641,14 @@ pub(crate) fn let_go_idle() {
     // Also evict idle host copies of registered title buffers (including
     // carded VRAM copies): title memory stays authoritative once no flight
     // is writing to the buffer, so the next use recreates the copy cleanly.
+    let buffers_idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     let gone_buffers: Vec<Arc<Shadow>> = {
         let mut map = buffers();
         let mut out = Vec::new();
         for entry in map.values_mut() {
             let idle = entry.shadow.as_ref().is_some_and(|s| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), buffers_idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
                     && !s.writes_pending()
             });
