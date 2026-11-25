@@ -15,7 +15,7 @@ use super::shader::{Shader, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -2406,6 +2406,10 @@ impl<'a> Lower<'a> {
                     .phi_at
                     .get(&id)
                     .ok_or("a lane-mask join without a phi")?;
+                if self.loop_mask_entry(b, &self.x.p.blocks[b].phis[i]).is_some() {
+                    let word = self.i32_of(id)?;
+                    return Ok(self.lane_bit(at, word, None));
+                }
                 let blk = self.block[b].ok_or("an unreachable join")?;
                 let v = self.s.m.phi(blk, self.s.t.i1);
                 self.mask_phis.insert(id, v);
@@ -9842,16 +9846,76 @@ impl<'a> Lower<'a> {
         live
     }
 
-    fn fill_phis(&mut self) -> Result<(), Stop> {
+    /// A Wave32 scalar loop value has a mask on its sole entry edge and
+    /// ordinary data on the back edges. The entry needs the mask's dword.
+    fn loop_mask_entry(&self, b: usize, phi: &Phi) -> Option<usize> {
+        let st = self.x.st;
+        if !self.console_lanes
+            || self.x.p.wave64
+            || !matches!(phi.reg, Reg::S(c) if c != EXEC && c != EXEC + 1)
+            || !st.masks.contains_key(&phi.value)
+        {
+            return None;
+        }
+        let mut entry = None;
+        let mut has_back_edge = false;
+        for (n, (&q, arg)) in self.x.p.blocks[b].preds.iter().zip(&phi.args).enumerate() {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let mask = st.masks.contains_key(arg);
+            if self.rpo[q] < self.rpo[b] {
+                if !mask || entry.replace(n).is_some() {
+                    return None;
+                }
+            } else {
+                if mask {
+                    return None;
+                }
+                has_back_edge = true;
+            }
+        }
+        entry.filter(|_| has_back_edge)
+    }
+
+    /// A mask can supply the dword at a numeric SGPR join alongside an
+    /// already lowered integer. A tracked mask join needs the loop shape
+    /// above, which identifies the entry as its only mask input.
+    fn data_phi_mask_input(&self, b: usize, phi: &Phi, n: usize) -> bool {
+        let st = self.x.st;
+        if !self.console_lanes
+            || self.x.p.wave64
+            || !matches!(phi.reg, Reg::S(_))
+            || !st.masks.contains_key(&phi.args[n])
+        {
+            return false;
+        }
+        if st.masks.contains_key(&phi.value) {
+            return self.loop_mask_entry(b, phi) == Some(n);
+        }
+        let mut has_data = false;
+        for (&q, arg) in self.x.p.blocks[b].preds.iter().zip(&phi.args) {
+            if self.tail[q].is_none() {
+                continue;
+            }
+            if self.rpo[q] >= self.rpo[b] {
+                return false;
+            }
+            has_data |= matches!(self.vals.get(arg), Some(Val::I32(_)));
+        }
+        has_data
+    }
+
+    fn fill_data_phis(&mut self, phis: &[(V, usize, usize)]) -> Result<(), Stop> {
         let p = self.x.p;
         let live = self.live_edges();
-        for (v, b, i) in std::mem::take(&mut self.data_phis) {
+        for &(v, b, i) in phis {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let Some(tail) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(tail);
                 let arg = phi.args[n];
                 let read = live.contains(&(phi.value, n));
                 let x = match (self.vals.get(&arg).copied(), bit) {
@@ -9866,6 +9930,15 @@ impl<'a> Lower<'a> {
                         } else {
                             self.s.m.i32(0)
                         }
+                    }
+                    (Some(Val::Missing(LANE_MASK)), false)
+                        if read && self.data_phi_mask_input(b, phi, n) =>
+                    {
+                        let current = (self.cur_ir, self.cur);
+                        (self.cur_ir, self.cur) = (q, tail);
+                        let word = self.mask_dword(arg);
+                        (self.cur_ir, self.cur) = current;
+                        word.map_err(|_| Stop::Retry(phi.value, LANE_MASK))?
                     }
                     (Some(Val::Bit(_)), false) if read => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
@@ -9883,9 +9956,28 @@ impl<'a> Lower<'a> {
             }
             self.s.m.set_phi(v, incoming);
         }
+        Ok(())
+    }
+
+    fn fill_phis(&mut self) -> Result<(), Stop> {
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
+        let data_phis = std::mem::take(&mut self.data_phis);
+        loop {
+            let reads = self.read_phis.len();
+            self.fill_data_phis(&data_phis)?;
+            self.fill_mask_phis()?;
+            // Mask expressions can read another data phi during finalisation.
+            // Fill again if that read made more incoming values live.
+            if reads == self.read_phis.len() {
+                return Ok(());
+            }
+        }
+    }
+
+    fn fill_mask_phis(&mut self) -> Result<(), Stop> {
+        let p = self.x.p;
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;

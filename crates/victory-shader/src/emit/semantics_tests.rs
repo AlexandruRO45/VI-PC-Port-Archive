@@ -383,6 +383,94 @@ fn run(
         .collect())
 }
 
+/// A single loop entry supplies a Wave32 mask, and the latch replaces it
+/// with integer data. Each iteration reads the dword and the lane's bit.
+/// A wave-uniform branch then joins a masked dword with an integer.
+#[test]
+fn wave32_mask_data_at_loop_entry() {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let mut body = Vec::from(vop3(0x0C5, 22, [int(0), v(1), 0], NONE)); // s22 = v1 != 0
+    body.extend([
+        sop1(0x03, 20, s(22)),  // s_mov_b32 s20, s22
+        sop1(0x03, 24, int(0)), // s_mov_b32 s24, 0
+        // The loop starts here. Save the previous and current values.
+        sop1(0x03, 22, s(20)), // s_mov_b32 s22, s20
+        vop1(0x01, 5, v(6)),   // v_mov_b32 v5, v6
+        vop1(0x01, 6, s(22)),  // v_mov_b32 v6, s22
+        vop1(0x01, 7, v(8)),   // v_mov_b32 v7, v8
+    ]);
+    body.extend(vop3(0x101, 8, [int(0), int(1), s(20)], NONE)); // v_cndmask_b32 v8, 0, 1, s20
+    body.extend([
+        0xB014_5319,                   // s_movk_i32 s20, 0x5319
+        sop2(0x00, 24, s(24), int(1)), // s_add_u32 s24, s24, 1
+        sopc(0x0A, s(24), int(2)),     // s_cmp_lt_u32 s24, 2
+        0xBF85_FFF6,                   // s_cbranch_scc1 -10
+        // After the loop, one wave takes each arm of a numeric join.
+        vop1(0x02, 26, v(2)),           // v_readfirstlane_b32 s26, v2
+        sopc(0x06, s(26), int(0)),      // s_cmp_eq_u32 s26, 0
+        0xBF85_0002,                    // s_cbranch_scc1 2
+        sop2(0x0E, 28, s(22), int(63)), // s_and_b32 s28, s22, 63
+        0xBF82_0001,                    // s_branch 1
+        sop1(0x03, 28, int(42)),        // s_mov_b32 s28, 42
+        vop1(0x01, 9, s(28)),           // v_mov_b32 v9, s28
+    ]);
+    body.extend(vop3(0x346, 8, [v(9), int(1), v(8)], NONE)); // pack the dword and bit
+    let shader = lower_program(&program(&body, false)).expect("lower the loop");
+    if let Ok(mut val) = validator::Validator::load(validator::Validator::default_path().as_deref())
+    {
+        val.validate(&mut shader.dxil.clone())
+            .expect("validate the loop's DXIL");
+        eprintln!("Wave32 loop DXIL validated");
+    }
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device for the Wave32 loop test");
+        return;
+    };
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the feature query writes the matching options structure.
+    let support = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut waves).cast(),
+            size_of_val(&waves) as u32,
+        )
+    };
+    if support.is_err()
+        || !waves.WaveOps.as_bool()
+        || !(waves.WaveLaneCountMin..=waves.WaveLaneCountMax).contains(&32)
+    {
+        eprintln!("Wave32 unavailable for the loop test");
+        return;
+    }
+
+    let masks: [u32; 2] = [0x9123_4321, 0x8321_1234];
+    let inputs: [[u32; 4]; 64] =
+        std::array::from_fn(|t| [(masks[t / 32] >> (t % 32)) & 1, (t / 32) as u32, 0, 0]);
+    let out = run(&host, &shader, &inputs, false).expect("dispatch the loop");
+    for (t, actual) in out.into_iter().enumerate() {
+        let lane = t % 32;
+        let first = masks[t / 32];
+        let second = 0x5319;
+        let joined = if t < 32 { 42 } else { second & 63 };
+        assert_eq!(
+            actual,
+            [
+                first,
+                second,
+                (first >> lane) & 1,
+                (joined << 1) | ((second >> lane) & 1)
+            ],
+            "thread {t}"
+        );
+    }
+    eprintln!("Wave32 loop readback matched on 64 threads");
+}
+
 // ---- comparing ----
 
 /// How a result dword is compared with the model's.
