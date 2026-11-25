@@ -591,9 +591,12 @@ fn apply_patches(base: usize) {
         .collect();
     // Patches 4, 5 and 7-9 switch off the title's lighting passes (indirect
     // diffuse, scattering, ray-marched gather): with them interiors came out
-    // black (run vu14 against vu15). Only with VICTORY_PATCH_HEAVY=1.
+    // black (run vu14 against vu15). Patch 6 forces a world render
+    // resolution mode: with it some passes ran at 1280x720 inside 2560x1440
+    // targets and the GPU took twice as long (run vu19 against vu17). Only
+    // with VICTORY_PATCH_HEAVY=1.
     if std::env::var("VICTORY_PATCH_HEAVY").map_or(true, |v| v.trim() != "1") {
-        skip.extend([4, 5, 7, 8, 9]);
+        skip.extend([4, 5, 6, 7, 8, 9]);
     }
     let mut list: Vec<(String, usize, Vec<u8>, Vec<u8>)> = Vec::new();
     if std::env::var("VICTORY_PATCH_DEFAULTS").map_or(true, |v| v.trim() != "0") {
