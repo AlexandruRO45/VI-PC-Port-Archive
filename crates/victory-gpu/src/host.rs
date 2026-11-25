@@ -6236,6 +6236,7 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    logged_frames: u64,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
@@ -6250,6 +6251,7 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            logged_frames: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
@@ -6265,6 +6267,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        self.logged_frames += 1;
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -6298,6 +6301,7 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
+        crate::draw::batch_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {
@@ -6436,8 +6440,9 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
-            crate::memcopy::log(frames);
-            barrier_line(frames);
+            let logged_frames = std::mem::take(&mut self.logged_frames).max(1) as f64;
+            crate::memcopy::log(logged_frames);
+            barrier_line(logged_frames);
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
