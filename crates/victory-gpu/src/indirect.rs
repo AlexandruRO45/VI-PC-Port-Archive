@@ -516,10 +516,13 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        // Last: given back once everything above is released.
+        _turn: std::sync::MutexGuard<'static, ()>,
     }
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            let turn = crate::host::warp_turn();
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -558,6 +561,7 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    _turn: turn,
                 })
             }
         }
@@ -1582,6 +1586,46 @@ void main() {
         let expected: u32 = windows.iter().flat_map(|g| g.iter()).sum();
         assert_eq!(hits, expected, "every record of both windows runs once");
         assert_eq!(spent, expected * 64, "and is charged what it asked for");
+    }
+
+    /// Every harness is on the same device (D3D12 makes one per adapter),
+    /// where two queues running pipelines for the first time at once can
+    /// end the process ([`crate::host::warp_turn`]). A second harness is
+    /// made only once the first is gone.
+    #[test]
+    fn warp_harnesses_take_turns() {
+        let Some(first) = WarpHarness::new() else {
+            return;
+        };
+        let (made, seen) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let second = WarpHarness::new();
+            let _ = made.send(());
+            drop(second);
+        });
+        let early = seen.recv_timeout(std::time::Duration::from_secs(1));
+        drop(first);
+        second.join().unwrap();
+        assert!(early.is_err(), "a second harness was made while the first was alive");
+    }
+
+    /// The crash the turns prevent, on demand:
+    /// `warp_window_executions_read_their_records_with_no_barrier_between`
+    /// on eight threads, twenty times on each. Without the turns this ended
+    /// the process in WARP's shader compiler (an access violation on one of
+    /// its threads) in 10 runs of 10.
+    #[test]
+    #[ignore = "a reproduction; about 15 s"]
+    fn warp_window_executions_on_eight_threads() {
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..20 {
+                        warp_window_executions_read_their_records_with_no_barrier_between();
+                    }
+                });
+            }
+        });
     }
 
     /// The windows of `warp_window_executions_read_their_records_with_no_barrier_between`

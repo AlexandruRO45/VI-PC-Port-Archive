@@ -645,6 +645,25 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+/// Tests: the turn to use the software adapter. D3D12 makes one device per
+/// adapter, so every test's WARP device is the same one, and WARP compiles
+/// a pipeline's shader on its own threads when a queue first runs it: two
+/// queues doing that at once can end the process (an access violation in
+/// d3d10warp.dll, on one of its threads, its compiler reading entry -1 of a
+/// table). Two threads that each ran new pipelines in a submission of their
+/// own at the same moment crashed in 10 runs of 10; the same with only one
+/// of them running (the other making pipelines), or with both running
+/// pipelines that had run before, in none. `indirect::`, its WARP tests in
+/// parallel, ended so in 6 runs of 510. A test that uses WARP holds the
+/// turn until everything it made there is released.
+#[cfg(test)]
+pub(crate) fn warp_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: Mutex<()> = Mutex::new(());
+    // Poisoned only by a test that failed holding it, which released what
+    // it made before giving it back.
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -876,6 +895,19 @@ mod tests {
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
+    }
+
+    /// A WARP test that fails while it holds the turn does not fail the
+    /// ones after it.
+    #[test]
+    fn warp_turn_is_taken_again_after_a_test_failed_holding_it() {
+        let failed = std::thread::spawn(|| {
+            let _turn = warp_turn();
+            panic!("a WARP test failing while it holds the turn");
+        })
+        .join();
+        assert!(failed.is_err());
+        drop(warp_turn());
     }
 }
 
