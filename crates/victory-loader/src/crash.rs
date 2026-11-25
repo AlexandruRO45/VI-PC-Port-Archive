@@ -24,6 +24,7 @@ use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleFileNameW, GetModuleHandleExW,
 };
+use windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION;
 use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
@@ -446,13 +447,14 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     let code = record.ExceptionCode;
     let at = record.ExceptionAddress as usize;
     let p = record.ExceptionInformation;
-    let detail = if code == EXCEPTION_ACCESS_VIOLATION {
+    let memory = (code == EXCEPTION_ACCESS_VIOLATION).then(|| query_memory(p[1]));
+    let detail = if let Some(memory) = &memory {
         let kind = match p[0] {
             0 => "read",
             1 => "write",
             _ => "execute",
         };
-        format!(" ({kind} {:#x}: {})", p[1], memory_at(p[1]))
+        format!(" ({kind} {:#x}: {})", p[1], memory_at(p[1], memory.as_ref()))
     } else if code == CPP_EXCEPTION && record.NumberParameters >= 4 && p[0] == CPP_MAGIC {
         // SAFETY: a live MSVC throw.
         format!(" (C++ {} thrown)", unsafe { thrown(&p) })
@@ -475,6 +477,12 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         code as u32,
         locate(at)
     ));
+    if let Some(memory) = &memory {
+        // SAFETY: the report runs on the faulting thread.
+        let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        let region = memory.as_ref().map_or_else(|| "VirtualQuery unavailable".into(), region_details);
+        line(format!("  tid={tid} fault_address={:#x} {region}", p[1]));
+    }
     line(format!(
         "  rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rsp {:#x} rbp {:#x}",
         context.Rax,
@@ -607,26 +615,33 @@ fn module_of(address: usize) -> Option<String> {
     Some(format!("{name}+{:#x}", address - module as usize))
 }
 
+fn query_memory(address: usize) -> Option<MEMORY_BASIC_INFORMATION> {
+    use windows_sys::Win32::System::Memory::VirtualQuery;
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: query the address-space metadata without dereferencing the address.
+    let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+    (n != 0).then_some(info)
+}
+
+fn region_details(info: &MEMORY_BASIC_INFORMATION) -> String {
+    format!(
+        "BaseAddress={:#x} AllocationBase={:#x} AllocationProtect={:#x} Type={:#x} RegionSize={:#x} State={:#x} Protect={:#x}",
+        info.BaseAddress as usize, info.AllocationBase as usize, info.AllocationProtect,
+        info.Type, info.RegionSize, info.State, info.Protect
+    )
+}
+
 /// What is at `address`, for an access violation there: nothing, memory
 /// reserved but never committed, a guard page, or the protection the access
 /// broke (with the module, for an image's pages). Each points at a different
 /// cause: a wild pointer, an allocation whose commit failed, a stack
 /// overrun, a write to code or constants.
-fn memory_at(address: usize) -> String {
+fn memory_at(address: usize, info: Option<&MEMORY_BASIC_INFORMATION>) -> String {
     use windows_sys::Win32::System::Memory::{
-        MEM_FREE, MEM_IMAGE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE,
-        PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
-        PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+        MEM_FREE, MEM_IMAGE, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
     };
-    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: reads the address space's bookkeeping, not `address` itself.
-    let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
-    if n == 0 {
-        // Above the process's address space: Windows reports a
-        // non-canonical address as all ones.
-        return "outside the address space".into();
-    }
+    let Some(info) = info else { return "outside the address space".into() };
     let protect = match info.State {
         MEM_FREE => return "nothing mapped there".into(),
         MEM_RESERVE => return "reserved, never committed".into(),
@@ -698,17 +713,24 @@ mod tests {
             page(3, PAGE_NOACCESS);
             base as usize
         };
-        assert_eq!(memory_at(base + 8), "reserved, never committed");
-        assert_eq!(memory_at(base + 0x1008), "read-only");
-        assert_eq!(memory_at(base + 0x2008), "a guard page");
-        assert_eq!(memory_at(base + 0x3008), "no access");
+        let describe = |at| memory_at(at, query_memory(at).as_ref());
+        assert_eq!(describe(base + 8), "reserved, never committed");
+        assert_eq!(describe(base + 0x1008), "read-only");
+        assert_eq!(describe(base + 0x2008), "a guard page");
+        assert_eq!(describe(base + 0x3008), "no access");
+        let info = query_memory(base + 8).unwrap();
+        let details = region_details(&info);
+        assert!(details.contains(&format!("AllocationBase={base:#x}")));
+        assert!(details.contains("AllocationProtect=0x1"));
+        assert!(details.contains("RegionSize=0x1000"));
+        assert!(details.contains("Type=0x20000"));
         // SAFETY: releases the reservation made above.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-        assert_eq!(memory_at(base + 8), "nothing mapped there");
-        assert_eq!(memory_at(0), "nothing mapped there");
-        assert_eq!(memory_at(usize::MAX), "outside the address space");
+        assert_eq!(describe(base + 8), "nothing mapped there");
+        assert_eq!(describe(0), "nothing mapped there");
+        assert_eq!(describe(usize::MAX), "outside the address space");
         // This test's own code: an image page, named by its module.
-        let code = memory_at(memory_at_names_what_an_access_hit as *const () as usize);
+        let code = describe(memory_at_names_what_an_access_hit as *const () as usize);
         let named = code.starts_with("read-execute, in victory_loader-");
         assert!(named, "{code}");
     }
