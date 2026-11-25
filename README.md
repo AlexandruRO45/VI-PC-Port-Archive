@@ -46,8 +46,6 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 
 ### Newest (2026-11-25, later the same day)
 
-<<<<<<< HEAD
-=======
 **Update, the same night: the first room now renders right on the test
 machine** (walls, textures, people, lamps), at 190 to 450 ms a frame (2 to 5
 frames a second): the picture work has caught up, the frame rate has not.
@@ -89,7 +87,6 @@ What did it, on top of the list below:
   about 77,500 thread groups in x where one dispatch runs 65,535 (the
   rest is cut off).
 
->>>>>>> upstream/main
 Memory sync between the title's memory and the copies on the card:
 - **A write through one view of a physical page is seen by the copies taken
   through its other views** (`VICTORY_VIEW_GUARD=0` turns it off). The title

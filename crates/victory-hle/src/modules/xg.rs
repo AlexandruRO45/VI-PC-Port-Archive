@@ -582,21 +582,6 @@ struct Vtable([*const (); 13]);
 unsafe impl Sync for Vtable {}
 
 static VTABLE: Vtable = Vtable([
-<<<<<<< HEAD
-    add_ref as *const (),        // 0x00
-    release as *const (),        // 0x08
-    layout as *const (),         // 0x10
-    unused as *const (),         // 0x18 size
-    unused as *const (),         // 0x20 alignment
-    unused as *const (),         // 0x28 mip offset
-    element_offset as *const (), // 0x30
-    unused as *const (),         // 0x38 element coordinate
-    copy_into as *const (),      // 0x40
-    copy_from as *const (),      // 0x48
-    tiling as *const (),         // 0x50
-    unused as *const (),         // 0x58 view descriptor
-    unused as *const (),         // 0x60 tiled resource?
-=======
     add_ref as *const (),   // 0x00
     release as *const (),   // 0x08
     layout as *const (),    // 0x10
@@ -610,7 +595,6 @@ static VTABLE: Vtable = Vtable([
     tiling as *const (),    // 0x50
     unused as *const (),    // 0x58 view descriptor
     unused as *const (),    // 0x60 tiled resource?
->>>>>>> upstream/main
 ]);
 
 pub(crate) fn module() -> HleModule {

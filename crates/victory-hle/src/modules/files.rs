@@ -776,14 +776,7 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         let (mut out, mut n) = ([0u8; 10], 0);
         let handle = file.as_raw_handle().cast();
-<<<<<<< HEAD
-        assert_ne!(
-            ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()),
-            0
-        );
-=======
         assert_ne!(ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()), 0);
->>>>>>> upstream/main
         assert_eq!((&out, n), (b"0123456789", 10));
     }
 
@@ -792,13 +785,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.bin");
         // Over two chunks, and not a whole number of 3-byte items.
-<<<<<<< HEAD
-        let bytes: Vec<u8> = (0..(5 << 19) + 1)
-            .map(|i| (i * 7 + i / 251) as u8)
-            .collect();
-=======
         let bytes: Vec<u8> = (0..(5 << 19) + 1).map(|i| (i * 7 + i / 251) as u8).collect();
->>>>>>> upstream/main
         std::fs::write(&path, &bytes).unwrap();
         let fclose = host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32);
         let open = || {
@@ -812,20 +799,8 @@ mod tests {
         let mut out = vec![0xaau8; bytes.len() + 64];
         let items = fread(out.as_mut_ptr(), 3, out.len() / 3, f);
         assert_eq!(items, bytes.len() / 3);
-<<<<<<< HEAD
-        assert_eq!(
-            &out[..bytes.len()],
-            &bytes[..],
-            "the partial last item's bytes too"
-        );
-        assert!(
-            out[bytes.len()..].iter().all(|&b| b == 0xaa),
-            "nothing past what was read"
-        );
-=======
         assert_eq!(&out[..bytes.len()], &bytes[..], "the partial last item's bytes too");
         assert!(out[bytes.len()..].iter().all(|&b| b == 0xaa), "nothing past what was read");
->>>>>>> upstream/main
         fclose(f);
 
         // Exact reads continue where the last one stopped.

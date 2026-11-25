@@ -629,15 +629,7 @@ pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize
     {
         let physical = physical();
         for (i, page) in touched.iter().enumerate() {
-<<<<<<< HEAD
-            let Some(addresses) = physical
-                .pages
-                .get(page)
-                .and_then(|slice| physical.shown.get(&slice.key(0)))
-            else {
-=======
             let Some(addresses) = physical.pages.get(page).and_then(|slice| physical.shown.get(&slice.key(0))) else {
->>>>>>> upstream/main
                 continue;
             };
             // The bytes of this page that the write covers.
@@ -818,24 +810,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-<<<<<<< HEAD
-    victory_gpu::title_memory_view(
-        base,
-        len,
-        slice.section.0 as usize,
-        (slice.index * PAGE) as u64,
-    );
-    for k in 0..len.div_ceil(PAGE) {
-        physical
-            .shown
-            .entry(slice.key(k))
-            .or_default()
-            .push(base + k * PAGE);
-=======
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
->>>>>>> upstream/main
     }
     physical.views.insert(base, (len, slice));
     true
@@ -1412,17 +1389,7 @@ mod tests {
     fn pages_say_where_they_are_mapped() {
         let pages = allocate(3);
         let reserve = |n: usize| {
-<<<<<<< HEAD
-            let at = XMemVirtualAlloc(
-                std::ptr::null_mut(),
-                n * PAGE,
-                MEM_RESERVE | PAGES_64K,
-                0,
-                PAGE_READWRITE,
-            );
-=======
             let at = XMemVirtualAlloc(std::ptr::null_mut(), n * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
->>>>>>> upstream/main
             assert!(!at.is_null());
             at
         };

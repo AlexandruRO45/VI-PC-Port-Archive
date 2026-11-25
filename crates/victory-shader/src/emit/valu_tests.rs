@@ -359,25 +359,11 @@ fn v_cvt_f32_f64_rounds_to_nearest_even() {
     run_cases(&shader, &inputs, |backend, i, _, got| {
         let x = values[i];
         if x.is_nan() {
-<<<<<<< HEAD
-            assert!(
-                f32::from_bits(got).is_nan(),
-                "{backend}: cvt({x}) = {got:#010x}, want NaN"
-            );
-            return;
-        }
-        let want = cvt_f32_f64_reference(x);
-        assert_eq!(
-            got, want,
-            "{backend}: cvt({x:e}) = {got:#010x}, want {want:#010x}"
-        );
-=======
             assert!(f32::from_bits(got).is_nan(), "{backend}: cvt({x}) = {got:#010x}, want NaN");
             return;
         }
         let want = cvt_f32_f64_reference(x);
         assert_eq!(got, want, "{backend}: cvt({x:e}) = {got:#010x}, want {want:#010x}");
->>>>>>> upstream/main
     });
 }
 
@@ -414,21 +400,6 @@ fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
             let inputs: Vec<[u32; 4]> = selectors.iter().map(|&(a, b)| [a, b, 0, 0]).collect();
             // Cross-lane code declares WaveSize(32), which WARP's pipeline
             // creation refuses: hardware only.
-<<<<<<< HEAD
-            run_cases_on(
-                &shader,
-                &inputs,
-                &[("hardware", false)],
-                |backend, i, inp, got| {
-                    let want = permlane_source(u32::from(read), inp[0], inp[1], cross);
-                    assert_eq!(
-                        got, want,
-                        "{backend}: op {op:#x} selectors {:08x?}, lane {read}",
-                        selectors[i]
-                    );
-                },
-            );
-=======
             run_cases_on(&shader, &inputs, &[("hardware", false)], |backend, i, inp, got| {
                 let want = permlane_source(u32::from(read), inp[0], inp[1], cross);
                 assert_eq!(
@@ -437,7 +408,6 @@ fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
                     selectors[i]
                 );
             });
->>>>>>> upstream/main
         }
     }
 }
@@ -1117,14 +1087,7 @@ fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
         (0x7BFF, 65504),  // 65504.0 (max finite f16) -> 65504
         (0x7C00, 0xFFFF), // +inf -> 65535 (saturated)
     ];
-<<<<<<< HEAD
-    let u16_in: Vec<[u32; 4]> = u16_cases
-        .iter()
-        .map(|&(x, _)| [u32::from(x), 0, 0, 0])
-        .collect();
-=======
     let u16_in: Vec<[u32; 4]> = u16_cases.iter().map(|&(x, _)| [u32::from(x), 0, 0, 0]).collect();
->>>>>>> upstream/main
     run_cases(&cvt_u16, &u16_in, |backend, i, inp, got| {
         let want = u16_cases[i].1;
         assert_eq!(
@@ -1142,20 +1105,6 @@ fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
     );
 
     let i16_cases: &[(u16, u16)] = &[
-<<<<<<< HEAD
-        (0xFC00, 0x8000),           // -inf -> -32768
-        (0xF8E2, 0x8000),           // -40000.0 -> -32768 (saturated, not wrapped)
-        (0xD7BC, (-123i16) as u16), // -123.75 -> -123
-        (0x7E00, 0),                // NaN -> 0
-        (0x57BC, 123),              // 123.75 -> 123
-        (0x78E2, 0x7FFF),           // +40000.0 -> 32767 (saturated, not wrapped)
-        (0x7C00, 0x7FFF),           // +inf -> 32767
-    ];
-    let i16_in: Vec<[u32; 4]> = i16_cases
-        .iter()
-        .map(|&(x, _)| [u32::from(x), 0, 0, 0])
-        .collect();
-=======
         (0xFC00, 0x8000),       // -inf -> -32768
         (0xF8E2, 0x8000),       // -40000.0 -> -32768 (saturated, not wrapped)
         (0xD7BC, (-123i16) as u16), // -123.75 -> -123
@@ -1165,7 +1114,6 @@ fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
         (0x7C00, 0x7FFF),       // +inf -> 32767
     ];
     let i16_in: Vec<[u32; 4]> = i16_cases.iter().map(|&(x, _)| [u32::from(x), 0, 0, 0]).collect();
->>>>>>> upstream/main
     run_cases(&cvt_i16, &i16_in, |backend, i, inp, got| {
         let want = i16_cases[i].1;
         assert_eq!(
@@ -1484,12 +1432,7 @@ fn v_cvt_f32_f64_matches_ieee754() {
             );
         } else {
             assert_eq!(
-<<<<<<< HEAD
-                got,
-                want,
-=======
                 got, want,
->>>>>>> upstream/main
                 "{backend}: v_cvt_f32_f64({x} / {:#018x}) = {got:#010x}, want {want:#010x}",
                 x.to_bits(),
             );
@@ -1519,12 +1462,7 @@ fn v_cvt_f32_f64_matches_ieee754() {
 fn whole_wave_f64_sum_and_cvt_f32_f64() {
     let s_or_saveexec_b32 =
         |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x3D << 8 | src0 as u32;
-<<<<<<< HEAD
-    let v_mov_dpp8 =
-        |vdst: u8, vsrc: u8, sel: u32| [vop1(0x001, vdst, 0xE9), vsrc as u32 | (sel << 8)];
-=======
     let v_mov_dpp8 = |vdst: u8, vsrc: u8, sel: u32| [vop1(0x001, vdst, 0xE9), vsrc as u32 | (sel << 8)];
->>>>>>> upstream/main
     let v_mov_row_mirror = |vdst: u8, vsrc: u8| {
         [
             vop1(0x001, vdst, 0xFA),

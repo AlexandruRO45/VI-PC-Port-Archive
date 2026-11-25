@@ -59,13 +59,10 @@ pub(crate) struct Heap {
     host: std::sync::OnceLock<Option<host::HostHeap>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
-<<<<<<< HEAD
-=======
     /// Changed pages of a placed shader-visible heap. Some titles copy
     /// descriptor records into it as bytes, without a descriptor API call.
     #[cfg(windows)]
     written: Option<crate::watch::Tracked>,
->>>>>>> upstream/main
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -162,8 +159,6 @@ fn mirror(handle: u64) {
     }
 }
 
-<<<<<<< HEAD
-=======
 /// Mirrors records copied directly into placed shader-visible heaps. Calls
 /// to `Create*View` are already mirrored by [`mirror`]; raw CPU copies leave
 /// only write-watch pages to reveal which slots changed.
@@ -278,7 +273,6 @@ fn changed_slots(
     first.min(last)..last
 }
 
->>>>>>> upstream/main
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
@@ -524,12 +518,7 @@ fn inline() -> bool {
 
 /// Views named whole in their records since the start: constant buffer
 /// views, views of placed memory (for the memory line).
-<<<<<<< HEAD
-static NAMED_WHOLE: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-=======
 static NAMED_WHOLE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
->>>>>>> upstream/main
 
 /// The two record words of the 62 bits `payload` of kind `kind`.
 fn kind_words(kind: u32, payload: u64) -> [u32; 2] {
@@ -557,29 +546,14 @@ fn constant_words(address: u64, size: u32) -> Option<[u32; 2]> {
     } else {
         return None;
     };
-<<<<<<< HEAD
-    Some(kind_words(
-        CONSTANT,
-        code << CONSTANT_ADDRESS_BITS | address,
-    ))
-=======
     Some(kind_words(CONSTANT, code << CONSTANT_ADDRESS_BITS | address))
->>>>>>> upstream/main
 }
 
 /// The constant buffer view [`constant_words`] named.
 fn constant_of(i: u32, generation: u32) -> View {
     let payload = payload(i, generation);
     let code = (payload >> CONSTANT_ADDRESS_BITS) as u32;
-<<<<<<< HEAD
-    let size = if code >> 14 == 0 {
-        code
-    } else {
-        (code & 0x3fff) << 8
-    };
-=======
     let size = if code >> 14 == 0 { code } else { (code & 0x3fff) << 8 };
->>>>>>> upstream/main
     View::Constant(payload & ((1 << CONSTANT_ADDRESS_BITS) - 1), size)
 }
 
@@ -620,12 +594,7 @@ impl Views {
     fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
         let payload = payload(i, generation);
         let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
-<<<<<<< HEAD
-        let &(unordered, resource, rest) =
-            self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
-=======
         let &(unordered, resource, rest) = self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
->>>>>>> upstream/main
         let mut desc = [0u32; 16];
         desc[..10].copy_from_slice(&rest[..10]);
         (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
@@ -1119,13 +1088,10 @@ pub(crate) extern "system" fn create_heap(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         pending: Default::default(),
-<<<<<<< HEAD
-=======
         #[cfg(windows)]
         written: (placed && visible)
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
->>>>>>> upstream/main
     });
     #[cfg(windows)]
     if visible {
@@ -1183,8 +1149,6 @@ mod tests {
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
     }
 
-<<<<<<< HEAD
-=======
     #[cfg(windows)]
     #[test]
     fn raw_heap_sync_stops_before_dynamic_host_slots() {
@@ -1213,7 +1177,6 @@ mod tests {
         );
     }
 
->>>>>>> upstream/main
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();
@@ -1240,8 +1203,6 @@ mod tests {
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
     }
 
-<<<<<<< HEAD
-=======
     /// A descriptor copied into a placed heap as bytes is mirrored before
     /// the next submission, even though no descriptor method saw the copy.
     #[cfg(windows)]
@@ -1294,7 +1255,6 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
->>>>>>> upstream/main
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();
@@ -1335,46 +1295,6 @@ mod tests {
     #[test]
     fn constant_views_fit_their_records() {
         let top = (1u64 << CONSTANT_ADDRESS_BITS) - 1;
-<<<<<<< HEAD
-        for address in [
-            0u64,
-            0x100,
-            0x2602_0000,
-            0xd_6b60_0000,
-            0x7ffd_a34f_0000,
-            top,
-        ] {
-            for size in [
-                0u32,
-                1,
-                255,
-                256,
-                4000,
-                (1 << 14) - 1,
-                1 << 14,
-                65536,
-                (1 << 22) - 256,
-            ] {
-                let [i, generation] = constant_words(address, size).expect("fits");
-                assert_eq!(generation >> KIND_SHIFT, CONSTANT);
-                assert_eq!(
-                    view_at(i, generation),
-                    Some(View::Constant(address, size)),
-                    "{address:#x} {size}"
-                );
-            }
-        }
-        assert_eq!(
-            constant_words(top + 1, 256),
-            None,
-            "an address past 47 bits"
-        );
-        assert_eq!(
-            constant_words(0x1000, (1 << 14) + 1),
-            None,
-            "16 KiB or more, no multiple of 256"
-        );
-=======
         for address in [0u64, 0x100, 0x2602_0000, 0xd_6b60_0000, 0x7ffd_a34f_0000, top] {
             for size in [0u32, 1, 255, 256, 4000, (1 << 14) - 1, 1 << 14, 65536, (1 << 22) - 256] {
                 let [i, generation] = constant_words(address, size).expect("fits");
@@ -1384,7 +1304,6 @@ mod tests {
         }
         assert_eq!(constant_words(top + 1, 256), None, "an address past 47 bits");
         assert_eq!(constant_words(0x1000, (1 << 14) + 1), None, "16 KiB or more, no multiple of 256");
->>>>>>> upstream/main
         assert_eq!(constant_words(0x1000, 1 << 22), None, "4 MiB");
         // Different views never share their words.
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1000, 512));
@@ -1411,29 +1330,8 @@ mod tests {
             View::Placed(_, r, _) => *r == resource,
             _ => false,
         };
-<<<<<<< HEAD
-        let entries = || {
-            VIEWS
-                .read()
-                .unwrap()
-                .list
-                .iter()
-                .filter(|(v, _)| mine(v))
-                .count()
-        };
-        let shapes = || {
-            VIEWS
-                .read()
-                .unwrap()
-                .shapes
-                .iter()
-                .filter(|s| s.1 == resource)
-                .count()
-        };
-=======
         let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
         let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
->>>>>>> upstream/main
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);

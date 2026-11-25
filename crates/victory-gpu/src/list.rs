@@ -165,14 +165,7 @@ pub(crate) fn tables_done(lists: &[This]) {
         // SAFETY: the title passes our lists.
         let list = unsafe { &*this.cast::<List>() };
         if list.earlier.is_empty() {
-<<<<<<< HEAD
-            list.state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .tables_done();
-=======
             list.state.lock().unwrap_or_else(|e| e.into_inner()).tables_done();
->>>>>>> upstream/main
         }
     }
 }
@@ -266,29 +259,11 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
-<<<<<<< HEAD
-    for (
-        i,
-        Detached {
-            host,
-            _uploads,
-            _state,
-        },
-    ) in lists.into_iter().enumerate()
-    {
-        // The descriptor slots and the upload memory its commands named.
-        drop(_state);
-        drop(_uploads);
-        if !ran.contains(&i)
-            || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0
-        {
-=======
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
         if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
->>>>>>> upstream/main
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -339,29 +314,14 @@ fn cut(this: This, wait: ValueWait) {
         // shortcut: without a new host list the wait stands before the part
         // it was recorded in.
         static ONCE: std::sync::Once = std::sync::Once::new();
-<<<<<<< HEAD
-        ONCE.call_once(|| {
-            tracing::warn!(
-                "no host list for the part after a wait: the wait moves to the part's start"
-            )
-        });
-=======
         ONCE.call_once(|| tracing::warn!("no host list for the part after a wait: the wait moves to the part's start"));
->>>>>>> upstream/main
         list.gate.push(wait);
         return;
     };
     current.close();
     static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-<<<<<<< HEAD
-        tracing::info!(
-            parts = list.earlier.len() + 2,
-            "a list is cut at a wait for a memory value"
-        );
-=======
         tracing::info!(parts = list.earlier.len() + 2, "a list is cut at a wait for a memory value");
->>>>>>> upstream/main
     }
     if let Some(done) = list.host.replace(fresh) {
         let waits = std::mem::replace(&mut list.gate, vec![wait]);
@@ -874,15 +834,7 @@ fn unlike(dst: This, src: This) -> bool {
     if unlike {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-<<<<<<< HEAD
-            tracing::warn!(
-                ?dst,
-                ?src,
-                "copy between a stand-in target and title-format texels skipped"
-            )
-=======
             tracing::warn!(?dst, ?src, "copy between a stand-in target and title-format texels skipped")
->>>>>>> upstream/main
         });
     }
     unlike
@@ -982,25 +934,13 @@ extern "system" fn copy_texture_region(
             let made = read_back(list, dst, x, y, z, src, source_box);
             if n <= 16 || n.is_multiple_of(4096) || made.is_err() {
                 static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-<<<<<<< HEAD
-                if made.is_err() && REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 16
-                {
-=======
                 if made.is_err() && REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 16 {
->>>>>>> upstream/main
                     return;
                 }
                 let source = crate::resource::host_resource(src.resource).map(|r| {
                     // SAFETY: a live resource.
                     let d = unsafe { r.GetDesc() };
-<<<<<<< HEAD
-                    format!(
-                        "{}x{} f{} mips {}",
-                        d.Width, d.Height, d.Format.0, d.MipLevels
-                    )
-=======
                     format!("{}x{} f{} mips {}", d.Width, d.Height, d.Format.0, d.MipLevels)
->>>>>>> upstream/main
                 });
                 tracing::info!(
                     copies = n,
@@ -1135,19 +1075,10 @@ fn read_back(
         return Err("a destination corner other than the footprint's");
     }
     let host = crate::host::host().ok_or("no host")?;
-<<<<<<< HEAD
-    let (footprint, [size, row, rows, pitch]) =
-        dst.footprint.host_rows().ok_or("an unknown format")?;
-    // The title's buffer holds every row at its own pitch.
-    let bytes = pitch * (rows - 1) + row;
-    let data = buffer_range(dst.resource, dst.footprint.offset, bytes)
-        .ok_or("a destination outside its buffer")?;
-=======
     let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
     // The title's buffer holds every row at its own pitch.
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
->>>>>>> upstream/main
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
@@ -1174,19 +1105,8 @@ fn read_back(
     // in `copy_texture_region`), naming a live texture and our buffer, which
     // the list keeps until it is reset; the box is the title's.
     unsafe {
-<<<<<<< HEAD
-        list.list.CopyTextureRegion(
-            (&raw const to).cast(),
-            0,
-            0,
-            0,
-            (&raw const from).cast(),
-            host_box,
-        )
-=======
         list.list
             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
->>>>>>> upstream/main
     };
     list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize]);
     Ok(())
@@ -1245,15 +1165,7 @@ extern "system" fn resolve(
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
-<<<<<<< HEAD
-            let format = if crate::resource::stands_in(dst) {
-                a.Format
-            } else {
-                DXGI_FORMAT(format as i32)
-            };
-=======
             let format = if crate::resource::stands_in(dst) { a.Format } else { DXGI_FORMAT(format as i32) };
->>>>>>> upstream/main
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
@@ -1376,18 +1288,8 @@ extern "system" fn clear_dsv(
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-<<<<<<< HEAD
-            list.list.ClearDepthStencilView(
-                dsv,
-                D3D12_CLEAR_FLAGS(flags as i32 & 3),
-                depth,
-                stencil,
-                rects,
-            )
-=======
             list.list
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
->>>>>>> upstream/main
         };
     }
     #[cfg(not(windows))]
@@ -1519,14 +1421,7 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
-<<<<<<< HEAD
-    let Some(len) = usize::try_from(size)
-        .ok()
-        .and_then(|s| s.checked_add(align))
-    else {
-=======
     let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
->>>>>>> upstream/main
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
@@ -1539,14 +1434,7 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Moving the vector keeps its heap block where it is.
-<<<<<<< HEAD
-    uploads
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(block);
-=======
     uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
->>>>>>> upstream/main
     at
 }
 
@@ -1583,13 +1471,7 @@ mod state {
     ) {
         // (Through the draw state, which keeps them for the host list
         // that continues this one after a cut: `State::replay`.)
-<<<<<<< HEAD
-        with_state(this, |list, s| {
-            s.set_viewports(list, items(viewports, count))
-        });
-=======
         with_state(this, |list, s| s.set_viewports(list, items(viewports, count)));
->>>>>>> upstream/main
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
         with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
@@ -1823,15 +1705,7 @@ extern "system" fn execute_indirect(
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
-<<<<<<< HEAD
-        let kind = if *kind == DISPATCH_SINGLE {
-            DISPATCH
-        } else {
-            *kind
-        };
-=======
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
->>>>>>> upstream/main
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -2003,25 +1877,15 @@ pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
 pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
     let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
     let mut by = vec![Vec::new(); lists.len()];
-<<<<<<< HEAD
-    waits.retain(
-        |&(list, wait)| match lists.iter().position(|&l| l as usize == list) {
-=======
     waits.retain(|&(list, wait)| {
         match lists.iter().position(|&l| l as usize == list) {
->>>>>>> upstream/main
             Some(i) => {
                 by[i].push(wait);
                 false
             }
             None => true,
-<<<<<<< HEAD
-        },
-    );
-=======
         }
     });
->>>>>>> upstream/main
     by
 }
 
@@ -2090,12 +1954,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
-<<<<<<< HEAD
-        let barrier =
-            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-=======
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
->>>>>>> upstream/main
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -2352,25 +2211,10 @@ mod tests {
         assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
-<<<<<<< HEAD
-        assert!(
-            allocate_upload(list, 8, 0x30).is_null(),
-            "not a power of two"
-        );
-        assert_eq!(reset(list, allocator, null), S_OK);
-        // SAFETY: the list is ours.
-        assert!(
-            unsafe { &(*list.cast::<List>()).uploads }
-                .lock()
-                .unwrap()
-                .is_empty()
-        );
-=======
         assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
->>>>>>> upstream/main
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

@@ -74,9 +74,6 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = count * instances;
         draw_counts = uint2(count, instances);
     } else if (kind == 2) {
-<<<<<<< HEAD
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
-=======
         uint3 asked = src_args.Load3(src_at);
         // Diagnostics, in the budget buffer's words after the mesh ones:
         // the largest x a compute record asked for, and the records that
@@ -91,7 +88,6 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
         }
         uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
->>>>>>> upstream/main
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
@@ -360,18 +356,7 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-<<<<<<< HEAD
-    let constants = [
-        kind,
-        stride,
-        records,
-        args_offset,
-        has_count | (u32::from(ahead) << 1),
-        count_offset,
-    ];
-=======
     let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
->>>>>>> upstream/main
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -692,12 +677,7 @@ void main() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-<<<<<<< HEAD
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE)
-            .expect("the card compare must compile on WARP");
-=======
         let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
->>>>>>> upstream/main
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -719,12 +699,7 @@ void main() {
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
                 let constants = [0u32, 0, size as u32, PIECES, 0, mode];
-<<<<<<< HEAD
-                warp.list
-                    .SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-=======
                 warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
->>>>>>> upstream/main
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
@@ -758,8 +733,6 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
-<<<<<<< HEAD
-=======
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software
     /// adapter, in one list behind the compare as `Host::card_before`
     /// records it: each flagged piece takes a ticket and, while it is
@@ -861,7 +834,6 @@ void main() {
         assert_eq!(slot(PIECE - SKEW as usize), piece0);
     }
 
->>>>>>> upstream/main
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
@@ -1155,12 +1127,7 @@ void main() {
                     D3D12_RESOURCE_STATE_COMMON,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 )]);
-<<<<<<< HEAD
-                warp.list
-                    .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
-=======
                 warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
->>>>>>> upstream/main
                 warp.list.ResourceBarrier(&[transition(
                     &dst_buf,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -1173,63 +1140,24 @@ void main() {
                 (
                     (budget_ptr as *const u32).read_volatile(),
                     (budget_ptr as *const u32).add(1).read_volatile(),
-<<<<<<< HEAD
-                    std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4)
-                        .to_vec(),
-=======
                     std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4).to_vec(),
->>>>>>> upstream/main
                 )
             };
             for (i, groups) in filled.into_iter().enumerate() {
                 let rec = &out[i * 8..i * 8 + 4];
-<<<<<<< HEAD
-                assert_eq!(
-                    rec,
-                    [
-                        groups,
-                        u32::from(groups > 0).max(1).min(1),
-                        1,
-                        0xAB00 + i as u32
-                    ],
-                    "filled record {i}, ahead {ahead}"
-                );
-=======
                 assert_eq!(rec, [groups, u32::from(groups > 0).max(1).min(1), 1, 0xAB00 + i as u32], "filled record {i}, ahead {ahead}");
->>>>>>> upstream/main
             }
             let charged_filled = (5 + 519) * 128;
             if ahead {
                 for i in filled.len()..RECORDS as usize {
-<<<<<<< HEAD
-                    assert_eq!(
-                        out[i * 8..i * 8 + 3],
-                        [0, 0, 0],
-                        "unfilled slot {i} must come out empty"
-                    );
-                    assert_eq!(
-                        out[i * 8 + 3],
-                        u32::MAX,
-                        "the words after the record are copied as they are"
-                    );
-=======
                     assert_eq!(out[i * 8..i * 8 + 3], [0, 0, 0], "unfilled slot {i} must come out empty");
                     assert_eq!(out[i * 8 + 3], u32::MAX, "the words after the record are copied as they are");
->>>>>>> upstream/main
                 }
                 assert_eq!(spent, charged_filled, "unfilled slots charge nothing");
                 assert_eq!(largest, 519, "and are not counted as asked for");
             } else {
                 // Thirteen slots at 65,535 groups: sixteen would be all of it.
-<<<<<<< HEAD
-                assert_eq!(
-                    spent,
-                    charged_filled + 13 * 65535 * 128,
-                    "clamped one by one, each slot is charged the most"
-                );
-=======
                 assert_eq!(spent, charged_filled + 13 * 65535 * 128, "clamped one by one, each slot is charged the most");
->>>>>>> upstream/main
                 assert_eq!(largest, u32::MAX);
             }
         }
@@ -1505,10 +1433,6 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
-<<<<<<< HEAD
-        #[allow(dead_code)]
-=======
->>>>>>> upstream/main
         depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
@@ -1534,14 +1458,7 @@ void work() {
             DepthOrArraySize: 1,
             MipLevels: 1,
             Format: format,
-<<<<<<< HEAD
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-=======
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
->>>>>>> upstream/main
             Flags: flags,
             ..Default::default()
         };
@@ -1572,14 +1489,7 @@ void work() {
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
-<<<<<<< HEAD
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-=======
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
->>>>>>> upstream/main
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             Flags: flags,
             ..Default::default()
@@ -1594,16 +1504,7 @@ void work() {
         out.unwrap()
     }
 
-<<<<<<< HEAD
-    fn heap(
-        device: &ID3D12Device,
-        kind: D3D12_DESCRIPTOR_HEAP_TYPE,
-        count: u32,
-        visible: bool,
-    ) -> ID3D12DescriptorHeap {
-=======
     fn heap(device: &ID3D12Device, kind: D3D12_DESCRIPTOR_HEAP_TYPE, count: u32, visible: bool) -> ID3D12DescriptorHeap {
->>>>>>> upstream/main
         let flags = if visible {
             D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
         } else {
@@ -1622,16 +1523,7 @@ void work() {
         }
     }
 
-<<<<<<< HEAD
-    fn pipeline(
-        device: &ID3D12Device,
-        root: &ID3D12RootSignature,
-        vs: &[u8],
-        ps: &[u8],
-    ) -> ID3D12PipelineState {
-=======
     fn pipeline(device: &ID3D12Device, root: &ID3D12RootSignature, vs: &[u8], ps: &[u8]) -> ID3D12PipelineState {
->>>>>>> upstream/main
         let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
@@ -1667,14 +1559,7 @@ void work() {
                 NumRenderTargets: 1,
                 RTVFormats: formats,
                 DSVFormat: DXGI_FORMAT_D32_FLOAT,
-<<<<<<< HEAD
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-=======
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
->>>>>>> upstream/main
                 ..Default::default()
             };
             device.CreateGraphicsPipelineState(&desc).unwrap()
@@ -1698,13 +1583,7 @@ void work() {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
                 let device = device?;
                 let desc = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-<<<<<<< HEAD
-                    .and_then(|factory| {
-                        factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid())
-                    })
-=======
                     .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
->>>>>>> upstream/main
                     .ok()?
                     .cast::<IDXGIAdapter1>()
                     .ok()?
@@ -1722,14 +1601,8 @@ void work() {
                         ..Default::default()
                     })
                     .ok()?;
-<<<<<<< HEAD
-                let allocator: ID3D12CommandAllocator = device
-                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                    .ok()?;
-=======
                 let allocator: ID3D12CommandAllocator =
                     device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
->>>>>>> upstream/main
                 let list: ID3D12GraphicsCommandList = device
                     .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
                     .ok()?;
@@ -1754,19 +1627,7 @@ void work() {
                     .ok()?;
 
                 let size = (WIDTH, HEIGHT);
-<<<<<<< HEAD
-                let colour = |state| {
-                    texture(
-                        &device,
-                        size,
-                        DXGI_FORMAT_R8G8B8A8_UNORM,
-                        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                        state,
-                    )
-                };
-=======
                 let colour = |state| texture(&device, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, state);
->>>>>>> upstream/main
                 let target = [
                     colour(D3D12_RESOURCE_STATE_RENDER_TARGET),
                     colour(D3D12_RESOURCE_STATE_RENDER_TARGET),
@@ -1815,25 +1676,13 @@ void work() {
 
                 // Target and depth views.
                 let rtvs = heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, false);
-<<<<<<< HEAD
-                let rtv_step = device
-                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
-                    as usize;
-=======
                 let rtv_step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize;
->>>>>>> upstream/main
                 let mut targets = [rtvs.GetCPUDescriptorHandleForHeapStart(); 2];
                 targets[1].ptr += rtv_step;
                 device.CreateRenderTargetView(&target[0], None, targets[0]);
                 device.CreateRenderTargetView(&target[1], None, targets[1]);
                 let dsvs = heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, false);
-<<<<<<< HEAD
-                let dsv_step = device
-                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV)
-                    as usize;
-=======
                 let dsv_step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV) as usize;
->>>>>>> upstream/main
                 let depth_written = dsvs.GetCPUDescriptorHandleForHeapStart();
                 let mut depth_tested = depth_written;
                 depth_tested.ptr += dsv_step;
@@ -1857,15 +1706,7 @@ void work() {
                     heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, true),
                 ];
                 for views in &view_heaps {
-<<<<<<< HEAD
-                    device.CreateShaderResourceView(
-                        &image,
-                        None,
-                        views.GetCPUDescriptorHandleForHeapStart(),
-                    );
-=======
                     device.CreateShaderResourceView(&image, None, views.GetCPUDescriptorHandleForHeapStart());
->>>>>>> upstream/main
                 }
                 let tables = [
                     view_heaps[0].GetGPUDescriptorHandleForHeapStart(),
@@ -1922,13 +1763,7 @@ void work() {
                 let run: ID3D12CommandList = self.list.cast().unwrap();
                 self.queue.ExecuteCommandLists(&[Some(run)]);
                 self.queue.Signal(&self.fence, self.submitted).unwrap();
-<<<<<<< HEAD
-                self.fence
-                    .SetEventOnCompletion(self.submitted, self.event)
-                    .unwrap();
-=======
                 self.fence.SetEventOnCompletion(self.submitted, self.event).unwrap();
->>>>>>> upstream/main
                 WaitForSingleObject(self.event, INFINITE);
                 self.allocator.Reset().unwrap();
                 self.list.Reset(&self.allocator, None).unwrap();
@@ -1999,15 +1834,7 @@ void work() {
                                 l.ResourceBarrier(&[transition(&self.other, read, target)]);
                             }
                             Between::DepthMove => {
-<<<<<<< HEAD
-                                let (from, to) = if odd == 0 {
-                                    (written, tested)
-                                } else {
-                                    (tested, written)
-                                };
-=======
                                 let (from, to) = if odd == 0 { (written, tested) } else { (tested, written) };
->>>>>>> upstream/main
                                 l.ResourceBarrier(&[transition(&self.depth, from, to)]);
                             }
                             Between::Heaps => {
@@ -2015,16 +1842,7 @@ void work() {
                                 l.SetGraphicsRootDescriptorTable(0, self.tables[odd]);
                             }
                             Between::Targets => {
-<<<<<<< HEAD
-                                l.OMSetRenderTargets(
-                                    1,
-                                    Some(&self.targets[odd]),
-                                    false,
-                                    Some(&self.depth_tested),
-                                );
-=======
                                 l.OMSetRenderTargets(1, Some(&self.targets[odd]), false, Some(&self.depth_tested));
->>>>>>> upstream/main
                             }
                             Between::Compute | Between::ComputeWithWaits => {
                                 let waits = between == Between::ComputeWithWaits;
@@ -2033,14 +1851,7 @@ void work() {
                                 }
                                 l.SetComputeRootSignature(&self.work_root);
                                 l.SetPipelineState(&self.work);
-<<<<<<< HEAD
-                                l.SetComputeRootUnorderedAccessView(
-                                    0,
-                                    self.words.GetGPUVirtualAddress(),
-                                );
-=======
                                 l.SetComputeRootUnorderedAccessView(0, self.words.GetGPUVirtualAddress());
->>>>>>> upstream/main
                                 l.Dispatch(1, 1, 1);
                                 if waits {
                                     l.ResourceBarrier(&[super::uav_barrier()]);
@@ -2062,18 +1873,7 @@ void work() {
                         l.Reset(&self.allocator, None).unwrap();
                     } else {
                         l.EndQuery(&self.stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
-<<<<<<< HEAD
-                        l.ResolveQueryData(
-                            &self.stamps,
-                            D3D12_QUERY_TYPE_TIMESTAMP,
-                            0,
-                            2,
-                            &self.back,
-                            0,
-                        );
-=======
                         l.ResolveQueryData(&self.stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &self.back, 0);
->>>>>>> upstream/main
                     }
                 }
             }
@@ -2090,18 +1890,8 @@ void work() {
                 stamps[1].saturating_sub(stamps[0])
             };
             // SAFETY: a plain query of our queue.
-<<<<<<< HEAD
-            let frequency = unsafe { self.queue.GetTimestampFrequency() }
-                .unwrap_or(1)
-                .max(1);
-            (
-                ticks as f64 * 1e6 / frequency as f64 / f64::from(drawn.max(1)),
-                recording,
-            )
-=======
             let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1).max(1);
             (ticks as f64 * 1e6 / frequency as f64 / f64::from(drawn.max(1)), recording)
->>>>>>> upstream/main
         }
     }
 
@@ -2112,52 +1902,12 @@ void work() {
             eprintln!("no hardware adapter, or our shaders did not compile; skipped");
             return;
         };
-<<<<<<< HEAD
-        eprintln!(
-            "bare command cost on {}: {DRAWS} one-triangle draws into {WIDTH}x{HEIGHT}, three batches each",
-            rig.card
-        );
-=======
         eprintln!("bare command cost on {}: {DRAWS} one-triangle draws into {WIDTH}x{HEIGHT}, three batches each", rig.card);
->>>>>>> upstream/main
         // The first batch pays for whatever the driver does at first use.
         rig.batch(Between::Nothing, 1);
         let variants = [
             ("(a) nothing changes between draws", Between::Nothing, 1),
             ("(b) another pipeline every draw", Between::Pipeline, 1),
-<<<<<<< HEAD
-            (
-                "(c) a barrier pair on a second texture every draw",
-                Between::BarrierPair,
-                1,
-            ),
-            (
-                "(d) the tested depth texture moved between write and read every draw",
-                Between::DepthMove,
-                1,
-            ),
-            (
-                "(e) another pair of descriptor heaps every draw",
-                Between::Heaps,
-                1,
-            ),
-            ("(f) another colour target every draw", Between::Targets, 1),
-            (
-                "(g) nothing changes, in 100 lists run one by one",
-                Between::Nothing,
-                100,
-            ),
-            (
-                "(h) a compute pass of ours of one group before every draw",
-                Between::Compute,
-                1,
-            ),
-            (
-                "(i) the same pass between two waits for earlier shader writes",
-                Between::ComputeWithWaits,
-                1,
-            ),
-=======
             ("(c) a barrier pair on a second texture every draw", Between::BarrierPair, 1),
             ("(d) the tested depth texture moved between write and read every draw", Between::DepthMove, 1),
             ("(e) another pair of descriptor heaps every draw", Between::Heaps, 1),
@@ -2165,7 +1915,6 @@ void work() {
             ("(g) nothing changes, in 100 lists run one by one", Between::Nothing, 100),
             ("(h) a compute pass of ours of one group before every draw", Between::Compute, 1),
             ("(i) the same pass between two waits for earlier shader writes", Between::ComputeWithWaits, 1),
->>>>>>> upstream/main
         ];
         let mut least = Vec::new();
         for (name, between, lists) in variants {
@@ -2177,13 +1926,6 @@ void work() {
             );
             least.push(runs[0].0);
         }
-<<<<<<< HEAD
-        assert!(
-            least.iter().all(|us| us.is_finite() && *us > 0.0),
-            "the card gave no time for a batch"
-        );
-=======
         assert!(least.iter().all(|us| us.is_finite() && *us > 0.0), "the card gave no time for a batch");
->>>>>>> upstream/main
     }
 }

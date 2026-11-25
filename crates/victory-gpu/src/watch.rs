@@ -33,8 +33,6 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
-<<<<<<< HEAD
-=======
 /// A title-memory range whose changed pages another subsystem needs to read.
 pub(crate) struct Tracked {
     start: usize,
@@ -56,7 +54,6 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
->>>>>>> upstream/main
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
@@ -354,19 +351,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-<<<<<<< HEAD
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-=======
     // View memory the guards already hold cannot be write-watched: the
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
@@ -392,7 +376,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         },
         failed as u64,
     );
->>>>>>> upstream/main
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -429,11 +412,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ))
 }
 
-<<<<<<< HEAD
-/// Guarded blocks of view memory.
-const BLOCK: usize = PAGE;
-
-=======
 impl Tracked {
     /// Takes changed pages of `[from, to)`, cut to the tracked range. A
     /// partial page stays changed so a later take can read its other bytes.
@@ -492,7 +470,6 @@ fn known_view(start: usize) -> bool {
     g.protected.contains(&first) || g.absent.contains(&first)
 }
 
->>>>>>> upstream/main
 struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
@@ -811,18 +788,6 @@ pub fn writing(at: usize, len: usize) {
 /// copies of buffers and textures read through tables take them again);
 /// 2, the placed textures picked by index that lie under it are due again;
 /// 4, both also for reads to plain addresses when they have finished.
-<<<<<<< HEAD
-/// Unset or `0`: nothing, counted only. `1`: bits 1 and 2. `guards`: bit 1
-/// alone. `slots`: bit 2 alone. `all`: everything.
-pub(crate) fn page_writes() -> u8 {
-    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_PAGE_WRITES").as_deref().map(str::trim) {
-        Ok("1") => 3,
-        Ok("guards") => 1,
-        Ok("slots") => 2,
-        Ok("all") => 7,
-        _ => 0,
-=======
 /// Unset or `guards`: bit 1 alone. `0`: nothing, counted only (the default
 /// until run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`:
 /// everything.
@@ -839,7 +804,6 @@ pub(crate) fn page_writes() -> u8 {
         Ok("slots") => 2,
         Ok("all") => 7,
         _ => 1,
->>>>>>> upstream/main
     })
 }
 
@@ -933,54 +897,14 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-<<<<<<< HEAD
-pub struct Remapping(
-    #[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>,
-    #[cfg(feature = "diagnostics")]
-    std::time::Instant,
-);
-
-/// Since they were last taken: how many times the runtime changed a mapping,
-/// the microseconds it held the lock for all of them, and the longest one.
-///
-/// Every reader's wait in the texture lane is a wait for this, and nothing
-/// measured it: the frame line counts the readers, so a count of the writer
-/// says whether their sum is one long change or many short ones.
-#[cfg(feature = "diagnostics")]
-pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 3] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
-
-#[cfg(feature = "diagnostics")]
-impl Drop for Remapping {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let us = self.1.elapsed().as_micros() as u64;
-        REMAPS[0].fetch_add(1, Relaxed);
-        REMAPS[1].fetch_add(us, Relaxed);
-        REMAPS[2].fetch_max(us, Relaxed);
-    }
-}
-=======
 pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
->>>>>>> upstream/main
 
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-<<<<<<< HEAD
-    let guard = MAPPING.write().unwrap_or_else(|e| e.into_inner());
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    Remapping(
-        guard,
-        #[cfg(feature = "diagnostics")]
-        started,
-    )
-=======
     Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
->>>>>>> upstream/main
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).

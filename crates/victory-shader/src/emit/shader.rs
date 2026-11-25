@@ -408,18 +408,7 @@ impl Shader {
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
             let i32t = self.t.i32;
-<<<<<<< HEAD
-            let v = self.op(
-                block,
-                "binary.i32",
-                Attr::ReadNone,
-                i32t,
-                40,
-                &[index, null],
-            );
-=======
             let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, null]);
->>>>>>> upstream/main
             self.m.tag(v, super::bitcode::Tag::Clamp);
             v
         } else if sampler {
@@ -430,18 +419,7 @@ impl Shader {
             // heap smaller than 2,048 would need.
             let last = self.m.i32(2047);
             let i32t = self.t.i32;
-<<<<<<< HEAD
-            let v = self.op(
-                block,
-                "binary.i32",
-                Attr::ReadNone,
-                i32t,
-                40,
-                &[index, last],
-            );
-=======
             let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
->>>>>>> upstream/main
             self.m.tag(v, super::bitcode::Tag::Clamp);
             v
         } else {
