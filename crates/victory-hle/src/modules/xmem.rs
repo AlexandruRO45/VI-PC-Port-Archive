@@ -409,12 +409,12 @@ pub fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
         .views
         .range(..=at)
         .next_back()
-        .filter(|(base, (size, _))| *base + size > at)
+        .filter(|(base, (size, _))| base.saturating_add(*size) > at)
         .map(|(base, _)| *base);
     let starts = first.into_iter().chain(physical.views.range(at.saturating_add(1)..end).map(|(b, _)| *b));
     for base in starts.collect::<Vec<_>>() {
         let (size, slice) = &physical.views[&base];
-        let (from, to) = (at.max(base), end.min(base + size));
+        let (from, to) = (at.max(base), end.min(base.saturating_add(*size)));
         for page in (from / PAGE..to.div_ceil(PAGE)).map(|p| p * PAGE) {
             let k = (page - base) / PAGE;
             if let Some(addresses) = physical.shown.get(&slice.key(k)) {
@@ -1363,5 +1363,30 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn aliases_handles_saturating_range_bounds() {
+        let pages = allocate(1);
+        let top = usize::MAX - PAGE + 1;
+        let alias = 0x2000_0000usize;
+        let slice = {
+            let mut p = physical();
+            let slice = p.pages[&pages[0]].clone();
+            p.views.insert(top, (2 * PAGE, slice.clone()));
+            p.shown.entry(slice.key(0)).or_default().push(alias);
+            slice
+        };
+        let mut out = Vec::new();
+        aliases(top + 1, PAGE, &mut out);
+        {
+            let mut p = physical();
+            p.views.remove(&top);
+            if let Some(addrs) = p.shown.get_mut(&slice.key(0)) {
+                addrs.retain(|&a| a != alias);
+            }
+        }
+        assert_eq!(out, vec![(top, alias)]);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 }
