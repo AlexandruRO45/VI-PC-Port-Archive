@@ -185,7 +185,7 @@ pub(crate) fn sync_heaps() {
     }
     let started = std::time::Instant::now();
     let (mut read, mut mirrored) = (0, 0);
-    let mut bytes = Vec::new();
+    let (mut bytes, mut records) = (Vec::new(), Vec::new());
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -208,6 +208,7 @@ pub(crate) fn sync_heaps() {
                 bytes.resize(to - from, 0);
                 if crate::host::read_into(from as *const u8, &mut bytes) {
                     read += 1;
+                    records.clear();
                     for index in changed_slots(from, to, start as usize, step, mirrored_count) {
                         let handle = start + index * step;
                         let mut crossing = [0; 12];
@@ -220,8 +221,9 @@ pub(crate) fn sync_heaps() {
                             None if crate::host::read_into(handle as *const u8, &mut crossing) => &crossing,
                             None => continue,
                         };
-                        mirrored += u64::from(host.mirror_copied(index as u32, handle, record));
+                        records.push((index as u32, handle, host::words_of(record)));
                     }
+                    mirrored += host.mirror_copied_run(&records);
                 }
                 page += crate::watch::PAGE;
             }

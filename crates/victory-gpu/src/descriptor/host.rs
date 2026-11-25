@@ -362,6 +362,11 @@ fn stale_rule() -> Rule {
     })
 }
 
+/// The three words of a descriptor header as read from title memory.
+pub(crate) fn words_of(bytes: &[u8; 12]) -> [u32; 3] {
+    [0, 4, 8].map(|at| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]))
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`, or is
 /// about to write it through the kernel (`crate::watch`): the placed
 /// textures there may have arrived, gone, or changed with no descriptor
@@ -1597,10 +1602,25 @@ impl HostHeap {
         self.copied = Some(Mutex::new(vec![[0; 3]; self.count as usize]));
     }
 
-    /// Mirrors a changed header from the kernel's snapshot of a heap page.
-    pub(crate) fn mirror_copied(&self, index: u32, handle: u64, bytes: &[u8; 12]) -> bool {
-        let words = [0, 4, 8].map(|at| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()));
-        self.mirror_words(index, handle, words, false, true).1
+    /// Mirrors the changed headers (index, handle, words) of the kernel's snapshot of a heap
+    /// page, and says how many changed. Most of a written page is as it was: those are
+    /// found under one lock of the kept records, not two locks each.
+    pub(crate) fn mirror_copied_run(&self, records: &[(u32, u64, [u32; 3])]) -> u64 {
+        let changed: Vec<(u32, u64, [u32; 3])> = match &self.copied {
+            Some(kept) => {
+                let kept = kept.lock().unwrap_or_else(|e| e.into_inner());
+                records
+                    .iter()
+                    .filter(|&&(index, _, words)| kept.get(index as usize).is_none_or(|k| *k != words))
+                    .copied()
+                    .collect()
+            }
+            None => records.to_vec(),
+        };
+        changed
+            .into_iter()
+            .map(|(index, handle, words)| u64::from(self.mirror_words(index, handle, words, false, true).1))
+            .sum()
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
