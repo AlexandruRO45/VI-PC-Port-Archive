@@ -17,9 +17,8 @@ PROJECTS = {
     "victory": ("Marvisak/VIctory", r"## Status"),
     "xbox2windows": ("R0Y00/Xbox2Windows", r"> \*\*Current status\.\*\*"),
     "tuxbox": ("brcly/TuxBox", r"\*\*GTA VI \(ProjectScarlett\)\*\*"),
-    "victory-fork": ("fxceless/victory-fork", r"## Status of this fork"),
+    "hyphenn": ("fxceless/victory-fork", r"## Status of this fork"),  # the repo keeps its name; called hyphenn here
     "anyxboxx": ("LooperSalty/AnyXboxX", r"> \*\*Where we are"),
-    "ztrx": ("Zettrox/ztrx", r"## Status"),
     "dexnom": ("DexNom/VIctory", r"## Changes in this snapshot"),
     "belobug": ("Belobug/VIctory-Belobug-AMD", r"## State of this fork"),
 }

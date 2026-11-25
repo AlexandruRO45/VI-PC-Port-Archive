@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Browse the Archive</title>
-<meta name="description" content="Search every issue, pull request and comment from Leonida (old and new), xcl, VIctory, victory-fork, AnyXboxX, ztrx, DexNom Runtime, VIctory-Belobug-AMD, Xbox2Windows and TuxBox.">
+<meta name="description" content="Search every issue, pull request and comment from Leonida (old and new), xcl, VIctory, hyphenn, AnyXboxX, ztrx, DexNom Runtime, VIctory-Belobug-AMD, Xbox2Windows and TuxBox.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
@@ -80,7 +80,7 @@ const PROJECTS = {
   victory: { name: "VIctory", branch: "victory" },
   xbox2windows: { name: "Xbox2Windows", branch: "xbox2windows" },
   tuxbox: { name: "TuxBox", branch: "tuxbox" },
-  "victory-fork": { name: "victory-fork", branch: "victory-fork" },
+  hyphenn: { name: "hyphenn", branch: "hyphenn" },
   anyxboxx: { name: "AnyXboxX", branch: "anyxboxx" },
   ztrx: { name: "ztrx", branch: "ztrx" },
   dexnom: { name: "DexNom Runtime", branch: "dexnom" },
@@ -164,7 +164,7 @@ async function renderDetail(n) {
 
 function route() {
   if (/^#leonida(\/|$)/.test(location.hash)) { location.replace(location.hash.replace("#leonida", "#leonida-old")); return; } // old links
-  if (/^#victory-gta6(\/|$)/.test(location.hash)) { location.replace(location.hash.replace("#victory-gta6", "#victory-fork")); return; } // renamed 24 Nov 2026
+  if (/^#victory-(gta6|fork)(\/|$)/.test(location.hash)) { location.replace(location.hash.replace(/^#victory-(gta6|fork)/, "#hyphenn")); return; } // renamed 24 and 25 Nov 2026
   const [p, n] = location.hash.slice(1).split("/");
   if (PROJECTS[p] && p !== project) { project = p; shown = PAGE; current = null; tabs(); renderList(); }
   if (n && /^\d+$/.test(n)) renderDetail(+n);

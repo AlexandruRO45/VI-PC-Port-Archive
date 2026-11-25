@@ -1,6 +1,6 @@
-# victory-fork GitHub export
+# hyphenn GitHub export
 
-Issues, pull requests and comments from `fxceless/victory-fork` (called `victory-gta6` until 24 Nov 2026), exported from the GitHub REST API on 2026-11-25.
+Issues, pull requests and comments from `fxceless/victory-fork` (called `victory-gta6` until 24 Nov 2026; archived here as hyphenn), exported from the GitHub REST API on 2026-11-25.
 
 Each file in `data/` is gzipped JSON Lines: one API object per line, unchanged.
 

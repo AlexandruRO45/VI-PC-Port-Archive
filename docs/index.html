@@ -4,12 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GTA6 PC Port Archive</title>
-<meta name="description" content="Archive of the open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory, victory-fork, AnyXboxX, ztrx, DexNom Runtime, VIctory-Belobug-AMD, Xbox2Windows and TuxBox. Code, branches, pull requests, issues and comments, synced hourly. Projects removed from GitHub stay here.">
+<meta name="description" content="Archive of the open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory, hyphenn, AnyXboxX, ztrx, DexNom Runtime, VIctory-Belobug-AMD, Xbox2Windows and TuxBox. Code, branches, pull requests, issues and comments, synced hourly. Projects removed from GitHub stay here.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <script>
   // old links pointed issues at index.html#project/number; they live on browse.html now ("leonida" is now "leonida-old")
-  if (/^#(leonida|leonida-old|leonida-new|xcl|victory|xbox2windows|tuxbox|victory-fork|anyxboxx|ztrx|dexnom|belobug|victory-gta6)(\/\d+)?$/.test(location.hash))
-    location.replace("browse.html" + location.hash.replace(/^#leonida(?=\/|$)/, "#leonida-old").replace(/^#victory-gta6/, "#victory-fork"));
+  if (/^#(leonida|leonida-old|leonida-new|xcl|victory|xbox2windows|tuxbox|hyphenn|victory-fork|anyxboxx|ztrx|dexnom|belobug|victory-gta6)(\/\d+)?$/.test(location.hash))
+    location.replace("browse.html" + location.hash.replace(/^#leonida(?=\/|$)/, "#leonida-old").replace(/^#victory-(gta6|fork)/, "#hyphenn"));
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -170,7 +170,7 @@
 </main>
 
 <footer><div class="wrap">
-  <span>Licenses: Leonida (old and new) GPL-3.0 · xcl GPL-2.0 · VIctory GPL-3.0 · Xbox2Windows MIT · TuxBox Apache-2.0 · victory-fork GPL-3.0 · AnyXboxX GPL-3.0 · ztrx GPL-3.0 · DexNom Runtime GPL-3.0 · VIctory-Belobug-AMD GPL-3.0</span>
+  <span>Licenses: Leonida (old and new) GPL-3.0 · xcl GPL-2.0 · VIctory GPL-3.0 · Xbox2Windows MIT · TuxBox Apache-2.0 · hyphenn GPL-3.0 · AnyXboxX GPL-3.0 · ztrx GPL-3.0 · DexNom Runtime GPL-3.0 · VIctory-Belobug-AMD GPL-3.0</span>
   <a href="https://github.com/Guernica4u/GTA6-PC-Port-Archive">GitHub repository</a>
 </div></footer>
 
@@ -200,15 +200,15 @@ const PROJECTS = {
   tuxbox: { repo: "brcly/TuxBox", saved: "24 Nov 2026", name: "TuxBox", lic: "Apache-2.0", branch: "tuxbox", up: "https://github.com/brcly/TuxBox",
     desc: "Runs Xbox Series games on Linux (through Proton) and Windows.", reached: 2,
     note: "On Linux it starts and shows the player selection screen in 4K. What comes after that isn't checked yet.", src: "https://github.com/brcly/TuxBox/blob/main/docs/PROGRESS.md#games" },
-  "victory-fork": { repo: "fxceless/victory-fork", saved: "24 Nov 2026", name: "victory-fork", gta: true, lic: "GPL-3.0", branch: "victory-fork", up: "https://github.com/fxceless/victory-fork",
+  hyphenn: { repo: "fxceless/victory-fork", saved: "24 Nov 2026", name: "hyphenn", gta: true, top: 3, lic: "GPL-3.0", branch: "hyphenn", up: "https://github.com/fxceless/victory-fork",
     desc: "A fork of VIctory focused on getting GTA VI's world to render and run on a Windows PC.", reached: 4,
     note: "Plays the opening cutscene and renders the first gameplay scene with working input, but at 2-4 fps and with everything in shadow black.", src: "https://github.com/fxceless/victory-fork#status-of-this-fork-2026-11-25" },
   anyxboxx: { repo: "LooperSalty/AnyXboxX", saved: "24 Nov 2026", name: "AnyXboxX", gta: true, lic: "GPL-3.0", branch: "anyxboxx", up: "https://github.com/LooperSalty/AnyXboxX",
-    desc: "An Xbox Series X emulator prototype aimed only at GTA VI for now, running it through victory-fork.", reached: 4,
+    desc: "An Xbox Series X emulator prototype aimed only at GTA VI for now, running it through hyphenn.", reached: 4,
     note: "Shows the world with the character under your control, at about 5.4 fps. Not playable yet: graphics problems remain and there is no ray tracing.", src: "https://github.com/LooperSalty/AnyXboxX#readme" },
-  ztrx: { repo: "Zettrox/ztrx", saved: "25 Nov 2026", name: "ztrx", gta: true, lic: "GPL-3.0", branch: "ztrx", up: "https://github.com/Zettrox/ztrx",
-    desc: "Runs GTA VI's Xbox Series build natively on Windows with NVIDIA cards. Built on VIctory and victory-fork.", reached: 5,
-    note: "The prologue is playable from the cell to the boat chase, and it ran 1 h 30 min without a crash. Only 1-3 fps, shadows are black and there is no ray-traced lighting yet.", src: "https://github.com/Zettrox/ztrx#status-2026-11-25" },
+  ztrx: { repo: "Zettrox/ztrx", saved: "25 Nov 2026", gone: "25 Nov 2026", born: "25 Nov 2026", commits: 226, name: "ztrx", gta: true, lic: "GPL-3.0", branch: "ztrx", up: null, frozen: "Final copy, 25 Nov 2026",
+    desc: "Ran GTA VI's Xbox Series build natively on Windows with NVIDIA cards, prologue playable at 1-3 fps. Built on VIctory and hyphenn. Its GitHub account was removed the day it was published.", reached: 5,
+    note: "The prologue is playable from the cell to the boat chase, and it ran 1 h 30 min without a crash. Only 1-3 fps, shadows are black and there is no ray-traced lighting yet.", src: `${REPO}/tree/main/ztrx#status-2026-11-25` },
   dexnom: { repo: "DexNom/VIctory", saved: "25 Nov 2026", name: "DexNom Runtime", gta: true, top: 1, lic: "GPL-3.0", branch: "dexnom", up: "https://github.com/DexNom/VIctory",
     desc: "A VIctory fork for AMD Radeon cards, with a one-click setup and experimental ray tracing.", reached: 4,
     note: "Plays in the city on an RX 7900 XTX, with experimental ray-traced lighting. Frames can still take seconds and some objects show black.", src: "https://github.com/DexNom/VIctory#changes-in-this-snapshot" },

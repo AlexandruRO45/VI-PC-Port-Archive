@@ -16,9 +16,9 @@ ZERO of Rockstars game assets, files, or leaked info is on this repo, NOTHING HE
 | [`victory/`](victory) | VIctory: an attempt at running GTA VI on PC | `Marvisak/VIctory` | GPL-3.0 |
 | [`xbox2windows/`](xbox2windows) | Xbox2Windows: static recompilation of Xbox Series software for x64 Windows | `R0Y00/Xbox2Windows` | MIT |
 | [`tuxbox/`](tuxbox) | TuxBox: Xbox Series compatibility layer for Linux and Windows | `brcly/TuxBox` | Apache-2.0 |
-| [`victory-fork/`](victory-fork) | victory-fork: a fork of VIctory aimed at getting the world to render and run | `fxceless/victory-fork` (was `victory-gta6`) | GPL-3.0 |
+| [`hyphenn/`](hyphenn) | hyphenn: a fork of VIctory aimed at getting the world to render and run | `fxceless/victory-fork` (was `victory-gta6`) | GPL-3.0 |
 | [`anyxboxx/`](anyxboxx) | AnyXboxX: an Xbox Series X emulator prototype, aimed at GTA VI for now | `LooperSalty/AnyXboxX` | GPL-3.0 |
-| [`ztrx/`](ztrx) | ztrx: runs the Xbox Series build natively on Windows with NVIDIA cards, based on VIctory and victory-fork | `Zettrox/ztrx` | GPL-3.0 |
+| [`ztrx/`](ztrx) | ztrx: runs the Xbox Series build natively on Windows with NVIDIA cards, based on VIctory and hyphenn | `Zettrox/ztrx` (removed from GitHub on 2026-11-25) | GPL-3.0 |
 | [`dexnom/`](dexnom) | DexNom Runtime: a VIctory fork for AMD Radeon cards | `DexNom/VIctory` | GPL-3.0 |
 | [`belobug/`](belobug) | VIctory-Belobug-AMD: a VIctory fork for AMD Radeon cards | `Belobug/VIctory-Belobug-AMD` | GPL-3.0 |
 | [`github-export/`](github-export) | each project's issues, pull requests and comments | | |
@@ -41,7 +41,7 @@ hashes and file paths, is on its own branches:
 | VIctory | `victory/main` | `victory/pr/<number>` (612) | `victory/github-export` |
 | Xbox2Windows | `xbox2windows/main`, other branches as `xbox2windows/branch/<name>` (155), tag `xbox2windows/<tag>` | `xbox2windows/pr/<number>` (1,130) | `xbox2windows/github-export` |
 | TuxBox | `tuxbox/main`, other branches as `tuxbox/branch/<name>` (2) | `tuxbox/pr/<number>` (68) | `tuxbox/github-export` |
-| victory-fork | `victory-fork/main` | `victory-fork/pr/<number>` (43) | `victory-fork/github-export` |
+| hyphenn | `hyphenn/main` | `hyphenn/pr/<number>` (801) | `hyphenn/github-export` |
 | AnyXboxX | `anyxboxx/main`, other branches as `anyxboxx/branch/<name>` (2) | `anyxboxx/pr/<number>` (138) | `anyxboxx/github-export` |
 | ztrx | `ztrx/main` | `ztrx/pr/<number>` (20) | `ztrx/github-export` |
 | DexNom Runtime | `dexnom/main`, other branches as `dexnom/branch/<name>` (2) | `dexnom/pr/<number>` (48) | `dexnom/github-export` |
