@@ -43,6 +43,8 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod placed;
+#[cfg(windows)]
 mod plaincopy;
 #[cfg(windows)]
 mod primitive;
