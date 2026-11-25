@@ -1350,22 +1350,24 @@ mod tests {
 
     #[test]
     fn freed_page_numbers_can_be_reused_at_the_limit() {
-        const CHILD: &str = "VICTORY_TEST_XMEM_PAGE_REUSE";
-        if std::env::var_os(CHILD).is_none() {
-            // Keep the seeded page allocator out of the other XMem tests.
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "modules::xmem::tests::freed_page_numbers_can_be_reused_at_the_limit",
-                ])
-                .env(CHILD, "1")
-                .status()
-                .unwrap();
-            assert!(status.success());
-            return;
-        }
+        // Seed a private allocator so parallel tests never see the artificial limit.
+        let mut allocator = Physical {
+            next_page: PAGE_NUMBER_LIMIT - FRAMES,
+            ..Default::default()
+        };
+        let section = || {
+            let pages = allocate(1);
+            let section = physical().pages[&pages[0]].section.clone();
+            assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+            section
+        };
+        let (original, replacement) = (section(), section());
+        let mut output = [MaybeUninit::uninit()];
+        assert!(allocator.allocate(original, &mut output));
+        // SAFETY: a successful allocation filled the output.
+        let page = unsafe { output[0].assume_init() };
+        assert_eq!(page >> 4, (1 << 21) - 1);
 
-        physical().next_page = PAGE_NUMBER_LIMIT - FRAMES;
         let reserve = || {
             let address = XMemVirtualAlloc(
                 std::ptr::null_mut(),
@@ -1375,42 +1377,55 @@ mod tests {
                 PAGE_READWRITE,
             );
             assert!(!address.is_null());
-            address
+            address as usize
         };
         let (old, new, alias) = (reserve(), reserve(), reserve());
-        let pages = allocate(1);
-        assert_eq!(pages[0] >> 4, (1 << 21) - 1);
-        assert_eq!(XMemMapPhysicalPages(old, 1, pages.as_ptr()), old);
-        assert!(write_physical(&pages, 0, &[7]));
+        let old_slice = allocator.pages[&page].clone();
+        assert!(map(&mut allocator, old, PAGE, old_slice.clone()));
+        View::map(&old_slice, 1).unwrap().bytes()[0] = 7;
 
-        let refused = |requested| {
-            let mut count = requested;
-            let mut output = [1, 2];
-            assert_eq!(
-                XMemAllocatePhysicalPages(0, &mut count, output.as_mut_ptr()),
-                0
-            );
-            assert_eq!(count, 0);
-            assert_eq!(output, [1, 2]);
-        };
-        refused(1);
-        refused(usize::MAX);
-        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
-        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        assert!(!allocator.allocate(replacement.clone(), &mut output));
+        allocator.free(page);
+        allocator.free(page);
         // A second free must not grant another use of the same number.
-        refused(2);
-        assert_eq!(allocate(1), pages);
-        assert_eq!(XMemMapPhysicalPages(new, 1, pages.as_ptr()), new);
-        assert!(map_alias(alias as u64, old as u64, PAGE as u64));
+        let mut too_many = [MaybeUninit::new(1), MaybeUninit::new(2)];
+        assert!(!allocator.allocate(replacement.clone(), &mut too_many));
+        // SAFETY: both elements were initialized before the call.
+        assert_eq!(unsafe { too_many.map(|n| n.assume_init()) }, [1, 2]);
+        assert!(allocator.allocate(replacement, &mut output));
+        // SAFETY: a successful allocation filled the output.
+        assert_eq!(unsafe { output[0].assume_init() }, page);
+        let new_slice = allocator.pages[&page].clone();
+        assert!(map(&mut allocator, new, PAGE, new_slice.clone()));
+        let alias_slice = allocator.views[&old].1.clone();
+        assert!(map(&mut allocator, alias, PAGE, alias_slice));
         // SAFETY: the new view has just been mapped read-write.
-        assert_eq!(unsafe { new.cast::<u8>().read() }, 0);
-        assert!(write_physical(&pages, 0, &[9]));
+        assert_eq!(unsafe { (new as *const u8).read() }, 0);
+        View::map(&new_slice, 1).unwrap().bytes()[0] = 9;
         // SAFETY: all three views are still mapped read-write.
         unsafe {
-            assert_eq!(old.cast::<u8>().read(), 7);
-            assert_eq!(alias.cast::<u8>().read(), 7);
-            assert_eq!(new.cast::<u8>().read(), 9);
+            assert_eq!((old as *const u8).read(), 7);
+            assert_eq!((alias as *const u8).read(), 7);
+            assert_eq!((new as *const u8).read(), 9);
         }
+        for address in [old, new, alias] {
+            unmap(&mut allocator, address, PAGE);
+            // SAFETY: unmap returned the test's view to its own placeholder.
+            let freed = unsafe { VirtualFree(address as *mut c_void, 0, MEM_RELEASE) };
+            assert_ne!(freed, 0);
+        }
+    }
+
+    #[test]
+    fn oversized_physical_request_clears_count_without_writing_page_numbers() {
+        let mut count = usize::MAX;
+        let mut output = [1, 2];
+        assert_eq!(
+            XMemAllocatePhysicalPages(0, &mut count, output.as_mut_ptr()),
+            0
+        );
+        assert_eq!(count, 0);
+        assert_eq!(output, [1, 2]);
     }
 
     #[test]
