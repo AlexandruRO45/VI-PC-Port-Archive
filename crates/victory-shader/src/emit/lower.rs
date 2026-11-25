@@ -3351,6 +3351,7 @@ impl<'a> Lower<'a> {
                         .ok_or("a special operand (vccz, execz, scc, lds_direct)")?;
                     Ok(l.s.m.i32((x >> (32 * h)) as u32))
                 }
+                Some(op) if h == 0 => l.operand(inst, op),
                 // Of a signed operand, a literal sign-extends too.
                 Some(&Operand::Literal(x)) if name.ends_with("_i64") => {
                     Ok(l.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 }))
@@ -5953,15 +5954,24 @@ impl<'a> Lower<'a> {
                         self.boolean(m, c)?
                     }
                     Some(&Operand::Const(k)) => {
-                        let x =
-                            crate::resource::inline(k).ok_or("a select on an untracked mask")?;
-                        if x == 0 {
+                        let mask = if self.x.native.wave64 {
+                            crate::resource::inline64(k)
+                        } else {
+                            crate::resource::inline(k).map(u64::from)
+                        }
+                        .ok_or("a select on an untracked mask")?;
+                        let full = if self.x.native.wave64 {
+                            u64::MAX
+                        } else {
+                            u64::from(u32::MAX)
+                        };
+                        if mask == 0 {
                             self.s.m.bool(false)
-                        } else if x == u32::MAX {
+                        } else if mask == full {
                             self.s.m.bool(true)
                         } else if self.console_lanes {
-                            let lo = self.s.m.i32(x);
-                            let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
+                            let lo = self.s.m.i32(mask as u32);
+                            let hi = self.s.m.i32((mask >> 32) as u32);
                             self.lane_bit(c, lo, Some(hi))
                         } else {
                             return Err("a constant lane mask");
