@@ -29,6 +29,7 @@ use std::ffi::{c_char, c_void};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use windows::Win32::Graphics::Dxgi::IDXGIFactory2;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::core::{Interface, PCSTR, PCWSTR};
 
@@ -562,6 +563,7 @@ type EvaluateFeature =
 type FreeResources = unsafe extern "C" fn(u32, *const Viewport) -> SlResult;
 type GetFeatureFunction = unsafe extern "C" fn(u32, *const c_char, *mut *mut c_void) -> SlResult;
 type SetOptions = unsafe extern "C" fn(*const Viewport, *const Options) -> SlResult;
+type UpgradeInterface = unsafe extern "C" fn(*mut *mut c_void) -> SlResult;
 type Farproc = unsafe extern "system" fn() -> isize;
 
 struct Streamline {
@@ -571,6 +573,7 @@ struct Streamline {
     evaluate_feature: EvaluateFeature,
     free_resources: FreeResources,
     set_options: SetOptions,
+    upgrade_interface: UpgradeInterface,
 }
 
 /// Streamline's warnings and errors in VIctory's log.
@@ -689,12 +692,41 @@ fn streamline(device: *mut c_void) -> Option<&'static Streamline> {
                     b"slFreeResources\0",
                 )?),
                 set_options: std::mem::transmute::<*mut c_void, SetOptions>(set_options),
+                upgrade_interface: std::mem::transmute::<Farproc, UpgradeInterface>(get(
+                    b"slUpgradeInterface\0",
+                )?),
             }
         };
         tracing::info!(?dir, "dlss: Streamline initialised on the host device");
         Some(sl)
     })
     .as_ref()
+}
+
+/// The factory to make the presenter's swap chain with: with DLSS on,
+/// Streamline's proxy for `factory` (Streamline started for `device`, the
+/// host `ID3D12Device`), so that each present runs Streamline's
+/// `presentCommon`, which manual hooking otherwise never calls (its
+/// bookkeeping and the release of what upscales left); else `factory`.
+pub(crate) fn present_factory(device: *mut c_void, factory: IDXGIFactory2) -> IDXGIFactory2 {
+    if !enabled() {
+        return factory;
+    }
+    let Some(sl) = streamline(device) else {
+        return factory;
+    };
+    let mut raw = factory.as_raw();
+    // SAFETY: a live factory; Streamline replaces the pointer with its
+    // proxy, which takes over this reference (`slUpgradeInterface`).
+    let r = unsafe { (sl.upgrade_interface)(&mut raw) };
+    if r != 0 || raw.is_null() {
+        report("slUpgradeInterface", r);
+        return factory;
+    }
+    std::mem::forget(factory);
+    tracing::info!("dlss: presenting through Streamline");
+    // SAFETY: Streamline's proxy, an IDXGIFactory2, with our reference.
+    unsafe { IDXGIFactory2::from_raw(raw) }
 }
 
 /// One upscale context of the title: a Streamline viewport.
