@@ -1953,6 +1953,7 @@ impl HostHeap {
                 None
             } else {
                 MIRROR_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                MIRROR_MADE_KIND[made_kind(&view)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if self.sampler {
                     make(&view, self.cpu(index))
                 } else {
@@ -2200,6 +2201,29 @@ fn sync_tables() -> bool {
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the last frame line: host descriptor views made for records that
+/// changed, by kind: constant buffer, placed texture, placed buffer, shader
+/// (a resource object's view). Says which kind the uncached creations are.
+pub(crate) static MIRROR_MADE_KIND: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The kind of `view` as [`MIRROR_MADE_KIND`] counts it.
+fn made_kind(view: &View) -> usize {
+    match view {
+        View::Constant(..) => 0,
+        View::Placed(..) => {
+            if is_texture_view(view) {
+                1
+            } else {
+                2
+            }
+        }
+        View::Shader(..) => 3,
+        View::Unordered(..) => 2,
+        View::Sampler(..) | View::ConsoleSampler(..) => 1,
+    }
+}
 
 /// Since the last frame line: host descriptor views made for records that
 /// changed (`make`), and those left to the draw or the pass that reads them

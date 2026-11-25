@@ -6599,10 +6599,18 @@ impl Meter {
                 let made = crate::descriptor::host::MIRROR_MADE.swap(0, Ordering::Relaxed) as f64 / frames;
                 let later = crate::descriptor::host::MIRROR_DEFERRED.swap(0, Ordering::Relaxed) as f64 / frames;
                 let copied = crate::descriptor::host::VIEW_COPIED.swap(0, Ordering::Relaxed) as f64 / frames;
+                let kind = [0, 1, 2, 3].map(|i| {
+                    crate::descriptor::host::MIRROR_MADE_KIND[i].swap(0, Ordering::Relaxed) as f64 / frames
+                });
                 if made + later > 0.0 {
                     tracing::info!(
                         "descriptor views per frame: {made:.0} slots made, {copied:.0} copied from a view made before, \
-                         {later:.0} left to the draws that read them"
+                         {later:.0} left to the draws that read them; made by kind: constant {:.0}, placed texture {:.0}, \
+                         placed buffer {:.0}, shader {:.0}",
+                        kind[0],
+                        kind[1],
+                        kind[2],
+                        kind[3]
                     );
                 }
             }
