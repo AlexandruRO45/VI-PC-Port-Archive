@@ -445,7 +445,7 @@ pub(crate) fn let_go_idle(force: bool) {
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
         let keep = Arc::strong_count(s) > 1
-            || (!force && !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES));
+            || !crate::host::idle_expired(s.used.load(Relaxed), idle_ms, IDLE_FRAMES, force);
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
