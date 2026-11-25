@@ -52,6 +52,9 @@ pub(crate) struct Staging {
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
+    /// Exact bytes of each journal page, including the cut first/last pages.
+    /// Published only after a successful upload, never after an OOM.
+    pages: Vec<blake3::Hash>,
     uploaded: bool,
     retry: bool,
 }
@@ -245,6 +248,19 @@ pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Re
     Some(buffer)
 }
 
+/// Split at journal boundaries, with the exact bytes inside the texture.
+fn page_ranges(from: usize, to: usize) -> impl Iterator<Item = (usize, usize)> {
+    use crate::watch::PAGE;
+    let mut at = from;
+    std::iter::from_fn(move || {
+        if at >= to { return None; }
+        let end = at.saturating_add(PAGE - at % PAGE).min(to);
+        let range = (at, end);
+        at = end;
+        Some(range)
+    })
+}
+
 impl Staging {
     /// Copy each subresource to the texture, already in COPY_DEST.
     pub(crate) fn record(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource, buffer: &ID3D12Resource) {
@@ -283,19 +299,68 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let Some(end) = start.checked_add(size).filter(|end| *end > start) else { return (0, None) };
         if let Some(tracked) = &self.tracked {
-            if tracked.take(start, end).is_empty() && last.uploaded && !last.retry {
+            let dirty = tracked.take(start, end);
+            if dirty.is_empty() && last.uploaded && !last.retry {
                 return (0, None);
             }
+            let mut probed = 0;
+            // On a small dirty subset, verify only those pages. Keep the
+            // full read for initial upload and large or genuinely changed
+            // ranges, so detile still sees one complete initialized image.
+            if !last.retry && !last.pages.is_empty()
+                && dirty.iter().map(|(a, b)| b - a).sum::<usize>() < size / 2
+            {
+                let mut page = room(&READ, crate::watch::PAGE).unwrap_or_default();
+                if !page.is_empty() {
+                    let same = dirty.iter().all(|&(a, b)| {
+                        page_ranges(a, b).all(|(a, b)| {
+                            let out = &mut page[..b - a];
+                            crate::host::copy_mapped(out.as_mut_ptr(), a as *const u8, out.len(), false);
+                            probed += out.len();
+                            last.pages.get(a / crate::watch::PAGE - start / crate::watch::PAGE)
+                                == Some(&blake3::hash(out))
+                        })
+                    });
+                    reuse(&READ, page);
+                    if same {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            use crate::copystat::{C, add};
+                            add(C::TexWatched, probed as u64);
+                            add(C::TexIdentical, probed as u64);
+                        }
+                        return (probed, None);
+                    }
+                }
+            }
             last.retry = true;
-            let Some(mut read) = room(&READ, size) else { return (0, None) };
+            let Some(mut read) = room(&READ, size) else { return (probed, None) };
             crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-            let upload = self.stage(host, &read);
+            // The journal is page-granular. Aliases, neighboring allocations
+            // and still-reserved lazy pages can flag a texture whose bytes
+            // did not change. Hash the actual zero-filled data before taking
+            // an UPLOAD allocation or detiling it again.
+            let hash = blake3::hash(&read);
+            let same = last.hash == Some(hash);
+            let upload = if same { None } else { self.stage(host, &read) };
+            if upload.is_some() {
+                last.uploaded = true;
+                last.hash = Some(hash);
+                if size >= 4 * crate::watch::PAGE {
+                    last.pages = page_ranges(start, end)
+                        .map(|(a, b)| blake3::hash(&read[a - start..b - start])).collect();
+                }
+            }
             reuse(&READ, read);
-            last.uploaded |= upload.is_some();
-            last.retry = upload.is_none();
+            last.retry = !same && upload.is_none();
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return (size, upload);
+            {
+                use crate::copystat::{C, add};
+                add(C::TexWatched, (size + probed) as u64);
+                if same { add(C::TexIdentical, size as u64); }
+                if upload.is_some() { add(C::TexChanged, self.size as u64); }
+            }
+            return (size + probed, upload);
         }
         let Some(mut read) = room(&READ, size) else { return (0, None) };
         let Some((hash, bytes)) = read_resident(self.memory, &mut read) else {
@@ -310,7 +375,7 @@ impl Staging {
         if upload.is_some() {
             last.hash = Some(hash);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexChanged, bytes as u64);
+            crate::copystat::add(crate::copystat::C::TexChanged, self.size as u64);
         }
         (bytes, upload)
     }
@@ -568,6 +633,83 @@ mod tests {
             assert_eq!(&upload[y * 256..y * 256 + 16], &[0x57; 16]);
         }
         assert_eq!(&upload[784..], &[0xcc; 240]);
+    }
+
+    #[test]
+    fn watched_texture_skips_false_dirty_uploads_but_uploads_real_changes() {
+        let host = host().expect("D3D12 host");
+        let at = crate::watch::tests::pool(1);
+        let layout = Texture::new(&TextureDesc {
+            dimension: Dimension::Tex2d,
+            format: 28,
+            width: 64, height: 64, depth_or_array: 1, mips: 1, samples: 1, swizzle: Swizzle::LINEAR,
+        }).unwrap().planes[0].layout.clone();
+        let size = layout.size as usize;
+        assert!(size < crate::watch::PAGE);
+        let staging = Staging {
+            size: 16384,
+            footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Width: 64, Height: 64, Depth: 1, RowPitch: 256, ..Default::default() },
+            }],
+            rows: vec![64], layout, mips: 1, memory: at as *const u8,
+            tracked: Some(crate::watch::track(at, size, true).unwrap()), last: Mutex::default(),
+        };
+        assert!(staging.refresh_now(host).1.is_some());
+        assert_eq!(staging.refresh_now(host).0, 0, "clean page needs no read");
+        let mut reads = 0;
+        for _ in 0..32 {
+            // Write after the texture's end but in its tracked page.
+            // SAFETY: the fixture owns the whole page.
+            unsafe { (at as *mut u8).add(size).write_volatile(1); }
+            let (read, upload) = staging.refresh_now(host);
+            reads += read;
+            assert_eq!(read, size);
+            assert!(upload.is_none());
+        }
+        // SAFETY: in the actual texture, unlike the writes above.
+        unsafe { (at as *mut u8).write_volatile(0x5a); }
+        assert!(staging.refresh_now(host).1.is_some());
+        eprintln!("watched fixture: {reads} bytes read, 0 uploaded (previously {} bytes of upload allocations)", 32 * staging.size);
+        drop(staging);
+        // SAFETY: no tracker remains on the owned pool.
+        assert_ne!(unsafe { VirtualFree(at as _, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn watched_large_texture_probes_only_its_dirty_page() {
+        use crate::watch::PAGE;
+        let host = host().expect("D3D12 host");
+        let pool = crate::watch::tests::pool(9);
+        let at = pool + 256;
+        let layout = Texture::new(&TextureDesc {
+            dimension: Dimension::Tex2d,
+            format: 28,
+            width: 512, height: 256, depth_or_array: 1, mips: 1, samples: 1, swizzle: Swizzle::LINEAR,
+        }).unwrap().planes[0].layout.clone();
+        let size = layout.size as usize;
+        let staging = Staging {
+            size: 512 * 256 * 4,
+            footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Width: 512, Height: 256, Depth: 1, RowPitch: 2048, ..Default::default() },
+            }],
+            rows: vec![256], layout, mips: 1, memory: at as *const u8,
+            tracked: Some(crate::watch::track(at, size, true).unwrap()), last: Mutex::default(),
+        };
+        assert!(staging.refresh_now(host).1.is_some());
+        // SAFETY: a neighboring byte of the test's first journal page.
+        unsafe { (pool as *mut u8).write_volatile(0x5a); }
+        let (read, upload) = staging.refresh_now(host);
+        assert_eq!(read, PAGE - 256);
+        assert!(upload.is_none());
+        // SAFETY: the first byte inside the texture, on the same journal page.
+        unsafe { (at as *mut u8).write_volatile(0x5a); }
+        assert!(staging.refresh_now(host).1.is_some());
+        eprintln!("watched sparse fixture: {size} -> {read} source bytes; no upload for unchanged texels");
+        drop(staging);
+        // SAFETY: no tracker remains on the owned pool.
+        assert_ne!(unsafe { VirtualFree(pool as _, 0, MEM_RELEASE) }, 0);
     }
 
     #[test]
