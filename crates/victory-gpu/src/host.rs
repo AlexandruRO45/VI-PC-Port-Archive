@@ -3559,6 +3559,14 @@ impl Host {
             ]);
             p.copy.close();
             self.execute(&[&p.copy]);
+            // The capture and the black-frame probe read what the copy wrote
+            // and are dropped when this returns: with `VICTORY_ASYNC_SUBMIT`
+            // the copy may not have run yet (the device was removed reading
+            // a freed probe).
+            #[cfg(feature = "diagnostics")]
+            if capture.is_some() || probe.is_some() {
+                self.wait_in_flight();
+            }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
@@ -3641,6 +3649,11 @@ impl Host {
             list.ResourceBarrier(&out);
             p.copy.close();
             self.execute(&[&p.copy]);
+            // As in `present`: the capture reads what the copy wrote.
+            #[cfg(feature = "diagnostics")]
+            if capture.is_some() {
+                self.wait_in_flight();
+            }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
