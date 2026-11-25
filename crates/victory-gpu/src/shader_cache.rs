@@ -95,8 +95,11 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     match CACHE.get() {
         Some(cache) => {
             // Translations for hosts without 64-lane waves differ.
+            // So do those that run refused wave64 programs approximately.
             let key = if victory_shader::emit::host_wave64() {
                 *build()
+            } else if victory_shader::emit::wave64_approx() {
+                *blake3::hash(&[&build()[..], b"wave32-approx"].concat()).as_bytes()
             } else {
                 *blake3::hash(&[&build()[..], b"wave32"].concat()).as_bytes()
             };

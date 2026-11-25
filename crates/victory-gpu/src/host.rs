@@ -224,10 +224,15 @@ fn create() -> windows::core::Result<Host> {
             && options.WaveLaneCountMin <= 64
             && options.WaveLaneCountMax >= 64;
         victory_shader::emit::set_host_wave64(wave64);
+        // `VICTORY_WAVE64_APPROX=1`: wave64 programs the split refuses run
+        // anyway in 32-lane waves, possibly drawing wrong, instead of not.
+        let approx = !wave64 && crate::switch::on("VICTORY_WAVE64_APPROX");
+        victory_shader::emit::set_wave64_approx(approx);
         tracing::info!(
             min = options.WaveLaneCountMin,
             max = options.WaveLaneCountMax,
             wave64,
+            approx,
             "host wave lanes"
         );
         let messages = debug

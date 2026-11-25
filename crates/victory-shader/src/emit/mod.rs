@@ -261,6 +261,22 @@ pub fn set_host_wave64(supported: bool) {
     HOST_WAVE64.store(supported, std::sync::atomic::Ordering::Relaxed);
 }
 
+static WAVE64_APPROX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// On a host without 64-lane waves ([`set_host_wave64`]): wave64 programs
+/// the exact split refuses run anyway, in the host's waves, their
+/// cross-lane results possibly wrong (`lower::lower_with`), instead of
+/// being left out. Off by default; part of every translation, so the
+/// shader cache keys on it.
+pub fn set_wave64_approx(on: bool) {
+    WAVE64_APPROX.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What [`set_wave64_approx`] last set.
+pub fn wave64_approx() -> bool {
+    WAVE64_APPROX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// What [`set_host_wave64`] last set.
 pub fn host_wave64() -> bool {
     HOST_WAVE64.load(std::sync::atomic::Ordering::Relaxed)

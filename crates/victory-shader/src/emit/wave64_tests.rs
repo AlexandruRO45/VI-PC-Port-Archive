@@ -197,6 +197,56 @@ fn lower_counting(
     lds: u32,
     host_wave64: bool,
 ) -> Result<(HostShader, u32), String> {
+    lower_counting_with(words, threads, lds, host_wave64, false)
+}
+
+/// The wave size a DXIL container's `PSV0` part declares (its minimum),
+/// none for 0.
+fn declared_wave(dxil: &[u8]) -> Option<u32> {
+    let u32_at = |o: usize| dxil.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let parts = u32_at(28)? as usize;
+    for k in 0..parts {
+        let at = u32_at(32 + 4 * k)? as usize;
+        if dxil.get(at..at + 4)? == b"PSV0" {
+            // Part header (8), the info's size (4), then the info: the
+            // minimum wave lanes at 16.
+            return u32_at(at + 8 + 4 + 16).filter(|&n| n != 0);
+        }
+    }
+    None
+}
+
+/// A program the split refuses (LDS shared without barriers in one console
+/// wave of more than 32 threads) runs approximately with the fallback: it
+/// lowers as for 64-lane waves and declares no wave size, where without
+/// the fallback it is refused, and a program the split takes is untouched.
+#[test]
+fn a_refused_wave64_program_runs_in_narrower_waves_with_the_fallback() {
+    let mut w = prologue();
+    w.extend(vop3(V_READLANE, 14, v(1), k(40), 0));
+    w.push(v_mov_b32(5, s(14)));
+    w.extend(store(5, 0, 64));
+    w.push(S_ENDPGM);
+    assert!(lower_counting_with(&w, 64, 512, false, false).is_err(), "refused without");
+    let (approx, _) = lower_counting_with(&w, 64, 512, false, true).expect("lowered with the fallback");
+    assert_eq!(declared_wave(&approx.dxil), None, "no wave size declared");
+    let (exact, _) = lower_counting_with(&w, 64, 512, true, false).expect("for 64-lane waves");
+    assert_eq!(declared_wave(&exact.dxil), Some(64), "64 where the host has it");
+    // Taken by the split: the same with or without the fallback.
+    let (split, _) = lower_counting_with(&w, 128, 512, false, false).expect("split");
+    let (split_too, _) = lower_counting_with(&w, 128, 512, false, true).expect("split too");
+    assert_eq!(split.dxil, split_too.dxil);
+    assert_eq!(declared_wave(&split.dxil), Some(32));
+}
+
+/// [`lower_counting`] through `lower::lower_with` and its fallback.
+fn lower_counting_with(
+    words: &[u32],
+    threads: u32,
+    lds: u32,
+    host_wave64: bool,
+    approx: bool,
+) -> Result<(HostShader, u32), String> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
@@ -229,7 +279,7 @@ fn lower_counting(
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower_for(
+    let lowered = lower::lower_with(
         &lower::Parts {
             native: &native,
             p: &p,
@@ -243,6 +293,7 @@ fn lower_counting(
             view_marks: false,
         },
         host_wave64,
+        approx,
     )
     .map_err(|e| e.to_string())?;
     let syncs = lowered.group_syncs;

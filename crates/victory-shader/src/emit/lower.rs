@@ -101,7 +101,29 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_for(parts, super::host_wave64())
+    lower_with(parts, super::host_wave64(), super::wave64_approx())
+}
+
+/// [`lower_for`]; on a host without 64-lane waves and with `approx`
+/// ([`super::set_wave64_approx`]), a wave64 program the split refuses is
+/// lowered as for a host with them and declares no wave size, so it runs
+/// in the host's narrower waves instead of not at all.
+/// shortcut: such a program's lanes past the host's wave are not there for
+/// lane reads, its ballots miss the other host wave's lanes, and LDS it
+/// shares without barriers races between the two host waves: its results
+/// can be wrong where the exact split could give none.
+pub(crate) fn lower_with(
+    parts: &Parts,
+    host_wave64: bool,
+    approx: bool,
+) -> Result<Lowered, ShaderError> {
+    match lower_for(parts, host_wave64) {
+        Err(e) if !host_wave64 && approx && e.to_string().contains("without 64-lane waves") => {
+            let _undeclared = super::shader::UndeclaredWave64::new();
+            lower_for(parts, true)
+        }
+        r => r,
+    }
 }
 
 /// [`lower`] for a host that runs 64-lane waves (`host_wave64`) or not: a

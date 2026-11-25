@@ -62,6 +62,29 @@ pub fn set_heap_views(n: u32) -> bool {
     true
 }
 
+thread_local! {
+    /// Shaders finished on this thread declare no wave size above 32
+    /// ([`UndeclaredWave64`]).
+    static UNDECLARED_WAVE64: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While this lives, shaders finished on this thread declare no wave size
+/// above 32: a wave64 program lowered for 64-lane waves then runs in a
+/// host's narrower ones (`lower::lower_with`).
+pub(crate) struct UndeclaredWave64(bool);
+
+impl UndeclaredWave64 {
+    pub(crate) fn new() -> Self {
+        UndeclaredWave64(UNDECLARED_WAVE64.replace(true))
+    }
+}
+
+impl Drop for UndeclaredWave64 {
+    fn drop(&mut self) {
+        UNDECLARED_WAVE64.set(self.0);
+    }
+}
+
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes
@@ -600,6 +623,12 @@ impl Shader {
         h
     }
 
+    /// The wave size the container declares: [`Shader::wave_size`], but
+    /// none above 32 while an [`UndeclaredWave64`] lives on this thread.
+    fn declared_wave_size(&self) -> Option<u32> {
+        self.wave_size.filter(|&n| n <= 32 || !UNDECLARED_WAVE64.get())
+    }
+
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
@@ -914,7 +943,7 @@ impl Shader {
             let state = [3, max, 1, 5, 1].map(|n| Some(i32c(&mut self, n)));
             props.push(self.m.md_node(state.to_vec()));
         }
-        if let Some(n) = self.wave_size {
+        if let Some(n) = self.declared_wave_size() {
             props.push(i32c(&mut self, 11));
             let n = Some(i32c(&mut self, n));
             props.push(self.m.md_node(vec![n]));
@@ -1007,7 +1036,7 @@ impl Shader {
             gs: self.gs,
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
-            wave_size: self.wave_size,
+            wave_size: self.declared_wave_size(),
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);
