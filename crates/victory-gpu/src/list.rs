@@ -659,7 +659,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if crate::resource::skipped_mips(dst) + crate::resource::skipped_mips(src) > 0 {
                 return;
             }
-            if crate::texture::title_written(from) {
+            if crate::texture::title_written(src) {
                 crate::texture::upload(&list, src, from);
             }
             ensure_state(&list, dst, COPY_DEST);
@@ -945,7 +945,7 @@ extern "system" fn copy_texture_region(
             if crate::resource::skipped_mips(src.resource) > 0 {
                 return;
             }
-            if crate::texture::title_written(texture) {
+            if crate::texture::title_written(src.resource) {
                 crate::texture::upload(&list, src.resource, texture);
             }
             ensure_state(&list, src.resource, COPY_SOURCE);
