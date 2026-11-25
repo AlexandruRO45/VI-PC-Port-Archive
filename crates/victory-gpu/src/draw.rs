@@ -1608,10 +1608,11 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
-        let asked = std::time::Instant::now();
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
+        let remap_started = std::time::Instant::now();
         host.texture_slots_remapped(frame);
+        let remap_time = remap_started.elapsed();
         if heap_recheck() {
             // Sample at most one batch per heap and frame. Check time before
             // each sample; unprocessed entries stay due for the next frame.
@@ -1632,8 +1633,12 @@ impl State {
                 HEAP_TEXTURE_RECHECK_US.fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
+        let queue_started = std::time::Instant::now();
         let (due, census) = host.texture_slots_due(frame, 4096);
-        HEAP_PHASES[2].fetch_add(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
+        HEAP_PHASES[2].fetch_add(
+            (remap_time + queue_started.elapsed()).as_micros() as u64,
+            Ordering::Relaxed,
+        );
         let phase = |i: usize, since: std::time::Instant| {
             HEAP_PHASES[i].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
         };
