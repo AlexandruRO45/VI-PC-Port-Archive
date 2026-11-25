@@ -88,6 +88,9 @@ pub(crate) struct Shadow {
     /// the card alone keeps in step with the title's memory in its arena,
     /// and the bytes from its first byte to `start`.
     resident: Option<(Arc<crate::resident::Resident>, u64)>,
+    /// With residents, for a window in place: the last frame it was asked
+    /// for in, and how many frames running ([`hot_window`]).
+    heat: [AtomicU64; 2],
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2264,6 +2267,7 @@ impl Shadow {
             section: None,
             remapped: std::sync::atomic::AtomicBool::new(false),
             resident: None,
+            heat: [AtomicU64::new(0), AtomicU64::new(0)],
         }
     }
 
@@ -3811,7 +3815,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     drop_stale(&mut map, (start, len));
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
-        return Some(shadow.clone());
+        return Some(hot_window(&mut map, (start, len)));
     }
     // With arenas, over view memory: a 4 MiB window is rarely one run of a
     // section (the census: 1,948 MB of windows over views have unmapped
@@ -3824,7 +3828,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         drop_stale(&mut map, (run, bytes));
         if let Some(shadow) = map.get(&(run, bytes)) {
             note(shadow);
-            return Some(shadow.clone());
+            return Some(hot_window(&mut map, (run, bytes)));
         }
         if let Some(placed) = crate::inplace::place_for(run, bytes, true) {
             let shadow = Arc::new(Shadow::placed(placed, run, bytes, true));
@@ -3952,6 +3956,86 @@ pub(crate) fn exact_line(frames: f64) {
         asked as f64 / frames,
         made as f64 / frames
     );
+}
+
+/// The frames running a window in place must be asked for in before it
+/// becomes a resident (`VICTORY_RESIDENT_HOT_FRAMES`, 3; [`hot_window`]).
+fn hot_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| std::env::var("VICTORY_RESIDENT_HOT_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3).max(1))
+}
+
+/// A run of frames a window was asked for in, after an ask in `frame`
+/// (the last ask was in `last`, the run so far `run` frames): the run, and
+/// whether it reached `hot` with this ask. Frames more than 8 apart start
+/// the run anew.
+fn warmed(last: u64, frame: u64, run: u64, hot: u64) -> (u64, bool) {
+    if frame == last {
+        return (run, false);
+    }
+    let run = if last == 0 || frame > last + 8 { 1 } else { run + 1 };
+    (run, run == hot)
+}
+
+/// With residents (`crate::resident`, `VICTORY_INPLACE=4`), the window in
+/// place at `key` that is being handed out: one that shaders asked for in
+/// [`hot_frames`] frames running, of the size of a buffer that would get a
+/// copy in the card's memory or more, becomes a resident there, once (in
+/// place the card reads it over the bus every frame: run inplace3-pool,
+/// the card's waits 79.5 -> 106.2 ms, the bus 3.5 -> 4.8 GB/s). The window
+/// in place stays for what holds it; the table hands out the resident.
+/// Windows in residents the new one replaces are let go too.
+fn hot_window(map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, key: (u64, u64)) -> Arc<Shadow> {
+    let shadow = map[&key].clone();
+    if !crate::resident::on() || shadow.place.is_none() || !cards() || shadow.len < card_limits().0 {
+        return shadow;
+    }
+    let frame = crate::frame::current();
+    let (run, hot) = warmed(shadow.heat[0].swap(frame, Ordering::Relaxed), frame, shadow.heat[1].load(Ordering::Relaxed), hot_frames());
+    shadow.heat[1].store(run, Ordering::Relaxed);
+    if !hot {
+        return shadow;
+    }
+    let Some(found) = crate::resident::find(shadow.start, shadow.len, true) else {
+        return shadow;
+    };
+    let gone: Vec<(u64, u64)> =
+        map.iter().filter(|(_, s)| s.in_resident().is_some_and(|r| found.replaced.iter().any(|x| Arc::ptr_eq(x, r)))).map(|(k, _)| *k).collect();
+    for k in gone {
+        crate::host::retire(map.remove(&k));
+    }
+    let mut window = Shadow::resident(found.resident, found.bias, shadow.start, shadow.len);
+    window.window = true;
+    window.used.store(shadow.used.load(Ordering::Relaxed), Ordering::Relaxed);
+    let window = Arc::new(window);
+    crate::host::retire(map.insert(key, window.clone()));
+    window
+}
+
+#[cfg(test)]
+mod heat_tests {
+    use super::warmed;
+
+    /// A window becomes hot once, in the third frame running it is asked
+    /// for in; asks within a frame count once; a gap of more than 8 frames
+    /// starts the run anew.
+    #[test]
+    fn a_window_is_hot_in_the_third_frame_running() {
+        let mut state = (0u64, 0u64);
+        let mut ask = |frame: u64| {
+            let (run, hot) = warmed(state.0, frame, state.1, 3);
+            state = (frame, run);
+            hot
+        };
+        assert!(!ask(10));
+        assert!(!ask(10), "the same frame");
+        assert!(!ask(11));
+        assert!(ask(13), "within 8 frames: the third");
+        assert!(!ask(14), "once");
+        assert!(!ask(30), "a gap: anew");
+        assert!(!ask(31));
+        assert!(ask(32));
+    }
 }
 
 #[cfg(test)]
