@@ -18,7 +18,8 @@
 //! 0 is uploaded (every mip and array slice), depth and stencil planes are
 //! not.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -57,6 +58,54 @@ struct Last {
     pages: Vec<blake3::Hash>,
     uploaded: bool,
     retry: bool,
+}
+
+fn staging_margin(enabled: Option<&str>, mb: Option<&str>) -> Option<u64> {
+    if enabled == Some("0") { return None; }
+    Some(mb.and_then(|v| v.parse::<u64>().ok()).unwrap_or(256).saturating_mul(1 << 20))
+}
+
+/// Remaining space for one staging allocation, or None to keep the old path.
+fn headroom(margin: Option<u64>, query: impl FnOnce() -> Option<(u64, u64)>) -> Option<u64> {
+    let margin = margin?; // Opt-out must not even look up the DXGI adapter.
+    let (usage, budget) = query()?;
+    // On UMA there may be no NON_LOCAL segment at all.
+    if usage == 0 && budget == 0 { return None; }
+    Some(budget.saturating_sub(margin).saturating_sub(usage))
+}
+
+fn staging_headroom(device: &ID3D12Device) -> Option<u64> {
+    static MARGIN: OnceLock<Option<u64>> = OnceLock::new();
+    let margin = MARGIN.get_or_init(|| staging_margin(
+        std::env::var("VICTORY_STAGING_BUDGET").ok().as_deref(),
+        std::env::var("VICTORY_STAGING_BUDGET_MARGIN_MB").ok().as_deref(),
+    ));
+    headroom(*margin, || {
+        // Host has one device for the process. Cache failed samples too.
+        type Sample = (Instant, Option<(u64, u64)>);
+        static SAMPLE: Mutex<Option<Sample>> = Mutex::new(None);
+        let mut sample = SAMPLE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, value)) = *sample && at.elapsed() < Duration::from_millis(100) {
+            return value;
+        }
+        let value = non_local_memory(device);
+        *sample = Some((Instant::now(), value));
+        value
+    })
+}
+
+fn non_local_memory(device: &ID3D12Device) -> Option<(u64, u64)> {
+    use windows::Win32::Graphics::Dxgi::*;
+    static ADAPTER: OnceLock<Option<IDXGIAdapter3>> = OnceLock::new();
+    // SAFETY: the host device is live; select its exact adapter.
+    let adapter = ADAPTER.get_or_init(|| unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid(device.GetAdapterLuid())).ok()
+    }).as_ref()?;
+    let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    // SAFETY: valid output for the host's node zero.
+    unsafe { adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut info) }.ok()?;
+    Some((info.CurrentUsage, info.Budget))
 }
 
 thread_local! {
@@ -286,14 +335,14 @@ impl Staging {
     pub(crate) fn refresh(&self, host: &crate::host::Host) -> Option<ID3D12Resource> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let (read, changed) = self.refresh_now(host);
+        let (read, changed) = self.refresh_now(host, || staging_headroom(&host.device));
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
         changed
     }
 
-    fn refresh_now(&self, host: &crate::host::Host) -> (usize, Option<ID3D12Resource>) {
+    fn refresh_now(&self, host: &crate::host::Host, headroom: impl FnOnce() -> Option<u64>) -> (usize, Option<ID3D12Resource>) {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
@@ -342,7 +391,7 @@ impl Staging {
             // an UPLOAD allocation or detiling it again.
             let hash = blake3::hash(&read);
             let same = last.hash == Some(hash);
-            let upload = if same { None } else { self.stage(host, &read) };
+            let upload = if same { None } else { self.stage(host, &read, last.uploaded, headroom) };
             if upload.is_some() {
                 last.uploaded = true;
                 last.hash = Some(hash);
@@ -370,9 +419,10 @@ impl Staging {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, bytes as u64);
-        let upload = if last.hash == Some(hash) { None } else { self.stage(host, &read) };
+        let upload = if last.hash == Some(hash) { None } else { self.stage(host, &read, last.uploaded, headroom) };
         reuse(&READ, read);
         if upload.is_some() {
+            last.uploaded = true;
             last.hash = Some(hash);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexChanged, self.size as u64);
@@ -387,7 +437,12 @@ impl Staging {
         Some(at..at + padded.min(self.size.checked_sub(at)?))
     }
 
-    fn stage(&self, host: &crate::host::Host, tiled: &[u8]) -> Option<ID3D12Resource> {
+    fn stage(&self, host: &crate::host::Host, tiled: &[u8], uploaded: bool, headroom: impl FnOnce() -> Option<u64>) -> Option<ID3D12Resource> {
+        if uploaded && headroom().is_some_and(|left| self.size as u64 > left) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexDeferred, 1);
+            return None;
+        }
         let max = self.footprints.iter().zip(&self.rows).try_fold(0usize, |n, (fp, &r)| {
             Some(n.max(self.span(fp, r)?.len()))
         })?;
@@ -655,21 +710,31 @@ mod tests {
             rows: vec![64], layout, mips: 1, memory: at as *const u8,
             tracked: Some(crate::watch::track(at, size, true).unwrap()), last: Mutex::default(),
         };
-        assert!(staging.refresh_now(host).1.is_some());
-        assert_eq!(staging.refresh_now(host).0, 0, "clean page needs no read");
+        assert!(staging.refresh_now(host, || Some(0)).1.is_some());
+        assert_eq!(staging.refresh_now(host, || None).0, 0, "clean page needs no read");
         let mut reads = 0;
         for _ in 0..32 {
             // Write after the texture's end but in its tracked page.
             // SAFETY: the fixture owns the whole page.
             unsafe { (at as *mut u8).add(size).write_volatile(1); }
-            let (read, upload) = staging.refresh_now(host);
+            let (read, upload) = staging.refresh_now(host, || None);
             reads += read;
             assert_eq!(read, size);
             assert!(upload.is_none());
         }
         // SAFETY: in the actual texture, unlike the writes above.
         unsafe { (at as *mut u8).write_volatile(0x5a); }
-        assert!(staging.refresh_now(host).1.is_some());
+        let previous = staging.last.lock().unwrap().hash.unwrap();
+        assert!(staging.refresh_now(host, || headroom(staging_margin(None, None), || Some((512 << 20, 768 << 20)))).1.is_none());
+        {
+            let last = staging.last.lock().unwrap();
+            assert!(last.retry);
+            assert_eq!(last.hash, Some(previous)); // no copy recorded; previous contents remain published
+        }
+        // No intervening write: the consumed journal entry must not lose the change.
+        assert!(staging.refresh_now(host, || Some(staging.size as u64)).1.is_some());
+        assert!(!staging.last.lock().unwrap().retry);
+        assert_ne!(staging.last.lock().unwrap().hash, Some(previous));
         eprintln!("watched fixture: {reads} bytes read, 0 uploaded (previously {} bytes of upload allocations)", 32 * staging.size);
         drop(staging);
         // SAFETY: no tracker remains on the owned pool.
@@ -697,19 +762,58 @@ mod tests {
             rows: vec![256], layout, mips: 1, memory: at as *const u8,
             tracked: Some(crate::watch::track(at, size, true).unwrap()), last: Mutex::default(),
         };
-        assert!(staging.refresh_now(host).1.is_some());
+        assert!(staging.refresh_now(host, || None).1.is_some());
         // SAFETY: a neighboring byte of the test's first journal page.
         unsafe { (pool as *mut u8).write_volatile(0x5a); }
-        let (read, upload) = staging.refresh_now(host);
+        let (read, upload) = staging.refresh_now(host, || None);
         assert_eq!(read, PAGE - 256);
         assert!(upload.is_none());
         // SAFETY: the first byte inside the texture, on the same journal page.
         unsafe { (at as *mut u8).write_volatile(0x5a); }
-        assert!(staging.refresh_now(host).1.is_some());
+        assert!(staging.refresh_now(host, || None).1.is_some());
         eprintln!("watched sparse fixture: {size} -> {read} source bytes; no upload for unchanged texels");
         drop(staging);
         // SAFETY: no tracker remains on the owned pool.
         assert_ne!(unsafe { VirtualFree(pool as _, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn untracked_budget_retries_and_opt_out_uploads_the_same_bytes() {
+        let host = host().expect("D3D12 host");
+        let layout = Texture::new(&TextureDesc {
+            dimension: Dimension::Tex2d, format: 28, width: 64, height: 64,
+            depth_or_array: 1, mips: 1, samples: 1, swizzle: Swizzle::LINEAR,
+        }).unwrap().planes[0].layout.clone();
+        let mut source = vec![0x5a; layout.size as usize];
+        let staging = Staging {
+            size: 64 * 256, footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Width: 64, Height: 64, Depth: 1, RowPitch: 256, ..Default::default()
+                },
+            }], rows: vec![64], layout, mips: 1, memory: source.as_ptr(), tracked: None, last: Mutex::default(),
+        };
+        let bytes = |upload: &ID3D12Resource| {
+            let mut data = std::ptr::null_mut();
+            // SAFETY: a live mappable upload of staging.size bytes. Balance this extra Map.
+            unsafe {
+                upload.Map(0, None, Some(&mut data)).unwrap();
+                let bytes = std::slice::from_raw_parts(data.cast::<u8>(), staging.size).to_vec();
+                upload.Unmap(0, Some(&D3D12_RANGE::default()));
+                bytes
+            }
+        };
+        let full = || headroom(staging_margin(None, None), || Some((768 << 20, 768 << 20)));
+        let first = staging.refresh_now(host, full).1.unwrap();
+        source.fill(0xaa);
+        assert!(staging.refresh_now(host, full).1.is_none());
+        assert_eq!(bytes(&first), vec![0x5a; staging.size]);
+        let second = staging.refresh_now(host, || Some(staging.size as u64)).1.unwrap();
+        assert_eq!(bytes(&second), vec![0xaa; staging.size]);
+        source.fill(0x5a);
+        let off = || headroom(staging_margin(Some("0"), None), || panic!("queried when disabled"));
+        let third = staging.refresh_now(host, off).1.unwrap();
+        assert_eq!(bytes(&third), bytes(&first));
+        assert!(staging.refresh_now(host, off).1.is_none());
     }
 
     #[test]
