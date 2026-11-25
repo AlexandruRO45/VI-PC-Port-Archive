@@ -544,8 +544,8 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
-                    host.log_messages();
+                    let messages = host.log_messages();
+                    tracing::warn!(error = %e, ?shaders, ?messages, "host pipeline refused");
                     return None;
                 }
             };
@@ -578,8 +578,8 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
-                    host.log_messages();
+                    let messages = host.log_messages();
+                    tracing::warn!(error = %e, ?shaders, ?messages, "host mesh pipeline refused");
                     return None;
                 }
             };
@@ -654,8 +654,8 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
-                host.log_messages();
+                let messages = host.log_messages();
+                tracing::warn!(error = %e, ?shaders, ?messages, "host pipeline refused");
                 return None;
             }
         };
