@@ -6645,7 +6645,13 @@ impl<'a> Lower<'a> {
             // shortcut: no constant operand seen; its high half is not known.
             return Err("a constant operand of v_pk_fmac_f16");
         }
-        let x = self.operand(inst, &op)?;
+        // Source 0 may be the value DPP selected from another lane, which
+        // `valu` stored in `self.src0`; reading the operand again would take
+        // this lane's own.
+        let x = match (k, self.src0) {
+            (0, Some(x)) => x,
+            _ => self.operand(inst, &op)?,
+        };
         let c = self.cur;
         let x = if high {
             let k16 = self.s.m.i32(16);

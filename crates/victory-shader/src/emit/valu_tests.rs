@@ -1747,3 +1747,23 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+/// `v_pk_fmac_f16` with DPP multiplies the lane DPP selected, not the
+/// executing lane's own src0: lane 0 shifts its row's source out of the row,
+/// so the bound-control source is zero and the product is zero (without the
+/// DPP read it would be 2.0 * 2.0).
+#[test]
+fn packed_fmac_multiplies_the_dpp_selected_lane() {
+    // v_mov_b32 v2, v1; v_mov_b32 v0, 0;
+    // v_pk_fmac_f16 v0, dpp(v2), v1 with row_shr:1, bound_ctrl.
+    let dpp = 0x3C << 25 | 1 << 9 | 0xFA;
+    let ext = 0xF << 28 | 0xF << 24 | 1 << 19 | 0x111 << 8 | 2;
+    let shader = build_valu_cs(&[vop1(0x001, 2, vgpr(1)), vop1(0x001, 0, 0x80), dpp, ext]);
+    run_cases(
+        &shader,
+        &[[0x4000_4000, 0, 0, 0]],
+        |backend, _, _, got| {
+            assert_eq!(got, 0, "{backend}: the DPP source is lane 0's own zero");
+        },
+    );
+}
