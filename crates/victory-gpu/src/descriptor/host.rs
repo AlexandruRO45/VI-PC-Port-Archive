@@ -4583,18 +4583,47 @@ void main(uint3 id : SV_DispatchThreadID) {
             3, 0, 0, 0, 16, 0, 16, 0x0001_0001, DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, 1, 0, 0x100,
             0, 0,
         ];
+        let tex_srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        // SAFETY: 40-byte POD view description.
+        let tex_srv_words: [u32; 10] =
+            unsafe { std::ptr::from_ref(&tex_srv).cast::<[u32; 10]>().read() };
 
-        // Scenario 1: Steady-state frame with 1 released transient resource + 256 rewritten slots.
+        // Scenario 1: Steady-state frame with 1 clean bound view going stale + 256 rewritten slots.
         let mut s1 = Vec::with_capacity(SAMPLES);
         for iter in 0..(WARMUP + SAMPLES) {
+            // Materialize a bound transient buffer SRV in slot 0 on the preceding frame
+            // so slot 0 is clean (not in `dirty`) when the resource is released below.
             crate::queue::pass_frame();
-            // Create and release a transient buffer + view so VIEWED bumps realistically.
             let trans = make_title_buffer(tex_addr_base, 256, false);
             let words = make_raw_srv(0, 16);
             create_srv(std::ptr::null(), trans, &words, slot_handle(0));
+            {
+                let mut b = host_heap.bindless.lock().unwrap();
+                b.budget = None;
+            }
+            let _ = host_heap.bindless_plan().unwrap();
+            {
+                let b = host_heap.bindless.lock().unwrap();
+                assert!(b.slots.contains_key(&0) && !b.dirty.contains(&0));
+            }
+
+            // Advance frame, release the bound resource (stale detection must find clean slot 0),
+            // and rewrite 256 other slots (keeping slots 0..2 reserved).
+            crate::queue::pass_frame();
             assert_eq!(release(trans), 0);
-            // Rewrite 256 slots across the heap.
-            let base_slot = (iter * 256) % (SLOTS - 256);
+            let base_slot = 2 + (iter * 256) % (SLOTS - 258);
             for k in 0..256 {
                 let s = base_slot + k;
                 let (b_addr, b_res) = buffers[s % BUFFERS];
@@ -4634,24 +4663,55 @@ void main(uint3 id : SV_DispatchThreadID) {
             let plan = std::hint::black_box(host_heap.bindless_plan().unwrap());
             let us = t0.elapsed().as_secs_f64() * 1e6;
             assert!(!plan.reads.is_empty());
+            assert!(
+                !host_heap.bindless.lock().unwrap().slots.contains_key(&0),
+                "clean stale slot 0 must be found and dropped"
+            );
             if iter >= WARMUP {
                 s1.push(us);
             }
         }
         stats("steady_frame_256_rewrites_64k", s1);
 
-        // Scenario 2: Frame with placed-texture eviction epoch + VIEWED bump + 256 rewrites.
+        // Scenario 2: Frame with a bound placed texture evicted + clean stale view + 256 rewrites.
         let mut s2 = Vec::with_capacity(SAMPLES);
+        let probe_addr = tex_addr_base + (64 << 10);
+        let mut placed_tex_srv = [0u32; 16];
+        placed_tex_srv[..10].copy_from_slice(&tex_srv_words);
+        placed_tex_srv[10] = probe_addr as u32;
+        placed_tex_srv[11] = (probe_addr >> 32) as u32;
         for iter in 0..(WARMUP + SAMPLES) {
+            // Materialize both a bound transient buffer SRV (slot 0) and a bound placed
+            // texture (slot 1) on the preceding frame so both are clean before eviction.
             crate::queue::pass_frame();
-            let probe_addr = tex_addr_base + (64 << 10);
-            assert!(crate::resource::texture_at(probe_addr, &tex_desc, 0).is_some());
-            crate::watch::title_memory_remapped(probe_addr as usize, 64 << 10);
             let trans = make_title_buffer(tex_addr_base, 256, false);
             let words = make_raw_srv(0, 16);
-            create_srv(std::ptr::null(), trans, &words, slot_handle(1));
+            create_srv(std::ptr::null(), trans, &words, slot_handle(0));
+            create_placed_srv(std::ptr::null(), &tex_desc, &placed_tex_srv, slot_handle(1));
+            {
+                let mut b = host_heap.bindless.lock().unwrap();
+                b.budget = None;
+            }
+            let _ = host_heap.bindless_plan().unwrap();
+            let old_host_tex = {
+                use windows::core::Interface;
+                let b = host_heap.bindless.lock().unwrap();
+                assert!(b.slots.contains_key(&0) && !b.dirty.contains(&0));
+                assert!(!b.dirty.contains(&1));
+                let t = b.uses.get(&1).and_then(|u| u.placed).unwrap_or(0);
+                assert_ne!(t, 0, "bound placed texture in slot 1 must be materialized");
+                host_heap.kept.lock().unwrap()[1]
+                    .as_ref()
+                    .map(|r| r.as_raw() as usize)
+                    .expect("bound placed texture must be kept in slot 1")
+            };
+
+            // Advance frame, evict the bound placed texture and release the bound view,
+            // and rewrite 256 other slots (keeping slots 0..2 reserved).
+            crate::queue::pass_frame();
+            crate::watch::title_memory_remapped(probe_addr as usize, 64 << 10);
             assert_eq!(release(trans), 0);
-            let base_slot = (iter * 256) % (SLOTS - 256);
+            let base_slot = 2 + (iter * 256) % (SLOTS - 258);
             for k in 0..256 {
                 let s = base_slot + k;
                 let (b_addr, _) = buffers[s % BUFFERS];
@@ -4670,6 +4730,27 @@ void main(uint3 id : SV_DispatchThreadID) {
             let plan = std::hint::black_box(host_heap.bindless_plan().unwrap());
             let us = t0.elapsed().as_secs_f64() * 1e6;
             assert!(!plan.reads.is_empty());
+            {
+                use windows::core::Interface;
+                let b = host_heap.bindless.lock().unwrap();
+                assert!(
+                    !b.slots.contains_key(&0),
+                    "clean stale slot 0 must be found and dropped"
+                );
+                assert_ne!(
+                    b.uses.get(&1).and_then(|u| u.placed).unwrap_or(0),
+                    0,
+                    "evicted placed texture in slot 1 must be re-materialized"
+                );
+                let new_host_tex = host_heap.kept.lock().unwrap()[1]
+                    .as_ref()
+                    .map(|r| r.as_raw() as usize);
+                assert_ne!(
+                    new_host_tex,
+                    Some(old_host_tex),
+                    "evicted placed texture in slot 1 must replace the host texture"
+                );
+            }
             if iter >= WARMUP {
                 s2.push(us);
             }
@@ -4680,7 +4761,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut s3 = Vec::with_capacity(SAMPLES);
         for iter in 0..(WARMUP + SAMPLES) {
             crate::queue::pass_frame();
-            let base_slot = (iter * URGENT) % (SLOTS - URGENT);
+            let base_slot = 2 + (iter * URGENT) % (SLOTS - URGENT - 2);
             for k in 0..URGENT {
                 let s = base_slot + k;
                 let (b_addr, b_res) = buffers[s % BUFFERS];
