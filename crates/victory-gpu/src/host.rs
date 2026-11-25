@@ -835,10 +835,10 @@ static GPU_TIMES: Mutex<Option<std::collections::HashMap<String, (u32, f64)>>> =
 #[cfg(feature = "diagnostics")]
 static TIMED_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Logs and forgets the GPU time per kind of command, per frame.
+/// Logs and forgets the GPU time per kind of command, per frame over the
+/// `frames` presented since the last time.
 #[cfg(feature = "diagnostics")]
-fn log_gpu_times() {
-    let frames = f64::from(TIMED_FRAMES.swap(0, Ordering::Relaxed).max(1));
+fn log_gpu_times(frames: f64) {
     let Some(times) = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
@@ -3646,12 +3646,17 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            // The counters below add up over the whole interval since the
+            // last such line (about 5 s), not over the last second's
+            // `frames`: per frame, they are divided by the interval's frames.
+            #[cfg(feature = "diagnostics")]
+            let interval_frames = f64::from(TIMED_FRAMES.swap(0, Ordering::Relaxed).max(1));
             #[cfg(feature = "diagnostics")]
             tracing::info!("sparse writes since: {}", crate::shadow::sparse_writes_text());
             #[cfg(feature = "diagnostics")]
             log_gpu_waits();
             #[cfg(feature = "diagnostics")]
-            log_gpu_times();
+            log_gpu_times(interval_frames);
             tracing::info!(
                 "[{} {}] {fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB, bindless plans \
@@ -3679,7 +3684,7 @@ impl Meter {
                         crate::resource::placed_census();
                     }
                 }
-                crate::copystat::log(frames);
+                crate::copystat::log(interval_frames);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
