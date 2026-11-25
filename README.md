@@ -70,6 +70,18 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
+On Windows 10 the in-box D3D12 runtime stops at shader model 6.5. Stage an
+Agility SDK runtime next to the build output, then rebuild so `victory.exe`
+exports the loader's opt-in symbols (`D3D12SDKVersion` / `D3D12SDKPath`):
+
+```powershell
+cargo xtask agility                      # Microsoft.Direct3D.D3D12 1.614.1 → target\release\D3D12\
+cargo build --release -p victory         # build.rs enables the exports when D3D12Core.dll is present
+```
+
+`cargo clean` removes that folder; run `cargo xtask agility` again before
+rebuilding. Windows 11 hosts that already expose SM 6.6 can skip this.
+
 Run the title:
 
 ```powershell
