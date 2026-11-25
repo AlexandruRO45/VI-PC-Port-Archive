@@ -8,7 +8,7 @@
 use windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC;
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::{HostShader, StaticSampler, VIEW_STRIDES, lower, validator};
+use super::{HostShader, StaticSampler, VIEW_SKIP_SHIFT, VIEW_STRIDES, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -417,7 +417,7 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
                     // User data, then the stride table: heap index 1 holds
                     // 12-byte elements.
                     roots: vec![
-                        (0, Root::Constants(ud)),
+                        (0, Root::Constants(ud.clone())),
                         (
                             1,
                             Root::View {
@@ -434,6 +434,38 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         let want: Vec<u32> = (0..32).map(|l| 200 + l).collect();
         assert_eq!(words[0], want, "{label}");
+        // The view starts 8 bytes early (astrosteveo's review of #1762):
+        // the stride is the entry's low bits, the skip its top ones.
+        let early: Vec<u32> = [7, 7].into_iter().chain(data.iter().copied()).collect();
+        let views = [
+            View::RawUav(32),
+            View::Buffer {
+                data: &early,
+                stride: Stride::Structured(12),
+            },
+        ];
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: vec![4, 12 | 8 << VIEW_SKIP_SHIFT],
+                            },
+                        ),
+                    ],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(words[0], want, "{label}, 8 bytes early");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
@@ -443,7 +475,9 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
 /// buffers (strides from their used-resource entries) read and write the
 /// right bytes through the raw views the host makes of structured views,
 /// and declare raw handles (a structured handle on a raw view is undefined
-/// in D3D12).
+/// in D3D12). From astrosteveo's review: also when the raw views start 4,
+/// 8 or 12 bytes before the title's (a view off 16 bytes of its buffer's
+/// copy), as their view-stride entries say.
 #[test]
 fn indexed_loads_and_atomics_of_structured_buffers_read_raw_views() {
     let structured = |kind, user_data, stride| UsedResource {
@@ -459,15 +493,7 @@ fn indexed_loads_and_atomics_of_structured_buffers_read_raw_views() {
         ],
         32,
     );
-    // 32 elements of 12 bytes: (100 + e, 200 + e, 300 + e).
-    let data: Vec<u32> = (0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]).collect();
-    let views = [
-        View::RawUav(64),
-        View::Buffer {
-            data: &data,
-            stride: Stride::Structured(12),
-        },
-    ];
+    assert_eq!(shader.root_srvs, [VIEW_STRIDES], "the views' skips");
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -485,20 +511,151 @@ fn indexed_loads_and_atomics_of_structured_buffers_read_raw_views() {
             // The SRV's table at heap index 1 (byte 32), the UAV's at 0.
             ud[u.index as usize] = if u.slot == 0 { 32 } else { 0 };
         }
-        let words = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
-                    views: &views,
-                    samplers: &[],
-                    groups: [1, 1, 1],
+        for skip in [0u32, 4, 8, 12] {
+            // 32 elements of 12 bytes, (100 + e, 200 + e, 300 + e), after
+            // `skip` bytes the view does not have.
+            let early = (skip / 4) as usize;
+            let data: Vec<u32> = std::iter::repeat_n(0xDEAD, early)
+                .chain((0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]))
+                .collect();
+            let views = [
+                View::RawUav(68),
+                View::Buffer {
+                    data: &data,
+                    stride: Stride::Structured(12),
                 },
-            )
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        let want: Vec<u32> = (0..32).flat_map(|l| [0, 200 + l]).collect();
-        assert_eq!(words[0], want, "{label}");
+            ];
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        // User data, then the view-stride table.
+                        roots: vec![
+                            (0, Root::Constants(ud.clone())),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: vec![8 | skip << VIEW_SKIP_SHIFT, 12 | skip << VIEW_SKIP_SHIFT],
+                                },
+                            ),
+                        ],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            let mut want = vec![0u32; 68];
+            for l in 0..32 {
+                want[early + 2 * l + 1] = 200 + l as u32;
+            }
+            assert_eq!(words[0], want, "{label}, views {skip} bytes early");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// User data: s0 a table with a structured SRV (12-byte elements), s2 a
+/// table with a raw UAV. Each lane stores dword 4 of the SRV (element 1's
+/// dword 1, a scalar buffer load) to dword `lane` of the UAV.
+const STRUCTURED_SCALAR_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF420_0504,
+    0xFA00_0010, // s_buffer_load_dword s20, s[8:11], 0x10
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E02_0214, // v_mov_b32 v1, s20
+    0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+    0xE070_1000,
+    0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// From astrosteveo's review of #1762: a scalar load of a structured view
+/// (a stride in its used-resource entry) whose raw view starts early reads
+/// from the title's first byte, as its view-stride entry says; a raw view
+/// (no stride) is read from its own first byte.
+#[test]
+fn scalar_loads_of_structured_views_add_the_bytes_their_views_start_early() {
+    let structured = |kind, user_data, stride| UsedResource {
+        stride,
+        ..entry(kind, 4, user_data)
+    };
+    let shader = build(
+        STRUCTURED_SCALAR_WAVE32,
+        vec![param(RootType::Table, 0), param(RootType::Table, 2)],
+        vec![structured(ResourceType::Srv, 0, 12), entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    assert_eq!(shader.root_srvs, [VIEW_STRIDES], "the view's skip");
+    let raw = build(
+        STRUCTURED_SCALAR_WAVE32,
+        vec![param(RootType::Table, 0), param(RootType::Table, 2)],
+        vec![entry(ResourceType::Srv, 4, 0), entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    assert!(raw.root_srvs.is_empty(), "a raw view starts at its first byte");
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            // The SRV's table at heap index 1 (byte 32), the UAV's at 0.
+            ud[u.index as usize] = if u.slot == 0 { 32 } else { 0 };
+        }
+        for skip in [0u32, 4, 8, 12] {
+            let data: Vec<u32> = std::iter::repeat_n(0xDEAD, (skip / 4) as usize)
+                .chain((0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]))
+                .collect();
+            let views = [
+                View::RawUav(32),
+                View::Buffer {
+                    data: &data,
+                    stride: Stride::Structured(12),
+                },
+            ];
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud.clone())),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: vec![4, 12 | skip << VIEW_SKIP_SHIFT],
+                                },
+                            ),
+                        ],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(words[0], vec![201; 32], "{label}, view {skip} bytes early");
+        }
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

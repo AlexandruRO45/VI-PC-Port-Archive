@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_STRIDES, flags};
+use super::shader::{Shader, VIEW_SKIP_SHIFT, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -201,6 +201,11 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    /// [`Lower::view_skip`] of a handle, by block and handle.
+    skips: HashMap<(usize, V), V>,
+    /// The heap index [`Lower::buffer_guard`] checked, by the index it
+    /// gave (which may be the null view's).
+    guarded: HashMap<V, V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -608,6 +613,8 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            skips: HashMap::new(),
+            guarded: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -1722,7 +1729,45 @@ impl<'a> Lower<'a> {
         if structured {
             return Ok((h, index, off, at));
         }
+        // The raw view may start a few bytes before the title's view.
+        let at = match self.view_skip(src, h) {
+            Some(skip) => self.s.m.bin(self.cur, Bin::Add, at, skip),
+            None => at,
+        };
         Ok((h, at, self.s.m.undef(self.s.t.i32), at))
+    }
+
+    /// The bytes the host's raw view at heap handle `h` (made for the
+    /// descriptor `src`) starts before the title's view: the top bits of its
+    /// view-stride entry ([`VIEW_SKIP_SHIFT`]), non-zero only for a
+    /// structured view off 16 bytes of its buffer's copy. `None` for handles
+    /// that are no heap view, and for descriptors whose used-resource entry
+    /// says they are constants or raw (the host makes those views at their
+    /// first byte); a descriptor from the heap itself, or with no entry,
+    /// may name any view.
+    fn view_skip(&mut self, src: &Source, h: V) -> Option<V> {
+        let &(asked, index) = self.s.buffer_index.get(&h)?;
+        // The entry the guard read: 0 where the null view stands in.
+        let index = self.guarded.get(&asked).copied().unwrap_or(index);
+        if !self.is_heap_direct(src)
+            && self
+                .used_kind(src)
+                .is_some_and(|u| u.kind == ResourceType::Cbv || u.stride == 0)
+        {
+            return None;
+        }
+        let c = self.cur;
+        if let Some(&skip) = self.skips.get(&(c, h)) {
+            return Some(skip);
+        }
+        let four = self.s.m.i32(4);
+        let at = self.s.m.bin(c, Bin::Mul, index, four);
+        let table = self.s.root_srv_handle(VIEW_STRIDES);
+        let word = self.raw_dword(table, at);
+        let shift = self.s.m.i32(VIEW_SKIP_SHIFT);
+        let skip = self.s.m.bin(c, Bin::LShr, word, shift);
+        self.skips.insert((c, h), skip);
+        Some(skip)
     }
 
     /// A raw view `src` at byte offset `off` (`props` as [`Self::handle`]
@@ -1744,7 +1789,11 @@ impl<'a> Lower<'a> {
     ) -> Result<(V, V), Why> {
         let Some((lo, hi)) = self.root_address(src) else {
             let h = self.handle(site, src, false, props)?;
-            let off = match self.root_view_offset(src) {
+            let at = match self.root_view_offset(src) {
+                Some(at) => Some(at),
+                None => self.view_skip(src, h),
+            };
+            let off = match at {
                 Some(at) => self.s.m.bin(self.cur, Bin::Add, off, at),
                 None => off,
             };
@@ -4209,12 +4258,18 @@ impl<'a> Lower<'a> {
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
-            None if record > 0 => {
-                let bytes = field(self, 0);
-                let stride = self.s.m.i32(record);
-                vec![(2, self.s.m.bin(c, Bin::UDiv, bytes, stride))]
+            None => {
+                // A raw view that starts early has those bytes more.
+                let mut size = field(self, 0);
+                if let Some(skip) = self.view_skip(&src, h) {
+                    size = self.s.m.bin(c, Bin::Sub, size, skip);
+                }
+                if record > 0 {
+                    let stride = self.s.m.i32(record);
+                    size = self.s.m.bin(c, Bin::UDiv, size, stride);
+                }
+                vec![(2, size)]
             }
-            None => vec![(2, field(self, 0))],
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -4522,6 +4577,7 @@ impl<'a> Lower<'a> {
         let handle = self.s.heap_handle(c, view, false, true, props);
         // Pages written here are marked in the page table's bitmap.
         self.s.view_index.remove(&handle);
+        self.s.buffer_index.remove(&handle);
         MemoryEntry {
             handle,
             offset: self.s.m.bin(c, Bin::Sub, lo, start),
@@ -4852,7 +4908,9 @@ impl<'a> Lower<'a> {
             &[table, at, iu, mask, four],
         );
         let x = self.s.m.extract(c, r, 0);
-        Ok(self.as_int(x))
+        let word = self.as_int(x);
+        let low = self.s.m.i32((1 << VIEW_SKIP_SHIFT) - 1);
+        Ok(self.s.m.bin(self.cur, Bin::And, word, low))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -5104,7 +5162,9 @@ impl<'a> Lower<'a> {
         // The null unordered access view sits just below the null SRV.
         let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
-        self.s.m.select(c, none, null, index)
+        let guarded = self.s.m.select(c, none, null, index);
+        self.guarded.insert(guarded, index);
+        guarded
     }
 
     /// Whether a descriptor comes from the resource heap itself (root type
