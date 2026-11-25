@@ -19,8 +19,10 @@ use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
+use known::{Known, Reached};
 
 mod bvh;
+mod known;
 
 type Why = &'static str;
 
@@ -10581,64 +10583,11 @@ impl<'a> Lower<'a> {
     /// (the loop redefines their conditions). Fewer conditions are weaker,
     /// so keeping only the last few stays sound.
     fn live_edges(&self) -> HashSet<(Value, usize)> {
-        const MAX_KNOWN: usize = 4;
-        /// What is known of the lanes along a path: the last few branch
-        /// conditions taken, in order (a value, not a heap allocation:
-        /// shaders with control flow push thousands of them).
-        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-        struct Known {
-            conditions: [(Bool, bool); MAX_KNOWN],
-            len: usize,
-        }
-        impl Known {
-            fn get(&self) -> &[(Bool, bool)] {
-                &self.conditions[..self.len]
-            }
-            /// With `c` after the others, the oldest dropped past the limit.
-            fn and(mut self, c: (Bool, bool)) -> Known {
-                if self.len == MAX_KNOWN {
-                    self.conditions.copy_within(1.., 0);
-                    self.len -= 1;
-                }
-                self.conditions[self.len] = c;
-                self.len += 1;
-                self
-            }
-            /// The same conditions as a set: sorted, without repeats.
-            fn set(self) -> Known {
-                let mut sorted = self.conditions;
-                sorted[..self.len].sort_unstable();
-                sorted[..self.len].iter().fold(NONE, |s, &c| {
-                    if s.get().last() == Some(&c) {
-                        s
-                    } else {
-                        s.and(c)
-                    }
-                })
-            }
-            /// The subsets of a set, as sets.
-            fn subsets(self) -> impl Iterator<Item = Known> {
-                (0..1usize << self.len).map(move |m| {
-                    (0..self.len)
-                        .filter(|j| m >> j & 1 == 1)
-                        .fold(NONE, |s, j| s.and(self.conditions[j]))
-                })
-            }
-        }
-        const NONE: Known = Known {
-            conditions: [(Bool::FALSE, false); MAX_KNOWN],
-            len: 0,
-        };
         let (p, st) = (self.x.p, &self.x.st);
-        let mut work: Vec<(Value, Known)> = self.read_phis.iter().map(|&v| (v, NONE)).collect();
+        let mut work: Vec<(Value, Known)> =
+            self.read_phis.iter().map(|&v| (v, Known::NONE)).collect();
         let mut live = HashSet::new();
-        // The sets of conditions each phi was reached with. A set has at
-        // most `MAX_KNOWN` conditions, so once a phi has more earlier sets
-        // than a set has subsets, whether one of them is a subset of it is a
-        // lookup of each subset in an index of them, not a scan (a phi of
-        // some programs is reached with tens of thousands).
-        const INDEXED: usize = 1 << MAX_KNOWN;
-        let mut seen = HashMap::<Value, (Vec<Known>, HashSet<Known>)>::new();
+        let mut seen = HashMap::<Value, Reached>::new();
         // Whether some lane meets each set of conditions: paths into a join
         // ask again for the same sets.
         let mut meets = HashMap::<Known, bool>::new();
@@ -10646,28 +10595,15 @@ impl<'a> Lower<'a> {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
-            let (done, index) = seen.entry(v).or_default();
             // Known of fewer lanes than before: nothing new is live.
-            let covered = if done.len() < INDEXED {
-                done.iter()
-                    .any(|d| d.get().iter().all(|c| known.get().contains(c)))
-            } else {
-                known.set().subsets().any(|s| index.contains(&s))
-            };
-            if covered {
+            if !seen.entry(v).or_default().add(known) {
                 continue;
-            }
-            done.push(known.set());
-            if done.len() == INDEXED {
-                index.extend(done.iter().copied());
-            } else if done.len() > INDEXED {
-                index.extend(done.last().copied());
             }
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 if self.tail[q].is_none() {
                     continue;
                 }
-                let mut k = NONE;
+                let mut k = Known::NONE;
                 // Forward edges out of a block that is no loop's latch (a
                 // loop's exit is also taken at its iteration limit).
                 if let LaneExit::Branch {
