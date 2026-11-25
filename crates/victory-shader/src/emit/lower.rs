@@ -257,6 +257,8 @@ struct Lower<'a> {
     split: bool,
     /// Split, and run as the console runs it ([`CONSOLE_FLOW`]).
     console_cf: bool,
+    /// Masks held as numbers whose number is being read (see `atom`).
+    opaque_open: HashSet<Value>,
     /// Split without [`Self::console_cf`] cannot run it, the console flow can.
     wants_console_flow: bool,
     /// The console thread's flat id in the group (relabelled; see
@@ -417,6 +419,11 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
+
+/// Why the console flow in halves refuses a compute program's sample with
+/// implicit derivatives (`image_sample`, `image_sample_b`).
+pub(crate) const IMPLICIT_SAMPLE_IN_HALVES: Why =
+    "an implicit-derivative sample in the console flow on a host without 64-lane waves";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -727,6 +734,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             split,
             console_cf: x.console_cf,
+            opaque_open: HashSet::new(),
             wants_console_flow,
             console_flat: None,
             xchg: None,
@@ -2579,11 +2587,20 @@ impl<'a> Lower<'a> {
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
-                let hi = match self.pair_high(v) {
-                    Some(h) => Some(self.get(h)?),
-                    None => None,
-                };
-                let lo = self.get(v)?;
+                // The number may itself be known only as this mask's dword
+                // (a mask copied dword by dword): no number to test then.
+                if !self.opaque_open.insert(v) {
+                    return Err("an opaque lane mask");
+                }
+                let words = (|| {
+                    let hi = match self.pair_high(v) {
+                        Some(h) => Some(self.get(h)?),
+                        None => None,
+                    };
+                    Ok((self.get(v)?, hi))
+                })();
+                self.opaque_open.remove(&v);
+                let (lo, hi) = words?;
                 let word = |w: Val| match w {
                     Val::I32(x) => Ok(x),
                     _ => Err("an opaque lane mask"),
@@ -8178,6 +8195,16 @@ impl<'a> Lower<'a> {
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
         };
+        // A compute program's sample with implicit derivatives has no valid
+        // DXIL form yet: the module fails validation ("an operation that is
+        // incompatible with the shader stage", #201). Drivers take such a
+        // module in the per-lane form; in the console flow in halves, with
+        // group barriers in its loops and branches, a title run lost its
+        // device in two of them. Such a program stops here until the sample
+        // has a valid form.
+        if matches!(op, 60 | 61) && !self.s.pixel && self.console_cf && self.split {
+            return Err(IMPLICIT_SAMPLE_IN_HALVES);
+        }
         if op == 72 {
             // Width, height, depth or layers, levels (per dmask) of the level
             // in the first address: DXIL's dimensions; a channel DXIL leaves
