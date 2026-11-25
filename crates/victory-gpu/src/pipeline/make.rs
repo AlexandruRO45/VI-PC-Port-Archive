@@ -43,29 +43,41 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
-        let mut key = blake3::Hasher::new();
-        for s in &shaders {
-            key.update(s.stage.as_bytes());
-            key.update(s.hash.as_bytes());
-        }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let key = key(&shaders, graphics.as_deref());
+        #[cfg(feature = "diagnostics")]
+        log("created", &key, || format!("{shaders:?}\t{}", graphics.as_ref().map(|g| g.describe()).unwrap_or_default()));
         Pending {
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            key,
             used: AtomicBool::new(false),
         }
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            #[cfg(feature = "diagnostics")]
+            log_built(&self.key);
+            made
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// The pipeline key shared by title-created and pre-built pipelines.
+pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> String {
+    let mut key = blake3::Hasher::new();
+    for s in shaders {
+        key.update(s.stage.as_bytes());
+        key.update(s.hash.as_bytes());
+    }
+    key.update(graphics.map(GraphicsState::describe).unwrap_or_default().as_bytes());
+    key.finalize().to_hex()[..32].to_owned()
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -88,6 +100,48 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
                 failed.join(" + ")
             })
         }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_built(key: &str) {
+    if let Some((name, loaded)) = super::library::LAST_PIPELINE.take() {
+        log("built", key, || format!("{name}\t{}", if loaded { "loaded" } else { "made" }));
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn log_path() -> Option<&'static std::path::Path> {
+    static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_LOG").map(Into::into))
+        .as_deref()
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn logging() -> bool {
+    log_path().is_some()
+}
+
+/// Records creation, first use and the corresponding host cache entry.
+#[cfg(feature = "diagnostics")]
+fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
+    use std::collections::HashSet;
+    use std::io::Write;
+    type Log = Mutex<(std::fs::File, HashSet<String>)>;
+    static LOG: OnceLock<Option<Log>> = OnceLock::new();
+    let Some(path) = log_path() else { return };
+    let Some(log) = LOG.get_or_init(|| {
+        match std::fs::File::create(path) {
+            Ok(file) => Some(Mutex::new((file, HashSet::new()))),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "pipeline log is unavailable");
+                None
+            }
+        }
+    }) else { return };
+    let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
+    if log.1.insert(format!("{what} {key}")) {
+        let _ = writeln!(log.0, "{what}\t{key}\t{}", rest());
     }
 }
 
@@ -122,6 +176,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        #[cfg(feature = "diagnostics")]
+        log("used", &p.key, String::new);
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);

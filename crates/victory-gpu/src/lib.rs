@@ -12,7 +12,8 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees. Planned:
+//! share, [`console`] which console model the title sees, `external` host
+//! libraries recording into title lists. Planned:
 //! `present` (swap chain).
 
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -25,6 +26,8 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
@@ -34,6 +37,8 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
+#[cfg(windows)]
+mod memory;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
@@ -47,10 +52,11 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
-mod memory;
-#[cfg(windows)]
 mod shadow;
 pub mod signature;
+mod switch;
+#[cfg(windows)]
+mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]

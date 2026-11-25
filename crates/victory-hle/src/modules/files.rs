@@ -83,8 +83,15 @@ pub fn mount_at(letter: char, root: &Path) {
 }
 
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
-/// keeps its own).
+/// keeps its own). An empty root is the current directory, as it is to a
+/// path joined to it: it is the title's folder when the title is run by its
+/// file name alone (`victory run GTA6.exe`).
 fn root_wide(root: &Path) -> Vec<u16> {
+    let root = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
     while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
@@ -568,7 +575,11 @@ fn overlapped_read(buffer: *mut u8, len: u32, pending: bool) {
                 "ReadFile into a title view still under way when it returns: if a refresh guards the destination first, the read fails or lands unseen"
             );
         } else {
-            tracing::info!(?buffer, len, "ReadFile with an OVERLAPPED into a title view, done in the call");
+            tracing::info!(
+                ?buffer,
+                len,
+                "ReadFile with an OVERLAPPED into a title view, done in the call"
+            );
         }
     }
 }
@@ -818,7 +829,10 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         let (mut out, mut n) = ([0u8; 10], 0);
         let handle = file.as_raw_handle().cast();
-        assert_ne!(ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()), 0);
+        assert_ne!(
+            ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()),
+            0
+        );
         assert_eq!((&out, n), (b"0123456789", 10));
     }
 
@@ -872,7 +886,11 @@ mod tests {
             for at in self.at {
                 victory_gpu::title_memory_remapped(at, 2 * BLOCK);
                 // SAFETY: a view mapped by `new`.
-                unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ }) };
+                unsafe {
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: at as *mut _,
+                    })
+                };
             }
             // SAFETY: the section `new` made.
             unsafe { CloseHandle(self.section) };
@@ -939,7 +957,10 @@ mod tests {
             Some(vec![view / BLOCK, view / BLOCK + 1])
         );
         let last = into + SENT.len() - 1;
-        assert!(!writable(into) && !writable(last), "the read no longer holds them open");
+        assert!(
+            !writable(into) && !writable(last),
+            "the read no longer holds them open"
+        );
     }
 
     /// The title's synchronous reads land in guarded views while refreshes
@@ -952,7 +973,13 @@ mod tests {
             writer,
             move |into| {
                 let mut n = 0;
-                let done = ReadFile(reader.as_raw_handle(), into as *mut u8, LEN, &mut n, std::ptr::null_mut());
+                let done = ReadFile(
+                    reader.as_raw_handle(),
+                    into as *mut u8,
+                    LEN,
+                    &mut n,
+                    std::ptr::null_mut(),
+                );
                 (done, n, last_error())
             },
             |&(done, n, _)| (done, n) == (1, LEN),
@@ -1005,11 +1032,10 @@ mod tests {
             writer,
             move |into| {
                 const IONBF: i32 = 4;
-                let stream =
-                    host!("ucrtbase.dll", "_fdopen": extern "C" fn(i32, *const c_char) -> File)(
-                        fd,
-                        c"rb".as_ptr(),
-                    );
+                let stream = host!("ucrtbase.dll", "_fdopen": extern "C" fn(i32, *const c_char) -> File)(
+                    fd,
+                    c"rb".as_ptr(),
+                );
                 assert!(!stream.is_null());
                 let setvbuf = host!("ucrtbase.dll", "setvbuf": extern "C" fn(File, *mut c_char, i32, usize) -> i32);
                 assert_eq!(setvbuf(stream, std::ptr::null_mut(), IONBF, 0), 0);
@@ -1076,7 +1102,10 @@ mod tests {
         const GENERIC_WRITE: u32 = 0x4000_0000;
         const OPEN_EXISTING: u32 = 3;
         let null = std::ptr::null_mut();
-        let name = w(&format!(r"\\.\pipe\victory-files-test-{}", std::process::id()));
+        let name = w(&format!(
+            r"\\.\pipe\victory-files-test-{}",
+            std::process::id()
+        ));
         let server = host!("kernel32.dll", "CreateNamedPipeW": extern "system" fn(*const u16, u32, u32, u32, u32, u32, u32, *const c_void) -> Handle)(
             name.as_ptr(),
             PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
@@ -1106,7 +1135,8 @@ mod tests {
         );
         assert!(!event.is_null());
         let write = host!("kernel32.dll", "WriteFile": extern "system" fn(Handle, *const u8, u32, *mut u32, *mut c_void) -> i32);
-        let wait = host!("kernel32.dll", "WaitForSingleObject": extern "system" fn(Handle, u32) -> u32);
+        let wait =
+            host!("kernel32.dll", "WaitForSingleObject": extern "system" fn(Handle, u32) -> u32);
         let views = Views::new();
         tracing::subscriber::with_default(Redirected, || {
             // A read of no bytes has nothing to land and is not the one warned of.
@@ -1116,7 +1146,13 @@ mod tests {
                 let into = views.at[0] + 100 + k * SENT.len();
                 // `OVERLAPPED`: two status words, the offset, the event.
                 let mut overlapped = [0, 0, 0, event as usize];
-                let done = ReadFile(server, into as *mut u8, LEN, null.cast(), overlapped.as_mut_ptr().cast());
+                let done = ReadFile(
+                    server,
+                    into as *mut u8,
+                    LEN,
+                    null.cast(),
+                    overlapped.as_mut_ptr().cast(),
+                );
                 assert_eq!((done, last_error()), (0, ERROR_IO_PENDING));
                 let mut n = 0;
                 assert_ne!(write(client, SENT.as_ptr(), LEN, &mut n, null), 0);
@@ -1185,6 +1221,17 @@ mod tests {
             verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
             w(r"\\?\UNC\server\share\y")[..22].to_vec()
         );
+    }
+
+    /// A title run by its file name alone has an empty folder: the drive
+    /// over it is the current directory, not the current drive's root.
+    #[test]
+    fn an_empty_root_is_the_current_directory() {
+        let letter = mount(Path::new("")).unwrap();
+        let path = format!(r"{letter}:\a.rpf");
+        let host = translate(&w(&path)[..path.len()]).map(|v| text(&v));
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(host, Some(cwd.join("a.rpf").display().to_string()));
     }
 
     #[test]

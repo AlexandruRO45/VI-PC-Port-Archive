@@ -240,6 +240,25 @@ impl Bools {
         self.meet_seen(all, &mut Meets::default())
     }
 
+    /// The value of `atom` in every lane that satisfies `facts`, if those
+    /// conditions decide it.
+    pub fn decides(&self, facts: &[(Bool, bool)], atom: Atom) -> Option<bool> {
+        let node = *self
+            .unique
+            .get(&(*self.ids.get(&atom)?, Bool::FALSE, Bool::TRUE))?;
+        let mut all = facts.to_vec();
+        let mut seen = Meets::default();
+        all.push((node, false));
+        let can_be_false = self.meet_seen(&all, &mut seen);
+        all[facts.len()] = (node, true);
+        let can_be_true = self.meet_seen(&all, &mut seen);
+        match (can_be_false, can_be_true) {
+            (false, true) => Some(true),
+            (true, false) => Some(false),
+            _ => None,
+        }
+    }
+
     /// [`Self::meet`], which looks up in `seen` what earlier calls on these
     /// `Bools` found out and adds what it finds. The answer is the one
     /// `meet` gives.

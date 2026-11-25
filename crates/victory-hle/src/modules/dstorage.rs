@@ -153,7 +153,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    WALLS_FILES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((file as usize, kept));
     put(out, file)
 }
 
@@ -364,6 +367,8 @@ struct Lanes {
     refused: u64,
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
+    /// Requests into physical pages.
+    pages: u64,
     since: Option<std::time::Instant>,
 }
 
@@ -421,6 +426,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     done: Default::default(),
                     refused: 0,
                     bcpack: Default::default(),
+                    pages: 0,
                     since: None,
                 }),
                 work: Condvar::new(),
@@ -456,7 +462,10 @@ impl Scheduler {
 fn walls_trace() -> u8 {
     static ON: OnceLock<u8> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("VICTORY_WALLS_TRACE").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0)
+        std::env::var("VICTORY_WALLS_TRACE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .unwrap_or(0)
     })
 }
 
@@ -475,7 +484,10 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     } else {
         let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
         let source = request.source as usize;
-        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+        files
+            .iter()
+            .find(|f| f.0 == source)
+            .map_or_else(|| "?".to_string(), |f| f.1.clone())
     };
     let hr = match result {
         Ok(()) => 0,
@@ -500,7 +512,10 @@ fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
-            lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
+            lanes = scheduler
+                .work
+                .wait(lanes)
+                .unwrap_or_else(|e| e.into_inner());
             continue;
         };
         drop(lanes);
@@ -528,6 +543,9 @@ impl Lanes {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
+        if job.request.options & PAGE_DESTINATION != 0 {
+            self.pages += 1;
+        }
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
         if elapsed.as_secs() >= 5 {
@@ -540,7 +558,9 @@ impl Lanes {
                 reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
-                bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                bcpack_workers =
+                    format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                page_destinations = std::mem::take(&mut self.pages),
                 waiting,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
@@ -652,7 +672,11 @@ impl Lane {
     fn flush(&mut self) {
         while let Some(&(seq, _)) = self.statuses.front() {
             let waiting = self.reads.front().map(|r| r.0);
-            if waiting.into_iter().chain(self.running.first().copied()).any(|s| s < seq) {
+            if waiting
+                .into_iter()
+                .chain(self.running.first().copied())
+                .any(|s| s < seq)
+            {
                 return;
             }
             let Some((_, status)) = self.statuses.pop_front() else {
@@ -744,7 +768,6 @@ enum Command {
     Read(Request),
     Status(Status),
 }
-
 
 /// A status entry to write, holding a reference on its array.
 struct Status {
@@ -873,7 +896,11 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         return into_destination(request, size, |out| read_into(request, out).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
     }
-    let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
+    let tables = if bc != 0 {
+        Some(bcpack_tables()?)
+    } else {
+        None
+    };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
@@ -945,7 +972,9 @@ fn use_bcpack_tables(dir: std::path::PathBuf) {
 
 #[cfg(test)]
 fn load_bcpack_tables() -> Result<Tables, String> {
-    let dir = BCPACK_DIR.get().ok_or("no folder set for the test tables")?;
+    let dir = BCPACK_DIR
+        .get()
+        .ok_or("no folder set for the test tables")?;
     let bytes = std::fs::read(dir.join("tables.bin")).map_err(|e| e.to_string())?;
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
@@ -971,7 +1000,9 @@ static READING: AtomicU64 = AtomicU64::new(0);
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
-        out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
+        out.copy_from_slice(unsafe {
+            std::slice::from_raw_parts(request.source.cast(), out.len())
+        });
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
@@ -1008,15 +1039,12 @@ fn into_destination(
         let write = || {
             // SAFETY: the title's destination holds `destination_size`
             // bytes, at least `len`, and nothing else writes it until completion.
-            let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
+            let out =
+                unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
             fill(out).map(drop)
         };
         let at = request.destination as usize;
-        if request.options == 0 {
-            return victory_gpu::with_kernel_write(at, len, write);
-        }
-        victory_gpu::kernel_will_write(at, len);
-        return write();
+        return victory_gpu::with_kernel_write(at, len, write);
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let mut pages = vec![0usize; (offset + len).div_ceil(PAGE)];
@@ -1042,11 +1070,7 @@ fn into_destination(
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(&pages, offset, len) {
-        let filled = fill(window.bytes());
-        // With the bytes in: the title's views of them changed without a
-        // fault of theirs (`victory_gpu`'s guard).
-        window.written();
-        return filled.map(drop);
+        return fill(window.bytes()).map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
@@ -1068,29 +1092,33 @@ fn into_destination(
             if !pages.contains(&0) && super::xmem::write_physical(&pages, offset, &data[..n]) {
                 let late = LATE.fetch_add(1, Ordering::Relaxed) + 1;
                 if late.is_power_of_two() {
-                    tracing::info!(late, still_zero = STILL_ZERO.load(Ordering::Relaxed), "dstorage: a page list filled after its request started: written late");
+                    tracing::info!(
+                        late,
+                        still_zero = STILL_ZERO.load(Ordering::Relaxed),
+                        "dstorage: a page list filled after its request started: written late"
+                    );
                 }
                 return Ok(());
             }
         }
         let still = STILL_ZERO.fetch_add(1, Ordering::Relaxed) + 1;
         if still.is_power_of_two() {
-            tracing::info!(still_zero = still, late = LATE.load(Ordering::Relaxed), "dstorage: a page list still names page 0 after 8 ms");
+            tracing::info!(
+                still_zero = still,
+                late = LATE.load(Ordering::Relaxed),
+                "dstorage: a page list still names page 0 after 8 ms"
+            );
         }
     }
-    {
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
-    }
+    // The title polls for completion without reading the result, so
+    // a failed request leaves its model or texture silently unwritten.
+    tracing::warn!(
+        offset,
+        len,
+        pages = pages.len(),
+        "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+    );
+    Err(E_INVALIDARG)
 }
 
 /// Slots by the 2020 order, which the argument shapes at
@@ -1339,7 +1367,8 @@ mod tests {
         // Requests in flight together run in any order, so none of them
         // shares a destination (failed ones leave theirs undefined).
         let mut buffers = [[0u8; 16]; 5];
-        let [failed, failed_too, out, other, bcpack] = buffers.each_mut().map(|b| b.as_mut_ptr().cast());
+        let [failed, failed_too, out, other, bcpack] =
+            buffers.each_mut().map(|b| b.as_mut_ptr().cast());
 
         // Segment 0: a read past the end, then a bad stream; the first wins.
         enqueue(queue, &request(0, failed, 16, file, 4090, 16));
@@ -1400,6 +1429,7 @@ mod tests {
             done: Default::default(),
             refused: 0,
             bcpack: Default::default(),
+            pages: 0,
             since: None,
         }
     }
@@ -1555,7 +1585,10 @@ mod tests {
         let (_dir, file) = file_with(&contents);
         let (queue, array) = (new_queue(0), status_array(1));
         let mut out = [0u8; 16];
-        enqueue(queue, &request(4 << 1, out.as_mut_ptr().cast(), 16, file, 100, 88));
+        enqueue(
+            queue,
+            &request(4 << 1, out.as_mut_ptr().cast(), 16, file, 100, 88),
+        );
         enqueue_status(queue, array, 0);
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
@@ -1622,7 +1655,10 @@ mod tests {
     fn a_page_list_filled_after_its_request_starts() {
         use crate::modules::xmem;
         let (mut given, mut page) = (1usize, [0usize; 1]);
-        assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()), 1);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()),
+            1
+        );
         let mapped = xmem::XMemVirtualAlloc(
             std::ptr::null_mut(),
             PAGE,

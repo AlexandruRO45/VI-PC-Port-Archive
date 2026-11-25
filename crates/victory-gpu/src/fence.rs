@@ -288,4 +288,5 @@ mod tests {
         assert_eq!(slot::<Release>(queried, 0x10)(queried), 1);
         assert_eq!(slot::<Release>(f, 0x10)(f), 0);
     }
+
 }

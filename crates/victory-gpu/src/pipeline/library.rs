@@ -398,6 +398,8 @@ struct Library {
     /// Stores share it and a save takes it alone: the size the library
     /// asks for must still be its size when it is written out.
     saving: RwLock<()>,
+    prebuilt: Mutex<HashSet<String>>,
+    prebuilt_changed: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the library synchronises
@@ -431,6 +433,7 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
+const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
@@ -474,6 +477,16 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     _blob: blob,
                     added: AtomicU64::new(0),
                     saving: RwLock::new(()),
+                    prebuilt: Mutex::new(
+                        DIR.get()
+                            .and_then(|d| std::fs::read_to_string(d.join(PREBUILT_FILE)).ok())
+                            .unwrap_or_default()
+                            .lines()
+                            .filter(|key| !key.is_empty())
+                            .map(str::to_owned)
+                            .collect(),
+                    ),
+                    prebuilt_changed: AtomicBool::new(false),
                 });
             }
             Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
@@ -490,7 +503,46 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         _blob: Blob::None,
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
+        prebuilt: Mutex::new(HashSet::new()),
+        prebuilt_changed: AtomicBool::new(false),
     })
+}
+
+/// Whether this pipeline has already been built into the current library.
+pub(crate) fn prebuilt(key: &str) -> bool {
+    library().is_some_and(|library| {
+        library.prebuilt.lock().unwrap_or_else(|e| e.into_inner()).contains(key)
+    })
+}
+
+/// Builds through the normal pipeline path and remembers keys that loaded
+/// from, or were actually stored into, the host library.
+pub(crate) fn prebuild<T>(key: String, make: impl FnOnce() -> Option<T>) -> Option<T> {
+    PREBUILD_STORED.with(|stored| stored.set(false));
+    let made = make();
+    if made.is_some() && PREBUILD_STORED.with(std::cell::Cell::get) && let Some(library) = library() {
+        let mut keys = library.prebuilt.lock().unwrap_or_else(|e| e.into_inner());
+        if keys.insert(key) {
+            library.prebuilt_changed.store(true, Ordering::Relaxed);
+        }
+    }
+    made
+}
+
+thread_local! {
+    static PREBUILD_STORED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    pub(crate) static LAST_PIPELINE: std::cell::Cell<Option<(String, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "diagnostics")]
+fn note_pipeline(name: &str, loaded: bool) {
+    if super::make::logging() {
+        LAST_PIPELINE.set(Some((name.to_owned(), loaded)));
+    }
 }
 
 /// A pipeline's name in the library: the hash of what its host
@@ -514,7 +566,12 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        let made = create();
+        #[cfg(feature = "diagnostics")]
+        if made.is_ok() {
+            note_pipeline(name, false);
+        }
+        return made;
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -529,6 +586,9 @@ pub(crate) fn pipeline(
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            PREBUILD_STORED.with(|stored| stored.set(true));
+            #[cfg(feature = "diagnostics")]
+            note_pipeline(name, true);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -543,6 +603,8 @@ pub(crate) fn pipeline(
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    note_pipeline(name, false);
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(
@@ -557,6 +619,7 @@ pub(crate) fn pipeline(
     // differs) is refused, which leaves the library as it was.
     if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
+        PREBUILD_STORED.with(|stored| stored.set(true));
     }
     Ok(pso)
 }
@@ -565,6 +628,7 @@ pub(crate) fn pipeline(
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static SAVE: Mutex<()> = Mutex::new(());
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
@@ -574,25 +638,36 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    let _save = SAVE.lock().unwrap_or_else(|e| e.into_inner());
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let tmp = temporary_path(&dir.join(LIBRARY_FILE));
+    let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+    let keys_changed = library.prebuilt_changed.swap(false, Ordering::Relaxed);
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
-    let bytes = {
+    let (bytes, added, keys) = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+        if !used_changed && !keys_changed && added == 0 {
             return;
         }
+        // Snapshot the recorded keys while the library cannot be extended.
+        // A key registered after this snapshot is saved with the next blob.
+        let keys = keys_changed.then(|| {
+            let keys = library.prebuilt.lock().unwrap_or_else(|e| e.into_inner());
+            let mut keys: Vec<_> = keys.iter().cloned().collect();
+            keys.sort_unstable();
+            keys
+        });
         if added == 0 {
-            0
+            (0, 0, keys)
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
@@ -600,16 +675,22 @@ pub(crate) fn save(now: bool) {
             if let Err(e) = serialise(&library.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 let _ = std::fs::remove_file(&tmp);
+                USED_CHANGED.fetch_or(used_changed, Ordering::Relaxed);
+                library.prebuilt_changed.fetch_or(keys_changed, Ordering::Relaxed);
                 return;
             }
             library.added.store(0, Ordering::Relaxed);
-            SAVED.store(size as u64, Ordering::Relaxed);
-            size
+            (size, added, keys)
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    let used: Vec<String> = used().iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    if library_written.is_err() {
+        library.added.fetch_add(added, Ordering::Relaxed);
+        let _ = std::fs::remove_file(&tmp);
+    }
     if bytes > 0 && library_written.is_ok() {
+        SAVED.store(bytes as u64, Ordering::Relaxed);
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
@@ -624,7 +705,14 @@ pub(crate) fn save(now: bool) {
         });
     }
     let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
+        .and_then(|()| {
+            if let Some(keys) = keys {
+                write_atomically(&dir.join(PREBUILT_FILE), keys.join("\n").as_bytes())
+            } else {
+                Ok(())
+            }
+        });
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -634,7 +722,11 @@ pub(crate) fn save(now: bool) {
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => {
+            USED_CHANGED.fetch_or(used_changed, Ordering::Relaxed);
+            library.prebuilt_changed.fetch_or(keys_changed, Ordering::Relaxed);
+            tracing::warn!(error = %e, "host pipeline library not saved");
+        }
     }
 }
 
@@ -670,9 +762,21 @@ fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Res
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
 /// `path`: a reader never sees a part.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    let tmp = temporary_path(path);
+    let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
+}
+
+fn temporary_path(path: &std::path::Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
+    ))
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).

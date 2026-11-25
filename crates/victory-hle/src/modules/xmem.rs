@@ -153,6 +153,20 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if at.is_null() {
+        let error = std::io::Error::last_os_error();
+        if kind & MEM_COMMIT != 0 {
+            commit_refused(size, "virtual memory", error);
+        } else {
+            tracing::warn!(
+                size,
+                kind = format_args!("{kind:#x}"),
+                flags = format_args!("{flags:#x}"),
+                %error,
+                "XMemVirtualAlloc refused"
+            );
+        }
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -296,6 +310,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     // SAFETY: the layout has a non-zero size.
     let block = unsafe { alloc(layout) };
     if block.is_null() {
+        tracing::warn!(size, "XMemAllocDefault: the host heap is out of memory");
         return block.cast();
     }
     // SAFETY: the block holds the alignment (at least the header) and then
@@ -370,6 +385,51 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// Where each slice (section, page index) is mapped: the addresses of
+    /// its page in every view showing it (the GPU side's change tracking
+    /// follows writes through one view to the others, `aliases`).
+    shown: HashMap<(usize, usize), Vec<usize>>,
+}
+
+impl Slice {
+    /// The key of page `k` of the slices from this one on in `shown`.
+    fn key(&self, k: usize) -> (usize, usize) {
+        (Arc::as_ptr(&self.section) as usize, self.index + k)
+    }
+}
+
+/// Every address of a title view showing a page that title memory at
+/// `[at, at + len)` shows, except the page's own address: pushed to `out`
+/// as (page address, other address). The GPU side's change tracking
+/// (`victory_gpu::watch`) marks writes there too.
+pub fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
+    let end = at.saturating_add(len);
+    if at == end {
+        return;
+    }
+    let physical = physical();
+    let first = physical
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| *base + size > at)
+        .map(|(base, _)| *base);
+    let starts = first.into_iter().chain(
+        physical
+            .views
+            .range(at.saturating_add(1)..end)
+            .map(|(b, _)| *b),
+    );
+    for base in starts.collect::<Vec<_>>() {
+        let (size, slice) = &physical.views[&base];
+        let (from, to) = (at.max(base), end.min(base + size));
+        for page in (from / PAGE..to.div_ceil(PAGE)).map(|p| p * PAGE) {
+            let k = (page - base) / PAGE;
+            if let Some(addresses) = physical.shown.get(&slice.key(k)) {
+                out.extend(addresses.iter().filter(|&&a| a != page).map(|&a| (page, a)));
+            }
+        }
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -554,7 +614,11 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         // The title's views of these pages show new bytes with no fault of
         // theirs: the guard over them is told (`victory_gpu`).
-        victory_gpu::title_memory_written(slice.section.0 as usize, (slice.index * PAGE + within) as u64, k);
+        victory_gpu::title_memory_written(
+            slice.section.0 as usize,
+            (slice.index * PAGE + within) as u64,
+            k,
+        );
         (within, done) = (0, done + k);
     }
     true
@@ -577,10 +641,11 @@ impl PageWindow {
         let (within, len) = (self.within, self.len);
         &mut self.view.bytes()[within..within + len]
     }
+}
 
-    /// The bytes were written (or the write was tried): the title's views
-    /// of them are told (`victory_gpu`), as [`write_physical`] tells.
-    pub(crate) fn written(&self) {
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        // A title view can see the new bytes without taking a write fault.
         victory_gpu::title_memory_written(self.section, self.offset, self.len);
     }
 }
@@ -660,9 +725,9 @@ fn scatter_unmap_run(
     let safe = |at: usize| {
         at != 0
             && at.is_multiple_of(PAGE)
-            && at.checked_add(PAGE).is_some_and(|end| {
-                input_ranges.iter().all(|&(lo, hi)| end <= lo || at >= hi)
-            })
+            && at
+                .checked_add(PAGE)
+                .is_some_and(|end| input_ranges.iter().all(|&(lo, hi)| end <= lo || at >= hi))
     };
     if !safe(start) {
         return 1;
@@ -862,7 +927,19 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(
+        base,
+        len,
+        slice.section.0 as usize,
+        (slice.index * PAGE) as u64,
+    );
+    for k in 0..len / PAGE {
+        physical
+            .shown
+            .entry(slice.key(k))
+            .or_default()
+            .push(base + k * PAGE);
+    }
     physical.views.insert(base, (len, slice));
     true
 }
@@ -876,7 +953,14 @@ fn commit(base: usize, len: usize) -> bool {
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
         return true;
     }
-    let error = std::io::Error::last_os_error();
+    commit_refused(len, "physical pages", std::io::Error::last_os_error());
+    false
+}
+
+/// Reports memory the host would not give: at the Windows commit limit to
+/// `crashes.log`, since the title usually faults soon after on the null it
+/// gets; otherwise as a warning.
+fn commit_refused(len: usize, what: &str, error: std::io::Error) {
     if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
         let mut info = PERFORMANCE_INFORMATION {
             cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
@@ -884,20 +968,25 @@ fn commit(base: usize, len: usize) -> bool {
         };
         // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
         let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
-        victory_loader::log_crash(&commit_limit_message(len, &error, queried.then_some(&info)));
+        victory_loader::log_crash(&commit_limit_message(
+            len,
+            what,
+            &error,
+            queried.then_some(&info),
+        ));
     } else {
-        tracing::warn!(len, %error, "committing physical pages failed");
+        tracing::warn!(len, %error, "committing {what} failed");
     }
-    false
 }
 
 fn commit_limit_message(
     len: usize,
+    what: &str,
     error: &std::io::Error,
     info: Option<&PERFORMANCE_INFORMATION>,
 ) -> String {
     let mut message = format!(
-        "VIctory: Windows commit limit reached while committing {len} bytes of physical pages: {error}.\n"
+        "VIctory: Windows commit limit reached while committing {len} bytes of {what}: {error}.\n"
     );
     if let Some(info) = info {
         use std::fmt::Write;
@@ -941,6 +1030,15 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        for k in 0..size / PAGE {
+            let key = slice.key(k);
+            if let Some(addresses) = physical.shown.get_mut(&key) {
+                addresses.retain(|&a| a != at + k * PAGE);
+                if addresses.is_empty() {
+                    physical.shown.remove(&key);
+                }
+            }
+        }
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1184,7 +1282,10 @@ mod tests {
         assert_eq!(run(0, &[(base, base + PAGE)]), 1);
         assert_eq!(run(0, &[(base + PAGE, base + 2 * PAGE)]), 1);
         assert_eq!(scatter_unmap_run(base + PAGE, 2, &[], |_| (base, true)), 1);
-        assert_eq!(scatter_unmap_run(base, 2, &[], |_| (base + 2 * PAGE, true)), 1);
+        assert_eq!(
+            scatter_unmap_run(base, 2, &[], |_| (base + 2 * PAGE, true)),
+            1
+        );
         assert_eq!(scatter_unmap_run(base + 1, 2, &[], |_| unreachable!()), 1);
         let end = usize::MAX - PAGE + 1;
         assert_eq!(scatter_unmap_run(end, 2, &[], |_| (0, true)), 1);
@@ -1211,7 +1312,10 @@ mod tests {
             at(4).cast::<u8>().write(29);
         }
         let addresses = [at(1), at(2), std::ptr::null_mut(), at(3)];
-        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 4, std::ptr::null()), 0);
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 4, std::ptr::null()),
+            0
+        );
         assert_eq!(query(at(1)).host.State, MEM_RESERVE);
         assert_eq!(query(at(2)).host.State, MEM_RESERVE);
         assert_eq!(query(at(3)).host.State, MEM_COMMIT);
@@ -1223,7 +1327,10 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(at(2), 1, &pages[2]), at(2));
         let addresses = [at(1), at(2), at(3), std::ptr::null_mut(), at(4)];
         let scattered = [0, 0, pages[0], 0, 0];
-        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), addresses.len(), scattered.as_ptr()), 0);
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), addresses.len(), scattered.as_ptr()),
+            0
+        );
         assert_eq!(query(at(1)).host.State, MEM_RESERVE);
         assert_eq!(query(at(2)).host.State, MEM_RESERVE);
         assert_eq!(query(at(3)).host.State, MEM_COMMIT);
@@ -1251,10 +1358,11 @@ mod tests {
             PageSize: 4096,
             ..Default::default()
         };
-        let report = commit_limit_message(4 * MIB, &error, Some(&info));
-        assert!(report.contains("4194304 bytes"));
+        let report = commit_limit_message(4 * MIB, "physical pages", &error, Some(&info));
+        assert!(report.contains("4194304 bytes of physical pages"));
         assert!(report.contains("2 MiB of 3 MiB in use"));
-        let fallback = commit_limit_message(4 * MIB, &error, None);
+        let fallback = commit_limit_message(4 * MIB, "virtual memory", &error, None);
+        assert!(fallback.contains("4194304 bytes of virtual memory"));
         for report in [&report, &fallback] {
             assert!(report.contains("os error 1455"));
             assert!(report.contains("Windows paging file size"));
@@ -1298,6 +1406,15 @@ mod tests {
             assert_eq!(at(b, 1).cast::<u8>().read(), 7);
             a.cast::<u8>().write(1);
         }
+        // Each mapping knows the other (the GPU side's change tracking).
+        let others = |p: *mut c_void| {
+            let mut out = Vec::new();
+            aliases(p as usize, PAGE, &mut out);
+            out.into_iter().map(|(_, a)| a).collect::<Vec<_>>()
+        };
+        assert_eq!(others(at(a, 2)), [at(b, 1) as usize]);
+        assert_eq!(others(at(b, 1)), [at(a, 2) as usize]);
+        assert!(others(a).is_empty());
         // Writes into pages (DirectStorage's) show through their views.
         assert!(write_physical(&pages[2..], 1, &[9]));
         // SAFETY: mapped read-write.
@@ -1332,7 +1449,15 @@ mod tests {
         assert!(map_alias(b as u64, at(a, 2) as u64, PAGE as u64));
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { b.cast::<u8>().read() }, 7);
+        let mut both = others(at(a, 2));
+        both.sort_unstable();
+        assert_eq!(both, [b as usize, at(b, 1) as usize]);
         assert!(map_alias(b as u64, 0, PAGE as u64));
+        assert_eq!(
+            others(at(a, 2)),
+            [at(b, 1) as usize],
+            "unmapped views are forgotten"
+        );
         assert_eq!(query(b).host.State, MEM_RESERVE);
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);

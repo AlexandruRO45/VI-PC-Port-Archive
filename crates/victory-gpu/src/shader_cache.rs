@@ -18,17 +18,29 @@ use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType, ShaderError};
 
-static CACHE: OnceLock<Cache> = OnceLock::new();
+struct ShaderCache {
+    path: PathBuf,
+    cache: Cache,
+}
+
+static CACHE: OnceLock<ShaderCache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
-/// Keeps translated shaders in `dir` from now on.
-pub fn use_shader_cache(dir: PathBuf) {
-    match Cache::open(dir) {
+/// Opens the shader cache once and returns the directory actually in use.
+pub fn use_shader_cache(dir: PathBuf) -> Option<PathBuf> {
+    if let Some(cache) = CACHE.get() {
+        return Some(cache.path.clone());
+    }
+    match Cache::open(&dir) {
         Ok(cache) => {
-            let _ = CACHE.set(cache);
+            let cache = CACHE.get_or_init(|| ShaderCache { path: dir, cache });
+            Some(cache.path.clone())
         }
-        Err(e) => tracing::warn!(error = %e, "no shader cache"),
+        Err(e) => {
+            tracing::warn!(error = %e, "no shader cache");
+            None
+        }
     }
 }
 
@@ -92,9 +104,19 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
-/// The translation of a console shader container, from the cache when
-/// there is one.
-pub(crate) fn host_shader(container: &[u8], wave_wide: bool) -> Result<HostShader, String> {
+/// Translates a console shader container and reports whether the cache supplied it.
+pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+    #[cfg(windows)]
+    let wave_wide = crate::pipeline::warmup_wave_wide(container);
+    #[cfg(not(windows))]
+    let wave_wide = false;
+    host_shader_with_mode(container, wave_wide)
+}
+
+pub(crate) fn host_shader_with_mode(
+    container: &[u8],
+    wave_wide: bool,
+) -> (Result<HostShader, String>, bool) {
     let translate = |c: &[u8]| {
         translate_one(|| {
             if wave_wide {
@@ -105,14 +127,14 @@ pub(crate) fn host_shader(container: &[u8], wave_wide: bool) -> Result<HostShade
         })
     };
     match CACHE.get() {
-        Some(cache) => cached(
-            cache,
+        Some(cache) => cached_with_hit(
+            &cache.cache,
             &for_translation_target(build(), victory_shader::emit::view_heap_limit(), wave_wide),
             victory_shader::emit::host_uses_wave32(),
             container,
             translate,
         ),
-        None => translate(container),
+        None => (translate(container), false),
     }
 }
 
@@ -166,6 +188,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
 }
 
+#[cfg(test)]
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
@@ -173,30 +196,42 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
+    cached_with_hit(cache, build, wave32, container, translate).0
+}
+
+fn cached_with_hit(
+    cache: &Cache,
+    build: &[u8; 32],
+    wave32: bool,
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+) -> (Result<HostShader, String>, bool) {
     let input = [&build[..], &[u8::from(wave32)], container].concat();
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
     };
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
+        let path = match cache.get_or_convert(&converter, &input) {
+            Ok(path) => path,
+            Err(e) => return (Err(format!("{e:#}")), false),
+        };
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
+            let hit = !converter.ran.load(Ordering::Relaxed);
+            let (counter, what) = if !hit {
                 (&MISSES, "translated and cached")
             } else {
                 (&HITS, "from the cache")
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
-            return Ok(shader);
+            return (Ok(shader), hit);
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    ((converter.translate)(container), false)
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";

@@ -844,17 +844,20 @@ impl Staging {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            // The buffer ends with the last row's bytes, short of a whole
-            // pitch.
-            let len = (pitch * rows as usize * f.Depth as usize)
-                .min(self.bytes.saturating_sub(footprint.Offset) as usize);
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            let Some(remaining) = self.bytes.checked_sub(footprint.Offset) else {
+                tracing::warn!(mip, slice, "texture footprint is outside the staging buffer");
+                return;
+            };
+            let layer = pitch.saturating_mul(rows as usize);
+            // The last row does not necessarily include a whole pitch.
+            let len = layer.saturating_mul(f.Depth as usize).min(remaining as usize);
+            // SAFETY: the offset and length both lie inside the mapped staging buffer.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, mip, slice, linear, pitch, layer)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
@@ -944,6 +947,9 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    if (at as usize).checked_add(len).is_none() {
+        return false;
+    }
     if by_query() {
         return committed_by_query(at, len);
     }
@@ -1016,18 +1022,28 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     let mut p = at as usize;
-    let end = p + len;
+    let Some(end) = p.checked_add(len) else { return false };
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
+        if n == 0
+            || info.State != MEM_COMMIT
+            || info.Protect == 0
+            || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0
+        {
             return false;
         }
-        p = info.BaseAddress as usize + info.RegionSize;
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= p {
+            return false;
+        }
+        p = next;
     }
     true
 }

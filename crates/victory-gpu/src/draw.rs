@@ -582,6 +582,29 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// A root signature that directly indexes heaps must follow this binding.
+    fn bind_heaps(&mut self, list: &HostList) {
+        if self.host_heaps != self.heaps {
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+                .heaps
+                .iter()
+                .filter(|&&h| h != 0)
+                .filter_map(|&h| crate::descriptor::heap(h as This).host())
+                .map(|h| Some(h.heap.clone()))
+                .collect();
+            heaps.iter().flatten().for_each(|h| list.keep(h));
+            // SAFETY: an open list and shader-visible heaps.
+            unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            self.host_heaps = self.heaps;
+            self.host_roots = [0; 2];
+        }
+    }
+
+    /// A host library can replace the bindings tracked by the title.
+    pub(crate) fn host_state_lost(&mut self) {
+        (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+    }
+
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
         for &h in heaps {
@@ -1009,22 +1032,7 @@ impl State {
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
-        // Heaps first: a root signature with directly indexed heaps must be
-        // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
-        }
+        self.bind_heaps(list);
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
         let tested = if !compute && self.depth_state == DEPTH_READ {
@@ -2038,6 +2046,51 @@ impl State {
             }
             text
         });
+    }
+
+    /// Clears the view described by the title's CPU descriptor.
+    pub(crate) fn clear_unordered(
+        &mut self,
+        list: &HostList,
+        cpu: u64,
+        values: [u32; 4],
+        float: bool,
+        rects: &[RECT],
+    ) {
+        let Some(view @ (View::Unordered(..) | View::Placed(true, ..))) =
+            crate::descriptor::view(cpu)
+        else {
+            once!("an unordered access clear without a valid UAV");
+            return;
+        };
+        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
+        let (Some(heap), Some(host)) = (heap, crate::host::host()) else {
+            once!("an unordered access clear without a bound view heap");
+            return;
+        };
+        let Some(visible) = heap.host() else { return };
+        let Some(slot) = visible.dynamic(1) else { return };
+        self.bind_heaps(list);
+        let cleared = host.with_cpu_view(|cpu| {
+            let Some(resource) = visible.copy_unordered_at(slot, &view, cpu) else { return false };
+            readable(list, ResourceType::Uav, &view);
+            list.keep(&resource);
+            let gpu = visible.gpu_handle(slot);
+            // SAFETY: an open list and two handles for the same live resource.
+            unsafe {
+                if float {
+                    list.list.ClearUnorderedAccessViewFloat(gpu, cpu, &resource, &values.map(f32::from_bits), rects);
+                } else {
+                    list.list.ClearUnorderedAccessViewUint(gpu, cpu, &resource, &values, rects);
+                }
+            }
+            true
+        });
+        if cleared {
+            self.dynamic.push((std::ptr::from_ref(heap) as usize, slot, 1));
+        } else {
+            visible.release(slot, 1);
+        }
     }
 
     /// Runs a dispatch on the host.

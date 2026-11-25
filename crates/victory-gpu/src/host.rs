@@ -49,11 +49,12 @@ pub(crate) struct Host {
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
     next_dsv: AtomicU32,
+    cpu_view: Mutex<ID3D12DescriptorHeap>,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
-    presenter: Mutex<Option<Presenter>>,
+    presenter: Mutex<Presentation>,
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
@@ -512,11 +513,12 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    crate::tdr::log();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
         let debug =
-            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+            cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
@@ -556,7 +558,7 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -616,6 +618,11 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        let cpu_view = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: 1,
+            ..Default::default()
+        })?;
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
@@ -631,9 +638,10 @@ fn create() -> windows::core::Result<Host> {
             dsvs,
             dsv_size,
             next_dsv: AtomicU32::new(0),
+            cpu_view: Mutex::new(cpu_view),
             messages,
             next_rtv: AtomicU32::new(0),
-            presenter: Mutex::new(None),
+            presenter: Mutex::new(Presentation::default()),
             adapter,
         })
     }
@@ -1423,12 +1431,36 @@ fn record_twin_copy(
     }
 }
 
+#[cfg(feature = "diagnostics")]
+fn traced_shaders() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        std::env::var("VICTORY_TRACE_SHADERS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|hash| !hash.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+}
+
+#[cfg(feature = "diagnostics")]
+fn trace_shader_command(what: &str, shaders: &[String]) {
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if shaders.iter().any(|hash| what.contains(hash.as_str()))
+        && LOGGED.fetch_add(1, Ordering::Relaxed) < 500
+    {
+        tracing::info!("traced command: {what}");
+    }
+}
+
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+        cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED")
     })
 }
 
@@ -8130,6 +8162,31 @@ impl Host {
         first_error
     }
 
+    /// Whether the runtime accepts anisotropic filtering with point mipmaps.
+    pub(crate) fn aniso_point_mip(&self) -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+            // SAFETY: the feature matches the output structure and its size.
+            unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS19,
+                    (&raw mut options).cast(),
+                    std::mem::size_of_val(&options) as u32,
+                )
+            }
+            .is_ok()
+                && options.AnisoFilterWithPointMipSupported.as_bool()
+        })
+    }
+
+    /// A CPU-only descriptor held exclusively until recording finishes.
+    pub(crate) fn with_cpu_view<T>(&self, record: impl FnOnce(D3D12_CPU_DESCRIPTOR_HANDLE) -> T) -> T {
+        let heap = self.cpu_view.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the heap is live and cannot be reused before the call returns.
+        record(unsafe { heap.GetCPUDescriptorHandleForHeapStart() })
+    }
+
     /// A host render target view of `resource`, valid until it is recorded.
     pub(crate) fn rtv(
         &self,
@@ -8678,8 +8735,15 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
+        let shaders = traced_shaders();
         if !dred_on() {
-            crate::capture::op(std::ptr::from_ref(self) as usize, what);
+            if shaders.is_empty() {
+                crate::capture::op(std::ptr::from_ref(self) as usize, what);
+            } else {
+                let what = what();
+                trace_shader_command(&what, shaders);
+                crate::capture::op(std::ptr::from_ref(self) as usize, || what);
+            }
             return;
         }
         {
@@ -8690,6 +8754,7 @@ impl HostList {
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
             let what = what();
+            trace_shader_command(&what, shaders);
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
@@ -9697,6 +9762,12 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+#[derive(Default)]
+struct Presentation {
+    presenter: Option<Presenter>,
+    next_attempt: Option<std::time::Instant>,
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
@@ -10053,15 +10124,27 @@ impl Host {
             return None;
         };
         let (width, height) = (desc.Width as u32, desc.Height);
-        let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
-        if presenter.is_none() {
+        let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let Presentation { presenter, next_attempt } = &mut *presentation;
+        let should_make = presenter.is_none();
+        let should_resize = presenter.as_ref().is_some_and(|p| {
+            (p.width, p.height, p.format) != (width, height, format)
+        });
+        if (should_make || should_resize)
+            && next_attempt.is_some_and(|at| std::time::Instant::now() < at)
+        {
+            return None;
+        }
+        if should_make {
             *presenter = match self.presenter(width, height, format) {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    tracing::warn!(error = %e, "no swap chain");
+                    *next_attempt = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+                    tracing::warn!(error = %e, width, height, format = format.0, "no swap chain");
                     return None;
                 }
             };
+            *next_attempt = None;
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
@@ -10074,6 +10157,7 @@ impl Host {
             };
             match resized {
                 Ok(()) => {
+                    *next_attempt = None;
                     (p.width, p.height, p.format) = (width, height, format);
                     tracing::info!(
                         width,
@@ -10085,7 +10169,8 @@ impl Host {
                     self.log_video_memory("right after the swap chain's buffers were made again");
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, width, height, "swap chain not resized");
+                    *next_attempt = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+                    tracing::warn!(error = %e, width, height, format = format.0, "swap chain not resized");
                     return None;
                 }
             }

@@ -135,7 +135,9 @@ fn valid_container(name: &str) -> bool {
 /// A committed version of a container.
 struct Version {
     dir: PathBuf,
-    number: u64,
+    /// The highest version number any entry in the container's folder
+    /// carries, readable or not; the next commit goes above it.
+    highest: u64,
     name: String,
     display: String,
     /// Blob names; blob `i` is the file `i`.
@@ -188,7 +190,7 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
 
 /// Loads and validates one committed version directory: its manifest must
 /// parse cleanly and every referenced blob file must exist.
-fn load_version(version: PathBuf, number: u64) -> std::io::Result<Version> {
+fn load_version(version: PathBuf, highest: u64) -> std::io::Result<Version> {
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
     let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
     let blobs = names.split_off(2);
@@ -203,11 +205,17 @@ fn load_version(version: PathBuf, number: u64) -> std::io::Result<Version> {
     }
     Ok(Version {
         dir: version,
-        number,
+        highest,
         name,
         display,
         blobs,
     })
+}
+
+/// The canonical number written by `commit`, excluding aliases like v01.
+fn version_number(file: &str) -> Option<u64> {
+    let n = file.strip_prefix('v')?.parse::<u64>().ok()?;
+    (n > 0 && format!("v{n}") == file).then_some(n)
 }
 
 /// The container's newest intact committed version, if any. Validates
@@ -215,15 +223,17 @@ fn load_version(version: PathBuf, number: u64) -> std::io::Result<Version> {
 /// newest version never destroys the last known-good save.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
+    let mut highest = 0;
     for entry in std::fs::read_dir(dir)?.flatten() {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
             remove_path(&entry.path())?;
-        } else if entry.file_type().is_ok_and(|t| t.is_dir())
-            && let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok())
-        {
-            committed.push(n);
+        } else if let Some(n) = version_number(&file) {
+            highest = highest.max(n);
+            if entry.file_type()?.is_dir() {
+                committed.push(n);
+            }
         }
     }
     committed.sort_unstable();
@@ -234,9 +244,9 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut chosen = None;
     for &number in committed.iter().rev() {
         let version = dir.join(format!("v{number}"));
-        match load_version(version, number) {
+        match load_version(version, highest) {
             Ok(v) => {
-                chosen = Some(v);
+                chosen = Some((number, v));
                 break;
             }
             Err(e) => {
@@ -245,13 +255,13 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
             }
         }
     }
-    let Some(chosen) = chosen else {
+    let Some((chosen_number, chosen)) = chosen else {
         return Err(last_err.unwrap_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest")
         }));
     };
     for &other in &committed {
-        if other != chosen.number {
+        if other < chosen_number {
             let _ = std::fs::remove_dir_all(dir.join(format!("v{other}")));
         }
     }
@@ -303,8 +313,9 @@ fn commit(
         match source {
             Source::Data(data) => write(path, data)?,
             // Files are never changed in place, so sharing one is safe.
-            Source::Kept(from) => std::fs::hard_link(from, &path)
-                .or_else(|_| std::fs::copy(from, &path).map(drop))?,
+            Source::Kept(from) => {
+                std::fs::hard_link(from, &path).or_else(|_| write(path, &std::fs::read(from)?))?
+            }
         }
         step();
     }
@@ -507,7 +518,9 @@ impl Update {
         }
         let replaced: u64 = current.as_ref().map_or(0, |v| {
             let sizes = v.sizes();
-            let changed = sizes.iter().filter(|(n, _)| self.changes.iter().any(|(c, _)| c == n));
+            let changed = sizes
+                .iter()
+                .filter(|(n, _)| self.changes.iter().any(|(c, _)| c == n));
             changed.map(|(_, size)| size).sum()
         });
         let root = self.dir.parent().unwrap_or(&self.dir);
@@ -517,7 +530,12 @@ impl Update {
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
-        let number = current.as_ref().map_or(1, |v| v.number + 1);
+        let Some(number) = current
+            .as_ref()
+            .map_or(Some(1), |v| v.highest.checked_add(1))
+        else {
+            return NO_ACCESS;
+        };
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
             return io_error(&self.dir, &e);
         }
@@ -560,7 +578,11 @@ fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8
     names
         .into_iter()
         .map(|name| {
-            let i = version.blobs.iter().position(|b| *b == name).ok_or(BLOB_NOT_FOUND)?;
+            let i = version
+                .blobs
+                .iter()
+                .position(|b| *b == name)
+                .ok_or(BLOB_NOT_FOUND)?;
             let data = std::fs::read(version.blob(i)).map_err(|e| io_error(&c.dir, &e))?;
             Ok((name, data))
         })
@@ -620,7 +642,12 @@ pub struct BlobInfo {
 
 /// Calls `callback` with the information of each container that passes
 /// `keep` until it returns false; never under our lock (it may call us).
-fn report(root: &Path, keep: impl Fn(&str) -> bool, context: *mut c_void, callback: ContainerCallback) {
+fn report(
+    root: &Path,
+    keep: impl Fn(&str) -> bool,
+    context: *mut c_void,
+    callback: ContainerCallback,
+) {
     let infos: Vec<(CString, CString, u32, u64, i64)> = {
         let _saves = saves_lock();
         containers(root)
@@ -1021,7 +1048,10 @@ mod tests {
     fn a_full_disk_is_not_the_quota() {
         let mb = 1 << 20;
         assert_eq!(no_room(2 * mb, 0, 0, mb), Some(OUT_OF_LOCAL_STORAGE));
-        assert_eq!(no_room(2 * mb, 0, QUOTA - mb, 100 * mb), Some(QUOTA_EXCEEDED));
+        assert_eq!(
+            no_room(2 * mb, 0, QUOTA - mb, 100 * mb),
+            Some(QUOTA_EXCEEDED)
+        );
         // Replacing a blob of the same size fits a full quota.
         assert_eq!(no_room(mb, mb, QUOTA, 100 * mb), None);
         assert_eq!(no_room(mb, 0, 0, mb), None);
@@ -1050,18 +1080,28 @@ mod tests {
     }
 
     fn old_state() -> Option<(String, Vec<(String, String)>)> {
-        Some(("one".into(), vec![("a".into(), "old a".into()), ("b".into(), "old b".into())]))
+        Some((
+            "one".into(),
+            vec![("a".into(), "old a".into()), ("b".into(), "old b".into())],
+        ))
     }
 
     /// Run by the crash test in a child process; does nothing otherwise.
     #[test]
     fn crash_child() {
-        let (Ok(root), Ok(op)) = (std::env::var("VICTORY_SAVE_CHILD"), std::env::var("VICTORY_SAVE_OP")) else {
+        let (Ok(root), Ok(op)) = (
+            std::env::var("VICTORY_SAVE_CHILD"),
+            std::env::var("VICTORY_SAVE_OP"),
+        ) else {
             return;
         };
         let root = PathBuf::from(root);
         let hr = if op == "update" {
-            update(&root, "two", &[("a", Some("new a")), ("b", None), ("c", Some("new c"))])
+            update(
+                &root,
+                "two",
+                &[("a", Some("new a")), ("b", None), ("c", Some("new c"))],
+            )
         } else {
             delete(&root, "Slot")
         };
@@ -1074,15 +1114,25 @@ mod tests {
     /// new one.
     #[test]
     fn a_kill_at_any_step_leaves_old_or_new() {
-        let new = Some(("two".into(), vec![("a".into(), "new a".into()), ("c".into(), "new c".into())]));
+        let new = Some((
+            "two".into(),
+            vec![("a".into(), "new a".into()), ("c".into(), "new c".into())],
+        ));
         for (op, after) in [("update", new), ("delete", None)] {
             let mut seen = (0, 0);
             for stop in 1.. {
                 let dir = tempfile::tempdir().unwrap();
                 let root = dir.path();
-                assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+                assert_eq!(
+                    update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+                    S_OK
+                );
                 let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "modules::xgamesave::tests::crash_child", "--nocapture"])
+                    .args([
+                        "--exact",
+                        "modules::xgamesave::tests::crash_child",
+                        "--nocapture",
+                    ])
                     .args(["--test-threads=1"])
                     .env("VICTORY_SAVE_CHILD", root)
                     .env("VICTORY_SAVE_OP", op)
@@ -1116,6 +1166,37 @@ mod tests {
         }
     }
 
+    /// A kept blob that cannot be hard-linked (NTFS allows 1024 links to a
+    /// file) is copied into the new version with its exact bytes.
+    #[cfg(windows)]
+    #[test]
+    fn a_kept_blob_past_the_link_limit_is_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        const NTFS: &str = "the temp folder must be on NTFS, which allows 1024 links to a file";
+        let old_b = container_dir(root, "Slot").join("v1").join("1");
+        for i in 0..1023 {
+            std::fs::hard_link(&old_b, links.path().join(i.to_string())).expect(NTFS);
+        }
+        let full = std::fs::hard_link(&old_b, links.path().join("full")).expect_err(NTFS);
+        assert_eq!(full.kind(), std::io::ErrorKind::TooManyLinks, "{NTFS}");
+
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+
+        let new = (
+            "two".into(),
+            vec![("a".into(), "new a".into()), ("b".into(), "old b".into())],
+        );
+        assert_eq!(state(root), Some(new));
+        assert!(!old_b.exists());
+        assert_eq!(std::fs::read(links.path().join("0")).unwrap(), b"old b");
+    }
+
     #[test]
     fn names_are_exact() {
         for name in ["Save_1", "slot/2", "a.b c%", "\u{e9}t\u{e9}"] {
@@ -1127,16 +1208,35 @@ mod tests {
         for good in ["Profile/Slot_1", "a/b/Save-2.sav", "x", &"a".repeat(256)] {
             assert!(valid_container(good), "{good}");
         }
-        for bad in ["a b", "", "a/", "a.", "a..b", "a.b/c", "a-b/c", &"a".repeat(257)] {
+        for bad in [
+            "a b",
+            "",
+            "a/",
+            "a.",
+            "a..b",
+            "a.b/c",
+            "a-b/c",
+            &"a".repeat(257),
+        ] {
             assert!(!valid_container(bad), "{bad}");
         }
 
         // Containers and blobs differing only in case, reserved device
         // names, characters the host forbids, long names: all distinct.
         let dir = tempfile::tempdir().unwrap();
-        let p = Provider { root: dir.path().into() };
+        let p = Provider {
+            root: dir.path().into(),
+        };
         let long = "n".repeat(300);
-        let blobs = ["A", "a", "CON", "nul.txt", "x/y:z*?\"<>|", long.as_str(), "end. "];
+        let blobs = [
+            "A",
+            "a",
+            "CON",
+            "nul.txt",
+            "x/y:z*?\"<>|",
+            long.as_str(),
+            "end. ",
+        ];
         for container in ["Save", "save", "SAVE/CON.x"] {
             let c = p.container(container);
             let u = Update {
@@ -1168,7 +1268,10 @@ mod tests {
     #[test]
     fn the_old_layout_moves_over() {
         let saves = tempfile::tempdir().unwrap();
-        let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
+        let root = saves
+            .path()
+            .join(format!("{:016X}", xuser::XUID))
+            .join("scid");
         let old = root.join("Player");
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("Save%20Game%20Data"), b"data").unwrap();
@@ -1187,7 +1290,10 @@ mod tests {
             ]
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
-        assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
+        assert_eq!(
+            (v.dir.file_name(), v.display.as_str()),
+            (Some("v1".as_ref()), "Chapter 1")
+        );
     }
 
     /// An empty configuration id names none. As a folder name it would be
@@ -1261,7 +1367,10 @@ mod tests {
             S_OK
         );
         type Delete = extern "system" fn(This, *mut Update, *const c_char) -> HRESULT;
-        assert_eq!(method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()), S_OK);
+        assert_eq!(
+            method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()),
+            S_OK
+        );
         type Submit = extern "system" fn(This, *const Update, *mut AsyncBlock) -> HRESULT;
         let mut b = block();
         assert_eq!(method::<Submit>(&OBJECT, 0xe0)(this, update, &mut b), S_OK);
@@ -1424,12 +1533,19 @@ mod tests {
         std::fs::write(container_dir.join("v3.new"), b"stray").unwrap();
 
         let v = current(&container_dir).unwrap().expect("must recover v1");
-        assert_eq!(v.number, 1);
+        assert_eq!(v.dir, container_dir.join("v1"));
+        assert_eq!(v.highest, 99);
         assert_eq!(v.name, "Slot_1");
         assert_eq!(v.blobs, ["world"]);
         assert_eq!(std::fs::read(v.dir.join("0")).unwrap(), b"good-save");
-        assert!(!v2.exists(), "damaged v2 should be pruned after v1 is validated");
-        assert!(!container_dir.join("v3.new").exists(), "stray .new file cleaned up");
+        assert!(
+            v2.exists(),
+            "the unreadable newer version must not be removed"
+        );
+        assert!(
+            !container_dir.join("v3.new").exists(),
+            "stray .new file cleaned up"
+        );
 
         // Also test a v2 whose manifest parses cleanly but whose blob file is missing.
         let v2_missing = container_dir.join("v2");
@@ -1439,9 +1555,93 @@ mod tests {
             manifest("Slot_1", "Chapter 2", &["world"]),
         )
         .unwrap();
-        let v = current(&container_dir).unwrap().expect("must still recover v1");
-        assert_eq!(v.number, 1);
+        let v = current(&container_dir)
+            .unwrap()
+            .expect("must still recover v1");
+        assert_eq!(v.dir, container_dir.join("v1"));
+        assert_eq!(v.highest, 99);
         assert_eq!(std::fs::read(v.dir.join("0")).unwrap(), b"good-save");
-        assert!(!v2_missing.exists());
+        assert!(v2_missing.exists());
+    }
+
+    /// Only `v<N>` as `commit` writes it is a version: `v01` and the like
+    /// are neither read, counted nor removed (#870).
+    #[test]
+    fn a_noncanonical_folder_does_not_remove_a_committed_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        let slot = container_dir(root, "Slot");
+        for stray in ["v01", "v001", "v+1", "v0", "v02"] {
+            std::fs::create_dir(slot.join(stray)).unwrap();
+        }
+        assert_eq!(state(root), old_state());
+        assert!(slot.join("v1").is_dir());
+        for stray in ["v01", "v001", "v+1", "v0", "v02"] {
+            assert!(slot.join(stray).exists(), "{stray} was removed");
+        }
+    }
+
+    /// A newer version folder that does not read (an empty folder, a file,
+    /// a broken manifest) neither hides the committed save, nor removes it,
+    /// nor blocks the next update, which goes above it.
+    #[test]
+    fn an_unreadable_newer_version_does_not_cost_the_save() {
+        type Make = fn(&Path);
+        let strays: [(&str, Make); 3] = [
+            ("empty folder", |p| std::fs::create_dir(p).unwrap()),
+            ("file", |p| std::fs::write(p, b"not a version").unwrap()),
+            ("broken manifest", |p| {
+                std::fs::create_dir(p).unwrap();
+                std::fs::write(p.join(MANIFEST), [9, 0, 0, 0, b'x']).unwrap();
+            }),
+        ];
+        for (what, make) in strays {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            assert_eq!(
+                update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+                S_OK
+            );
+            let slot = container_dir(root, "Slot");
+            make(&slot.join("v2"));
+
+            assert_eq!(state(root), old_state(), "{what}: read");
+            assert!(slot.join("v1").is_dir(), "{what}: v1 was removed");
+
+            assert_eq!(
+                update(root, "two", &[("a", Some("new a"))]),
+                S_OK,
+                "{what}: update"
+            );
+            let blobs = vec![("a".into(), "new a".into()), ("b".into(), "old b".into())];
+            let after = Some(("two".into(), blobs));
+            assert_eq!(state(root), after, "{what}: after the update");
+            assert!(
+                slot.join("v3").is_dir(),
+                "{what}: the update did not go above v2"
+            );
+            // Read again: the new version stays the container.
+            assert_eq!(state(root), after, "{what}: second read");
+        }
+    }
+
+    /// With no readable version at all, reads and updates fail and nothing
+    /// is removed.
+    #[test]
+    fn no_readable_version_is_refused_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        std::fs::write(slot.join("v1").join(MANIFEST), [1, 2, 3]).unwrap();
+        let c = Provider { root: root.into() }.container("Slot");
+        assert_eq!(read(&c, None).err(), Some(NO_ACCESS));
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
+        assert!(slot.join("v1").join("0").is_file());
+        assert!(!slot.join("v2").exists());
     }
 }
