@@ -197,6 +197,13 @@ impl Shadow {
         n
     }
 
+    /// Offset of `[address, address + len)` in `self.buffer` when this copy
+    /// holds all of it.
+    pub(crate) fn offset_for_range(&self, address: u64, len: u64) -> Option<u64> {
+        let offset = address.checked_sub(self.start)?;
+        (offset.checked_add(len)? <= self.len).then_some(offset + self.base)
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
