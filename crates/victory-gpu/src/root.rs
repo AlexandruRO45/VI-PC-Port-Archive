@@ -130,16 +130,48 @@ fn serialize_with(
     blob: *mut *mut c_void,
     error: *mut *mut c_void,
 ) -> HRESULT {
+    // The first attempt's error blob lands in a pointer of our own: a retry is
+    // handed the caller's `error` again and would overwrite the first blob
+    // without releasing it.
+    let mut first_error: *mut c_void = std::ptr::null_mut();
     // SAFETY: the caller resolved the host export, which has this signature.
-    let result = unsafe { serialize(&desc, version, blob, error) };
+    let result = unsafe { serialize(&desc, version, blob, std::ptr::addr_of_mut!(first_error)) };
     if result >= 0 || desc.flags & HEAP_FLAGS == 0 {
-        return result;
+        return answer_error(result, first_error, error);
     }
+    release_blob(first_error);
     tracing::debug!(
         flags = format_args!("{:#x}", desc.flags),
         "host refused the heap-directly-indexed root signature flags; retrying without them"
     );
     retry_without_heap_flags(serialize, &desc, version, blob, error)
+}
+
+/// Hands the first attempt's error blob to the caller and returns `result`;
+/// a blob no caller asked for is released instead of leaked.
+fn answer_error(result: HRESULT, blob: *mut c_void, error: *mut *mut c_void) -> HRESULT {
+    if error.is_null() {
+        release_blob(blob);
+    } else {
+        // SAFETY: checked non-null; the caller passes room for a pointer.
+        unsafe { *error = blob };
+    }
+    result
+}
+
+/// Releases a blob the host handed out. It is a COM object, so `Release` is
+/// the third slot after `QueryInterface` and `AddRef`; a null one is ignored.
+fn release_blob(blob: *mut c_void) {
+    if blob.is_null() {
+        return;
+    }
+    type Release = extern "system" fn(*const c_void) -> u32;
+    // SAFETY: a blob from the host is a COM object: its first word is the
+    // vtable, whose third entry is `Release`.
+    let vtable = unsafe { *(blob as *const *const *const ()) };
+    // SAFETY: the third slot of a blob's vtable holds `Release`.
+    let release: Release = unsafe { std::mem::transmute(*vtable.add(2) as usize) };
+    release(blob.cast_const());
 }
 
 /// The second attempt of [`serialize_with`], with [`HEAP_FLAGS`] cleared.
@@ -190,11 +222,13 @@ fn serialize_versioned_with(
     blob: *mut *mut c_void,
     error: *mut *mut c_void,
 ) -> HRESULT {
+    let mut first_error: *mut c_void = std::ptr::null_mut();
     // SAFETY: the caller resolved the host export, which has this signature.
-    let result = unsafe { serialize(&desc, blob, error) };
+    let result = unsafe { serialize(&desc, blob, std::ptr::addr_of_mut!(first_error)) };
     if result >= 0 || desc.desc.flags & HEAP_FLAGS == 0 {
-        return result;
+        return answer_error(result, first_error, error);
     }
+    release_blob(first_error);
     tracing::debug!(
         flags = format_args!("{:#x}", desc.desc.flags),
         "host refused the heap-directly-indexed root signature flags; retrying without them"
@@ -706,6 +740,106 @@ mod tests {
             "a refusal that is not about the flags comes back unchanged"
         );
     }
+
+    /// How many blobs the fake host handed out were released.
+    static RELEASES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// COM `Release`, the third slot of a blob.
+    extern "system" fn released(_: *const c_void) -> u32 {
+        RELEASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        0
+    }
+
+    /// `QueryInterface`, `AddRef`, `Release`.
+    #[repr(C)]
+    struct FakeVtable([*const (); 3]);
+    // SAFETY: function addresses only.
+    unsafe impl Sync for FakeVtable {}
+    static BLOB_VTABLE: FakeVtable = FakeVtable([
+        std::ptr::null(),
+        std::ptr::null(),
+        released as *const (),
+    ]);
+
+    /// A fake error blob: a COM object, so its first word is the vtable.
+    #[repr(C)]
+    struct FakeBlob(*const *const ());
+    // SAFETY: the only field is an address.
+    unsafe impl Sync for FakeBlob {}
+    static BLOB_OBJECT: FakeBlob = FakeBlob(BLOB_VTABLE.0.as_ptr());
+
+    fn fake_blob() -> *mut c_void {
+        std::ptr::addr_of!(BLOB_OBJECT) as *mut c_void
+    }
+
+    /// A refusal that leaves an error blob behind, as a host does, so a retry
+    /// has one to overwrite.
+    unsafe extern "system" fn refuses_heap_flags_with_blob(
+        desc: *const Desc,
+        _: u32,
+        _: *mut *mut c_void,
+        error: *mut *mut c_void,
+    ) -> HRESULT {
+        // SAFETY: the tests pass a live description and room for a pointer.
+        let flags = unsafe { (*desc).flags };
+        if !error.is_null() {
+            // SAFETY: checked non-null; the caller passes room for a pointer.
+            unsafe { *error = fake_blob() };
+        }
+        if flags & HEAP_FLAGS == 0 {
+            S_OK
+        } else {
+            E_INVALIDARG
+        }
+    }
+
+    /// The refusal's error blob is released when the retry replaces it, and
+    /// handed on untouched when there is no retry.
+    #[test]
+    fn the_first_error_blob_is_released_by_a_retry() {
+        let releases = || RELEASES.load(std::sync::atomic::Ordering::Relaxed);
+        let mut blob = std::ptr::null_mut();
+
+        let before = releases();
+        let mut error = std::ptr::null_mut();
+        assert_eq!(
+            serialize_with(refuses_heap_flags_with_blob, plain(0xc01), 1, &mut blob, &mut error),
+            S_OK
+        );
+        assert_eq!(
+            releases(),
+            before + 1,
+            "the refusal's blob is released instead of overwritten"
+        );
+        assert_eq!(error, fake_blob(), "the caller gets the retry's blob");
+
+        let before = releases();
+        let mut error = std::ptr::null_mut();
+        assert_eq!(
+            serialize_with(refuses_heap_flags_with_blob, plain(0x41), 1, &mut blob, &mut error),
+            S_OK
+        );
+        assert_eq!(releases(), before, "no retry, so the blob is the caller's");
+        assert_eq!(error, fake_blob());
+
+        let before = releases();
+        assert_eq!(
+            serialize_with(
+                refuses_heap_flags_with_blob,
+                plain(0x41),
+                1,
+                &mut blob,
+                std::ptr::null_mut()
+            ),
+            S_OK
+        );
+        assert_eq!(
+            releases(),
+            before + 1,
+            "a caller that asked for no error blob does not leak it"
+        );
+    }
+
     /// Truncated and nonsense blobs reach the host, which rejects them
     /// without writing an object.
     #[cfg(windows)]
