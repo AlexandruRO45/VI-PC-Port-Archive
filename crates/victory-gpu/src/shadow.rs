@@ -1306,6 +1306,53 @@ mod tests {
         assert_eq!(find(base, 3 * w), None);
     }
 
+    /// A range in one window, then a range across that window's end, which
+    /// gets a window of its own over both (the first inside it): what the
+    /// title writes reaches both copies, and what the GPU writes through
+    /// the spanning one goes back to title memory and from there into the
+    /// first at its next refresh. (Within one submission the two copies are
+    /// apart, as any two copies of the same bytes are.)
+    #[test]
+    fn overlapping_windows_agree_through_title_memory() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if host().is_none() {
+            return;
+        }
+        let w = WINDOW as usize;
+        // SAFETY: a fresh allocation, released below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * w, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let b = p.next_multiple_of(w);
+        let title = |at: usize| (b + at) as *mut u8;
+        // SAFETY: (all title reads and writes below) bytes of our allocation.
+        unsafe { title(w - 40).write_volatile(0x11) };
+        let first = loose((b + w - 64) as u64, (b + w - 32) as u64).expect("a window");
+        let spanning = loose((b + w - 16) as u64, (b + w + 16) as u64).expect("a window across the boundary");
+        assert!(!Arc::ptr_eq(&first, &spanning));
+        assert_eq!((first.start, first.len), (b as u64, w as u64));
+        assert_eq!((spanning.start, spanning.len), (b as u64, 2 * w as u64), "the first lies inside it");
+        let byte = |s: &Shadow, at: usize| s.read_host(((b + at) & !3) as u64, 1)[0].to_le_bytes()[(b + at) % 4];
+        // The title writes: both copies take it at their refresh.
+        // SAFETY: a byte of our allocation.
+        unsafe { title(w - 40).write_volatile(0x22) };
+        first.update(b + w - 64, 64);
+        spanning.update(b + w - 64, 64);
+        assert_eq!((byte(&first, w - 40), byte(&spanning, w - 40)), (0x22, 0x22));
+        // A shader writes through the spanning copy; it goes back to title
+        // memory, and the first copy takes it at its next refresh.
+        spanning.writing(b + w - 64, 64, false);
+        spanning.write_host((b + w - 40) as u64, &[0x33]);
+        spanning.copy_back(b + w - 64, 64);
+        // SAFETY: a byte of our allocation.
+        let back = unsafe { title(w - 40).read_volatile() };
+        assert_eq!(back, 0x33, "back in title memory");
+        first.update(b + w - 64, 64);
+        assert_eq!(byte(&first, w - 40), 0x33, "and in the first copy");
+        LOOSE.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(s, _), _| s != b as u64);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
     #[test]
     fn loose_memory_must_be_committed() {
         use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
