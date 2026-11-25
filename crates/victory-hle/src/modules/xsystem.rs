@@ -36,8 +36,8 @@ pub const ANALYTICS: Guid = Guid::new(
 const CONSOLE_ID: &str = "00000000000000000000000000000000000001";
 /// The retail sandbox.
 const SANDBOX: &str = "RETAIL";
-/// `XSystemXboxLiveSandboxIdMaxBytes`: the least the runtime accepts for the
-/// sandbox id, whatever the sandbox's own length.
+/// The smallest sandbox-id buffer the runtime accepts, whatever the sandbox's
+/// own length.
 const SANDBOX_ID_MAX_BYTES: usize = 16;
 /// Base64 of 32 bytes: 44 characters (45 bytes with the NUL).
 const DEVICE_ID: &str = "VkljdG9yeSBvZmZsaW5lIGRldmljZSBpZGVudGl0eSE=";
