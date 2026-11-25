@@ -324,12 +324,13 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
-    /// The bytes it spans in a buffer: every row pitched but the last.
+    /// The bytes it spans in a buffer: every row pitched but the last; none
+    /// if the title's numbers overflow.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
-        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+        let lines = u64::from(self.height).div_ceil(block).checked_mul(u64::from(self.depth))?;
+        let last = u64::from(self.width).div_ceil(block).checked_mul(element)?;
+        u64::from(self.row_pitch).checked_mul(lines.saturating_sub(1))?.checked_add(last)
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
@@ -1849,6 +1850,17 @@ pub(crate) fn test_buffer(width: u64) -> This {
 
 #[cfg(test)]
 mod tests {
+    use super::PlacedFootprint;
+
+    /// A footprint the title makes up with sizes that overflow is no copy.
+    #[test]
+    fn footprints_that_overflow_span_no_bytes() {
+        let footprint = |width, height, depth, row_pitch| PlacedFootprint { offset: 0, format: 28, width, height, depth, row_pitch };
+        assert_eq!(footprint(4, 4, 1, 256).bytes(), Some(256 * 3 + 16));
+        assert_eq!(footprint(1, u32::MAX, u32::MAX, 256).bytes(), None, "pitch times rows overflows");
+        assert_eq!(footprint(1, u32::MAX, u32::MAX, 0).bytes(), Some(4), "no pitch, no overflow");
+    }
+
     use super::*;
     use crate::object::slot;
 
