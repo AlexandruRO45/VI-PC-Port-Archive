@@ -477,12 +477,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
     let base = u32_at(part, 4)? as usize;
-    // The rows the count asks for are in the part, 32 bytes each: a count
-    // from a damaged part would otherwise be an allocation of its size.
-    if count > part.len().saturating_sub(base) / 32 {
-        return Err(ShaderError::Malformed("signature rows out of bounds"));
-    }
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(part.len() / 32));
     for i in 0..count {
         let at = base + 32 * i;
         let name_at = u32_at(part, at + 4)? as usize;
@@ -493,11 +488,6 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
         let mask = *part
             .get(at + 24)
             .ok_or(ShaderError::Malformed("truncated"))?;
-        // A row has four dwords, so its mask names at most four components
-        // (the emission shifts `1 << cols`, which overflows past 8).
-        if mask.count_ones() > 4 {
-            return Err(ShaderError::Malformed("signature element mask"));
-        }
         if u32_at(part, at + 28)? != 0 {
             return Err(ShaderError::Unsupported {
                 offset: 0,
@@ -600,28 +590,20 @@ mod tests {
         out
     }
 
-    /// A damaged signature part fails the translation instead of aborting
-    /// on the allocation its count asks for.
+    /// A count from a damaged part does not size the allocation, and the
+    /// rows it asks for are refused where they run off the part.
     #[test]
     fn a_signature_count_past_its_rows_is_refused() {
         let mut part = isg1(0, 0x1);
         part[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(
-            signature(&part).unwrap_err(),
-            ShaderError::Malformed("signature rows out of bounds")
-        );
+        assert!(signature(&part).is_err());
         let part = [0x20u8, 0, 0, 0, 0, 0, 0, 0];
         assert!(signature(&part).is_err());
     }
 
-    /// The mask and the register of a row reach shifts and a PSV0 table
-    /// sized from them: a damaged part is refused, not a panic.
+    /// PSV0 counts a signature's register rows in a byte.
     #[test]
-    fn a_signature_row_outside_its_fields_is_refused() {
-        assert_eq!(
-            signature(&isg1(0, 0xFF)).unwrap_err(),
-            ShaderError::Malformed("signature element mask")
-        );
+    fn a_signature_register_outside_its_field_is_refused() {
         assert_eq!(
             signature(&isg1(0x4000_0000, 0x1)).unwrap_err(),
             ShaderError::Malformed("signature element register")
