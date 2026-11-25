@@ -14,8 +14,27 @@
 //! writes the same pages every submission. The lists record no GPU
 //! commands, so the time on the GPU is next to nothing.
 //!
+//! Every range declared above either is marked (copied back by page,
+//! [`Shadow::copy_back_marked`]) or stays out of title memory (root UAVs in
+//! lists that read memory with no copy), so none would reach the byte merge
+//! of a declared range's copy-back ([`Shadow::copy_back`]: title memory read,
+//! the GPU's bytes put in, written back). So that it runs, one list a
+//! submission also declares a small copy unmarked, and the shaders' part
+//! changes 8 bytes of one of its pieces: 33 pieces of 64 KiB merged and
+//! written back a frame. That volume is made up, not taken from the title
+//! (its snapshots add about 4 MB a frame to the published 563, and its
+//! merges about 33 times the unit cost below to `copying back`).
+//!
 //! [`world_frame_preparing`] prints the frame's parts next to the published
 //! numbers, then what each mechanism costs on its own ([`unit_costs`]).
+//!
+//! Comparing builds: code layout alone moves `copying back` by about half
+//! (from ~122 to ~180 ms on a Ryzen 5 5600X, `diag` profile on WARP, with
+//! some never-called functions added; not every such change moves it; the
+//! #2134 review). One build per side says little. First check
+//! that the changed code runs at all (the counters, e.g. the pieces merged
+//! for a change to the copy-back's merge), then compare several builds per
+//! side (each with a trivial unrelated change) before reading a difference.
 //!
 //! ```text
 //! VICTORY_D3D12_WARP=1 cargo test --profile diag -p victory-gpu --features diagnostics \
@@ -69,6 +88,11 @@ const TITLE_COPY_LISTS: [usize; 3] = [3, 9, 10];
 /// of those the ones where they changed bytes.
 const MARKED_PAGES: usize = 60;
 const MARKED_CHANGED: usize = 36;
+/// The list that declares one copy of two pages whole as written, unmarked
+/// (in place of one of its other refreshes): kept as a snapshot and copied
+/// back with the byte merge. The shaders change one of its pieces. Made up
+/// (see the module's text).
+const UNMARKED_LIST: usize = 7;
 /// Pages the title writes before each submission (3,663 a frame, 240 MB
 /// if each were another page; some are the same, 160 MB is copied): this
 /// many of them the same ones every time, the rest anywhere. The split is
@@ -217,6 +241,11 @@ struct Frame {
     /// Page faults while the title wrote and in the submissions.
     faults_title: u64,
     faults_submitting: u64,
+    /// Bytes the copy-backs of declared ranges wrote into title memory (the
+    /// byte merge's, in whole 64 KiB pieces here), and the pieces the
+    /// shaders changed for them.
+    merged: u64,
+    changed: u64,
     /// The diagnostics counters (`crate::copystat`).
     #[cfg(feature = "diagnostics")]
     counters: Vec<u64>,
@@ -229,6 +258,7 @@ fn frame(all: &[Buffer], lists: &[HostList], rng: &mut Rng, stamp: &mut u64) -> 
     let mut f = Frame::default();
     let us = |a: &std::sync::atomic::AtomicU64| a.load(Relaxed);
     let (prepared, on_gpu, back) = (us(&SUBMISSION_US[0]), us(&SUBMISSION_US[1]), us(&COPY_BACK[0]));
+    let merged = us(&COPY_BACK[1]);
     for s in 0..SUBMISSIONS {
         // The title writes: the same pages as before every submission, then
         // pages anywhere; two in three in the heap.
@@ -245,15 +275,27 @@ fn frame(all: &[Buffer], lists: &[HostList], rng: &mut Rng, stamp: &mut u64) -> 
         f.faults_title += page_faults() - faults;
         // The lists.
         let mut marked: Vec<(usize, usize, usize)> = Vec::new();
+        let mut unmarked: Vec<usize> = Vec::new();
         for (l, list) in lists.iter().enumerate() {
             if MEMORY_LISTS.contains(&l) {
                 crate::memory::bind(list, crate::memory::OURS).expect("a page table");
             }
             let at = heap.start + (rng.below(heap.len - HEAP_REFRESH) & !255);
             heap.copy.refresh(list, at as u64, HEAP_REFRESH as u64);
-            for _ in 0..SMALL_REFRESHES {
+            let declares = l == UNMARKED_LIST;
+            for _ in 0..SMALL_REFRESHES - usize::from(declares) {
                 let b = &all[1 + rng.below(all.len() - 1)];
                 b.copy.refresh(list, b.start as u64, b.len as u64);
+            }
+            if declares {
+                // A copy of two pages (the last kind), declared unmarked: a
+                // snapshot is kept and the copy-back merges what the shaders
+                // changed.
+                let k = all.len() - COPIES[3].0 + rng.below(COPIES[3].0);
+                let b = &all[k];
+                b.copy.refresh(list, b.start as u64, b.len as u64);
+                b.copy.gpu_writes(list, b.start as u64, b.len as u64, false);
+                unmarked.push(k);
             }
             let root_uavs = ROOT_UAV_LISTS.contains(&l);
             if root_uavs {
@@ -297,6 +339,16 @@ fn frame(all: &[Buffer], lists: &[HostList], rng: &mut Rng, stamp: &mut u64) -> 
                         (all[k].copy.clone(), at.min(start + len - 8) as u64, n < MARKED_CHANGED)
                     })
                     .collect();
+                // And one piece of each unmarked range, not marked, with a
+                // value no write before had (the title's stamps are small).
+                let merges: Vec<(Arc<Shadow>, u64)> = unmarked
+                    .iter()
+                    .map(|&k| {
+                        let b = &all[k];
+                        (b.copy.clone(), (b.start + rng.below(b.len / PAGE) * PAGE + 128) as u64)
+                    })
+                    .collect();
+                f.changed += merges.len() as u64;
                 let value = *stamp;
                 list.defer_host(move || {
                     for (copy, at, changed) in &writes {
@@ -304,6 +356,9 @@ fn frame(all: &[Buffer], lists: &[HostList], rng: &mut Rng, stamp: &mut u64) -> 
                         if *changed {
                             copy.write_host(*at, &value.to_le_bytes());
                         }
+                    }
+                    for (copy, at) in &merges {
+                        copy.write_host(*at, &(value | 1 << 63).to_le_bytes());
                     }
                 });
             }
@@ -321,6 +376,7 @@ fn frame(all: &[Buffer], lists: &[HostList], rng: &mut Rng, stamp: &mut u64) -> 
     f.preparing = ms(&SUBMISSION_US[0], prepared);
     f.gpu = ms(&SUBMISSION_US[1], on_gpu);
     f.back = ms(&COPY_BACK[0], back);
+    f.merged = us(&COPY_BACK[1]) - merged;
     #[cfg(feature = "diagnostics")]
     {
         crate::watch::frame_done();
@@ -384,6 +440,13 @@ fn world_frame_preparing() {
     let row = |what: &str, ours: f64, published: &str| println!("  {what:<44} {ours:>12.1}   {published}");
     row("preparing, ms", median(&frames, |f| f.preparing), "1198");
     row("copying back, ms", median(&frames, |f| f.back), "122");
+    row("  declared pieces the shaders changed", median(&frames, |f| f.changed as f64), "made up");
+    row(
+        "  merged and written back",
+        median(&frames, |f| (f.merged / PAGE as u64) as f64),
+        "made up",
+    );
+    row("    MB", median(&frames, |f| f.merged as f64 / 1e6), "made up");
     row("the title's writes (guard faults), ms", median(&frames, |f| f.title), "not published");
     row(
         "page faults",
@@ -413,6 +476,8 @@ fn world_frame_preparing() {
         row("  the frame before too", c(C::WrittenAgain), "not quoted");
         row("snapshots, MB", mb(C::SnapshotBytes), "563");
         row("  ms", ms(C::SnapshotUs), "31.7");
+        row("declared ranges compared, MB", mb(C::CompareBytes), "not quoted");
+        row("  ms", ms(C::CompareUs), "not quoted");
         row("marked pages compared", c(C::MarkedPages), "1996");
         row("  written back, MB", mb(C::MarkedBytes), "77.6");
         row("  ms", ms(C::MarkedUs), "74.4");
@@ -436,6 +501,10 @@ fn world_frame_preparing() {
     }
     #[cfg(not(feature = "diagnostics"))]
     println!("  (no counters: build with --features diagnostics)");
+    println!(
+        "  (comparing builds: code layout alone moves `copying back` by about half; check with the counters \
+         that the changed code runs, and compare several builds per side)"
+    );
     unit_costs(&all);
 }
 
@@ -510,6 +579,26 @@ fn unit_costs(all: &[Buffer]) {
             ms(started) * 1e3
         );
     }
+    // A declared range's copy-back with the byte merge: a 1 MiB copy kept
+    // as a snapshot, 8 bytes of one piece changed, that piece merged.
+    let one = all.iter().find(|b| b.len == MIB).expect("a 1 MiB copy");
+    const MERGES: usize = 200;
+    let (mut kept, mut back) = (0.0, 0.0);
+    for n in 0..MERGES {
+        let started = Instant::now();
+        one.copy.writing(one.start, one.len, false);
+        kept += ms(started);
+        let at = one.start + (n % (MIB / PAGE)) * PAGE + 128;
+        one.copy.write_host(at as u64, &(n as u64 | 1 << 62).to_le_bytes());
+        let started = Instant::now();
+        assert_eq!(one.copy.copy_back(one.start, one.len), PAGE, "one piece merged");
+        back += ms(started);
+    }
+    println!(
+        "  a 1 MiB declared range, unmarked: its snapshot {:.1} us; its copy-back with one 64 KiB piece merged {:.1} us",
+        kept * 1e3 / MERGES as f64,
+        back * 1e3 / MERGES as f64
+    );
     // 3. A guard's round by the kind of memory: the title writes a page
     // (the fault, the handler), the next refresh copies and guards it again.
     for (kind, in_views) in [("a write-watched pool", false), ("views shown twice", true)] {
