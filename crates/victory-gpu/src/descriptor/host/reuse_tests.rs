@@ -314,6 +314,7 @@ fn capped_heap(device: &ID3D12Device) -> HostHeap {
         count: 1,
         dynamic: MIN_DYNAMIC,
         sampler: false,
+        marks: None,
         made: Mutex::new(vec![0]),
         kept: Mutex::new(vec![None; total as usize]),
         slots: Arc::new(DynamicSlots::new(1, MIN_DYNAMIC)),
