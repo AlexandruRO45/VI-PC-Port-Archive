@@ -1035,15 +1035,21 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     // view can take — the format itself, a member of its typeless family
     // (the committed fallback creates a typeless texture and views it
     // typed), or — where enhanced-barrier creation carries a cast list —
-    // by cast: AMD tolerates the flag on one that cannot (B5G5R5A1, B5G6R5,
-    // B4G4R4A4 and like elements), NVIDIA removes the device for it at
-    // GetResourceAllocationInfo. Drop the flag, as a depth target's above —
-    // an unordered view of it still will not make.
+    // by cast. The cast list only goes with a typeless texture: a
+    // standalone format (one without a typeless family: B5G5R5A1, B5G6R5,
+    // B4G4R4A4 and like elements) is created typed, and
+    // GetResourceAllocationInfo sees the bare description — no cast list —
+    // so the flag stays lethal to NVIDIA there. AMD tolerates the flag on
+    // one that cannot be stored, NVIDIA removes the device for it. Drop
+    // the flag, as a depth target's above — an unordered view of it still
+    // will not make.
     if d.flags & UNORDERED != 0 {
         use windows::Win32::Graphics::Direct3D12::ID3D12Device10;
         use windows::core::Interface;
         let typed = crate::descriptor::host::typed_store;
+        let typeless = family(d.format) == d.format && family(d.format + 1) == d.format;
         let castable_uav = d.flags & DEPTH == 0
+            && typeless
             && crate::host::host()
                 .is_some_and(|h| h.device.cast::<ID3D12Device10>().is_ok())
             && castable(d.format).into_iter().any(typed);
@@ -1916,9 +1922,10 @@ mod tests {
             };
             host_desc(&desc).is_some_and(|d| d.flags & UNORDERED != 0)
         };
-        // 86 B5G5R5A1_UNORM and 85 B5G6R5_UNORM: no member of either
-        // family takes a typed store on any shipping host, and the flag
-        // removes NVIDIA's device at GetResourceAllocationInfo.
+        // 86 B5G5R5A1_UNORM and 85 B5G6R5_UNORM: neither has a typeless
+        // family, so no typed view and no cast list reaches them on any
+        // host — the flag removes NVIDIA's device at
+        // GetResourceAllocationInfo and must drop everywhere.
         assert!(!has(86) && !has(85), "the unviewable formats dropped it");
         // 28 R8G8B8A8_UNORM stores wherever feature level 11.0 is met;
         // then the typeless 27 its sRGB twin 29 is rewritten to, and the
