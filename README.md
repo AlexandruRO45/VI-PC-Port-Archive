@@ -83,15 +83,48 @@ executable (`cargo xtask agility`; the exe exports `D3D12SDKVersion` /
 without the init crash the SM 6.5 runtime causes.
 
 **Best verified configuration** — textures, world geometry and mostly-correct
-static lighting, ~4 fps (230-250 ms per frame):
+static lighting, **~5.6 fps (180 ms per frame)** in Series S mode:
 
 ```bash
 VICTORY_BVH_BUILDER=1 VICTORY_BVH_QUARANTINE=1 \
 VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 \
 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024 \
 VICTORY_TEXTURE_MIP_DROP=1 VICTORY_RELAY=1 \
-  victory.exe run "<game>\game_scarlett_master.exe" --execute
+VICTORY_PERMLANE=1 VICTORY_RELAY_COPY_QUEUE=1 VICTORY_CARD_COMPARE_PARALLEL=1 \
+  victory.exe run "<game>\game_scarlett_master.exe" --execute --console series-s
 ```
+
+### Frame-rate progress and methods (2026-11-25)
+
+From a black screen at ~1 fps to a lit, textured, controllable world at ~5.6 fps,
+by stacking verified fixes (each A/B tested in the same scene; lighting/geometry
+regressions rejected):
+
+| Stage | Frame | Change |
+|-------|-------|--------|
+| Base fork (Series X) | ~260-270 ms | textures + static RT lighting (`BVH_BUILDER`/`QUARANTINE`) |
+| + mip-drop=1 | ~270 ms | lighting vastly improved (texture residency), fps ~unchanged |
+| + `RELAY=1` | ~230-250 ms | ordered relay worker overlaps copy-back with prep |
+| + #40 permlane, #71 COPY-queue + parallel compare | ~230-240 ms | geometry restored; **read-back fetch 86→6 ms**, GPU 172→140 ms |
+| + #81/#203 (descriptor-as-data, wave sums, interp) | ~220 ms | refusals 21→9→6; more geometry |
+| + #188/#32 **Series-S stretch** (`--console series-s`) | **~180 ms** | 720p render stretched to 1080p; **GPU render 140→96 ms** |
+
+Methods that worked:
+- **Resolution scaling via Series S** (#188/#32): the title renders at Series S
+  resolution; the `ffx` HLE module turns the upscale dispatch into a plain stretch
+  and `over.rs` composites the second present plane. Series S *without* the stretch
+  stalls at a black boot screen — the stretch is what makes it present.
+- **Read-back on a COPY queue** (#71): relay fetches of completed flights run on a
+  dedicated DMA queue (`VICTORY_RELAY_COPY_QUEUE`, default on) so they do not wait
+  behind in-flight graphics; the card compare uses a 64-thread-group-per-piece
+  reduction (`VICTORY_CARD_COMPARE_PARALLEL`, default on).
+- **Shader-translation fixes** ported from fxceless/victory-fork: #40
+  (`v_permlane16/x16`, `VICTORY_PERMLANE`), #81/#203 (descriptor-only-as-data,
+  16-bit divergent wave sums, paired f16 interpolation), #9 (`v_cvt_f32_f64` + f64
+  whole-wave sums), and Marvisak #1733 (helper-lane `v_readfirstlane` reads its own
+  value — avoids 0.3-1.3 s helper-lane loop spins).
+- **Overlap, not horsepower**: the frame is latency-bound; `RELAY=1` (ordered) is
+  the win, `RELAY=2` (precise per-memory waits) is slower here.
 
 Findings on this machine:
 
