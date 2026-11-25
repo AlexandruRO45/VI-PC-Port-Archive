@@ -403,15 +403,20 @@ impl Slice {
 /// as (page address, other address). The GPU side's change tracking
 /// (`victory_gpu::watch`) marks writes there too.
 pub fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
-    let physical = physical();
     let end = at.saturating_add(len);
+    if end <= at {
+        return;
+    }
+    let physical = physical();
     let first = physical
         .views
         .range(..=at)
         .next_back()
         .filter(|(base, (size, _))| *base + size > at)
         .map(|(base, _)| *base);
-    let starts = first.into_iter().chain(physical.views.range(at.saturating_add(1)..end).map(|(b, _)| *b));
+    let starts = first
+        .into_iter()
+        .chain(physical.views.range(at.saturating_add(1)..end).map(|(b, _)| *b));
     for base in starts.collect::<Vec<_>>() {
         let (size, slice) = &physical.views[&base];
         let (from, to) = (at.max(base), end.min(base + size));
@@ -698,9 +703,15 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    let Some(bytes) = n.checked_mul(PAGE) else {
+        return std::ptr::null_mut();
+    };
     let base = address as usize;
+    if base.checked_add(bytes).is_none() {
+        return std::ptr::null_mut();
+    }
     let mut physical = physical();
-    unmap(&mut physical, base, n * PAGE);
+    unmap(&mut physical, base, bytes);
     if pages.is_null() {
         return address;
     }
@@ -905,13 +916,12 @@ fn commit_limit_message(
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
-    // No bytes: no view to return. The search below would still find the
-    // view holding `base` and cut it in two there, and its range of views
-    // starting inside would run backwards (which `BTreeMap` panics on).
-    if len == 0 {
+    // No bytes (or overflow at `usize::MAX`): no view to return. The search
+    // below would otherwise construct a reversed `BTreeMap::range` and panic.
+    let end = base.saturating_add(len);
+    if end <= base {
         return;
     }
-    let end = base + len;
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
     let first = physical
@@ -922,7 +932,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .map(|(at, _)| *at);
     let hit: Vec<usize> = first
         .into_iter()
-        .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
+        .chain(physical.views.range(base.saturating_add(1)..end).map(|(at, _)| *at))
         .collect();
     for at in hit {
         let Some((size, slice)) = physical.views.remove(&at) else {
@@ -1412,5 +1422,21 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn aliases_and_map_reject_zero_length_and_overflowing_ranges() {
+        let mut out = Vec::new();
+        aliases(0x1_0000, 0, &mut out);
+        aliases(usize::MAX, 0, &mut out);
+        aliases(usize::MAX, 16, &mut out);
+        assert!(out.is_empty());
+
+        let too_many = usize::MAX / PAGE + 1;
+        assert!(XMemMapPhysicalPages(0x1_0000 as *mut c_void, too_many, std::ptr::null()).is_null());
+        assert!(
+            XMemMapPhysicalPages((usize::MAX - PAGE + 1) as *mut c_void, 2, std::ptr::null())
+                .is_null()
+        );
     }
 }
