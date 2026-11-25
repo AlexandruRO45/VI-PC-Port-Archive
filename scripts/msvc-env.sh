@@ -67,15 +67,22 @@ if [ -z "$_kits" ]; then
     _msvc_env_say "the MSVC toolbox is at $_msvc_bin but no Windows SDK Lib was found;"
     _msvc_env_say "set VICTORY_WINDOWS_KITS. Linking will fail for want of the SDK libraries."
 else
-    # Newest SDK. The linker is a Windows program, so LIB is semicolon-separated
-    # Windows paths: the toolchain's own lib, then um and ucrt from the SDK.
-    _ver="$(ls -d "$_kits"/Lib/10.* 2>/dev/null | sort -V | tail -1)"
-    _msvc_lib="$(cygpath -w "$_msvc_bin/../../../lib/x64")"
-    _um="$(cygpath -w "$_ver/um/x64")"
-    _ucrt="$(cygpath -w "$_ver/ucrt/x64")"
-    LIB="$_msvc_lib;$_um;$_ucrt"
-    export LIB
-    _msvc_env_say "SDK libraries: $_ver"
+    # Newest SDK containing both um/x64 and ucrt/x64. The linker is a Windows
+    # program, so LIB is semicolon-separated Windows paths: the toolchain's own
+    # lib, then um and ucrt from the SDK.
+    _ver="$(for _cand in "$_kits"/Lib/10.*; do
+        [ -d "$_cand/um/x64" ] && [ -d "$_cand/ucrt/x64" ] && printf '%s\n' "$_cand"
+    done 2>/dev/null | sort -V | tail -1)"
+    if [ -z "$_ver" ]; then
+        _msvc_env_say "no complete Windows SDK (um/x64 + ucrt/x64) found under $_kits/Lib; keeping existing LIB"
+    else
+        _msvc_lib="$(cygpath -w "$_msvc_bin/../../../lib/x64")"
+        _um="$(cygpath -w "$_ver/um/x64")"
+        _ucrt="$(cygpath -w "$_ver/ucrt/x64")"
+        LIB="$_msvc_lib;$_um;$_ucrt"
+        export LIB
+        _msvc_env_say "SDK libraries: $_ver"
+    fi
 fi
 
 PATH="$_msvc_bin:$PATH"
@@ -83,4 +90,4 @@ export PATH
 export VICTORY_MSVC="$_msvc_bin"
 _msvc_env_say "linker: $_msvc_bin/link.exe"
 
-unset _msvc_bin _kits _msvc_root _vs_root _d _vswhere _ver _msvc_lib _um _ucrt
+unset _msvc_bin _kits _msvc_root _vs_root _d _vswhere _ver _cand _msvc_lib _um _ucrt
