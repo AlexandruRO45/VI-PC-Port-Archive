@@ -12,6 +12,20 @@ use victory_shader::{Container, DxilProgram, FourCC, HwStage, ShaderError, nativ
 /// Files above this size are skipped (read whole into memory for now).
 pub(crate) const MAX_FILE: u64 = 2 << 30;
 
+/// The size of a regular file or a symlink to one. The walk can keep its
+/// default directory traversal while accepting files from a linked game folder.
+pub(crate) fn shader_file_size(entry: &walkdir::DirEntry) -> Option<u64> {
+    let kind = entry.file_type();
+    let metadata = if kind.is_symlink() {
+        std::fs::metadata(entry.path()).ok()?
+    } else if kind.is_file() {
+        entry.metadata().ok()?
+    } else {
+        return None;
+    };
+    metadata.is_file().then(|| metadata.len())
+}
+
 /// A shader container in a file: as is, or packed in an SGD5 record.
 pub(crate) enum Source<'a> {
     Raw { offset: usize, data: &'a [u8] },
@@ -79,11 +93,11 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
             .into_iter()
             .filter_map(Result::ok)
         {
-            if !entry.file_type().is_file() {
+            let Some(size) = shader_file_size(&entry) else {
                 continue;
-            }
+            };
             let path = entry.path();
-            if entry.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE {
+            if size > MAX_FILE {
                 eprintln!("skipping large file {}", path.display());
                 continue;
             }
