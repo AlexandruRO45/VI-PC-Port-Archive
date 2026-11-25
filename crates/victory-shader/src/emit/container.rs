@@ -84,8 +84,12 @@ impl SigElement {
         }
     }
 
+    fn effective_col(&self) -> u8 {
+        if self.row.is_some() { self.col } else { 0 }
+    }
+
     fn mask(&self) -> u8 {
-        ((1u8 << self.cols) - 1) << self.col
+        ((1u8 << self.cols) - 1) << self.effective_col()
     }
 }
 
@@ -120,7 +124,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
-        let used = e.usage << e.col;
+        let used = e.usage << e.effective_col();
         let rw = if input { used } else { !used & 0xf };
         for v in [
             0,
@@ -442,5 +446,27 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn unallocated_signature_element_uses_column_zero() {
+        let depth = SigElement {
+            name: "SV_DEPTH".into(),
+            index: 0,
+            kind: 17, // SV_Depth
+            comp: 9,
+            interp: 0,
+            cols: 1,
+            row: None,
+            col: 0xff,
+            usage: 0x1,
+            half: false,
+        };
+        let bytes = signature(&[depth], false);
+        // Header (8 bytes) + 1 row (32 bytes): bytes 24..26 of row are [mask, rw].
+        assert_eq!(bytes[8 + 24], 0x1);
+        assert_eq!(bytes[8 + 25], 0xe);
+        // Canonical name emitted as "SV_Depth\0".
+        assert_eq!(&bytes[40..], b"SV_Depth\0");
     }
 }
