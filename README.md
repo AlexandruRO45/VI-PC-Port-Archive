@@ -23,7 +23,24 @@ I recorded this configuration on 25 November 2026. Vice-Tay rendered on the RTX 
 
 ## Local test results
 
-### Current renderer build · 25 November 2026
+### 30-minute play session · 25 November 2026
+
+I played [`386e885`](https://github.com/TaynanGT/Vice-Tay/commit/386e885) for **30 minutes 12 seconds in the world without a crash**, then closed the window myself. The process exited with code 0. Release build, Series X profile, `VICTORY_RELAY=2` with its snapshot ring, `VICTORY_BACK_ALIAS=1`, `VICTORY_COPY_NO_WAIT=1`, and the wave-wide form for four compute programs (`VICTORY_WAVE_WIDE_ONLY`). The pipeline library was warm; the shader cache was not.
+
+The session started from a save in the prologue and went from the cell, through the corridor and the common room, into the robbery, with the player turning the camera and walking every minute. The renderer logged one frame line a second.
+
+| Stretch | Median FPS | Frame time |
+| --- | ---: | ---: |
+| Whole session, 1,629 one-second samples | **7.0** | 143 ms |
+| Corridor and common room | 7.4–9.5 | 105–135 ms |
+| Robbery, under control | 6.3–7.8 | 129–160 ms |
+| Scene change into the robbery, about two minutes | 1.9–3.8 | 264–537 ms |
+
+Across the session the 25th and 75th percentiles were 4.6 and 7.9 FPS, the 90th 8.8, and the highest one-second sample 11.3.
+
+I ended the session at 30 minutes because the process had grown to 36 GB of private memory and the PC had about 1 GB of commit left. That leak is the next thing to fix; a longer session needs it fixed first.
+
+### First launch with an empty shader cache · 25 November 2026
 
 I tested [`b033e17a`](https://github.com/TaynanGT/Vice-Tay/commit/b033e17a) on the system above in Series X mode. The diagnostics build used `VICTORY_RELAY=2`, frame capture, and a 1920 × 1080 window limit. I started with an existing D3D12 pipeline library and an empty shader cache. Shader compilation continued through loading and into the cinematic.
 
@@ -51,7 +68,8 @@ The PresentMon figures use the intervals between presents. The prologue and cine
 
 - The prologue has reached player control. I could turn the camera in the first room and record a scene transition.
 - The current renderer build reached the 3D opening cinematic. Some figures appeared as dark silhouettes. In the earlier prologue run, the sky and window were overexposed, shadow edges were jagged, and some details were missing.
-- Campaign completion and long-session stability remain unverified on this setup.
+- A 30-minute session ran without a crash from the cell into the robbery. Memory grows by about 1 GB a minute, which limits sessions on this 48 GB PC.
+- Campaign completion remains unverified on this setup.
 
 The latest renderer changes recheck texture updates after queue overflow, reuse upload buffers for texture copies, and keep each pipeline and root signature once per command list. See [PR #14](https://github.com/TaynanGT/Vice-Tay/pull/14) for the changes and credits.
 
