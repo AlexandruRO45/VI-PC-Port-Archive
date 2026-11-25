@@ -375,3 +375,28 @@ fn saveexec_scc_tests_new_exec_not_saved_exec() {
     ];
     console_flow_case("saveexec SCC tests new EXEC", &body, 64, |_| 42);
 }
+
+/// A select on a mask held as a number (here the constant 5: lanes 0 and 2)
+/// tests the console lane's bit. A program split in halves has no console
+/// lane for it: with its host lane, lanes 32 and 34 would take the bits of
+/// lanes 0 and 2. Such a select is refused there, not lowered. No device.
+#[test]
+fn selects_on_numeric_masks_are_refused_in_halves() {
+    let mut body = IN_HALF.to_vec();
+    body.extend_from_slice(&[
+        0xD501_0002,
+        0x0216_0101, // v_cndmask_b32 v2, v1, v0, 5
+    ]);
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let refused = emit_for(&program(&body, 64), nvidia).map(|cs| wave_size(&cs.dxil));
+    assert!(
+        matches!(&refused, Err(e) if e.to_string().contains("split in halves")),
+        "{refused:?}"
+    );
+    // One host wave is the console wave: the lane tests its own bit.
+    let native = emit_for(&program(&body, 64), super::Target::ANY).unwrap();
+    assert_eq!(wave_size(&native.dxil), Some(64));
+}

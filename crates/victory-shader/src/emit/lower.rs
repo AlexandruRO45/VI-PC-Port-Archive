@@ -2559,12 +2559,12 @@ impl<'a> Lower<'a> {
                 };
                 let lo = word(lo)?;
                 let hi = hi.map(word).transpose()?;
-                Ok(self.lane_bit(at, lo, hi))
+                self.lane_bit(at, lo, hi)
             }
             Atom::Constant(k) if self.console_lanes => {
                 let lo = self.s.m.i32(k as u32);
                 let hi = self.s.m.i32((k >> 32) as u32);
-                Ok(self.lane_bit(at, lo, Some(hi)))
+                self.lane_bit(at, lo, Some(hi))
             }
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
@@ -2598,8 +2598,14 @@ impl<'a> Lower<'a> {
 
     /// This lane's bit of the mask `lo`, `hi` (wave64; host lane = console
     /// lane, so not in a program split in halves).
-    fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
-        debug_assert!(!self.split || self.console_cf);
+    fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> Result<V, Why> {
+        if self.split && !self.console_cf {
+            // A half's lanes are 0..31 of their own host wave: the upper
+            // half would test the low word. (Guards and branches on such
+            // masks keep a program out of this form; a select's mask, which
+            // need not be one of those, gets here.)
+            return Err("a lane mask held as a number in a wave64 program split in halves");
+        }
         if self.console_cf {
             // The console lane's bit: its half's word, its host lane's bit.
             let (lane, half) = self.console_lane();
@@ -2614,7 +2620,7 @@ impl<'a> Lower<'a> {
             let sh = self.s.m.bin(at, Bin::And, lane, k31);
             let t = self.s.m.bin(at, Bin::LShr, word, sh);
             let t = self.s.m.bin(at, Bin::And, t, one);
-            return self.s.m.cmp(at, pred::NE, t, z);
+            return Ok(self.s.m.cmp(at, pred::NE, t, z));
         }
         self.s.flags |= flags::WAVE_OPS;
         let lane = self.s.op(
@@ -2641,7 +2647,7 @@ impl<'a> Lower<'a> {
         let sh = self.s.m.bin(at, Bin::And, lane, k31);
         let t = self.s.m.bin(at, Bin::LShr, word, sh);
         let t = self.s.m.bin(at, Bin::And, t, one);
-        self.s.m.cmp(at, pred::NE, t, z)
+        Ok(self.s.m.cmp(at, pred::NE, t, z))
     }
 
     /// The value of the high dword of the wave64 register pair whose low
@@ -6135,7 +6141,7 @@ impl<'a> Lower<'a> {
                         } else if self.console_lanes {
                             let lo = self.s.m.i32(x);
                             let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
-                            self.lane_bit(c, lo, Some(hi))
+                            self.lane_bit(c, lo, Some(hi))?
                         } else {
                             return Err("a constant lane mask");
                         }
