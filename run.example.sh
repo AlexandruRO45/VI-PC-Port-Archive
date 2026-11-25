@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Proton wrapper for VIctory. Edit the four paths at the top, then:
 #   ./run.sh ./target/x86_64-pc-windows-msvc/diag/victory.exe \
-#       run 'Z:\path\to\GTA6.Xbox.v1.0.2.1\game_scarlett_master.exe' --execute
-# See findings.md for the full setup.
+#       run 'Z:\path\to\the-title-dump\<the title exe>' --execute
+# See docs/linux-proton.md for the full setup.
 set -euo pipefail
 
-repo=/path/to/victory-gta6                              # where the fork is checked out
-game=/path/to/GTA6.Xbox.v1.0.2.1                        # your own game dump (read-only is fine)
-work=$HOME/.local/share/victory-proton-test             # the Proton prefix for this title
+repo=/path/to/victory-fork                               # where this fork is checked out
+game=/path/to/the-title-dump                             # your own dump (read-only is fine)
+work=$HOME/.local/share/victory-proton-test              # the Proton prefix for this title
 steam=$HOME/.local/share/Steam
 
 runtime="$steam/steamapps/common/SteamLinuxRuntime_4/_v2-entry-point"

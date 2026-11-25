@@ -1,18 +1,31 @@
 #!/usr/bin/env bash
 # Autonomous VIctory runner: each run picks up where the last one stalled.
 #
-# A run writes to auto/run-<n>.log. When that log goes quiet for STALL_SECS
+# A run writes to $WORK/run-<n>.log. When that log goes quiet for STALL_SECS
 # while the process is alive, the last "host pipeline: making" line names the
-# pipeline that blocked the title; its shader hashes go into auto/skips.txt,
+# pipeline that blocked the title; its shader hashes go into $WORK/skips.txt,
 # which every later run passes as VICTORY_SKIP_PIPELINES. Every run's best
-# frame and fps go to auto/ledger.txt. Crashes (process gone without a stall)
-# are recorded and retried with the same skips.
+# frame and fps go to $WORK/ledger.txt. Crashes (process gone without a stall)
+# are recorded and retried with the same skips. Three runs without a new skip
+# stop the loop.
+#
+# Required: GAME is the title executable, as the wrapper takes it.
+# Optional: REPO, EXE, WORK, RUNNER (default: $REPO/run.sh), MAX_RUNS,
+#           STALL_SECS, LOOP_LIMIT, SAME_STALL_LIMIT.
 set -u
 
 repo=${REPO:-$(cd "$(dirname "$0")/.." && pwd)}
 exe=${EXE:-$repo/target/x86_64-pc-windows-msvc/diag/victory.exe}
 game=${GAME:-}
-[ -n "$game" ] || game='Z:\path\to\GTA6.Xbox.v1.0.2.1\game_scarlett_master.exe'
+if [ -z "$game" ]; then
+    echo "GAME is not set (the title executable, as the wrapper takes it)" >&2
+    exit 2
+fi
+runner=${RUNNER:-$repo/run.sh}
+if [ ! -x "$runner" ]; then
+    echo "RUNNER is not executable: $runner (copy run.example.sh to run.sh)" >&2
+    exit 2
+fi
 work=${WORK:-$repo/auto-runs}
 skips=$work/skips.txt
 ledger=$work/ledger.txt
@@ -24,9 +37,10 @@ stall_secs=${STALL_SECS:-150}
 loop_limit=${LOOP_LIMIT:-256}
 same_stall_limit=${SAME_STALL_LIMIT:-3}
 
-# Leftovers from an earlier manual run. The script's own command line has no
-# game name, so this cannot match itself.
-pkill -f 'game_scarlett_master.exe' 2>/dev/null
+# Leftovers from an earlier manual run. Compare against the executable's
+# basename; GAME may use Windows separators.
+title_exe=$(basename -- "${game//\\//}")
+pkill -f "$title_exe" 2>/dev/null
 sleep 2
 
 run=0
@@ -58,7 +72,7 @@ while [ "$run" -lt "$max_runs" ]; do
     export VICTORY_KEYS=$(seq 20 5 300 | awk '{printf "%s:Enter,",$1}' | sed 's/,$//')
     mkdir -p "$VICTORY_CAPTURE"
 
-    setsid --wait "${RUNNER:-/tmp/opencode/victory-slr.sh}" runinprefix "$exe" run "$game" --execute \
+    setsid --wait "$runner" "$exe" run "$game" --execute \
         >"$log" 2>&1 &
     pid=$!
     sleep 2
