@@ -515,10 +515,9 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// translated with, and the title makes 25 pipelines (their
 /// shaders translated at once) before it makes its view heap. Those would
 /// read a view index past the heap unclamped, the read that hangs NVIDIA.
-/// Called before a shader is translated.
-/// shortcut: the limit is the capped heap's last slot whatever size the
-/// title's heap turns out to have; a heap that fits is not capped and
-/// keeps no null slot there (an index past it is as undefined as before).
+/// Called before a shader is translated and before a view heap is made.
+/// Every view heap on a capped host covers the same translated range,
+/// including a small title heap, and keeps the final clamp slot null.
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -553,6 +552,22 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// Computes `(fitted_title_count, total_heap_size)` for a descriptor heap.
+///
+/// When `null_slot != 0`, every view heap on the host covers `null_slot + 1`
+/// slots so translated shaders' host-wide clamp always lands on a valid null
+/// slot, and `fitted_title_count` is capped so `fitted + extra <= null_slot`.
+fn view_heap_layout(count: u32, extra: u32, null_slot: u32) -> Option<(u32, u32)> {
+    if null_slot != 0 {
+        let size = null_slot.checked_add(1)?;
+        let fitted = count.min(null_slot.checked_sub(extra)?);
+        Some((fitted, size))
+    } else {
+        let size = count.checked_add(extra)?;
+        Some((count, size))
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -574,19 +589,19 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count, size) = match make(count + extra) {
-            Ok(heap) => (heap, count, count + extra),
-            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out; a title that reaches
-                // them needs remapping. The heap's last slot stays null, and shaders read it for
-                // any view index from there on (`set_view_heap_limit`): a read past the heap's
-                // end hung NVIDIA's GPU (the title's heap is a little over 1 000 000 views).
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}; views past it read a null slot");
-                victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra - 1, PORTABLE_VIEWS)
-            }
+        if !sampler {
+            probe_view_limit();
+        }
+        let null = if sampler { 0 } else { victory_shader::emit::view_heap_limit() };
+        // The heap cap policy is fixed once by `probe_view_limit()` before any
+        // shader translation or heap allocation. If a subsequent allocation
+        // fails, fail explicitly rather than mutating the global clamp mid-run
+        // (which would invalidate previously translated shaders and cache keys).
+        let (count, size) = view_heap_layout(count, extra, null)?;
+        let heap = match make(size) {
+            Ok(heap) => heap,
             Err(e) => {
-                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                tracing::warn!(error = %e, count, size, sampler, "no host descriptor heap");
                 return None;
             }
         };
@@ -600,12 +615,6 @@ impl HostHeap {
         tracing::debug!(count, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
-        GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
-            gpu,
-            u64::from(count + extra) * u64::from(step),
-            u64::from(step),
-            sampler,
-        ));
         let strides = (!sampler)
             .then(|| {
                 let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
@@ -646,8 +655,15 @@ impl HostHeap {
         // null instead.
         let started = std::time::Instant::now();
         if let Err(e) = h.fill_null(kind, size) {
-            tracing::warn!(error = %e, "host descriptor heap not made null");
+            tracing::warn!(error = %e, size, sampler, "host descriptor heap not made null; refusing uninitialized heap");
+            return None;
         }
+        GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
+            gpu,
+            u64::from(size) * u64::from(step),
+            u64::from(step),
+            sampler,
+        ));
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         Some(h)
     }
@@ -2454,6 +2470,67 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// Pure heap-sizing arithmetic: capped heaps always include `null + 1`
+    /// slots and keep title + dynamic slots strictly below `null`, while
+    /// uncapped heaps allocate `count + extra` directly.
+    #[test]
+    fn heap_sizing_keeps_the_clamp_slot_past_title_and_dynamic_slots() {
+        let null = PORTABLE_VIEWS - 1;
+        // Small title heap on a capped host still allocates up to `null + 1`.
+        assert_eq!(view_heap_layout(4, DYNAMIC, null), Some((4, PORTABLE_VIEWS)));
+        // Exact-fit title heap leaves `null` free for the clamp target.
+        assert_eq!(
+            view_heap_layout(null - DYNAMIC, DYNAMIC, null),
+            Some((null - DYNAMIC, PORTABLE_VIEWS))
+        );
+        // Overflowing title heap clamps title slots so dynamic slots end at `null - 1`.
+        assert_eq!(
+            view_heap_layout(null - DYNAMIC + 1, DYNAMIC, null),
+            Some((null - DYNAMIC, PORTABLE_VIEWS))
+        );
+        assert_eq!(
+            view_heap_layout(PORTABLE_VIEWS + 100, DYNAMIC, null),
+            Some((null - DYNAMIC, PORTABLE_VIEWS))
+        );
+        // Uncapped host (null == 0) allocates requested title + extra slots.
+        assert_eq!(view_heap_layout(4, DYNAMIC, 0), Some((4, 4 + DYNAMIC)));
+        assert_eq!(view_heap_layout(128, 0, 0), Some((128, 128)));
+        // Overflow protection.
+        assert_eq!(view_heap_layout(u32::MAX, 1, 0), None);
+        assert_eq!(view_heap_layout(4, DYNAMIC, DYNAMIC - 1), None);
+        assert_eq!(view_heap_layout(4, 0, u32::MAX), None);
+    }
+
+    /// Small heaps and a dynamic range ending at the cap must leave the
+    /// shader's clamp target out of both title and dynamic allocations.
+    #[test]
+    fn view_heaps_keep_the_clamp_slot_null() {
+        let Some(host) = host() else {
+            eprintln!("no host GPU; heap clamp test not run");
+            return;
+        };
+        probe_view_limit();
+        let null = victory_shader::emit::view_heap_limit();
+        if null == 0 {
+            eprintln!("the host has no portable view-heap cap; not run");
+            return;
+        }
+        assert!(null >= DYNAMIC);
+        for count in [4, null - DYNAMIC, null - DYNAMIC + 1, null + 1] {
+            let heap = HostHeap::new(false, count).expect("a view heap on the live device");
+            // SAFETY: a plain query of a live heap.
+            assert_eq!(unsafe { heap.heap.GetDesc().NumDescriptors }, null + 1);
+            assert_eq!(heap.dynamic, DYNAMIC);
+            assert!(heap.count + heap.dynamic <= null);
+            let first = heap.dynamic(DYNAMIC).expect("the whole dynamic range");
+            assert!(first + DYNAMIC - 1 < null);
+            assert_eq!(heap.dynamic(1), None);
+        }
+        // SAFETY: a plain query of the live device after the allocations.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        eprintln!("heap clamp checked on hardware: {} slots, {DYNAMIC} dynamic slots; small, exact-fit and overflowing title heaps leave slot {null} null", null + 1);
     }
 
     #[test]

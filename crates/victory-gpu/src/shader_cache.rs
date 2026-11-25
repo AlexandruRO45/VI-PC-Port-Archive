@@ -39,7 +39,11 @@ pub(crate) fn counts() -> (u64, u64) {
 
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// diagnostics build can change at run time, and the host view heap cap).
+///
+/// Side effect: calls [`crate::descriptor::host::probe_view_limit`] on first
+/// use (which initializes the host device if needed) so the host's view heap
+/// cap is fixed before the cache key is computed.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -54,6 +58,10 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                // A shader keeps the null slot it was translated with. Detect
+                // the host cap before making a key, including cache-only runs.
+                crate::descriptor::host::probe_view_limit();
+                bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
                 // Which group barriers wait is part of the translation too.
                 bytes.push(victory_shader::emit::group_sync());
                 // So are the switches that pick the form of a wave64 program:

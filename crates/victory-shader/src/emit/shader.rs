@@ -119,6 +119,11 @@ pub(crate) struct Geometry {
 /// out of bounds"), which AMD's driver forgives.
 static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// The host view heap's final null slot, or zero before a cap is detected.
+pub fn view_heap_limit() -> u32 {
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
 pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
