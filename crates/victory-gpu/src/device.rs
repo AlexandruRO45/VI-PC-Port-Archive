@@ -262,6 +262,15 @@ const OPTIONS: [u32; 16] = [
     2,  // resource heap tier
 ];
 
+/// The value `check_feature_support` answers for `PSSpecifiedStencilRefSupported`
+/// (index 5 of [`OPTIONS`]): whether the title is told a pixel shader may
+/// write the stencil reference. Exposed so a test can hold the claim against
+/// what the host reports, which is not the same on every GPU.
+#[cfg(test)]
+pub(crate) fn claimed_stencil_ref() -> u32 {
+    OPTIONS[5]
+}
+
 extern "system" fn check_feature_support(
     _: This,
     feature: u32,
@@ -377,7 +386,9 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             let mut bytes = [0u8; 128];
             (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then(|| {
                 bytes
-                    .as_chunks::<8>().0.iter()
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|c| c.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b)))
                     .collect()
             })
@@ -385,9 +396,7 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         #[cfg(not(windows))]
         let words = |_: usize| None::<Vec<u64>>;
         let description = words(desc as usize);
-        let first = description
-            .as_ref()
-            .and_then(|w| words(w[0] as usize));
+        let first = description.as_ref().and_then(|w| words(w[0] as usize));
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
@@ -583,5 +592,214 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    /// What this host actually reports for the capabilities `device.rs`
+    /// answers the title's queries with.
+    ///
+    /// The title asks the console for these and `check_feature_support`
+    /// returns a fixed table (`OPTIONS`), which is right — a title written
+    /// for a console must see the console's values or it takes a different
+    /// path. What is *not* checked anywhere is whether the host can deliver
+    /// them. `host::create` reads two (`OPTIONS1`'s wave lanes, `OPTIONS7`'s
+    /// mesh shader tier); the other fourteen are claimed and never compared.
+    ///
+    /// This test prints both tables side by side on the machine it runs on,
+    /// so the gap is a number rather than a suspicion. It does not fail when
+    /// they differ — a host weaker than the console in a field the title
+    /// never reads is not a bug — it fails only where the layer has no
+    /// fallback and the difference must be known.
+    #[test]
+    fn the_claimed_capabilities_against_what_the_host_reports() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: our device; a plain feature query.
+        let ok = unsafe {
+            host.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+                .is_ok()
+        };
+        if !ok {
+            return; // the query itself is not answered here
+        }
+        let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: as above.
+        let _ = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut o1).cast(),
+                size_of_val(&o1) as u32,
+            )
+        };
+        let mut o7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+        // SAFETY: as above.
+        let _ = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7,
+                (&raw mut o7).cast(),
+                size_of_val(&o7) as u32,
+            )
+        };
+        // The claimed table, index for index (`device.rs` `OPTIONS`).
+        let claimed: [(usize, &str, u32, u32); 15] = [
+            (
+                0,
+                "double precision ops",
+                1,
+                u32::from(o.DoublePrecisionFloatShaderOps.as_bool()),
+            ),
+            (
+                1,
+                "output merger logic ops",
+                1,
+                u32::from(o.OutputMergerLogicOp.as_bool()),
+            ),
+            (
+                2,
+                "minimum precision 16-bit",
+                2,
+                o.MinPrecisionSupport.0 as u32,
+            ),
+            (3, "tiled resources tier", 3, o.TiledResourcesTier.0 as u32),
+            (
+                4,
+                "resource binding tier",
+                3,
+                o.ResourceBindingTier.0 as u32,
+            ),
+            (
+                5,
+                "stencil ref from PS",
+                1,
+                u32::from(o.PSSpecifiedStencilRefSupported.as_bool()),
+            ),
+            (
+                6,
+                "typed UAV loads",
+                1,
+                u32::from(o.TypedUAVLoadAdditionalFormats.as_bool()),
+            ),
+            (
+                7,
+                "rasterizer ordered views",
+                1,
+                u32::from(o.ROVsSupported.as_bool()),
+            ),
+            (
+                8,
+                "conservative raster tier",
+                3,
+                o.ConservativeRasterizationTier.0 as u32,
+            ),
+            (
+                9,
+                "GPU address bits",
+                40,
+                o.MaxGPUVirtualAddressBitsPerResource,
+            ),
+            (
+                10,
+                "64 KiB standard swizzle",
+                0,
+                u32::from(o.StandardSwizzle64KBSupported.as_bool()),
+            ),
+            (
+                14,
+                "viewport/RT index any stage",
+                1,
+                u32::from(
+                    o.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation
+                        .as_bool(),
+                ),
+            ),
+            (15, "resource heap tier", 2, o.ResourceHeapTier.0 as u32),
+            // Reported by OPTIONS1/7, already read by `host::create`.
+            (100, "wave lanes max", 64, o1.WaveLaneCountMax),
+            (101, "mesh shader tier", 1, o7.MeshShaderTier.0 as u32),
+        ];
+        let mut weak = Vec::new();
+        for (index, what, claim, host_says) in claimed {
+            eprintln!("CAP {what:<28} claimed={claim:<3} host={host_says}");
+            // A claimed value the host is below, on a field the layer reads
+            // without a fallback, is what this test is for. The three below
+            // are the ones it does read.
+            let must = match index {
+                100 => host_says >= 32, // a wave of 32 lanes is the floor for a 32-lane card
+                101 => host_says >= 1,  // mesh shaders, for the world's draws
+                _ => true,
+            };
+            if !must {
+                weak.push(format!("{what}: claimed {claim}, host {host_says}"));
+            }
+        }
+        assert!(
+            weak.is_empty(),
+            "the layer reads these and the host is below them: {weak:?}"
+        );
+    }
+
+    /// The claim in `OPTIONS` that a pixel shader may write the stencil
+    /// reference (`PSSpecifiedStencilRefSupported`), against what the host
+    /// says, and whether a pipeline carrying one is actually created.
+    ///
+    /// The title is told `1` for this field. `emit` supports `SV_StencilRef`
+    /// (there is a test for its SFI0 bit), so a title that believes the
+    /// claim can put a `SV_StencilRef` output in a pixel shader and have it
+    /// translated and handed to the host. On a host reporting `0` the
+    /// pipeline creation is what would refuse it — or worse, accept it and
+    /// ignore the output. Nothing checked which happens.
+    ///
+    /// This test reports the host's answer and, where the host says no,
+    /// states plainly that the layer's claim is unbacked here rather than
+    /// failing: which of the two is right for a title is a decision, and
+    /// this only makes the difference visible.
+    #[test]
+    fn the_stencil_ref_claim_and_what_the_host_supports() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: our device; a plain feature query.
+        let ok = unsafe {
+            host.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+                .is_ok()
+        };
+        if !ok {
+            return;
+        }
+        let host_says = o.PSSpecifiedStencilRefSupported.as_bool();
+        eprintln!(
+            "STENCIL-REF: OPTIONS[5] claims 1 (a pixel shader may write it); host says {}",
+            u8::from(host_says)
+        );
+        // The claim is the console's, and the title is meant to see it. What
+        // matters is that the difference is recorded where someone reading a
+        // stencil bug will find it, not that the two agree.
+        assert_eq!(
+            crate::device::claimed_stencil_ref(),
+            1,
+            "the console claims it; changing this changes what the title does"
+        );
+        if !host_says {
+            eprintln!(
+                "STENCIL-REF: this host does not support a pixel shader writing the stencil \
+                 reference. A title using it is translated and given a pipeline that the host \
+                 may refuse, or accept and ignore. `draw.rs` still sets the reference through \
+                 `OMSetStencilRef`, which is a different mechanism and does work."
+            );
+        }
     }
 }
