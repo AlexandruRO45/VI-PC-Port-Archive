@@ -1640,10 +1640,9 @@ struct CardWork {
     overdue: CardOverdue,
     /// [`CARD_PATCH`], if it compiled: root signature and pipeline.
     patch: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
-    /// Buffers in the PC's memory for a plan's patches (buffer, mapping,
-    /// bytes), not in use: a plan takes one and gives it back with its
-    /// lists.
-    patch_buffers: Vec<(ID3D12Resource, usize, u64)>,
+    /// Buffers in the PC's memory for a plan's patches (buffer, mapping),
+    /// not in use: a plan takes one and gives it back with its lists.
+    patch_pool: PatchPool<(ID3D12Resource, usize)>,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and persistent mappings, used only
@@ -2770,6 +2769,13 @@ void main(uint index : SV_GroupIndex, uint3 group : SV_GroupID) {
 /// bytes of the dword stay as the card holds them (a flight's writes).
 /// The patches name each dword once, so no two threads share one; the
 /// offsets are below 4 GiB ([`card_patchable`]).
+///
+/// Two atomic steps, not a load and a store: the first clears the mask's
+/// bits the title's bytes do not set, the second sets those they do, and
+/// neither changes a bit outside the mask. A write of the dword's other
+/// bytes by anything else on the card at the same time (none today: one
+/// queue runs everything in order) is kept, where a load and a store
+/// would put back the bytes as they were before it.
 pub(crate) const CARD_PATCH: &str = r#"
 #define RS "RootConstants(num32BitConstants=1, b0), SRV(t0), UAV(u0)"
 cbuffer Patches : register(b0) { uint count; };
@@ -2783,7 +2789,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     uint3 p = patches.Load3(id.x * 12u);
     uint at = p.x * 4u;
-    copy.Store(at, (copy.Load(at) & ~p.z) | (p.y & p.z));
+    copy.InterlockedAnd(at, ~p.z | p.y);
+    copy.InterlockedOr(at, p.y & p.z);
 }
 "#;
 
@@ -2791,8 +2798,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 pub(crate) const CARD_PATCH_PER_GROUP: u32 = 64;
 
 /// Whether the copies in the card's memory take title bytes by
-/// [`CARD_PATCH`] (it compiled): then the runs put in under flights are
-/// not held to the copies a list can take (`stale_under_flights`).
+/// [`CARD_PATCH`] (it compiled): then the short runs put in under flights
+/// go up as patches, held to their own room (`crate::shadow::Room`).
 static CARD_PATCHES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether a copy of `size` bytes in the card's memory can take patches
@@ -2803,11 +2810,112 @@ pub(crate) fn card_patchable(size: u64) -> bool {
 
 /// A run of title bytes shorter than this goes to the card's side as
 /// patches, a longer one by a copy of its own.
-const CARD_PATCH_RUN: usize = 256;
+pub(crate) const CARD_PATCH_RUN: usize = 256;
 
-/// Since the last frame line: patches of [`CARD_PATCH`] sent up, and the
-/// copies they were for.
-static CARD_PATCHED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// The most runs of title bytes put in under flights that go up by a copy
+/// each before one submission (`crate::shadow::Room`): a settle is due past
+/// it, as it was for every run before the patches.
+pub(crate) const CARD_COPIES_MOST: usize = 512;
+
+/// The most bytes of patches ([`CARD_PATCH`], 12 bytes a dword) the short
+/// runs put in under flights take before one submission: about 1.4 million
+/// patches, where the bus scene of run dd56178 put in 20-80 thousand runs
+/// of about 3 bytes a frame. Also the size of the buffer taken for them
+/// before any is put in ([`Host::patch_reserve`]).
+pub(crate) const CARD_PATCH_BYTES_MOST: usize = 16 << 20;
+
+/// The least bytes of a plan's buffer of patches.
+const PATCH_LEAST: u64 = 64 << 10;
+
+/// The most bytes of buffers of patches kept for later plans
+/// ([`PatchPool`]), and the plans after which one no plan took goes.
+const PATCH_POOL_MOST: u64 = 64 << 20;
+const PATCH_POOL_AGE: u64 = 256;
+
+/// From this many ranges sent up to a copy in the card's memory on, the
+/// pieces hashed again after them are hashed in joined runs whatever
+/// `VICTORY_CARD_REHASH_RUNS` says ([`rehash_runs`]); with patches always.
+const REHASH_JOIN_FROM: usize = 512;
+
+/// Since the last frame line: patches of [`CARD_PATCH`] sent up, the
+/// copies they were for, the title bytes they put in; copies of ranges
+/// recorded to bring card sides up to date (`CopyBufferRegion`); buffers
+/// of patches there was no memory for.
+static CARD_PATCHED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// A buffer in the PC's memory for a plan's patches: the buffer, its
+/// mapping, its bytes.
+type PatchBuffer = (ID3D12Resource, usize, u64);
+
+/// Buffers for plans' patches that no plan holds, for later plans: each
+/// with its bytes and the count of plans when it was given back, in the
+/// order they were. A plan takes the smallest that holds its patches, so
+/// that a few patches do not pin a big buffer while their flight is in the
+/// air (each plan held one of 1 MiB or more, and up to 128 lists are in the
+/// air). Kept: the ones given back last, at most [`PATCH_POOL_MOST`] bytes
+/// of them, and none that no plan took for [`PATCH_POOL_AGE`] plans.
+struct PatchPool<T> {
+    free: Vec<(T, u64, u64)>,
+    plans: u64,
+}
+
+impl<T> Default for PatchPool<T> {
+    fn default() -> Self {
+        PatchPool { free: Vec::new(), plans: 0 }
+    }
+}
+
+impl<T> PatchPool<T> {
+    /// The smallest buffer kept of `least` bytes or more, and of `most` or
+    /// fewer.
+    fn take(&mut self, least: u64, most: u64) -> Option<(T, u64)> {
+        let i = (0..self.free.len())
+            .filter(|&i| (least..=most).contains(&self.free[i].1))
+            .min_by_key(|&i| self.free[i].1)?;
+        let (buffer, bytes, _) = self.free.remove(i);
+        Some((buffer, bytes))
+    }
+
+    /// The biggest buffer kept.
+    fn take_biggest(&mut self) -> Option<(T, u64)> {
+        let i = (0..self.free.len()).max_by_key(|&i| self.free[i].1)?;
+        let (buffer, bytes, _) = self.free.remove(i);
+        Some((buffer, bytes))
+    }
+
+    /// Keeps `buffer` (of `bytes`) for later plans, within the bounds.
+    fn give_back(&mut self, buffer: T, bytes: u64) {
+        self.free.push((buffer, bytes, self.plans));
+        self.trim();
+    }
+
+    /// A plan is made: the buffers age.
+    fn plan(&mut self) {
+        self.plans += 1;
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        let plans = self.plans;
+        self.free.retain(|b| plans - b.2 < PATCH_POOL_AGE);
+        // From the one given back last: those that still fit.
+        let mut kept = 0u64;
+        let mut keep = vec![false; self.free.len()];
+        for (i, b) in self.free.iter().enumerate().rev() {
+            if kept + b.1 <= PATCH_POOL_MOST {
+                kept += b.1;
+                keep[i] = true;
+            }
+        }
+        let mut keep = keep.into_iter();
+        self.free.retain(|_| keep.next() == Some(true));
+    }
+
+    #[cfg(test)]
+    fn bytes(&self) -> u64 {
+        self.free.iter().map(|b| b.1).sum()
+    }
+}
 
 /// The bytes of a slot of [`CARD_COMPARE`]'s ring: a piece widened to 16
 /// bytes at both ends, as the hashing reads it. The ring's first slot's
@@ -3058,6 +3166,17 @@ fn rehash_runs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
 }
 
+/// Whether the pieces hashed again after `ranges` ranges went up to a copy
+/// in the card's memory are hashed in joined runs: with [`rehash_runs`],
+/// and whatever it says with patches (`patches`) or past
+/// [`REHASH_JOIN_FROM`] ranges. With patches a send takes up to a million
+/// short ranges, and a pass of its own for each hashed the same pieces
+/// thousands of times (80 thousand runs of 3 bytes: 80 thousand
+/// dispatches, about 5 GB read on the card).
+fn rehash_joined(patches: bool, ranges: usize) -> bool {
+    rehash_runs() || patches || ranges > REHASH_JOIN_FROM
+}
+
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, and compare passes after the lists.
@@ -3115,7 +3234,7 @@ struct CardPlan {
     count_at: Option<u32>,
     /// The buffer its patches of title bytes were in ([`CARD_PATCH`]),
     /// given back with its lists.
-    patches: Option<(ID3D12Resource, usize, u64)>,
+    patches: Option<PatchBuffer>,
 }
 
 impl CardPlan {
@@ -4105,7 +4224,12 @@ pub(crate) fn staging_wait(in_flight: u64) {
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> bool {
+///
+/// `reserve`: where the title's bytes are put in beside the flights' writes
+/// and a copy in the card's memory is among those refreshed, the buffer for
+/// the submission's patches ([`Host::patch_reserve`]), taken before any
+/// run is put in, for [`Host::card_before`].
+fn stale_under_flights(host: &Host, runs: &[&HostList], reserve: &mut Option<PatchBuffer>) -> bool {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
@@ -4124,15 +4248,21 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     }
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
-        // settle is still due where that could not be done. At most this
-        // many changed runs go up to copies in the card's memory: each a
-        // copy of its own there, or with [`CARD_PATCH`] a dword's patch
+        // settle is still due where that could not be done. What goes up
+        // to copies in the card's memory is held to a submission's room:
+        // 512 long runs, each a copy of its own there, and the short ones
+        // as dword patches ([`CARD_PATCH`]) while 16 MiB of patches last
         // (the bus scene of run dd56178 put in 20-80 thousand runs of
         // about 3 bytes a frame under flights, and still settled for title
         // memory changed under them about twice a frame: 75 ms of waiting
-        // for the card).
-        let mut runs_left = if CARD_PATCHES.load(Ordering::Relaxed) { 1 << 18 } else { 512 };
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        // for the card). The buffer the patches go up in is taken first:
+        // without memory for it the short runs take copies too, and past
+        // 512 a settle is due, as before the patches.
+        if reserve.is_none() && spans.iter().any(|(shadow, ..)| shadow.carded()) {
+            *reserve = host.patch_reserve();
+        }
+        let mut room = crate::shadow::Room::new(reserve.is_some());
+        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut room));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
@@ -4563,17 +4693,78 @@ fn late_line(frames: f64) {
     }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
-        let [unwatched, unknown, over, over_runs, unsnapped] =
+        let [unwatched, unknown, over, over_runs, unsnapped, over_patches] =
             crate::shadow::unmerged_stats().map(|n| n as f64 / frames);
-        let [patches, patched] = [0, 1].map(|i| CARD_PATCHED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        let [patches, patched, patched_bytes, copies, no_memory] =
+            std::array::from_fn(|i| CARD_PATCHED[i].swap(0, Ordering::Relaxed) as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB; not put in, a settle due, for: a copy not write-watched {unwatched:.1}, \
-             title writes not known {unknown:.1}, more changed runs than copies in the card's memory take {over:.1} \
-             (the page past the limit had {over_runs:.0}), a copy without its snapshot {unsnapped:.1}; \
-             {patches:.0} dword patches sent up to {patched:.1} copies in the card's memory",
-            bytes / (1 << 20) as f64
+             title writes not known {unknown:.1}, more runs of {CARD_PATCH_RUN} bytes or more than the {CARD_COPIES_MOST} \
+             copies a submission sends up {over:.1}, more short runs than its {} MiB of patches {over_patches:.1} (the page \
+             past a limit had {over_runs:.0} runs), a copy without its snapshot {unsnapped:.1}; sent up to copies in the \
+             card's memory: {patches:.0} dword patches with {:.2} MB of title bytes to {patched:.1} copies, {copies:.0} \
+             copies of ranges; {no_memory:.2} buffers of patches without memory",
+            bytes / (1 << 20) as f64,
+            CARD_PATCH_BYTES_MOST >> 20,
+            patched_bytes / (1 << 20) as f64
         );
+    }
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::{PATCH_POOL_AGE, PATCH_POOL_MOST, PatchPool, REHASH_JOIN_FROM, rehash_joined, rehash_runs};
+
+    /// Buffers of patches kept for later plans: a plan gets the smallest
+    /// that holds its patches and none four times their size, so a few
+    /// patches do not pin the 16 MiB the merge's room took; the pool keeps
+    /// at most 64 MiB, the buffers given back last, and lets go of one no
+    /// plan took for 256 plans.
+    #[test]
+    fn the_pool_gives_the_smallest_buffer_that_holds_and_lets_go_of_old_ones() {
+        const K: u64 = 1 << 10;
+        let mut pool = PatchPool::<u32>::default();
+        pool.give_back(1, 64 * K);
+        pool.give_back(2, 256 * K);
+        pool.give_back(3, 16 << 20);
+        pool.give_back(4, 128 * K);
+        assert_eq!(pool.take(100 * K, 4 * 128 * K), Some((4, 128 * K)), "the smallest of 128 and 256 KiB");
+        assert_eq!(pool.take(100 * K, 4 * 128 * K), Some((2, 256 * K)));
+        assert_eq!(pool.take(300 * K, 4 * 512 * K), None, "16 MiB for 300 KiB of patches");
+        assert_eq!(pool.take(300 * K, u64::MAX), Some((3, 16 << 20)));
+        pool.give_back(5, 1 << 20);
+        assert_eq!(pool.take_biggest(), Some((5, 1 << 20)));
+        assert_eq!(pool.take_biggest(), Some((1, 64 * K)));
+        assert_eq!(pool.take_biggest(), None);
+        // At most 64 MiB, the last given back first.
+        for i in 0..10 {
+            pool.give_back(10 + i, 16 << 20);
+        }
+        assert_eq!(pool.bytes(), PATCH_POOL_MOST);
+        let mut kept: Vec<u32> = std::iter::from_fn(|| pool.take_biggest().map(|b| b.0)).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, [16, 17, 18, 19]);
+        // One no plan took for 256 plans goes; one given back since stays.
+        pool.give_back(30, 64 * K);
+        for _ in 0..PATCH_POOL_AGE - 1 {
+            pool.plan();
+        }
+        pool.give_back(31, 64 * K);
+        assert_eq!(pool.bytes(), 128 * K);
+        pool.plan();
+        assert_eq!(pool.take_biggest(), Some((31, 64 * K)));
+        assert_eq!(pool.bytes(), 0);
+    }
+
+    /// The pieces hashed again after ranges went up are hashed in joined
+    /// runs with patches, or with more than 512 ranges, whatever
+    /// `VICTORY_CARD_REHASH_RUNS` says; else as it says.
+    #[test]
+    fn rehash_runs_join_with_patches_or_many_ranges() {
+        assert!(rehash_joined(true, 1));
+        assert!(rehash_joined(false, REHASH_JOIN_FROM + 1));
+        assert_eq!(rehash_joined(false, REHASH_JOIN_FROM), rehash_runs());
     }
 }
 
@@ -5189,7 +5380,7 @@ impl Host {
                 areas,
                 overdue: CardOverdue::default(),
                 patch: self.make_card_patch(),
-                patch_buffers: Vec::new(),
+                patch_pool: PatchPool::default(),
             })
         }
     }
@@ -5242,6 +5433,74 @@ impl Host {
         made
     }
 
+    /// The buffer for a submission's patches of title bytes ([`CARD_PATCH`]),
+    /// taken before the title's bytes are put in under flights
+    /// (`stale_under_flights`), so that the merge takes no more short runs
+    /// than can go up as patches: [`CARD_PATCH_BYTES_MOST`] bytes, its whole
+    /// room, kept or made. `None` without the patch or without memory: the
+    /// short runs then take copies, as before. [`Host::card_before`] gives
+    /// it back, or a plan whose patches it holds.
+    fn patch_reserve(&self) -> Option<PatchBuffer> {
+        let most = CARD_PATCH_BYTES_MOST as u64;
+        let kept = {
+            let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+            let work = work.as_mut()?;
+            work.patch.as_ref()?;
+            work.patch_pool.take(most, u64::MAX)
+        };
+        match kept {
+            Some(((buffer, data), bytes)) => Some((buffer, data, bytes)),
+            None => self.make_patch_buffer(most),
+        }
+    }
+
+    /// A buffer in the PC's memory of `bytes` for patches.
+    fn make_patch_buffer(&self, bytes: u64) -> Option<PatchBuffer> {
+        let made = self.shared_buffer(bytes).map(|(buffer, data)| {
+            name(&buffer, || "patches of title bytes for copies in the card's memory".into());
+            (buffer, data as usize, bytes)
+        });
+        if made.is_none() {
+            CARD_PATCHED[4].fetch_add(1, Ordering::Relaxed);
+        }
+        made
+    }
+
+    /// A buffer for a plan's `bytes` of patches: the smallest kept that
+    /// holds them and is not four times the size they would make (the
+    /// submission's `reserve` is kept first), else one made of the next
+    /// power of two (64 KiB at least, where it was 1 MiB). Without memory,
+    /// the smallest kept that holds them, else the biggest kept: the caller
+    /// sends the ranges past its room by copies.
+    fn patch_buffer(&self, bytes: u64, reserve: Option<PatchBuffer>) -> Option<PatchBuffer> {
+        let want = bytes.next_power_of_two().max(PATCH_LEAST);
+        self.patch_back(reserve);
+        // `None` for the biggest kept.
+        let kept = |sizes: Option<(u64, u64)>| -> Option<PatchBuffer> {
+            let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+            let pool = &mut work.as_mut()?.patch_pool;
+            let ((buffer, data), size) = match sizes {
+                Some((least, most)) => pool.take(least, most),
+                None => pool.take_biggest(),
+            }?;
+            Some((buffer, data, size))
+        };
+        kept(Some((bytes, want.saturating_mul(4))))
+            .or_else(|| self.make_patch_buffer(want))
+            .or_else(|| kept(Some((bytes, u64::MAX))))
+            .or_else(|| kept(None))
+    }
+
+    /// A buffer of patches that no plan holds goes back to the pool.
+    fn patch_back(&self, buffer: Option<PatchBuffer>) {
+        let Some((buffer, data, bytes)) = buffer else {
+            return;
+        };
+        if let Some(work) = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            work.patch_pool.give_back((buffer, data), bytes);
+        }
+    }
+
     /// The compare's ring UAV and its slots for a compare of `flown` lists:
     /// the ring's own buffer when [`relay_snapshot`] is on and the lists
     /// are sent ahead, else the results buffer and no slots (the shader
@@ -5263,10 +5522,12 @@ impl Host {
     ///
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
     /// then stores the hashes it makes (see [`flagged_pieces`] and
-    /// `relay`).
-    fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+    /// `relay`). `reserve`: the buffer of patches taken for the title's
+    /// bytes put in under flights ([`Host::patch_reserve`]).
+    fn card_before(&self, runs: &[&HostList], flown: bool, reserve: Option<PatchBuffer>) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
+            self.patch_back(reserve);
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
@@ -5288,22 +5549,21 @@ impl Host {
                 }
             }
         }
-        // With the relay: the order of the queue is held from here until
-        // what is taken is on the queue, and the taking is numbered.
-        let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
-        let sent_as = match order.as_mut() {
-            Some(order) => {
-                **order += 1;
-                **order
-            }
-            None => 0,
-        };
+        // With the relay, the number of this send in the order of the queue
+        // (`QUEUE_ORDER`): the count so far and one. Only this thread sends
+        // (it holds the submission lock), and the count is set to it below,
+        // under the order's lock, with the list put on the queue: a fetch
+        // that goes to the queue before then has a lower count and leaves
+        // the ranges taken now out (`Shadow::card_merge_relay`), as it did
+        // while the order's lock was held from the taking on. The patches
+        // are made before it is taken: the relay's fetches waited for them.
+        let sent_as = if relay() { *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()) + 1 } else { 0 };
         let mut dirty = crate::shadow::card_dirty(sent_as);
-        if declared.is_empty() && dirty.is_empty() {
+        let patching = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|work| work.patch.is_some());
+        if (declared.is_empty() && dirty.is_empty()) || patching.is_none() {
+            self.patch_back(reserve);
             return None;
         }
-        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        let work = work.as_mut()?;
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -5315,60 +5575,80 @@ impl Host {
             }) {
                 whole.push(shadow.clone());
                 if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                    dirty.push((shadow.clone(), Vec::new()));
+                    dirty.push((shadow.clone(), Vec::new().into()));
                 }
             }
         }
+        // Per copy: the ranges that go up by a copy each, and the short
+        // ones that go up as patches ([`CARD_PATCH`]), which title bytes
+        // put in under flights are (thousands of runs of a few bytes a
+        // frame), with where its patches are in the plan's buffer. Made
+        // before the order of the queue and the card's work are taken; the
+        // bytes are read under each copy's CPU side's lock alone.
+        let patchable: Vec<bool> = dirty
+            .iter()
+            .map(|(shadow, _)| patching == Some(true) && shadow.card_sides().is_some_and(|(_, _, size)| card_patchable(size)))
+            .collect();
+        let split = |room: usize| -> (Vec<(Vec<(usize, usize)>, Vec<(usize, usize)>)>, usize) {
+            let mut left = room;
+            let split = dirty.iter().zip(&patchable).map(|((_, ranges), &p)| crate::shadow::card_split(ranges, p, &mut left)).collect();
+            (split, room - left)
+        };
+        let (mut splits, dwords) = split(usize::MAX);
+        let mut patches_in: Option<PatchBuffer> = None;
+        if dwords > 0 {
+            patches_in = self.patch_buffer(dwords as u64 * 12, reserve);
+            // Without memory for all of them: as many as the buffer holds,
+            // the short ranges past it by copies (the title's bytes put in
+            // under flights had their room in `reserve`).
+            let held = patches_in.as_ref().map_or(0, |b| (b.2 / 12) as usize);
+            if held < dwords {
+                splits = split(held).0;
+            }
+        } else {
+            self.patch_back(reserve);
+        }
+        let mut patches: Vec<[u32; 3]> = Vec::new();
+        let patched_at: Vec<std::ops::Range<usize>> = dirty
+            .iter()
+            .zip(&splits)
+            .map(|((shadow, _), (_, short))| {
+                let first = patches.len();
+                shadow.card_patches(short, &mut patches);
+                first..patches.len()
+            })
+            .collect();
+        if patches.is_empty() {
+            self.patch_back(patches_in.take());
+        }
+        if let Some((_, data, size)) = &patches_in {
+            let bytes = patches.len() * 12;
+            if bytes as u64 > *size {
+                fail(format_args!("{} patches of title bytes for a buffer of {size} bytes", patches.len()));
+            }
+            // SAFETY: the mapping holds `size` bytes, `bytes` or more; the
+            // buffer is no plan's, so the card does not read it now.
+            unsafe { std::ptr::copy_nonoverlapping(patches.as_ptr().cast::<u8>(), *data as *mut u8, bytes) };
+            let patched = splits.iter().flat_map(|(_, short)| short).map(|&(a, b)| (b - a) as u64).sum::<u64>();
+            CARD_PATCHED[0].fetch_add(patches.len() as u64, Ordering::Relaxed);
+            CARD_PATCHED[1].fetch_add(patched_at.iter().filter(|p| !p.is_empty()).count() as u64, Ordering::Relaxed);
+            CARD_PATCHED[2].fetch_add(patched, Ordering::Relaxed);
+            crate::shadow::CARD_STATS[0].fetch_add(patched, Ordering::Relaxed);
+        }
+        let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(order) = order.as_mut() {
+            if **order + 1 != sent_as {
+                fail(format_args!("the order of the queue moved from {} while send {sent_as} was made", sent_as - 1));
+            }
+            **order = sent_as;
+        }
+        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let work = work.as_mut()?;
         let mut used: Vec<(bool, Prelude)> = Vec::new();
-        let mut patches_in: Option<(ID3D12Resource, usize, u64)> = None;
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
-            // Per copy: the ranges that go up by a copy each, and where its
-            // patches are in `patches` ([`CARD_PATCH`]): the short ones,
-            // which title bytes put in under flights are (thousands of runs
-            // of a few bytes a frame).
-            let mut patches: Vec<[u32; 3]> = Vec::new();
-            let mut split: Vec<(Vec<(usize, usize)>, std::ops::Range<usize>)> = dirty
-                .iter()
-                .map(|(shadow, ranges)| {
-                    let patchable = work.patch.is_some()
-                        && shadow.card_sides().is_some_and(|(_, _, size)| card_patchable(size));
-                    if !patchable {
-                        return (ranges.clone(), 0..0);
-                    }
-                    let (short, long): (Vec<(usize, usize)>, Vec<(usize, usize)>) =
-                        ranges.iter().partition(|&&(a, b)| b - a < CARD_PATCH_RUN);
-                    let first = patches.len();
-                    shadow.card_patches(&short, &mut patches);
-                    (long, first..patches.len())
-                })
-                .collect();
-            if !patches.is_empty() {
-                let bytes = (patches.len() * 12) as u64;
-                patches_in = match work.patch_buffers.iter().position(|b| b.2 >= bytes) {
-                    Some(i) => Some(work.patch_buffers.swap_remove(i)),
-                    None => {
-                        let size = bytes.next_power_of_two().max(1 << 20);
-                        self.shared_buffer(size).map(|(buffer, data)| {
-                            name(&buffer, || "patches of title bytes for copies in the card's memory".into());
-                            (buffer, data as usize, size)
-                        })
-                    }
-                };
-                match &patches_in {
-                    // SAFETY: the mapping holds `bytes` or more; the buffer
-                    // is no plan's, so the card does not read it now.
-                    Some((_, data, _)) => unsafe {
-                        std::ptr::copy_nonoverlapping(patches.as_ptr().cast::<u8>(), *data as *mut u8, bytes as usize);
-                        CARD_PATCHED[0].fetch_add(patches.len() as u64, Ordering::Relaxed);
-                        CARD_PATCHED[1].fetch_add(split.iter().filter(|(_, p)| !p.is_empty()).count() as u64, Ordering::Relaxed);
-                    },
-                    // No memory for them: a copy per range, as before.
-                    None => split = dirty.iter().map(|(_, ranges)| (ranges.clone(), 0..0)).collect(),
-                }
-            }
             let (allocator, list) = &sync;
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
@@ -5377,7 +5657,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for ((shadow, ranges), (copied, patched)) in dirty.iter().zip(&split) {
+                    for (((shadow, ranges), (copied, _)), patched) in dirty.iter().zip(&splits).zip(&patched_at) {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
@@ -5385,6 +5665,7 @@ impl Host {
                             list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
+                        CARD_PATCHED[3].fetch_add(copied.len() as u64, Ordering::Relaxed);
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         // The card side's state: common at the list's start
                         // (a buffer's decays when its submission has run).
@@ -5441,8 +5722,12 @@ impl Host {
                         } else {
                             ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
                         };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        // The same pieces in fewer passes (`rehash_joined`).
+                        let runs = if rehash_joined(work.patch.is_some(), ranges.len()) {
+                            crate::shadow::joined_piece_runs(runs)
+                        } else {
+                            runs
+                        };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
@@ -5573,6 +5858,7 @@ impl Host {
             }
             plan.lists.push((true, check));
         }
+        work.patch_pool.plan();
         Some(plan)
     }
 
@@ -5597,8 +5883,8 @@ impl Host {
     fn card_done(&self, plan: CardPlan) {
         if let Some(work) = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             let mut plan = plan;
-            if let Some(buffer) = plan.patches.take() {
-                work.patch_buffers.push(buffer);
+            if let Some((buffer, data, bytes)) = plan.patches.take() {
+                work.patch_pool.give_back((buffer, data), bytes);
             }
             work.plan_done(plan);
         }
@@ -6485,6 +6771,9 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        // The buffer for the patches of the title's bytes put in under
+        // flights, if they are put in (`stale_under_flights`).
+        let mut reserve: Option<PatchBuffer> = None;
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
@@ -6507,13 +6796,13 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && stale_under_flights(self, runs, &mut reserve) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && stale_under_flights(self, runs, &mut reserve) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
@@ -6551,7 +6840,7 @@ impl Host {
             }
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown);
+        let card = self.card_before(runs, flown, reserve);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -8471,7 +8760,8 @@ impl Meter {
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+                     ranges were sent up (joined with patches, past {REHASH_JOIN_FROM} ranges, or with VICTORY_CARD_REHASH_RUNS=1: \
+                     now {}), {compares:.0} compare passes",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
