@@ -52,6 +52,7 @@ def main(argv=None):
     for name in ("emitter","provider","proton","prefix","compiler-dir","dxc","dxv","work","output"):
         ap.add_argument("--"+name,type=Path,required=True)
     ap.add_argument("--adapter",required=True)
+    ap.add_argument("--layout", choices=("linear", "2d", "3d"), default="linear")
     a=ap.parse_args(argv)
     if a.work.exists() or a.output.exists():ap.error("fresh work and output required")
     a.work.mkdir(parents=True)
@@ -62,13 +63,14 @@ def main(argv=None):
         for i,(width,op,sel,lane,bias,rhs,fi) in enumerate(cases()):
             name=f"dpp{i:03}"
             control=sum(v<<(3*j) for j,v in enumerate(sel))
-            source=subprocess.check_output([a.emitter,str(width),op,f"{control:x}",str(lane),f"{bias:x}",f"{rhs:x}",str(fi)],text=True,timeout=15)
+            group = {"linear": (width,1,1), "2d": (8,width//8,1), "3d": (4,4,width//16)}[a.layout]
+            source=subprocess.check_output([a.emitter,str(width),op,f"{control:x}",str(lane),f"{bias:x}",f"{rhs:x}",str(fi),*map(str,group)],text=True,timeout=15)
             hlsl=trial/(name+".hlsl");hlsl.write_text(source)
             blob=trial/(name+".cso")
             subprocess.run([a.dxc,"-T","cs_6_0","-E","main","-O3","-Fo",blob,hlsl],check=True,capture_output=True,timeout=30)
             subprocess.run([a.dxv,blob],check=True,capture_output=True,timeout=30)
             expected[name]=reference(width,op,sel,lane,bias,rhs)
-            rows.append(dict(case=name,width=width,operation=op,selectors=sel,lane=lane,bias=bias,rhs=rhs,fi=fi,dxil_sha256=sha(blob)))
+            rows.append(dict(case=name,width=width,group=group,operation=op,selectors=sel,lane=lane,bias=bias,rhs=rhs,fi=fi,dxil_sha256=sha(blob)))
         (trial/"cases.txt").write_text("".join(f"{n} 0 raw 1\n" for n in expected))
         exe,status,fields=run_gpu_guest(ROOT/"tools/reference/independent-shaders/compute.cpp",
                 "dpp8-exchange.exe",trial,a.work,a.proton,a.prefix,a.provider,a.compiler_dir,
@@ -82,7 +84,7 @@ def main(argv=None):
         unchanged=fingerprints=={n:sha(getattr(a,n)) for n in fingerprints}
         result=dict(schema=1,scope="Native synthetic instructions, actual emitted HLSL and reflected raw UAV store; no output instrumentation",
                     adapter=fields.get("adapter"),guest_exit=status,passed=status==0 and fields.get("adapter")==a.adapter and unchanged and all(x["matched"] for x in rows),
-                    cases=len(rows),compared_words=len(rows)*384,result_words=sum(x["width"] for x in rows),
+                    layout=a.layout,cases=len(rows),compared_words=len(rows)*384,result_words=sum(x["width"] for x in rows),
                     tools_sha256=fingerprints,guest_sha256=sha(exe),rows=rows)
         if fields.get("error"):result["error"]=fields["error"]
         with a.output.open("x") as stream:json.dump(result,stream,indent=2);stream.write("\n")

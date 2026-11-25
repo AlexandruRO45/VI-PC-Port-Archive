@@ -19,7 +19,8 @@ pub(super) const DPP8_EXCHANGE: u32 = 0x7fe7;
 /// its octet. Constant readlane is
 /// only allowed at 32 threads where wave32/wave64 agree for lanes 0..31.
 pub(super) fn straight_exchange(insns: &mut [Insn], group: [u32; 3]) -> bool {
-    if !matches!(group, [32, 1, 1] | [64, 1, 1]) || insns.len() > 4096
+    let Some(lanes) = group.into_iter().try_fold(1u32, u32::checked_mul) else { return false; };
+    if !matches!(lanes, 32 | 64) || insns.len() > 4096
         || insns.last().is_none_or(|i| i.mnemonic != "s_endpgm")
     { return false; }
     let mut found = false;
@@ -43,7 +44,7 @@ pub(super) fn straight_exchange(insns: &mut [Insn], group: [u32; 3]) -> bool {
             let [Opnd::Vgpr(dst @ 0..=105)] = i.dst[..] else { return false };
             let (Some(Opnd::Vgpr(src)), Some(Opnd::ConstInt(lane @ 0..=31))) =
                 (i.src.first(), i.src.get(1)) else { return false };
-            if group[0] != 32 || i.raw.as_slice() !=
+            if lanes != 32 || i.raw.as_slice() !=
                 [0xd7600000 | u32::from(dst), ((128 + *lane as u32) << 9) | 256 | u32::from(*src)]
             { return false; }
         } else if i.enc == Enc::Smem && i.mnemonic == "s_load_dwordx4" {
@@ -909,6 +910,14 @@ pub(super) fn portable_single_wave(insns: &[Insn]) -> bool {
         }
     }
     true
+}
+
+/// The native compute local IDs are x-fast, then y, then z. A group-shared
+/// exchange indexes the whole logical wave, not the x coordinate alone.
+pub(super) fn portable_lane_id(group: [u32; 3]) -> String {
+    let [x, y, z] = group;
+    if y == 1 && z == 1 { "gtid.x".into() }
+    else { format!("(gtid.x + {x}u * (gtid.y + {y}u * gtid.z))") }
 }
 
 // A second barrier prevents a fast host subgroup from overwriting a slot

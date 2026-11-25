@@ -52,8 +52,15 @@ CHECKS = {
     **{f"wave-guard-{width}-{variant}": Check("check_wave_guard", emitter="wave_guard",
                                               extra=("--width", str(width), "--variant", variant))
        for width in (32, 64) for variant in ("original", "chain", "chain-zero")},
+    "wave-guard-64-2d": Check("check_wave_guard", emitter="wave_guard",
+                              extra=("--width", "64", "--group", "8", "8", "1")),
+    "wave-guard-64-3d": Check("check_wave_guard", emitter="wave_guard",
+                              extra=("--width", "64", "--group", "4", "4", "4")),
     "lockstep": Check("check_lockstep_gpu", emitter="lockstep", llvm=True, dxc=True),
     "dpp8-exchange": Check("check_dpp8_exchange", emitter="lone_lane_probe", dxc=True),
+    **{f"dpp8-exchange-{layout}": Check("check_dpp8_exchange", emitter="lone_lane_probe", dxc=True,
+                                       extra=("--layout", layout))
+       for layout in ("2d", "3d")},
     "pixel-heap-offsets": Check("check_pixel_heap_offsets", emitter="pixel_heap_offsets", dxc=True),
     "pixel-link": Check("check_portable_pixel_link", emitter="xshader", dxc=True),
     "pixel-link-slot86": Check("check_slot86_portable_link", emitter="xshader", dxc=True),
