@@ -1230,3 +1230,35 @@ fn nested_exec_masks_keep_shared_visibility_results_across_halves() {
         }
     }
 }
+
+/// A select on an inline constant mask (here 5: lanes 0 and 2) tests the
+/// console lane's bit, like one on a mask held in scalars
+/// (`numeric_selects_beside_in_half_reads`). A program split in halves has
+/// only its host lane for it (lanes 32 and 34 would take the bits of lanes
+/// 0 and 2): on a host without 64-lane waves the select is deferred and,
+/// its result being used, the program takes the console flow instead.
+#[test]
+fn selects_on_constant_masks_beside_in_half_reads() {
+    let mut body = IN_HALF.to_vec();
+    body.extend_from_slice(&[
+        0xD501_0002,
+        0x0216_0101, // v_cndmask_b32 v2, v1, v0, 5
+    ]);
+    let p = program(&body, 64);
+    let wave32 = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let halves = emit_for(&p, wave32).unwrap();
+    assert_eq!(wave_size(&halves.dxil), Some(32));
+    // One host wave is the console wave: the lane tests its own bit.
+    let native = emit_for(&p, super::Target::ANY).unwrap();
+    assert_eq!(wave_size(&native.dxil), Some(64));
+    // v1 is t ^ 16 (the swizzle), v0 is t.
+    program_case(
+        "a select on a constant mask beside in-half reads",
+        &p,
+        |t| if t == 0 || t == 2 { t } else { t ^ 16 },
+        true,
+    );
+}
