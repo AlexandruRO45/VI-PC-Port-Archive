@@ -98,6 +98,42 @@ l'un change ce que le titre observe, son commentaire le dit. Si une exécution
 montre un problème d'image, désactiver d'abord `VICTORY_LATE_WAIT`
 (`VICTORY_LATE_WAIT=0`), puis `VICTORY_RELAY=0`, `VICTORY_ASYNC_SUBMIT=0`.
 
+### Ce que j'ai appris en regardant les autres forks (25/11/2026, soir)
+
+Trois projets font la même chose en public, et j'ai lu les deux plus avancés
+pour voir ce qu'ils ont que cette branche n'a pas :
+
+- **ZSlayerHQ/victory-world-runtime**, branche `next` (la ligne à suivre,
+  dernier commit `0808b0c`) : le runtime de *victory-world*. C'est la base la
+  plus à jour, et elle rassemble les forks publics. Le README y annonce
+  « environ 24 Go de RAM et 9 Go de mémoire vidéo dans le monde », et des
+  réglages de mémoire Windows (erreur 1455 dans `crashes.log` = pas assez de
+  mémoire de commit).
+- **DexNom/VIctory**, un fork de cette même base, testé sur Radeon RX 7900
+  XTX : il ajoute le **lancer de rayons** (constructeur de structures
+  d'accélération, traversée et éclairage) derrière un mode expérimental, des
+  correctifs de shaders (échantillonnage 2×2 aux bords de triangles, cube
+  maps, wave64, samplers statiques par branche) et la reprise des textures
+  éparses. Ses propres mesures donnent **969 ms par image en ville avec le RT
+  allumé** (3 469 ms avant son correctif d'écriture), soit environ 1 image/s :
+  le RT n'est pas encore une solution de vitesse, même chez lui.
+
+**Ce que ça change pour toi (NVIDIA, pas AMD)** : rien dans ce que fait
+DexNom n'est propre à Radeon. Ses correctifs de shaders et de textures sont
+du D3D12 ordinaire ; seul son test et ses chiffres le sont. Ce que sa branche
+apporte vraiment, et que celle-ci n'a pas encore, c'est le **lancer de rayons**
+(chantier 3 ci-dessous, les zones noires) et la **reprise des textures
+éparses** (une texture dont seules les pages du milieu sont là s'envoie quand
+même). Ces deux-là sont le prochain vrai travail ; recopier le reste ne
+donnerait presque rien, puisque la base est la même.
+
+Une mesure que j'ai faite ce soir sur ta machine va dans ce sens : sur un même
+dossier de test, cette branche tient **0,8 à 1,0 image/s** avec 260 à 970 ms
+de « heap buffers » par image, contre **0,3 image/s et 3 000 ms** pour la base
+d'origine avant le passage de vitesse — et les deux tournent sur la même
+machine, donc le reste de l'écart avec DexNom est dans la scène (la ville) et
+dans le RT, pas dans le pilote.
+
 ### Ce qui manque encore pour être jouable (chantiers en cours)
 
 1. **Le bornage par enregistrement dans les propres listes du jeu est
