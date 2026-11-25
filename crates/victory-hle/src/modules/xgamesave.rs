@@ -433,6 +433,16 @@ impl Update {
     /// Applies the update as one new version of the container.
     fn submit(&self) -> HRESULT {
         let _saves = saves_lock();
+        // A legacy directory of this container's name still sitting under
+        // the root means its migration has not finished (it fails whole on
+        // an unreadable blob). Writing now would commit a version without
+        // the legacy blobs, and the next scan would clear the old
+        // directory as done: refuse until the migration has gone through.
+        if let Some(root) = self.dir.parent()
+            && root.join(file_name(&self.name)).is_dir()
+        {
+            return BLOB_NOT_FOUND;
+        }
         let current = match current(&self.dir) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -1169,12 +1179,26 @@ mod tests {
         let mut perms = std::fs::metadata(&header).unwrap().permissions();
         perms.set_mode(0);
         std::fs::set_permissions(&header, perms).unwrap();
-        assert_eq!(std::fs::read(&header).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        // A privileged process (root) reads regardless of the mode: without
+        // the ability to deny a read, the test's premise does not hold.
+        if std::fs::read(&header).is_ok() {
+            return;
+        }
 
         let p = Provider::open(saves.path(), Some("scid")).unwrap();
         let _ = p.container("Player");
         assert!(old.is_dir(), "nothing migrated");
         assert!(old.join("Data").exists() && old.join("Header").exists());
+        // An update to the container waits for the migration: committing
+        // now would leave the legacy blobs out, and the next scan would
+        // clear the old directory as done.
+        let refused = Update {
+            name: "Player".into(),
+            dir: container_dir(&p.root, "Player"),
+            display: None,
+            changes: vec![("New".into(), Some(b"new".to_vec()))],
+        };
+        assert_eq!(refused.submit(), BLOB_NOT_FOUND);
 
         let mut perms = std::fs::metadata(&header).unwrap().permissions();
         perms.set_mode(0o600);
