@@ -211,6 +211,7 @@ fn build(words: &[u32]) -> Result<HostShader, String> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })
     .map_err(|e| format!("lower: {e:?}"))?;
     let shader = HostShader {
@@ -227,6 +228,7 @@ fn build(words: &[u32]) -> Result<HostShader, String> {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -655,7 +657,9 @@ fn valu_hardware_and_warp_agree() {
     );
 }
 
-/// The hardware adapters (index, description), software ones left out.
+/// The hardware adapters (index, description): as `host.rs`'s
+/// `hardware_adapter`, not flagged software and with video memory of their
+/// own, so CI's basic render driver is left out with WARP.
 fn hardware_adapters() -> Vec<(u32, String)> {
     use windows::Win32::Graphics::Dxgi::*;
     let mut out = Vec::new();
@@ -668,6 +672,7 @@ fn hardware_adapters() -> Vec<(u32, String)> {
         while let Ok(a) = factory.EnumAdapters1(i) {
             if let Ok(d) = a.GetDesc1()
                 && d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
+                && d.DedicatedVideoMemory > 0
             {
                 let n = d.Description.iter().take_while(|&&c| c != 0).count();
                 out.push((i, String::from_utf16_lossy(&d.Description[..n])));
