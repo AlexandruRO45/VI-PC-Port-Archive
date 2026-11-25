@@ -951,7 +951,7 @@ mod tests {
             }
         }
         let _pool = PoolGuard(base);
-        let (buffer, data) = host.upload_buffer(4).expect("upload buffer");
+        let (buffer, _data) = host.upload_buffer(4).expect("upload buffer");
         let layout = victory_formats::texture::Layout::new(&victory_formats::texture::Desc {
             dimension: victory_formats::texture::Dimension::Tex2d,
             width: 128,
