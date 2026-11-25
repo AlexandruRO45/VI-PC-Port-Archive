@@ -146,6 +146,48 @@ extern "system" fn unregister_progress(
     true
 }
 
+/// Progress is already complete and never changes.
+extern "system" fn update_monitor(_: This, _monitor: *const c_void) -> bool {
+    false
+}
+
+const DEFAULT_LOCALE: &str = "en-US";
+/// `LOCALE_NAME_MAX_LENGTH`: maximum locale name length in code units, including NUL.
+const LOCALE_NAME_MAX_LENGTH: usize = 85;
+
+#[cfg(windows)]
+fn query_host_locale() -> Option<String> {
+    let mut buf = [0u16; LOCALE_NAME_MAX_LENGTH];
+    // SAFETY: `buf` holds `LOCALE_NAME_MAX_LENGTH` writable UTF-16 code units.
+    let len = unsafe {
+        windows_sys::Win32::Globalization::GetUserDefaultLocaleName(
+            buf.as_mut_ptr(),
+            buf.len() as i32,
+        )
+    };
+    let len = usize::try_from(len).ok().filter(|&n| n > 1)?;
+    let locale = String::from_utf16(buf.get(..len - 1)?).ok()?;
+    (!locale.is_empty()).then_some(locale)
+}
+
+fn user_locale_name() -> String {
+    #[cfg(windows)]
+    if let Some(locale) = query_host_locale() {
+        return locale;
+    }
+    DEFAULT_LOCALE.to_owned()
+}
+
+/// Host user locale as a BCP-47 tag (`XPackageGetUserLocale`), falling back to
+/// `en-US` if querying the host returns empty.
+extern "system" fn user_locale(_: This, size: usize, buffer: *mut u8) -> HRESULT {
+    if buffer.is_null() {
+        return xasync::E_INVALIDARG;
+    }
+    let locale = user_locale_name();
+    put_string(&locale, size, buffer, std::ptr::null_mut())
+}
+
 /// 0: ready.
 // shortcut: every selector counts as installed, including ones the
 // package's layout does not have (the console answers those with an
@@ -231,6 +273,17 @@ extern "system" fn uninstall_chunks(
     if is_ours(id) { S_OK } else { NO_PACKAGE }
 }
 
+/// `XPackageGetMountPathSize`: byte count (including NUL) for the path
+/// `mount_path` (`0xc8`) writes; no mount handles exist, so both reject any
+/// handle with `E_INVALIDARG` and `mount_path_size` zeroes a non-null `size`.
+extern "system" fn mount_path_size(_: This, _mount: *const c_void, size: *mut usize) -> HRESULT {
+    if !size.is_null() {
+        // SAFETY: checked non-null.
+        unsafe { size.write(0) };
+    }
+    xasync::E_INVALIDARG
+}
+
 /// Mount handles only come from mounting another package, and there is
 /// none.
 extern "system" fn mount_path(_: This, _: *const c_void, _: usize, _: *mut u8) -> HRESULT {
@@ -287,10 +340,10 @@ static VTABLE: Methods<40> = Methods([
     create_monitor as *const (),        // 0x28
     close_monitor as *const (),         // 0x30
     progress as *const (),              // 0x38
-    missing::<8> as *const (),          // 0x40 update a monitor
+    update_monitor as *const (),        // 0x40
     register_progress as *const (),     // 0x48
     unregister_progress as *const (),   // 0x50
-    missing::<11> as *const (),         // 0x58 user locale
+    user_locale as *const (),           // 0x58
     find_availability as *const (),     // 0x60
     missing::<13> as *const (),         // 0x68 enumerate chunk availability
     change_order as *const (),          // 0x70
@@ -303,7 +356,7 @@ static VTABLE: Methods<40> = Methods([
     missing::<21> as *const (),         // 0xa8
     missing::<22> as *const (),         // 0xb0
     missing::<23> as *const (),         // 0xb8 mount (deprecated)
-    missing::<24> as *const (),         // 0xc0 mount path size
+    mount_path_size as *const (),       // 0xc0
     mount_path as *const (),            // 0xc8
     close_mount as *const (),           // 0xd0
     missing::<27> as *const (),         // 0xd8
@@ -351,6 +404,100 @@ mod tests {
             );
             assert_ne!(token, 0);
             assert!(unregister(this, monitor(), token, wait));
+        }
+    }
+
+    #[test]
+    fn monitor_update_user_locale_and_mount_path_size() {
+        type Update = extern "system" fn(This, *const c_void) -> bool;
+        type Locale = extern "system" fn(This, usize, *mut u8) -> HRESULT;
+        type MountSize = extern "system" fn(This, *const c_void, *mut usize) -> HRESULT;
+        type MountPath = extern "system" fn(This, *const c_void, usize, *mut u8) -> HRESULT;
+
+        let this: This = &OBJECT;
+        assert_eq!(VTABLE.0[0x40 / 8], update_monitor as *const ());
+        assert_eq!(VTABLE.0[0x58 / 8], user_locale as *const ());
+        assert_eq!(VTABLE.0[0xc0 / 8], mount_path_size as *const ());
+        assert_eq!(VTABLE.0[0xc8 / 8], mount_path as *const ());
+
+        let update = method::<Update>(&OBJECT, 0x40);
+        assert!(!update(this, monitor()));
+        assert!(!update(this, std::ptr::null()));
+
+        let expected = user_locale_name();
+        assert!(!expected.is_empty());
+        assert!(
+            expected.split('-').all(|part| !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')),
+            "unexpected locale tag: {expected}"
+        );
+        #[cfg(windows)]
+        {
+            let mut wide = [0u16; LOCALE_NAME_MAX_LENGTH];
+            // SAFETY: `wide` holds `LOCALE_NAME_MAX_LENGTH` UTF-16 code units.
+            let n = unsafe {
+                windows_sys::Win32::Globalization::GetUserDefaultLocaleName(
+                    wide.as_mut_ptr(),
+                    wide.len() as i32,
+                )
+            };
+            if n > 1 {
+                let host = String::from_utf16(&wide[..(n as usize) - 1]).unwrap();
+                assert_eq!(expected, host);
+            }
+        }
+
+        let need = expected.len() + 1;
+        let mut expected_nul = expected.into_bytes();
+        expected_nul.push(0);
+
+        let locale = method::<Locale>(&OBJECT, 0x58);
+        assert_eq!(
+            locale(this, LOCALE_NAME_MAX_LENGTH, std::ptr::null_mut()),
+            xasync::E_INVALIDARG
+        );
+        let mut short = vec![0xff_u8; need - 1];
+        assert_eq!(
+            locale(this, 0, short.as_mut_ptr()),
+            xasync::E_NOT_SUFFICIENT_BUFFER
+        );
+        assert_eq!(
+            locale(this, short.len(), short.as_mut_ptr()),
+            xasync::E_NOT_SUFFICIENT_BUFFER
+        );
+        assert!(short.iter().all(|&b| b == 0xff));
+
+        let mut exact = vec![0xff_u8; need];
+        assert_eq!(locale(this, exact.len(), exact.as_mut_ptr()), S_OK);
+        assert_eq!(exact, expected_nul);
+
+        let mut wide_buf = vec![0xff_u8; LOCALE_NAME_MAX_LENGTH.max(need + 10)];
+        assert_eq!(locale(this, wide_buf.len(), wide_buf.as_mut_ptr()), S_OK);
+        assert_eq!(&wide_buf[..need], expected_nul.as_slice());
+        assert!(wide_buf[need..].iter().all(|&b| b == 0xff));
+
+        let mount_size = method::<MountSize>(&OBJECT, 0xc0);
+        let mount_path = method::<MountPath>(&OBJECT, 0xc8);
+        assert_eq!(
+            mount_size(this, std::ptr::null(), std::ptr::null_mut()),
+            xasync::E_INVALIDARG
+        );
+        let fake_mount = (&raw const OBJECT).cast::<c_void>();
+        for handle in [std::ptr::null(), fake_mount] {
+            let mut path_size = usize::MAX;
+            assert_eq!(
+                mount_size(this, handle, &mut path_size),
+                xasync::E_INVALIDARG
+            );
+            assert_eq!(path_size, 0);
+            let mut path_buf = [0xff_u8; 8];
+            assert_eq!(
+                mount_path(this, handle, path_buf.len(), path_buf.as_mut_ptr()),
+                xasync::E_INVALIDARG
+            );
+            assert_eq!(path_buf, [0xff; 8]);
         }
     }
 
