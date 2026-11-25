@@ -233,6 +233,16 @@ impl Memory {
     }
 }
 
+/// The title released `heap`: its run of slots went with it. The run is
+/// kept by the heap's address, which the next heap the title makes may get,
+/// and that heap has no run and no views yet.
+pub(crate) fn forget(heap: &HostHeap) {
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = guard.as_mut() {
+        m.heaps.remove(&(std::ptr::from_ref(heap) as usize));
+    }
+}
+
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name gets its copies (`addresses`: its root views;
 /// `constants`: its root constants, see the module), every numbered copy
@@ -252,12 +262,14 @@ pub(crate) fn ready(
     }
     let m = guard.as_mut()?;
     let frame = crate::frame::current();
+    // Before the faults are taken: the copies they number are new to this
+    // list like the ones its own arguments number.
+    let numbered = m.copies.len();
     if m.frame != frame {
         m.frame = frame;
         m.refused.clear();
         m.take_faults();
     }
-    let numbered = m.copies.len();
     for &address in addresses {
         m.name(address);
     }

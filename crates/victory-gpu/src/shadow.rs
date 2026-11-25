@@ -2103,7 +2103,9 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            // A copy may start inside a piece: the first cut is `from`
+            // then, not below the copy's start.
+            at.saturating_sub((start + at) % PIECE).max(from)
         };
         let scan = &scan;
         std::thread::scope(|s| {
@@ -2823,8 +2825,11 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        // Every window that starts below the end: one may be longer than
+        // the 4 MiB grid (a sized ask that crosses a line), and so start
+        // further below `at` than that.
         let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
+            .range(..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();

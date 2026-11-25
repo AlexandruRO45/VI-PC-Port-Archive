@@ -933,6 +933,10 @@ pub(crate) struct HostList {
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
+    /// Further preludes, for a submission that names the list more than
+    /// once: each time needs its own, since the ones before it are queued
+    /// and have not run when it is recorded.
+    repeats: Mutex<Vec<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -3529,6 +3533,7 @@ impl Host {
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
+                repeats: Mutex::default(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
@@ -4858,10 +4863,11 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
-        for list in runs {
+        for (i, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            let earlier = runs[..i].iter().filter(|l| std::ptr::eq(**l, *list)).count();
+            if let Some(prelude) = list.prelude(earlier) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -5607,7 +5613,9 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// `earlier`: how many times the submission names this list before
+    /// this one; those preludes are queued, so this one is another list.
+    fn prelude(&self, earlier: usize) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -5671,11 +5679,18 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        let own = if earlier == 0 {
+            self.prelude.get_or_init(|| host().and_then(|h| h.make_prelude())).clone()
+        } else {
+            let mut repeats = self.repeats.lock().unwrap_or_else(|e| e.into_inner());
+            while repeats.len() < earlier
+                && let Some(made) = host().and_then(|h| h.make_prelude())
+            {
+                repeats.push(made);
+            }
+            repeats.get(earlier - 1).cloned()
+        };
+        let Some((allocator, list)) = own.as_ref() else {
             fail(format_args!("no host list for a state prelude"));
         };
         // SAFETY: the prelude is not executing (every submission is waited
@@ -7098,14 +7113,20 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            // A texture that already is a copy source stays one: a
+            // transition between equal states is not a barrier the host
+            // accepts.
+            let first = usize::from(state == D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list.ResourceBarrier(
+                &[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ][first..],
+            );
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -7115,14 +7136,16 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            list.ResourceBarrier(
+                &[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ][first..],
+            );
             copy.close();
             match slot {
                 Some(i) => {

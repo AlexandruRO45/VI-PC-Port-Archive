@@ -1446,12 +1446,13 @@ impl State {
         }
         // The pass itself once per frame: per list it ran up to 51 times a
         // frame over 81,000 views and 4,100 host copies, 18 s of every
-        // frame (2026-11-24, run 11).
+        // frame (2026-11-24, run 11). Per heap: the views the pass keeps
+        // are the heap's, and a second heap's are not made by the first's
+        // pass.
         // shortcut: what the title writes into such buffers between lists
         // of one frame is seen a frame late.
-        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) == frame {
+        if host.buffers_frame.swap(frame, Ordering::Relaxed) == frame {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
