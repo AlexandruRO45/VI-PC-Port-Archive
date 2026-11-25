@@ -14,15 +14,17 @@
 //! Pipelines a draw waits for go ahead of those started early (at the
 //! title's creation, because an earlier run drew them).
 //!
-//! Passes over the screen (no vertex input, no depth) have workers and a
-//! longer budget of their own: the title fills its lighting tables with
-//! such draws once, at the world's first frame, and behind a world's worth
-//! of pipelines they waited minutes; a run that lost them had no diffuse
-//! light at all.
+//! Passes over the screen (no vertex input, no depth) have workers of
+//! their own: the title fills its lighting tables with such draws once, at
+//! the world's first frame, and behind a world's worth of pipelines they
+//! waited out their kind of the budget before a worker ever reached them;
+//! a run that lost them had no diffuse light at all. Each kind keeps its
+//! own budget, but both are the same half a second: a misclassified pass
+//! can only move to the other pool, never wait longer.
 //!
-//! shortcut: the budgets (half a second of waiting per title frame, 20 s
-//! for screen passes) are guesses; another pass the title runs only once
-//! and whose pipeline takes longer is lost.
+//! shortcut: the budget (half a second of waiting per title frame kind) is
+//! a guess; a pass the title runs only once and whose pipeline takes
+//! longer is lost, and logged once when it does.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -170,12 +172,12 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
+/// Waiting allowed per title frame, over all threads, per kind (a
+/// pipeline's own pool; see `Pending::screen`). The two stay apart so a
+/// world's pipelines cannot spend a screen pass's budget, and both are the
+/// same half a second so a pass classified on either side never waits
+/// longer than only the ordinary pool allowed.
 const BUDGET: Duration = Duration::from_millis(500);
-
-/// Waiting allowed per title frame for passes over the screen (below the
-/// title's 30 s watchdog).
-const SCREEN_BUDGET: Duration = Duration::from_secs(20);
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -198,8 +200,26 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p, true);
         wait(p, crate::frame::current());
+        if p.made.get().is_none() {
+            dropped(p);
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Logs a draw whose pipeline was not made within its kind of the budget,
+/// so its draw is skipped: once per pipeline key, as a pass drawn only
+/// once is never drawn again.
+fn dropped(p: &Pending) {
+    static DROPPED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let dropped = DROPPED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if dropped
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(p.key.clone())
+    {
+        tracing::warn!(key = %p.key, "a draw's pipeline is not made within the frame's budget; the draw is skipped");
+    }
 }
 
 /// Queues `p` for the workers: once, and once more ahead of the early
@@ -235,12 +255,11 @@ fn wait(p: &Pending, frame: u64) {
     static FRAME: [AtomicU64; 2] = [const { AtomicU64::new(u64::MAX) }; 2];
     static WAITED_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let kind = usize::from(p.screen);
-    let budget = [BUDGET, SCREEN_BUDGET][kind];
     let waited = &WAITED_US[kind];
     if FRAME[kind].swap(frame, Ordering::Relaxed) != frame {
         waited.store(0, Ordering::Relaxed);
     }
-    let left = budget.saturating_sub(Duration::from_micros(waited.load(Ordering::Relaxed)));
+    let left = BUDGET.saturating_sub(Duration::from_micros(waited.load(Ordering::Relaxed)));
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
