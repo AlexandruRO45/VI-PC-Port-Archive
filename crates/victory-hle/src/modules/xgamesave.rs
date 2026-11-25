@@ -186,6 +186,24 @@ fn version_number(file: &str) -> Option<u64> {
     (n > 0 && format!("v{n}") == file).then_some(n)
 }
 
+/// Clears the staging path even if a regular file occupies it.
+fn remove_staged_version(path: &Path) -> std::io::Result<()> {
+    let kind = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.file_type(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    #[cfg(windows)]
+    if std::os::windows::fs::FileTypeExt::is_symlink_dir(&kind) {
+        return std::fs::remove_dir(path);
+    }
+    if kind.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
 /// The names in version folder `dir`: container, display, blobs; `None` if
 /// its manifest is missing or does not parse.
 fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
@@ -212,8 +230,8 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     for entry in std::fs::read_dir(dir)?.flatten() {
         let file = entry.file_name();
         let file = file.to_string_lossy();
-        if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+        if file.strip_suffix(".new").and_then(version_number).is_some() {
+            remove_staged_version(&entry.path())?;
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -279,9 +297,7 @@ fn commit(
     blobs: &[(&str, Source<'_>)],
 ) -> std::io::Result<()> {
     let staged = dir.join(format!("v{number}.new"));
-    if staged.exists() {
-        std::fs::remove_dir_all(&staged)?;
-    }
+    remove_staged_version(&staged)?;
     std::fs::create_dir_all(&staged)?;
     let write = |path: PathBuf, data: &[u8]| -> std::io::Result<()> {
         let mut file = std::fs::File::create(path)?;
@@ -1472,6 +1488,38 @@ mod tests {
             // Read again: the new version stays the container.
             assert_eq!(state(root), after, "{what}: second read");
         }
+    }
+
+    #[test]
+    fn a_staged_version_file_does_not_hide_a_committed_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        let staged = slot.join("v2.new");
+        let unrelated = slot.join("notes.new");
+        std::fs::write(&staged, b"stray file").unwrap();
+        std::fs::write(&unrelated, b"keep me").unwrap();
+
+        assert_eq!(state(root), old_state());
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep me");
+
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+        assert!(slot.join("v2").is_dir());
+    }
+
+    #[test]
+    fn a_staged_version_file_can_be_replaced_on_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("v1.new");
+        std::fs::write(&staged, b"stray file").unwrap();
+
+        commit(dir.path(), 1, "Slot", "one", &[("a", Source::Data(b"new a"))]).unwrap();
+
+        assert!(!staged.exists());
+        let version = current(dir.path()).unwrap().unwrap();
+        assert_eq!(std::fs::read(version.dir.join("0")).unwrap(), b"new a");
     }
 
     /// With no readable version at all, reads and updates fail and nothing
