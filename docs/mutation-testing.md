@@ -55,8 +55,32 @@ hardware tests skip, so the CPU tests are what decide a mutant.
 - `cargo-mutants` generates no mutants inside `Lower::new` in this tree
   (large function, many branches). Extract the rule into a helper and test
   the helper.
+- An **unviable** mutant does not compile; it is not a missing test. A
+  **timeout** means the mutant hangs; it is detected but costs the full
+  test timeout, so prefer bounded loops (see `named_adapter`).
 - `crates/victory-shader/src/emit/lower.rs` exceeds the `cargo xtask policy`
   source-size limit. That is a known issue in the README and does not excuse
   missing tests.
 - The baseline must be green before mutation results mean anything. Known
   baseline failures are tracked in issues #2 and #8; #93 fixes #8.
+- Set `RUST_TEST_THREADS=1` (as `.github/workflows/mutants.yml` does in CI): the
+  xmem page pool and the GPU differential tests share global state between
+  tests. Run hardware and xmem runs serially on a developer machine too.
+- `xtask` (`repository_passes_policy`) is excluded in CI until PRs #72/#84
+  reduce `crates/victory-shader/src/emit/lower.rs` below the 512 KiB limit.
+
+## Documented equivalent mutants
+
+These survived but do not change behaviour; they are not suppressed by
+configuration:
+
+- `emit/wave.rs::constant`: replacing the `code != NULL` match guard with
+  `true` is equivalent. The null SGPR is not a readable scalar and `sconst`
+  never holds it, so the lookup still returns `None`.
+- `xmem.rs::map_whole`: disabling the `pages.len() <= 64` guard on the
+  `None` arm is not observable in the xmem suite after the small-run-into-a-
+  whole-view fix. The guard is kept because the title maps its GPU heap in
+  several calls; the startup regression test covers the other side.
+- `host.rs::named_adapter`: making the `adapters.is_empty()` error guard
+  always false is equivalent: with no adapters collected the next step finds
+  no index and returns `Err` either way.

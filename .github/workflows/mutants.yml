@@ -28,7 +28,9 @@ jobs:
         shell: pwsh
         env:
           BASE_REF: ${{ github.base_ref }}
+          RUST_TEST_THREADS: "1"
         run: |
           git fetch origin $env:BASE_REF --depth=1
           git diff "origin/$env:BASE_REF...HEAD" | Set-Content "$env:RUNNER_TEMP\pr.diff"
-          cargo mutants --in-diff "$env:RUNNER_TEMP\pr.diff" --timeout 300 --jobs 2
+          # Exclude xtask while lower.rs exceeds the 512 KiB asset-policy cap (#72/#84).
+          cargo mutants --in-diff "$env:RUNNER_TEMP\pr.diff" -e "xtask/**" --timeout 300 --jobs 2
