@@ -143,7 +143,11 @@ impl Module {
                             TYPE_BLOCK | CONSTANTS_BLOCK | VALUE_SYMTAB_BLOCK | FUNCTION_BLOCK
                         );
                     if read {
+                        let base = self.values.len();
                         self.block(r, inner, inner_width)?;
+                        if inner == FUNCTION_BLOCK {
+                            self.values.truncate(base);
+                        }
                     } else {
                         r.at += words * 32;
                     }
@@ -568,6 +572,13 @@ mod tests {
             ]
         );
         assert_eq!(m.counts.instructions, 7);
+    }
+
+    #[test]
+    fn counts_each_body_from_module_values() {
+        let c = count(&super::super::bitcode::two_function_bitcode()).expect("counts");
+        assert_eq!((c.blocks, c.instructions), (2, 4));
+        assert_eq!(kinds(&c), [("add", 1), ("fadd", 1), ("ret", 2)]);
     }
 
     /// Through a whole container, as a shader is handed to the host.
