@@ -2145,6 +2145,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
+        // One host texture takes the castable-format path, which needs
+        // enhanced-barrier creation; a host without it keeps a texture
+        // per format.
+        let castable = host
+            .device
+            .cast::<windows::Win32::Graphics::Direct3D12::ID3D12Device10>()
+            .is_ok();
         let slots = Slots::new(4);
         let read = compile_cs(READ);
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
@@ -2182,7 +2189,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             let a = crate::resource::host_copy(object).unwrap();
             let b = crate::resource::host_copy(placed as This).unwrap();
-            assert_eq!(std::sync::Arc::ptr_eq(&a, &b), shared, "round {round}: one host texture");
+            assert_eq!(std::sync::Arc::ptr_eq(&a, &b), shared && castable, "round {round}: one host texture");
             let unordered = View::Unordered(object as usize, 0, Some([written, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
             slots.make(0, &unordered);
             slots.make(1, &view);
@@ -2198,7 +2205,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             list.close();
             host.execute(&[&list]);
             let copied = crate::texture::ALIAS_COPIES.load(Ordering::Relaxed) > copies;
-            assert_eq!(copied, !shared, "round {round}: a copy only where not shared");
+            assert_eq!(copied, !shared || !castable, "round {round}: a copy only where not shared");
             let n = read_size as usize;
             for i in [0usize, 7, n * 9 + 33, n * n - 1] {
                 let (x, y) = (i % n, i / n);
