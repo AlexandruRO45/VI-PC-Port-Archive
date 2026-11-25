@@ -478,6 +478,24 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             })
         })
     });
+    list.defer_memory_pages(move |held| {
+        let Layout { copies, blocks, owner, .. } = &*layout(key);
+        // SAFETY: the prefix fence finished the GPU's use of this bitmap.
+        let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
+        for (w, &word) in marks.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let entry = w * 32 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some(&l1) = blocks.get(entry / BLOCK).filter(|_| entry / BLOCK != 0)
+                    && let Some(Some(k)) = owner.get(entry)
+                {
+                    let address = l1 << 28 | (entry % BLOCK) << 16;
+                    held.push((copies[*k].clone(), address, crate::watch::PAGE));
+                }
+            }
+        }
+    });
     list.defer_after(move || {
         let Layout { copies, blocks, owner, .. } = &*layout(key);
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());

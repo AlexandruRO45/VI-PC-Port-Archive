@@ -155,7 +155,7 @@ fn with_draw_state(this: This, compute: bool, f: impl FnOnce(&crate::host::HostL
 #[cfg(windows)]
 pub(crate) fn cpu_source_list<'a>(this: This, from: usize, len: usize) -> Option<&'a crate::host::HostList> {
     let list = host_list(this)?;
-    if !list.writes_for_cpu_reads(&[(from, len)]) {
+    if !list.writes_for_cpu_reads(&[(from, len)], true) {
         return Some(list);
     }
     // SAFETY: the title passes one of our lists.

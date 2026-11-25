@@ -244,6 +244,9 @@ impl State {
         if !pipeline.stages.iter().any(|stage| !stage.root_cbvs.is_empty()) || !list.has_recorded_writes() {
             return false;
         }
+        // A reader that can itself miss cannot complete the computed
+        // prefix. Keep the existing checks for bounded writers there.
+        let opaque = !pipeline.stages.iter().any(|stage| stage.memory.is_some());
         pipeline.stages.iter().flat_map(|s| &s.root_cbvs).any(|&(slot, _)| {
             let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 return false;
@@ -252,7 +255,7 @@ impl State {
                 return false;
             };
             !shadow.gpu(*address).is_multiple_of(256)
-                && list.writes_for_cpu_reads(&[(*address as usize, shadow.left(*address).min(1 << 16) as usize)])
+                && list.writes_for_cpu_reads(&[(*address as usize, shadow.left(*address).min(1 << 16) as usize)], opaque)
         })
     }
 
@@ -2305,6 +2308,179 @@ void main() { target.Store(0, value); }
             }
         }
         assert_eq!(observed, [29, 29, 29, 29], "each root CBV must see its GPU producer");
+    }
+
+    /// Real GPU writes and dirty marks, decoded by the normal computed
+    /// page table completion. A miss must leave both CPU staging and title
+    /// memory on the still-published value. Run alone: the miss holds
+    /// computed writes for this frame and the next in this process.
+    #[test]
+    #[ignore = "requires a GPU and isolated computed-memory frame state"]
+    fn computed_tail_reads_after_the_fence_without_publishing_a_miss() {
+        computed_tail_regression(false);
+    }
+
+    /// A later CPU copy writes a neighboring dword on the same page.
+    /// The subsequent refresh must not replace the earlier private write.
+    #[test]
+    #[ignore = "requires a GPU and isolated computed-memory frame state"]
+    fn computed_tail_preserves_the_private_producer_across_a_page_refresh() {
+        computed_tail_regression(true);
+    }
+
+    fn computed_tail_regression(overlap_refresh: bool) {
+        const PRODUCE: &str = r#"
+ByteAddressBuffer pageTable : register(t0);
+RWByteAddressBuffer target : register(u0);
+RWByteAddressBuffer dirty : register(u1);
+cbuffer input : register(b0) { uint region; uint page; uint miss; }
+[RootSignature("SRV(t0), UAV(u0), UAV(u1), RootConstants(num32BitConstants=3,b0)")]
+[numthreads(1, 1, 1)]
+void main() {
+    uint block = pageTable.Load(region * 4);
+    uint entry = block * 4096 + page;
+    uint ignored;
+    dirty.InterlockedOr((entry >> 5) * 4, 1u << (entry & 31), ignored);
+    if (miss != 0) { dirty.InterlockedOr(0, 1, ignored); }
+    target.Store(0, 29);
+}
+"#;
+        const CONSUME: &str = r#"
+cbuffer Input : register(b0) { uint value; }
+RWByteAddressBuffer target : register(u0);
+[RootSignature("CBV(b0), UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main() { target.Store(0, value); }
+"#;
+        const OVERLAP: &str = r#"
+RWByteAddressBuffer target : register(u0);
+RWByteAddressBuffer dirty : register(u1);
+cbuffer input : register(b0) { uint bit; }
+[RootSignature("UAV(u0), UAV(u1), RootConstants(num32BitConstants=1,b0)")]
+[numthreads(1, 1, 1)]
+void main() {
+    uint ignored;
+    target.Store(4, target.Load(0));
+    dirty.InterlockedOr((bit >> 5) * 4, 1u << (bit & 31), ignored);
+}
+"#;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+
+        let host = crate::host::host().expect("computed-tail regression needs a host GPU");
+        let (produce_root, produce) = compile_cs(PRODUCE);
+        let (consume_root, consume) = compile_cs(CONSUME);
+        let (overlap_root, overlap) = compile_cs(OVERLAP);
+        let page = crate::watch::PAGE;
+        for (case, miss, expected) in [(0, 0, 29), (1, 1, 11), (2, 0, 11)] {
+            // The translated page table addresses the low 40 bits.
+            let title = (0x54_2000_0000usize + case * page * 64..0x54_2000_0000usize + (case + 1) * page * 64)
+                .step_by(page)
+                .find_map(|at| {
+                    // SAFETY: a private test allocation at an available address.
+                    let data = unsafe {
+                        VirtualAlloc(
+                            at as *const _,
+                            page,
+                            MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
+                            PAGE_READWRITE,
+                        )
+                    };
+                    (!data.is_null()).then_some(data as usize)
+                })
+                .expect("low title page");
+            let address = title + 16;
+            // SAFETY: private allocated title page.
+            unsafe { (address as *mut u32).write(11) };
+            crate::shadow::register(title, title as u64, page as u64);
+            let target = crate::shadow::find(address as u64, 4).unwrap();
+            let result = buffer(4);
+            let (result_data, _) = crate::resource::buffer_bytes(result).unwrap();
+            let output = crate::shadow::find(result_data as u64, 4).unwrap();
+
+            let (title_list, allocator) = title_list();
+            let prefix = crate::list::host_list(title_list).unwrap();
+            let map = crate::memory::bind(prefix, crate::memory::OURS).unwrap();
+            let args = [(title >> 28) as u32, ((title >> 16) & 4095) as u32, miss];
+            // SAFETY: the open prefix list keeps the computed map and the
+            // target lives through submission. UAV addresses are aligned.
+            unsafe {
+                prefix.list.SetComputeRootSignature(&produce_root);
+                prefix.list.SetPipelineState(&produce);
+                prefix.list.SetComputeRootShaderResourceView(0, map.table);
+                prefix.list.SetComputeRootUnorderedAccessView(1, target.gpu(address as u64));
+                prefix.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+                prefix.list.SetComputeRoot32BitConstants(3, 3, args.as_ptr().cast(), 0);
+                prefix.list.Dispatch(1, 1, 1);
+            }
+            let suffix = crate::list::cpu_source_list(title_list, address, 4).unwrap();
+            assert!(!std::ptr::eq(prefix, suffix), "opaque producer must end before CPU staging");
+            // The innermost view can be a different copy than the full
+            // page owner selected by the computed address table.
+            if case == 0 {
+                crate::shadow::register(title + 4, (title + 4) as u64, 64);
+                let inner = crate::shadow::find(address as u64, 4).unwrap();
+                assert!(!std::sync::Arc::ptr_eq(&target, &inner));
+            }
+            let constant = root_view(suffix, address as u64, false, false).unwrap();
+            assert_ne!(constant, target.gpu(address as u64));
+            let mut copied = 0u32;
+            output.refresh(suffix, result_data as u64, 4);
+            output.gpu_writes(suffix, result_data as u64, 4, false);
+            suffix.defer_copy((&raw mut copied).cast(), address as *const u8, 4);
+            // SAFETY: the suffix list holds the CBV and the output shadow.
+            unsafe {
+                suffix.list.SetComputeRootSignature(&consume_root);
+                suffix.list.SetPipelineState(&consume);
+                suffix.list.SetComputeRootConstantBufferView(0, constant);
+                suffix.list.SetComputeRootUnorderedAccessView(1, output.gpu(result_data as u64));
+                suffix.list.Dispatch(1, 1, 1);
+            }
+            let cpu = 55u32;
+            if miss != 0 {
+                if overlap_refresh {
+                    suffix.defer_copy((address + 8) as *mut u8, (&raw const cpu).cast(), 4);
+                    target.refresh(suffix, address as u64, 16);
+                }
+                let (bit, _) = target.mark_entry(address as u64).unwrap();
+                let dirty = crate::shadow::view_writes(false).unwrap();
+                target.gpu_writes(suffix, (address + 4) as u64, 4, true);
+                // SAFETY: the target and the ordinary mark bitmap live
+                // through the list. This writes next to the withheld dword.
+                unsafe {
+                    suffix.list.SetComputeRootSignature(&overlap_root);
+                    suffix.list.SetPipelineState(&overlap);
+                    suffix.list.SetComputeRootUnorderedAccessView(0, target.gpu(address as u64));
+                    suffix.list.SetComputeRootUnorderedAccessView(1, dirty);
+                    suffix.list.SetComputeRoot32BitConstant(2, bit, 0);
+                    suffix.list.Dispatch(1, 1, 1);
+                }
+            }
+            suffix.close();
+            host.execute(&[prefix, suffix]);
+            // SAFETY: the fence is complete and both title allocations live.
+            let read = unsafe { [(address as *const u32).read(), result_data.cast::<u32>().read(), copied] };
+            println!("computed tail case {case}: source, staged CBV, CPU copy = {read:?}");
+            assert_eq!(read, [expected; 3]);
+            // SAFETY: also inside the allocation, initialized to zero.
+            assert_eq!(unsafe { ((address + 4) as *const u32).read() }, 0);
+            if miss != 0 {
+                let private = target.read_host(address as u64, 4);
+                println!("private shadow after suffix: {private:?}");
+                assert_eq!([private[1], private[2]], [29, if overlap_refresh { 55 } else { 0 }]);
+            }
+            for resource in [result, title_list, allocator] {
+                crate::object::slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+            }
+            if case == 0 {
+                crate::shadow::unregister(title + 4, (title + 4) as u64);
+            }
+            crate::shadow::unregister(title, title as u64);
+            crate::memory::prepare(crate::memory::OURS, |_, _, _| {});
+            drop(target);
+            crate::watch::tests::free(title);
+        }
     }
 
     #[test]
