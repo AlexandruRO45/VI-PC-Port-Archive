@@ -351,6 +351,103 @@ fn tbuffer_d16_loads_pack_two_channels_per_dword() {
     }
 }
 
+fn sqrt_f64_results(setup: &[u32], instruction: &[u32], inputs: &[u64]) -> Vec<(String, Vec<u64>)> {
+    let cases: Vec<_> = inputs
+        .iter()
+        .map(|&bits| [bits as u32, (bits >> 32) as u32, 0, 0])
+        .collect();
+    let mut results = std::collections::BTreeMap::<String, Vec<u64>>::new();
+    for (word, shift) in [(6, 0), (7, 32)] {
+        let mut body = setup.to_vec();
+        body.extend_from_slice(instruction);
+        body.push(vop1(0x001, 0, vgpr(word)));
+        let shader = try_build_valu_cs(&body).unwrap_or_else(|error| {
+            panic!("V_SQRT_F64: {error}");
+        });
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        let bits = u64::from_le_bytes(features.data.try_into().unwrap());
+        assert_eq!(bits & 0x8001, 0, "SFI0 doubles and int64 feature bits");
+        run_cases(&shader, &cases, |backend, index, _, value| {
+            let words = results
+                .entry(backend.to_owned())
+                .or_insert_with(|| vec![0; inputs.len()]);
+            words[index] |= u64::from(value) << shift;
+        });
+    }
+    results.into_iter().collect()
+}
+
+#[test]
+fn sqrt_f64_tracks_binary64_range_and_rounding() {
+    const SIGN: u64 = 1 << 63;
+    const MIN_NORMAL: u64 = 1 << 52;
+    const INFINITY: u64 = 0x7ff0_0000_0000_0000;
+    let inputs = [
+        0,
+        SIGN,
+        1,
+        2,
+        3,
+        1 << 19,
+        1 << 20,
+        1 << 21,
+        MIN_NORMAL / 2,
+        MIN_NORMAL - 1,
+        MIN_NORMAL,
+        MIN_NORMAL + 1,
+        0.25f64.to_bits(),
+        1.0f64.to_bits(),
+        1.0f64.to_bits() + 1,
+        2.0f64.to_bits(),
+        4.0f64.to_bits(),
+        25.0f64.to_bits(),
+        0x6dee_4b32_6055_5033,
+        f64::MAX.to_bits(),
+        INFINITY,
+        INFINITY | 17,
+        SIGN | INFINITY | 17,
+        SIGN | INFINITY,
+        (-4.0f64).to_bits(),
+        SIGN | 1,
+    ];
+    for mode in 0..4 {
+        let setup = [0xbfa4_0000 | mode << 2]; // s_round_mode
+        for (backend, outputs) in sqrt_f64_results(&setup, &[vop1(0x034, 6, vgpr(1))], &inputs) {
+            for (&input, got) in inputs.iter().zip(outputs) {
+                let expected = f64::from_bits(input).sqrt();
+                if expected.is_nan() {
+                    assert!(f64::from_bits(got).is_nan(), "{backend}: {input:#018x}");
+                } else if matches!(input, 0 | SIGN | INFINITY) {
+                    assert_eq!(got, input, "{backend}: {input:#018x}");
+                } else {
+                    let want = expected.to_bits();
+                    let bound = if mode == 0 { 1 << 28 } else { 1 << 29 };
+                    assert!(
+                        got.abs_diff(want) <= bound,
+                        "{backend}: {input:#018x}, mode {mode}, {got:#018x} vs {want:#018x}"
+                    );
+                    if mode == 1 {
+                        assert!(got >= want, "{backend}: round up for {input:#018x}");
+                    } else if mode != 0 {
+                        assert!(got <= want, "{backend}: round down for {input:#018x}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sqrt_f64_preserves_signed_zero_when_mode_flushes_subnormals() {
+    let inputs = [1, 0x8000_0000_0000_0001, 4.0f64.to_bits()];
+    let desired = [0, 0x8000_0000_0000_0000, 2.0f64.to_bits()];
+    let setup = [0xbfa5_0000 | 2 << 2]; // s_denorm_mode: flush FP16/FP64 input
+    for (backend, outputs) in sqrt_f64_results(&setup, &vop3(0x1b4, 6, sgpr(0), 0, 0), &inputs) {
+        assert_eq!(outputs, desired, "{backend}");
+    }
+}
+
 #[test]
 fn normalized_buffer_formats_load_their_ends_exactly() {
     // tbuffer_load_format_x.
