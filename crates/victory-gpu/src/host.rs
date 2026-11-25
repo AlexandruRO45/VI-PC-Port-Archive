@@ -2857,7 +2857,8 @@ mod fill_check {
 
     /// The title buffer copy waited for now: destination, source, length,
     /// the bytes of both when it blocked.
-    static PENDING_COPY: Mutex<Option<(usize, usize, usize, Vec<u8>, Vec<u8>)>> = Mutex::new(None);
+    static PENDING_COPY: Mutex<Option<PendingCopy>> = Mutex::new(None);
+    type PendingCopy = (usize, usize, usize, Vec<u8>, Vec<u8>);
     /// Copies checked after their wait; those whose source had changed;
     /// those whose destination had.
     static COPIES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];

@@ -297,6 +297,9 @@ impl Lane {
     }
 }
 
+/// The holds made so far, and the way to the thread that times them.
+type Holds = (u64, Option<Sender<(u64, u64)>>);
+
 /// The copy queues and what ties them to the direct queue.
 pub(crate) struct Second {
     bits: u32,
@@ -318,7 +321,7 @@ pub(crate) struct Second {
     /// there. Behind the lock: the holds made so far, and the way to the
     /// thread that times them.
     reached: ID3D12Fence,
-    holds: Mutex<(u64, Option<Sender<(u64, u64)>>)>,
+    holds: Mutex<Holds>,
     /// Since the last frame-rate line: waits of the direct queue for the up
     /// lane, those of them at which it stood, and for how many
     /// microseconds.
