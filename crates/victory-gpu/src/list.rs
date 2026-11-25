@@ -2078,15 +2078,14 @@ mod tests {
         let (mut allocator, mut list) = (null, null);
         assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
         assert_eq!(new_list(0, allocator, &LIST_IIDS[0], &mut list), S_OK);
-        let memory = [0u64; 2];
-        let at = |i: usize| (&raw const memory[i]) as u64;
-        let value = |i: usize| {
-            // SAFETY: inside the array.
-            unsafe { (at(i) as *const u64).read_volatile() }
-        };
+        // Memory the lists' waits and writes reach through addresses: atomics,
+        // for the compiler to know that it changes behind its back.
+        let memory = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+        let at = |i: usize| memory[i].as_ptr() as u64;
+        let value = |i: usize| memory[i].load(std::sync::atomic::Ordering::SeqCst);
         for _ in 0..2 {
-            // SAFETY: inside the array.
-            unsafe { (at(0) as *mut [u64; 2]).write_volatile([0; 2]) };
+            memory[0].store(0, std::sync::atomic::Ordering::SeqCst);
+            memory[1].store(0, std::sync::atomic::Ordering::SeqCst);
             state::stencil_ref(list, 3);
             // No work yet: not cut.
             wait_value(list, at(0), 7, 0);
@@ -2103,8 +2102,7 @@ mod tests {
             // Reset while the second part is still to run.
             assert_eq!(reset(list, allocator, null), S_OK);
             assert_eq!(submitted(list).len(), 1);
-            // SAFETY: inside the array.
-            unsafe { (at(1) as *mut u64).write_volatile(4) };
+            memory[1].store(4, std::sync::atomic::Ordering::SeqCst);
             assert!(parts[1].unmet().is_empty());
             crate::host::host().unwrap().execute(&[&*parts[1]]);
         }
