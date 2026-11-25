@@ -25,9 +25,10 @@ pub struct PreparedImage {
 }
 
 impl PreparedImage {
-    /// File name for the patched copy, unique per original build.
+    /// File name for these exact prepared bytes.
     pub fn file_name(&self) -> String {
-        format!("victory-image-{}.dll", &self.original_hash.to_hex()[..16])
+        let hash = blake3::hash(&self.bytes);
+        format!("victory-image-{}.dll", hash.to_hex())
     }
 }
 
