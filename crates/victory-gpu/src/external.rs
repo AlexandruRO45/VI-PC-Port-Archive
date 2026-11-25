@@ -25,19 +25,28 @@ pub fn host_texture(
     resource: *const Object,
     state: u32,
 ) -> Option<(ID3D12Resource, u32)> {
-    const READ: u32 = 0x40 | 0x80 | 0x800; // shader resource, copy source
-    const TARGET: u32 = 0x4 | 0x8 | 0x10; // render target, unordered access, depth write
     let host = crate::list::host_list(list)?;
     // One `HostTexture` held across refresh and state tracking so concurrent
     // eviction cannot replace what the list tracks behind what is returned.
     let copy = crate::resource::host_copy(resource)?;
+    host_texture_for(host, resource, &copy, state)
+}
+
+fn host_texture_for(
+    host: &crate::host::HostList,
+    resource: *const Object,
+    copy: &std::sync::Arc<crate::resource::HostTexture>,
+    state: u32,
+) -> Option<(ID3D12Resource, u32)> {
+    const READ: u32 = 0x40 | 0x80 | 0x800; // shader resource, copy source
+    const TARGET: u32 = 0x4 | 0x8 | 0x10; // render target, unordered access, depth write
     copy.stamp();
     if state & READ != 0 && state & TARGET == 0 {
-        if let Some(from) = crate::resource::alias_source(resource) {
-            crate::texture::alias_copy(host, from, resource);
+        if let Some(from) = crate::resource::alias_source_for(resource, copy) {
+            crate::texture::alias_copy_to(host, from, resource, copy);
         }
         if crate::texture::title_written(&copy.texture) {
-            crate::texture::upload(host, resource, &copy.texture);
+            crate::texture::upload_copy(host, resource, copy);
         }
     }
     #[cfg(feature = "diagnostics")]
@@ -49,7 +58,7 @@ pub fn host_texture(
         if state & UNORDERED_ACCESS != 0 && twin.planes.len() != 1 {
             return None;
         }
-        if crate::twin::route(host, &copy, twin, state) {
+        if crate::twin::route(host, copy, twin, state) {
             let plane = &twin.planes[0];
             if let Some(barrier) = host.move_texture(plane, state) {
                 // SAFETY: an open list and a live texture.
@@ -59,7 +68,7 @@ pub fn host_texture(
             return Some((plane.texture.clone(), state));
         }
     }
-    if let Some(barrier) = host.move_texture(&copy, state) {
+    if let Some(barrier) = host.move_texture(copy, state) {
         // SAFETY: an open list and a live texture.
         unsafe { host.list.ResourceBarrier(&[barrier]) };
     }
@@ -517,6 +526,163 @@ mod tests {
         for o in [ds, depth, list, allocator] {
             assert_eq!(release(o), 0);
         }
+        crate::watch::tests::free(pool);
+    }
+
+    /// If eviction clears `placed`'s cached slot (or another use replaces the
+    /// memory's shared texture) after `host_texture` captures `copy`, alias
+    /// lookup, alias copy, and title-memory upload still refresh and return
+    /// that exact `copy` rather than populating a replacement behind it.
+    #[test]
+    fn eviction_after_capturing_copy_refreshes_the_held_host_texture() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let pool = crate::watch::tests::pool(16);
+
+        // 1. Alias path: capture `placed_copy`, then evict `placed`'s cached
+        //    slot (`made_copy` becomes `None`) before `host_texture_for` runs.
+        let writer = texture_at(pool as u64, &texture_words(16, 16, 17, 0, 4));
+        let placed = texture_at(pool as u64, &texture_words(64, 64, 71, 0, 0));
+        let writer_copy = crate::resource::host_copy(writer).unwrap();
+        let placed_copy = crate::resource::host_copy(placed).unwrap();
+        assert!(crate::resource::give_up_now(placed));
+        assert!(crate::resource::made_copy(placed).is_none());
+
+        let mut wfp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut rows = 0u32;
+        let mut total = 0u64;
+        // SAFETY: live host texture and sized outputs.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &writer_copy.texture.GetDesc(),
+                0,
+                1,
+                0,
+                Some(&mut wfp),
+                Some(&mut rows),
+                None,
+                Some(&mut total),
+            );
+        }
+        let (upload, up_ptr) = host.upload_buffer(total).unwrap();
+        for r in 0..rows as usize {
+            for x in 0..16usize {
+                let at = r * wfp.Footprint.RowPitch as usize + x * 8;
+                // SAFETY: within `upload`'s mapped footprint.
+                unsafe {
+                    up_ptr.add(at).cast::<u32>().write(0x07e0_07e0);
+                    up_ptr.add(at + 4).cast::<u32>().write(0xffff_ffff);
+                }
+            }
+        }
+
+        let (allocator, list) = new_title_list();
+        let hl = crate::list::host_list(list).unwrap();
+        let (w_tex, _) = host_texture(list, writer, COPY_DEST).unwrap();
+        let (up_loc, w_sub) = copy_locations(&upload, wfp, &w_tex);
+        // SAFETY: open list; `w_tex` is in `COPY_DEST`.
+        record(list, |l| unsafe {
+            l.CopyTextureRegion(&w_sub, 0, 0, 0, &up_loc, None);
+        })
+        .unwrap();
+
+        let before_aliases = crate::texture::ALIAS_COPIES.load(Relaxed);
+        let (got_sr, s) = host_texture_for(hl, placed, &placed_copy, SHADER_RESOURCE).unwrap();
+        assert_eq!(s, SHADER_RESOURCE);
+        assert_eq!(got_sr.as_raw(), placed_copy.texture.as_raw());
+        assert_eq!(crate::texture::ALIAS_COPIES.load(Relaxed), before_aliases + 1);
+        assert!(
+            crate::resource::made_copy(placed).is_none(),
+            "refresh used the held copy without re-populating placed's evicted slot"
+        );
+
+        let (got_cp, s) = host_texture_for(hl, placed, &placed_copy, COPY_SOURCE).unwrap();
+        assert_eq!(s, COPY_SOURCE);
+        assert_eq!(got_cp.as_raw(), placed_copy.texture.as_raw());
+        let mut pfp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut ptotal = 0u64;
+        // SAFETY: live host texture and sized outputs.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &got_cp.GetDesc(),
+                0,
+                1,
+                0,
+                Some(&mut pfp),
+                None,
+                None,
+                Some(&mut ptotal),
+            );
+        }
+        let readback = readback_buffer(&host.device, ptotal);
+        let (rb_loc, p_sub) = copy_locations(&readback, pfp, &got_cp);
+        // SAFETY: open list; `got_cp` is in `COPY_SOURCE`.
+        record(list, |l| unsafe {
+            l.CopyTextureRegion(&rb_loc, 0, 0, 0, &p_sub, None);
+        })
+        .unwrap();
+        close_list(list);
+        host.execute(&[hl]);
+        assert_eq!(readback_value::<[u32; 2]>(&readback), [0x07e0_07e0, 0xffff_ffff]);
+        reset_list(list, allocator);
+
+        // 2. Upload path: capture `old_copy` of a read-only texture, evict its
+        //    cached slot (`made_copy` becomes `None`), and verify `upload_copy`
+        //    and `staging_for` upload into `old_copy` without touching `tex`'s
+        //    evicted slot.
+        let up_pool = crate::watch::tests::pool(4);
+        let up_addr = up_pool as u64;
+        let tex = texture_at(up_addr, &texture_words(4, 4, 28, 1, 0));
+        let old_copy = crate::resource::host_copy(tex).unwrap();
+        assert!(crate::resource::give_up_now(tex));
+        assert!(crate::resource::made_copy(tex).is_none());
+
+        // SAFETY: `up_pool` holds four committed 4 KiB pages.
+        unsafe { (up_pool as *mut u32).write_volatile(0xff77_6655) };
+        let (up_sr, s) = host_texture_for(hl, tex, &old_copy, SHADER_RESOURCE).unwrap();
+        assert_eq!(s, SHADER_RESOURCE);
+        assert_eq!(up_sr.as_raw(), old_copy.texture.as_raw());
+        assert!(
+            crate::resource::made_copy(tex).is_none(),
+            "upload_copy used the held copy without re-populating tex's evicted slot"
+        );
+        let (up_cp, s) = host_texture_for(hl, tex, &old_copy, COPY_SOURCE).unwrap();
+        assert_eq!(s, COPY_SOURCE);
+        assert_eq!(up_cp.as_raw(), old_copy.texture.as_raw());
+
+        let mut ufp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut utotal = 0u64;
+        // SAFETY: live host texture and sized outputs.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &up_cp.GetDesc(),
+                0,
+                1,
+                0,
+                Some(&mut ufp),
+                None,
+                None,
+                Some(&mut utotal),
+            );
+        }
+        let ureadback = readback_buffer(&host.device, utotal);
+        let (urb_loc, u_sub) = copy_locations(&ureadback, ufp, &up_cp);
+        // SAFETY: open list; `up_cp` is in `COPY_SOURCE`.
+        record(list, |l| unsafe {
+            l.CopyTextureRegion(&urb_loc, 0, 0, 0, &u_sub, None);
+        })
+        .unwrap();
+        close_list(list);
+        host.execute(&[hl]);
+        assert_eq!(readback_value::<u32>(&ureadback), 0xff77_6655);
+
+        reset_list(list, allocator);
+        drop((writer_copy, placed_copy, old_copy));
+        for o in [tex, placed, writer, list, allocator] {
+            assert_eq!(release(o), 0);
+        }
+        crate::watch::tests::free(up_pool);
         crate::watch::tests::free(pool);
     }
 }
