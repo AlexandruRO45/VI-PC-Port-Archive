@@ -86,3 +86,16 @@ pub(crate) fn total_system_ram_bytes() -> Option<u64> {
         (ok && m.ullTotalPhys > 0).then_some(m.ullTotalPhys)
     })
 }
+
+/// Remaining system commit headroom (`ullAvailPageFile`) in bytes, queried
+/// live from `GlobalMemoryStatusEx`.
+#[cfg(windows)]
+pub(crate) fn available_commit_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    ok.then_some(m.ullAvailPageFile)
+}

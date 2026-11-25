@@ -230,26 +230,37 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 // the frame before are still in the air, so more than 128 are out at a
 // time: 80 host lists were made and as many thrown away every frame,
 // 8 ms to make and more to free, on the thread that submits.)
-fn idle_most(total_ram_bytes: Option<u64>, cores: usize) -> (usize, u64) {
+fn idle_most(
+    total_ram_bytes: Option<u64>,
+    avail_commit_bytes: Option<u64>,
+    cores: usize,
+) -> (usize, u64) {
     const GIB: u64 = 1 << 30;
     let lists = cores.saturating_mul(64).clamp(512, 1024);
-    let bytes = match total_ram_bytes {
+    let by_ram = match total_ram_bytes {
         Some(ram) if ram <= 16 * GIB => 128 << 20,
         // 32 GB Windows systems typically report ~31.7–31.9 GiB in
         // `ullTotalPhys` after firmware/hardware reservations.
         Some(ram) if ram >= 30 * GIB => 512 << 20,
         _ => 256 << 20,
     };
-    (lists, bytes)
+    let by_commit = match avail_commit_bytes {
+        Some(avail) if avail < 4 * GIB => 128 << 20,
+        Some(avail) if avail < 8 * GIB => 256 << 20,
+        _ => 512 << 20,
+    };
+    (lists, by_ram.min(by_commit))
 }
 
 #[cfg(windows)]
 fn idle_limits() -> (usize, u64) {
-    static LIMITS: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
-    *LIMITS.get_or_init(|| {
-        let cores = std::thread::available_parallelism().map_or(8, usize::from);
-        idle_most(crate::total_system_ram_bytes(), cores)
-    })
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(8, usize::from));
+    idle_most(
+        crate::total_system_ram_bytes(),
+        crate::available_commit_bytes(),
+        cores,
+    )
 }
 
 /// Whether host lists that have run are used again (on by default;
@@ -284,7 +295,7 @@ fn fresh_list() -> Option<crate::host::HostList> {
 /// kept for [`fresh_list`].
 #[cfg(windows)]
 pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
-    if !pools() {
+    if !pools() || lists.is_empty() {
         return;
     }
     let (max_lists, max_bytes) = idle_limits();
@@ -2254,12 +2265,15 @@ mod tests {
     fn idle_most_scales_with_ram_and_cores() {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
-        assert_eq!(idle_most(None, 8), (128, 256 * MIB));
-        assert_eq!(idle_most(Some(8 * GIB), 4), (64, 128 * MIB));
-        assert_eq!(idle_most(Some(16 * GIB), 8), (128, 128 * MIB));
-        assert_eq!(idle_most(Some(24 * GIB), 12), (192, 256 * MIB));
-        assert_eq!(idle_most(Some(31 * GIB), 16), (256, 512 * MIB));
-        assert_eq!(idle_most(Some(32 * GIB), 16), (256, 512 * MIB));
-        assert_eq!(idle_most(Some(64 * GIB), 32), (256, 512 * MIB));
+        assert_eq!(idle_most(None, None, 8), (512, 256 * MIB));
+        assert_eq!(idle_most(Some(8 * GIB), None, 4), (512, 128 * MIB));
+        assert_eq!(idle_most(Some(16 * GIB), Some(16 * GIB), 8), (512, 128 * MIB));
+        assert_eq!(idle_most(Some(24 * GIB), Some(12 * GIB), 12), (768, 256 * MIB));
+        assert_eq!(idle_most(Some(31 * GIB), Some(12 * GIB), 16), (1024, 512 * MIB));
+        assert_eq!(idle_most(Some(32 * GIB), Some(8 * GIB), 16), (1024, 512 * MIB));
+        assert_eq!(idle_most(Some(64 * GIB), None, 32), (1024, 512 * MIB));
+        // Tight Windows commit headroom clamps 32+ GB hosts back to baseline / floor.
+        assert_eq!(idle_most(Some(32 * GIB), Some(6 * GIB), 16), (1024, 256 * MIB));
+        assert_eq!(idle_most(Some(32 * GIB), Some(3 * GIB), 16), (1024, 128 * MIB));
     }
 }
