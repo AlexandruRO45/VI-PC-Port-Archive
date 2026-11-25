@@ -43,7 +43,7 @@ hashes and file paths, is on its own branches:
 | TuxBox | `tuxbox/main`, other branches as `tuxbox/branch/<name>` (2) | `tuxbox/pr/<number>` (68) | `tuxbox/github-export` |
 | hyphenn | `hyphenn/main` | `hyphenn/pr/<number>` (801) | `hyphenn/github-export` |
 | AnyXboxX | `anyxboxx/main`, other branches as `anyxboxx/branch/<name>` (2) | `anyxboxx/pr/<number>` (138) | `anyxboxx/github-export` |
-| ztrx | `ztrx/main` | `ztrx/pr/<number>` (20) | `ztrx/github-export` |
+| ztrx | `ztrx/main` | `ztrx/pr/<number>` (104) | `ztrx/github-export` |
 | DexNom Runtime | `dexnom/main`, other branches as `dexnom/branch/<name>` (2) | `dexnom/pr/<number>` (48) | `dexnom/github-export` |
 | VIctory-Belobug-AMD | `belobug/main` | `belobug/pr/<number>` (146) | `belobug/github-export` |
 

@@ -58,4 +58,7 @@ jobs:
           echo "next run at $(date -u -d @$next '+%H:%M') UTC"
           sleep $(( next - now ))
           waiting=$(gh run list --workflow sync.yml --json status --jq '[.[] | select(.status == "queued" or .status == "pending" or .status == "waiting")] | length')
-          if [ "$waiting" = "0" ]; then gh workflow run sync.yml --ref main; else echo "a run is already waiting"; fi
+          if [ "$waiting" != "0" ]; then echo "a run is already waiting"; exit 0; fi
+          # GitHub sometimes answers HTTP 500 here; one miss would end the chain, so try a few times
+          for try in 1 2 3 4 5; do gh workflow run sync.yml --ref main && exit 0; sleep 60; done
+          exit 1
