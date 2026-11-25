@@ -7814,6 +7814,26 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
     }
 }
 
+/// The most of the card's budget the layer plans with
+/// (`VICTORY_VIDEO_BUDGET_MB`; unset or empty: the system's budget as it is).
+///
+/// The system's budget on an RTX 5070 Ti under Proton starts near 12.4 GB
+/// and in most runs drops to about 10.5 GB near frame 725. In the runs
+/// where it did not drop, the texture queue filled the card to nine
+/// tenths of 12.4 GB, the driver moved memory out to the PC's, and the
+/// indirect compute 982f3cccd5c04294 took 160-170 ms a call instead of
+/// 12 (GPU 200-260 ms a frame instead of 50-120). With 10500, four runs
+/// of four stayed fast.
+fn budget_cap() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_VIDEO_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(u64::MAX, |mb| mb << 20)
+    })
+}
+
 impl Host {
     /// The queue everything of ours runs on, for a call that must go to it
     /// in order with the lists (`crate::tiles`: a texture's levels are
@@ -8518,7 +8538,7 @@ impl Host {
             );
             self.log_video_memory("right after that change");
         }
-        Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+        Some([own.Budget.min(budget_cap()), own.CurrentUsage, shared.Budget, shared.CurrentUsage])
     }
 
     /// Both of the system's memory groups for this process, in bytes: for
