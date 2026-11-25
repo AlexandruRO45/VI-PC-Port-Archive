@@ -136,8 +136,20 @@ struct Window {
     scratch: ID3D12Resource,
 }
 
-/// The most records clamped in one pass ([`windows`]).
-const WINDOW_MOST: u64 = 64;
+/// The most records clamped in one pass ([`windows`]). A pass costs the
+/// card a switch from drawing to compute and back, whatever the number of
+/// records in it: 64 records a pass against 3,460 records a frame was 54
+/// passes a frame, and the draw budget of a frame is often shorter than
+/// that. `VICTORY_INDIRECT_WINDOW_MOST` sets it (4 to 4096).
+fn window_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_INDIRECT_WINDOW_MOST")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(256, |n| n.clamp(4, 4096))
+    })
+}
 
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=0` turns
@@ -152,7 +164,7 @@ const WINDOW_MOST: u64 = 64;
 ///
 /// With the switch, when a draw asks for a record a short step after the
 /// one drawn before, the clamp takes that record and the ones that step
-/// apart after it (16, then twice as many each time, [`WINDOW_MOST`] at
+/// apart after it (16, then twice as many each time, [`window_most`] at
 /// most, never past the buffer) into
 /// the list's scratch buffer in one pass, and the draws that follow read
 /// their record there with no pass of ours and no barrier (the scratch
@@ -3048,7 +3060,7 @@ impl State {
                             && step % 4 == 0
                             && (w.records == 1 || step == u64::from(w.step));
                         if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
+                            let fit = (args.left(arguments) / step).min(window_most()) as u32;
                             (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
                         } else {
                             (stride, max)

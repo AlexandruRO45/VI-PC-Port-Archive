@@ -737,9 +737,9 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 mod tests {
     use super::*;
     use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-    use windows::Win32::Graphics::Dxgi::*;
+
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
 
@@ -768,18 +768,12 @@ void main() {
 
     impl WarpHarness {
         fn new() -> Option<Self> {
-            // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
+            // One software device for the whole test binary: the tests run
+            // in threads of one process, and a device each crashed WARP
+            // every few runs (`crate::inplace::tests::warp`).
+            let device = crate::inplace::tests::warp()?;
+            // SAFETY: D3D12 test harness setup on that device.
             unsafe {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
-                let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
-                    return None;
-                }
-                let mut device: Option<ID3D12Device> = None;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
-                let device = device?;
                 let queue: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                         Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -1548,7 +1542,12 @@ void main() {
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
+                // Slot 0 is no draw; every real draw costs the same, so
+                // which of the slots the budget's room falls in depends on
+                // how the GPU schedules the threads of the clamp's waves:
+                // the count is what is fixed, not the slots.
+                assert!(i != 0, "the first record is no draw");
+                assert!(kept < 2, "no more than the two draws the budget holds");
                 kept += 1;
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");

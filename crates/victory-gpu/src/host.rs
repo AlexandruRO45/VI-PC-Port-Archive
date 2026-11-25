@@ -4521,6 +4521,32 @@ impl Host {
         if inflight_fetch() {
             INFLIGHT_STATS[3].fetch_add(1, Ordering::Relaxed);
         }
+        // One copy a piece becomes fewer copies. A piece of 64 KiB asked
+        // for as several (the title's frame reads the middle of a page, a
+        // few bytes at a time) is copied with the piece before it: the
+        // extra bytes cost a copy far less than the copy does (from
+        // DexNom's fork, "GPU readback combines adjacent copy ranges").
+        // `VICTORY_FETCH_JOIN=0` copies each piece on its own.
+        static JOIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let join = *JOIN.get_or_init(|| std::env::var_os("VICTORY_FETCH_JOIN").is_none_or(|v| v != "0"));
+        if join && pieces.len() > 1 {
+            // The pieces come in the copy lists' order (by copy, then by
+            // offset), so a run is a contiguous stretch of one copy. Each
+            // run is copied once, into the slot its first piece was given.
+            let mut joined: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> =
+                Vec::with_capacity(pieces.len());
+            for (shadow, lo, hi, at) in pieces.drain(..) {
+                match joined.last_mut() {
+                    Some(last) if std::sync::Arc::ptr_eq(&last.0, &shadow) && last.2 == lo => {
+                        last.2 = hi;
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::FetchJoined, 1);
+                    }
+                    _ => joined.push((shadow, lo, hi, at)),
+                }
+            }
+            pieces = joined;
+        }
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
         }

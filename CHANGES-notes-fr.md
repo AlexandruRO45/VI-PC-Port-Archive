@@ -74,7 +74,28 @@ Le flux de pipeline du titre nomme deux choses que la couche ne savait pas
 lire (le nombre d'échantillons forcé du rasteriseur, et les formats de cible
 un par un). Elles sont lues ; un flux qui les nomme n'est plus refusé.
 
-## 6. Essayé et abandonné (mesuré, pas supposé)
+## 6. Repris de DexNom (25 nov.)
+
+Trois correctifs de [DexNom/VIctory](https://github.com/DexNom/VIctory), portés
+et adaptés à notre branche :
+
+- **Une image qui change sans que le garde l'ait vue** (le film de l'intro :
+  trois images qui changent une fois sur huit) était montrée jusqu'à huit
+  images en retard, d'où les changements d'image brutaux au lancement. Elle
+  est maintenant hachée à chaque vérification pendant 16 images après une
+  première découverte (120 si c'était déjà le cas), et les images linéaires
+  d'un seul niveau (les plans du film) sont toujours hachées.
+  `crate::texture::Staging::unseen_write`.
+- **Les copies de retour de la carte** (ce que les shaders écrivent dans la
+  mémoire du titre) étaient une par morceau de 64 Kio. Celles qui se suivent
+  dans la même copie sont jointes en une seule copie ; un compteur les compte
+  (`fetches N pieces whole, M joined` dans la ligne de profil).
+  `VICTORY_FETCH_JOIN=0` revient à l'ancien comportement.
+- **La fenêtre d'envois indirects** était plafonnée à 64 enregistrements par
+  passe : 54 passes par image pour 3 460 envois. Le plafond est passé à 256
+  (réglable de 4 à 4096 par `VICTORY_INDIRECT_WINDOW_MOST`).
+
+## 7. Essayé et abandonné (mesuré, pas supposé)
 
 Deux pistes ont été écrites, compilées, mesurées, puis retirées parce
 qu'elles n'aidaient pas :
@@ -88,7 +109,7 @@ qu'elles n'aidaient pas :
   10 400 ms par image. La bonne façon est celle de DexNom (reprendre les
   textures éparses à l'envoi), pas de découper la lecture ici.
 
-## 7. Ce qui reste à changer, du plus utile au moins utile
+## 8. Ce qui reste à changer, du plus utile au moins utile
 
 1. **Les zones à l'ombre sont noires** : le lancer de rayons (l'éclairage
    indirect, les ombres) ne tourne pas. C'est ce que le fork de DexNom a en
