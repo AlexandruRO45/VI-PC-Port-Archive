@@ -1747,6 +1747,7 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
 /// SOP1 `op sdst, src0`.
 const fn sop1(op: u8, sdst: u8, src0: u8) -> u32 {
     0xBE80_0000 | (sdst as u32 & 0x7F) << 16 | (op as u32) << 8 | src0 as u32
@@ -1880,9 +1881,7 @@ fn vector_64bit_ops_expand_inline_constants_as_rdna2() {
     let sel_lt = vop3(0x101, 4, 128, 130, sgpr(6)); // v_cndmask_b32 v4, 0, 2, s6
     let or = vop3(0x11C, 0, vgpr(3), vgpr(4), 0); // v_or_b32 v0, v3, v4
     let cmp_shader = build_valu_cs(&[
-        
-        
-cmp_eq[0], cmp_eq[1], sel_eq[0], sel_eq[1], cmp_lt[0], cmp_lt[1], sel_lt[0], sel_lt[1],
+        cmp_eq[0], cmp_eq[1], sel_eq[0], sel_eq[1], cmp_lt[0], cmp_lt[1], sel_lt[0], sel_lt[1],
         or[0], or[1],
     ]);
     let inv_2pi = 0x3FC4_5F30_6DC9_C882u64;
