@@ -489,7 +489,7 @@ impl State {
         &mut self,
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
-        keys: Vec<KeyState>,
+        mut keys: Vec<KeyState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -499,6 +499,18 @@ impl State {
         }
         let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
+        if let Some(last) = self.slots[KEYBOARD].history.back()
+            && let Value::Keys(previous) = &last.value
+        {
+            // GameInput appends new presses and removes released keys in place.
+            // Stable sorting keeps simultaneous new presses in host poll order.
+            keys.sort_by_key(|k| {
+                previous
+                    .iter()
+                    .position(|p| p.scan_code == k.scan_code && p.virtual_key == k.virtual_key)
+                    .unwrap_or(usize::MAX)
+            });
+        }
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
     }
@@ -1585,6 +1597,29 @@ mod tests {
         for r in order {
             release(r);
         }
+    }
+
+    #[test]
+    fn keyboard_readings_keep_held_keys_in_press_order() {
+        let (hub, host) = fake();
+        let poll = |down: &[u8], expected: &[u8]| {
+            host.lock().unwrap().keys = down.iter().copied().map(key).collect();
+            hub.poll();
+            let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+            let mut got = [KeyState::default(); 4];
+            let n = key_state(r, 4, got.as_mut_ptr()) as usize;
+            let actual: Vec<_> = got[..n].iter().map(|k| k.virtual_key).collect();
+            let sequence = sequence_number(r, KEYBOARD_KIND);
+            release(r);
+            assert_eq!(actual, expected);
+            sequence
+        };
+        poll(b"W", b"W");
+        let wa = poll(b"AW", b"WA");
+        assert_eq!(poll(b"WA", b"WA"), wa);
+        poll(b"ADW", b"WAD");
+        poll(b"AD", b"AD");
+        poll(b"ADW", b"ADW");
     }
 
     #[test]
