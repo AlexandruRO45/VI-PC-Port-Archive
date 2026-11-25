@@ -1364,7 +1364,9 @@ pub(crate) fn host_made<'a>(
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    const FLOOR: u64 = 2 << 30;
+    const FLOOR_LARGE: u64 = 2 << 30;
+    const FLOOR_8GB: u64 = 1 << 30;
+    const EIGHT_GIB: u64 = 8 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -1372,14 +1374,26 @@ pub(crate) fn room() -> bool {
         mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
     });
     let filled = KINDS[1].load(Relaxed);
+    let mem = crate::host::host().and_then(|h| h.video_memory());
     if let Some(limit) = limit {
-        return filled < limit;
+        if filled >= limit {
+            return false;
+        }
+        return match mem {
+            Some([budget, used, ..]) => used < budget / 100 * 85,
+            None => true,
+        };
     }
-    if filled < FLOOR {
-        return true;
-    }
-    match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 10 * 9,
+    match mem {
+        Some([budget, used, ..]) => {
+            let small_vram = budget <= EIGHT_GIB;
+            let floor = if small_vram { FLOOR_8GB } else { FLOOR_LARGE };
+            let cap_pct = if small_vram { 85 } else { 90 };
+            if filled < floor {
+                return used < budget / 100 * 90;
+            }
+            used < budget / 100 * cap_pct
+        }
         None => filled < WITHOUT_BUDGET,
     }
 }
@@ -1410,8 +1424,12 @@ pub(crate) fn room() -> bool {
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_MS: u64 = 5_000;
-    const IDLE_FRAMES: u64 = 4;
+    const EIGHT_GIB: u64 = 8 << 30;
+    let tight_vram = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .is_some_and(|[budget, used, ..]| budget <= EIGHT_GIB && used >= budget / 100 * 70);
+    let idle_ms: u64 = if tight_vram { 1_500 } else { 5_000 };
+    let idle_frames: u64 = if tight_vram { 2 } else { 4 };
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -1430,7 +1448,7 @@ pub(crate) fn let_go_idle() {
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });

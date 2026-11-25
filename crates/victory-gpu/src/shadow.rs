@@ -148,10 +148,15 @@ pub(crate) fn cards() -> bool {
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
+        const EIGHT_GIB: u64 = 8 << 30;
+        let small_vram = host()
+            .and_then(|h| h.video_memory())
+            .is_some_and(|[budget, ..]| budget <= EIGHT_GIB);
+        let default_mb = if small_vram { 256 } else { 512 };
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", default_mb))
     })
 }
 
@@ -208,10 +213,12 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     // queue's own rule (`resource::room`: nine tenths of the budget) counts
     // them, so the card's use stays where it was and the textures' share
     // shrinks by the copies' bytes, at most `card_limits`' second number.
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
-    {
-        return None;
+    if let Some([budget, used, ..]) = host.video_memory() {
+        const EIGHT_GIB: u64 = 8 << 30;
+        let cap_pct = if budget <= EIGHT_GIB { 80 } else { 85 };
+        if used + size > budget / 100 * cap_pct {
+            return None;
+        }
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
@@ -263,10 +270,12 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
-    {
-        return None;
+    if let Some([budget, used, ..]) = host.video_memory() {
+        const EIGHT_GIB: u64 = 8 << 30;
+        let cap_pct = if budget <= EIGHT_GIB { 80 } else { 85 };
+        if used + size > budget / 100 * cap_pct {
+            return None;
+        }
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
