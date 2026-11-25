@@ -227,6 +227,9 @@ struct Lower<'a> {
     root_memory: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// Mesh: lanes read other lanes past their quad (DPP, `ds_swizzle_b32`),
+    /// so threads are numbered by their host lane ([`Lower::mesh_thread`]).
+    mesh_lanes: bool,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
@@ -467,6 +470,44 @@ fn smem_dwords(name: &str) -> Option<u32> {
     }
 }
 
+/// Mesh: the widest aligned run of lanes a lane permutation may read
+/// across ([`Lower::mesh_thread`] makes such runs host lanes).
+// shortcut: a host wave must hold the run: NVIDIA's (32) and AMD's (32, 64)
+// do; hosts with narrower waves read wrong lanes. Wider runs would depend on
+// the host's wave size, which the translation does not know (the shader
+// cache does not key on it).
+const MESH_BLOCK: u32 = 16;
+
+/// The aligned run of lanes a lane permutation (DPP, `ds_swizzle_b32`) reads
+/// within: 4 for quad permutations; none for other instructions and for
+/// patterns that may read any lane of the wave.
+fn lane_block(inst: &Inst) -> Option<u32> {
+    match &inst.fields {
+        Fields::Valu(v) => match v.dpp? {
+            Dpp::Row { ctrl: 0..=0xFF, .. } => Some(4),
+            Dpp::Lanes { .. } | Dpp::Row { ctrl: 0x141, .. } => Some(8),
+            Dpp::Row {
+                ctrl: 0x101..=0x10F | 0x111..=0x11F | 0x121..=0x12F | 0x140 | 0x150..=0x16F,
+                ..
+            } => Some(16),
+            Dpp::Row { .. } => None,
+        },
+        Fields::Ds {
+            offset0, offset1, ..
+        } if inst.name() == "ds_swizzle_b32" => {
+            let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
+            if offset & 0x8000 != 0 {
+                return Some(4);
+            }
+            // Bit-mask mode: the lane bits the and-mask clears or the or and
+            // xor masks set; the lane keeps the bits above them.
+            let touched = (!offset | offset >> 5 | offset >> 10) & 0x1F;
+            Some(1 << (32 - touched.leading_zeros()))
+        }
+        _ => None,
+    }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -487,6 +528,8 @@ impl<'a> Lower<'a> {
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
+        let mesh_lanes = matches!(x.native.io, StageIo::Ms(_))
+            && insts().any(|i| lane_block(i).is_some_and(|n| n > 4));
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -620,6 +663,7 @@ impl<'a> Lower<'a> {
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
             flat: None,
+            mesh_lanes,
             no_barrier,
             half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
@@ -2720,8 +2764,9 @@ impl<'a> Lower<'a> {
     fn cross_lane(&mut self, quad: bool) -> Result<(), Why> {
         if self.s.mesh.is_some() {
             // shortcut: no wave size for mesh shaders in SM 6.6, so host
-            // lanes cannot follow the console's; emulate through group-shared
-            // memory if mesh programs turn out to need these.
+            // lanes cannot follow the console's past runs of host lanes
+            // ([`Lower::mesh_block`]); emulate through group-shared memory if
+            // mesh programs turn out to need wider reads.
             return Err("a cross-lane operation in a mesh shader");
         }
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
@@ -2819,21 +2864,79 @@ impl<'a> Lower<'a> {
 
     /// Mesh: the thread's index in the group, which is its vertex and
     /// primitive index.
+    ///
+    /// When lanes read other lanes past their quad, the thread is relabelled
+    /// so that its index modulo the host wave size is its host lane: the
+    /// index is the wave's first lane's, rounded down to the host wave size,
+    /// plus the host lane index (a bijection while each host wave holds a
+    /// wave-aligned run of indices, as [`Lower::thread_id`] assumes in
+    /// compute). Runs of up to [`MESH_BLOCK`] console lanes are then runs of
+    /// host lanes, whatever the console and host wave sizes.
     fn mesh_thread(&mut self) -> V {
         if let Some(f) = self.flat {
             return f;
         }
         let e = self.s.entry;
-        let f = self.s.op(
+        let i32t = self.s.t.i32;
+        let mut f = self.s.op(
             e,
             "flattenedThreadIdInGroup.i32",
             Attr::ReadNone,
-            self.s.t.i32,
+            i32t,
             96,
             &[],
         );
+        if self.mesh_lanes {
+            let first = self
+                .s
+                .op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[f]);
+            let count = self
+                .s
+                .op(e, "waveGetLaneCount", Attr::ReadNone, i32t, 112, &[]);
+            let lane = self
+                .s
+                .op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+            let (one, all) = (self.s.m.i32(1), self.s.m.i32(u32::MAX));
+            let low = self.s.m.bin(e, Bin::Sub, count, one);
+            let high = self.s.m.bin(e, Bin::Xor, low, all);
+            let base = self.s.m.bin(e, Bin::And, first, high);
+            f = self.s.m.bin(e, Bin::Add, base, lane);
+            self.s.flags |= flags::WAVE_OPS;
+        }
         self.flat = Some(f);
         f
+    }
+
+    /// Mesh: whether `inst` permutes lanes within a run of host lanes
+    /// ([`Lower::mesh_thread`]), and how many; quad permutations read through
+    /// quad operations instead.
+    fn mesh_block(&mut self, inst: &Inst) -> Result<Option<u32>, Why> {
+        if self.s.mesh.is_none() {
+            return Ok(None);
+        }
+        match lane_block(inst) {
+            Some(n) if n <= 4 => Ok(None),
+            Some(n) if n <= MESH_BLOCK => {
+                debug_assert!(self.mesh_lanes);
+                self.s.flags |= flags::WAVE_OPS;
+                Ok(Some(n))
+            }
+            _ => Err("a cross-lane operation in a mesh shader"),
+        }
+    }
+
+    /// Mesh: `x` of console lane `src`, in this lane's run of `n` lanes.
+    fn mesh_read(&mut self, x: V, src: V, n: u32) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let lane = self
+            .s
+            .op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let (high, low) = (self.s.m.i32(!(n - 1)), self.s.m.i32(n - 1));
+        let base = self.s.m.bin(c, Bin::And, lane, high);
+        let pick = self.s.m.bin(c, Bin::And, src, low);
+        let at = self.s.m.bin(c, Bin::Or, base, pick);
+        self.read_lane(x, at)
     }
 
     /// The console wave size.
@@ -2843,8 +2946,8 @@ impl<'a> Lower<'a> {
 
     fn lane_index(&mut self) -> V {
         if self.s.mesh.is_some() {
-            // The console's lane: mesh code reads no other lanes, so host
-            // waves need not match the console's.
+            // The console's lane: mesh code reads no other lanes past runs
+            // of host lanes, so host waves need not match the console's.
             let f = self.mesh_thread();
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
@@ -2979,7 +3082,13 @@ impl<'a> Lower<'a> {
             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
             // console's, so quad-local swizzles read through quad operations.
             let mesh_quad = self.s.mesh.is_some() && quad;
-            if !mesh_quad {
+            // Other mesh swizzles stay in runs of host lanes.
+            let mesh_block = if mesh_quad {
+                None
+            } else {
+                self.mesh_block(inst)?
+            };
+            if !mesh_quad && mesh_block.is_none() {
                 self.cross_lane(quad)?;
             }
             // The source sits in the address field.
@@ -3006,6 +3115,8 @@ impl<'a> Lower<'a> {
             };
             let r = if mesh_quad || self.helpers_read(quad) {
                 self.quad_pick(x, src)
+            } else if let Some(n) = mesh_block {
+                self.mesh_read(x, src, n)
             } else {
                 self.read_lane(x, src)
             };
@@ -5264,7 +5375,14 @@ impl<'a> Lower<'a> {
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
         let mesh_quad = self.s.mesh.is_some() && quad;
-        if !mesh_quad {
+        // Other mesh permutations stay in runs of host lanes (DPP8: 8, row
+        // patterns: 16).
+        let mesh_block = if mesh_quad {
+            None
+        } else {
+            self.mesh_block(inst)?
+        };
+        if !mesh_quad && mesh_block.is_none() {
             self.cross_lane(quad)?;
         }
         let c = self.cur;
@@ -5344,6 +5462,8 @@ impl<'a> Lower<'a> {
         };
         let mut r = if mesh_quad || self.helpers_read(quad) {
             self.quad_pick(x, src)
+        } else if let Some(n) = mesh_block {
+            self.mesh_read(x, src, n)
         } else {
             self.read_lane(x, src)
         };

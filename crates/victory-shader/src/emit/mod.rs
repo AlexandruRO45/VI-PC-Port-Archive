@@ -947,9 +947,20 @@ mod tests {
     /// (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1, 0.5, 1): triangle (0, 1, 2)
     /// covers the whole target.
     fn triangle_mesh(prim: u32) -> Result<HostShader, ShaderError> {
-        let words = [
+        mesh_program(&[0x7E12_02FF, prim], 32, 10) // v_mov_b32 v9, prim
+    }
+
+    /// A one-wave (wave32) triangle mesh program of `threads` lanes: the lane
+    /// index in v1, then `body`, which leaves the primitive in v9; each lane
+    /// exports it and, as its vertex, the position (lane & 1 ? 3 : -1,
+    /// lane & 2 ? 3 : -1, 0.5, 1).
+    fn mesh_program(body: &[u32], threads: u32, vgprs: u16) -> Result<HostShader, ShaderError> {
+        let mut words = vec![
             0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
             0x0001_00C1,
+        ];
+        words.extend(body);
+        words.extend([
             0x3604_0281, // v_and_b32 v2, 1, v1
             0x3606_0282, // v_and_b32 v3, 2, v1
             0x7E04_0D02, // v_cvt_f32_u32 v2, v2
@@ -960,26 +971,24 @@ mod tests {
             0x060A_0AF3, // v_add_f32 v5, -1.0, v5
             0x7E0C_02F0, // v_mov_b32 v6, 0.5
             0x7E0E_02F2, // v_mov_b32 v7, 1.0
-            0x7E12_02FF, // v_mov_b32 v9, prim
-            prim,
             0xF800_0941, // exp prim v9, off, off, off done
             0x0000_0009,
             0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
             0x0706_0504,
             0xBF81_0000, // s_endpgm
-        ];
+        ]);
         let native = NativeProgram {
             stage: HwStage::Ms,
             wave64: false,
-            vgprs: 10,
+            vgprs,
             layout: vec![],
             used: vec![],
             io: StageIo::Ms(crate::native::MeshIo {
                 outputs: vec![],
                 clip_cntl: 0,
-                threads: 32,
-                max_vertices: 32,
-                max_primitives: 32,
+                threads,
+                max_vertices: threads,
+                max_primitives: threads,
                 topology: 2,
                 lds_bytes: 0,
             }),
@@ -1110,6 +1119,205 @@ mod tests {
         }
         if ran == 0 {
             eprintln!("no device with mesh shaders; skipped");
+        }
+    }
+
+    /// v_mov_b32 v10, v1: the lane's own index.
+    #[cfg(windows)]
+    const OWN_LANE: [u32; 1] = [0x7E14_0301];
+
+    /// Lane permutations of mesh programs within runs of 8 and 16 lanes:
+    /// each reads v1 (the lane index) into v8; v10 is the console's source
+    /// lane for each lane.
+    fn mesh_permutes() -> Vec<(&'static str, Vec<u32>, Vec<u32>)> {
+        vec![
+            (
+                "dpp8 reversed",
+                vec![0x7E10_02E9, 0x0539_7701], // v_mov_b32_dpp v8, v1 dpp8:[7,6,5,4,3,2,1,0]
+                vec![0x3A14_0287],              // v_xor_b32 v10, 7, v1
+            ),
+            (
+                "row_mirror",
+                vec![0x7E10_02FA, 0xFF01_4001], // v_mov_b32_dpp v8, v1 row_mirror
+                vec![0x3A14_028F],              // v_xor_b32 v10, 15, v1
+            ),
+            (
+                "row_half_mirror",
+                vec![0x7E10_02FA, 0xFF01_4101], // v_mov_b32_dpp v8, v1 row_half_mirror
+                vec![0x3A14_0287],              // v_xor_b32 v10, 7, v1
+            ),
+            (
+                "row_xmask:9",
+                vec![0x7E10_02FA, 0xFF01_6901], // v_mov_b32_dpp v8, v1 row_xmask:9
+                vec![0x3A14_0289],              // v_xor_b32 v10, 9, v1
+            ),
+            (
+                "row_ror:3",
+                vec![0x7E10_02FA, 0xFF01_2301], // v_mov_b32_dpp v8, v1 row_ror:3
+                vec![
+                    0x4E14_0283, // v_subrev_nc_u32 v10, 3, v1
+                    0x3614_148F, // v_and_b32 v10, 15, v10
+                    0x3618_02D0, // v_and_b32 v12, -16, v1
+                    0x3814_190A, // v_or_b32 v10, v10, v12
+                ],
+            ),
+            (
+                "ds_swizzle swap 8",
+                vec![
+                    0xD8D4_201F, // ds_swizzle_b32 v8, v1 offset:swizzle(SWAP,8)
+                    0x0800_0001,
+                    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                ],
+                vec![0x3A14_0288], // v_xor_b32 v10, 8, v1
+            ),
+        ]
+    }
+
+    /// The primitive is culled where v8 is v10: v9 = v8 != v10 ? the
+    /// triangle : the triangle culled.
+    fn cull_where_equal() -> [u32; 6] {
+        [
+            0x7D8A_1508, // v_cmp_ne_u32 vcc_lo, v8, v10
+            0x7E12_02FF, // v_mov_b32 v9, TRIANGLE | CULL
+            TRIANGLE | CULL,
+            0x7E16_02FF, // v_mov_b32 v11, TRIANGLE
+            TRIANGLE,
+            0x0212_1709, // v_cndmask_b32 v9, v9, v11, vcc_lo
+        ]
+    }
+
+    /// Two console waves of 32 lanes: each lane permutes v1 into v8, puts
+    /// the lane it should have read into v10, and exports the triangle
+    /// culled where they agree.
+    fn permute_mesh(permute: &[u32], expect: &[u32]) -> Result<HostShader, ShaderError> {
+        let mut body = permute.to_vec();
+        body.extend(expect);
+        body.extend(cull_where_equal());
+        mesh_program(&body, 64, 13)
+    }
+
+    /// Mesh lane permutations within runs of up to 16 lanes translate (the
+    /// threads numbered by their host lanes), and dxil.dll, where there is
+    /// one, takes each module; a swizzle across 32 lanes is still refused.
+    #[test]
+    fn mesh_permutes_in_runs_of_16_lanes_translate() {
+        #[cfg(windows)]
+        let mut validator = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        for (name, permute, expect) in mesh_permutes() {
+            let ms = permute_mesh(&permute, &expect).unwrap_or_else(|e| panic!("{name}: {e}"));
+            #[cfg(windows)]
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut ms.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+        }
+        let swap16 = [
+            0xD8D4_401F, // ds_swizzle_b32 v8, v1 offset:swizzle(SWAP,16)
+            0x0800_0001,
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        let Err(ShaderError::Unsupported { what, .. }) = permute_mesh(&swap16, &[0x3A14_0290])
+        else {
+            panic!("translated a mesh swizzle across 32 lanes");
+        };
+        assert_eq!(what, "a cross-lane operation in a mesh shader");
+    }
+
+    /// Mesh lane permutations on the host GPU and on WARP (where they have
+    /// mesh shaders and waves of 16 lanes or more): every lane reads the
+    /// lane the console's would, so every primitive is culled and nothing
+    /// is lit. Comparing each lane with its own index instead lights the
+    /// target (the check itself works).
+    #[test]
+    #[cfg(windows)]
+    fn mesh_permutes_read_the_console_lanes() {
+        use super::host::{Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_D3D12_OPTIONS7,
+            D3D12_FEATURE_DATA_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+            D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ps = constant_color();
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let mut mesh = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: each query writes the structure of the given size.
+            let queried = unsafe {
+                host.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS7,
+                        (&raw mut mesh).cast(),
+                        size_of_val(&mesh) as u32,
+                    )
+                    .and(host.device.CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut waves).cast(),
+                        size_of_val(&waves) as u32,
+                    ))
+            };
+            if queried.is_err() || mesh.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
+                eprintln!("no mesh shaders on the {label} device; skipped");
+                continue;
+            }
+            if waves.WaveLaneCountMin < 16 {
+                eprintln!(
+                    "{label}: waves of {} lanes, under the 16 mesh permutes need; skipped",
+                    waves.WaveLaneCountMin
+                );
+                continue;
+            }
+            let draw = |ms: &HostShader| {
+                let root = host
+                    .root_signature_for(&[(ms, D3D12_SHADER_VISIBILITY_MESH)])
+                    .unwrap();
+                let pso = host
+                    .mesh_pipeline_with(&root, &ms.dxil, &ps)
+                    .unwrap_or_else(|e| panic!("{label}: mesh pipeline: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![(0, Root::Constants(vec![0]))],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 1,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+                texels.iter().filter(|t| t[3] != 0.0).count()
+            };
+            for (name, permute, expect) in mesh_permutes() {
+                let lit = draw(&permute_mesh(&permute, &expect).unwrap());
+                assert_eq!(lit, 0, "{label}, {name}: some lane read another lane");
+                let lit = draw(&permute_mesh(&permute, &OWN_LANE).unwrap());
+                assert_eq!(
+                    lit, 256,
+                    "{label}, {name}: the check lit {lit} of 256 texels"
+                );
+            }
+            eprintln!(
+                "{label}: mesh permutes read the console lanes (waves of {}-{} lanes)",
+                waves.WaveLaneCountMin, waves.WaveLaneCountMax
+            );
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("no device with mesh shaders and 16-lane waves; skipped");
         }
     }
 
