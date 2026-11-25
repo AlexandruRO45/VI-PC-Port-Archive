@@ -1891,7 +1891,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         }
     }
     match (view, u.kind) {
-        (View::Shader(resource, _), ResourceType::Srv) => {
+        (View::Shader(resource, _), ResourceType::Srv) if *resource != 0 => {
             // A view of memory the GPU writes through another title texture
             // whose host copy this one could not share reads that copy.
             if let Some(a) = crate::resource::alias_source(*resource as This) {

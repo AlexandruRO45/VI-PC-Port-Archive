@@ -1494,11 +1494,11 @@ impl Resource {
             Backing::Committed(ref memory) => memory.ptr.as_ptr(),
             // SAFETY: placement checked the range lies inside the heap.
             Backing::Placed { heap, offset } => unsafe {
-                (*heap.cast::<Heap>())
-                    .memory
-                    .ptr
-                    .as_ptr()
-                    .add(offset as usize)
+                let h = heap.cast::<Heap>();
+                if h.is_null() {
+                    return std::ptr::null_mut();
+                }
+                (*h).memory.ptr.as_ptr().add(offset as usize)
             },
             Backing::Address(at) => at,
         }
@@ -1799,12 +1799,16 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
     let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
     let bytes = |d: &ResourceDesc| {
         let (size, block) = element(d.format)?;
-        let swizzle = texture_layout(d).map_or(d.layout, |t| t.planes[0].layout.desc.swizzle.0);
+        let swizzle = texture_layout(d).map_or(d.layout, |t| t.planes.first().map_or(d.layout, |p| p.layout.desc.swizzle.0));
         let rows = u64::from(d.height).div_ceil(block);
         Some((d.dimension, d.width.div_ceil(block) * size, rows, d.depth_or_array_size, d.sample_count, swizzle))
     };
     let want = bytes(&b.desc)?;
-    map.get(&(b.data() as u64))?
+    let ptr = b.data();
+    if ptr.is_null() {
+        return None;
+    }
+    map.get(&(ptr as u64))?
         .iter()
         .map(|&r| r as This)
         .filter(|&r| r != placed)
