@@ -22,6 +22,12 @@ $times = @($presents | Where-Object {
     ([double]$_.elapsed_ns / 1e9) -le $EndSeconds
 } | ForEach-Object { [double]$_.interval_ns / 1e6 } | Sort-Object -Descending)
 if ($times.Count -lt 2) { throw 'At least two complete presentation intervals are required.' }
+$middle = [int][Math]::Floor($times.Count / 2)
+$median = if ($times.Count % 2 -eq 0) {
+    ($times[$middle - 1] + $times[$middle]) / 2.0
+} else {
+    $times[$middle]
+}
 function Mean($values) { ($values | Measure-Object -Average).Average }
 function TailFps($fraction) {
     $count = [Math]::Max(1, [Math]::Ceiling($times.Count * $fraction))
@@ -34,6 +40,7 @@ function TailFps($fraction) {
     start_seconds = $StartSeconds
     end_seconds = $EndSeconds
     mean_frame_ms = Mean $times
+    median_frame_ms = $median
     fps = 1000.0 / (Mean $times)
     low_1_percent_fps = TailFps 0.01
     low_0_1_percent_fps = TailFps 0.001

@@ -14,7 +14,7 @@ try {
     $rows | Export-Csv -LiteralPath $csv -NoTypeInformation
     $summary = (& "$PSScriptRoot/summarize-profile.ps1" -InputCsv $csv) | ConvertFrom-Json
     if ($summary.intervals -ne 1000 -or [Math]::Abs($summary.mean_frame_ms - 10.18) -gt 0.00001 -or
-        $summary.low_0_1_percent_fps -ne 10 -or [Math]::Abs($summary.low_1_percent_fps - (1000.0 / 28)) -gt 0.00001 -or
+        $summary.median_frame_ms -ne 10 -or $summary.low_0_1_percent_fps -ne 10 -or [Math]::Abs($summary.low_1_percent_fps - (1000.0 / 28)) -gt 0.00001 -or
         $summary.p99_frame_ms -ne 10 -or $summary.p99_9_frame_ms -ne 20) { throw 'Incorrect percentile or tail-mean calculation.' }
     $rows[20].lost_records = 1
     $rows | Export-Csv -LiteralPath $csv -NoTypeInformation
