@@ -11,9 +11,7 @@ use std::mem::ManuallyDrop;
 use std::time::Instant;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::core::PCSTR;
-
-mod cbv_snapshots;
+use windows::core::{Interface, PCSTR};
 
 const HLSL: &str = r#"
 #define RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), RootConstants(num32BitConstants=2, b0), UAV(u0)"
@@ -292,8 +290,57 @@ impl Fixture {
     }
 }
 
+fn capped_heap(device: &ID3D12Device) -> HostHeap {
+    let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    let total = 1 + MIN_DYNAMIC;
+    // SAFETY: a plain shader-visible heap on the fixture's own device.
+    let (heap, cpu, step) = unsafe {
+        let heap: ID3D12DescriptorHeap = device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: kind,
+                NumDescriptors: total,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+            .unwrap();
+        let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+        let step = device.GetDescriptorHandleIncrementSize(kind);
+        (heap, cpu, step)
+    };
+    HostHeap {
+        heap,
+        cpu,
+        step,
+        count: 1,
+        dynamic: MIN_DYNAMIC,
+        sampler: false,
+        made: Mutex::new(vec![0]),
+        kept: Mutex::new(vec![None; total as usize]),
+        slots: Arc::new(DynamicSlots::new(1, MIN_DYNAMIC)),
+        pairs: Mutex::new((total, Vec::new())),
+        pairs_end: total,
+        strides: None,
+        addresses: Default::default(),
+        viewed: Default::default(),
+    }
+}
+
+fn descriptor() -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_UINT,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_SRV {
+                MipLevels: 1,
+                ..Default::default()
+            },
+        },
+    }
+}
+
 fn occupancy(heap: &HostHeap) -> usize {
-    heap.dynamic
+    heap.slots
         .next
         .lock()
         .unwrap()
@@ -309,16 +356,23 @@ fn heap_replacement(fixture: &Fixture) {
         slot: 0,
         record: 1 << 32,
         view: &view,
-        resource: &fixture.textures[0],
+        resource: fixture.textures[0].clone(),
+        desc: descriptor(),
     }];
-    let original = HostHeap::new_on(&fixture.device, false, 1).unwrap();
-    let original_pool = Arc::downgrade(&original.dynamic);
-    let original_table = original.shared_textures(SPAN, &views).unwrap();
+    let original = capped_heap(&fixture.device);
+    let original_pool = Arc::downgrade(&original.slots);
+    let original_table = original
+        .shared_textures_on(&fixture.device, SPAN, &views)
+        .unwrap();
     let list_local = original.reserve_dynamic(SPAN).unwrap();
+    let original_id = original.identity();
     drop(original);
 
-    let replacement = HostHeap::new_on(&fixture.device, false, 1).unwrap();
-    let replacement_table = replacement.shared_textures(SPAN, &views).unwrap();
+    let replacement = capped_heap(&fixture.device);
+    let replacement_table = replacement
+        .shared_textures_on(&fixture.device, SPAN, &views)
+        .unwrap();
+    assert_ne!(original_id, replacement.identity());
     assert_eq!(original_table.first(), replacement_table.first());
     assert!(!Arc::ptr_eq(&original_table, &replacement_table));
     assert_ne!(
@@ -340,7 +394,7 @@ struct ResultRow {
 
 fn run(fixture: &Fixture, shared: bool, lists: usize, distinct: bool) -> ResultRow {
     let device = &fixture.device;
-    let heap = HostHeap::new_on_with_dynamic(device, false, 1, MIN_DYNAMIC).unwrap();
+    let heap = capped_heap(device);
     let width = (lists * 4) as u64;
     let output = resource(
         device,
@@ -388,11 +442,12 @@ fn run(fixture: &Fixture, shared: bool, lists: usize, distinct: bool) -> ResultR
                 slot: position,
                 record: generation << 32,
                 view: &view,
-                resource: texture,
+                resource: texture.clone(),
+                desc: descriptor(),
             }];
             let started = Instant::now();
             let slot = if shared {
-                heap.shared_textures(SPAN, &views).map(|lease| {
+                heap.shared_textures_on(device, SPAN, &views).map(|lease| {
                     let first = lease.first();
                     leases.push(lease);
                     first
@@ -400,10 +455,14 @@ fn run(fixture: &Fixture, shared: bool, lists: usize, distinct: bool) -> ResultR
             } else if let Some(first) = heap.dynamic(SPAN) {
                 for slot in first..first + SPAN {
                     if slot == first + position {
-                        assert!(make_texture(device, texture, &view, heap.cpu(slot)));
-                        heap.keep(slot, Some(texture.clone()));
+                        device.CreateShaderResourceView(
+                            texture,
+                            Some(&views[0].desc),
+                            heap.cpu(slot),
+                        );
+                        heap.keep(slot, Some((texture.clone(), None)));
                     } else {
-                        heap.make_null(slot);
+                        null_view_on(device, heap.cpu(slot));
                     }
                 }
                 Some(first)
@@ -432,17 +491,23 @@ fn run(fixture: &Fixture, shared: bool, lists: usize, distinct: bool) -> ResultR
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         )]);
         end.CopyBufferRegion(&back, 0, &output, 0, width);
+        end.ResourceBarrier(&[crate::host::transition(
+            &output,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COMMON,
+        )]);
         end.Close().unwrap();
         work.push(end);
-        fixture.submit(&work);
-
-        let mut data = std::ptr::null_mut();
-        back.Map(0, None, Some(&mut data)).unwrap();
-        assert_eq!(
-            std::slice::from_raw_parts(data.cast::<u32>(), lists),
-            expected
-        );
-        back.Unmap(0, Some(&D3D12_RANGE::default()));
+        for _ in 0..2 {
+            fixture.submit(&work);
+            let mut data = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut data)).unwrap();
+            assert_eq!(
+                std::slice::from_raw_parts(data.cast::<u32>(), lists),
+                expected
+            );
+            back.Unmap(0, Some(&D3D12_RANGE::default()));
+        }
         drop((init_allocator, end_allocator, recorded));
     }
     let occupied = occupancy(&heap);
@@ -452,7 +517,7 @@ fn run(fixture: &Fixture, shared: bool, lists: usize, distinct: bool) -> ResultR
         assert_eq!(occupancy(&heap), SPAN as usize);
         drop(keep);
         assert_eq!(occupancy(&heap), 0);
-        assert!(heap.dynamic.shared.lock().unwrap().is_empty());
+        assert!(heap.slots.shared.lock().unwrap().is_empty());
     }
     ResultRow {
         failed: failures,
