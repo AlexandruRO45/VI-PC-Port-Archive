@@ -533,13 +533,14 @@ impl Module {
         u
     }
 
-    /// Which instructions are written: those [`Module::rooted`], the
-    /// branch conditions, and whatever they read, transitively (a phi or a
-    /// value nothing reads is dropped: lowering makes size queries for
+    /// Which instructions are written: those [`Module::rooted`] in reachable
+    /// blocks, reachable non-constant branch conditions, and whatever they
+    /// read through live edges, transitively (a phi or a value nothing in the
+    /// reachable program reads is dropped: lowering makes size queries for
     /// descriptor words no path reads, 556 of ActivateRays' 587). A worklist
     /// visits each instruction once, so a long chain of merges costs one
     /// pass, not one pass per merge.
-    fn live(&self) -> Vec<bool> {
+    fn live(&self, post: &[usize], seen: &[bool]) -> Vec<bool> {
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
         let mark = |live: &mut [bool], work: &mut Vec<u32>, v: V| {
@@ -550,18 +551,26 @@ impl Module {
                 work.push(i);
             }
         };
-        for b in &self.blocks {
-            for &i in b.body.iter().filter(|&&i| self.rooted(i)) {
+        for &b in post {
+            let blk = &self.blocks[b];
+            for &i in blk.body.iter().filter(|&&i| self.rooted(i)) {
                 mark(&mut live, &mut work, V::Inst(i));
             }
-            if let Some(Term::CondBr(c, ..)) = b.term {
+            if let Some(Term::CondBr(c, ..)) = self.term(b) {
                 mark(&mut live, &mut work, c);
             }
         }
         while let Some(i) = work.pop() {
-            for_each_operand(&self.insts[i as usize].op, |v| {
-                mark(&mut live, &mut work, v)
-            });
+            match &self.insts[i as usize].op {
+                Op::Phi(inc) => {
+                    for &(v, pred) in inc {
+                        if seen[pred] {
+                            mark(&mut live, &mut work, v);
+                        }
+                    }
+                }
+                op => for_each_operand(op, |v| mark(&mut live, &mut work, v)),
+            }
         }
         live
     }
@@ -645,7 +654,6 @@ impl Module {
     /// preheaders, as DXC emits them), or its predecessor would reach the
     /// target twice (the target's phis have one entry per predecessor).
     fn plan(&self) -> Plan {
-        let live = self.live();
         let succs = |b: usize| successors(self.term(b));
         let mut seen = vec![false; self.blocks.len()];
         let mut post = Vec::new();
@@ -667,6 +675,7 @@ impl Module {
             }
         }
         post.reverse();
+        let live = self.live(&post, &seen);
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in post.iter().enumerate() {
             pos[b] = n as u64;
@@ -1324,7 +1333,7 @@ mod tests {
     fn worklist_liveness_matches_passes() {
         for (regs, stages, read) in [(1, 0, 1), (1, 1, 1), (4, 3, 1), (8, 17, 3), (16, 40, 16)] {
             let m = synthetic(regs, stages, read);
-            let live = m.live();
+            let live = m.plan().live;
             assert_eq!(live, live_by_passes(&m), "{regs} regs x {stages} stages");
         }
     }
@@ -1356,7 +1365,7 @@ mod tests {
             V::Inst(i) => i as usize,
             _ => unreachable!(),
         };
-        let live = m.live();
+        let live = m.plan().live;
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
@@ -1536,7 +1545,7 @@ mod tests {
         m.store(entry, cell, one);
         let old = m.atomic(entry, Rmw::Add, cell, two);
         m.terminate(entry, Term::Ret);
-        let live = m.live();
+        let live = m.plan().live;
         let at = |v: V| match v {
             V::Inst(i) => live[i as usize],
             _ => unreachable!(),
@@ -1610,6 +1619,121 @@ mod tests {
         let _ = (m.call(live, sink, vec![t]), h);
         let u = m.uses();
         assert!(u.int64 && !u.heap && !u.sampler_heap, "{u:?}");
+    }
+
+    /// Values defined in reachable blocks whose only users lie behind an
+    /// untaken constant branch are dropped together with their flags and
+    /// constant globals.
+    #[test]
+    fn dead_branch_users_do_not_keep_reachable_values_or_flags_alive() {
+        let (mut m, b, sink) = module(3);
+        let [entry, live, dead] = b[..] else { unreachable!() };
+        let (i32t, i64t, handle_t, i1t) = (m.int(32), m.int(64), m.int(8), m.int(1));
+        let heap_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
+        let heap = m.function("dx.op.createHandleFromHeap", heap_ty, Some(Attr::ReadNone), false);
+        let (op, zero, one, no, yes) = (m.i32(218), m.i32(0), m.i32(1), m.bool(false), m.bool(true));
+        let five = m.int_const(i64t, 5);
+        let arr = m.array(2, i32t);
+        let init = m.aggregate(arr, &[zero, one]);
+        let dead_tbl = m.constant_global("dead_tbl", init);
+
+        // Defined in the reachable entry block, but consumed only in `dead`.
+        let h = m.call(entry, heap, vec![op, zero, no, no]);
+        let wide = m.bin(entry, Bin::Add, five, five);
+        let p = m.element(entry, dead_tbl, zero);
+        let loaded = m.load(entry, p);
+        m.terminate(entry, Term::CondBr(yes, live, dead));
+
+        let _ = m.call(live, sink, vec![one]);
+        m.terminate(live, Term::Ret);
+
+        let h32 = m.cast(dead, Cast::ZExt, h, i32t);
+        let w32 = m.cast(dead, Cast::Trunc, wide, i32t);
+        let _ = m.call(dead, sink, vec![h32]);
+        let _ = m.call(dead, sink, vec![w32]);
+        let _ = m.call(dead, sink, vec![loaded]);
+        m.terminate(dead, Term::Ret);
+
+        let plan = m.plan();
+        let at = |v: V| match v {
+            V::Inst(i) => plan.live[i as usize],
+            _ => unreachable!(),
+        };
+        assert!(!at(h) && !at(wide) && !at(p) && !at(loaded));
+        assert_eq!(m.uses(), Uses::default());
+        let ((globals, g_n), _) = m.kept(&plan);
+        let V::Global(g) = dead_tbl else { unreachable!() };
+        assert_eq!((globals[g as usize], g_n), (u32::MAX, 0));
+        let _ = m.write();
+    }
+
+    /// Values defined in reachable blocks that only feed a phi's incoming edge
+    /// from an unreachable predecessor are dropped along with that edge.
+    #[test]
+    fn unreachable_phi_edge_does_not_keep_reachable_value_alive() {
+        let (mut m, b, sink) = module(4);
+        let [entry, live, dead, join] = b[..] else { unreachable!() };
+        let (i32t, handle_t, i1t) = (m.int(32), m.int(8), m.int(1));
+        let heap_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
+        let heap = m.function("dx.op.createHandleFromHeap", heap_ty, Some(Attr::ReadNone), false);
+        let (op, zero, one, two, no, yes) = (
+            m.i32(218),
+            m.i32(0),
+            m.i32(1),
+            m.i32(2),
+            m.bool(false),
+            m.bool(true),
+        );
+
+        let dead_sum = m.bin(entry, Bin::Add, one, two);
+        let dead_h = m.call(entry, heap, vec![op, zero, no, no]);
+        let dead_h32 = m.cast(entry, Cast::ZExt, dead_h, i32t);
+        m.terminate(entry, Term::CondBr(yes, live, dead));
+
+        m.terminate(live, Term::Br(join));
+        m.terminate(dead, Term::Br(join));
+
+        let p_val = m.phi(join, i32t);
+        m.set_phi(p_val, vec![(one, live), (dead_sum, dead)]);
+        let p_h = m.phi(join, i32t);
+        m.set_phi(p_h, vec![(zero, live), (dead_h32, dead)]);
+        let out = m.bin(join, Bin::Add, p_val, p_h);
+        let _ = m.call(join, sink, vec![out]);
+        m.terminate(join, Term::Ret);
+
+        let plan = m.plan();
+        let at = |v: V| match v {
+            V::Inst(i) => plan.live[i as usize],
+            _ => unreachable!(),
+        };
+        assert!(!at(dead_sum) && !at(dead_h) && !at(dead_h32));
+        assert!(at(p_val) && at(p_h) && at(out));
+        assert_eq!(m.uses(), Uses::default());
+        let _ = m.write();
+    }
+
+    /// A reachable block whose only instructions fed an unreachable branch
+    /// becomes empty once those instructions are dropped, and folds away.
+    #[test]
+    fn block_emptied_by_dropping_dead_branch_uses_folds() {
+        let (mut m, b, sink) = module(4);
+        let [entry, mid, live, dead] = b[..] else { unreachable!() };
+        let (one, two, yes) = (m.i32(1), m.i32(2), m.bool(true));
+
+        m.terminate(entry, Term::Br(mid));
+        let only_for_dead = m.bin(mid, Bin::Add, one, two);
+        m.terminate(mid, Term::CondBr(yes, live, dead));
+        let _ = m.call(live, sink, vec![one]);
+        m.terminate(live, Term::Ret);
+        let _ = m.call(dead, sink, vec![only_for_dead]);
+        m.terminate(dead, Term::Ret);
+
+        let plan = m.plan();
+        let V::Inst(i) = only_for_dead else { unreachable!() };
+        assert!(!plan.live[i as usize]);
+        assert_eq!(plan.fold[mid], Some((entry, live)));
+        assert!(!plan.layout.contains(&mid));
+        let _ = m.write();
     }
 
     #[test]
