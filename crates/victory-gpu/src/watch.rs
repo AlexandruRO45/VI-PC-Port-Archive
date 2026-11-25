@@ -396,8 +396,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    // Straight into the journal: no list of the pages first.
+    for &at in &j.found[..count] {
+        j.written.insert(at / PAGE, now);
+    }
+    for page in guarded {
         j.written.insert(page, now);
     }
     Some((
@@ -495,11 +498,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-    if clean.len() == last - first {
-        // Nothing written, mapped or new since the range was last taken.
+    // Nothing written, mapped or new since the range was last taken: told
+    // by counting, without first copying 150,000 block numbers into a list.
+    if g.clean.range(first..last).count() == last - first {
         return Some(written);
     }
+    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
     let mut next_clean = 0;
     let mut uncommitted_until = first;
     for block in first..=last {
