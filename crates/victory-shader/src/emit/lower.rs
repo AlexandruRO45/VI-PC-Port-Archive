@@ -5103,12 +5103,10 @@ impl<'a> Lower<'a> {
 
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
-        if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
-            src
-        {
+        if let Source::Select { args, .. } | Source::Lanes { args, .. } = src {
             return self.used_kind(args.first()?);
         }
-        if let Source::LanePhi { args, .. } = src {
+        if let Source::Phi { args, .. } | Source::LanePhi { args, .. } = src {
             return args.iter().flatten().find_map(|a| self.used_kind(a));
         }
         if let Source::Built { address, .. } = src {
@@ -5251,17 +5249,27 @@ impl<'a> Lower<'a> {
                 }
             }
             Source::Phi { block, args }
-                if sampler && matches!(args[..], [Source::Constant(_), Source::Constant(_)]) =>
+                if sampler
+                    && args
+                        .iter()
+                        .flatten()
+                        .all(|a| matches!(a, Source::Constant(_)))
+                    && matches!(args.iter().flatten().count(), 1 | 2) =>
             {
+                let live: Vec<_> = args.iter().flatten().collect();
+                if let [only] = live[..] {
+                    return self.handle(site, only, sampler, props);
+                }
                 // One of two immediate samplers, chosen by uniform control
                 // flow: what reads it runs with both, the edge taken picks
                 // the result (static samplers cannot be indexed).
-                let [a, b] = &args[..] else {
+                let [a, b] = live[..] else {
                     unreachable!()
                 };
                 let ha = self.handle(site, a, sampler, props)?;
                 let hb = self.handle(site, b, sampler, props)?;
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
+                let first = args.iter().position(|a| a.is_some()).unwrap_or(0);
                 let mut incoming = Vec::new();
                 for (j, &q) in self.x.p.blocks[*block].preds.iter().enumerate() {
                     if self.block[q].is_none() {
@@ -5269,7 +5277,7 @@ impl<'a> Lower<'a> {
                     }
                     let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    incoming.push((self.s.m.bool(j == 0), at));
+                    incoming.push((self.s.m.bool(j == first), at));
                 }
                 let phi = self.s.m.phi(join, self.s.t.i1);
                 self.s.m.set_phi(phi, incoming);
@@ -5278,21 +5286,29 @@ impl<'a> Lower<'a> {
             }
             Source::Phi { block, args } => {
                 // Each predecessor computes its heap index at its end; the
-                // join picks one with a phi.
+                // join picks one with a phi. An edge no active lane takes
+                // gives index 0.
                 let _ = site;
                 let mut incoming = Vec::new();
                 for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
                     if self.block[q].is_none() {
                         continue;
                     }
-                    let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
+                    let Some(tail) = self.tail[q] else {
                         return Err("a descriptor chosen by control flow");
                     };
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
-                    self.cur = here;
-                    incoming.push((index?, at));
+                    let index = match arg {
+                        Some(Source::Loaded { load, first }) => {
+                            let here = std::mem::replace(&mut self.cur, at);
+                            let index = self.heap_index(*load, *first, sampler);
+                            self.cur = here;
+                            index?
+                        }
+                        None => self.s.m.i32(0),
+                        Some(_) => return Err("a descriptor chosen by control flow"),
+                    };
+                    incoming.push((index, at));
                 }
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
                 let phi = self.s.m.phi(join, self.s.t.i32);
