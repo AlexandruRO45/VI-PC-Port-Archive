@@ -317,8 +317,13 @@ impl Shadow {
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         if self.in_place {
+            // Still declared: nothing is snapshotted or copied back for it
+            // ([`Shadow::writing`], [`Shadow::copy_back`] return early), but
+            // after the submission its pages are marked changed for the
+            // other copies holding them ([`Shadow::landed`]). Returning here
+            // left the shader writes of root and table views in place
+            // unmarked: only those through the memory page table were.
             self.keep_in_place(list);
-            return;
         }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
@@ -2521,7 +2526,9 @@ pub(crate) mod tests {
         shadow.gpu_writes(&list, base as u64, 4096, false);
         assert_eq!(refs(), before + 1, "kept once by the list");
         drop(shadow);
-        assert_eq!(refs(), before, "the list holds it after the copy is gone");
+        // The write it declares holds the copy too, as for any copy, until
+        // the list is reset.
+        assert_eq!(refs(), before + 1, "the list holds it after the copy is gone");
         list.close();
         list.reset();
         assert_eq!(refs(), before - 1, "let go when the list is reset");
@@ -2566,6 +2573,42 @@ pub(crate) mod tests {
         }
     }
 
+
+    /// A shader write declared on a buffer in place (a root or table view)
+    /// is noted with the list like any other, and once the submission has
+    /// run the pages are changed for the other copies holding them.
+    #[test]
+    fn writes_declared_in_place_reach_the_copy_back() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::watch::tests::{free, pool};
+        let Some(host) = host() else { return };
+        let p = pool(2);
+        touch(p, 2 * PAGE);
+        let Some((buffer, gpu, heap)) = in_place_buffer(p as u64, PAGE as u64) else {
+            free(p);
+            return; // no heaps from process memory on this host
+        };
+        let in_place = Shadow::new_with(buffer, p as *mut u8, gpu, p as u64, PAGE as u64, Some(heap));
+        let other = crate::watch::track(p, 2 * PAGE, true).expect("pool memory is tracked");
+        other.take(p, p + 2 * PAGE);
+        let guarded = !other.changed(p / PAGE);
+        let list = host.new_list().unwrap();
+        in_place.gpu_writes(&list, p as u64 + 8, 4, false);
+        let declared = list.declared_writes();
+        list.close();
+        host.execute(&[&list]);
+        let marked = other.changed(p / PAGE);
+        let beside = other.changed(p / PAGE + 1);
+        list.reset();
+        drop((other, in_place));
+        let_go_in_place(p as u64, 2 * PAGE as u64);
+        free(p);
+        assert_eq!(declared, vec![(p + 8, 4)], "the write is declared with the list");
+        if guarded {
+            assert!(marked, "the page written in place is changed for other copies");
+            assert!(!beside, "and only that page");
+        }
+    }
 
     /// The in-place tests share the heap cache and the queue of stale heaps
     /// (and may get each other's addresses back): one at a time.

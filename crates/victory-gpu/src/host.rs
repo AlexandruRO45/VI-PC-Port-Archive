@@ -2073,6 +2073,20 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
     }
 
+    /// The ranges the list's shaders were declared to write, as
+    /// [`HostList::defer_gpu_write`] noted them.
+    #[cfg(test)]
+    pub(crate) fn declared_writes(&self) -> Vec<(usize, usize)> {
+        self.deferred()
+            .copies
+            .iter()
+            .filter_map(|step| match step {
+                Step::GpuWrite(_, address, len, ..) => Some((*address, *len)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Shaders of the list take views from the heap itself
     /// (`crate::bindless`): what the heap's views reach is brought up to
     /// date at submission (once until a title copy intervenes).
