@@ -541,6 +541,15 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
     if fixed_below { lowest } else { lowest.max(code_end & !3) }
 }
 
+/// The ballot word and bit of console lane `lane` on a host wave of
+/// `host_wave` lanes: the host wave's own lane, which `Lower::read_lane`
+/// reads (on a host of 32-lane waves a lane 32-63 names that lane of the
+/// half the host wave stands for).
+fn ballot_bit(lane: u32, host_wave: u32) -> (u32, u32) {
+    let local = lane & (host_wave - 1);
+    (local / 32, local % 32)
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -1198,14 +1207,16 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::And, r, low);
                 // Lane `hi` runs the section on the console even where it is
                 // elsewhere on the host; there it holds the identity. On a
-                // host of 32-lane waves the scan stays within the half.
+                // host of 32-lane waves the scan stays within the half: the
+                // ballot is asked about the lane `read_lane` reads.
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let b = self
                     .s
                     .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
-                let word = self.s.m.extract(c, b, hi / 32);
-                let (sh, one, z) = (self.s.m.i32(hi % 32), self.s.m.i32(1), self.s.m.i32(0));
+                let (word, shift) = ballot_bit(hi, self.host_wave());
+                let word = self.s.m.extract(c, b, word);
+                let (sh, one, z) = (self.s.m.i32(shift), self.s.m.i32(1), self.s.m.i32(0));
                 let bit = self.s.m.bin(c, Bin::LShr, word, sh);
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 let there = self.s.m.cmp(c, pred::NE, bit, z);
@@ -10958,11 +10969,23 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half};
+    use super::{Lowered, Numeric, Parts, ballot_bit, buffer_format, code_table_start, half_shift, lower, packed_half};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
     use crate::{io, ir, resource, structure};
+
+    #[test]
+    fn a_half_scans_ballot_bit_is_the_lane_it_reads() {
+        // On a 64-lane host, console lane 33 is bit 1 of word 1.
+        assert_eq!(ballot_bit(33, 64), (1, 1));
+        // On a 32-lane host the host wave reads its own lane 1 (`read_lane`
+        // masks to the half): the ballot is asked about that lane, not word
+        // 1, which is always 0 there.
+        assert_eq!(ballot_bit(33, 32), (0, 1));
+        assert_eq!(ballot_bit(1, 32), (0, 1));
+        assert_eq!(ballot_bit(63, 32), (0, 31));
+    }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
