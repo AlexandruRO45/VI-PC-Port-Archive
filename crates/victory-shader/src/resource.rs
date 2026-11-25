@@ -2608,6 +2608,60 @@ pub(crate) mod tests {
         ));
     }
 
+    #[test]
+    fn a_mixed_descriptor_proves_only_its_varying_dwords() {
+        // Dword 0 of the buffer descriptor differs between lanes (s0 or s1
+        // by `v_cndmask_b32`); dwords 1-3 are constants that reach
+        // `v_readfirstlane_b32` through `v_mov_b32` in every lane. The loop
+        // compares dword 0 alone.
+        let mixed = [
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0x7E08_0200, // v_mov_b32 v4, s0
+            0x0208_0801, // v_cndmask_b32 v4, s1, v4, vcc_lo
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7E0C_02C1, // v_mov_b32 v6, -1
+            0x7E0E_02FF,
+            0x1101_4FAC, // v_mov_b32 v7, 0x11014fac
+            0xBE94_037E, // s_mov_b32 s20, exec_lo
+            0x7E18_0504, // 0x20: v_readfirstlane_b32 s12, v4
+            0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+            0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+            0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+            0xD4C2_0015,
+            0x0002_080C, // v_cmp_eq_u32_e64 s21, s12, v4
+            0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+            0xE030_1000,
+            0x8003_0C00, // buffer_load_dword v12, v0, s[12:15], 0 offen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+            0xBF89_FFF4, // s_cbranch_execnz -> 0x20
+            0xBEFE_0314, // s_mov_b32 exec_lo, s20
+            S_ENDPGM,
+        ];
+        // The constant dwords fold, so the one compare proves the descriptor:
+        // lanes with their bit set take the table at s0, the others s1, and
+        // only dword 0 is a first-lane read the loop has to make the lane's
+        // own.
+        let r = waterfall(&mixed, false).unwrap();
+        let Source::Lanes { args, .. } = &r.descriptors[0].source else {
+            panic!("{:?}", r.descriptors[0].source)
+        };
+        let built = |param| Source::Built {
+            address: at(param, 0),
+            bits: 0,
+            words: [u32::MAX, 0x1101_4FAC],
+        };
+        assert_eq!(*args, [built(0), built(1)]);
+        assert_eq!(r.waterfall.compares, [(1, 4)]);
+        assert_eq!(r.waterfall.reads.len(), 1);
+
+        // Comparing a constant dword instead leaves the varying one unproven.
+        let mut uniform_compared = mixed;
+        let cmp = word_at(&uniform_compared, 0x0002_080C);
+        uniform_compared[cmp] = 0x0002_0A0D; // v_cmp_eq_u32_e64 s21, s13, v5
+        assert_eq!(refusal(&uniform_compared, false), NOT_SELECTED);
+    }
+
     #[cfg(windows)]
     #[test]
     fn uniform_vgpr_readfirstlane_descriptor_runs_on_gpu_and_warp() {
