@@ -128,6 +128,7 @@ struct OpDecl {
     attr: Attr,
     ret: Ty,
     args: Vec<Ty>,
+    opcode: u32,
     f: V,
     code: V,
 }
@@ -217,6 +218,7 @@ impl Shader {
             d.name == name
                 && d.attr == attr
                 && d.ret == ret
+                && d.opcode == opcode
                 && d.args.len() == args.len()
                 && d.args
                     .iter()
@@ -246,6 +248,7 @@ impl Shader {
                     attr,
                     ret,
                     args: types,
+                    opcode,
                     f,
                     code,
                 };
