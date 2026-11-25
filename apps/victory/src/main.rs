@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod menu_trace;
 mod prebuild;
 mod run;
 mod shader;
