@@ -582,12 +582,9 @@ pub(crate) fn thread_edges(
 
 /// The program without its early-outs: an `s_cbranch_execz` to a block that
 /// only ends the program (`if (!inBounds) return;`, the outermost branch of
-/// most compute programs) is left out, so the lanes that would have left
-/// walk the body with EXEC clear. Vector instructions and every effect are
-/// masked by EXEC already, as on the console, where the branch is taken
-/// only when no lane of the wave is left; scalar code has no effects. The
-/// body is then code every lane runs, which a console wave run as two host
-/// waves needs for the barriers of its exchanges and LDS accesses.
+/// most compute programs) can be left out if running its body with EXEC clear
+/// preserves the observable effects. For a body with group barriers, the
+/// retiring wave must be able to rendezvous at each one with the live waves.
 /// `None` if the program has no such branch.
 pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
     without_skips_mode(p, false, true)
@@ -614,6 +611,219 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
 /// are then code every lane runs.
 pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     without_skips_mode(p, deep, false)
+}
+
+/// An otherwise retired wave can traverse a loop before a group barrier only if
+/// it reaches that barrier. Recognize a natural loop counted from zero by one.
+/// Both compare operands and the SCC consumed by the backedge must be the
+/// values from this iteration, including when there are nested loops.
+fn counted_barrier_loop(p: &Program, head: usize, latch: usize) -> bool {
+    let blocks = &p.blocks;
+    let Exit::Branch { taken, not_taken } = blocks[latch].exit else {
+        return false;
+    };
+    if taken != head || not_taken <= latch {
+        return false;
+    }
+    let in_loop = |b: usize| (head..=latch).contains(&b);
+
+    let insts = &blocks[latch].insts;
+    let Some(branch) = insts.last().filter(|i| i.name() == "s_cbranch_scc0") else {
+        return false;
+    };
+    let Some(flag) = branch.read(Reg::Scc) else {
+        return false;
+    };
+    let Some(cmp) = insts.iter().find(|i| i.write(Reg::Scc) == Some(flag)) else {
+        return false;
+    };
+    let Fields::Sop { src, .. } = &cmp.fields else {
+        return false;
+    };
+    let [
+        Operand::Scalar { code, dwords: 1 },
+        Operand::Const(129..=192),
+    ] = src.as_slice()
+    else {
+        return false;
+    };
+    if *code > 105 {
+        return false;
+    }
+    let counter = Reg::S(*code);
+    if !matches!(cmp.name(), "s_cmp_eq_u32" | "s_cmp_gt_u32") {
+        return false;
+    }
+    let Some(tested) = cmp.read(counter) else {
+        return false;
+    };
+    let Some(add) = insts.iter().find(|i| i.write(counter) == Some(tested)) else {
+        return false;
+    };
+    if !matches!(add.name(), "s_add_i32" | "s_add_u32")
+        || !matches!(&add.fields, Fields::Sop { src, .. } if src.as_slice() == [
+            Operand::Scalar { code: *code, dwords: 1 }, Operand::Const(129)
+        ])
+    {
+        return false;
+    }
+    if blocks[head..=latch]
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| i.write(counter).is_some_and(|v| v != tested))
+    {
+        return false;
+    }
+    // A rotated loop can enter at its latch. Every entry from outside the
+    // interval must still reset the counter before its first comparison.
+    let mut entries = blocks[head..=latch]
+        .iter()
+        .flat_map(|b| &b.preds)
+        .copied()
+        .filter(|&pred| !in_loop(pred))
+        .peekable();
+    entries.peek().is_some() && entries.all(|pred| {
+        blocks[pred].insts.iter().rev().find(|i| i.write(counter).is_some()).is_some_and(|i|
+            i.name() == "s_mov_b32"
+                && matches!(&i.fields, Fields::Sop { src, .. } if src.as_slice() == [Operand::Const(128)]))
+    })
+}
+
+/// RDNA2 ISA 4.3: a wave reaching S_ENDPGM drops out of subsequent group
+/// barriers. Keeping it alive with empty EXEC gives the remaining waves
+/// equivalent rendezvous if every path visits the same barrier sites once,
+/// in order. Other checks still rule out side effects and re-enabling EXEC.
+fn terminal_barriers(
+    p: &Program,
+    inside: &[bool],
+    gate: usize,
+    first: usize,
+    target: usize,
+) -> bool {
+    // Every wave must reach this gate. A wave following another path could
+    // otherwise be waiting at an unrelated barrier while this one retires.
+    let mut visited = vec![false; p.blocks.len()];
+    let mut pending = vec![0];
+    while let Some(b) = pending.pop() {
+        if b == gate || visited[b] {
+            continue;
+        }
+        visited[b] = true;
+        let block = &p.blocks[b];
+        if matches!(block.exit, Exit::End | Exit::Indirect) {
+            return false;
+        }
+        for next in block.exit.successors() {
+            if next <= b {
+                return false;
+            }
+            pending.push(next);
+        }
+    }
+    if p.blocks
+        .iter()
+        .enumerate()
+        .any(|(b, block)| !inside[b] && block.insts.iter().any(|i| i.name() == "s_barrier"))
+    {
+        return false;
+    }
+    // The retired wave will still run scalar code. Restrict this transform
+    // to register arithmetic, control flow and ordinary descriptor loads;
+    // scalar messages, mode changes and atomics are observable with empty EXEC.
+    for i in p
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(b, _)| inside[*b])
+        .flat_map(|(_, b)| &b.insts)
+    {
+        let plain = match &i.fields {
+            Fields::Sop { .. } => matches!(
+                i.name(),
+                "s_add_i32"
+                    | "s_add_u32"
+                    | "s_and_b64"
+                    | "s_and_saveexec_b64"
+                    | "s_andn2_b64"
+                    | "s_bcnt1_i32_b64"
+                    | "s_bfe_u32"
+                    | "s_cmp_eq_u32"
+                    | "s_cmp_gt_u32"
+                    | "s_cmp_lg_u32"
+                    | "s_cselect_b64"
+                    | "s_max_i32"
+                    | "s_ff1_i32_b64"
+                    | "s_lshl_b32"
+                    | "s_mov_b32"
+                    | "s_mov_b64"
+            ),
+            Fields::Smem { .. } => matches!(
+                i.name(),
+                "s_load_dword" | "s_load_dwordx2" | "s_load_dwordx4"
+            ),
+            Fields::Sopp { .. } => matches!(
+                i.name(),
+                "s_barrier"
+                    | "s_branch"
+                    | "s_cbranch_execz"
+                    | "s_cbranch_scc0"
+                    | "s_cbranch_scc1"
+                    | "s_endpgm"
+                    | "s_nop"
+                    | "s_waitcnt"
+            ),
+            _ => true,
+        };
+        if !plain {
+            return false;
+        }
+    }
+    let mut phases = vec![0; inside.len()];
+    let mut total = 0;
+    for (b, block) in p.blocks.iter().enumerate().filter(|(b, _)| inside[*b]) {
+        phases[b] = total;
+        total += block
+            .insts
+            .iter()
+            .filter(|i| i.name() == "s_barrier")
+            .count();
+    }
+    if phases[first] != 0 || total == 0 {
+        return false;
+    }
+    let mut loops = Vec::new();
+    for (b, block) in p.blocks.iter().enumerate().filter(|(b, _)| inside[*b]) {
+        let after = phases[b]
+            + block
+                .insts
+                .iter()
+                .filter(|i| i.name() == "s_barrier")
+                .count();
+        if block.exit == Exit::End && after != total {
+            return false;
+        }
+        for next in block.exit.successors() {
+            if next == target {
+                if after != total {
+                    return false;
+                }
+            } else if phases[next] != after {
+                return false;
+            } else if next <= b {
+                // Disjoint or nested intervals terminate by induction. Two
+                // interleaving loops could reset each other's counters.
+                if loops
+                    .iter()
+                    .any(|&(head, latch)| head < next && next <= latch)
+                    || !counted_barrier_loop(p, next, b)
+                {
+                    return false;
+                }
+                loops.push((next, b));
+            }
+        }
+    }
+    true
 }
 
 fn without_skips_mode(p: &Program, deep: bool, early_only: bool) -> Option<Program> {
@@ -851,6 +1061,7 @@ fn without_skips_mode(p: &Program, deep: bool, early_only: bool) -> Option<Progr
         // No EXEC-independent scalar side effects inside the skipped region,
         // and EXEC must stay 0 throughout when entered with EXEC == 0 (except
         // inside a pure whole-wave section whose restore returns EXEC to 0).
+        let may_retire = std::cell::LazyCell::new(|| ends(target) && terminal_barriers(p, &inside, b, first, target));
         let branch = p.blocks[b].insts.last()?;
         let entry_exec = [branch.read(Reg::S(EXEC)), branch.read(Reg::S(EXEC + 1))];
         let mut inside_defs = std::collections::HashSet::new();
@@ -882,7 +1093,7 @@ fn without_skips_mode(p: &Program, deep: bool, early_only: bool) -> Option<Progr
                     i = end + 1;
                     continue;
                 }
-                if scalar_side_effect(inst) {
+                if scalar_side_effect(inst) && (inst.name() != "s_barrier" || !*may_retire) {
                     return None;
                 }
                 i += 1;
@@ -1981,6 +2192,79 @@ mod tests {
         w.extend_from_slice(after);
         w.push(S_ENDPGM);
         build_words(&w, true)
+    }
+
+    #[test]
+    fn terminal_skip_keeps_the_same_group_barriers_in_order() {
+        let terminal = |body: &[u32]| {
+            let mut words = vec![
+                0x7D88_0000,                     // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A,                     // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0000 | body.len() as u32, // s_cbranch_execz to s_endpgm
+            ];
+            words.extend_from_slice(body);
+            words.push(S_ENDPGM);
+            build_words(&words, true)
+        };
+        const BARRIER: u32 = 0xBF8A_0000;
+        let straight = terminal(&[BARRIER, BARRIER]);
+        let lowered = without_early_outs(&straight).expect("retired waves join the live waves");
+        assert_eq!(skips(&lowered), 0);
+        assert_eq!(
+            lowered
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| i.name() == "s_barrier")
+                .count(),
+            2
+        );
+
+        // The empty wave also completes a two-trip counter loop between rendezvous.
+        let counted = terminal(&[
+            BARRIER,
+            0xBE85_0380,
+            0x8105_8105,
+            0xBF06_8205,
+            0xBF84_FFFD,
+            BARRIER,
+        ]);
+        assert!(without_early_outs(&counted).is_some());
+        // Resetting the counter on its backedge prevents termination.
+        let reset = terminal(&[
+            BARRIER,
+            0xBE85_0380,
+            0x8105_8105,
+            0xBF06_8205,
+            0xBF84_FFFC,
+            BARRIER,
+        ]);
+        assert!(without_early_outs(&reset).is_none());
+
+        // Some waves take a different path before reaching the gate.
+        let bypass_gate = build_words(
+            &[
+                0xBF84_0004, // s_cbranch_scc0 to the second barrier
+                0x7D88_0000,
+                0xBE8C_246A,
+                0xBF88_0002,
+                BARRIER,
+                BARRIER,
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(without_early_outs(&bypass_gate).is_none());
+
+        // A scalar branch can bypass the first barrier.
+        let conditional = terminal(&[0xBF84_0001, BARRIER, BARRIER]);
+        assert!(without_early_outs(&conditional).is_none());
+        // A scalar backedge can repeat the first barrier.
+        let repeated = terminal(&[BARRIER, 0xBF84_FFFE, BARRIER]);
+        assert!(without_early_outs(&repeated).is_none());
+        // A loop with no proved exit can strand another wave at the second barrier.
+        let unbounded = terminal(&[BARRIER, 0xBF84_FFFF, BARRIER]);
+        assert!(without_early_outs(&unbounded).is_none());
     }
 
     fn skips(p: &Program) -> usize {
