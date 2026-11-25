@@ -46,7 +46,7 @@ pub(crate) extern "system" fn create(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    tracing::debug!(?desc, "query heap");
+    tracing::debug!(kind = desc.kind, count = desc.count, "query heap");
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
