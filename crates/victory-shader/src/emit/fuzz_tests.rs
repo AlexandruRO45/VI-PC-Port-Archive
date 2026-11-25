@@ -367,11 +367,12 @@ fn agree(name: &str, a: u32, b: u32) -> bool {
             x == y || (is_f16_nan(x) && is_f16_nan(y))
         });
     }
-    // The result's type: a conversion's comes first (v_cvt_<to>_<from>).
-    let half = match name.strip_prefix("v_cvt_") {
-        Some(rest) => rest.starts_with("f16"),
-        None => name.contains("16") && name.contains("_f"),
-    };
+    // The result's type is the first in the name (v_cvt_f16_f32,
+    // v_dot2_f32_f16).
+    const TYPES: &[&str] = &[
+        "f16", "f32", "f64", "i16", "u16", "i32", "u32", "i64", "u64", "b16", "b32", "b64",
+    ];
+    let half = name.split('_').find(|t| TYPES.contains(t)) == Some("f16");
     let float = name.contains("_f") || name.contains("frexp") || name.contains("ldexp");
     if float && !half && is_f32_nan(a) && is_f32_nan(b) {
         return true;
