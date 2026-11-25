@@ -4217,7 +4217,10 @@ mod present_plane_tests {
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
     }
+}
 
+#[cfg(test)]
+mod hdr_tests {
     #[test]
     fn desired_color_space_matches_format_and_hdr_state() {
         use super::desired_color_space;
