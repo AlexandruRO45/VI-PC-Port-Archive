@@ -2785,6 +2785,20 @@ impl<'a> Lower<'a> {
         if threads > 128 || mesh.max_vertices > 256 || mesh.max_primitives > 256 {
             return Err("a mesh shader beyond the host's limits");
         }
+        // DXIL's kMaxMSOutputTotalBytes: the validator sums, per output
+        // element, rows * columns (whatever the component width) times the
+        // declared maximum rounded up to 32, over both signatures. Our
+        // elements are one row each.
+        const MAX_MS_OUTPUT_BYTES: u32 = 32 * 1024;
+        let bytes = |els: &[SigElement], max: u32| -> u32 {
+            let scalars: u32 = els.iter().map(|e| u32::from(e.cols)).sum();
+            4 * scalars * max.next_multiple_of(32)
+        };
+        if bytes(&self.s.outputs, mesh.max_vertices) + bytes(&self.s.prims, mesh.max_primitives)
+            > MAX_MS_OUTPUT_BYTES
+        {
+            return Err("a mesh shader whose outputs exceed the host's 32 KiB budget");
+        }
         let e = self.s.entry;
         let void = self.s.t.void;
         let (v, p) = (

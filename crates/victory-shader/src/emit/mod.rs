@@ -895,6 +895,17 @@ mod tests {
     /// (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1, 0.5, 1): triangle (0, 1, 2)
     /// covers the whole target.
     fn triangle_mesh(prim: u32) -> Result<HostShader, ShaderError> {
+        triangle_mesh_sized(prim, (32, 32), (0, 0, false))
+    }
+
+    /// `triangle_mesh` with the program's declared maxima (vertices,
+    /// primitives) and that many extra 4-column float rows in the vertex and
+    /// primitive signatures, which the program never writes.
+    fn triangle_mesh_sized(
+        prim: u32,
+        (max_vertices, max_primitives): (u32, u32),
+        (vertex_rows, prim_rows, prim_scalar): (u32, u32, bool),
+    ) -> Result<HostShader, ShaderError> {
         let words = [
             0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
             0x0001_00C1,
@@ -926,12 +937,24 @@ mod tests {
                 outputs: vec![],
                 clip_cntl: 0,
                 threads: 32,
-                max_vertices: 32,
-                max_primitives: 32,
+                max_vertices,
+                max_primitives,
                 topology: 2,
                 lds_bytes: 0,
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let attribute = |i: u32, row: u32, cols: u8| SigElement {
+            name: format!("ATTR{i}"),
+            index: i,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols,
+            usage: 0,
+            half: false,
         };
         let position = SigElement {
             name: "SV_Position".into(),
@@ -945,14 +968,53 @@ mod tests {
             usage: 0xF,
             half: false,
         };
-        let osg1 = container::signature(&[position], false);
-        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let mut vertex = vec![position];
+        vertex.extend((0..vertex_rows).map(|i| attribute(i, i + 1, 4)));
+        let mut prims: Vec<SigElement> = (0..prim_rows).map(|i| attribute(i, i, 4)).collect();
+        if prim_scalar {
+            prims.push(attribute(prim_rows, prim_rows, 1));
+        }
+        let osg1 = container::signature(&vertex, false);
+        let psg1 = container::signature(&prims, false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1), (FourCC::PSG1, &psg1)]);
         let c = Container::parse(&bytes)?;
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
         let st = structure::structure(&p)?;
         let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
         let io = io::raise(&p, &native)?;
         emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// DXIL caps a mesh shader's outputs at 32768 bytes: four per scalar of
+    /// each output element, times the declared maximum rounded up to 32, over
+    /// the vertex and the primitive outputs. The numbers below are measured
+    /// against DXC's validator: 100 vertices (128) with 44 scalars and 40
+    /// primitive scalars (64) fill it exactly and pass; one more scalar is
+    /// "vertex plus primitive output size is greater than 32768". We refuse
+    /// the second with a reason of our own, and translate the first.
+    #[test]
+    fn a_mesh_program_over_the_output_budget_is_refused() {
+        #[cfg(windows)]
+        let mut validator = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        let at = triangle_mesh_sized(TRIANGLE, (100, 40), (10, 10, false))
+            .unwrap_or_else(|e| panic!("at the budget: {e}"));
+        #[cfg(windows)]
+        if let Some(v) = validator.as_mut() {
+            v.validate(&mut at.dxil.clone())
+                .unwrap_or_else(|e| panic!("at the budget: {e}"));
+        }
+        let Err(ShaderError::Unsupported { what, .. }) =
+            triangle_mesh_sized(TRIANGLE, (100, 40), (10, 10, true))
+        else {
+            panic!("a program one scalar over the budget translated");
+        };
+        assert_eq!(
+            what,
+            "a mesh shader whose outputs exceed the host's 32 KiB budget"
+        );
     }
 
     /// A primitive export's corners are 9-bit indices: the edge flag above
