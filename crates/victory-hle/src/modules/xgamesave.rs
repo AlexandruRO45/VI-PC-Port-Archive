@@ -197,18 +197,21 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
 }
 
 /// Loads and validates one committed version directory: its manifest must
-/// parse cleanly and every referenced blob file must exist.
+/// parse cleanly and every referenced blob file must exist. A damaged
+/// version gives `NotFound` (no manifest) or `InvalidData`; any other error
+/// is the disk's (a file held by another process, say), not the save's.
 fn load_version(version: PathBuf, highest: u64) -> std::io::Result<Version> {
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
     let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
     let blobs = names.split_off(2);
     let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
     for i in 0..blobs.len() {
-        if !version.join(i.to_string()).is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "missing save blob",
-            ));
+        let missing = || std::io::Error::new(std::io::ErrorKind::InvalidData, "missing save blob");
+        match std::fs::metadata(version.join(i.to_string())) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Err(missing()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(missing()),
+            Err(e) => return Err(e),
         }
     }
     Ok(Version {
@@ -250,7 +253,6 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     if committed.is_empty() {
         return Ok(None);
     }
-    let mut last_err = None;
     let mut chosen = None;
     for &number in committed.iter().rev() {
         let version = dir.join(format!("v{number}"));
@@ -259,16 +261,26 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
                 chosen = Some((number, v));
                 break;
             }
-            Err(e) => {
+            // Only damage moves on to an older version: a read the disk refuses
+            // now would serve a stale save, and the next write would drop the
+            // newer one.
+            Err(e) if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+            ) =>
+            {
                 tracing::warn!(version = number, error = %e, "ignoring damaged save version");
-                last_err = Some(e);
             }
+            Err(e) => return Err(e),
         }
     }
+    // Versions exist but none is intact: keep them all, and refuse (not
+    // `NotFound`, which would report the container as absent).
     let Some((chosen_number, chosen)) = chosen else {
-        return Err(last_err.unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest")
-        }));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no intact save version",
+        ));
     };
     for &other in &committed {
         if other < chosen_number {
@@ -1611,6 +1623,56 @@ mod tests {
         let after = Some(("two".into(), vec![("a".into(), "new a".into()), ("b".into(), "old b".into())]));
         assert_eq!(state(root), after);
         assert!(!staged.exists());
+    }
+
+    /// A newer version the disk will not read now (its manifest held open
+    /// without sharing) is not damage: reads and updates refuse, nothing is
+    /// removed, and once the file is free the newer version is the save.
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_newer_version_refuses_instead_of_serving_an_older_one() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        // v2 as a crash leaves it before v1 is removed, with a newer blob a.
+        let (v1, v2) = (slot.join("v1"), slot.join("v2"));
+        std::fs::create_dir(&v2).unwrap();
+        for entry in std::fs::read_dir(&v1).unwrap().flatten() {
+            std::fs::copy(entry.path(), v2.join(entry.file_name())).unwrap();
+        }
+        std::fs::write(v2.join("0"), b"new a").unwrap();
+        let newer = Some(("one".into(), vec![("a".into(), "new a".into()), ("b".into(), "old b".into())]));
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(v2.join(MANIFEST))
+            .unwrap();
+
+        let c = Provider { root: root.into() }.container("Slot");
+        assert!(current_named(&c.dir, "Slot").is_err());
+        assert_eq!(update(root, "two", &[("c", Some("c"))]), NO_ACCESS);
+        assert!(v1.is_dir() && v2.is_dir());
+
+        drop(locked);
+        assert_eq!(state(root), newer);
+    }
+
+    /// Versions that are all damaged keep the container: it is refused, not
+    /// reported absent, and nothing is removed.
+    #[test]
+    fn only_damaged_versions_are_refused_not_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        std::fs::remove_file(slot.join("v1").join(MANIFEST)).unwrap();
+        let c = Provider { root: root.into() }.container("Slot");
+        let e = current_named(&c.dir, "Slot").err().expect("refused");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        assert!(slot.join("v1").is_dir());
     }
 
     /// Only `v<N>` as `commit` writes it is a version: `v01` and the like
