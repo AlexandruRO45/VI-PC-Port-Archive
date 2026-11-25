@@ -843,7 +843,10 @@ impl Shader {
         let psg1 = container::signature(&self.prims, false);
         let mut parts: Vec<(&[u8; 4], &[u8])> =
             vec![(b"SFI0", &sfi0), (b"ISG1", &isg1), (b"OSG1", &osg1)];
-        if self.mesh.is_some() {
+        // DXC leaves PSG1 out when the mesh declares no per-primitive
+        // outputs; an empty part makes vkd3d-proton 3.1 hand RADV a mesh
+        // pipeline it segfaults compiling (the title's first world bind).
+        if self.mesh.is_some() && !self.prims.is_empty() {
             parts.push((b"PSG1", &psg1));
         }
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
