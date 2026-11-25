@@ -2310,17 +2310,21 @@ pub struct HdrDisplayInfo {
 }
 
 /// Returns the host display's HDR10 (`G2084_NONE_P2020`) luminance bounds,
-/// queried once at startup so the title and swap chain agree throughout a run.
+/// cached once the host device exists so the title and swap chain agree
+/// throughout a run without locking in adapter 0 before `host()` is ready.
 pub fn display_hdr_info() -> Option<HdrDisplayInfo> {
     static HDR: OnceLock<Option<HdrDisplayInfo>> = OnceLock::new();
-    *HDR.get_or_init(query_display_hdr_info)
+    let Some(h) = host() else {
+        return query_display_hdr_info(None);
+    };
+    *HDR.get_or_init(|| query_display_hdr_info(Some(h)))
 }
 
-fn query_display_hdr_info() -> Option<HdrDisplayInfo> {
+fn query_display_hdr_info(host: Option<&Host>) -> Option<HdrDisplayInfo> {
     // SAFETY: plain DXGI factory, adapter and output enumeration.
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-        let adapter: IDXGIAdapter1 = if let Some(host) = host() {
+        let adapter: IDXGIAdapter1 = if let Some(host) = host {
             let luid = host.device.GetAdapterLuid();
             factory
                 .EnumAdapterByLuid::<IDXGIAdapter1>(luid)

@@ -61,9 +61,9 @@ type This = *const Object;
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 struct HdrModeInfo {
-    min_tone_map_luminance: f32,
-    max_tone_map_luminance: f32,
-    max_full_frame_tone_map_luminance: f32,
+    min_nits: f32,
+    max_nits: f32,
+    max_full_frame_nits: f32,
 }
 
 fn try_enable_hdr_with(
@@ -76,9 +76,9 @@ fn try_enable_hdr_with(
             // SAFETY: caller passed a writable luminance info pointer.
             unsafe {
                 info.cast::<HdrModeInfo>().write_unaligned(HdrModeInfo {
-                    min_tone_map_luminance: hdr.min_luminance,
-                    max_tone_map_luminance: hdr.max_luminance,
-                    max_full_frame_tone_map_luminance: hdr.max_full_frame_luminance,
+                    min_nits: hdr.min_luminance,
+                    max_nits: hdr.max_luminance,
+                    max_full_frame_nits: hdr.max_full_frame_luminance,
                 });
             }
         }
@@ -226,10 +226,10 @@ mod tests {
         };
         let mut info = HdrModeInfo::default();
         assert_eq!(try_enable_hdr_with(0, (&raw mut info).cast(), Some(sample)), 1);
-        assert_eq!(info.min_tone_map_luminance, sample.min_luminance);
-        assert_eq!(info.max_tone_map_luminance, sample.max_luminance);
+        assert_eq!(info.min_nits, sample.min_luminance);
+        assert_eq!(info.max_nits, sample.max_luminance);
         assert_eq!(
-            info.max_full_frame_tone_map_luminance,
+            info.max_full_frame_nits,
             sample.max_full_frame_luminance
         );
         assert_eq!(try_enable_hdr_with(0, std::ptr::null_mut(), Some(sample)), 1);
