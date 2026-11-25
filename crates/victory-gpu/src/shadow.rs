@@ -2406,6 +2406,13 @@ impl Shadow {
                     use crate::copystat::{C, add};
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                    crate::traffic::note(
+                        crate::traffic::Kind::Copy,
+                        self.start as usize,
+                        self.len,
+                        (to - from) as u64,
+                        copied as u64,
+                    );
                 }
                 return copied;
             }
