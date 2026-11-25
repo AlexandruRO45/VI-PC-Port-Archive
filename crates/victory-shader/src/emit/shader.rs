@@ -441,6 +441,20 @@ impl Shader {
         self.annotate(block, h, props.0, props.1)
     }
 
+    /// A view heap handle for a buffer's size alone (`getDimensions`), kept
+    /// distinct from read/write handles so AMD's compiler does not merge them
+    /// when a buffer is indexed from its own record count (`amdxc64.dll+0x861b9f`).
+    pub fn size_handle(&mut self, block: usize, index: V, nonuniform: bool, props: (u32, u32)) -> V {
+        let bound = self.m.i32(if super::limits_indices() {
+            super::OWN_SLOTS - 2
+        } else {
+            (1 << 26) - 1
+        });
+        let i32t = self.t.i32;
+        let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, bound]);
+        self.handle_at(block, v, false, nonuniform, props)
+    }
+
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);

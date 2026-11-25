@@ -6264,15 +6264,6 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        // The handle is built from this load's own address (the other
-        // load's registers need not hold it here): the descriptor starts
-        // `skew` dwords before what this load reads.
-        let h = if load == site {
-            self.handle(site, &src, false, props)?
-        } else {
-            let index = self.heap_index_at(site, skew.wrapping_neg(), false)?;
-            self.s.heap_handle(self.cur, index, false, false, props)
-        };
         // The size words are asked of the host only when the program reads
         // one as data: most loads take the descriptor whole for an image or
         // buffer instruction, and hundreds of size queries of heap handles
@@ -6293,6 +6284,18 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // The handle is built from this load's own address (`skew` dwords
+        // before what it reads); buffers query size via `size_handle` so
+        // self-sized indexed reads/writes do not crash the AMD compiler.
+        let h = if image.is_none() {
+            let index = self.heap_index_at(site, skew.wrapping_neg(), false)?;
+            self.s.size_handle(self.cur, index, false, props)
+        } else if load == site {
+            self.handle(site, &src, false, props)?
+        } else {
+            let index = self.heap_index_at(site, skew.wrapping_neg(), false)?;
+            self.s.heap_handle(self.cur, index, false, false, props)
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
