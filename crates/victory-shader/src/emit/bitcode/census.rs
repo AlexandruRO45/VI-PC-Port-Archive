@@ -117,21 +117,9 @@ impl Module {
     pub(crate) fn census(&self) -> Census {
         let k = |s: &str| KINDS.iter().position(|k| *k == s).expect("kind");
         let call_kind: Vec<usize> = self.funcs.iter().map(|f| kind(&f.name)).collect();
-        let live = self.live();
         // The blocks `write` lays out: those reached from the entry.
-        let mut seen = vec![false; self.blocks.len()];
-        let mut stack = vec![0usize];
-        if !self.blocks.is_empty() {
-            seen[0] = true;
-        }
-        while let Some(b) = stack.pop() {
-            for &s in super::successors(self.blocks[b].term).iter() {
-                if !seen[s] {
-                    seen[s] = true;
-                    stack.push(s);
-                }
-            }
-        }
+        let (seen, _) = self.reachable();
+        let live = self.live(&seen);
         let mut c = Census::default();
         for (b, blk) in self.blocks.iter().enumerate() {
             if !seen[b] {
