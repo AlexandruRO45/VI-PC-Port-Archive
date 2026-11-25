@@ -817,6 +817,7 @@ impl<'a> Lower<'a> {
                         .flatten()
                         .copied()
                         .chain(whens)
+                        .chain(x.st.other.values().copied())
                         .collect();
                 all.sort_unstable();
                 all.dedup();
