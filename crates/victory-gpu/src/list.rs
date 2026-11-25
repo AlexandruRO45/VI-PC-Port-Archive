@@ -2173,4 +2173,43 @@ mod tests {
         }
     }
 
+    /// A `CopyResource` whose destination and source resolve to the same host
+    /// texture must return early without transitioning or recording a command.
+    #[cfg(windows)]
+    #[test]
+    fn copy_resource_skips_same_host_texture() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(new_list(0, allocator, &LIST_IIDS[0], &mut list), S_OK);
+
+        let tex = crate::resource::test_texture();
+        let other = crate::resource::test_texture();
+        let before_tex = std::sync::Arc::strong_count(&crate::resource::host_copy(tex).unwrap());
+        let before_other = std::sync::Arc::strong_count(&crate::resource::host_copy(other).unwrap());
+
+        copy_resource(list, tex, tex);
+        copy_resource_x(list, tex, tex, 0);
+        assert_eq!(
+            std::sync::Arc::strong_count(&crate::resource::host_copy(tex).unwrap()),
+            before_tex
+        );
+
+        // Contrast: copying between distinct host textures records state transitions and the copy.
+        copy_resource(list, other, tex);
+        assert!(std::sync::Arc::strong_count(&crate::resource::host_copy(tex).unwrap()) > before_tex);
+        assert!(
+            std::sync::Arc::strong_count(&crate::resource::host_copy(other).unwrap()) > before_other
+        );
+
+        assert_eq!(close(list), S_OK);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [tex, other, list, allocator] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
 }
