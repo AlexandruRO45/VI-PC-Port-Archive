@@ -638,6 +638,8 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some(adapter) = named_adapter() {
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
@@ -714,6 +716,46 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
         })
+    }
+}
+
+/// `VICTORY_ADAPTER=<part of a name>`: the hardware adapter whose name
+/// holds it (case ignored), else Windows' default. On a laptop with two
+/// GPUs this picks, say, an RDNA 2 integrated GPU (the console's GPU
+/// family, with 64-lane waves) over a 32-lane NVIDIA one, to compare what
+/// the title draws on each. Every adapter's name is logged when it is set.
+fn named_adapter() -> Option<IDXGIAdapter> {
+    let wanted = std::env::var("VICTORY_ADAPTER").ok()?.to_lowercase();
+    if wanted.is_empty() {
+        return None;
+    }
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let mut found = None;
+        let mut i = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            i += 1;
+            let Ok(desc) = adapter.GetDesc1() else { continue };
+            let name = String::from_utf16_lossy(&desc.Description)
+                .trim_end_matches('\0')
+                .to_string();
+            let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+            tracing::info!(adapter = %name, software, "host adapter");
+            if found.is_none() && !software && name.to_lowercase().contains(&wanted) {
+                found = adapter.cast::<IDXGIAdapter>().ok().map(|a| (a, name));
+            }
+        }
+        match found {
+            Some((adapter, name)) => {
+                tracing::info!(adapter = %name, "VICTORY_ADAPTER: host device on this adapter");
+                Some(adapter)
+            }
+            None => {
+                tracing::warn!(wanted = %wanted, "VICTORY_ADAPTER names no hardware adapter; the default is used");
+                None
+            }
+        }
     }
 }
 
