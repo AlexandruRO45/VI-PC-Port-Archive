@@ -709,6 +709,13 @@ extern "system" fn clear_rtv(
         ) else {
             return;
         };
+        if !crate::resource::allows_render_target(texture) {
+            tracing::warn!(
+                resource = ?record.resource,
+                "skipping ClearRenderTargetView: host texture lacks ALLOW_RENDER_TARGET"
+            );
+            return;
+        }
         // SAFETY: the title passes four floats (null is tolerated).
         let Some(color) = (unsafe { color.as_ref() }) else {
             return;
