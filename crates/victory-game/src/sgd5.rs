@@ -146,20 +146,23 @@ pub fn records(file: &[u8]) -> Vec<Record<'_>> {
 
 fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
     let u32_at = |o: usize| {
-        file.get(o..o + 4)
+        let end = o.checked_add(4)?;
+        file.get(o..end)
             .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize)
     };
     let n = u32_at(at.checked_sub(4)?)?;
-    let unpacked_size = u32_at(at + 8)?;
-    if u32_at(at + 4)? != n || n < 12 || unpacked_size > MAX_UNPACKED {
+    let unpacked_size = u32_at(at.checked_add(8)?)?;
+    if u32_at(at.checked_add(4)?)? != n || n < 12 || unpacked_size > MAX_UNPACKED {
         return None;
     }
     let nul = at.checked_sub(6)?;
+    let start = at.checked_add(12)?;
+    let end = at.checked_add(n)?;
     Some(Record {
         offset: at,
         name: (file[nul] == 0).then(|| name_before(file, nul)).flatten(),
         kind: file[at - 5],
-        packed: file.get(at + 12..at + n)?,
+        packed: file.get(start..end)?,
         unpacked_size,
     })
 }
@@ -208,12 +211,21 @@ impl<'a> Cursor<'a> {
         let all = self.bytes(n.checked_mul(size)?)?;
         Some(all.chunks_exact(size).collect())
     }
+    /// Skips `u32 n` items of `size` bytes without allocating, returning `n`.
+    fn skip_items(&mut self, size: usize) -> Option<usize> {
+        let n = self.u32()? as usize;
+        self.bytes(n.checked_mul(size)?)?;
+        Some(n)
+    }
     fn u32s(&mut self) -> Option<Vec<u32>> {
-        let items = self.items(4)?;
+        let n = self.u32()? as usize;
+        let all = self.bytes(n.checked_mul(4)?)?;
         Some(
-            items
+            all.as_chunks::<4>()
+                .0
                 .iter()
-                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .copied()
+                .map(u32::from_le_bytes)
                 .collect(),
         )
     }
@@ -289,28 +301,33 @@ fn effect<'a>(c: &mut Cursor<'a>, shaders: &[Vec<Shader<'a>>; 6]) -> Option<Effe
     let rasterizers = c.items(16)?;
     let depth_stencils = c.items(24)?;
     let blends = c.items(0x44)?;
-    c.items(0x24)?;
+    c.skip_items(0x24)?;
     let techniques = c.u32s()?;
     let passes = c.items(24)?;
-    let extra = c.u32s()?;
+    let extra = c.skip_items(4)?;
     // `size` is what the loader allocates for all this: a check on the parse.
-    let mut loaded = stages.iter().map(|s| s.len() + 1).sum::<usize>() * 8
-        + techniques.len() * 8
-        + passes.len() * 32
-        + extra.len() * 4;
+    let mut loaded = stages
+        .iter()
+        .try_fold(0usize, |acc, s| acc.checked_add(s.len().checked_add(1)?))?
+        .checked_mul(8)?
+        .checked_add(techniques.len().checked_mul(8)?)?
+        .checked_add(passes.len().checked_mul(32)?)?
+        .checked_add(extra.checked_mul(4)?)?;
     let strings = c.u32()?;
     if strings != SHARED {
         c.bytes(strings as usize)?;
-        loaded += strings as usize;
+        loaded = loaded.checked_add(strings as usize)?;
     }
     for _ in 0..2 {
         let n = c.u32()? as usize;
         c.bytes(n)?;
-        loaded += n;
+        loaded = loaded.checked_add(n)?;
     }
     let blocks = c.u32()? & 0x00FF_FFFF;
     if blocks != 0 {
-        loaded = loaded.next_multiple_of(8) + blocks as usize * 8;
+        loaded = loaded
+            .checked_next_multiple_of(8)?
+            .checked_add((blocks as usize).checked_mul(8)?)?;
     }
     for _ in 0..blocks {
         match c.u32()? {
@@ -319,13 +336,13 @@ fn effect<'a>(c: &mut Cursor<'a>, shaders: &[Vec<Shader<'a>>; 6]) -> Option<Effe
             }
             n => {
                 c.bytes(n as usize)?;
-                loaded += n as usize;
+                loaded = loaded.checked_add(n as usize)?;
             }
         }
     }
     let n = c.u32()? as usize;
     let names = c.bytes(n)?;
-    (loaded + names.len() == size).then_some(())?;
+    (loaded.checked_add(names.len())? == size).then_some(())?;
 
     let state = |list: &[&'a [u8]], i: usize| list.get(i).copied();
     let pass = |p: &[u8]| -> Option<Pass<'a>> {
@@ -568,5 +585,16 @@ mod tests {
         let found = records(&file);
         assert_eq!(found.len(), 4);
         assert_eq!(found[1].name, Some("PS_a"));
+    }
+
+    #[test]
+    fn record_rejects_overflowing_length() {
+        let mut file = vec![0u8; 64];
+        let at = 16;
+        file[at - 4..at].copy_from_slice(&u32::MAX.to_le_bytes());
+        file[at..at + 4].copy_from_slice(&MARKER);
+        file[at + 4..at + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        file[at + 8..at + 12].copy_from_slice(&16u32.to_le_bytes());
+        assert!(records(&file).is_empty());
     }
 }
