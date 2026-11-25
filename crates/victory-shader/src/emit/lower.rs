@@ -10146,6 +10146,7 @@ mod tests {
             outputs,
             prims: vec![],
             mesh_stride: 0,
+            view_marks: false,
         })
         .map(|_| ())
     }
