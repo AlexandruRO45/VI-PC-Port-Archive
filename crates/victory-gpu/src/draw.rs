@@ -369,13 +369,9 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
-/// Frames after a whole upload of a texture picked by index at which its
-/// memory is looked at again, each counted from the look before.
-const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
-
-/// Looks at uploaded textures picked by index that found the memory as it
-/// was, and that found it changed (uploaded again), since the start.
+/// Content checks that found a texture unchanged, or queued a fresh upload.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+pub(crate) static HEAP_TEXTURE_RECHECK_US: AtomicU64 = AtomicU64::new(0);
 
 /// Whether textures picked by index are looked at again after their upload
 /// (`VICTORY_HEAP_RECHECK=0`: no).
@@ -1479,12 +1475,9 @@ impl State {
     /// per frame and in all; the rest waits for later lists and frames.
     /// The most recently written slots first (`TextureQueue::due`); slots
     /// draws read through tables are not in the queue.
-    /// shortcut: uploaded once, and again only when the title rewrites the
-    /// slot. A placed texture not all mapped yet is uploaded with what is
-    /// there and looked at again (1, 2, 4, ... frames later, at most about
-    /// a second): uploaded again when more of it is mapped. Pages mapped
-    /// in place of others, and contents changed with no descriptor write,
-    /// are missed (hook the page-mapping events for those).
+    /// A partly mapped texture is uploaded again when more of it is mapped.
+    /// Complete uploads also get a limited number of timestamped content
+    /// checks for writes that do not update the descriptor.
     /// `VICTORY_HEAP_TEXTURES=0` turns it off.
     fn heap_textures(
         &self,
@@ -1521,6 +1514,26 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
+        if heap_recheck() {
+            // Sample at most one batch per heap and frame. Check time before
+            // each sample; unprocessed entries stay due for the next frame.
+            const RECHECK_LIMIT: usize = 256;
+            const RECHECK_TIME: std::time::Duration = std::time::Duration::from_millis(2);
+            let start = std::time::Instant::now();
+            let rechecks = host.texture_rechecks_due(frame, start, RECHECK_LIMIT);
+            if !rechecks.is_empty() {
+                for check in rechecks {
+                    if start.elapsed() >= RECHECK_TIME {
+                        break;
+                    }
+                    let changed = crate::texture::fingerprint(check.address, check.bytes) != check.fingerprint;
+                    if host.finish_texture_recheck(check, changed, frame, std::time::Instant::now()) {
+                        HEAP_TEXTURES_RECHECKED[usize::from(changed)].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                HEAP_TEXTURE_RECHECK_US.fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        }
         let (due, census) = host.texture_slots_due(frame, 4096);
         HEAP_PHASES[2].fetch_add(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
         let phase = |i: usize, since: std::time::Instant| {
@@ -1579,29 +1592,6 @@ impl State {
             // every 120 frames, changed or not; and asked by its first
             // page alone, one whose first page is the one missing counted
             // as not there.)
-            // A slot uploaded whole is looked at again a few times
-            // (`RECHECK_FRAMES`): the title writes a texture's view, and
-            // may fill the texture's memory itself only afterwards, with
-            // no descriptor write and nothing from the runtime to tell of
-            // it. The host copy then kept what the memory held at the
-            // first look for the rest of the run. The look reads 48 KiB;
-            // only a changed texture is uploaded again.
-            // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
-            let rechecked = host.texture_slot_checked(index, write);
-            if let Some((at, len, print, looks, uploaded)) = rechecked {
-                if crate::texture::fingerprint(at, len) == print {
-                    HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(
-                                index, write, frame + wait, (at, len), print, looks + 1, uploaded,
-                            )
-                        }
-                        None => host.texture_slot_done(index, write, None),
-                    }
-                    continue;
-                }
-            }
             let mut partly = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
@@ -1721,16 +1711,10 @@ impl State {
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             HEAP_PHASES[8].fetch_add(1, Ordering::Relaxed);
-            if bytes > 0 && rechecked.is_some() {
-                HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
-            }
             match memory {
-                // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(
-                        index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame,
-                    );
+                    host.texture_slot_uploaded(index, write, (at, len), print, std::time::Instant::now());
                 }
                 None => host.texture_slot_done(index, write, again),
             }

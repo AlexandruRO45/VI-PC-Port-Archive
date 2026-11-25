@@ -5,7 +5,9 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -341,11 +343,21 @@ struct Waiting {
     /// Bytes of its memory that were mapped when it was last uploaded
     /// without all of it there; 0: not uploaded yet.
     mapped: u64,
-    /// For a slot uploaded whole and looked at again
-    /// ([`TextureQueue::recheck`]): where its memory is (address, bytes),
-    /// the fingerprint it had at the upload, how many looks found it
-    /// unchanged, and the frame of the upload. A fingerprint of 0: none.
-    checked: (u64, u64, u64, u8, u64),
+    /// Content checks already spent on this descriptor write.
+    checks: u8,
+}
+
+/// Spacing in wall time so streaming still gets checked during slow frames.
+const TEXTURE_CHECK_MS: [u64; 5] = [150, 400, 1_350, 4_000, 13_000];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TextureRecheck {
+    index: u32,
+    write: u64,
+    pub(crate) address: u64,
+    pub(crate) bytes: u64,
+    pub(crate) fingerprint: u64,
+    checks: u8,
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -353,7 +365,11 @@ struct Waiting {
 /// which order (no host heap needed, so it is tested without one).
 #[derive(Default)]
 pub(crate) struct TextureQueue {
-    slots: std::collections::BTreeMap<u32, Waiting>,
+    slots: BTreeMap<u32, Waiting>,
+    /// Ordered separately so `due()` only scans slots that need uploads.
+    rechecks: BTreeMap<(Instant, u32), TextureRecheck>,
+    deadlines: HashMap<u32, Instant>,
+    last_recheck_frame: Option<u64>,
     writes: u64,
 }
 
@@ -363,16 +379,25 @@ impl TextureQueue {
     /// the host slot from a view the queue may hold already, which then
     /// stays as it is.
     fn written(&mut self, index: u32, frame: u64, due: u64, seen: bool) {
-        if seen && self.slots.contains_key(&index) {
+        if seen && (self.slots.contains_key(&index) || self.deadlines.contains_key(&index)) {
             return;
         }
+        self.cancel_recheck(index);
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checks: 0 });
     }
 
-    fn remove(&mut self, index: u32) {
-        self.slots.remove(&index);
+    fn remove(&mut self, index: u32) -> bool {
+        let pending = self.slots.remove(&index).is_some();
+        self.cancel_recheck(index) || pending
+    }
+
+    fn cancel_recheck(&mut self, index: u32) -> bool {
+        let Some(due) = self.deadlines.remove(&index) else {
+            return false;
+        };
+        self.rechecks.remove(&(due, index)).is_some()
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
@@ -470,7 +495,6 @@ impl TextureQueue {
         if let Some(w) = self.same(index, write) {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
-            w.checked = (0, 0, 0, 0, 0);
         }
     }
 
@@ -479,26 +503,60 @@ impl TextureQueue {
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
-            w.checked = (0, 0, 0, 0, 0);
         }
     }
 
-    /// Slot `index` was uploaded whole from memory `at` (address, bytes)
-    /// with fingerprint `print`: looked at again from frame `due`, for a
-    /// title that fills a texture's memory after it wrote the view (the
-    /// `looks`-th such look; `uploaded` is the upload's frame).
-    #[allow(clippy::too_many_arguments)]
-    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
-        if let Some(w) = self.same(index, write) {
-            (w.due, w.looks, w.mapped) = (due, 0, 0);
-            w.checked = (at.0, at.1, print, looks, uploaded);
+    /// An upload finished. Watch its source for late streaming writes, using
+    /// the balance of this slot generation's original check budget.
+    fn uploaded(&mut self, index: u32, write: u64, at: (u64, u64), fingerprint: u64, now: Instant) {
+        let Some(waiting) = self.same(index, write).copied() else {
+            return;
+        };
+        self.slots.remove(&index);
+        let (address, bytes) = at;
+        self.schedule_recheck(TextureRecheck {
+            index, write, address, bytes, fingerprint, checks: waiting.checks,
+        }, now);
+    }
+
+    fn schedule_recheck(&mut self, check: TextureRecheck, now: Instant) {
+        if let Some(&ms) = TEXTURE_CHECK_MS.get(usize::from(check.checks)) {
+            let due = now + Duration::from_millis(ms);
+            self.deadlines.insert(check.index, due);
+            self.rechecks.insert((due, check.index), check);
         }
     }
 
-    /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
-    /// waiting for such a look.
-    fn checked(&self, index: u32, write: u64) -> Option<(u64, u64, u64, u8, u64)> {
-        self.slots.get(&index).filter(|w| w.write == write && w.checked.2 != 0).map(|w| w.checked)
+    fn due_rechecks(&mut self, frame: u64, now: Instant, max: usize) -> Vec<TextureRecheck> {
+        if self.last_recheck_frame == Some(frame) {
+            return Vec::new();
+        }
+        let due: Vec<_> = self.rechecks.range(..=(now, u32::MAX))
+            .take(max).map(|(_, check)| *check).collect();
+        if !due.is_empty() {
+            self.last_recheck_frame = Some(frame);
+        }
+        due
+    }
+
+    /// Complete a sample taken without the lock. A descriptor rewrite or a
+    /// new mapping cancels its old sample, even if the bytes changed.
+    fn finish_recheck(&mut self, mut check: TextureRecheck, changed: bool, frame: u64, now: Instant) -> bool {
+        let current = self.deadlines.get(&check.index)
+            .and_then(|&due| self.rechecks.get(&(due, check.index)));
+        if current != Some(&check) {
+            return false;
+        }
+        self.cancel_recheck(check.index);
+        check.checks += 1;
+        if changed {
+            self.slots.insert(check.index, Waiting {
+                due: frame, written: frame, write: check.write, looks: 0, mapped: 0, checks: check.checks,
+            });
+        } else {
+            self.schedule_recheck(check, now);
+        }
+        true
     }
 
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
@@ -506,10 +564,11 @@ impl TextureQueue {
     /// written now, whatever was known of it (a pass at work on it does
     /// not take it out).
     fn changed(&mut self, index: u32, frame: u64, due: u64) {
+        self.cancel_recheck(index);
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checks: 0 });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -904,25 +963,25 @@ impl HostHeap {
         }
     }
 
-    /// Title slot `index` was uploaded whole: see [`TextureQueue::recheck`].
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn texture_slot_recheck(
+    /// Title slot `index` was uploaded whole: see [`TextureQueue::uploaded`].
+    pub(crate) fn texture_slot_uploaded(
         &self,
         index: u32,
         write: u64,
-        due: u64,
         at: (u64, u64),
-        print: u64,
-        looks: u8,
-        uploaded: u64,
+        fingerprint: u64,
+        now: Instant,
     ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded);
+        textures.uploaded(index, write, at, fingerprint, now);
     }
 
-    /// See [`TextureQueue::checked`].
-    pub(crate) fn texture_slot_checked(&self, index: u32, write: u64) -> Option<(u64, u64, u64, u8, u64)> {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index, write)
+    pub(crate) fn texture_rechecks_due(&self, frame: u64, now: Instant, max: usize) -> Vec<TextureRecheck> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).due_rechecks(frame, now, max)
+    }
+
+    pub(crate) fn finish_texture_recheck(&self, check: TextureRecheck, changed: bool, frame: u64, now: Instant) -> bool {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).finish_recheck(check, changed, frame, now)
     }
 
     /// Nothing to upload at title slot `index` now (its memory is not
@@ -1028,7 +1087,7 @@ impl HostHeap {
             stamp.store(now | TABLED_READ, Relaxed);
             if tabled_out() {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.slots.remove(&index).is_some() {
+                if textures.remove(index) {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
             }
@@ -2440,29 +2499,74 @@ mod tests {
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
     }
 
-    /// The queue of textures picked by index serves the slots looked at
-    /// before first, then the newest write and the oldest in turns; a
-    /// slot whose memory is not there is looked at again after
-    /// 1, 2, 4 frames up to the limit; and what the pass reports about a
-    /// slot written again meanwhile is dropped.
     #[test]
     fn a_texture_recheck_cannot_complete_a_rewritten_slot() {
         let mut queue = TextureQueue::default();
+        let now = Instant::now();
         queue.written(7, 1, 1, false);
         let write = queue.due(1, 1).0[0].1;
-        queue.recheck(7, write, 5, (0x10000, 4096), 123, 0, 1);
-        assert!(queue.due(4, 1).0.is_empty());
-        assert_eq!(queue.due(5, 1).0, [(7, write)]);
-        assert_eq!(queue.checked(7, write), Some((0x10000, 4096, 123, 0, 1)));
+        queue.uploaded(7, write, (0x10000, 4096), 123, now);
+        let due = now + Duration::from_millis(TEXTURE_CHECK_MS[0]);
+        let check = queue.due_rechecks(5, due, 1)[0];
 
+        // Seeing the same slot does not invalidate the sample. A real write does.
+        queue.written(7, 5, 5, true);
+        assert!(queue.slots.is_empty());
         queue.changed(7, 5, 5);
-        queue.done(7, write);
+        assert!(!queue.finish_recheck(check, true, 6, due));
         let next_write = queue.due(5, 1).0[0].1;
         assert_ne!(next_write, write);
-        assert_eq!(queue.checked(7, write), None);
-        assert_eq!(queue.checked(7, next_write), None);
+        assert!(queue.rechecks.is_empty());
     }
 
+    #[test]
+    fn texture_rechecks_have_a_separate_deadline_and_frame_budget() {
+        let mut queue = TextureQueue::default();
+        let now = Instant::now();
+        for index in 1..=3 {
+            queue.written(index, 1, 1, false);
+            let write = queue.due(1, 1).0[0].1;
+            queue.uploaded(index, write, (0x10000, 4096), 123, now + Duration::from_millis(u64::from(index)));
+        }
+        queue.written(4, 2, 2, false);
+        let deadline = now + Duration::from_millis(TEXTURE_CHECK_MS[0]);
+        assert!(queue.due_rechecks(2, deadline, 2).is_empty());
+        assert_eq!(queue.due(u64::MAX, 1).1, [1, 1, 0, 0, u64::MAX - 2]);
+        assert_eq!(queue.due(2, 1).0[0].0, 4);
+
+        let now = deadline + Duration::from_millis(10);
+        let checks = queue.due_rechecks(2, now, 2);
+        assert_eq!(checks.iter().map(|check| check.index).collect::<Vec<_>>(), [1, 2]);
+        assert!(queue.due_rechecks(2, now, 2).is_empty());
+        assert!(queue.finish_recheck(checks[0], false, 2, now));
+        assert_eq!(queue.due_rechecks(3, now, 4).iter()
+            .map(|check| check.index).collect::<Vec<_>>(), [2, 3]);
+        assert!(queue.remove(2));
+        assert!(!queue.finish_recheck(checks[1], true, 3, now));
+        assert!(!queue.deadlines.contains_key(&2));
+    }
+
+    #[test]
+    fn changing_contents_do_not_restart_the_texture_check_budget() {
+        let mut queue = TextureQueue::default();
+        let mut now = Instant::now();
+        queue.written(7, 0, 0, false);
+        let write = queue.due(0, 1).0[0].1;
+        queue.uploaded(7, write, (0x10000, 4096), 1, now);
+        for (step, ms) in TEXTURE_CHECK_MS.into_iter().enumerate() {
+            let frame = step as u64 + 1;
+            now += Duration::from_millis(ms);
+            let check = queue.due_rechecks(frame, now, 1)[0];
+            assert!(queue.finish_recheck(check, true, frame, now));
+            assert_eq!(queue.due(frame, 1).0, [(7, write)]);
+            queue.uploaded(7, write, (0x10000, 4096), frame + 1, now);
+        }
+        assert!(queue.rechecks.is_empty());
+        assert!(queue.deadlines.is_empty());
+        assert!(queue.slots.is_empty());
+    }
+
+    /// The upload queue serves retries first, then alternates the newest and oldest writes.
     #[test]
     fn the_texture_queue_serves_the_newest_writes_first() {
         let mut q = TextureQueue::default();
