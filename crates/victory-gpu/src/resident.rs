@@ -292,21 +292,31 @@ fn holder(from: u64, to: u64) -> Option<Arc<Resident>> {
     found
 }
 
+/// What [`find`] gives a title buffer.
+pub(crate) struct Found {
+    pub(crate) resident: Arc<Resident>,
+    /// The bytes from the resident's first byte to the buffer's.
+    pub(crate) bias: u64,
+    /// Residents the new one was made over and replaces: the caller lets
+    /// go of the buffers in them, whose next ask finds the new one.
+    pub(crate) replaced: Vec<Arc<Resident>>,
+}
+
 /// The resident title buffer `[start, start + len)` is in: the one that
 /// holds its 64 KiB pages if there is one (any buffer); else, with `new`
 /// (a buffer that would get a copy in the card's memory), one made for
-/// its pages if they lie in an arena and the budget has room. With the
-/// bytes from the resident's first byte to `start`. `None`: as before
+/// its pages if they lie in an arena and the budget has room ([`make_over`]:
+/// over the residents it overlaps too, if it can be). `None`: as before
 /// (in place, or a copy).
-pub(crate) fn find(start: u64, len: u64, new: bool) -> Option<(Arc<Resident>, u64)> {
+pub(crate) fn find(start: u64, len: u64, new: bool) -> Option<Found> {
     if !on() {
         return None;
     }
     let from = start & !(PAGE - 1);
     let to = start.checked_add(len.max(1))?.checked_next_multiple_of(PAGE)?;
-    if let Some(r) = holder(from, to) {
-        let bias = start - r.start;
-        return Some((r, bias));
+    if let Some(resident) = holder(from, to) {
+        let bias = start - resident.start;
+        return Some(Found { resident, bias, replaced: Vec::new() });
     }
     if !new {
         return None;
@@ -315,7 +325,7 @@ pub(crate) fn find(start: u64, len: u64, new: bool) -> Option<(Arc<Resident>, u6
     if !ready(&host.device) {
         return None;
     }
-    let made = make(from, to - from, most(), crate::arena::resolve_waiting, &mut |bytes| {
+    let (resident, replaced) = make_over(from, to, most(), &mut crate::arena::resolve_waiting, &mut |bytes| {
         if let Some([budget, used, ..]) = host.video_memory()
             && used + 2 * bytes > budget / 10 * 8
         {
@@ -324,11 +334,38 @@ pub(crate) fn find(start: u64, len: u64, new: bool) -> Option<(Arc<Resident>, u6
         host.uav_buffer(bytes)
     })?;
     tracing::info!(
-        start = format_args!("{from:#x}"),
-        mb = (to - from) >> 20,
+        start = format_args!("{:#x}", resident.start),
+        mb = resident.len >> 20,
+        replaced = replaced.len(),
         "a title buffer is resident in the card's memory, fed from its arena (VICTORY_INPLACE=4)"
     );
-    Some((made, start - from))
+    let bias = start - resident.start;
+    Some(Found { resident, bias, replaced })
+}
+
+/// A resident for title memory `[from, to)` (on 64 KiB) that no resident
+/// holds. Residents it overlaps become one with it: the new resident is
+/// made over all of them, if that lies in one arena within the budget,
+/// and takes their place in the registry (they stay alive, and in step,
+/// for what holds them: [`cross_mark`]). Else it is made over `[from, to)`
+/// alone. With the residents it replaces.
+fn make_over(
+    from: u64,
+    to: u64,
+    most: u64,
+    resolve: &mut dyn FnMut(u64, u64) -> Option<crate::arena::Resolved>,
+    buffer: &mut dyn FnMut(u64) -> Option<ID3D12Resource>,
+) -> Option<(Arc<Resident>, Vec<Arc<Resident>>)> {
+    let over: Vec<Arc<Resident>> =
+        lock(&RANGES).range(..to).filter_map(|(_, w)| w.upgrade()).filter(|r| r.overlaps(from, to) && r.still_good()).collect();
+    if !over.is_empty() {
+        let (lo, hi) = over.iter().fold((from, to), |(a, b), r| (a.min(r.start), b.max(r.start + r.len)));
+        if let Some(union) = make(lo, hi - lo, most, &mut *resolve, &mut *buffer) {
+            lock(&RANGES).retain(|_, w| !over.iter().any(|r| std::ptr::eq(w.as_ptr(), Arc::as_ptr(r))));
+            return Some((union, over));
+        }
+    }
+    Some((make(from, to - from, most, resolve, buffer)?, Vec::new()))
 }
 
 /// A resident for title memory `[from, from + bytes)` (on 64 KiB), if the
@@ -339,7 +376,7 @@ fn make(
     from: u64,
     bytes: u64,
     most: u64,
-    resolve: impl FnOnce(u64, u64) -> Option<crate::arena::Resolved>,
+    resolve: &mut dyn FnMut(u64, u64) -> Option<crate::arena::Resolved>,
     buffer: &mut dyn FnMut(u64) -> Option<ID3D12Resource>,
 ) -> Option<Arc<Resident>> {
     // The merge counts in 32 bits from `R`'s first byte.
@@ -1125,12 +1162,12 @@ mod tests {
         let mut arenas = crate::arena::Arenas::default();
         let mut buffer = |bytes| committed(&device, D3D12_HEAP_TYPE_DEFAULT, bytes).ok();
         // Not reported committed: no arena, no resident.
-        let none = make(start, n, u64::MAX, |at, len| arenas.resolve_with(&device, at, len, u64::MAX, u64::MAX, &mut |_| ()), &mut buffer);
+        let none = make(start, n, u64::MAX, &mut |at, len| arenas.resolve_with(&device, at, len, u64::MAX, u64::MAX, &mut |_| ()), &mut buffer);
         assert!(none.is_none());
         assert!(holder(start, start + k).is_none(), "nothing registered");
         // In an arena: a resident, registered.
         arenas.committed(start, n);
-        let outer = make(start, n, u64::MAX, |at, len| arenas.resolve_with(&device, at, len, u64::MAX, u64::MAX, &mut |_| ()), &mut buffer).expect("a resident");
+        let outer = make(start, n, u64::MAX, &mut |at, len| arenas.resolve_with(&device, at, len, u64::MAX, u64::MAX, &mut |_| ()), &mut buffer).expect("a resident");
         assert_eq!((outer.start, outer.len), (start, n));
         let inner = holder(start + k, start + 3 * k).expect("in its pages");
         assert!(Arc::ptr_eq(&inner, &outer));
@@ -1151,5 +1188,43 @@ mod tests {
         assert!(holder(start, start + k).is_none(), "forgotten when let go");
         drop((outer, inner, other, live));
         drop(arenas);
+    }
+
+    /// Residents that overlap become one: a big buffer whose pages hold a
+    /// resident made before it (an inner buffer used first) and more gets
+    /// one resident over both, which takes the older one's place; one over
+    /// the gap between two residents joins all three. The replaced ones
+    /// stay alive for what holds them, and in step with the new one.
+    #[test]
+    fn warp_overlapping_residents_become_one() {
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        let Some((base, _at)) = title(&device, 8) else { return };
+        let (k, start) = (K64 as u64, base as u64);
+        let mut arenas = crate::arena::Arenas::default();
+        arenas.committed(start, 8 * k);
+        let mut resolve = |at, len| arenas.resolve_with(&device, at, len, u64::MAX, u64::MAX, &mut |_| ());
+        let mut buffer = |bytes| committed(&device, D3D12_HEAP_TYPE_DEFAULT, bytes).ok();
+        let mut over = |from: u64, to: u64| make_over(start + from * k, start + to * k, u64::MAX, &mut resolve, &mut buffer).expect("a resident");
+        let (inner, replaced) = over(1, 2);
+        assert!(replaced.is_empty());
+        let (right, replaced) = over(5, 6);
+        assert!(replaced.is_empty());
+        let (outer, replaced) = over(0, 3);
+        assert_eq!((outer.start, outer.len), (start, 3 * k));
+        assert!(matches!(replaced.as_slice(), [r] if Arc::ptr_eq(r, &inner)));
+        assert!(Arc::ptr_eq(&holder(start + k, start + 2 * k).unwrap(), &outer), "the older one's pages find the new one");
+        let (all, replaced) = over(2, 6);
+        assert_eq!((all.start, all.len), (start, 6 * k));
+        assert_eq!(replaced.len(), 2);
+        assert!(replaced.iter().any(|r| Arc::ptr_eq(r, &outer)) && replaced.iter().any(|r| Arc::ptr_eq(r, &right)));
+        assert!(Arc::ptr_eq(&holder(start + 5 * k, start + 6 * k).unwrap(), &all));
+        assert!(Arc::ptr_eq(&holder(start, start + k).unwrap(), &all));
+        // Written through the new one: the page goes up to a replaced one.
+        let live = [all.clone(), inner.clone()];
+        let _ = (all.take(), inner.take());
+        assert_eq!(cross_mark(&live, &[(Some(&*all), start + k + 4, start + k + 8)]), k);
+        assert_eq!(inner.take(), [(0, k)]);
+        forget(start, start + 8 * k, false);
+        drop((inner, right, outer, all, live, replaced));
     }
 }

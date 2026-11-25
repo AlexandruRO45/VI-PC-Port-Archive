@@ -3568,10 +3568,20 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let big = cards() && size >= card_limits().0;
         // With residents (`crate::resident`, `VICTORY_INPLACE=4`): a buffer
         // in a resident's pages is that resident, whatever its size; a big
-        // one whose memory lies in an arena is made one.
-        if let Some((resident, bias)) = crate::resident::find(key.0, len, big) {
-            entry.shadow = Some(Arc::new(Shadow::resident(resident, bias, key.0, len)));
-            return entry.shadow.clone();
+        // one whose memory lies in an arena is made one. The buffers in
+        // residents a new one replaces are let go: their next ask finds it.
+        if let Some(found) = crate::resident::find(key.0, len, big) {
+            if !found.replaced.is_empty() {
+                for other in map.values_mut() {
+                    let replaced = |s: &Shadow| s.in_resident().is_some_and(|r| found.replaced.iter().any(|x| Arc::ptr_eq(x, r)));
+                    if other.shadow.as_deref().is_some_and(replaced) {
+                        crate::host::retire(other.shadow.take());
+                    }
+                }
+            }
+            let shadow = Arc::new(Shadow::resident(found.resident, found.bias, key.0, len));
+            map.get_mut(&key)?.shadow = Some(shadow.clone());
+            return Some(shadow);
         }
         // Small buffers stay copies below `VICTORY_INPLACE_MIN_KB` (T1).
         let small = len < crate::inplace::min_bytes();
