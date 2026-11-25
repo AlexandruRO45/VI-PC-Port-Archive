@@ -459,8 +459,12 @@ pub(crate) enum View {
 /// views, samplers) are kept for the run; they are bounded by the title's
 /// memory and sampler states.
 struct Views {
-    /// Each entry's view and generation.
-    list: Vec<(View, u32)>,
+    /// Each entry's view.
+    list: Vec<View>,
+    /// Each entry's generation: kept apart from the view, since a heap sync
+    /// asks about one for every slot of every page the title wrote
+    /// (hundreds of thousands a frame, one cache line each through `list`).
+    current: Vec<u32>,
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -469,6 +473,7 @@ struct Views {
 
 static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     list: Vec::new(),
+    current: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
@@ -496,11 +501,12 @@ fn record(handle: u64, view: View) {
         None => {
             let i = match views.free.pop() {
                 Some(i) => {
-                    views.list[i as usize].0 = view.clone();
+                    views.list[i as usize] = view.clone();
                     i
                 }
                 None => {
-                    views.list.push((view.clone(), 1));
+                    views.list.push(view.clone());
+                    views.current.push(1);
                     views.list.len() as u32 - 1
                 }
             };
@@ -511,7 +517,7 @@ fn record(handle: u64, view: View) {
             i
         }
     };
-    let generation = views.list[i as usize].1;
+    let generation = views.current[i as usize];
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     drop(views);
@@ -526,14 +532,14 @@ pub(crate) fn forget(resource: usize) {
         return;
     };
     for i in entries {
-        let (view, generation) = views.list[i as usize].clone();
+        let (view, generation) = (views.list[i as usize].clone(), views.current[i as usize]);
         // Entries freed through a view's other resource may hold another
         // view by now.
         if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
             continue;
         }
         views.index.remove(&view);
-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+        views.current[i as usize] = generation.wrapping_add(1).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
@@ -544,8 +550,8 @@ pub(crate) fn forget(resource: usize) {
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    let view = views.list.get(i as usize)?;
+    (*views.current.get(i as usize)? == generation).then(|| view.clone())
 }
 
 /// For each record (tag, index, generation), into `out`: whether it names a
@@ -554,10 +560,11 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 /// thousands of records a frame).
 fn views_current(records: &[[u32; 3]], out: &mut [bool]) {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let (current, views) = (&views.current, &views.list);
     for (record, out) in records.iter().zip(out.iter_mut()) {
         let &[tag, i, generation] = record;
-        *out = tag == VIEW_TAG
-            && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation);
+        // A record of a freed entry is stale: nothing views it any more.
+        *out = tag == VIEW_TAG && current.get(i as usize) == Some(&generation) && views.get(i as usize).is_some();
     }
 }
 
@@ -569,8 +576,8 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    let view = views.list.get(i as usize)?;
+    (tag == VIEW_TAG && views.current.get(i as usize) == Some(&generation)).then(|| view.clone())
 }
 
 /// A description of `N` words, if the title passes one.
