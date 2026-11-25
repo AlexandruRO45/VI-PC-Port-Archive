@@ -1025,12 +1025,26 @@ fn cpu_read_boundaries(runs: &[&HostList]) -> Vec<usize> {
     if runs.len() < 2 {
         return boundaries;
     }
+    let pages = |(at, len): (usize, usize)| {
+        let page = crate::watch::PAGE;
+        let base = at / page * page;
+        let end = at.saturating_add(len);
+        let padding = (page - end % page) % page;
+        (base, end.saturating_add(padding) - base)
+    };
     let mut may_withhold = Vec::new();
     for list in runs {
-        may_withhold.extend(list.deferred().copies.iter().filter_map(|step| match step {
-            &Step::GpuWrite(_, at, len, _, true) => Some((at, len)),
-            _ => None,
-        }));
+        for step in &list.deferred().copies {
+            match step {
+                // The addresses it writes are unknown until it runs.
+                Step::Memory(_) => return boundaries,
+                &Step::GpuWrite(_, at, len, _, true) if len != 0 => {
+                    // Withholding any bytes can suppress an entire marked page.
+                    may_withhold.push(pages((at, len)));
+                }
+                _ => {}
+            }
+        }
     }
     let mut writes = Vec::new();
     let mut computed = false;
@@ -1044,7 +1058,9 @@ fn cpu_read_boundaries(runs: &[&HostList]) -> Vec<usize> {
                 crate::watch::overlaps_writes((src, len), &writes)
             }
             _ => false,
-        }) && !writes.iter().any(|&write| crate::watch::overlaps_writes(write, &may_withhold)) {
+        }) && !writes.iter().any(|&(at, len)| {
+            len != 0 && crate::watch::overlaps_writes(pages((at, len)), &may_withhold)
+        }) {
             boundaries.push(i);
             writes.clear();
         }
@@ -3610,10 +3626,10 @@ mod withholding {
             assert!(std::env::var_os("VICTORY_TEST_ORDERING_REQUIRE_GPU").is_none());
             return;
         };
-        let title = crate::watch::tests::pool(1);
         let page = crate::watch::PAGE;
-        crate::shadow::register(title, title as u64, page as u64);
-        let shadow = crate::shadow::find(title as u64, page as u64).unwrap();
+        let title = crate::watch::tests::pool(2);
+        crate::shadow::register(title, title as u64, (2 * page) as u64);
+        let shadow = crate::shadow::find(title as u64, (2 * page) as u64).unwrap();
         let (producer, read, disjoint) = (
             host.new_list().unwrap(), host.new_list().unwrap(), host.new_list().unwrap(),
         );
@@ -3633,12 +3649,17 @@ mod withholding {
             }
             list
         };
-        let nonoverlapping = computed_write(title + 4);
+        let nonoverlapping = computed_write(title + page);
         assert_eq!(super::cpu_read_boundaries(&[&producer, &read, &nonoverlapping]), [1]);
+        let same_page = computed_write(title + 4);
+        assert!(super::cpu_read_boundaries(&[&producer, &read, &same_page]).is_empty());
         let overlapping = computed_write(title);
         assert!(super::cpu_read_boundaries(&[&producer, &read, &overlapping]).is_empty());
         assert!(super::cpu_read_boundaries(&[&overlapping, &read]).is_empty());
-        drop((producer, read, disjoint, nonoverlapping, overlapping, shadow));
+        let opaque = host.new_list().unwrap();
+        opaque.defer_memory(0);
+        assert!(super::cpu_read_boundaries(&[&producer, &read, &opaque]).is_empty());
+        drop((producer, read, disjoint, nonoverlapping, same_page, overlapping, opaque, shadow));
         crate::shadow::unregister(title, title as u64);
         crate::watch::tests::free(title);
     }
