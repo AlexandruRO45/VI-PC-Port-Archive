@@ -3958,6 +3958,7 @@ mod withholding {
     /// along.
     #[test]
     fn only_programs_using_title_memory_are_withheld() {
+        let _guard = crate::memory::tests::gpu_test_lock();
         use crate::watch::PAGE;
         let Some(host) = super::host() else {
             return; // no host GPU here
