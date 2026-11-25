@@ -218,7 +218,10 @@ fn dropped(p: &Pending) {
         .unwrap_or_else(|e| e.into_inner())
         .insert(p.key.clone())
     {
-        tracing::warn!(key = %p.key, "a draw's pipeline is not made within the frame's budget; the draw is skipped");
+        tracing::warn!(
+            key = %p.key,
+            "a draw's pipeline is not made within the frame's budget; its draw is skipped this frame — a pass drawn only once is lost"
+        );
     }
 }
 
@@ -419,5 +422,23 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A screen-classified pipeline (no inputs, no depth, triangle) is
+    /// routed to the screen pool, whose workers make it like any other
+    /// (here: no shaders, so no host pipeline — the answer is the same
+    /// shape, and the screen workers exist: the routing path ran).
+    #[test]
+    fn a_screen_pass_is_made_by_its_own_workers() {
+        let state = GraphicsState::screen_triangle_state();
+        assert!(state.screen_pass());
+        let p = Arc::new(Pending::new(Vec::new(), Some(Box::new(state))));
+        assert!(p.screen);
+        assert!(ready(&p).is_none());
+        let started = Instant::now();
+        while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        assert!(p.made.get().is_some());
     }
 }

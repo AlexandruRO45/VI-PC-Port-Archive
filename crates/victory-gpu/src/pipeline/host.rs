@@ -244,6 +244,20 @@ impl GraphicsState {
                 || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
             && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
     }
+
+    /// A screen-pass state like the lighting tables' fills, for tests of
+    /// the routing to the screen pool in `make`.
+    #[cfg(test)]
+    pub(crate) fn screen_triangle_state() -> GraphicsState {
+        GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            depth: D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: false.into(),
+                ..Default::default()
+            },
+            ..GraphicsState::default()
+        }
+    }
 }
 
 /// One input element: vertex buffer slot, byte offset, format.
