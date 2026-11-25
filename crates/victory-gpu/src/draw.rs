@@ -142,8 +142,8 @@ struct Window {
 const WINDOW_MOST: u64 = 128;
 
 /// Whether indirect draws that read record after record of one argument
-/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
-/// by default).
+/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`;
+/// off by default).
 ///
 /// The title issues its mesh draws one record per call, each from the next
 /// slot of the same argument buffer: 3,460 a frame in gameplay, and before
@@ -155,34 +155,12 @@ const WINDOW_MOST: u64 = 128;
 /// With the switch, when a draw asks for a record a short step after the
 /// one drawn before, the clamp takes that record and the ones that step
 /// apart after it (16, then twice as many each time, [`WINDOW_MOST`] at
-/// most, never past the buffer) into
-/// the list's scratch buffer in one pass, and the draws that follow read
-/// their record there with no pass of ours and no barrier (the scratch
-/// buffer stays readable as arguments until the next clamp), until one of
-/// these: a compute
-/// dispatch, a direct draw, an indirect call with a count buffer or more
-/// than one record, a draw whose shaders can store to buffers, a record
-/// outside the window, another host list.
-///
-/// The step is the one the title is seen to take, not the stride its
-/// command signature names: it draws one record a call, for which the
-/// stride means nothing, and the title names 12 bytes (the three
-/// words of a mesh dispatch) for records it keeps 32 bytes apart (2,173 of
-/// a frame's 3,349 mesh records in run 87's listed frame; 283 are 16
-/// apart, which ends a window). Walked by the named stride the window
-/// never opened: run 87, with the switch, still clamped 5,068 records a
-/// frame one at a time.
-///
-/// What it costs the guard against garbage records: nothing against a
-/// hang (every record is bounded as before and charged to the list's
-/// budget as before), but the budget is charged when a window is clamped,
-/// so also for records of the window's tail that are never drawn. Those
-/// hold garbage in this title (slots of all ones: run 93 spent lists'
-/// budgets on them and emptied the draws after), so in a window a record
-/// that asks for more than can run is left empty and charges nothing
-/// (`crate::indirect::bound_ahead`); a tail record that looks real is
-/// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
-/// before, at the next submission.
+/// most, never past the buffer) into a non-overlapping bump slice of the
+/// list's scratch buffer in one pass, and up to eight active windows stay
+/// readable across interleaved streams with no pass of ours and no barrier,
+/// until a compute dispatch, an indirect call with a count buffer or more
+/// than one record, a shader that can store to buffers, or another host
+/// list / reset.
 ///
 /// Off for the rest of the run from the first error the card's driver
 /// reports to the system (`crate::drvwatch`): every loss of the card in a

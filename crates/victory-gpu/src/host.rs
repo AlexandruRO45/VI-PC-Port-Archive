@@ -1878,16 +1878,13 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
-/// per range sent up.
+/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in
+/// a pass per range sent up.
 ///
-/// These passes are ours, they run on the card before every submission's
-/// lists, and no timing so far names them: each walks its 64 KiB pieces
-/// 16 bytes at a time, 4,096 steps one after the other, so a pass takes
-/// the time of one piece however few its pieces are. Run 102 sent up 514
-/// ranges a frame: 514 such passes. The same pieces are hashed either way;
-/// a piece hashed when it need not be, or not hashed when it should, costs
-/// a fetch that finds nothing and loses no shader write.
+/// Run 102 sent up 514 ranges a frame: 514 passes without coalescing.
+/// The same pieces are hashed either way; a piece hashed when it need
+/// not be, or not hashed when it should, costs a fetch that finds
+/// nothing and loses no shader write.
 ///
 /// `VICTORY_CARD_REHASH_RUNS=alt`: twenty seconds with, twenty without, in
 /// turn, each change said in the log: one run then measures both on the
