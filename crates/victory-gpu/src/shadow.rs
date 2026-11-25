@@ -2990,7 +2990,9 @@ impl Shadow {
         if !crate::host::walls_trace() {
             return;
         }
-        static SEEN: Mutex<(u64, BTreeMap<u64, (u64, u32, u64, u64)>)> = Mutex::new((0, BTreeMap::new()));
+        // Per buffer, by start: its length, pieces, bytes fetched, bytes written.
+        type Merged = BTreeMap<u64, (u64, u32, u64, u64)>;
+        static SEEN: Mutex<(u64, Merged)> = Mutex::new((0, BTreeMap::new()));
         let frame = crate::frame::current();
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
         if seen.0 != frame {
