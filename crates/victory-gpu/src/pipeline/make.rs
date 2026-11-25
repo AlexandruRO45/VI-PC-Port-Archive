@@ -305,7 +305,11 @@ fn work() {
         if p.taken.swap(true, Ordering::Relaxed) {
             continue; // its other queue entry
         }
+        #[cfg(feature = "diagnostics")]
+        let started = Instant::now();
         p.make();
+        #[cfg(feature = "diagnostics")]
+        super::timing::WORK.record(started.elapsed().as_micros() as u64);
         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
             drained();
         } else {
@@ -320,6 +324,8 @@ static PEAK: AtomicU64 = AtomicU64::new(0);
 /// The workers ran out of work: logged after a batch of 10 or more, and
 /// the cache saved (at most every 20 s).
 fn drained() {
+    #[cfg(feature = "diagnostics")]
+    super::timing::report();
     use super::library::{EARLY, LOADED, MADE};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
         tracing::info!(
