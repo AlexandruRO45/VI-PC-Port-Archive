@@ -141,10 +141,13 @@
 //!   dword 0 the address's low dword, 1 the high), and the host must have
 //!   a copy holding each such address.
 //! * **View addresses** ([`HostShader::view_addresses`]): a buffer
-//!   descriptor's dwords 0-1 read as numbers (the BVH SRV's base address)
-//!   come from the root SRV `t1` in [`MEMORY_SPACE`]: per resource-heap
-//!   index, two dwords, the buffer view's title address (high dword bits
-//!   0-15; stride bits 0), zeros for no buffer view.
+//!   descriptor's dwords 0-1 read as numbers (the BVH SRV's base address),
+//!   and an image descriptor's size, levels and type (dwords 2-4, loaded
+//!   whole; 2026-11-25) come from the root SRV `t1` in [`MEMORY_SPACE`]:
+//!   per resource-heap index, eight dwords in the descriptor's layout: a
+//!   buffer view's title address (high dword bits 0-15; stride bits 0), a
+//!   texture view's width, height, last level, type and depth as the host
+//!   view has them (base level and layer 0), zeros for anything else.
 //! * **Write marks** ([`HostShader::view_marks`], with
 //!   [`Options::view_marks`]; added 2026-11-25): every store or atomic
 //!   through an unordered buffer view from the heap (tables, the heap
@@ -185,6 +188,8 @@
 mod bitcode;
 #[cfg(all(test, windows))]
 mod bvh_tests;
+#[cfg(all(test, windows))]
+mod compute_sample_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
@@ -213,6 +218,10 @@ mod synthetic_tests;
 pub mod validator;
 #[cfg(all(test, windows))]
 mod valu_tests;
+#[cfg(all(test, windows))]
+mod uav_stage_tests;
+#[cfg(all(test, windows))]
+mod view_image_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;

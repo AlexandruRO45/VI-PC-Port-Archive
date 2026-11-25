@@ -172,6 +172,48 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// Per value: the joins taking it as an argument and the instructions
+/// (block, index) reading it, in program order.
+#[derive(Default)]
+struct ReadIndex {
+    phi_users: HashMap<Value, Vec<Value>>,
+    readers: HashMap<Value, Vec<(usize, usize)>>,
+}
+
+impl ReadIndex {
+    fn new(p: &Program) -> Self {
+        let mut r = ReadIndex::default();
+        for b in &p.blocks {
+            for phi in &b.phis {
+                for &a in &phi.args {
+                    let u = r.phi_users.entry(a).or_default();
+                    if !u.contains(&phi.value) {
+                        u.push(phi.value);
+                    }
+                }
+            }
+        }
+        for (bi, b) in p.blocks.iter().enumerate() {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                for &(_, v) in &inst.reads {
+                    let u = r.readers.entry(v).or_default();
+                    if u.last() != Some(&(bi, ii)) {
+                        u.push((bi, ii));
+                    }
+                }
+            }
+        }
+        r
+    }
+}
+
+/// The bits of an image descriptor's dwords 2 to 4 the view addresses hold
+/// as the host view has them (`victory_gpu`'s `image_words`): width and
+/// height (dword 2, not the resource-level bit), base and last level and
+/// type (dword 3, not the swizzle, tiling or block-compression swizzle),
+/// depth and base layer (dword 4).
+const IMAGE_BITS: [u32; 3] = [0x7FFF_FFFF, 0xF00F_F000, 0x1FFF_1FFF];
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -193,6 +235,8 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
+    /// Who reads each value, made on first use ([`Lower::data_bits`]).
+    read_index: std::cell::OnceCell<ReadIndex>,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
@@ -601,6 +645,7 @@ impl<'a> Lower<'a> {
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
+            read_index: std::cell::OnceCell::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -4524,11 +4569,16 @@ impl<'a> Lower<'a> {
 
     /// A descriptor load from a table or heap whose dwords the program only
     /// reads as numbers: the base address of a buffer view (dwords 0 and 1,
-    /// as a pointer to title memory: the BVH's address in its SRV). They
-    /// come from the host's view addresses, `t1` in
-    /// [`super::shader::MEMORY_SPACE`]: two dwords per heap index.
-    // shortcut: dword 1 holds the address bits only (stride and swizzle read
-    // 0); the other dwords stop the program when read; the table offset's
+    /// as a pointer to title memory: the BVH's address in its SRV), and of
+    /// an image descriptor loaded whole (8 dwords at a descriptor's start)
+    /// its size, levels and type (dwords 2 to 4, the bits in
+    /// [`IMAGE_BITS`], as the host view has them: the title's
+    /// `CS_RaytracingResolve` reads a heap image's width). They come from
+    /// the host's view addresses, `t1` in [`super::shader::MEMORY_SPACE`]:
+    /// 8 dwords per heap index, in the descriptor's layout.
+    // shortcut: dword 1 holds the address bits and an image's width bits
+    // only (stride, swizzle and format read 0); the other dwords, and other
+    // bits of dwords 2 to 4, stop the program when read; the table offset's
     // computed part is taken as whole descriptors (32-byte multiples).
     fn view_addresses(&mut self, inst: &Inst, site: Site, code: u8, count: u32) -> Result<(), Why> {
         const OTHER: Why = "a descriptor read only as data";
@@ -4540,13 +4590,18 @@ impl<'a> Lower<'a> {
             return Err("a descriptor read only as data");
         }
         let views = self.s.view_addresses_handle();
+        let image = count == 8 && a.offset % 32 == 0;
         for k in 0..count {
             let word = (a.offset / 4 + k) % 8;
-            let val = if word < 2 {
+            let known = |l: &Self| {
+                let used = inst.write(Reg::S(code + k as u8)).and_then(|v| l.data_bits(v));
+                (2..5).contains(&word) && used.is_some_and(|b| b & !IMAGE_BITS[word as usize - 2] == 0)
+            };
+            let val = if word < 2 || image && known(self) {
                 let index = self.heap_index(site, k as u8, false)?;
                 let c = self.cur;
-                let three = self.s.m.i32(3);
-                let at = self.s.m.bin(c, Bin::Shl, index, three);
+                let five = self.s.m.i32(5);
+                let at = self.s.m.bin(c, Bin::Shl, index, five);
                 let w = self.s.m.i32(4 * word);
                 let at = self.s.m.bin(c, Bin::Add, at, w);
                 Val::I32(self.raw_dword(views, at))
@@ -4558,6 +4613,94 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The bits of scalar value `v` its readers use (through the joins it
+    /// reaches), when each takes a constant field of it alone: a bit-field
+    /// extract, mask, shift or bit test by constants, or a funnel shift
+    /// (`v_alignbit_b32`) by a constant. `None` for any other reader
+    /// or none.
+    fn data_bits(&self, v: Value) -> Option<u32> {
+        let konst = |o: &Operand| match *o {
+            Operand::Literal(x) => Some(x),
+            Operand::Const(c @ 128..=192) => Some(u32::from(c) - 128),
+            _ => None,
+        };
+        let low = |w: u32| if w >= 32 { u32::MAX } else { (1u32 << w) - 1 };
+        let index = self.read_index.get_or_init(|| ReadIndex::new(self.x.p));
+        let mut set = vec![v];
+        let mut i = 0;
+        while i < set.len() {
+            for &u in index.phi_users.get(&set[i]).map_or(&[][..], Vec::as_slice) {
+                if !set.contains(&u) {
+                    set.push(u);
+                }
+            }
+            i += 1;
+        }
+        let mut at: Vec<(usize, usize)> = set
+            .iter()
+            .flat_map(|x| index.readers.get(x).map_or(&[][..], Vec::as_slice))
+            .copied()
+            .collect();
+        at.sort_unstable();
+        at.dedup();
+        if at.is_empty() {
+            return None;
+        }
+        let mut bits = 0u32;
+        for (b, k) in at {
+            let inst = &self.x.p.blocks[b].insts[k];
+            let src = match &inst.fields {
+                Fields::Sop { src, .. } => src,
+                Fields::Valu(f)
+                    if f.sdwa.is_none()
+                        && f.dpp.is_none()
+                        && f.neg | f.abs | f.opsel | f.omod == 0
+                        && !f.clamp =>
+                {
+                    &f.src
+                }
+                _ => return None,
+            };
+            // Which operands read `v` (a join of it counts as `v`).
+            let mine: Vec<bool> = src
+                .iter()
+                .map(|o| {
+                    matches!(*o, Operand::Scalar { code, dwords: 1 }
+                        if inst.read(Reg::S(code)).is_some_and(|x| set.contains(&x)))
+                })
+                .collect();
+            if !mine.contains(&true) {
+                return None;
+            }
+            let only = |i: usize| mine.iter().enumerate().all(|(j, &m)| m == (j == i));
+            let c = |i: usize| src.get(i).and_then(konst);
+            bits |= match inst.name() {
+                "s_bfe_u32" | "s_bfe_i32" if only(0) => {
+                    let f = c(1)?;
+                    low((f >> 16) & 0x7F) << (f & 31)
+                }
+                "v_bfe_u32" | "v_bfe_i32" if only(0) => low(c(2)? & 31) << (c(1)? & 31),
+                "s_and_b32" | "v_and_b32" if only(0) => c(1)?,
+                "s_and_b32" | "v_and_b32" if only(1) => c(0)?,
+                "s_lshr_b32" if only(0) => u32::MAX << (c(1)? & 31),
+                "v_lshrrev_b32" if only(1) => u32::MAX << (c(0)? & 31),
+                "s_lshl_b32" if only(0) => u32::MAX >> (c(1)? & 31),
+                "v_lshlrev_b32" if only(1) => u32::MAX >> (c(0)? & 31),
+                "s_bitcmp0_b32" | "s_bitcmp1_b32" if only(0) => 1 << (c(1)? & 31),
+                // ({src0, src1} >> src2): src0's low src2 bits, src1's
+                // bits from src2 up.
+                "v_alignbit_b32" if !mine[2] => {
+                    let s = c(2)? & 31;
+                    let hi = if mine[0] { low(s) } else { 0 };
+                    let lo = if mine[1] { u32::MAX << s } else { 0 };
+                    hi | lo
+                }
+                _ => return None,
+            };
+        }
+        Some(bits)
     }
 
     /// `s_load_dword*` from the program's constant table.

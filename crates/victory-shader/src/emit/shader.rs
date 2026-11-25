@@ -48,6 +48,7 @@ pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
@@ -90,6 +91,10 @@ pub(crate) struct Shader {
     pub mesh: Option<Mesh>,
     pub mesh_compute: bool,
     pub(super) mesh_uav: Option<V>,
+    /// An operation with implicit derivatives (sample, bias, comparison,
+    /// level of detail, derivatives) was emitted: a compute shader then
+    /// declares validator 1.8 (`finish`).
+    pub(super) derivatives: bool,
     /// A geometry shader taking triangles and emitting triangle strips of
     /// at most this many vertices (`rect`).
     pub gs: Option<u32>,
@@ -177,6 +182,7 @@ impl Shader {
             mesh: None,
             mesh_compute: false,
             mesh_uav: None,
+            derivatives: false,
             gs: None,
             user_data: 0,
             samplers: 0,
@@ -234,6 +240,11 @@ impl Shader {
         let f = self
             .m
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
+        // Sample, SampleBias, SampleCmp, CalculateLOD, DerivCoarseX/Y,
+        // DerivFineX/Y.
+        if matches!(opcode, 60 | 61 | 64 | 81 | 83..=86) {
+            self.derivatives = true;
+        }
         let mut all = vec![self.m.i32(opcode)];
         all.extend(args);
         let choice = self
@@ -381,8 +392,9 @@ impl Shader {
     }
 
     /// The handle of the view addresses (`t1` in [`MEMORY_SPACE`], a raw
-    /// buffer: per resource-heap index, a buffer view's title address as a
-    /// buffer descriptor's dwords 0 and 1), made in the entry block.
+    /// buffer: per resource-heap index, 8 dwords in the descriptor's layout:
+    /// a buffer view's title address as dwords 0 and 1, a texture view's
+    /// size, levels and type as dwords 1 to 4), made in the entry block.
     pub fn view_addresses_handle(&mut self) -> V {
         if let Some(h) = self.view_addresses {
             return h;
@@ -813,6 +825,17 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        // UAVs of the module (not the heap's) outside the pixel and compute
+        // stages, as the validator collects them: write marks in a vertex
+        // shader.
+        let module_uavs = !self.root_uavs.is_empty()
+            || self.memory_dirty.is_some()
+            || self.view_writes.is_some()
+            || self.mesh_uav.is_some();
+        let compute = self.threads.is_some() && self.mesh.is_none();
+        if module_uavs && !self.pixel && !compute {
+            self.flags |= flags::UAVS_EVERY_STAGE;
+        }
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
@@ -874,7 +897,18 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        // Validators before 1.8 take implicit derivatives (shader model 6.6)
+        // in pixel shaders only: compute shaders that sample declare 1.8, as
+        // DXC with `-validator-version 1.8` does (the title's archive census:
+        // 735 compute programs), with `PSV0` runtime info 3.
+        let validator_1_8 = self.derivatives && self.threads.is_some() && self.mesh.is_none();
+        let valver = if validator_1_8 {
+            let eight = i32c(&mut self, 8);
+            self.m.md_node(vec![Some(one), Some(eight)])
+        } else {
+            version
+        };
+        self.m.named_md("dx.valver", vec![valver]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
@@ -899,6 +933,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
@@ -945,6 +982,7 @@ impl Shader {
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
+            entry_name: validator_1_8,
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);

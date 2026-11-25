@@ -650,7 +650,7 @@ mod tests {
                         let mut roots = vec![(0, Root::Constants(user))];
                         if cs.view_addresses {
                             // Textures/samplers have no title buffer address.
-                            roots.push((1, Root::View { srv: true, data: vec![0; 2] }));
+                            roots.push((1, Root::View { srv: true, data: vec![0; 8] }));
                         }
                         let (_, records) = gpu.draw_with_mesh_compute_readback_roots(
                             &root, &pipeline, &draw, &fallback, &roots,
