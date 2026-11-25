@@ -7,11 +7,11 @@ e com 16 GB o jogo estoura (~8 GB) ao entrar no mundo.
 ## O que este branch tem (tudo opt-in)
 - `VICTORY_RGB9E5_AS_R11G11B10=1`: o Series S pede um alvo HDR 1920x1080 `R9G9B9E5_SHAREDEXP` como render target/UAV.
   O PC não aceita; ele vira `R11G11B10_FLOAT` (mesmo tamanho por pixel).
-- `VICTORY_SHOW_TARGET=3840x2160-f28`: o Series S compõe a tela final em planos que o LumeGX ainda não junta.
-  O buffer apresentado sai preto. Este contorno mostra o alvo 4K onde o jogo desenha. **Conhecido:** cutscenes
-  podem aparecer pretas (só legendas). A correção definitiva (compor os planos) está em andamento.
+- `VICTORY_PRESENT_PLANES=1`: o Series S apresenta 2 planos por quadro: cena 3D 1920x1080 (plane 0) e interface 3840x2160
+  (plane 1, menu/HUD/legendas). O hardware do Xbox junta os dois; o LumeGX agora compõe (interface por cima, alpha
+  premultiplicado). Antes só o plane 0 aparecia, e o menu ficava preto. Depuração: `VICTORY_PRESENT_PLANES_BLEND=over|opaque|ignore-alpha`.
 - `VICTORY_OWN_UPSCALER=1` (opcional): mantém o upscaler próprio do jogo em vez do FSR do Xbox.
-- Requer build **diag** (`--features diagnostics`), porque o `SHOW_TARGET` é um recurso de diagnóstico.
+- O script usa o build **diag** (`--features diagnostics`) para ter logs completos.
 
 ## Requisitos
 - Windows 10/11 e GPU DX12 (com ou sem mesh shaders).
@@ -28,7 +28,8 @@ copy victory.example.toml victory.toml   # opcional: ajuste os caminhos
 .\scripts\teste-series-s.ps1 -Game 'D:\seu\dump\game_scarlett_master.exe' -FidelityFx 'D:\ffx'
 ```
 O primeiro build leva alguns minutos. Na tela inicial, espere uns 30 s e aperte um botão do controle.
-O loading demora. No mundo, o fps é baixo: as cópias CPU<->GPU ainda não foram otimizadas.
+O loading demora. No mundo, o fps é baixo (0,1–0,3 fps): as cópias CPU<->GPU ainda não foram otimizadas. Texturas e objetos
+aparecem incompletos (streaming lento). Com 16 GB de RAM ocorre falta de memória (`0x8007000E`) aos ~5 min; com 32 GB o teto dobra.
 
 ## O que reportar
 - Até onde chegou (menu, loading, mundo, cutscene) e prints.

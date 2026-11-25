@@ -20,7 +20,7 @@ $Exe = Join-Path $Repo 'target\diag\victory.exe'
 
 # Correcoes do Series S (todas opt-in):
 $env:VICTORY_RGB9E5_AS_R11G11B10 = '1'            # alvo HDR R9G9B9E5 que o PC recusa -> R11G11B10
-$env:VICTORY_SHOW_TARGET         = '3840x2160-f28' # mostra o alvo onde a imagem esta (contorno temporario)
+$env:VICTORY_PRESENT_PLANES      = '1'             # compoe cena (plane 0) + interface (plane 1), como o display do Xbox
 if ($FidelityFx) { $env:VICTORY_FIDELITYFX_DIR = $FidelityFx }
 $env:VICTORY_NO_WATCHDOG = '1'
 $env:VICTORY_LOG         = 'info'
