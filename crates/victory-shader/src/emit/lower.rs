@@ -4331,7 +4331,7 @@ impl<'a> Lower<'a> {
                     self.s.root_srv_handle(rp.slot)
                 } else {
                     let src = Source::Built {
-                        address: a,
+                        address: *a,
                         bits: 0,
                         words: [0, 0],
                     };
@@ -4802,7 +4802,7 @@ impl<'a> Lower<'a> {
             .used
             .iter()
             .filter(|u| {
-                u.root == RootType::Table && u.user_data == rp.user_data && u.table_offset_dwords <= a_dword && a_dword < u.table_offset_dwords + u32::from(u.dwords)
+                u.root == RootType::Table && u.user_data == rp.user_data && u.table_offset_dwords <= a_dword && a_dword < u.table_offset_dwords + u32::from(u.dwords) && a_dword < u.table_offset_dwords + u32::from(u.dwords)
             })
             .max_by_key(|u| u.table_offset_dwords)
             .copied()?;
