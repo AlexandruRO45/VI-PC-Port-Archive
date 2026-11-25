@@ -3191,6 +3191,10 @@ mod helpers {
         });
         {
             let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+            // Offers of calls that are over go: a short call returns before
+            // every kept thread has looked at it, and what it left would be
+            // taken, found closed and put down ahead of this call's work.
+            jobs.retain(|j| !j.closed.load(Ordering::Relaxed));
             jobs.extend(std::iter::repeat_n(job.clone(), others.min(KEPT)));
         }
         MORE.notify_all();
