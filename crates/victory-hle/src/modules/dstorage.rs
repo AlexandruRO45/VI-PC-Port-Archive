@@ -2094,14 +2094,14 @@ mod tests {
         let plain = l.start().unwrap();
         assert_eq!(plain.request.options, 0);
         assert!(l.start().is_none());
-        l.finish(&plain, Ok(()));
+        let _ = l.finish(&plain, Ok(()));
         assert_eq!(l.lanes[&0].held.len(), 2);
         l.submit(0);
         let paged = l.start().unwrap();
         assert_eq!(paged.request.options, PAGE_DESTINATION);
         assert!(l.lanes[&0].held.is_empty());
         assert!(!l.lanes[&0].statuses.is_empty());
-        l.finish(&paged, Ok(()));
+        let _ = l.finish(&paged, Ok(()));
         assert!(l.lanes[&0].statuses.is_empty());
     }
 
