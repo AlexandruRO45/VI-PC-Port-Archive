@@ -381,6 +381,12 @@ fn few_atoms(bools: &crate::structure::Bools, b: Bool) -> bool {
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
 
+#[derive(Clone, Copy)]
+enum BufAccess {
+    Smem,
+    Mubuf { idxen: bool },
+}
+
 impl<'a> Tracer<'a> {
     fn new(
         p: &'a Program,
@@ -1075,9 +1081,18 @@ impl<'a> Tracer<'a> {
         {
             words = raw.to_vec();
         }
+        let buf_access = if !inst.name().contains("format") && dwords == 4 {
+            match inst.fields {
+                Fields::Smem { .. } => Some(BufAccess::Smem),
+                Fields::Buffer { idxen, .. } => Some(BufAccess::Mubuf { idxen }),
+                _ => None,
+            }
+        } else {
+            None
+        };
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
-        self.classify(&words, &mut Vec::new(), &mut known)
+        self.classify(&words, &mut Vec::new(), &mut known, buf_access)
     }
 
     /// The source of a descriptor's words; `joins` are the phi blocks
@@ -1087,11 +1102,12 @@ impl<'a> Tracer<'a> {
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
+        buf_access: Option<BufAccess>,
     ) -> Result<Source, &'static str> {
-        if let Some(source) = self.phi(words, joins, known)? {
+        if let Some(source) = self.phi(words, joins, known, buf_access)? {
             return Ok(source);
         }
-        if let Some(source) = self.select(words, joins, known)? {
+        if let Some(source) = self.select(words, joins, known, buf_access)? {
             return Ok(source);
         }
         let read = |w: &Term| match *w {
@@ -1102,7 +1118,7 @@ impl<'a> Tracer<'a> {
             // Read from the first active lane, as a waterfall loop does: the
             // dwords each lane holds.
             let lanes: Vec<Term> = sources.into_iter().map(Term::Value).collect();
-            return self.per_lane(&lanes, joins, known);
+            return self.per_lane(&lanes, joins, known, buf_access);
         }
         if words.iter().any(|w| read(w).is_some()) {
             return Err("a descriptor partly read from the first lane");
@@ -1118,6 +1134,11 @@ impl<'a> Tracer<'a> {
             return Ok(Source::Constant(consts));
         }
         if let Some(source) = self.loaded(words) {
+            return Ok(source);
+        }
+        if let Some(access) = buf_access
+            && let Some(source) = self.rewritten_buffer(words, access)
+        {
             return Ok(source);
         }
         if let [lo, hi, Term::Const(w2), Term::Const(w3)] = *words {
@@ -1160,6 +1181,7 @@ impl<'a> Tracer<'a> {
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
+        raw_buffer: Option<BufAccess>,
     ) -> Result<Option<Source>, &'static str> {
         let phi_of = |w: &Term| match *w {
             Term::Value(v) => self.phis[v.0 as usize],
@@ -1193,7 +1215,7 @@ impl<'a> Tracer<'a> {
                     None => *w,
                 })
                 .collect();
-            self.classify(&edge, joins, known)
+            self.classify(&edge, joins, known, raw_buffer)
         };
         let args = match taken.iter().position(|&t| t) {
             Some(first) if taken.contains(&false) => edge(first, joins, known).and_then(|live| {
@@ -1234,6 +1256,7 @@ impl<'a> Tracer<'a> {
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
+        raw_buffer: Option<BufAccess>,
     ) -> Result<Option<Source>, &'static str> {
         let picks: Vec<_> = words
             .iter()
@@ -1272,7 +1295,7 @@ impl<'a> Tracer<'a> {
         };
         let args = [true, false]
             .into_iter()
-            .map(|set| self.classify(&side(set), joins, known))
+            .map(|set| self.classify(&side(set), joins, known, raw_buffer))
             .collect::<Result<_, _>>();
         joins.pop();
         Ok(Some(Source::Select { scc, args: args? }))
@@ -1452,6 +1475,278 @@ impl<'a> Tracer<'a> {
         (x == d1).then_some([w0, d1, d2, d3])
     }
 
+    /// A loaded 4-dword non-format buffer descriptor whose stride/record/flag
+    /// fields were rewritten by pure SCC-free scalar ALU while preserving the
+    /// 48-bit base address (`w0` and `w1[15:0]`, and all of `w1` when the
+    /// instruction indexes by stride) and the addressing-mode bits (`w1[31]`
+    /// `SWIZZLE_ENABLE`, and `w3[23:21]` `ADD_TID_ENABLE` / `INDEX_STRIDE`).
+    fn rewritten_buffer(&self, words: &[Term], access: BufAccess) -> Option<Source> {
+        let [w0, w1, w2, w3] = *words else {
+            return None;
+        };
+        let Term::Value(v0) = w0 else {
+            return None;
+        };
+        let load = self.defs[v0.0 as usize]?;
+        let inst = self.inst(load);
+        if !inst.name().starts_with("s_load_") {
+            return None;
+        }
+        let first = inst.writes.iter().position(|w| w.1 == v0)?;
+        let slice = inst.writes.get(first..first + 4)?;
+        let allowed = [slice[0].1, slice[1].1, slice[2].1, slice[3].1];
+        let mut budget = 64u32;
+        let (w1_mask, w3_mask) = match access {
+            BufAccess::Smem => (0x0000_FFFF, 0),
+            BufAccess::Mubuf { idxen: false } => (0x8000_FFFF, 0x00E0_0000),
+            BufAccess::Mubuf { idxen: true } => (u32::MAX, 0x00E0_0000),
+        };
+        let w1_ok = if matches!(access, BufAccess::Mubuf { idxen: true }) {
+            w1 == Term::Value(allowed[1])
+        } else {
+            self.preserves_bits(w1, allowed[1], w1_mask, &mut budget)
+                && self.derived_from_load(w1, &allowed, &mut budget)
+        };
+        // shortcut: NUM_RECORDS (`w2`) may be rewritten, while the host view's
+        // bound stays the record count in memory.
+        if !w1_ok
+            || !self.derived_from_load(w2, &allowed, &mut budget)
+            || !self.preserves_bits(w3, allowed[3], w3_mask, &mut budget)
+            || !self.derived_from_load(w3, &allowed, &mut budget)
+        {
+            return None;
+        }
+        Some(Source::Loaded {
+            load,
+            first: first as u8,
+        })
+    }
+
+    /// Whether every bit in `mask` of `t` is guaranteed to be zero.
+    fn bits_zero(&self, t: Term, mask: u32, budget: &mut u32) -> bool {
+        if mask == 0 {
+            return true;
+        }
+        match t {
+            Term::Const(c) => c & mask == 0,
+            Term::Value(v) => {
+                if *budget == 0 {
+                    return false;
+                }
+                *budget -= 1;
+                let Some(inst) = self.def(v) else {
+                    return false;
+                };
+                if inst.writes.first().is_none_or(|w| w.1 != v) {
+                    return false;
+                }
+                let Fields::Sop { src, .. } = &inst.fields else {
+                    return false;
+                };
+                let term = |k: usize| src.get(k).and_then(|s| self.term(inst, s));
+                match inst.name() {
+                    "s_mov_b32" => term(0).is_some_and(|x| self.bits_zero(x, mask, budget)),
+                    "s_pack_ll_b32_b16" => {
+                        term(0).is_some_and(|x| self.bits_zero(x, mask & 0xFFFF, budget))
+                            && term(1)
+                                .is_some_and(|x| self.bits_zero(x, (mask >> 16) & 0xFFFF, budget))
+                    }
+                    "s_pack_lh_b32_b16" => {
+                        term(0).is_some_and(|x| self.bits_zero(x, mask & 0xFFFF, budget))
+                            && term(1)
+                                .is_some_and(|x| self.bits_zero(x, mask & 0xFFFF_0000, budget))
+                    }
+                    "s_lshl_b32" => match (term(0), term(1)) {
+                        (Some(Term::Const(a)), Some(Term::Const(n))) => {
+                            a.wrapping_shl(n & 31) & mask == 0
+                        }
+                        (_, Some(Term::Const(n))) => {
+                            let s = n & 31;
+                            s > 0 && (mask >> s) == 0
+                        }
+                        _ => false,
+                    },
+                    "s_lshr_b32" => match (term(0), term(1)) {
+                        (Some(Term::Const(a)), Some(Term::Const(n))) => {
+                            a.wrapping_shr(n & 31) & mask == 0
+                        }
+                        (_, Some(Term::Const(n))) => {
+                            let s = n & 31;
+                            s > 0 && (mask << s) == 0
+                        }
+                        _ => false,
+                    },
+                    "s_bfm_b32" => match (term(0), term(1)) {
+                        (Some(Term::Const(w)), Some(Term::Const(at))) => {
+                            let width = w & 31;
+                            let offset = at & 31;
+                            let ones = ((1u64 << width) - 1) << offset;
+                            (ones as u32) & mask == 0
+                        }
+                        (_, Some(Term::Const(at))) => {
+                            let offset = at & 31;
+                            offset > 0 && (mask >> offset) == 0
+                        }
+                        _ => false,
+                    },
+                    "s_and_b32" => {
+                        term(0).is_some_and(|x| self.bits_zero(x, mask, budget))
+                            || term(1).is_some_and(|x| self.bits_zero(x, mask, budget))
+                    }
+                    "s_andn2_b32" => {
+                        term(0).is_some_and(|x| self.bits_zero(x, mask, budget))
+                            || matches!(term(1), Some(Term::Const(c)) if (!c) & mask == 0)
+                    }
+                    "s_or_b32" | "s_xor_b32" => {
+                        term(0).is_some_and(|x| self.bits_zero(x, mask, budget))
+                            && term(1).is_some_and(|x| self.bits_zero(x, mask, budget))
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    /// Whether `t` preserves every bit of `orig` selected by `mask`.
+    fn preserves_bits(&self, t: Term, orig: Value, mask: u32, budget: &mut u32) -> bool {
+        if mask == 0 || t == Term::Value(orig) {
+            return true;
+        }
+        let Term::Value(v) = t else {
+            return false;
+        };
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        let Some(inst) = self.def(v) else {
+            return false;
+        };
+        if inst.writes.first().is_none_or(|w| w.1 != v) {
+            return false;
+        }
+        let Fields::Sop { dst, src, .. } = &inst.fields else {
+            return false;
+        };
+        let term = |k: usize| src.get(k).and_then(|s| self.term(inst, s));
+        match inst.name() {
+            "s_mov_b32" => term(0).is_some_and(|x| self.preserves_bits(x, orig, mask, budget)),
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" if mask & !0xFFFF == 0 => {
+                term(0).is_some_and(|x| self.preserves_bits(x, orig, mask, budget))
+            }
+            "s_and_b32" => match (term(0), term(1)) {
+                (Some(x), Some(Term::Const(m))) | (Some(Term::Const(m)), Some(x))
+                    if m & mask == mask =>
+                {
+                    self.preserves_bits(x, orig, mask, budget)
+                }
+                _ => false,
+            },
+            "s_or_b32" | "s_xor_b32" => match (term(0), term(1)) {
+                (Some(x), Some(y)) => {
+                    (self.preserves_bits(x, orig, mask, budget) && self.bits_zero(y, mask, budget))
+                        || (self.preserves_bits(y, orig, mask, budget)
+                            && self.bits_zero(x, mask, budget))
+                }
+                _ => false,
+            },
+            "s_andn2_b32" => match (term(0), term(1)) {
+                (Some(x), Some(y)) => {
+                    self.preserves_bits(x, orig, mask, budget) && self.bits_zero(y, mask, budget)
+                }
+                _ => false,
+            },
+            "s_orn2_b32" => match (term(0), term(1)) {
+                (Some(x), Some(Term::Const(c))) if (!c) & mask == 0 => {
+                    self.preserves_bits(x, orig, mask, budget)
+                }
+                _ => false,
+            },
+            "s_bfe_u32" => match (term(0), term(1)) {
+                (Some(x), Some(Term::Const(k))) => {
+                    let offset = k & 31;
+                    let width = (k >> 16) & 0x7F;
+                    offset == 0
+                        && (width >= 32 || (width > 0 && (mask >> width) == 0))
+                        && self.preserves_bits(x, orig, mask, budget)
+                }
+                _ => false,
+            },
+            "s_bitset0_b32" | "s_bitset1_b32" => {
+                let Some(Term::Const(bit)) = term(0) else {
+                    return false;
+                };
+                if mask & (1u32 << (bit & 31)) != 0 {
+                    return false;
+                }
+                let Some(Operand::Scalar { code, .. }) = dst else {
+                    return false;
+                };
+                inst.read(Reg::S(*code))
+                    .is_some_and(|prev| self.preserves_bits(self.origin(prev), orig, mask, budget))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `t` is computed via pure SCC-free scalar ALU exclusively from
+    /// constants and `allowed` (the four dwords of one loaded descriptor).
+    fn derived_from_load(&self, t: Term, allowed: &[Value; 4], budget: &mut u32) -> bool {
+        match t {
+            Term::Const(_) => true,
+            Term::Value(v) if allowed.contains(&v) => true,
+            Term::Value(v) => {
+                if *budget == 0 {
+                    return false;
+                }
+                *budget -= 1;
+                let Some(inst) = self.def(v) else {
+                    return false;
+                };
+                if inst.writes.first().is_none_or(|w| w.1 != v) {
+                    return false;
+                }
+                let Fields::Sop { dst, src, .. } = &inst.fields else {
+                    return false;
+                };
+                let all_srcs = |b: &mut u32| {
+                    src.iter().all(|s| {
+                        self.term(inst, s)
+                            .is_some_and(|x| self.derived_from_load(x, allowed, b))
+                    })
+                };
+                let dst_prev = |b: &mut u32| {
+                    let Some(Operand::Scalar { code, .. }) = dst else {
+                        return false;
+                    };
+                    *code != NULL
+                        && inst.read(Reg::S(*code)).is_some_and(|prev| {
+                            self.derived_from_load(self.origin(prev), allowed, b)
+                        })
+                };
+                match inst.name() {
+                    "s_movk_i32" => true,
+                    "s_mov_b32" | "s_not_b32" | "s_brev_b32" | "s_abs_i32" => {
+                        src.len() == 1 && all_srcs(budget)
+                    }
+                    "s_addk_i32" | "s_mulk_i32" => dst_prev(budget),
+                    "s_bitset0_b32" | "s_bitset1_b32" => {
+                        src.len() == 1 && all_srcs(budget) && dst_prev(budget)
+                    }
+                    "s_and_b32" | "s_or_b32" | "s_xor_b32" | "s_andn2_b32" | "s_orn2_b32"
+                    | "s_nand_b32" | "s_nor_b32" | "s_xnor_b32" | "s_mul_i32" | "s_mul_hi_u32"
+                    | "s_mul_hi_i32" | "s_bfe_u32" | "s_bfe_i32" | "s_bfm_b32" | "s_max_u32"
+                    | "s_max_i32" | "s_min_u32" | "s_min_i32" | "s_lshl_b32" | "s_lshr_b32"
+                    | "s_ashr_i32" | "s_add_u32" | "s_add_i32" | "s_sub_u32" | "s_sub_i32"
+                    | "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32"
+                    | "s_lshl4_add_u32" | "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16"
+                    | "s_pack_hh_b32_b16" => src.len() == 2 && all_srcs(budget),
+                    _ => false,
+                }
+            }
+        }
+    }
+
     /// For a `v_readfirstlane_b32` result: the VGPR value it reads.
     fn first_lane_source(&self, v: Value) -> Option<Value> {
         let inst = self.def(v)?;
@@ -1581,6 +1876,7 @@ impl<'a> Tracer<'a> {
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
+        raw_buffer: Option<BufAccess>,
     ) -> Result<Source, &'static str> {
         let words = words
             .iter()
@@ -1588,15 +1884,15 @@ impl<'a> Tracer<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let words = &words[..];
         let Some(&lane) = words.iter().find(|&&w| self.varies(w)) else {
-            return self.classify(words, joins, known);
+            return self.classify(words, joins, known, raw_buffer);
         };
         if let Some(source) = self.fetched(words, known)? {
             return Ok(source);
         }
-        if let Some(source) = self.lane_select(words, joins, known)? {
+        if let Some(source) = self.lane_select(words, joins, known, raw_buffer)? {
             return Ok(source);
         }
-        if let Some(source) = self.lane_phi(words, joins, known)? {
+        if let Some(source) = self.lane_phi(words, joins, known, raw_buffer)? {
             return Ok(source);
         }
         let Term::Value(v) = lane else { unreachable!() };
@@ -1678,6 +1974,7 @@ impl<'a> Tracer<'a> {
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
+        raw_buffer: Option<BufAccess>,
     ) -> Result<Option<Source>, &'static str> {
         let picks: Vec<_> = words
             .iter()
@@ -1726,7 +2023,7 @@ impl<'a> Tracer<'a> {
             .map(|set| {
                 let n = known.len();
                 known.extend(bit.map(|b| (b, set)));
-                let arg = self.per_lane(&side(set), joins, known);
+                let arg = self.per_lane(&side(set), joins, known, raw_buffer);
                 known.truncate(n);
                 arg
             })
@@ -1776,6 +2073,7 @@ impl<'a> Tracer<'a> {
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
+        raw_buffer: Option<BufAccess>,
     ) -> Result<Option<Source>, &'static str> {
         let phi_of = |w: &Term| match *w {
             Term::Value(v) => self.phis[v.0 as usize],
@@ -1836,7 +2134,7 @@ impl<'a> Tracer<'a> {
                         None => *w,
                     })
                     .collect();
-                self.per_lane(&edge, joins, known).map(Some)
+                self.per_lane(&edge, joins, known, raw_buffer).map(Some)
             } else {
                 Ok(None)
             };
@@ -2524,6 +2822,206 @@ pub(crate) mod tests {
                 what: "a descriptor changed after loading"
             }
         );
+    }
+
+    #[test]
+    fn rewritten_loaded_buffer_descriptors_keep_base_and_reject_unsafe_edits() {
+        let sop2 = |op: u32, sdst: u32, src0: u32, src1: u32| -> u32 {
+            0x8000_0000 | (op << 23) | (sdst << 16) | (src1 << 8) | src0
+        };
+        let run = |extra: &[u32], access: &[u32]| {
+            let mut w = vec![
+                0xBE88_0304, // s_mov_b32 s8, s4
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xF408_0204,
+                0xFA00_0160, // s_load_dwordx4 s[8:11], s[8:9], 0x160
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            ];
+            w.extend_from_slice(extra);
+            w.extend_from_slice(access);
+            w.push(S_ENDPGM);
+            let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            track(&p, &[param(Table, 4, 1)], HwStage::Cs, lanes(&p).as_ref())
+        };
+        let mubuf_store = [0xE078_1000, 0x8002_0007]; // buffer_store_dwordx4 v[0:3], v7, s[8:11], 0 offen
+        let smem_load = [0xF420_0304, 0xFA00_0000]; // s_buffer_load_dword s12, s[8:11], null
+
+        let err_what = |err| match err {
+            ShaderError::Unsupported { what, .. } => what,
+            other => panic!("unexpected error: {other:?}"),
+        };
+
+        // Valid rewrites: clear/set stride in w1[29:16] while preserving w1[15:0],
+        // scale w2 via shift/mul, and rewrite w3 flags.
+        let r = run(
+            &[
+                sop2(0x14, 9, 9, 0xFF),
+                0x3FFF_0000,                 // s_andn2_b32 s9, s9, 0x3fff0000
+                0xBE89_1D94,                 // s_bitset1_b32 s9, 20
+                sop2(0x1E, 10, 10, 128 + 2), // s_lshl_b32 s10, s10, 2
+                sop2(0x10, 11, 11, 0xFF),
+                0x3000_0000, // s_or_b32 s11, s11, 0x30000000
+            ],
+            &mubuf_store,
+        )
+        .expect("raw MUBUF with rewritten buffer descriptor");
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Loaded {
+                load: (0, 2),
+                first: 0
+            }
+        );
+
+        let r_smem = run(
+            &[
+                sop2(0x0E, 9, 9, 0xFF),
+                0xC000_FFFF,                       // s_and_b32 s9, s9, 0xc000ffff
+                sop2(0x1E, 12, 128 + 3, 128 + 16), // s_lshl_b32 s12, 3, 16
+                sop2(0x10, 9, 9, 12),              // s_or_b32 s9, s9, s12
+                0xBE8A_03FF,
+                0x0000_0400, // s_mov_b32 s10, 0x400
+                sop2(0x32, 11, 11, 0xFF),
+                0x0000_3000, // s_pack_ll_b32_b16 s11, s11, 0x3000
+            ],
+            &smem_load,
+        )
+        .expect("s_buffer_load with rewritten buffer descriptor");
+        assert_eq!(
+            r_smem.descriptors[0].source,
+            Source::Loaded {
+                load: (0, 2),
+                first: 0
+            }
+        );
+
+        // Branch-local rewrites joined by a phi preserve Source::Phi of Loaded descriptors.
+        let r_phi = track_words(
+            &[
+                0xBE8C_0304, // s_mov_b32 s12, s4
+                0xBE8D_0380, // s_mov_b32 s13, 0
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF85_0005, // s_cbranch_scc1 -> alt
+                0xF408_0206,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[12:13], null
+                sop2(0x0E, 9, 9, 0xFF),
+                0xC000_FFFF, // s_and_b32 s9, s9, 0xc000ffff
+                0xBF82_0003, // s_branch -> use
+                0xF408_0206,
+                0xFA00_0010, // alt: s_load_dwordx4 s[8:11], s[12:13], 0x10
+                sop2(0x1E, 10, 10, 128 + 1), // s_lshl_b32 s10, s10, 1
+                0xF420_0304,
+                0xFA00_0000, // use: s_buffer_load_dword s12, s[8:11], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 4, 1)],
+            HwStage::Cs,
+        );
+        assert!(matches!(r_phi.descriptors[0].source, Source::Phi { .. }));
+
+        // Unsafe edits must still fail with "a descriptor changed after loading":
+        // 1. Modifying w0 (BASE_ADDRESS[31:0])
+        assert_eq!(
+            err_what(run(&[sop2(0x00, 8, 8, 128 + 4)], &mubuf_store).unwrap_err()),
+            "a descriptor changed after loading"
+        );
+        // 2. Clearing or modifying bits in w1[15:0] (BASE_ADDRESS[47:32])
+        for bad_w1 in [
+            vec![sop2(0x0E, 9, 9, 0xFF), 0xC000_FFFE], // s_and_b32 s9, s9, 0xc000fffe
+            vec![sop2(0x00, 9, 9, 128 + 1)],           // s_add_u32 s9, s9, 1
+            vec![0xBE89_1C8F],                         // s_bitset0_b32 s9, 15
+            vec![sop2(0x10, 9, 9, 128 + 1)],           // s_or_b32 s9, s9, 1
+        ] {
+            assert_eq!(
+                err_what(run(&bad_w1, &mubuf_store).unwrap_err()),
+                "a descriptor changed after loading",
+                "expected refusal for {bad_w1:08x?}"
+            );
+        }
+        // 3. Formatted buffer instructions (tbuffer_load_format_x) must stay refused
+        let tbuf_fmt = [0xE808_1000, 0x8002_0001];
+        assert_eq!(
+            err_what(run(&[sop2(0x0E, 9, 9, 0xFF), 0xC000_FFFF], &tbuf_fmt).unwrap_err()),
+            "a descriptor changed after loading"
+        );
+        // 4. Mixing a neighboring descriptor's dword from a wider s_load_dwordx8 must fail
+        let wide_mix = track_words_err(
+            &[
+                0xBE8C_0304, // s_mov_b32 s12, s4
+                0xBE8D_0380, // s_mov_b32 s13, 0
+                0xF40C_0206,
+                0xFA00_0000,            // s_load_dwordx8 s[8:15], s[12:13], null
+                0xBF8C_C07F,            // s_waitcnt lgkmcnt(0)
+                sop2(0x00, 10, 10, 14), // s_add_u32 s10, s10, s14 (from 2nd descriptor!)
+                0xE078_1000,
+                0x8002_0007, // buffer_store_dwordx4 v[0:3], v7, s[8:11], 0 offen
+                S_ENDPGM,
+            ],
+            &[param(Table, 4, 1)],
+        );
+        assert_eq!(wide_mix, "a descriptor changed after loading");
+        // 5. Rewritten 4-dword sampler descriptor must stay refused
+        let bad_sampler = track_words_err(
+            &[
+                0xBE90_0304, // s_mov_b32 s16, s4
+                0xBE91_0380, // s_mov_b32 s17, 0
+                0xF40C_0408,
+                0xFA00_0000, // s_load_dwordx8 s[16:23], s[16:17], null
+                0xF408_0308,
+                0xFA00_0020,                 // s_load_dwordx4 s[12:15], s[16:17], 0x20
+                0xBF8C_C07F,                 // s_waitcnt lgkmcnt(0)
+                sop2(0x10, 15, 15, 128 + 1), // s_or_b32 s15, s15, 1 (sampler modified)
+                0xF09C_0F08,
+                0x0064_0000, // image_sample_lz v[0:3], v[0:1], s[16:23], s[12:15]
+                S_ENDPGM,
+            ],
+            &[param(Table, 4, 1)],
+        );
+        assert_eq!(bad_sampler, "a descriptor changed after loading");
+        // 6. Indexed MUBUF (`idxen = true`) accepts w2/w3 rewrites when w1 (stride)
+        // is untouched, and rejects modified stride bits in w1.
+        let mubuf_idxen = [0xE078_2000, 0x8002_0007]; // buffer_store_dwordx4 v[0:3], v7, s[8:11], 0 idxen
+        assert!(run(&[sop2(0x1E, 10, 10, 128 + 1)], &mubuf_idxen).is_ok());
+        assert_eq!(
+            err_what(run(&[sop2(0x0E, 9, 9, 0xFF), 0xC000_FFFF], &mubuf_idxen).unwrap_err()),
+            "a descriptor changed after loading"
+        );
+    }
+
+    #[test]
+    fn rewrites_that_change_addressing_are_refused() {
+        let run = |extra: &[u32]| {
+            let mut w = vec![
+                0xBE88_0304, // s_mov_b32 s8, s4
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xF408_0204,
+                0xFA00_0160, // s_load_dwordx4 s[8:11], s[8:9], 0x160
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            ];
+            w.extend_from_slice(extra);
+            // buffer_store_dwordx4 v[0:3], v7, s[8:11], 0 offen
+            w.extend_from_slice(&[0xE078_1000, 0x8002_0007, S_ENDPGM]);
+            let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            track(&p, &[param(Table, 4, 1)], HwStage::Cs, lanes(&p).as_ref())
+        };
+        for extra in [
+            [0x880B_FF0B, 0x0080_0000], // s_or_b32 s11, s11, 0x00800000 (ADD_TID_ENABLE)
+            [0x880B_FF0B, 0x0060_0000], // s_or_b32 s11, s11, 0x00600000 (INDEX_STRIDE)
+            [0x8809_FF09, 0x8000_0000], // s_or_b32 s9, s9, 0x80000000 (SWIZZLE_ENABLE)
+        ] {
+            assert!(run(&extra).is_err(), "accepted {extra:08x?}");
+        }
+    }
+
+    fn track_words_err(words: &[u32], layout: &[RootParam]) -> &'static str {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        match track(&p, layout, HwStage::Cs, lanes(&p).as_ref()).unwrap_err() {
+            ShaderError::Unsupported { what, .. } => what,
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     /// A compute program whose root parameters do not fit its 16 user

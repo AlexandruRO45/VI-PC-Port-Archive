@@ -439,6 +439,37 @@ fn normalized_codes_truncate_back_to_themselves() {
 }
 
 #[test]
+fn rewritten_loaded_buffer_descriptor_executes_on_gpu_and_warp() {
+    // Load the raw UAV descriptor a second time into s[12:15], clear stride
+    // bits [29:16] while preserving w1[15:0], shift w2, and set OOB_SELECT in
+    // w3, then store v1 and load it back into v0 through s[12:15].
+    let shader = build_valu_cs(&[
+        s_load_dwordx4(12, 4)[0],
+        s_load_dwordx4(12, 4)[1],
+        0xBF8C_C07F,             // s_waitcnt lgkmcnt(0)
+        sop2(0x0E, 13, 13, 255), // s_and_b32 s13, s13, 0xC000_FFFF
+        0xC000_FFFF,
+        sop2(0x1E, 14, 14, 128 + 2), // s_lshl_b32 s14, s14, 2
+        sop2(0x10, 15, 15, 255),     // s_or_b32 s15, s15, 0x3000_0000
+        0x3000_0000,
+        buffer_store_dword(1, 12, 0)[0],
+        buffer_store_dword(1, 12, 0)[1],
+        0xBF8C_0F70, // s_waitcnt vmcnt(0)
+        // MUBUF buffer_load_dword v0, off, s[12:15], 0
+        0x38 << 26 | 0x0C << 18,
+        0x80 << 24 | (12 >> 2) << 16,
+        0xBF8C_0F70, // s_waitcnt vmcnt(0)
+    ]);
+    run_cases(
+        &shader,
+        &[[0xDEAD_BEEF, 0, 0, 0], [0x1234_5678, 0, 0, 0]],
+        |backend, _, inp, got| {
+            assert_eq!(got, inp[0], "{backend}: rewritten buffer load/store");
+        },
+    );
+}
+
+#[test]
 fn packed_add_selects_halves_of_inline_constants() {
     // Add the inline constant 1/(2*pi) to v1 (zero) to read back its two halves.
     // The same GFX10 source field (248) has a different bit pattern for a
