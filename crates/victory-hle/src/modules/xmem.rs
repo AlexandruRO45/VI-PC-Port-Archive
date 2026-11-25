@@ -21,7 +21,8 @@ use windows_sys::Win32::System::Memory::{
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQuery,
+    VirtualQueryEx, MEM_PRIVATE,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -292,13 +293,19 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
-        return XMemVirtualAlloc(
+        let at = XMemVirtualAlloc(
             std::ptr::null_mut(),
             size,
             MEM_RESERVE | MEM_COMMIT,
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
         );
+        // The address may be one a freed allocation had: what the GPU side
+        // tracked there is not this memory.
+        if !at.is_null() {
+            victory_gpu::title_memory_remapped(at as usize, size);
+        }
+        return at;
     }
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
@@ -324,6 +331,30 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     }
 }
 
+/// The bytes of the private allocation that starts at `base`: every region
+/// from there with that allocation base (guarded pages split it into
+/// several). 0 if `base` does not start one.
+fn allocation_extent(base: *mut c_void) -> usize {
+    let mut end = base as usize;
+    loop {
+        // SAFETY: plain integers and pointers, all valid zeroed.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a plain query into a valid out-structure.
+        if unsafe { VirtualQuery(end as *const c_void, &mut info, size_of_val(&info)) } == 0
+            || info.AllocationBase != base
+            || info.Type != MEM_PRIVATE
+        {
+            break;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= end {
+            break;
+        }
+        end = next;
+    }
+    end - base as usize
+}
+
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
 pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
@@ -333,6 +364,14 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            // The GPU side forgets the allocation first and gives its
+            // guarded pages write access back: after the release another
+            // allocation may take the address, and a guard left over (or a
+            // protection change made later) would hit memory not ours.
+            let len = allocation_extent(address);
+            if len != 0 {
+                victory_gpu::title_memory_remapped(address as usize, len);
+            }
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -1179,6 +1218,23 @@ mod tests {
         let process = unsafe { GetCurrentProcess() };
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
+    }
+
+    #[test]
+    fn an_allocation_extent_spans_its_differently_protected_regions() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        const P: usize = 4096;
+        // SAFETY: a fresh allocation of our own, released at the end.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 * P, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!base.is_null());
+            let mut old = 0;
+            assert_ne!(VirtualProtect(base.cast::<u8>().add(P).cast(), P, PAGE_READONLY, &mut old), 0);
+            assert_eq!(allocation_extent(base), 3 * P);
+            // Not the start of an allocation.
+            assert_eq!(allocation_extent(base.cast::<u8>().add(P).cast()), 0);
+            assert_ne!(VirtualFree(base, 0, MEM_RELEASE), 0);
+        }
     }
 
     #[test]
