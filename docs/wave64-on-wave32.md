@@ -4,8 +4,8 @@ Status: steps 1, 2 and 4 to 6 are in. On NVIDIA, wave64 programs whose
 lanes read only their own half run as two 32-lane waves. The others run in
 the console flow, in groups of one console wave or of several: masks read
 whole, lanes of the other half, divergent branches and loops, scalars a
-divergent loop leaves, whole-wave reductions and prefixes, and LDS shared
-within a wave. Nothing of this plan is open.
+divergent loop or branch leaves, whole-wave reductions and prefixes, and
+LDS shared within a wave. Nothing of this plan is open.
 
 ## The problem
 
@@ -150,7 +150,7 @@ host without 64-lane waves even when it reads no other lane (it declared
 Left as is: two lanes of the two halves writing the same dword in one
 instruction keep the host's order, not the console's.
 
-### Scalars after a divergent loop
+### Scalars after a divergent loop or branch
 
 After a loop its lanes leave at different times, the console wave's scalars
 are what the last iteration (of any lane) left. The per-lane form takes
@@ -160,6 +160,22 @@ half had its own count (lanes 0-31 read 32 where the console reads 64).
 Where the console flow can run the program it does so now: its loops run
 while any lane of the console wave does. `valu_tests` checks both cases
 on the host's own wave sizes.
+
+A divergent if/else is the same: the console wave runs each side some lane
+takes, in code order, so after the join every lane reads the scalars the
+last side run left. The per-lane form ranks each lane's side and takes the
+highest with a wave maximum (`Lower::join_scalars`), again over a half: a
+half whose lanes all took the earlier side read its value (lanes 0-31 read
+1 where the console reads 2). Such a program now goes to the console flow
+too, when a lane-dependent branch with both sides leading to the join lies
+between the join and its immediate dominator, and a scalar joined there is
+read after it (`Lower::scalars_join_apart`). Joins only uniform branches
+reach keep the per-lane form.
+
+On a host with 64-lane waves both cases now declare `WaveSize(64)`: left
+to choose, an RDNA2 driver ran such programs in waves of 32, with the same
+half counts (the two `scalar_counted_in_*` tests failed on an RX 6950 XT
+and an RX 6700 XT, #92). Only these programs change there.
 
 ### Groups of several console waves
 

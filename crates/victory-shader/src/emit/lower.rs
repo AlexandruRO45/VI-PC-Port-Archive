@@ -153,7 +153,10 @@ thread_local! {
 ///   every exchange. A group of one console wave orders it with a group
 ///   barrier; in a group of several, each console wave's two halves meet
 ///   on their own ([`Lower::pair_meet`]), since the group's other console
-///   waves take branches of their own;
+///   waves take branches of their own. So does a program reading scalars
+///   that a divergent loop or branch left ([`Lower::leave_loops`],
+///   [`Lower::join_scalars`]), which the per-lane form takes from half the
+///   console wave there;
 /// * on any host, a program that reads or writes a named lane
 ///   (`v_readlane`, `v_writelane`) and has branches its lanes take
 ///   differently. Those instructions ignore EXEC on the console, and a wave
@@ -2186,21 +2189,30 @@ impl<'a> Lower<'a> {
             }
         }
         self.find_loop_exits();
-        // After a divergent loop a console wave's scalars are what the lane
-        // that ran it longest left ([`Self::leave_loops`]), found by a wave
-        // operation over the host wave: on a host without 64-lane waves half
-        // the console wave, each half with its own result. The console flow
-        // runs the loop while any lane of the console wave does, as the
-        // console does; where it cannot, the per-lane form stays.
-        if self.console_flow_ok
-            && !self.x.console_cf
-            && !self.x.per_lane_only
-            && self
+        // After a divergent loop or branch a console wave's scalars are what
+        // the lane that ran the loop longest, or took the last path, left
+        // ([`Self::leave_loops`], [`Self::join_scalars`]), found by a wave
+        // operation over the host wave. On a host without 64-lane waves that
+        // is half the console wave, each half with its own result: the
+        // console flow runs the loop while any lane of the console wave does
+        // and each path some lane takes, as the console does; where it
+        // cannot, the per-lane form stays. A host with 64-lane waves is
+        // asked for the console's (left alone, a driver may run 32).
+        let scalars_after = self.mask_data == MaskData::Console
+            && (self
                 .loop_exits
                 .values()
                 .flatten()
                 .any(|(_, after)| !after.is_empty())
+                || self.scalars_join_apart());
+        if scalars_after
+            && self.x.native.wave64
+            && self.s.wave_size.is_none()
+            && self.x.target.runs(64)
         {
+            self.s.wave_size = Some(64);
+        }
+        if self.console_flow_ok && !self.x.console_cf && !self.x.per_lane_only && scalars_after {
             return Err(unsupported(0, CONSOLE_FLOW));
         }
         self.cur = self.s.entry;
@@ -12578,6 +12590,73 @@ impl<'a> Lower<'a> {
             }
             self.loop_bodies.insert(h, body);
         }
+    }
+
+    /// Whether lanes of one console wave may reach a join of branches by
+    /// different paths and read there a scalar the paths leave differently
+    /// ([`Self::join_scalars`]): a lane-dependent branch whose two sides
+    /// both lead to the join, between the join and its immediate dominator
+    /// (or that branch's own block). Joins only uniform branches reach keep
+    /// every lane of a wave on one path.
+    fn scalars_join_apart(&self) -> bool {
+        let p = self.x.p;
+        let reachable = |q: usize| self.block[q].is_some();
+        let order = crate::ir::reverse_postorder(&p.blocks);
+        let mut index = vec![usize::MAX; p.blocks.len()];
+        for (n, &b) in order.iter().enumerate() {
+            index[b] = n;
+        }
+        let idom = crate::ir::idoms(&p.blocks, &order, &index);
+        let splits = |x: usize, to: &HashSet<usize>| match self.x.st.exits[x] {
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } => {
+                to.contains(&taken)
+                    && to.contains(&not_taken)
+                    && !self
+                        .x
+                        .st
+                        .bools
+                        .support(when)
+                        .iter()
+                        .all(|a| matches!(a, Atom::Uniform(_)))
+            }
+            _ => false,
+        };
+        (0..p.blocks.len()).any(|b| {
+            let block = &p.blocks[b];
+            if !reachable(b) || self.counters.contains_key(&b) || self.loop_exits.contains_key(&b) {
+                return false;
+            }
+            let scalar = block.phis.iter().any(|phi| {
+                let s = match phi.reg {
+                    Reg::S(c) => c != EXEC && c != EXEC + 1,
+                    Reg::Scc => true,
+                    _ => false,
+                };
+                s && !self.bad.contains_key(&phi.value)
+            });
+            if !scalar || block.preds.iter().filter(|&&q| reachable(q)).count() < 2 {
+                return false;
+            }
+            let d = idom[b];
+            if d == usize::MAX || d == b {
+                return false;
+            }
+            // `b` and the blocks that lead to it without passing `d`.
+            let mut to = HashSet::from([b]);
+            let mut work = vec![b];
+            while let Some(x) = work.pop() {
+                for &q in &p.blocks[x].preds {
+                    if reachable(q) && q != d && to.insert(q) {
+                        work.push(q);
+                    }
+                }
+            }
+            splits(d, &to) || to.iter().any(|&x| splits(x, &to))
+        })
     }
 
     /// Entering `b`, a join of branches (not a loop header): its scalar

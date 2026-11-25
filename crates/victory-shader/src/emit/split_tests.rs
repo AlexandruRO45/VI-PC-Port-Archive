@@ -808,6 +808,95 @@ fn several_console_waves_share_lds_within_each() {
     }
 }
 
+/// An if/else on the lane, each side setting s9, then s9 read: the console
+/// wave runs each side some lane of it takes, the else side last, so all
+/// its lanes read 2 where some lane took the else side and 1 where none
+/// did. Wave w's lanes below 16 (w + 1) take the then side: from wave 3 on,
+/// and in the 32 threads of a last wave of 96, every lane does.
+fn both_sides(cmp: u32) -> Vec<u32> {
+    let mut body = LANE_AND_WAVE.to_vec();
+    body.extend([
+        0x4A0C_0A81, // v_add_nc_u32 v6, 1, v5
+        0x340C_0C84, // v_lshlrev_b32 v6, 4, v6
+        0xBE89_0380, // s_mov_b32 s9, 0
+        cmp,
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0001, // s_cbranch_execz else
+        0xBE89_0381, // s_mov_b32 s9, 1
+        0x89FE_0A7E, // else: s_xor_b64 exec, exec, s[10:11]
+        0xBF88_0001, // s_cbranch_execz join
+        0xBE89_0382, // s_mov_b32 s9, 2
+        0x88FE_0A7E, // join: s_or_b64 exec, exec, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ]);
+    body
+}
+
+/// v_cmp_gt_u32 vcc, v6, v1: the lane's place below 16 (w + 1).
+const BELOW_16_PER_WAVE: u32 = 0x7D88_0306;
+
+/// [`both_sides`] in groups of one console wave and of several: the halves
+/// of a console wave take different sides, yet read the same scalar. The
+/// per-lane form read each half's own side on hosts without 64-lane waves,
+/// and on hosts with them where the driver ran 32-lane waves.
+#[test]
+fn scalars_after_a_divergent_branch_are_the_console_waves() {
+    waves_case(
+        "s9 set on both sides of a divergent if/else",
+        &both_sides(BELOW_16_PER_WAVE),
+        &[64, 128, 256, 96, 112],
+        |t, n| {
+            let w = t / 64;
+            if wave_threads(n, w) > 16 * (w + 1) {
+                2
+            } else {
+                1
+            }
+        },
+    );
+}
+
+/// Which programs [`scalars_after_a_divergent_branch_are_the_console_waves`]
+/// changes: a scalar joined after a branch on the lane goes to the console
+/// flow on a 32-lane host and asks a host with 64-lane waves for them; a
+/// branch the whole wave takes (on the group id), and a divergent branch
+/// whose scalar is not read after the join, keep the per-lane form and no
+/// wave size.
+#[test]
+fn only_scalars_joined_after_a_branch_on_the_lane_need_the_console_wave() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let rdna = super::Target {
+        lanes_min: 32,
+        lanes_max: 64,
+    };
+    let uniform = [
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF84_0001, // s_cbranch_scc0 join
+        0xBE89_0381, // s_mov_b32 s9, 1
+        0x7E04_0209, // join: v_mov_b32 v2, s9
+    ];
+    let divergent = both_sides(BELOW_16_PER_WAVE);
+    let mut unread = divergent.clone();
+    *unread.last_mut().unwrap() = 0x7E04_0300; // v_mov_b32 v2, v0
+    let check = |label: &str, body: &[u32], on_nvidia: Option<u32>, on_rdna: Option<u32>| {
+        for threads in [64, 128] {
+            let p = program(body, threads);
+            let cs = emit_for(&p, nvidia).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let at = format!("{label}, {threads} threads");
+            assert_eq!(wave_size(&cs.dxil), on_nvidia, "{at}, 32-32");
+            let cs = emit_for(&p, rdna).unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(wave_size(&cs.dxil), on_rdna, "{at}, 32-64");
+        }
+    };
+    check("divergent", &divergent, Some(32), Some(64));
+    check("uniform", &uniform, None, None);
+    check("not read after", &unread, None, None);
+}
+
 // ---- Whole-wave sections in halves (`Lower::both_halves`) ----
 
 /// A whole-wave sum of `v0` as the console compiler expands it for wave64

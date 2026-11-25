@@ -1522,6 +1522,58 @@ fn mask_grown_inside_a_branch_counted_after_it() {
     assert!(got.iter().all(|&x| x == 32), "lanes counted: {got:?}");
 }
 
+/// A scalar both sides of a divergent if/else write, read after the join:
+/// the console runs each side some lane takes, in code order, so every lane
+/// reads what the later side left (2), even where its own lanes took only
+/// the earlier one. The halves of the console wave take different sides
+/// (lanes below 32 and the rest, then the other way round), as do 16 lanes
+/// of each half.
+#[test]
+fn scalar_written_on_both_sides_of_a_divergent_branch_read_after_it() {
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    // v_cmp_<op>_u32 vcc, <k>, v0, by (VOPC opcode, inline constant).
+    for (cmp, label) in [
+        (0x7D88_00A0u32, "lanes 0-31 then, 32-63 else"), // v_cmp_gt_u32 vcc, 32, v0
+        (0x7D86_00A0, "lanes 32-63 then, 0-31 else"),    // v_cmp_le_u32 vcc, 32, v0
+        (0x7D88_0090, "lanes 0-15 then, the rest else"), // v_cmp_gt_u32 vcc, 16, v0
+    ] {
+        let body = [
+            0x7E14_0300, // v_mov_b32 v10, v0 (thread id kept)
+            0xBE86_0380, // s_mov_b32 s6, 0
+            cmp,
+            0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+            0xBF88_0001, // s_cbranch_execz else
+            0xBE86_0381, // s_mov_b32 s6, 1
+            0x89FE_047E, // else: s_xor_b64 exec, exec, s[4:5]
+            0xBF88_0001, // s_cbranch_execz join
+            0xBE86_0382, // s_mov_b32 s6, 2
+            0x88FE_047E, // join: s_or_b64 exec, exec, s[4:5]
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ];
+        let shader =
+            build_lanes_cs(&body, host.target()).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        let got: Vec<u32> = out[0][..64].to_vec();
+        assert!(got.iter().all(|&x| x == 2), "{label}: {got:?}");
+    }
+}
+
 /// Nested divergent loops with a scalar counter in the inner one: the wave
 /// runs 4 outer iterations, and in each the inner loop runs until its
 /// longest lane (4 iterations) is done, so every lane reads 16.
