@@ -551,8 +551,12 @@ impl Module {
                 work.push(i);
             }
         };
+        let mut phi_owner = vec![usize::MAX; self.insts.len()];
         for &b in post {
             let blk = &self.blocks[b];
+            for &i in &blk.phis {
+                phi_owner[i as usize] = b;
+            }
             for &i in blk.body.iter().filter(|&&i| self.rooted(i)) {
                 mark(&mut live, &mut work, V::Inst(i));
             }
@@ -563,8 +567,9 @@ impl Module {
         while let Some(i) = work.pop() {
             match &self.insts[i as usize].op {
                 Op::Phi(inc) => {
+                    let owner = phi_owner[i as usize];
                     for &(v, pred) in inc {
-                        if seen[pred] {
+                        if owner != usize::MAX && self.has_edge(seen, pred, owner) {
                             mark(&mut live, &mut work, v);
                         }
                     }
@@ -573,6 +578,12 @@ impl Module {
             }
         }
         live
+    }
+
+    /// Whether block `from` is reachable and its simplified terminator
+    /// directly targets `to` (an untaken constant branch's edge is not one).
+    fn has_edge(&self, seen: &[bool], from: usize, to: usize) -> bool {
+        seen[from] && successors(self.term(from)).contains(&to)
     }
 
     /// Block `b`'s terminator, a branch on a constant taking its one edge
@@ -611,17 +622,29 @@ impl Module {
                 read[*g as usize] = true;
             }
         }
-        for b in plan.layout.iter().map(|&b| &self.blocks[b]) {
+        for &x in &plan.layout {
+            let b = &self.blocks[x];
             for &i in b.phis.iter().chain(&b.body).filter(|&&i| plan.live[i as usize]) {
                 let op = &self.insts[i as usize].op;
                 if let Op::Call(f, _) = *op {
                     called[f as usize] = true;
                 }
-                for_each_operand(op, |v| {
+                let mut note = |v: V| {
                     if let V::Global(g) = v {
                         read[g as usize] = true;
                     }
-                });
+                };
+                match op {
+                    // Only the entries the writer keeps read anything.
+                    Op::Phi(inc) => {
+                        for &(v, pred) in inc {
+                            if plan.edge(self, pred, x) {
+                                note(v);
+                            }
+                        }
+                    }
+                    _ => for_each_operand(op, note),
+                }
             }
         }
         let number = |keep: &mut dyn Iterator<Item = bool>| {
@@ -1068,7 +1091,7 @@ impl Plan {
     /// is still there (not a constant branch's other edge, not from a block
     /// left out).
     fn edge(&self, m: &Module, b: usize, x: usize) -> bool {
-        self.seen[b] && successors(m.term(b)).iter().any(|&s| self.to(s) == x)
+        m.has_edge(&self.seen, b, x)
     }
 }
 
@@ -1710,6 +1733,58 @@ mod tests {
         assert!(at(p_val) && at(p_h) && at(out));
         assert_eq!(m.uses(), Uses::default());
         let _ = m.write();
+    }
+
+    /// A phi entry from a reachable predecessor whose edge to the phi's block
+    /// a constant branch removed (directly, or through an empty block that
+    /// folds away) keeps nothing alive: liveness and the writer agree on
+    /// which entries exist.
+    #[test]
+    fn dropped_direct_phi_edge_from_reachable_pred_does_not_keep_value_alive() {
+        for folded in [false, true] {
+            let (mut m, b, sink) = module(3);
+            let [entry, mid, join] = b[..] else { unreachable!() };
+            let (i32t, handle_t, i1t) = (m.int(32), m.int(8), m.int(1));
+            let heap_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
+            let heap = m.function("dx.op.createHandleFromHeap", heap_ty, Some(Attr::ReadNone), false);
+            let (op, zero, one, two, no, yes) =
+                (m.i32(218), m.i32(0), m.i32(1), m.i32(2), m.bool(false), m.bool(true));
+
+            // Pure values defined in the reachable entry block, read only by
+            // the phi entry along the removed direct edge entry -> join.
+            let dead_sum = m.bin(entry, Bin::Add, one, two);
+            let dead_h = m.call(entry, heap, vec![op, zero, no, no]);
+            let dead_h32 = m.cast(entry, Cast::ZExt, dead_h, i32t);
+            m.terminate(entry, Term::CondBr(yes, mid, join));
+            if !folded {
+                // A non-empty middle block: it stays.
+                let _ = m.call(mid, sink, vec![one]);
+            }
+            m.terminate(mid, Term::Br(join));
+            let p_val = m.phi(join, i32t);
+            m.set_phi(p_val, vec![(one, mid), (dead_sum, entry)]);
+            let p_h = m.phi(join, i32t);
+            m.set_phi(p_h, vec![(zero, mid), (dead_h32, entry)]);
+            let out = m.bin(join, Bin::Add, p_val, p_h);
+            let _ = m.call(join, sink, vec![out]);
+            m.terminate(join, Term::Ret);
+
+            let plan = m.plan();
+            let at = |v: V| match v {
+                V::Inst(i) => plan.live[i as usize],
+                _ => unreachable!(),
+            };
+            assert_eq!(plan.fold[mid].is_some(), folded, "folded={folded}");
+            if folded {
+                assert_eq!(plan.fold[mid], Some((entry, join)));
+            }
+            assert!(!at(dead_sum) && !at(dead_h) && !at(dead_h32), "folded={folded}");
+            assert!(at(p_val) && at(p_h) && at(out), "folded={folded}");
+            assert!(!plan.edge(&m, entry, join), "the removed direct edge, folded={folded}");
+            assert!(plan.edge(&m, mid, join), "the taken edge, folded={folded}");
+            assert_eq!(m.uses(), Uses::default(), "folded={folded}");
+            let _ = m.write();
+        }
     }
 
     /// A reachable block whose only instructions fed an unreachable branch
