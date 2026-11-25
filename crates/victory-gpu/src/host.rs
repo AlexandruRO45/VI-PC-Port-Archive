@@ -3760,8 +3760,71 @@ impl Unsettled {
 }
 
 static UNSETTLED: Mutex<Unsettled> = Mutex::new(Unsettled(Vec::new()));
-/// Copies let run without waiting, and copies made again, for the log.
-static COPY_NO_WAIT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// For the log: copies let run without waiting, copies made again, fills
+/// let run without waiting, fills whose source a copy-back wrote after.
+static COPY_NO_WAIT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The fills of upload memory [`copy_no_wait`] let run: per submission, the
+/// source of each and its bytes. A fill cannot be made again (the list that
+/// reads the upload memory is on the card by then), so a copy-back over a
+/// source is only counted: the list drew with the bytes from before those
+/// shaders ran. None was seen; the count in the log says if that changes.
+struct UnsettledFills {
+    /// The submission whose preparing ran them, and source to bytes.
+    by_submission: std::collections::VecDeque<(u64, std::collections::BTreeMap<usize, usize>)>,
+    /// The longest fill noted.
+    longest: usize,
+}
+
+impl UnsettledFills {
+    fn ran(&mut self, src: usize, len: usize, until: u64) {
+        if self.by_submission.back().is_none_or(|b| b.0 != until) {
+            self.by_submission.push_back((until, Default::default()));
+        }
+        let fills = &mut self.by_submission.back_mut().expect("just pushed").1;
+        let bytes = fills.entry(src).or_insert(0);
+        *bytes = len.max(*bytes);
+        self.longest = self.longest.max(len);
+    }
+
+    /// The copy-back writes title memory `[at, at + len)`: how many noted
+    /// fills read from there, each counted once.
+    fn written(&mut self, at: usize, len: usize) -> u64 {
+        let from = at.saturating_sub(self.longest);
+        let mut hit = 0;
+        for (_, fills) in &mut self.by_submission {
+            let over: Vec<usize> = fills.range(from..at + len).filter(|&(&src, &n)| at < src + n).map(|(&src, _)| src).collect();
+            hit += over.len() as u64;
+            for src in over {
+                fills.remove(&src);
+            }
+        }
+        hit
+    }
+
+    /// Every flight up to `last` has landed.
+    fn landed(&mut self, last: u64) {
+        while self.by_submission.front().is_some_and(|f| f.0 <= last) {
+            self.by_submission.pop_front();
+        }
+    }
+}
+
+static UNSETTLED_FILLS: Mutex<UnsettledFills> = Mutex::new(UnsettledFills {
+    by_submission: std::collections::VecDeque::new(),
+    longest: 0,
+});
+
+fn unsettled_fills() -> std::sync::MutexGuard<'static, UnsettledFills> {
+    UNSETTLED_FILLS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A fill of upload memory ran at a submission's preparing.
+fn fill_ran(src: usize, len: usize) {
+    if copy_no_wait() && late() {
+        unsettled_fills().ran(src, len, crate::shadow::prepared());
+    }
+}
 
 fn unsettled() -> std::sync::MutexGuard<'static, Unsettled> {
     UNSETTLED.lock().unwrap_or_else(|e| e.into_inner())
@@ -3778,6 +3841,10 @@ fn copy_ran(dst: usize, src: usize, len: usize) {
 pub(crate) fn copy_source_written(at: usize, len: usize) {
     if copy_no_wait() {
         unsettled().written(at, len);
+        let fills = unsettled_fills().written(at, len);
+        if fills > 0 && COPY_NO_WAIT[3].fetch_add(fills, Ordering::Relaxed) == 0 {
+            tracing::warn!(at, len, "a flight's shaders wrote the source of a fill of upload memory that had not waited: its list drew with the bytes from before");
+        }
     }
 }
 
@@ -3801,6 +3868,7 @@ fn recopy_written_sources() {
 fn copies_settled(last: u64) {
     if copy_no_wait() {
         unsettled().landed(last);
+        unsettled_fills().landed(last);
     }
 }
 
@@ -3843,6 +3911,28 @@ mod copy_no_wait_tests {
         assert!(u.due().is_empty(), "the newer copy's bytes stay");
         u.written(0x5000, 1);
         assert_eq!(u.due(), [(0x9080, 0x5000, 0x100)]);
+    }
+
+    #[test]
+    fn a_copy_back_over_a_fills_source_counts_it_once_until_its_submission_lands() {
+        let mut f = super::UnsettledFills {
+            by_submission: Default::default(),
+            longest: 0,
+        };
+        f.ran(0x1000, 0x1e0, 7);
+        f.ran(0x3000, 0xa0, 7);
+        f.ran(0x5000, 0xa0, 8);
+        // beside every source, then over the tail of the first and the head of the third
+        assert_eq!(f.written(0x11e0, 0x20), 0);
+        assert_eq!(f.written(0x11df, 1), 1);
+        assert_eq!(f.written(0x1000, 0x1e0), 0, "counted once");
+        assert_eq!(f.written(0x4ff0, 0x11), 1);
+        // submission 7 lands: its fill at 0x3000 is settled
+        f.landed(7);
+        assert_eq!(f.written(0x3000, 0xa0), 0);
+        f.ran(0x7000, 0xa0, 9);
+        f.landed(8);
+        assert_eq!(f.written(0x7000, 1), 1);
     }
 
     #[test]
@@ -3897,7 +3987,11 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
+                    if touches(written, src, src + len) && copy_no_wait() {
+                        if count {
+                            COPY_NO_WAIT[2].fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             note_blocked_fill(written, src, len);
@@ -7459,6 +7553,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    fill_ran(src, len);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -8220,11 +8315,10 @@ impl Meter {
                     if join_copies() { "on" } else { "off" }
                 );
             }
-            let [through, again] = [0, 1].map(|i| COPY_NO_WAIT[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if through + again > 0.0 {
+            let [through, again, fills, stale] = [0, 1, 2, 3].map(|i| COPY_NO_WAIT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if through + again + fills + stale > 0.0 {
                 tracing::info!(
-                    "title buffer copies whose source flights may write, per frame (VICTORY_COPY_NO_WAIT=1): {through:.1} ran \
-                     without waiting, {again:.2} were made again after a copy-back wrote the source"
+                    "reads of memory that flights may write, per frame (VICTORY_COPY_NO_WAIT=1): {through:.1} title buffer copies ran without waiting, {again:.2} of them made again after a copy-back wrote the source; {fills:.1} fills of upload memory ran without waiting, {stale:.2} had a copy-back write their source after"
                 );
             }
         }
