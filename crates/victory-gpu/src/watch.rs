@@ -793,10 +793,13 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
             }
         }
     }
+    // If the new mapping cannot be guarded (a write the guards do not see is
+    // under way through it), the page is changed; its bytes now may hold that
+    // write already, so nothing is saved of them.
     if others.iter().any(|&o| g.protected.contains(&(o / PAGE)))
         && protect(&mut g, &[page]).is_empty()
     {
-        changed(&mut g, page, page + 1, true);
+        changed(&mut g, page, page + 1, false);
     }
 }
 
