@@ -2078,15 +2078,11 @@ mod tests {
         let (mut allocator, mut list) = (null, null);
         assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
         assert_eq!(new_list(0, allocator, &LIST_IIDS[0], &mut list), S_OK);
-        let memory = [0u64; 2];
-        let at = |i: usize| (&raw const memory[i]) as u64;
-        let value = |i: usize| {
-            // SAFETY: inside the array.
-            unsafe { (at(i) as *const u64).read_volatile() }
-        };
+        let memory = [std::cell::Cell::new(0u64), std::cell::Cell::new(0u64)];
+        let at = |i: usize| memory[i].as_ptr() as u64;
         for _ in 0..2 {
-            // SAFETY: inside the array.
-            unsafe { (at(0) as *mut [u64; 2]).write_volatile([0; 2]) };
+            memory[0].set(0);
+            memory[1].set(0);
             state::stencil_ref(list, 3);
             // No work yet: not cut.
             wait_value(list, at(0), 7, 0);
@@ -2099,12 +2095,11 @@ mod tests {
             let parts = submitted(list);
             assert!(parts[0].unmet().is_empty() && parts[1].unmet().len() == 1);
             crate::host::host().unwrap().execute(&[&*parts[0]]);
-            assert_eq!(value(0), 1);
+            assert_eq!(memory[0].get(), 1);
             // Reset while the second part is still to run.
             assert_eq!(reset(list, allocator, null), S_OK);
             assert_eq!(submitted(list).len(), 1);
-            // SAFETY: inside the array.
-            unsafe { (at(1) as *mut u64).write_volatile(4) };
+            memory[1].set(4);
             assert!(parts[1].unmet().is_empty());
             crate::host::host().unwrap().execute(&[&*parts[1]]);
         }

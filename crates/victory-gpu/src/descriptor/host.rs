@@ -3008,14 +3008,15 @@ void main() {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
+        let first_dynamic_slot = heap.count();
         let a = heap.dynamic(heap.spare - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + heap.spare - 100));
+        assert_eq!((a, b), (first_dynamic_slot, first_dynamic_slot + heap.spare - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
         heap.release(a, 50);
-        assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + heap.spare - 40));
+        assert_eq!(heap.dynamic(50), Some(first_dynamic_slot));
+        assert_eq!(heap.dynamic(40), Some(first_dynamic_slot + heap.spare - 40));
     }
 
     /// A sampler heap past the host's limit is capped, not lost, and keeps
