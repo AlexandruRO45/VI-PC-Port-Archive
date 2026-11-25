@@ -516,7 +516,14 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
-            }) || {
+            }) || (mask_data_join_enabled()
+                && p.blocks.iter().any(|b| {
+                    b.phis.iter().any(|phi| {
+                        x.st.masks.contains_key(&phi.value)
+                            && phi.args.iter().any(|a| !x.st.masks.contains_key(a))
+                    })
+                }))
+                || {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
                 let whens = x.st.exits.iter().filter_map(|e| match *e {
@@ -1882,6 +1889,21 @@ impl<'a> Lower<'a> {
         } else {
             self.tail[b].ok_or("a lane mask written after its use")?
         };
+        let here = std::mem::replace(&mut self.cur, at);
+        let result = self.mask_number_in(inst, src, op, at, wave64);
+        self.cur = here;
+        result
+    }
+
+    fn mask_number_in(
+        &mut self,
+        inst: &Inst,
+        src: &[Operand],
+        op: &str,
+        at: usize,
+        wave64: bool,
+    ) -> Result<(V, V), Why> {
+        const ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
         // Dword `h` of source `k` (inline constants sign-extend).
         let word = |l: &mut Self, k: usize, h: u8| -> Result<V, Why> {
             let x = match src.get(k) {
@@ -10023,13 +10045,14 @@ impl<'a> Lower<'a> {
     /// that ran it) leaves the edge dead. A back edge forgets the branches
     /// (the loop redefines their conditions). Fewer conditions are weaker,
     /// so keeping only the last few stays sound.
-    fn live_edges(&self) -> HashSet<(Value, usize)> {
+    fn extend_live_edges(
+        &self,
+        mut work: Vec<(Value, Vec<(Bool, bool)>)>,
+        live: &mut HashSet<(Value, usize)>,
+        seen: &mut HashMap<Value, Vec<Vec<(Bool, bool)>>>,
+    ) {
         const MAX_KNOWN: usize = 4;
         let (p, st) = (self.x.p, &self.x.st);
-        let mut work: Vec<(Value, Vec<(Bool, bool)>)> =
-            self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
-        let mut live = HashSet::new();
-        let mut seen = HashMap::<Value, Vec<Vec<(Bool, bool)>>>::new();
         while let Some((v, known)) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
@@ -10072,13 +10095,92 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        live
     }
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
-        let live = self.live_edges();
-        for (v, b, i) in std::mem::take(&mut self.data_phis) {
+        self.cur_ir = usize::MAX;
+        let data_phis = std::mem::take(&mut self.data_phis);
+        let mut live = HashSet::new();
+        let mut seen = HashMap::new();
+        let mut seeded: HashSet<Value> = HashSet::new();
+        let mut tried_masks: HashSet<Value> = HashSet::new();
+        loop {
+            while let Some((v, b, i)) = self.pending_masks.pop() {
+                let phi = &p.blocks[b].phis[i];
+                let offset = p.blocks[b].offset;
+                let mut incoming = Vec::new();
+                for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                    let Some(qb) = self.tail[q] else { continue };
+                    let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                    let arg = phi.args[n];
+                    let x = if let Some(&m) = self.x.st.masks.get(&arg) {
+                        self.boolean(m, qb).map_err(|w| unsupported(offset, w))?
+                    } else if self.console_lanes
+                        && mask_data_join_enabled()
+                        && phi.args.iter().any(|a| self.x.st.masks.contains_key(a))
+                    {
+                        let here = std::mem::replace(&mut self.cur, qb);
+                        let r = self
+                            .i32_of(arg)
+                            .and_then(|lo| {
+                                let hi = self.pair_high(arg).map(|h| self.i32_of(h)).transpose()?;
+                                Ok(self.lane_bit(qb, lo, hi))
+                            })
+                            .map_err(|w| unsupported(offset, w));
+                        self.cur = here;
+                        r?
+                    } else {
+                        return Err(unsupported(offset, "a lane-mask join of an untracked mask"));
+                    };
+                    incoming.push((x, qb));
+                }
+                self.s.m.set_phi(v, incoming);
+            }
+            let work: Vec<_> = self
+                .read_phis
+                .iter()
+                .copied()
+                .filter(|v| seeded.insert(*v))
+                .map(|v| (v, Vec::new()))
+                .collect();
+            self.extend_live_edges(work, &mut live, &mut seen);
+            let before_read = self.read_phis.len();
+            if self.mask_data == MaskData::Console && mask_data_join_enabled() {
+                for &(_, b, i) in &data_phis {
+                    let phi = &p.blocks[b].phis[i];
+                    if phi.reg == Reg::Scc {
+                        continue;
+                    }
+                    for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                        let Some(tail_q) = self.tail[q] else {
+                            continue;
+                        };
+                        if !live.contains(&(phi.value, n)) {
+                            continue;
+                        }
+                        let arg = phi.args[n];
+                        let is_mask =
+                            self.x.st.masks.contains_key(&arg) || self.x.st.highs.contains_key(&arg);
+                        if is_mask
+                            && matches!(self.vals.get(&arg), None | Some(Val::Missing(_)))
+                            && tried_masks.insert(arg)
+                        {
+                            let qb = self.edges.get(&(q, b)).copied().unwrap_or(tail_q);
+                            let here = std::mem::replace(&mut self.cur, qb);
+                            if let Ok(x) = self.mask_dword(arg) {
+                                self.vals.insert(arg, Val::I32(x));
+                            }
+                            self.cur = here;
+                        }
+                    }
+                }
+            }
+            if self.pending_masks.is_empty() && self.read_phis.len() == before_read {
+                break;
+            }
+        }
+        for (v, b, i) in data_phis {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
             let mut incoming = Vec::new();
@@ -10126,22 +10228,6 @@ impl<'a> Lower<'a> {
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
-        }
-        while let Some((v, b, i)) = self.pending_masks.pop() {
-            let phi = &p.blocks[b].phis[i];
-            let offset = p.blocks[b].offset;
-            let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
-                incoming.push((x, qb));
-            }
-            self.s.m.set_phi(v, incoming);
         }
         Ok(())
     }
@@ -11048,6 +11134,33 @@ mod tests {
             assert_eq!(param(a), "- - - - - - - -");
         }
     }
+
+    #[test]
+    fn a_register_joining_a_lane_mask_and_data_lowers() {
+        // s2 holds a lane mask on entry (vcc_lo & exec_lo) and data from
+        // v_readfirstlane_b32 on the loop back edge; the loop reads s2 both
+        // as data (v_and_b32) and as a mask (s_and_b32 -> s_cmp_eq_u32).
+        let words = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+            0x8702_7E6A, // s_and_b32 s2, vcc_lo, exec_lo
+            0x3602_0202, // loop: v_and_b32 v1, s2, v1
+            0x8703_7E02, // s_and_b32 s3, s2, exec_lo
+            0xBF06_8003, // s_cmp_eq_u32 s3, 0
+            0xBF85_0003, // s_cbranch_scc1 -> end
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF84_FFF9, // s_cbranch_scc0 -> loop
+            S_ENDPGM,
+        ];
+        lowers(&words, 0).expect("mask+data join should lower");
+    }
+}
+
+/// Whether registers joining a lane mask and data in compute shaders lower
+/// using ballots and lane-bit extracts (`VICTORY_MASK_DATA_JOIN`, on unless 0).
+fn mask_data_join_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MASK_DATA_JOIN").map_or(true, |v| v != "0"))
 }
 
 #[cfg(test)]
