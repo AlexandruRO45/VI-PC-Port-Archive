@@ -167,6 +167,14 @@ pub(crate) struct Arenas {
     /// Bytes of open parts and sections, and of those being opened on the
     /// arenas' thread.
     locked: u64,
+    /// With [`early`]: parts asked early ([`Arenas::ask_early`]) by
+    /// (start, bytes), while being opened.
+    early: std::collections::BTreeSet<(u64, u64)>,
+    /// With [`early`]: commits reported and not asked yet, and whether
+    /// the host is up (a first range was resolved): until then commits
+    /// wait here, and the host is not made for them.
+    early_waiting: Vec<(u64, u64)>,
+    host_up: bool,
 }
 
 /// Since the start: parts and sections opened, refused, retired; their
@@ -260,6 +268,7 @@ impl Arenas {
         }
         let parts: Vec<(u64, u64)> = self.parts.keys().filter(|&&(s, n)| s < end && s + n > at).copied().collect();
         for key in &parts {
+            self.early.remove(key);
             match self.parts.remove(key) {
                 Some(Slot::Open(arena)) => {
                     self.locked -= arena.bytes;
@@ -271,6 +280,68 @@ impl Arenas {
             }
         }
         parts
+    }
+
+    /// With [`early`]: committed private title memory `[at, at + len)`,
+    /// just reported, is asked of the arenas' thread to open now, not at
+    /// its first GPU use (a part of 2.2 GB takes 365 ms to open; in run
+    /// inplace3-pool 1,320 placements were turned down meanwhile). The
+    /// parts are cut from the commit itself, every [`STRIDE`] from its
+    /// start up to [`PART`] each (as [`grid_part`] cuts a run), so that
+    /// commits made in steps do not open parts over each other; a range
+    /// over two commits gets the part of its run at its first use, as
+    /// before. A commit of `smallest` bytes or less is opened at its first
+    /// use (on the asking thread), and what an open part or one asked
+    /// early holds is not asked again. The budget is held from the ask on
+    /// ([`Arenas::reserve`]); over it, nothing is asked.
+    fn ask_early(&mut self, at: u64, len: u64, smallest: u64, most: u64, request: &mut dyn FnMut(Request)) {
+        let k = K64 as u64;
+        let (lo, hi) = (at.next_multiple_of(k), at.saturating_add(len) & !(k - 1));
+        if hi <= lo || hi - lo <= smallest {
+            return;
+        }
+        let mut start = lo;
+        loop {
+            let bytes = (hi - start).min(PART);
+            let key = (start, bytes);
+            if self.open_part(start, start + bytes).is_none()
+                && !self.early_opening(start, start + bytes)
+                && !self.parts.contains_key(&key)
+                && self.reserve(bytes, most).is_ok()
+            {
+                self.parts.insert(key, Slot::Opening(bytes));
+                self.early.insert(key);
+                request(Request::Part(start, bytes));
+                tracing::info!(
+                    start = format_args!("{start:#x}"),
+                    mb = bytes >> 20,
+                    "arena: committed graphics memory asked of the arenas' thread as the runtime reported it (VICTORY_ARENA_EARLY=1)"
+                );
+            }
+            if start + bytes >= hi {
+                break;
+            }
+            start += STRIDE;
+        }
+    }
+
+    /// With [`early`], once the host is up: the commits waiting are asked
+    /// ([`Arenas::ask_early`]).
+    fn ask_waiting(&mut self, smallest: u64, most: u64, request: &mut dyn FnMut(Request)) {
+        for (at, len) in std::mem::take(&mut self.early_waiting) {
+            self.ask_early(at, len, smallest, most, request);
+        }
+    }
+
+    /// Whether a part asked early that holds `[at, end)` is being opened.
+    fn early_opening(&self, at: u64, end: u64) -> bool {
+        self.early.iter().any(|&(s, n)| s <= at && end <= s + n && matches!(self.parts.get(&(s, n)), Some(Slot::Opening(_))))
+    }
+
+    /// Whether a part asked early that holds any of `[at, end)` is being
+    /// opened.
+    fn early_opening_over(&self, at: u64, end: u64) -> bool {
+        self.early.iter().any(|&(s, n)| s < end && at < s + n && matches!(self.parts.get(&(s, n)), Some(Slot::Opening(_))))
     }
 
     /// Holds `bytes` of the budget for a part or section the arenas'
@@ -411,6 +482,8 @@ impl Arenas {
         // its run of committed pages.
         let arena = match self.open_part(at, end) {
             Some(arena) => arena,
+            // A part asked early that holds it is being opened.
+            None if self.early_opening(at, end) => return Err(Why::Opening),
             None => {
                 let key = self.part_for(at, end)?;
                 match self.parts.get(&key) {
@@ -512,7 +585,10 @@ impl Arenas {
         let slot = self.held_or_given_back(held, slot);
         counted(&slot);
         match request {
-            Request::Part(start, bytes) => self.keep((start, bytes), slot),
+            Request::Part(start, bytes) => {
+                self.early.remove(&(start, bytes));
+                self.keep((start, bytes), slot);
+            }
             Request::Section(section, _) => {
                 self.sections.insert(section, slot);
             }
@@ -697,7 +773,13 @@ fn worker() -> &'static std::sync::mpsc::Sender<Request> {
 pub(crate) fn resolve(at: u64, len: u64) -> Option<Resolved> {
     let host = crate::host::host()?;
     let mut asked = Vec::new();
-    let resolved = with(|a| a.resolve_with(&host.device, at, len, sync_bytes(), most(), &mut |r| asked.push(r)));
+    let resolved = with(|a| {
+        if early() && !a.host_up {
+            a.host_up = true;
+            a.ask_waiting(sync_bytes(), most(), &mut |r| asked.push(r));
+        }
+        a.resolve_with(&host.device, at, len, sync_bytes(), most(), &mut |r| asked.push(r))
+    });
     for request in asked {
         let _ = worker().send(request);
     }
@@ -716,12 +798,35 @@ pub(crate) fn census() -> (u64, u64, u64) {
 
 /// The runtime committed private title memory `[at, at + len)` that the
 /// GPU may use (`XMemVirtualAlloc`): it may be opened as an arena on first
-/// GPU use. Only memory told here is ever opened as a part.
+/// GPU use, or at once with [`early`]. Only memory told here is ever
+/// opened as a part.
 pub fn title_memory_committed(at: usize, len: usize) {
     if crate::inplace::level() < 3 || len == 0 {
         return;
     }
-    with(|a| a.committed(at as u64, len as u64));
+    let (at, len) = (at as u64, len as u64);
+    let mut asked = Vec::new();
+    with(|a| {
+        a.committed(at, len);
+        if early() {
+            a.early_waiting.push((at, len));
+            if a.host_up {
+                a.ask_waiting(sync_bytes(), most(), &mut |r| asked.push(r));
+            }
+        }
+    });
+    for request in asked {
+        let _ = worker().send(request);
+    }
+}
+
+/// Whether committed graphics memory is asked of the arenas' thread to
+/// open as soon as the runtime reports it, not at its first GPU use
+/// ([`Arenas::ask_early`]; `VICTORY_ARENA_EARLY=1`, off by default; with
+/// arenas, `VICTORY_INPLACE=3` or more). Read once.
+fn early() -> bool {
+    static EARLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EARLY.get_or_init(|| std::env::var_os("VICTORY_ARENA_EARLY").is_some_and(|v| v == "1"))
 }
 
 /// The title is about to decommit, release or protect `[at, at + len)`
@@ -733,7 +838,17 @@ pub fn title_memory_released(at: usize, len: usize) {
     if crate::inplace::level() < 3 {
         return;
     }
-    let parts = with(|a| a.released(at as u64, len as u64));
+    // A part asked early over it that is being opened is waited for (five
+    // seconds at most): while it opens its pages are locked, and the
+    // title's call would fail (R9). Without [`early`] there is none.
+    let (at, len) = (at as u64, len as u64);
+    let (end, wait, asked) = (at.saturating_add(len.max(1)), std::time::Duration::from_secs(5), std::time::Instant::now());
+    let parts = loop {
+        if let Some(parts) = with(|a| (asked.elapsed() >= wait || !a.early_opening_over(at, end)).then(|| a.released(at, len))) {
+            break parts;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
     let mut gone = 0;
     for (start, bytes) in parts {
         gone += crate::shadow::in_place_let_go(start, bytes, false);
@@ -915,6 +1030,45 @@ mod tests {
             // here, their addresses went to tests running beside this one,
             // and about one run in ten ended in an access violation.
         }
+    }
+
+    /// `VICTORY_ARENA_EARLY`: a commit is asked of the thread at once, in
+    /// parts cut from it, its bytes held; asked once; a small one, or one
+    /// over the budget, is not. A range in a part being opened is turned
+    /// down as opening, not asked as a part of its run; a release over it
+    /// sees it; landed or released, it is no longer waited for.
+    #[test]
+    fn a_commit_asked_early_is_opened_in_parts_of_its_own() {
+        let base = 0x10_0000_0000u64;
+        let mut a = Arenas::default();
+        a.committed(base, 5 * G);
+        let mut asked = Vec::new();
+        let most = 16 * G;
+        a.ask_early(base, 5 * G, 64 << 20, most, &mut |r| asked.push(r));
+        let parts: Vec<(u64, u64)> = asked
+            .iter()
+            .map(|r| match *r {
+                Request::Part(s, n) => (s, n),
+                Request::Section(..) => panic!("a section"),
+            })
+            .collect();
+        assert_eq!(parts, [(base, PART), (base + 2 * G, 3 * G)], "every 2 GiB from its start, up to its end");
+        assert_eq!(a.locked, PART + 3 * G, "held from the ask on");
+        a.ask_early(base + G, G, 64 << 20, most, &mut |r| asked.push(r));
+        a.ask_early(base + 5 * G, 64 << 20, 64 << 20, most, &mut |r| asked.push(r));
+        a.ask_early(base + 6 * G, G, 64 << 20, PART + 3 * G, &mut |r| asked.push(r));
+        assert_eq!(asked.len(), 2, "held already, small, over the budget: not asked");
+        assert!(a.early_opening(base + 16, base + 32) && a.early_opening_over(base + 3 * G, base + 5 * G));
+        if let Some(device) = crate::inplace::tests::warp() {
+            let why = a.resolve_why(&device, base + 16, 16, 0, most, &mut |r| asked.push(r)).err();
+            assert_eq!((why, asked.len()), (Some(Why::Opening), 2), "waits for the part asked early");
+        }
+        a.landed(Request::Part(base, PART), Slot::Refused(Why::Host));
+        assert!(!a.early_opening(base + 16, base + 32));
+        assert_eq!(a.locked, 3 * G);
+        assert_eq!(a.released(base + 3 * G, 16), [(base, PART), (base + 2 * G, 3 * G)]);
+        assert_eq!(a.locked, 0);
+        assert!(!a.early_opening_over(base, base + 5 * G) && a.early.is_empty());
     }
 
     /// On the software adapter: a region opened as one arena; two title
