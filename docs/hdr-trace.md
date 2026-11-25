@@ -6,7 +6,8 @@ switches once at first use, and records nothing unless all of the following
 hold: `VICTORY_HDR_TRACE=1`, `VICTORY_CAPTURE_WORLD` is set, and
 `VICTORY_CAPTURE_LISTED_ONLY=1`. A TiledLighting draw also flushes the kept
 lines, the Present line and the presented PNG on its own: the first frame
-where that draw executes, or the `VICTORY_HDR_TRACE_AFTER`-th one (default 1),
+where that draw executes, or the frames named by `VICTORY_HDR_TRACE_AFTER` (a comma list
+of post-world frames with that draw; default 1),
 so a frame offset a slow world never reaches is not needed. Copies and lines
 are made only for that trigger frame (and for explicitly listed frames). Recording is armed for the run (the title
 records a frame's commands before presenting it, so filtering by the
@@ -19,7 +20,8 @@ Disabled, it costs one cached boolean and allocates nothing.
 1. The first real occurrence of each of these programs, as the host recorded
    it: `34fb51b8a0312e82`, `68029c67dca01425`, `1cd9bc634417a981`,
    `48e74d16cbfa45e3`, `df11dcd012cd7382`, `7c649c422f6208e4`,
-   `5970ee6dbc47ec61`.
+   `5970ee6dbc47ec61`, and the upscale `4f4ec7b16673362f` (its
+   render target joins the presented source).
 2. For each selected table slot: static slot and dword offset, SRV/UAV,
    host slot, descriptor address, object and title VA (placed views),
    requested and **observed** effective format, mip/array/plane, generation
@@ -55,8 +57,8 @@ $env:VICTORY_CAPTURE_WORLD    = '2'
 $env:VICTORY_LOG              = 'info,victory_gpu::hdr_trace=info'
 ```
 
-`$env:VICTORY_HDR_TRACE_AFTER = '8'` flushes the 8th frame with a
-TiledLighting draw instead of the first (more settled), and is optional.
+`$env:VICTORY_HDR_TRACE_AFTER = '1,2,3,4'` keeps the first four frames with a TiledLighting draw (one PNG and one
+sample set each), so a card frame and the scene after it can be compared.
 
 Do not set `VICTORY_DUMP_TARGETS`, `VICTORY_DUMP_WRITERS`, `VICTORY_SHOW_TARGET`,
 `VICTORY_GPU_TIMING`, `VICTORY_D3D12_DRED` or `VICTORY_D3D12_DEBUG` for this
