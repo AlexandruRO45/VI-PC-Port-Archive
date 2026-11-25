@@ -90,6 +90,13 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// Copies [`alias_copy`] recorded since the last frame-rate line.
 pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether subresource `i` of one texture is the same mip and slice as
+/// subresource `i` of the other: those of an array are numbered mip by
+/// mip within each slice, so arrays with other mip counts do not match.
+fn subresources_correspond(a: &D3D12_RESOURCE_DESC, b: &D3D12_RESOURCE_DESC) -> bool {
+    a.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D || a.DepthOrArraySize <= 1 || a.MipLevels == b.MipLevels
+}
+
 /// Records, once per list, the copy of `from`'s host texture into `to`'s:
 /// two title textures at one memory that cannot share a host texture
 /// (`resource::alias_source`: block-compressed against plain formats of
@@ -114,6 +121,10 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     }
     // SAFETY: live resources.
     let (da, db) = unsafe { (a.GetDesc(), b.GetDesc()) };
+    if !subresources_correspond(&da, &db) {
+        once!(?da, ?db, "an aliased texture array not copied: its mips differ in number");
+        return;
+    }
     let count = |d: &D3D12_RESOURCE_DESC| {
         if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
             u32::from(d.MipLevels)
@@ -486,6 +497,23 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two-slice arrays of two mips and of one: subresource 1 is a
+    /// slice's second mip in one and the second slice in the other.
+    #[test]
+    fn array_subresources_correspond_only_with_as_many_mips() {
+        let array = |mips: u16, slices: u16, dimension| D3D12_RESOURCE_DESC {
+            Dimension: dimension,
+            MipLevels: mips,
+            DepthOrArraySize: slices,
+            ..Default::default()
+        };
+        let d2 = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        assert!(!subresources_correspond(&array(2, 2, d2), &array(1, 2, d2)));
+        assert!(subresources_correspond(&array(2, 2, d2), &array(2, 2, d2)));
+        assert!(subresources_correspond(&array(2, 1, d2), &array(1, 1, d2)), "mips of one slice are a prefix");
+        assert!(subresources_correspond(&array(2, 4, D3D12_RESOURCE_DIMENSION_TEXTURE3D), &array(1, 4, D3D12_RESOURCE_DIMENSION_TEXTURE3D)));
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
