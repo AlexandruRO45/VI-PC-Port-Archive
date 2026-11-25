@@ -1403,13 +1403,24 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     }
     if texture.is_none() {
         castable_formats.clear();
+        // No cast list now: `ALLOW_UNORDERED_ACCESS` is legal only where the
+        // format itself takes a typed unordered view. The castable creation
+        // was offered only because one of its formats does; where the host
+        // refused it (a packed format it will not make castable), keeping the
+        // flag would remove the device, so the texture is made without it.
+        let mut fallback = *d;
+        if fallback.flags & UNORDERED != 0
+            && !crate::descriptor::host::typed_store(fallback.format)
+        {
+            fallback.flags &= !UNORDERED;
+        }
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
         let made = unsafe {
             host.device.CreateCommittedResource(
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
-                std::ptr::from_ref(d).cast(),
+                std::ptr::from_ref(&fallback).cast(),
                 D3D12_RESOURCE_STATES(initial as i32),
                 clear_value,
                 &mut texture,
