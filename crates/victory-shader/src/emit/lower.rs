@@ -267,6 +267,10 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    /// Values written in a section whose per-lane shapes are known, by `(b, start)`.
+    section_lanes: HashMap<Value, (usize, usize)>,
+    /// Cached `(lo, hi)` `f64` wave sums keyed by `(dxil_block, lo, hi, mask)`.
+    f64_sums: HashMap<(usize, Value, Value, Value), (V, V)>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -709,6 +713,8 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            section_lanes: HashMap::new(),
+            f64_sums: HashMap::new(),
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -1107,7 +1113,14 @@ impl<'a> Lower<'a> {
         let inst = &self.x.p.blocks[b].insts[i];
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
-                let shape = self.sections[&b][&start].shapes.get(&w).copied();
+                let sec = &self.sections[&b][&start];
+                let shape = sec.shapes.get(&w).copied();
+                if shape.is_none()
+                    && whole_wave_ext_enabled()
+                    && sec.lane_shapes.contains_key(&w)
+                {
+                    self.section_lanes.insert(w, (b, start));
+                }
                 match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)) {
                     Ok(x) => Val::I32(x),
                     Err(why) => Val::Missing(why),
@@ -1200,6 +1213,44 @@ impl<'a> Lower<'a> {
                 let high = self.s.m.i32(0xFFFF_0000);
                 let top = self.s.m.bin(c, Bin::And, top, high);
                 return Ok(self.s.m.bin(c, Bin::Or, top, r));
+            }
+            Shape::Active64 { high, lo, hi, mask } => {
+                if !whole_wave_ext_enabled() {
+                    return Err("a whole-wave section step the simulation does not follow");
+                }
+                let c = self.cur;
+                let (out_lo, out_hi) = if let Some(&pair) = self.f64_sums.get(&(c, lo, hi, mask))
+                {
+                    pair
+                } else {
+                    let &m = self
+                        .x
+                        .st
+                        .masks
+                        .get(&mask)
+                        .ok_or("a wave reduction's untracked mask")?;
+                    let on = self.boolean(m, c)?;
+                    let (lo_v, hi_v) = (self.i32_of(lo)?, self.i32_of(hi)?);
+                    let f = self.cvt_f32_f64(lo_v, hi_v);
+                    let zero = self.s.m.i32(0);
+                    let x = self.s.m.select(c, on, f, zero);
+                    self.s.flags |= flags::WAVE_OPS;
+                    let arg = self.as_float(x);
+                    let (k0, s0) = (self.s.m.i8(0), self.s.m.i8(0));
+                    let sum = self.s.op(
+                        c,
+                        "waveActiveOp.f32",
+                        Attr::NoUnwind,
+                        self.s.t.f32,
+                        119,
+                        &[arg, k0, s0],
+                    );
+                    let bits = self.as_int(sum);
+                    let pair = self.cvt_f64_f32(bits);
+                    self.f64_sums.insert((c, lo, hi, mask), pair);
+                    pair
+                };
+                return Ok(if high { out_hi } else { out_lo });
             }
         };
         // A mesh program's lanes are numbered as the console's, its host
@@ -6350,69 +6401,10 @@ impl<'a> Lower<'a> {
             }
             "v_cvt_f32_f64" => {
                 // Double to float in integer arithmetic (no 64-bit float on
-                // the host path): round to nearest even, overflow to
-                // infinity, NaN kept quiet, results below the float range
-                // flushed to signed zero (as the console flushes f32
-                // denormals by default).
+                // the host path).
                 let x = self.src64(inst, 0)?;
                 let (lo, hi) = self.split64(x);
-                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let sign = {
-                    let m = k(self, 0x8000_0000);
-                    self.s.m.bin(c, Bin::And, hi, m)
-                };
-                let e = {
-                    let (k20, m) = (k(self, 20), k(self, 0x7FF));
-                    let t = self.s.m.bin(c, Bin::LShr, hi, k20);
-                    self.s.m.bin(c, Bin::And, t, m)
-                };
-                let m = {
-                    let (mh, k3, k29) = (k(self, 0xF_FFFF), k(self, 3), k(self, 29));
-                    let t = self.s.m.bin(c, Bin::And, hi, mh);
-                    let t = self.s.m.bin(c, Bin::Shl, t, k3);
-                    let u = self.s.m.bin(c, Bin::LShr, lo, k29);
-                    self.s.m.bin(c, Bin::Or, t, u)
-                };
-                let rest = {
-                    let r = k(self, 0x1FFF_FFFF);
-                    self.s.m.bin(c, Bin::And, lo, r)
-                };
-                // Normal: sign | (e - 896) << 23 | m, plus the rounding carry.
-                let (k896, k23, one, half) = (k(self, 896), k(self, 23), k(self, 1), k(self, 0x1000_0000));
-                let e32 = self.s.m.bin(c, Bin::Sub, e, k896);
-                let ebits = self.s.m.bin(c, Bin::Shl, e32, k23);
-                let bits = self.s.m.bin(c, Bin::Or, sign, ebits);
-                let bits = self.s.m.bin(c, Bin::Or, bits, m);
-                let above = self.s.m.cmp(c, pred::IUGT, rest, half);
-                let tie = self.s.m.cmp(c, pred::EQ, rest, half);
-                let odd = self.s.m.bin(c, Bin::And, m, one);
-                let k0 = k(self, 0);
-                let odd = self.s.m.cmp(c, pred::NE, odd, k0);
-                let tie_up = self.s.m.bin(c, Bin::And, tie, odd);
-                let up = self.s.m.bin(c, Bin::Or, above, tie_up);
-                let zero = k(self, 0);
-                let carry = self.s.m.select(c, up, one, zero);
-                let normal = self.s.m.bin(c, Bin::Add, bits, carry);
-                // Exponent ranges, by the double's exponent: <= 896 to zero,
-                // >= 1151 to infinity, 0x7FF infinity or NaN.
-                let inf = {
-                    let i = k(self, 0x7F80_0000);
-                    self.s.m.bin(c, Bin::Or, sign, i)
-                };
-                let nan = {
-                    let q = k(self, 0x7FC0_0000);
-                    self.s.m.bin(c, Bin::Or, sign, q)
-                };
-                let mantissa = self.s.m.bin(c, Bin::Or, m, rest);
-                let has_mantissa = self.s.m.cmp(c, pred::NE, mantissa, zero);
-                let special = self.s.m.select(c, has_mantissa, nan, inf);
-                let (k7ff, k1151) = (k(self, 0x7FF), k(self, 1151));
-                let small = self.s.m.cmp(c, pred::IULE, e, k896);
-                let big = self.s.m.cmp(c, pred::IUGE, e, k1151);
-                let all = self.s.m.cmp(c, pred::EQ, e, k7ff);
-                let r = self.s.m.select(c, big, inf, normal);
-                let r = self.s.m.select(c, small, sign, r);
-                let r = self.s.m.select(c, all, special, r);
+                let r = self.cvt_f32_f64(lo, hi);
                 int(self, r)
             }
             // An SGPR spilled to a VGPR lane and read back is the SGPR, in
@@ -6437,6 +6429,24 @@ impl<'a> Lower<'a> {
                 Err("a VGPR of spilled SGPRs read per lane")
             }
             "v_readlane_b32" => {
+                if whole_wave_ext_enabled()
+                    && let (Some(&Operand::Vector { reg, .. }), Some(l_op)) =
+                        (v.src.first(), v.src.get(1))
+                    && let Some(src_v) = inst.read(Reg::V(reg))
+                    && let Some(&(sb, start)) = self.section_lanes.get(&src_v)
+                    && let Some(lane_idx) = match *l_op {
+                        Operand::Const(k) => crate::resource::inline(k),
+                        Operand::Literal(x) => Some(x),
+                        _ => None,
+                    }
+                    && let Some(&Some(sh)) = self.sections[&sb][&start]
+                        .lane_shapes
+                        .get(&src_v)
+                        .and_then(|ls| ls.get(lane_idx as usize))
+                {
+                    let r = self.shape(sh)?;
+                    return int(self, r);
+                }
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
@@ -6493,6 +6503,106 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
         }
+    }
+
+    /// Converts IEEE `f64` (`lo`, `hi` as i32) to `f32` bits in integer
+    /// arithmetic: round to nearest even, overflow to infinity, NaN kept
+    /// quiet, results below float range flushed to signed zero.
+    fn cvt_f32_f64(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let sign = {
+            let m = k(self, 0x8000_0000);
+            self.s.m.bin(c, Bin::And, hi, m)
+        };
+        let e = {
+            let (k20, m) = (k(self, 20), k(self, 0x7FF));
+            let t = self.s.m.bin(c, Bin::LShr, hi, k20);
+            self.s.m.bin(c, Bin::And, t, m)
+        };
+        let m = {
+            let (mh, k3, k29) = (k(self, 0xF_FFFF), k(self, 3), k(self, 29));
+            let t = self.s.m.bin(c, Bin::And, hi, mh);
+            let t = self.s.m.bin(c, Bin::Shl, t, k3);
+            let u = self.s.m.bin(c, Bin::LShr, lo, k29);
+            self.s.m.bin(c, Bin::Or, t, u)
+        };
+        let rest = {
+            let r = k(self, 0x1FFF_FFFF);
+            self.s.m.bin(c, Bin::And, lo, r)
+        };
+        // Normal: sign | (e - 896) << 23 | m, plus the rounding carry.
+        let (k896, k23, one, half) = (
+            k(self, 896),
+            k(self, 23),
+            k(self, 1),
+            k(self, 0x1000_0000),
+        );
+        let e32 = self.s.m.bin(c, Bin::Sub, e, k896);
+        let ebits = self.s.m.bin(c, Bin::Shl, e32, k23);
+        let bits = self.s.m.bin(c, Bin::Or, sign, ebits);
+        let bits = self.s.m.bin(c, Bin::Or, bits, m);
+        let above = self.s.m.cmp(c, pred::IUGT, rest, half);
+        let tie = self.s.m.cmp(c, pred::EQ, rest, half);
+        let odd = self.s.m.bin(c, Bin::And, m, one);
+        let zero = k(self, 0);
+        let odd = self.s.m.cmp(c, pred::NE, odd, zero);
+        let tie_up = self.s.m.bin(c, Bin::And, tie, odd);
+        let up = self.s.m.bin(c, Bin::Or, above, tie_up);
+        let carry = self.s.m.select(c, up, one, zero);
+        let normal = self.s.m.bin(c, Bin::Add, bits, carry);
+        // Exponent ranges, by the double's exponent: <= 896 to zero,
+        // >= 1151 to infinity, 0x7FF infinity or NaN.
+        let inf = {
+            let i = k(self, 0x7F80_0000);
+            self.s.m.bin(c, Bin::Or, sign, i)
+        };
+        let nan = {
+            let q = k(self, 0x7FC0_0000);
+            self.s.m.bin(c, Bin::Or, sign, q)
+        };
+        let mantissa = self.s.m.bin(c, Bin::Or, m, rest);
+        let has_mantissa = self.s.m.cmp(c, pred::NE, mantissa, zero);
+        let special = self.s.m.select(c, has_mantissa, nan, inf);
+        let (k7ff, k1151) = (k(self, 0x7FF), k(self, 1151));
+        let small = self.s.m.cmp(c, pred::IULE, e, k896);
+        let big = self.s.m.cmp(c, pred::IUGE, e, k1151);
+        let all = self.s.m.cmp(c, pred::EQ, e, k7ff);
+        let r = self.s.m.select(c, big, inf, normal);
+        let r = self.s.m.select(c, small, sign, r);
+        self.s.m.select(c, all, special, r)
+    }
+
+    /// Converts IEEE `f32` bits to `(lo, hi)` `f64` words in integer
+    /// arithmetic (denormals flush to signed zero).
+    fn cvt_f64_f32(&mut self, bits: V) -> (V, V) {
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (kmask, k8, ke_max) = (k(self, 0x8000_0000), k(self, 0xFF), k(self, 0xFF));
+        let sign = self.s.m.bin(c, Bin::And, bits, kmask);
+        let (k23, k20, k896) = (k(self, 23), k(self, 20), k(self, 896));
+        let e = self.s.m.bin(c, Bin::LShr, bits, k23);
+        let e = self.s.m.bin(c, Bin::And, e, ke_max);
+        let _ = k8;
+        let mmask = k(self, 0x7F_FFFF);
+        let m = self.s.m.bin(c, Bin::And, bits, mmask);
+        let (k3, k29) = (k(self, 3), k(self, 29));
+        let mhi = self.s.m.bin(c, Bin::LShr, m, k3);
+        let norm_e = self.s.m.bin(c, Bin::Add, e, k896);
+        let norm_e = self.s.m.bin(c, Bin::Shl, norm_e, k20);
+        let norm_hi = self.s.m.bin(c, Bin::Or, sign, norm_e);
+        let norm_hi = self.s.m.bin(c, Bin::Or, norm_hi, mhi);
+        let zero = k(self, 0);
+        let lo = self.s.m.bin(c, Bin::Shl, m, k29);
+        let small = self.s.m.cmp(c, pred::EQ, e, zero);
+        let lo = self.s.m.select(c, small, zero, lo);
+        let hi = self.s.m.select(c, small, sign, norm_hi);
+        let spec_e = k(self, 0x7FF0_0000);
+        let spec_hi = self.s.m.bin(c, Bin::Or, sign, spec_e);
+        let spec_hi = self.s.m.bin(c, Bin::Or, spec_hi, mhi);
+        let big = self.s.m.cmp(c, pred::EQ, e, ke_max);
+        let hi = self.s.m.select(c, big, spec_hi, hi);
+        (lo, hi)
     }
 
     /// A 64-bit source (a register pair; inline constants sign-extend).
@@ -11378,6 +11488,107 @@ mod tests {
         lower_with(&heap_tex_dims, heap_layout, vec![])
             .expect("heap image GetDimensions without sample should lower");
     }
+
+    #[test]
+    fn whole_wave_extensions_lower() {
+        // Post-section `v_readlane_b32` reading lane 63 where only lanes 32..63
+        // hold the full-wave bit-or (`amd_fidelityfx_upscaler_xbox` pattern).
+        let readlane63 = [
+            0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
+            0xD501_0002,
+            0x0022_0080, // v_cndmask_b32 v2, 0, v0, s[8:9]
+            0x3804_04E9,
+            0xDE54_C102, // v_or_b32 v2, v2, v2 dpp8:[1,0,3,2,5,4,7,6]
+            0x3804_04E9,
+            0x9360_1202, // v_or_b32 v2, v2, v2 dpp8:[2,2,0,0,6,6,4,4]
+            0x3804_04E9,
+            0x0009_2402, // v_or_b32 v2, v2, v2 dpp8:[4,4,4,4,0,0,0,0]
+            0x3804_04FA,
+            0xFF09_4002, // v_or_b32 v2, v2, v2 row_mirror bound_ctrl:1
+            0xD778_0003,
+            0x0201_0102, // v_permlanex16_b32 v3, v2, 0, 0
+            0x3804_0503, // v_or_b32 v2, v3, v2
+            0xD760_000A,
+            0x0001_0102, // v_readlane_b32 s10, v2, 0
+            0x3804_040A, // v_or_b32 v2, s10, v2
+            0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+            0xD760_000A,
+            0x0001_7F02, // v_readlane_b32 s10, v2, 63
+            0x4A00_000A, // v_add_nc_u32 v0, s10, v0
+            S_ENDPGM,
+        ];
+        lower_wave(&readlane63, vec![], vec![], true)
+            .expect("v_readlane_b32 outside section at lane 63 should lower");
+
+        // 64-bit f64 reduction (`v_add_f64`) -> s_mov -> v_cvt_f32_f64.
+        let add_f64 = [
+            0x7E26_0280, // v_mov_b32 v19, 0
+            0x7E28_02FF,
+            0x3FF0_0000, // v_mov_b32 v20, 0x3ff00000 (1.0f64 high)
+            0xBE86_25C1, // s_or_saveexec_b64 s[6:7], -1
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xD501_0002,
+            0x001A_2702, // v_cndmask_b32 v2, v2, v19, s[6:7]
+            0xD501_0003,
+            0x001A_2903, // v_cndmask_b32 v3, v3, v20, s[6:7]
+            0x7E08_02E9,
+            0xDE54_C102, // v_mov_b32 v4, v2 dpp8:[1,0,3,2,5,4,7,6]
+            0x7E0A_02E9,
+            0xDE54_C103, // v_mov_b32 v5, v3 dpp8:[1,0,3,2,5,4,7,6]
+            0xD564_0002,
+            0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+            0x7E08_02E9,
+            0x9360_1202, // v_mov_b32 v4, v2 dpp8:[2,2,0,0,6,6,4,4]
+            0x7E0A_02E9,
+            0x9360_1203, // v_mov_b32 v5, v3 dpp8:[2,2,0,0,6,6,4,4]
+            0xD564_0002,
+            0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+            0x7E08_02E9,
+            0x0009_2402, // v_mov_b32 v4, v2 dpp8:[4,4,4,4,0,0,0,0]
+            0x7E0A_02E9,
+            0x0009_2403, // v_mov_b32 v5, v3 dpp8:[4,4,4,4,0,0,0,0]
+            0xD564_0002,
+            0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+            0x7E08_02FA,
+            0xFF09_4002, // v_mov_b32 v4, v2 row_mirror bound_ctrl:1
+            0x7E0A_02FA,
+            0xFF09_4003, // v_mov_b32 v5, v3 row_mirror bound_ctrl:1
+            0xD564_0002,
+            0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+            0xD778_0004,
+            0x0201_0102, // v_permlanex16_b32 v4, v2, 0, 0
+            0xD778_0005,
+            0x0201_0103, // v_permlanex16_b32 v5, v3, 0, 0
+            0xD564_0002,
+            0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+            0xD760_0008,
+            0x0001_4102, // v_readlane_b32 s8, v2, 32
+            0xD760_0009,
+            0x0001_4103, // v_readlane_b32 s9, v3, 32
+            0xD564_0002,
+            0x0002_0408, // v_add_f64 v[2:3], s[8:9], v[2:3]
+            0xD760_0008,
+            0x0001_0102, // v_readlane_b32 s8, v2, 0
+            0xD760_0009,
+            0x0001_0103, // v_readlane_b32 s9, v3, 0
+            0xBE8C_0308, // s_mov_b32 s12, s8
+            0xBE8D_0309, // s_mov_b32 s13, s9
+            0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+            0x7E00_1E0C, // v_cvt_f32_f64 v0, s[12:13]
+            S_ENDPGM,
+        ];
+        lower_wave(&add_f64, vec![], vec![], true)
+            .expect("v_add_f64 whole-wave sum should lower");
+    }
+}
+
+/// Whether extended whole-wave section lowering (`v_readlane_b32` per-lane
+/// outputs and `v_add_f64` reductions) is enabled
+/// (`VICTORY_WHOLE_WAVE_EXT`, on unless 0).
+fn whole_wave_ext_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_WHOLE_WAVE_EXT").map_or(true, |v| v != "0"))
 }
 
 /// Whether descriptor loads with no access instruction query DXIL
