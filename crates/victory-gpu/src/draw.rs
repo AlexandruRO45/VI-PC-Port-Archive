@@ -462,7 +462,33 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 /// the ones whose first page was not there (asked by the first page alone,
 /// as before, they counted as not there at all).
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Since the start: looks that found more of a placed texture's memory
+/// mapped than at its last look although no notice of the runtime
+/// (`descriptor::host::remapped`) had made its slot due: memory that
+/// arrives unannounced, which only the looks find ([`park_frames`]).
+pub(crate) static HEAP_TEXTURES_UNANNOUNCED: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_TEXTURE_PARK_FRAMES=<n>`: a texture uploaded in part whose look
+/// found no more of its memory mapped is looked at again after up to `n`
+/// frames, not after at most 256 (or less: about 4 s). The runtime's
+/// notices make it due at once when memory is mapped, unmapped or written
+/// under it, so the looks are only for memory that arrives without one: 0,
+/// the default, keeps them as they are. Each look asks the kernel about
+/// every 64 KiB of the texture (4.5 ms a frame on average in a release
+/// run, 241 slots looked at, peaks of 13-16 ms). To try only where the
+/// frame line's "arrived unannounced" stays at about 0 through a long run
+/// with streaming: a texture whose memory arrived so stays partly uploaded
+/// for up to `n` frames.
+pub(crate) fn park_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_PARK_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
@@ -1758,6 +1784,9 @@ impl State {
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
         let most = (4000 / took).clamp(16, 256);
+        // (a texture uploaded in part and found no further along: see
+        // `park_frames`)
+        let parked = most.max(park_frames());
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -1804,6 +1833,12 @@ impl State {
                 let len = upload_bytes.unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 phase(3, turn);
+                // More there than at the last look, with no notice between
+                // (a notice resets the looks).
+                let (was_mapped, looks) = host.texture_slot_seen(index);
+                if mapped > was_mapped && looks > 0 {
+                    HEAP_TEXTURES_UNANNOUNCED.fetch_add(1, Ordering::Relaxed);
+                }
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -1812,9 +1847,9 @@ impl State {
                     continue;
                 }
                 if mapped < len {
-                    if mapped <= host.texture_slot_mapped(index) {
+                    if mapped <= was_mapped {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
-                        host.texture_slot_later(index, write, frame, most);
+                        host.texture_slot_later(index, write, frame, parked);
                         continue;
                     }
                     if !crate::texture::committed(address as *const u8, 1) {

@@ -9906,6 +9906,7 @@ impl Meter {
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
                 let [same, parts, tails] =
                     [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURES_PARTLY[i].load(Ordering::Relaxed));
+                let unannounced = crate::draw::HEAP_TEXTURES_UNANNOUNCED.load(Ordering::Relaxed);
                 let [unchanged, reuploaded] =
                     crate::draw::HEAP_TEXTURES_RECHECKED.each_ref().map(|n| n.load(Ordering::Relaxed));
                 let [early, bake] = crate::draw::EARLY_TEXTURE_PASSES.each_ref().map(|n| n.load(Ordering::Relaxed));
@@ -9914,7 +9915,8 @@ impl Meter {
                      {away} waiting for their memory, {partly} uploaded in part; since the start: {} slots found uploaded already by \
                      the draws that read them through tables, {} writes of tables' slots (due some frames later), {} slots taken out \
                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
-                     {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
+                     {same} looks that found no more mapped, {unannounced} that found more arrived unannounced; \
+                     {} slots made stale by a newer view of other memory there, \
                      {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
                      {} made slots found unmapped and made null; {unchanged} content checks unchanged, \
                      {reuploaded} requested an upload after a change, {:.1} ms checking since start; \
