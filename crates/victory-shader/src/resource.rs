@@ -195,6 +195,9 @@ pub fn track(
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
+                // A load in an earlier block ran once before the loop and
+                // stays uniform; otherwise its first-lane read fails the
+                // waterfall proof for operands loaded inside block `b`.
                 if let Source::Loaded { load, .. } = source
                     && load.0 == b
                     && load.1 < i
