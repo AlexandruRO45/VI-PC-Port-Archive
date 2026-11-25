@@ -1529,8 +1529,8 @@ mod tests {
                 0,
             );
         }
-        // `map_whole` already coalesced the reservation into the view; after
-        // unmapping it there is no reservation left to release.
+        // SAFETY: `map_whole` already coalesced the reservation into the view,
+        // and `base` came from `XMemVirtualAlloc` above if any reservation remained.
         let _ = unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }
 
