@@ -24,8 +24,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_BINK_TRACE").is_some_and(|v| v == "1" || v == "true")
+        std::env::var_os("VICTORY_BINK_TRACE").is_some_and(|v| v == "1" || v == "true") || only()
     })
+}
+
+/// `VICTORY_HASH_MOVIE_ONLY=1`: a texture is hashed at every refresh only when
+/// its bytes are one of the decoder's own frame buffers, rather than whenever
+/// any other view maps them. The decoder is the writer known to reach its
+/// buffers through a view the guard cannot see (`crate::inplace::another_view`
+/// answers the broader question, and in the world every texture a second view
+/// maps is hashed every frame: 162-264 MB a frame, 30-108 MB of it changed).
+pub fn only() -> bool {
+    static ONLY: OnceLock<bool> = OnceLock::new();
+    *ONLY.get_or_init(|| std::env::var_os("VICTORY_HASH_MOVIE_ONLY").is_some_and(|v| v == "1"))
 }
 
 /// One range the title registered with its decoder: where, how long, and

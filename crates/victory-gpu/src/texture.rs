@@ -643,7 +643,14 @@ impl Staging {
             1 => true,
             2 => false,
             _ => {
-                let second = crate::inplace::another_view(start, size);
+                // `VICTORY_HASH_MOVIE_ONLY`: only the decoder's own buffers,
+                // which it writes through a view the guard cannot see, are hashed
+                // at every refresh; other second views keep the eight-frame turn.
+                let second = if crate::movie::only() {
+                    crate::movie::overlaps(start, size).is_some()
+                } else {
+                    crate::inplace::another_view(start, size)
+                };
                 self.second_view.store(if second { 1 } else { 2 }, Relaxed);
                 second
             }
