@@ -128,6 +128,19 @@ impl Drop for Held<'_> {
 static NAMES: Names = Names::new();
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// The library of a WARP host: the hardware's refuses its pipelines and the
+/// other way round, so one file for both was emptied by every switch (#2637).
+const SOFTWARE_LIBRARY_FILE: &str = "host-pipelines-warp.bin";
+
+/// The library file of a host on the software adapter or on hardware.
+fn library_file(software: bool) -> &'static str {
+    if software { SOFTWARE_LIBRARY_FILE } else { LIBRARY_FILE }
+}
+
+/// The library file of this run's host.
+fn host_library_file() -> &'static str {
+    library_file(crate::host::host().is_some_and(|h| h.software))
+}
 const EARLY_FILE: &str = "early-pipelines.txt";
 const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
@@ -139,7 +152,7 @@ fn library() -> Option<&'static Shared> {
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
-            let blob = read(LIBRARY_FILE).unwrap_or_default();
+            let blob = read(host_library_file()).unwrap_or_default();
             let tag = tag(&blob);
             let mut library = open(&device, blob);
             // The pre-build's list, if it was saved with these bytes.
@@ -345,7 +358,7 @@ pub(crate) fn save(now: bool) {
     };
     let used = used().as_ref().map(Used::list).unwrap_or_default();
     let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
+        .and_then(|()| write_atomically(&dir.join(host_library_file()), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
             Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
@@ -491,6 +504,15 @@ mod tests {
     fn a_save_buffer_the_host_cannot_give_is_refused() {
         assert!(zeroed(usize::MAX / 2).is_none());
         assert_eq!(zeroed(100).as_deref(), Some(&[0u8; 100][..]));
+    }
+
+    /// A WARP host and a hardware one keep their libraries apart, so a run on
+    /// one does not empty the other's; the hardware file keeps its name (#2637).
+    #[test]
+    fn warp_and_hardware_hosts_keep_their_own_library() {
+        assert_eq!(library_file(false), "host-pipelines.bin");
+        assert_ne!(library_file(true), library_file(false));
+        assert!(library_file(true).ends_with(".bin"));
     }
 
     #[test]
