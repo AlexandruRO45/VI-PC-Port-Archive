@@ -33,6 +33,9 @@ usage: proton/run.sh [options] [--] [victory args...]
                  GE-Proton, off elsewhere — MangoHud cannot present
                  through the Valve family's shared present mode)
   --no-mangohud  leave MANGOHUD unset (no overlay)
+  --log-window   tail the run's output in a terminal window (alacritty,
+                 konsole or xterm); VICTORY_LOG_WINDOW=file:term picks
+                 the log file and the terminal
 
 Notes:
   VICTORY_COPY_MEMORY defaults to 1: under Wine the title memory used in
@@ -60,6 +63,7 @@ texture_no_wait=1
 watchdog=""
 mangohud=1
 mangohud_forced=""
+log_window=""
 
 while [[ $# -gt 0 && $1 != -- ]]; do
     case "$1" in
@@ -75,6 +79,7 @@ while [[ $# -gt 0 && $1 != -- ]]; do
         --no-watchdog) watchdog=""; shift ;;
         --mangohud)    mangohud=1; mangohud_forced=1; shift ;;
         --no-mangohud) mangohud=""; mangohud_forced=1; shift ;;
+        --log-window)  log_window=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *)      break ;;
     esac
@@ -265,4 +270,31 @@ fi
 # prefix setup, so a fresh prefix never receives dxvk/vkd3d.
 wexe=$("$proton/proton" getcompatpath "$exe" 2>/dev/null)
 [[ -n $wexe ]] || die "proton getcompatpath failed for $exe"
+
+# --log-window keeps a terminal tailing the run's output, the live view the
+# first runs had before everything went to a redirected log. The log itself
+# lives outside the prefix; VICTORY_LOG_WINDOW names both the file and,
+# with a colon, the terminal (`file:term`).
+if [[ -n $log_window ]]; then
+    log=${VICTORY_LOG_WINDOW:-$HOME/.local/share/victory/proton-run.log}
+    term=${log##*:}
+    [[ $term == "$log" ]] && term=""
+    log=${log%%:*}
+    mkdir -p "$(dirname "$log")"
+    : > "$log"
+    if [[ -z $term ]]; then
+        for candidate in alacritty konsole xterm; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+                term=$candidate
+                break
+            fi
+        done
+    fi
+    if [[ -n $term ]]; then
+        "$term" -e tail -n 200 -f "$log" >/dev/null 2>&1 &
+    else
+        echo "proton/run.sh: no terminal for --log-window; tail $log" >&2
+    fi
+    exec "$proton/proton" waitforexitandrun "$wexe" "$@" > >(tee -a "$log") 2>&1
+fi
 exec "$proton/proton" waitforexitandrun "$wexe" "$@"

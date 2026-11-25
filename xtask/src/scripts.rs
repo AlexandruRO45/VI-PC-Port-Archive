@@ -290,6 +290,41 @@ mod tests {
     }
 
     #[test]
+    fn proton_launcher_log_window_tees_the_run() {
+        let tmp = temp_dir("log-window");
+        let prefix = tmp.join("prefix");
+        let exe = tmp.join("victory.exe");
+        fs::write(&exe, b"not a real exe").expect("stand-in exe");
+        let proton = fake_proton(&tmp, &prefix, true);
+        let log = tmp.join("run.log");
+        // `true` as the terminal: the tee path runs, no window opens.
+        let out = Command::new("bash")
+            .args(["proton/run.sh", "--prefix"])
+            .arg(&prefix)
+            .arg("--proton")
+            .arg(&proton)
+            .arg("--exe")
+            .arg(&exe)
+            .arg("--log-window")
+            .args(["--", "config"])
+            .current_dir(root())
+            .env("VICTORY_LOG_WINDOW", format!("{}:true", log.display()))
+            .output()
+            .expect("bash");
+        assert!(
+            out.status.success(),
+            "run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let written = fs::read_to_string(&log).expect("log file");
+        assert!(
+            written.contains("launched"),
+            "the log window's file must carry the run output: {written}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn proton_launcher_shader_caches_live_outside_the_prefix() {
         let tmp = temp_dir("shader-cache");
         let prefix = tmp.join("prefix");
