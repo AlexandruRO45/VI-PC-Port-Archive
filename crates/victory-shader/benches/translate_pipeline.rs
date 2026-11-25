@@ -1,6 +1,11 @@
 //! End-to-end and stage-by-stage timing of the ordinary shader translation
 //! pipeline on compact, deterministic synthetic GFX10 programs (no title files
 //! or GPU required).
+//!
+//! Scope & limits: synthetic CS/PS workloads exercising ALU-heavy straight-line
+//! code, divergent CFG, guarded vector runs, SGPR-to-VGPR spills, and pixel
+//! interpolation. Does not represent real title shader corpora, VS/MS/GS
+//! stages, DXBC/cache decompression, or host D3D12 PSO creation.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -260,12 +265,13 @@ fn main() {
 
     const SAMPLES: usize = 11;
     const ITERS: u32 = 16;
-    println!("translate_pipeline: {SAMPLES} samples x {ITERS} iters/sample (release)");
+    println!("translate_pipeline: {SAMPLES} samples x {ITERS} iters/sample (release, synthetic CS/PS workloads)");
+    println!("note: e2e_total = ir_bld..emit (6 additive stages); [decode] (inside ir_bld) and [dead] (inside emit) are standalone sub-timings");
     println!(
-        "{:<21} {:>5} {:>4} {:>7} | {:>6} {:>6} {:>5} {:>5} {:>4} {:>6} {:>5} {:>6} | {:>7} ({:>6}..{:>6}) | hash",
-        "workload", "insts", "blks", "dxil_B", "decode", "ir_bld", "spill", "dead", "io", "struct", "resrc", "emit", "total", "min", "max"
+        "{:<21} {:>5} {:>4} {:>7} | {:>9} ({:>6}..{:>6}) | {:>6} {:>5} {:>4} {:>6} {:>5} {:>6} | {:>8} {:>6} | fnv1a_64",
+        "workload", "insts", "blks", "dxil_B", "e2e_total", "min", "max", "ir_bld", "spill", "io", "struct", "resrc", "emit", "[decode]", "[dead]"
     );
-    println!("{}", "-".repeat(154));
+    println!("{}", "-".repeat(162));
 
     let mut sum_med = Duration::ZERO;
     for (name, native) in &cases {
@@ -326,12 +332,13 @@ fn main() {
         let m = |k: usize| us(samples[k][SAMPLES / 2]);
         sum_med += samples[8][SAMPLES / 2];
         println!(
-            "{:<21} {:>5} {:>4} {:>7} | {:>5.0}u {:>5.0}u {:>4.0}u {:>4.0}u {:>3.0}u {:>5.0}u {:>4.0}u {:>5.0}u | {:>6.0}u ({:>5.0}u..{:>5.0}u) | {:#018x}",
+            "{:<21} {:>5} {:>4} {:>7} | {:>8.0}u ({:>5.0}u..{:>5.0}u) | {:>5.0}u {:>4.0}u {:>3.0}u {:>5.0}u {:>4.0}u {:>5.0}u | {:>7.0}u {:>5.0}u | {:#018x}",
             name, n_insts, n_blks, dxil_len,
-            m(0), m(1), m(2), m(3), m(4), m(5), m(6), m(7),
-            m(8), us(samples[8][0]), us(samples[8][SAMPLES - 1]), hash
+            m(8), us(samples[8][0]), us(samples[8][SAMPLES - 1]),
+            m(1), m(2), m(4), m(5), m(6), m(7),
+            m(0), m(3), hash
         );
     }
-    println!("{}", "-".repeat(154));
-    println!("Sum of workload medians: {:.2} ms", sum_med.as_secs_f64() * 1e3);
+    println!("{}", "-".repeat(162));
+    println!("Sum of e2e_total medians: {:.2} ms", sum_med.as_secs_f64() * 1e3);
 }
