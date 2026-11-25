@@ -518,7 +518,6 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    #[cfg(feature = "diagnostics")]
     if crate::movie::on() {
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
@@ -529,11 +528,15 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
                 .and_then(|(_, desc)| crate::resource::texture_layout(desc))
                 .map_or(0, |t| t.planes[0].layout.size as usize);
             let at = memory.map_or(0, |(at, _)| at as usize);
-            let of = format!(
-                "{}x{}x{} f{} mips {}",
-                d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels
-            );
-            crate::movie::said(resource as usize, &of, at, len, host_written);
+            crate::movie::surface(resource as usize, at, len);
+            #[cfg(feature = "diagnostics")]
+            {
+                let of = format!(
+                    "{}x{}x{} f{} mips {}",
+                    d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels
+                );
+                crate::movie::said(resource as usize, &of, at, len, host_written);
+            }
         }
     }
     if host_written || !list.first_use(resource as usize) {

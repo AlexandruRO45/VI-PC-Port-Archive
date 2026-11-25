@@ -1,6 +1,7 @@
 //! Movie surfaces: the frame buffers the title registers with its Bink
 //! decoder, so that a texture whose memory is one of them says what it did
-//! with it (`VICTORY_BINK_TRACE=1`, diagnostics only).
+//! with it (`VICTORY_BINK_TRACE=1` for the report, `=0` to turn the whole
+//! module off).
 //!
 //! A title's movie is decoded into buffers the title allocates and hands to
 //! the decoder (`BinkRegisterFrameBuffers`), and the picture on screen is a
@@ -13,30 +14,58 @@
 //! texture path with what it decided about a texture that reads one of those
 //! ranges, so one log holds both ends beside each other.
 //!
-//! Nothing here runs unless the switch is on: [`note`] and [`overlaps`] are
-//! inert with an empty table.
+//! The table is filled on every run, because the refresh path matches a
+//! texture against it ([`only`]); the reports are what the switch turns on.
 
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// `VICTORY_BINK_TRACE=1`: record the decoder's buffers and report every
-/// texture that reads one.
+/// Whether the decoder's buffers are recorded at all: on, unless
+/// `VICTORY_BINK_TRACE=0` turns this module off entirely.
 pub fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_BINK_TRACE").is_some_and(|v| v == "1" || v == "true") || only()
-    })
+    *ON.get_or_init(|| set("VICTORY_BINK_TRACE", true))
 }
 
-/// `VICTORY_HASH_MOVIE_ONLY=1`: a texture is hashed at every refresh only when
-/// its bytes are one of the decoder's own frame buffers, rather than whenever
-/// any other view maps them. The decoder is the writer known to reach its
-/// buffers through a view the guard cannot see (`crate::inplace::another_view`
-/// answers the broader question, and in the world every texture a second view
-/// maps is hashed every frame: 162-264 MB a frame, 30-108 MB of it changed).
+/// `VICTORY_BINK_TRACE=1`: say in the log what was recorded — every plane as
+/// it is registered, every texture that reads one, and what each refresh
+/// decided. Off by default: the recording is what the refresh path needs, and
+/// its reports are for reading a run, not for running one.
+pub fn trace() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| set("VICTORY_BINK_TRACE", false))
+}
+
+/// `VICTORY_HASH_MOVIE_ONLY=0`: hash a texture that another view maps at
+/// every refresh, the way this did before the decoder's buffers were known.
+/// On by default, because that rule costs what the movie costs: in the world
+/// every texture a second view maps was hashed every frame (162-264 MB a
+/// frame, 30-108 MB of it changed, 127.0 ms of texture work a frame against
+/// 13.3 ms), while a texture is hashed at every refresh only when its bytes
+/// are one of the decoder's own frame buffers — the writer known to reach its
+/// buffers through a view the guard cannot see.
 pub fn only() -> bool {
     static ONLY: OnceLock<bool> = OnceLock::new();
-    *ONLY.get_or_init(|| std::env::var_os("VICTORY_HASH_MOVIE_ONLY").is_some_and(|v| v == "1"))
+    *ONLY.get_or_init(|| set("VICTORY_HASH_MOVIE_ONLY", true))
+}
+
+/// A switch that is on unless the variable says `0` or `false`, or off unless
+/// it says `1` or `true`.
+fn set(name: &str, on_unless: bool) -> bool {
+    match std::env::var_os(name) {
+        None => on_unless,
+        Some(v) => {
+            let v = v.to_string_lossy();
+            let yes = v == "1" || v.eq_ignore_ascii_case("true");
+            if yes {
+                true
+            } else if v == "0" || v.eq_ignore_ascii_case("false") {
+                false
+            } else {
+                on_unless
+            }
+        }
+    }
 }
 
 /// One range the title registered with its decoder: where, how long, and
@@ -64,13 +93,15 @@ pub fn note(at: usize, size: usize, name: &'static str) {
         return;
     }
     planes.push(Plane { at, size, name });
-    tracing::info!(
-        at = format_args!("{at:#x}"),
-        size,
-        len = format_args!("{:#x}", size),
-        name,
-        "movie plane registered"
-    );
+    if trace() {
+        tracing::info!(
+            at = format_args!("{at:#x}"),
+            size,
+            len = format_args!("{:#x}", size),
+            name,
+            "movie plane registered"
+        );
+    }
 }
 
 /// Every range recorded so far.
@@ -113,12 +144,52 @@ pub fn overlaps(at: usize, len: usize) -> Option<Plane> {
         .copied()
 }
 
+/// Notes where a texture that may sample a movie plane keeps its memory, and
+/// the offset from the decoder's own address for the same bytes ([`delta`]):
+/// a plane is matched by address, so a texture the title placed on the
+/// decoder's memory somewhere else cannot be found without it. Runs in every
+/// build, once per texture, because the refresh path depends on it.
+pub(crate) fn surface(resource: usize, memory: usize, size: usize) {
+    if !on() || memory == 0 {
+        return;
+    }
+    static SEEN: Mutex<Option<Vec<usize>>> = Mutex::new(None);
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_with(Vec::new);
+        if seen.contains(&resource) {
+            return;
+        }
+        seen.push(resource);
+    }
+    let Some(same) = planes()
+        .into_iter()
+        .find(|p| p.at as u32 == memory as u32 || p.at as u32 == (memory + size) as u32)
+    else {
+        return;
+    };
+    let delta = memory as isize - same.at as isize;
+    let mut known = DELTA.lock().unwrap_or_else(|e| e.into_inner());
+    if *known == Some(delta) {
+        return;
+    }
+    *known = Some(delta);
+    if trace() {
+        tracing::info!(
+            plane_at = format_args!("{:#x}", same.at),
+            texture_at = format_args!("{memory:#x}"),
+            delta,
+            "movie surface: a texture and a decoder buffer differ by one offset"
+        );
+    }
+}
+
 /// Says where a texture the movie could sample keeps its memory, once per
 /// texture, whether or not it is one of the decoder's buffers: the match is
 /// by address, so both ends of it have to be in the log.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn said(resource: usize, desc: &str, memory: usize, size: usize, host_written: bool) {
-    if !on() {
+    if !on() || !trace() {
         return;
     }
     static SAID: Mutex<Option<Vec<usize>>> = Mutex::new(None);
@@ -129,25 +200,6 @@ pub(crate) fn said(resource: usize, desc: &str, memory: usize, size: usize, host
             return;
         }
         said.push(resource);
-    }
-    if memory != 0 {
-        let planes = planes();
-        if let Some(same) = planes
-            .iter()
-            .find(|p| p.at as u32 == memory as u32 || p.at as u32 == (memory + size) as u32)
-        {
-            let delta = memory as isize - same.at as isize;
-            let mut known = DELTA.lock().unwrap_or_else(|e| e.into_inner());
-            if *known != Some(delta) {
-                *known = Some(delta);
-                tracing::info!(
-                    plane_at = format_args!("{:#x}", same.at),
-                    texture_at = format_args!("{memory:#x}"),
-                    delta,
-                    "movie surface: a texture and a decoder buffer differ by one offset"
-                );
-            }
-        }
     }
     let plane = overlaps(memory, size);
     // Whether the second view is *recorded*: a detector that cannot fire is
@@ -218,6 +270,9 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// size`, at most once a frame per texture and only on every [`EVERY`]th
 /// frame. `detail` is evaluated only when the line is written.
 pub(crate) fn verdict(what: &str, memory: usize, size: usize, detail: impl FnOnce() -> String) {
+    if !trace() {
+        return;
+    }
     let Some(plane) = overlaps(memory, size) else {
         return;
     };
