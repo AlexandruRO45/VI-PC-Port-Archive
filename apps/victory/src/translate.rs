@@ -397,11 +397,17 @@ fn translate(
                 let taken = sampled.entry(reason.clone()).or_default();
                 let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
                 // Even when two sanitized reason strings collide, the next slot is one
-                // this run has not written yet.
-                let slot = (was..3).find(|i| taken.insert(*i));
-                if let Some(i) = slot {
-                    let _ = std::fs::create_dir_all(&dir);
-                    let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{i}.cdxil")), &bytes[..]);
+                // this run has not written yet. A slot is the sampler's only once the
+                // write has succeeded: a failed write (a directory that could not be
+                // made) leaves it for the next failure of the reason.
+                let slot = (was..3).find(|i| !taken.contains(i));
+                if let Some(i) = slot
+                    && std::fs::create_dir_all(&dir).is_ok()
+                {
+                    let at = std::path::Path::new(&dir).join(format!("{stem}_{i}.cdxil"));
+                    if std::fs::write(&at, &bytes[..]).is_ok() {
+                        taken.insert(i);
+                    }
                 }
             }
         }
