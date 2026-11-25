@@ -63,13 +63,14 @@ impl Cache {
         let (tmp, mut file) = tempfile_in(dir)?;
         let written = file.write_all(&output);
         drop(file);
-        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if let Err(error) = published {
+        if let Err(err) = written {
             let _ = std::fs::remove_file(&tmp);
-            // A concurrent writer may have published while we converted.
-            // Windows can refuse replacement while a reader holds that file.
+            return Err(err.into());
+        }
+        if let Err(err) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
             if !same_output(&path, &output).unwrap_or(false) {
-                return Err(error.into());
+                return Err(err.into());
             }
         }
         Ok(path)
@@ -161,85 +162,6 @@ mod tests {
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn an_open_concurrent_cache_entry_wins_only_if_identical() {
-        use std::os::windows::fs::OpenOptionsExt;
-        use std::sync::{Mutex, mpsc};
-        use std::time::Duration;
-
-        struct Paused {
-            inner: Upper,
-            entered: mpsc::Sender<()>,
-            resume: Mutex<mpsc::Receiver<()>>,
-        }
-
-        impl Converter for Paused {
-            fn id(&self) -> &'static str {
-                self.inner.id()
-            }
-
-            fn version(&self) -> u32 {
-                self.inner.version()
-            }
-
-            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
-                self.entered.send(())?;
-                self.resume
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(10))?;
-                self.inner.convert(input)
-            }
-        }
-
-        let publish = |winning_bytes: &[u8]| {
-            let tmp = tempfile::tempdir().unwrap();
-            let cache = Cache::open(tmp.path().join("cache")).unwrap();
-            let (entered, converting) = mpsc::channel();
-            let (resume, resumed) = mpsc::channel();
-            let delayed = Paused {
-                inner: Upper {
-                    version: 1,
-                    runs: AtomicUsize::new(0),
-                },
-                entered,
-                resume: Mutex::new(resumed),
-            };
-            let winner = Upper {
-                version: 1,
-                runs: AtomicUsize::new(0),
-            };
-            std::thread::scope(|scope| {
-                let pending = scope.spawn(|| cache.get_or_convert(&delayed, b"abc"));
-                converting.recv_timeout(Duration::from_secs(10)).unwrap();
-
-                let published = cache.get_or_convert(&winner, b"abc").unwrap();
-                std::fs::write(&published, winning_bytes).unwrap();
-                // FILE_SHARE_READ allows another reader but prevents replacing the file.
-                let guard = std::fs::OpenOptions::new()
-                    .read(true)
-                    .share_mode(1)
-                    .open(&published)
-                    .unwrap();
-                resume.send(()).unwrap();
-                let result = pending.join().unwrap();
-                assert_eq!(std::fs::read(&published).unwrap(), winning_bytes);
-                assert_eq!(
-                    std::fs::read_dir(published.parent().unwrap())
-                        .unwrap()
-                        .count(),
-                    1
-                );
-                drop(guard);
-                result.map(|path| assert_eq!(path, published))
-            })
-        };
-        assert!(publish(b"XYZ").is_err(), "different bytes");
-        assert!(publish(b"ABCD").is_err(), "extra bytes");
-        publish(b"ABC").expect("identical output was published");
-    }
-
     #[test]
     fn failed_publication_removes_the_staging_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -257,6 +179,77 @@ mod tests {
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_publication_reuses_only_identical_entries() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        struct RacingUpper {
+            cache: Cache,
+            published: &'static [u8],
+            held: std::sync::Mutex<Option<std::fs::File>>,
+        }
+
+        impl Converter for RacingUpper {
+            fn id(&self) -> &'static str {
+                "test.upper"
+            }
+            fn version(&self) -> u32 {
+                1
+            }
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                let output = input.to_ascii_uppercase();
+                let key = CacheKey::new(self, input);
+                let path = self.cache.path_for(&key);
+                let dir = path.parent().unwrap();
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(&path, self.published)?;
+                // FILE_SHARE_READ permits readers but prevents replacement while held.
+                *self.held.lock().unwrap() = Some(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(1)
+                        .open(&path)?,
+                );
+                let (probe, mut probe_file) = tempfile_in(dir)?;
+                probe_file.write_all(&output)?;
+                drop(probe_file);
+                assert!(
+                    std::fs::rename(&probe, &path).is_err(),
+                    "the open reader must prevent replacing the published entry"
+                );
+                std::fs::remove_file(probe)?;
+                Ok(output)
+            }
+        }
+
+        let cases: &[(&[u8], bool)] = &[(b"ABC", true), (b"XYZ", false), (b"ABCD", false)];
+        for &(published, expected) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let cache = Cache::open(tmp.path().join("cache")).unwrap();
+            let conv = RacingUpper {
+                cache: cache.clone(),
+                published,
+                held: std::sync::Mutex::new(None),
+            };
+            let path = cache.path_for(&CacheKey::new(&conv, b"abc"));
+            let result = cache.get_or_convert(&conv, b"abc");
+            assert_eq!(std::fs::read(&path).unwrap(), published);
+            assert_eq!(
+                std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                1
+            );
+            if expected {
+                assert_eq!(result.unwrap(), path);
+            } else {
+                assert!(
+                    result.is_err(),
+                    "different content was accepted: {published:?}"
+                );
+            }
+        }
     }
 
     #[test]
