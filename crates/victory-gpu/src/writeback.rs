@@ -186,14 +186,20 @@ impl Owners {
         Some(joined)
     }
 
-    pub(crate) fn publish(&self, shadow: u64, address: usize, data: &[u8]) -> usize {
-        self.publish_with(&CHANGED, shadow, address, data)
+    pub(crate) fn publish_shadow(
+        &self,
+        shadow: &crate::shadow::Shadow,
+        address: usize,
+        data: &[u8],
+    ) -> usize {
+        self.publish_with(&CHANGED, shadow.id(), Some(shadow), address, data)
     }
 
     fn publish_with(
         &self,
         changes: &Mutex<Changes>,
         shadow: u64,
+        shadow_ref: Option<&crate::shadow::Shadow>,
         address: usize,
         data: &[u8],
     ) -> usize {
@@ -213,12 +219,28 @@ impl Owners {
         );
         let write = |span: Range<usize>| {
             let n = span.len();
+            let slice = &data[span.start - address..span.start - address + n];
+            crate::host::shaders_write(span.start, slice);
+            if let Some(sh) = shadow_ref
+                && crate::inplace::back_own()
+            {
+                const K64: usize = 64 << 10;
+                let mut at = span.start;
+                let mut off = 0;
+                while off < n {
+                    let chunk_len = (K64 - (at % K64)).min(n - off);
+                    let chunk = &slice[off..off + chunk_len];
+                    if !sh.put_back_own_pinned(at, chunk) {
+                        crate::watch::writing(at, chunk_len);
+                        crate::host::write_mapped(at as *mut u8, chunk.as_ptr(), chunk_len);
+                    }
+                    at += chunk_len;
+                    off += chunk_len;
+                }
+                return n;
+            }
             crate::watch::writing(span.start, n);
-            crate::host::write_mapped(
-                span.start as *mut u8,
-                data[span.start - address..].as_ptr(),
-                n,
-            );
+            crate::host::write_mapped(span.start as *mut u8, slice.as_ptr(), n);
             n
         };
         let Some(parts) = parts else {
@@ -265,7 +287,7 @@ mod tests {
             .unwrap()
             .record(start + PAGE..start + 2 * PAGE, 12, 11);
         let old = Owners::single(12);
-        assert_eq!(old.publish_with(&changes, 9, start, &gpu), 2 * PAGE);
+        assert_eq!(old.publish_with(&changes, 9, None, start, &gpu), 2 * PAGE);
         assert_eq!(guest[..PAGE], gpu[..PAGE]);
         assert_eq!(guest[2 * PAGE..], gpu[2 * PAGE..]);
         assert_eq!(guest[object..object + 8], saved);
@@ -276,13 +298,13 @@ mod tests {
         together.declare(13, 8, &[(start + PAGE, start + 2 * PAGE)]);
         together.declare(13, 9, &[(start + PAGE + 8, start + PAGE + 12)]);
         assert_eq!(
-            together.publish_with(&changes, 9, start + PAGE, &gpu[PAGE..2 * PAGE]),
+            together.publish_with(&changes, 9, None, start + PAGE, &gpu[PAGE..2 * PAGE]),
             4
         );
         assert_eq!(guest[PAGE + 8..PAGE + 12], [0x80; 4]);
         assert_eq!(guest[object..object + 8], saved);
         assert_eq!(
-            Owners::single(13).publish_with(&changes, 9, start + object, &[7; 8]),
+            Owners::single(13).publish_with(&changes, 9, None, start + object, &[7; 8]),
             8
         );
         assert_eq!(guest[object..object + 8], [7; 8]);

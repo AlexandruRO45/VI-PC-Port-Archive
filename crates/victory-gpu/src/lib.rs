@@ -39,9 +39,15 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod material_demand;
+#[cfg(windows)]
+mod plaincopy;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod queue2;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

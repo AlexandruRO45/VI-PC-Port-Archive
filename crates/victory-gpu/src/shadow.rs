@@ -1990,7 +1990,7 @@ impl Shadow {
                     *h = merged;
                 }
                 if differs != 0 {
-                    written += owners.publish(self.id, start + at, title);
+                    written += owners.publish_shadow(self, start + at, title);
                 }
             }
             // Our write shows as a title write at the copy's next refresh,
@@ -2084,7 +2084,49 @@ impl Shadow {
         if !merge_piece(now, held, title) {
             return 0;
         }
-        owners.publish(self.id, start + at, title)
+        owners.publish_shadow(self, start + at, title)
+    }
+
+    /// With `crate::inplace::back_own` (`VICTORY_BACK_OWN_VIEW=1`): stores
+    /// what a merge made of title memory `[at, at + bytes.len())` (inside
+    /// one 64 KiB page, while caller holds the mapping pin) through a view
+    /// of our own, tells the journal, and notes the page current for this
+    /// copy if it was current before.
+    pub(crate) fn put_back_own_pinned(&self, at: usize, bytes: &[u8]) -> bool {
+        static OWN_WRITES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+        if !crate::inplace::back_own() {
+            return false;
+        }
+        let Some(shown) = crate::inplace::write_own_pinned(at, bytes) else {
+            OWN_WRITES[3].fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        let page = at / PAGE;
+        let others: Vec<usize> = shown.iter().map(|&a| a / PAGE).filter(|&p| p != page).collect();
+        let (before, now) = crate::watch::wrote_own(page, &others);
+        crate::descriptor::host::remapped(at, bytes.len());
+        let base = self.start as usize / PAGE;
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(taken) = page.checked_sub(base).and_then(|i| copied.get_mut(i))
+                && *taken != 0
+                && *taken >= before
+            {
+                *taken = (*taken).max(now);
+                OWN_WRITES[2].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        OWN_WRITES[1].fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        let n = OWN_WRITES[0].fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(16384) {
+            tracing::info!(
+                "what shaders wrote, stored through views of our own (VICTORY_BACK_OWN_VIEW=1), since the start: {n} stretches {} MB, {} pages noted current for the copy that wrote them (not copied in again), {} stretches written the old way",
+                OWN_WRITES[1].load(Ordering::Relaxed) >> 20,
+                OWN_WRITES[2].load(Ordering::Relaxed),
+                OWN_WRITES[3].load(Ordering::Relaxed)
+            );
+        }
+        true
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -2707,7 +2749,7 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
-                written = owners.publish(self.id, start + at, title);
+                written = owners.publish_shadow(self, start + at, title);
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
@@ -2787,7 +2829,7 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
-        owners.publish(self.id, start + at, title)
+        owners.publish_shadow(self, start + at, title)
     }
 }
 
