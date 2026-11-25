@@ -287,6 +287,28 @@ pub(crate) fn log_removal_context() {
     tracing::error!("when the host device went: {}", removal_context());
 }
 
+/// Once, when the host device is gone and this run cannot name the GPU
+/// command. Release builds have no debug layer (`VICTORY_D3D12_DEBUG` is a
+/// diagnostics switch). This device also refused DRED breadcrumbs
+/// (`0x887A0004` = DXGI_ERROR_UNSUPPORTED). Logged even with the debug
+/// layer off, so a TDR is not only a removal HRESULT.
+fn log_unnamed_tdr() {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let relay = relay();
+    let d3d12_debug = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
+    tracing::error!(
+        relay,
+        d3d12_debug,
+        "TDR: this log cannot name the GPU command (0x887A0004 = no DRED breadcrumbs on this device). \
+         If VICTORY_RELAY is off, this is a real illegal command (often mesh or a depth UAV). \
+         Next: a diagnostics build (`cargo build --profile diag -p victory --features diagnostics`) \
+         with VICTORY_D3D12_DEBUG=1 names the command; VICTORY_D3D12_DRED=1 only if the device supports it"
+    );
+}
+
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
@@ -502,10 +524,16 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
-            None if host.messages.is_none() => text.push_str(
-                "; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command",
-            ),
-            None => {}
+            None => {
+                // No named command: debug layer off (release), or on and
+                // silent. Say what to do next either way.
+                log_unnamed_tdr();
+                if host.messages.is_none() {
+                    text.push_str(
+                        "; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command",
+                    );
+                }
+            }
         }
     }
     tracing::error!("{text}");
@@ -2495,7 +2523,7 @@ fn relay_worker() {
 fn relay_hand_back(back: &[Declared]) {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
-        if shadow.carded() {
+        if shadow.carded() || shadow.in_place() {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -2752,7 +2780,7 @@ fn hand_back(back: &[Declared]) {
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for (shadow, declared) in back {
-            if shadow.carded() {
+            if shadow.carded() || shadow.in_place() {
                 continue;
             }
             let mut sorted = declared.clone();
@@ -2783,6 +2811,9 @@ fn hand_back(back: &[Declared]) {
         return;
     }
     for (shadow, declared) in back {
+        if shadow.in_place() {
+            continue;
+        }
         if shadow.carded() {
             // Done before (`Host::card_back`).
             shadow.copy_back_done(declared);

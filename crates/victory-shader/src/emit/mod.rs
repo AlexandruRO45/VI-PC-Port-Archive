@@ -219,7 +219,7 @@ pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_FAULTS, MEMORY_PAGES, MEMORY_SPACE, NULL_BUFFER_VIEW,
     ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT,
     USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_STRIDES,
-    set_view_heap_limit,
+    null_buffer_view, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -603,11 +603,14 @@ pub fn emit(
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // lowering has named the skipped blocks). Not `needs_every_lane`: that form puts
+    // group barriers inside branches and loops, and NVIDIA (32-lane waves, including
+    // RTX 5070 Ti) hung the card on it (`ptfx_CS_lightAtlas_*`, v4 e9765a7). Those
+    // programs stay on the 32-lane local-wave form below unless `VICTORY_WAVE_WIDE=1`.
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
-                && (what == lower::LANE_MASK || lower::needs_every_lane(what))
+                && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());

@@ -1753,7 +1753,7 @@ impl Host {
                     }
                     View::Pair => {}
                     View::NullBuffers => {
-                        let null = super::NULL_BUFFER_VIEW as usize;
+                        let null = super::null_buffer_view() as usize;
                         let (mut srv_at, mut uav_at) = (at, at);
                         srv_at.ptr += (null - i) * view_size;
                         uav_at.ptr += (null - 1 - i) * view_size;

@@ -71,6 +71,7 @@ pub fn run(
     }
 
     let images = cfg.cache_subdir("images")?;
+    victory_gpu::prepare_host();
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes

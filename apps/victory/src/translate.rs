@@ -165,7 +165,8 @@ pub fn run(
     }
     let paths = crate::default_paths(paths)?;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
-    // at most 32 lanes (as the runtime does on such a card).
+    // at most 32 lanes (as the runtime does on such a card). NVIDIA first.
+    victory_gpu::prepare_host();
     if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
         victory_shader::emit::set_host_max_wave(n);
     }
@@ -329,6 +330,9 @@ pub fn run(
 /// (`prebuild`).
 pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    // NVIDIA: 32-lane waves and a 1_000_000-view heap. Translate and the
+    // cache folder name must see that before the first container.
+    victory_gpu::prepare_host();
     let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
     let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
         anyhow::bail!("no shader cache in {}", shaders.display());

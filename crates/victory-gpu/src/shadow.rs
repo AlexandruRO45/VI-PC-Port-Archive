@@ -141,7 +141,7 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (1024).
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
 fn card_limits() -> (u64, u64) {
@@ -150,7 +150,7 @@ fn card_limits() -> (u64, u64) {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
     })
 }
 
@@ -939,8 +939,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 
 /// Whether the snapshots of a submission's shader-written ranges, and the
 /// compare that finds what the shaders wrote, run on several threads
-/// across ranges (`VICTORY_WIDE_BACK`; on by default; `0` keeps the old
-/// single-threaded path).
+/// across ranges (`VICTORY_WIDE_BACK=1`; off by default).
 ///
 /// Both ran range by range on the submitting thread, a range on several
 /// threads only if it was 16 MiB or more. The ranges left on the CPU's side
@@ -961,7 +960,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// lists only afterwards).
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_some_and(|v| v == "1"))
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -1713,8 +1712,10 @@ impl Shadow {
 
     /// Title memory `[start, start + len)` in place: `placed` is a buffer
     /// over it in a heap opened on it. Shaped as a copy so that everything
-    /// that binds, views or keeps a copy works on it unchanged; what
-    /// copies does nothing ([`Shadow::update`], [`Shadow::gpu_writes`]).
+    /// that binds, views or keeps a copy works on it unchanged; refresh and
+    /// copy-back do nothing ([`Shadow::update`]). Shader writes are still
+    /// declared ([`Shadow::gpu_writes`]) so late-wait flights know the
+    /// title memory they may write.
     fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
         crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
         let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
@@ -1831,15 +1832,18 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        let len = len.min(self.left(address));
         // In place the shaders write title memory itself: no snapshot, no
-        // compare, nothing to copy back, and no wait on its account.
+        // compare, nothing to copy back ([`Shadow::writing`]). With
+        // late-wait the range still has to be declared, so a later
+        // submission that reads this title memory waits for the flight.
+        // Without late-wait every submission is waited for already.
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
-        if self.place.is_some() {
+        if self.place.is_some() && !crate::host::late() {
             return;
         }
-        let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -2513,6 +2517,12 @@ impl Shadow {
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// Whether this is title memory opened as a host heap ([`crate::inplace`]):
+    /// shaders write the title's bytes themselves.
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the

@@ -1127,6 +1127,16 @@ impl State {
                             u.slot == slot
                                 && u.root == RootType::Other(victory_shader::emit::USER_VIEW_BIAS)
                         });
+                    // Host root signatures turn title SRVs into one-view
+                    // tables (`bounded_root_srvs`). Binding them with
+                    // Set*RootShaderResourceView is an illegal command:
+                    // NVIDIA removes the device (TDR 0x887A0006).
+                    if tabled {
+                        if !self.root_srv_table(list, Some(address), param, compute, biased) {
+                            return false;
+                        }
+                        continue;
+                    }
                     let Some(mut gpu) = root_view(list, address, kind == 1, kind == 2) else {
                         continue;
                     };

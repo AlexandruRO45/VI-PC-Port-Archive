@@ -107,6 +107,8 @@ fn runtime(base: [u8; 32]) -> Vec<u8> {
     bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
     // WaveSize(n) is omitted when n > host waves; NVIDIA is 32.
     bytes.extend_from_slice(&victory_shader::emit::host_max_wave().to_le_bytes());
+    // View indices clamped to this slot on a capped heap (NVIDIA 1_000_000); 0: no cap (AMD).
+    bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
     bytes
 }
 

@@ -30,6 +30,16 @@ pub const HEAP_SAMPLERS: u32 = 2048;
 /// (`emit`, "Buffer views at computed heap indices").
 pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
 
+/// Heap index of the null raw buffer SRV shaders read instead of a slot
+/// with no buffer view. On a host that cannot hold [`HEAP_VIEWS`] (NVIDIA
+/// at 1_000_000) this is [`view_heap_limit`]: the last slot of that heap.
+pub fn null_buffer_view() -> u32 {
+    match view_heap_limit() {
+        0 => NULL_BUFFER_VIEW,
+        limit => limit,
+    }
+}
+
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
@@ -137,6 +147,11 @@ static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::
 /// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
 pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The null slot shaders clamp view indices to (0: no NVIDIA-style heap cap).
+pub fn view_heap_limit() -> u32 {
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) struct Shader {

@@ -63,7 +63,7 @@ pub(crate) fn probe_level() -> u8 {
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE_PROBE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
-/// `VICTORY_INPLACE`: unset defaults to 2; `0` off. 1: a window of title
+/// `VICTORY_INPLACE`: 0 (unset) off. 1: a window of title
 /// memory outside buffers that lies in private memory committed whole is
 /// not copied: a part of the title's allocation is opened as a host heap
 /// and the window is a buffer placed over it ([`place_for`]). 2: title
@@ -74,11 +74,10 @@ pub(crate) fn probe_level() -> u8 {
 /// reserved, which the host refuses, and what a view shows changes when
 /// the title maps pages.
 ///
-/// What it assumes, for 2: nothing reads title memory that a submission
-/// not yet run writes through such a buffer. With every submission waited
-/// for (the default) that holds; with `VICTORY_LATE_WAIT` it does not,
-/// since the flights' rules know shader writes only by the ranges copies
-/// declare. Do not combine 2 with late wait.
+/// Stage 2 is valid with late-wait: shader writes through a placed buffer
+/// are declared as the copies' writes are, so a later submission that
+/// reads that title memory waits for the flight. Snapshot and copy-back
+/// stay skipped (the card writes title memory itself).
 ///
 /// shortcut: while a window is in place the title cannot decommit, free
 /// or protect its pages (the call fails with error 87; the probe shows
@@ -86,18 +85,8 @@ pub(crate) fn probe_level() -> u8 {
 /// kind was seen; [`title_memory_freeing`] is there for the runtime to
 /// call before such a call once it takes them over.
 pub(crate) fn level() -> u8 {
-    static REQUESTED: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    let requested = *REQUESTED.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2));
-    if requested >= 2 && crate::host::late() {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            tracing::warn!(
-                "VICTORY_INPLACE=2 is off while late-wait is on: only windows in place (stage 1); set VICTORY_INPLACE=1 or turn late-wait off"
-            );
-        });
-        return 1;
-    }
-    requested
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
 /// The most title memory in place at once, in bytes

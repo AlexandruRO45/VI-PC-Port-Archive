@@ -437,7 +437,9 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_MS: u64 = 10_000;
+    // Same threshold as host copies in `crate::resource::let_go_idle`: staging
+    // is the size of the texture; keeping unused ones was 2.1 GB (run 24).
+    const IDLE_MS: u64 = 5_000;
     const IDLE_FRAMES: u64 = 4;
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {

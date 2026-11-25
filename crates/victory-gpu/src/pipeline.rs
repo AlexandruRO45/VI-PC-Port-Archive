@@ -214,6 +214,9 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 /// The translation, and whether it came from the cache.
 #[cfg(windows)]
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
+    // Before `host_shader`: a shader keeps the heap clamp it was translated with.
+    // NVIDIA hangs on an index past a 1_000_000-slot heap; AMD's driver forgives it.
+    crate::descriptor::host::probe_view_limit();
     let (host, cached) = crate::shader_cache::host_shader(container);
     (host.and_then(|host| with_resources(container, host)), cached)
 }
@@ -224,8 +227,6 @@ fn with_resources(
     host: victory_shader::emit::HostShader,
 ) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
-    // The translation depends on it (a view index past a capped heap).
-    crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,

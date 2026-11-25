@@ -22,6 +22,15 @@ clap.workspace = true
 walkdir.workspace = true
 tracing.workspace = true
 
+[[bin]]
+name = "victory"
+path = "src/main.rs"
+
+[[bin]]
+name = "victory-diag"
+path = "src/main.rs"
+required-features = ["diagnostics"]
+
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.

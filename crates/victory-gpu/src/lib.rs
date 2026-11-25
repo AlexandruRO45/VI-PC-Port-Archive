@@ -68,6 +68,34 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::{crash_detail, on_failure};
+
+/// Creates the host D3D12 device (wave size, NVIDIA view-heap cap) before
+/// shaders are translated or the shader cache folder is chosen. AMD heaps
+/// can be larger than 1_000_000 views and waves can be 64; NVIDIA (RTX 40/50)
+/// is 32-lane waves and a 1_000_000-view cap. Translations must see that.
+#[cfg(windows)]
+pub fn prepare_host() {
+    let _ = host::host();
+    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE")
+        .ok()
+        .or_else(|| std::env::var("VICTORY_HOST_WAVE").ok())
+        .and_then(|v| v.parse().ok())
+    {
+        victory_shader::emit::set_host_max_wave(n);
+    }
+    if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        victory_shader::emit::set_view_heap_limit(n);
+        tracing::info!(null_slot = n, "VICTORY_VIEW_LIMIT: view indices clamped");
+    } else {
+        descriptor::host::probe_view_limit();
+    }
+}
+
+#[cfg(not(windows))]
+pub fn prepare_host() {}
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
