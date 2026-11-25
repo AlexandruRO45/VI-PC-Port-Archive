@@ -1160,8 +1160,8 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view);
+        if let Some((view, placed)) = host.mirror(index, handle, true) {
+            readable_resolved(list, u, &view, placed.as_ref());
         }
     }
 
@@ -1247,7 +1247,8 @@ impl State {
                 for u in &entries {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                        let placed = host.placed_at(first + u.table_offset_dwords / 8);
+                        readable_resolved(list, u, &view, placed.as_ref());
                     }
                 }
                 made.push((slot, first * 32));
@@ -1263,9 +1264,9 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(view) => {
-                        host.make_at(index, &view);
+                        let placed = host.make_at(index, &view);
                         if let Some(u) = used {
-                            readable(list, u, &view);
+                            readable_resolved(list, u, &view, placed.as_ref());
                         }
                     }
                     None => {
@@ -1768,15 +1769,21 @@ fn pipeline_crumb(p: &HostPipeline, command: crate::crumbs::Command, args: [u32;
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
 fn readable(list: &HostList, u: &UsedResource, view: &View) {
+    let placed = crate::descriptor::host::placed_texture(view);
+    readable_resolved(list, u, view, placed.as_ref());
+}
+
+fn readable_resolved(list: &HostList, u: &UsedResource, view: &View, owner: Option<&std::sync::Arc<crate::resource::Placed>>) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
-    let placed = crate::descriptor::host::placed_texture(view);
-    // A placed view of memory the GPU writes through another title texture
-    // reads that one's host copy.
-    if let Some(View::Shader(b, _)) = &placed
-        && let Some(a) = crate::resource::alias_source(*b as This)
+    // Use the exact generation installed in the slot. Do not bind an old
+    // descriptor and upload or transition the texture of a new mapping.
+    let placed = owner.map(|p| crate::descriptor::host::placed_shader(view, p));
+    if let Some(p) = owner
+        && !crate::resource::was_remapped(p.get())
+        && let Some(a) = crate::resource::alias_source(p.get())
     {
-        crate::texture::alias_copy(list, a, *b as This);
+        crate::texture::alias_copy(list, a.get(), p.get());
     }
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
@@ -1803,7 +1810,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             if let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
-                crate::texture::upload(list, *resource as This, t);
+                crate::texture::upload_placed(list, *resource as This, t, owner);
             }
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]
@@ -2279,11 +2286,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             let address = title_memory(1 << 20);
             let object = texture_at_address(address, &texture_words(size, size, written, 0x105, 4));
             let view = placed_view(address, texture_words(read_size, read_size, format, 0x105, 0));
-            let Some(View::Shader(placed, _)) = crate::descriptor::host::placed_texture(&view) else {
-                panic!("round {round}: a placed texture");
-            };
+            let placed = crate::descriptor::host::placed_texture(&view).expect("a placed texture");
             let a = crate::resource::host_copy(object).unwrap();
-            let b = crate::resource::host_copy(placed as This).unwrap();
+            let b = crate::resource::host_copy(placed.get()).unwrap();
             // One host texture only where the host took the castable formats.
             let shared = shared && !a.castable.is_empty();
             assert_eq!(std::sync::Arc::ptr_eq(&a, &b), shared, "round {round}: one host texture");

@@ -805,6 +805,8 @@ struct Resource {
     initial: HostInitial,
     #[cfg(windows)]
     key: Option<MemoryKey>,
+    #[cfg(windows)]
+    remapped: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(windows)]
@@ -1196,8 +1198,14 @@ fn shared_texture(
     let candidate = key.and_then(|key| {
         if d.flags & USES != 0 { return None; }
         let index = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
-        index.get(&address)?.iter().find_map(|&ptr| {
-            let r = resource(ptr as This);
+        let candidates: Vec<_> = index.get(&address)?.iter().filter_map(|&ptr| {
+            // SAFETY: the registry entry outlives the final Release.
+            unsafe { object::Held::try_new(ptr as This) }
+        }).collect();
+        drop(index);
+        candidates.into_iter().find_map(|pin| {
+            let r = resource(pin.get());
+            if was_remapped(pin.get()) { return None; }
             let own = host_desc(&r.desc)?;
             let compatible = family(own.format) == family(d.format)
                 || castable(own.format).into_iter().any(|f| family(f) == family(d.format));
@@ -1443,6 +1451,8 @@ fn hand_out_resource(
         initial,
         #[cfg(windows)]
         key: None,
+        #[cfg(windows)]
+        remapped: false.into(),
     });
     #[cfg(windows)]
     let resource = {
@@ -1480,7 +1490,7 @@ static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>
 /// shortcut: same start only; overlapping ranges, other mips or slices of
 /// one memory, and views of buffers are not matched.
 #[cfg(windows)]
-pub(crate) fn alias_source(placed: This) -> Option<This> {
+pub(crate) fn alias_source(placed: This) -> Option<object::Held> {
     const WRITTEN: u32 = 0x7; // render target, depth, unordered access
     let b = resource(placed);
     let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
@@ -1491,16 +1501,19 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         Some((d.dimension, d.width.div_ceil(block) * size, rows, d.depth_or_array_size, d.sample_count, swizzle))
     };
     let want = bytes(&b.desc)?;
-    map.get(&(b.data() as u64))?
-        .iter()
-        .map(|&r| r as This)
-        .filter(|&r| r != placed)
-        .find(|&r| {
-            let a = resource(r);
-            a.desc.flags & WRITTEN != 0
-                && bytes(&a.desc) == Some(want)
-                && matches!((a.materialized(), b.materialized()), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(x, y))
-        })
+    let candidates: Vec<_> = map.get(&(b.data() as u64))?.iter().filter_map(|&r| {
+        let r = r as This;
+        // SAFETY: final Release removes the index entry before freeing it.
+        (r != placed).then(|| unsafe { object::Held::try_new(r) }).flatten()
+    }).collect();
+    // Release rejected candidates only after dropping the registry lock.
+    drop(map);
+    candidates.into_iter().find(|r| {
+        let a = resource(r.get());
+        !was_remapped(r.get()) && a.desc.flags & WRITTEN != 0
+            && bytes(&a.desc) == Some(want)
+            && matches!((a.materialized(), b.materialized()), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(x, y))
+    })
 }
 
 #[cfg(windows)]
@@ -1704,55 +1717,14 @@ pub(crate) extern "system" fn create_at_address(
     )
 }
 
-/// Textures the title placed in its own memory and views without a
-/// resource object (device 0x230, Grand Theft Auto VI's streamed and
-/// interface textures), by address and description: a resource at that
-/// address, made the first time a draw reads one.
-/// shortcut: never released (one host texture per distinct address and
-/// description viewed); release them when the title unmaps or reuses the
-/// memory once streaming grows VRAM use.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+mod placed;
+#[cfg(windows)]
+pub(crate) use placed::{Placed, invalidate_placed, texture_at};
 
-/// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    // Words 1 and 13 are padding (stack bytes in the title's records).
-    let mut desc = *desc;
-    (desc[1], desc[13]) = (0, 0);
-    let desc = &desc;
-    // A resource whose memory's host texture was replaced since (one with
-    // more uses) is made again, sharing the new one.
-    // shortcut: the old one is kept (view heap slots made from it view its
-    // host texture until the title rewrites them).
-    if let Some(&r) = map.get(&(address, *desc))
-        && current(r as This)
-    {
-        return Some(r as This);
-    }
-    // SAFETY: 56 bytes in the description's layout.
-    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
-    if d.dimension == BUFFER {
-        return None;
-    }
-    let mut out = std::ptr::null();
-    let made = create_at_address(
-        std::ptr::null(),
-        address,
-        &d,
-        0,
-        std::ptr::null(),
-        &RESOURCE_IIDS[0],
-        &mut out,
-    );
-    if made != S_OK {
-        return None;
-    }
-    map.insert((address, *desc), out as usize);
-    resource(out).materialize().is_some().then_some(out)
+pub(crate) fn was_remapped(this: This) -> bool {
+    resource(this).remapped.load(std::sync::atomic::Ordering::Acquire)
 }
 
 pub(crate) extern "system" fn create_placed(

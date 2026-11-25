@@ -150,8 +150,8 @@ impl Viewed {
 
 /// What a made view reads that title memory feeds.
 fn seen(view: &View) -> Option<Seen> {
-    let placed = crate::descriptor::host::placed_texture(view);
-    let view = placed.as_ref().unwrap_or(view);
+    // A placed slot passes the resolved view it actually holds, not a
+    // second lookup that could see a different generation.
     if let View::Shader(resource, _) = view
         && let Some(texture) = crate::resource::host_resource(*resource as This)
     {
@@ -207,7 +207,7 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
         // memory) waits in `forget`.
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         for &r in inner.textures.keys() {
-            if !done.insert(r) {
+            if !done.insert(r) || crate::resource::was_remapped(r as This) {
                 continue;
             }
             let Some(texture) = crate::resource::host_resource(r as This) else {

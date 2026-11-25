@@ -207,6 +207,13 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
 /// The first use starts in COPY_DEST; its prelude performs the upload only
 /// if title memory changed. Keep the shared HostTexture, not a title pointer.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    upload_placed(list, resource, texture, None);
+}
+
+pub(crate) fn upload_placed(list: &HostList, resource: This, texture: &ID3D12Resource, placed: Option<&Arc<crate::resource::Placed>>) {
+    if placed.is_some_and(|p| crate::resource::was_remapped(p.get())) {
+        return;
+    }
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     // Once per list for each host texture, however many title textures of
@@ -219,7 +226,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     };
     let Some(copy) = crate::resource::host_copy(resource) else { return };
     crate::list::ensure_state(list, resource, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
-    list.defer_texture(staging, copy);
+    list.defer_texture(staging, copy, placed.cloned());
 }
 
 /// For textures shaders reach through the heap itself, at submission

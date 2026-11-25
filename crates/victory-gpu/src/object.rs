@@ -74,6 +74,23 @@ impl Held {
         Self(this)
     }
 
+    /// Take ownership of one already-acquired reference.
+    #[cfg(windows)]
+    pub(crate) unsafe fn adopt(this: This) -> Self {
+        Self(this)
+    }
+
+    /// Pin an entry in a non-owning registry. The registry lock must keep
+    /// the allocation alive even if its last owner has started to release it.
+    #[cfg(windows)]
+    pub(crate) unsafe fn try_new(this: This) -> Option<Self> {
+        // SAFETY: the registry has not unlinked this object or freed it.
+        let refs = unsafe { &*std::ptr::addr_of!((*this).refs) };
+        refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            if n == 0 { None } else { n.checked_add(1) }
+        }).ok().map(|_| Self(this))
+    }
+
     pub(crate) fn get(&self) -> This {
         self.0
     }

@@ -531,7 +531,7 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>),
+    Texture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>, Option<std::sync::Arc<crate::resource::Placed>>),
     /// Brings every buffer range a view heap's views reach up to date
     /// (`crate::bindless`).
     Heap(std::sync::Arc<crate::bindless::Viewed>),
@@ -1840,8 +1840,8 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, copy: std::sync::Arc<crate::resource::HostTexture>) {
-        self.deferred().copies.push(Step::Texture(staging, copy));
+    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, copy: std::sync::Arc<crate::resource::HostTexture>, placed: Option<std::sync::Arc<crate::resource::Placed>>) {
+        self.deferred().copies.push(Step::Texture(staging, copy, placed));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -1913,8 +1913,9 @@ impl HostList {
                     shadow.writing(*address, *len);
                     continue;
                 }
-                Step::Texture(staging, copy) => {
-                    if batch.texture_due(staging)
+                Step::Texture(staging, copy, placed) => {
+                    if !placed.as_ref().is_some_and(|p| crate::resource::was_remapped(p.get()))
+                        && batch.texture_due(staging)
                         && let Some(buffer) = staging.refresh(host)
                     {
                         uploads.push((staging.clone(), copy.clone(), buffer));

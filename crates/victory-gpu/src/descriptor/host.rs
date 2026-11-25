@@ -5,13 +5,14 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+use crate::resource::Placed;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -387,13 +388,21 @@ impl HostHeap {
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
+    pub(crate) fn make_at(&self, index: u32, view: &View) -> Option<Arc<Placed>> {
         let kept = make(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
-        self.keep(index, kept.flatten());
+        let kept = kept.flatten();
+        let placed = kept.as_ref().and_then(|k| k.2.clone());
+        self.keep(index, kept);
         self.set_stride(index, Some(view));
+        placed
+    }
+
+    pub(crate) fn placed_at(&self, index: u32) -> Option<Arc<Placed>> {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)?.as_ref()?.2.clone()
     }
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
@@ -448,7 +457,7 @@ impl HostHeap {
                     .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index));
             }
         }
-        self.keep(index, buffer.map(|b| (b.clone(), None)));
+        self.keep(index, buffer.map(|b| (b.clone(), None, None)));
         self.write_stride(index, 4);
     }
 
@@ -493,7 +502,7 @@ impl HostHeap {
         if let Some(slot) = kept.get_mut(index as usize) {
             let old = std::mem::replace(slot, resource);
             #[cfg(feature = "diagnostics")]
-            if let Some((old, _)) = &old
+            if let Some((old, _, _)) = &old
                 && !self.sampler
                 && slot.as_ref().map(|s| windows::core::Interface::as_raw(&s.0)) != Some(windows::core::Interface::as_raw(old))
                 // SAFETY: a live resource.
@@ -605,7 +614,7 @@ impl HostHeap {
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
-    pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+    pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<(View, Option<Arc<Placed>>)> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -636,7 +645,10 @@ impl HostHeap {
             }
             return None;
         };
-        if made[index as usize] != key {
+        let previous = || self.placed_at(index);
+        let placed = if made[index as usize] != key
+            || (for_draw && is_placed_texture(&view) && previous().is_none_or(|p| p.stale()))
+        {
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -655,12 +667,19 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
+            let valid = kept.is_some();
+            let kept = kept.flatten();
+            let placed = kept.as_ref().and_then(|k| k.2.clone());
             if !self.sampler {
-                self.viewed.set(index, Some(&view), kept.is_some());
+                let resolved = placed.as_ref().map(|p| placed_shader(&view, p));
+                self.viewed.set(index, resolved.as_ref().or(Some(&view)), valid);
             }
-            self.keep(index, kept.flatten());
-        }
-        Some(view)
+            self.keep(index, kept);
+            placed
+        } else {
+            previous()
+        };
+        Some((view, placed))
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -847,7 +866,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 /// The host resource a slot made by [`make`] views, if any, and the view's
 /// own copy of title memory ([`crate::shadow::for_view`]): the slot holds
 /// it, so that draws reading the view find and refresh that copy.
-type Kept = Option<(ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>>)>;
+type Kept = Option<(ID3D12Resource, Option<Arc<crate::shadow::Shadow>>, Option<Arc<Placed>>)>;
 
 /// Buffer views refused so far (diagnostics: the first are logged).
 #[cfg(feature = "diagnostics")]
@@ -893,7 +912,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((shadow.buffer.clone(), own.then_some(shadow), None)))
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in
@@ -953,7 +972,7 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((shadow.buffer.clone(), own.then_some(shadow), None)))
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -1137,7 +1156,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
-                Some(Some((texture.clone(), None)))
+                Some(Some((texture.clone(), None, None)))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -1161,7 +1180,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             // SAFETY: a live resource.
             if unsafe { texture.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
                 return crate::twin::uav(resource, &copy, desc.as_ref(), at)
-                    .map(|twin| Some((twin, None)));
+                    .map(|twin| Some((twin, None, None)));
             }
             let mut desc = desc.as_ref().map(uav_desc);
             if desc.is_none() && !default_view(resource) {
@@ -1179,7 +1198,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
-            Some(Some((texture.clone(), None)))
+            Some(Some((texture.clone(), None, None)))
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -1199,8 +1218,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             Some(None)
         }
         View::Placed(unordered, resource, desc) => {
-            if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+            if let Some(owner) = placed_texture(view) {
+                let mut kept = make(&placed_shader(view, &owner), at)?;
+                if let Some(kept) = &mut kept { kept.2 = Some(owner); }
+                return Some(kept);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -1230,7 +1251,7 @@ fn is_placed_texture(view: &View) -> bool {
 
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
-pub(crate) fn placed_texture(view: &View) -> Option<View> {
+pub(crate) fn placed_texture(view: &View) -> Option<Arc<Placed>> {
     const BUFFER: u32 = 1;
     let View::Placed(false, resource, desc) = view else {
         return None;
@@ -1239,8 +1260,12 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    crate::resource::texture_at(address, resource)
+}
+
+pub(crate) fn placed_shader(view: &View, owner: &Placed) -> View {
+    let View::Placed(false, _, desc) = view else { unreachable!("a placed SRV") };
+    View::Shader(owner.get() as usize, desc[..10].try_into().ok())
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
