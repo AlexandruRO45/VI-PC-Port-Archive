@@ -7,6 +7,9 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+// The batch translator drives the host shader compiler and validator,
+// which `victory_shader::emit` exposes on Windows only.
+#[cfg(windows)]
 mod translate;
 
 use std::path::PathBuf;
@@ -146,6 +149,7 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
+        #[cfg(windows)]
         Command::Translate {
             paths,
             validate,
@@ -162,6 +166,10 @@ fn main() -> Result<()> {
                 victory_shader::emit::set_host_max_wave(n);
             }
             translate::run(paths, validate, pipelines, list, jobs)
+        }
+        #[cfg(not(windows))]
+        Command::Translate { .. } => {
+            anyhow::bail!("translating shaders requires Windows")
         }
         Command::Run {
             exe,
