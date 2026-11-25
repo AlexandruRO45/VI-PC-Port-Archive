@@ -450,14 +450,20 @@ impl Shader {
     /// Refactoring lets the host fuse a multiply and an add the console
     /// rounds apart (Intel UHD and some NVIDIA drivers do); only `FMad`
     /// needs it, to fuse at all.
-    pub(crate) fn settle_flags(&mut self) {
+    fn settle_flags(&mut self) {
         if !self.fused {
             self.flags |= flags::NO_REFACTORING;
         }
     }
 
     /// The finished container.
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
+        self.finish_with_flags().0
+    }
+
+    /// The finished container and the final `ShaderFlags` settled after
+    /// module optimization.
+    pub(crate) fn finish_with_flags(mut self) -> (Vec<u8>, u64) {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -467,6 +473,7 @@ impl Shader {
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();
+            self.fused = used.fmad;
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
                 (flags::INT64, used.int64),
@@ -850,7 +857,7 @@ impl Shader {
             parts.push((b"PSG1", &psg1));
         }
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
-        container::build(&parts)
+        (container::build(&parts), self.flags)
     }
 
     /// The user-data buffer's annotation carries its size, known only now.

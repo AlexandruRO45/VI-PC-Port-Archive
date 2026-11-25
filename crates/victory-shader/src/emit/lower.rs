@@ -2282,6 +2282,12 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        #[cfg(test)]
+        let nonuniform_handles = self.s.nonuniform_handles;
+        #[cfg(test)]
+        let wave_ops = self.s.flags & flags::WAVE_OPS != 0;
+        let (dxil, final_flags) = self.s.finish_with_flags();
+        let _ = final_flags;
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2289,15 +2295,12 @@ impl<'a> Lower<'a> {
             root_srvs,
             root_uavs,
             #[cfg(test)]
-            nonuniform_handles: self.s.nonuniform_handles,
+            nonuniform_handles,
             #[cfg(test)]
-            wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            wave_ops,
             #[cfg(test)]
-            refactoring: {
-                self.s.settle_flags();
-                self.s.flags & flags::NO_REFACTORING == 0
-            },
-            dxil: self.s.finish(),
+            refactoring: final_flags & flags::NO_REFACTORING == 0,
+            dxil,
             user_data,
             samplers: self.samplers,
         })
@@ -11598,6 +11601,17 @@ mod tests {
         ]);
         assert_eq!(names[..2], ["v_mul_f32", "v_add_f32"]);
         assert!(!apart, "a multiply and an add stay apart");
+        let (dead_fma, names) = refactoring(&[
+            0xD54B_0009, // v_fma_f32 v9, v0, v0, v0 (unused; removed by DCE)
+            0x0402_0100,
+            0x1006_0100, // v_mul_f32 v3, v0, v0
+            0x0606_0103, // v_add_f32 v3, v3, v0
+        ]);
+        assert_eq!(names[..3], ["v_fma_f32", "v_mul_f32", "v_add_f32"]);
+        assert!(
+            !dead_fma,
+            "dead FMad removed by DCE must still disable refactoring"
+        );
     }
 
     fn perm_features(selector: u32) -> u64 {
