@@ -121,6 +121,9 @@ trait Source: Send {
     fn mouse(&mut self) -> (f32, f32) {
         (0.0, 0.0)
     }
+    /// The mouse is not being sampled (a pad is connected): leave the cursor
+    /// alone, and treat the next `mouse` call as a first sample.
+    fn mouse_idle(&mut self) {}
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -450,6 +453,7 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
+        let seen = self.state().seen_input;
         let (pads, keys, scripted, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
@@ -457,7 +461,18 @@ impl Hub {
             let scripted = source.scripted_keys();
             #[cfg(not(any(test, feature = "diagnostics")))]
             let scripted: [KeyState; 0] = [];
-            (pads, source.keys(), scripted, source.mouse())
+            // The mouse only drives the stand-in pad, which an active real pad
+            // turns off; sampling it then would still re-centre the cursor.
+            let any_pad = pads.iter().enumerate().any(|(slot, pad)| {
+                pad.is_some_and(|p| seen[slot] || p != PadState::default())
+            });
+            let mouse = if any_pad {
+                source.mouse_idle();
+                (0.0, 0.0)
+            } else {
+                source.mouse()
+            };
+            (pads, source.keys(), scripted, mouse)
         };
         let events = self.state().poll(&self.devices, pads, keys, &scripted, mouse);
         self.deliver(events);
@@ -1327,6 +1342,10 @@ mod host {
             stick_push(cursor.x - centre.x, cursor.y - centre.y, sensitivity)
         }
 
+        fn mouse_idle(&mut self) {
+            self.centred = false;
+        }
+
         #[cfg(any(test, feature = "diagnostics"))]
         fn scripted_keys(&mut self) -> Vec<KeyState> {
             #[cfg(feature = "diagnostics")]
@@ -1445,6 +1464,7 @@ mod tests {
         keys: Vec<KeyState>,
         scripted: Vec<KeyState>,
         mouse: (f32, f32),
+        mouse_polls: u32,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1461,7 +1481,9 @@ mod tests {
             self.0.lock().unwrap().scripted.clone()
         }
         fn mouse(&mut self) -> (f32, f32) {
-            self.0.lock().unwrap().mouse
+            let mut host = self.0.lock().unwrap();
+            host.mouse_polls += 1;
+            host.mouse
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
@@ -1759,15 +1781,22 @@ mod tests {
         );
         release(r);
 
-        // A connected pad turns the stand-in off, mouse included.
-        host.lock().unwrap().pads[0] = Some(PadState::default());
+        // A connected pad turns the stand-in off, mouse included: the mouse
+        // is not even sampled, so the cursor stays free.
+        let before = host.lock().unwrap().mouse_polls;
+        let pressed = PadState {
+            buttons: A,
+            ..Default::default()
+        };
+        host.lock().unwrap().pads[0] = Some(pressed);
         hub.poll();
+        assert_eq!(host.lock().unwrap().mouse_polls, before);
         assert_eq!(
             current(hub, GAMEPAD_KIND, FALLBACK),
             Err(DEVICE_DISCONNECTED)
         );
         let r = current(hub, GAMEPAD_KIND, 0).unwrap();
-        assert_eq!(pad(r), PadState::default());
+        assert_eq!(pad(r), pressed);
         release(r);
     }
 
