@@ -3760,6 +3760,7 @@ impl Host {
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        let _submitting = crate::phase::at(crate::phase::Phase::Submit);
         let _ = self.submit(runs, false);
     }
 
@@ -6048,6 +6049,7 @@ impl Meter {
                 }
             }
         }
+        crate::phase::line(frames, ms);
         if self.caption.is_none() {
             // The window's own text, read without a message.
             let mut buffer = vec![0u16; 512];

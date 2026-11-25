@@ -312,6 +312,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
 /// from the view table, so a detector that finds no second view can say
 /// whether there was none or whether its bytes were never recorded.
 pub fn views_at(at: usize, len: usize) -> Vec<(usize, usize, usize, u64)> {
+    let _scan = crate::phase::at(crate::phase::Phase::Shadow);
     let end = at.saturating_add(len.max(1));
     let v = views();
     v.views

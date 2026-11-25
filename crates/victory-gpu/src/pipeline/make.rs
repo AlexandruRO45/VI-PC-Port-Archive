@@ -77,6 +77,7 @@ impl Pending {
     }
 
     fn make(&self) {
+        let _translating = crate::phase::at(crate::phase::Phase::Translate);
         let started = Instant::now();
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
