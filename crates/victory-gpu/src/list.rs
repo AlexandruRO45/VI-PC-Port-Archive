@@ -1197,7 +1197,11 @@ mod state {
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
-        if y * z != 1 {
+        // No groups in any dimension: nothing runs.
+        if x == 0 || y == 0 || z == 0 {
+            return;
+        }
+        if y != 1 || z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
@@ -1574,6 +1578,17 @@ mod tests {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// `DispatchMesh` with group counts whose product overflows, or with
+    /// none in a dimension, is no mesh dispatch (and no panic).
+    #[cfg(windows)]
+    #[test]
+    fn mesh_dispatches_with_overflowing_or_zero_groups_do_nothing() {
+        // A null list: the state is never reached.
+        state::dispatch_mesh(std::ptr::null(), 16, 65536, 65536);
+        state::dispatch_mesh(std::ptr::null(), 16, 0, 1);
+        state::dispatch_mesh(std::ptr::null(), 0, 1, 1);
     }
 
     #[test]
