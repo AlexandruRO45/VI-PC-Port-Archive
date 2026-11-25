@@ -94,6 +94,19 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
+            // Translations from now on target this device's widest wave
+            // (split wave64 without 64-lane waves), as `victory-gpu` does.
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            if device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+            {
+                super::set_host_wave_max(options.WaveLaneCountMax);
+            }
             Ok(Host { device })
         }
     }
@@ -670,6 +683,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave_max: 64,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,
