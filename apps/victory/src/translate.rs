@@ -652,13 +652,6 @@ fn check(
                 .find(|l| l.contains("error"))
                 .unwrap_or(text.lines().next().unwrap_or(""))
                 .to_owned();
-            // The line after an error says what the validator compared, and
-            // it is the one that tells you what to fix: "Flags must match
-            // usage" arrives with a `note: Flags declared=…, actual=…`.
-            let reason = match text.lines().find(|l| l.contains("note:")) {
-                Some(note) => format!("{first} ({})", note.trim()),
-                None => first.clone(),
-            };
             if let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP") {
                 let n = t
                     .failed
@@ -677,7 +670,7 @@ fn check(
                     let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
                 }
             }
-            t.fail(format!("validator: {reason}"), label);
+            t.fail(format!("validator: {first}"), label);
         }
     }
 }
