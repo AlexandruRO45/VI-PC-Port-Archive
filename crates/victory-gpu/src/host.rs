@@ -1134,6 +1134,13 @@ impl Host {
         }
     }
 
+    /// The submission lock, for tests that drive copy-backs themselves:
+    /// their marks and copy-backs then interleave with no submission's.
+    #[cfg(test)]
+    pub(crate) fn lock_submissions(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.submitted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots

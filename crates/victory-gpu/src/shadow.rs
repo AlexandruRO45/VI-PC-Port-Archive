@@ -1622,6 +1622,10 @@ pub(crate) mod tests {
             unregister(p, p as u64);
             return; // no host GPU here
         };
+        // The bitmap and `copy_back_marks` are process-wide: hold the
+        // submission lock so no parallel test's submission consumes the
+        // bits this test sets before its own copy-back.
+        let _submissions = host().expect("a bitmap means a host").lock_submissions();
         let base = copy.marks.expect("tracked memory gets mark bits") as usize;
         assert_eq!(copy.mark_entry(p as u64 + PAGE as u64 + 8), Some((base as u32 + 1, 8)));
         copy.update(p, len);
@@ -1787,6 +1791,10 @@ pub(crate) mod tests {
             unregister(p, p as u64);
             return; // no host GPU here
         };
+        // The bitmap and `copy_back_marks` are process-wide: hold the
+        // submission lock so no parallel test's submission consumes the
+        // bits this test sets before its own copy-back.
+        let _submissions = host().expect("a bitmap means a host").lock_submissions();
         let base = copy.marks.expect("tracked memory gets mark bits") as usize;
         let bits = b.data as *mut u32;
         let mark = |page: usize| {
@@ -1845,6 +1853,10 @@ pub(crate) mod tests {
             unregister(p, p as u64);
             return; // no host GPU here
         };
+        // The bitmap and `copy_back_marks` are process-wide: hold the
+        // submission lock so no parallel test's submission consumes the
+        // bits this test sets before its own copy-back.
+        let _submissions = host().expect("a bitmap means a host").lock_submissions();
         let base = copy.marks.expect("tracked memory gets mark bits") as usize;
         let bits = b.data as *mut u32;
         let mark = || {
