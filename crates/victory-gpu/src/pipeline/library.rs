@@ -510,9 +510,25 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// Pipelines a driver's compiler crashed on (names, one per line).
 const CRASHED_FILE: &str = "crashed.txt";
 
-/// The pipeline named `name` is left out from the next run on.
+fn crashed_set() -> &'static Mutex<HashSet<String>> {
+    static NAMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        Mutex::new(
+            DIR.get()
+                .and_then(|d| std::fs::read_to_string(d.join(CRASHED_FILE)).ok())
+                .map(|t| t.lines().map(str::to_owned).collect())
+                .unwrap_or_default(),
+        )
+    })
+}
+
+/// The pipeline named `name` is left out for the rest of this run (in-memory)
+/// and from the next run on (`crashed.txt`).
 fn note_crashed(name: &str) {
     use std::io::Write;
+    if let Ok(mut set) = crashed_set().try_lock() {
+        set.insert(name.to_owned());
+    }
     let Some(dir) = DIR.get() else { return };
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -525,14 +541,9 @@ fn note_crashed(name: &str) {
 
 /// Whether the driver crashed making the pipeline named `name` before.
 fn crashed(name: &str) -> bool {
-    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
-    NAMES
-        .get_or_init(|| {
-            DIR.get()
-                .and_then(|d| std::fs::read_to_string(d.join(CRASHED_FILE)).ok())
-                .map(|t| t.lines().map(str::to_owned).collect())
-                .unwrap_or_default()
-        })
+    crashed_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .contains(name)
 }
 
@@ -547,6 +558,9 @@ thread_local! {
 struct Making;
 
 impl Making {
+    // Invariant: `create()` runs outside all runtime locks (`one_call`,
+    // `same_name`, `call`, `DONE`) so parking a faulting worker thread never
+    // deadlocks the pool or other threads.
     fn new(name: &str) -> Making {
         use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
         static HANDLER: std::sync::Once = std::sync::Once::new();
@@ -615,7 +629,6 @@ pub(crate) fn pipeline(
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
-        let _making = Making::new(name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
     // The load read the library's file (see `trim`).
