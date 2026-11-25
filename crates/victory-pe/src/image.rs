@@ -25,6 +25,9 @@ pub struct ImageInfo {
     pub stack_reserve: u64,
     pub stack_commit: u64,
     pub sections: Vec<SectionInfo>,
+    /// Function RVA ranges from the x64 exception directory (`.pdata`).
+    /// Leaf functions may not have entries here.
+    pub code_ranges: Vec<(u32, u32)>,
     pub imports: Vec<ImportModule>,
     pub delay_imports: Vec<ImportModule>,
     pub exports: Vec<ExportInfo>,
@@ -156,6 +159,8 @@ impl ImageInfo {
             })
             .collect();
 
+        let code_ranges = parse_code_ranges(&file, data, opt.size_of_image());
+
         let dir_present = |index: usize| {
             file.data_directory(index)
                 .is_some_and(|d| d.virtual_address.get(LE) != 0 && d.size.get(LE) != 0)
@@ -186,6 +191,7 @@ impl ImageInfo {
             stack_reserve: opt.size_of_stack_reserve(),
             stack_commit: opt.size_of_stack_commit(),
             sections,
+            code_ranges,
             imports,
             delay_imports,
             exports,
@@ -234,6 +240,36 @@ impl ImageInfo {
             _ => "other",
         }
     }
+}
+
+/// Reads valid x64 `RUNTIME_FUNCTION` ranges from the exception directory.
+/// Invalid/truncated entries are ignored; only ranges wholly inside the image
+/// are returned. The table is normally sorted, but sorting here also makes
+/// lookup robust to unusual linkers.
+fn parse_code_ranges(file: &PeFile64<'_>, data: &[u8], image_size: u32) -> Vec<(u32, u32)> {
+    let Some(directory) = file.data_directory(dir::EXCEPTION) else {
+        return Vec::new();
+    };
+    let rva = directory.virtual_address.get(LE);
+    let size = directory.size.get(LE) as usize;
+    if rva == 0 || size < 12 {
+        return Vec::new();
+    }
+    let Some(bytes) = file.section_table().pe_data_at(data, rva) else {
+        return Vec::new();
+    };
+    let bytes = &bytes[..bytes.len().min(size)];
+    let mut ranges = Vec::new();
+    for entry in bytes.chunks_exact(12) {
+        let begin = u32::from_le_bytes(entry[0..4].try_into().unwrap());
+        let end = u32::from_le_bytes(entry[4..8].try_into().unwrap());
+        if begin < end && end <= image_size {
+            ranges.push((begin, end));
+        }
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    ranges
 }
 
 fn has_flag(value: u16, flag: u16) -> bool {
