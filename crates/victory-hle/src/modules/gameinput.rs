@@ -29,21 +29,21 @@ pub const REFERENCE_TOO_OLD: HRESULT = 0x838A_0004_u32 as i32;
 const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 
-/// The COM interfaces the input objects answer (`GameInput.h`).
+/// The COM interfaces the input objects answer.
 const IID_IUNKNOWN: Guid = Guid::new(0, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
-const IID_IGAMEINPUT: Guid = Guid::new(
+const INPUT_IID: Guid = Guid::new(
     0x11be_2a7e,
     0x4254,
     0x445a,
     [0x9c, 0x09, 0xff, 0xc4, 0x0f, 0x00, 0x69, 0x18],
 );
-const IID_IGAMEINPUT_DEVICE: Guid = Guid::new(
+const DEVICE_IID: Guid = Guid::new(
     0x31dd_86fb,
     0x4c1b,
     0x408a,
     [0x86, 0x8f, 0x43, 0x9b, 0x3c, 0xd4, 0x71, 0x25],
 );
-const IID_IGAMEINPUT_READING: Guid = Guid::new(
+const READING_IID: Guid = Guid::new(
     0x2156_947a,
     0xe1fa,
     0x4de0,
@@ -664,13 +664,13 @@ fn query_interface(this: *const c_void, iid: *const Guid, out: Out, expected: Gu
 }
 
 extern "system" fn input_interface(this: *const c_void, iid: *const Guid, out: Out) -> HRESULT {
-    query_interface(this, iid, out, IID_IGAMEINPUT)
+    query_interface(this, iid, out, INPUT_IID)
 }
 extern "system" fn device_interface(this: *const c_void, iid: *const Guid, out: Out) -> HRESULT {
-    query_interface(this, iid, out, IID_IGAMEINPUT_DEVICE)
+    query_interface(this, iid, out, DEVICE_IID)
 }
 extern "system" fn reading_interface(this: *const c_void, iid: *const Guid, out: Out) -> HRESULT {
-    query_interface(this, iid, out, IID_IGAMEINPUT_READING)
+    query_interface(this, iid, out, READING_IID)
 }
 /// The input object and devices live as long as the process.
 extern "system" fn add_ref(_: *const c_void) -> u32 {
@@ -1031,18 +1031,18 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
     lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
 }
-/// `IsForceFeedbackMotorPoweredOn`: the host pads we expose have no motor
-/// this can report (XInput's vibration is not a powered motor).
+/// Whether a force-feedback motor is powered: the host pads we expose have no
+/// motor this can report (XInput's vibration is not a powered motor).
 extern "system" fn force_feedback_motor_powered_on(_: *const Device, _motor: u32) -> bool {
     false
 }
 
-/// `AcquireExclusiveRawDeviceAccess`: the host pad stays shared.
+/// Exclusive raw access is refused: the host pad stays shared.
 extern "system" fn acquire_raw_device_access(_: *const Device, _timeout: u64) -> bool {
     false
 }
 
-/// `ReleaseExclusiveRawDeviceAccess`: nothing was acquired.
+/// Releasing exclusive raw access does nothing: none was acquired.
 extern "system" fn release_raw_device_access(_: *const Device) {}
 
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
@@ -1565,7 +1565,7 @@ mod tests {
         assert_eq!(query(input.cast(), &IID_IUNKNOWN, &mut out), S_OK);
         assert_eq!(out, input.cast());
         out = std::ptr::dangling::<c_void>();
-        assert_eq!(query(input.cast(), &IID_IGAMEINPUT, &mut out), S_OK);
+        assert_eq!(query(input.cast(), &INPUT_IID, &mut out), S_OK);
         assert_eq!(out, input.cast());
         out = std::ptr::dangling::<c_void>();
         assert_eq!(query(input.cast(), &unknown, &mut out), E_NOINTERFACE);
@@ -1582,16 +1582,16 @@ mod tests {
         let device = &hub.devices[0] as *const Device;
         let query = slot::<Query, _>(device, 0);
         out = std::ptr::dangling::<c_void>();
-        assert_eq!(query(device.cast(), &IID_IGAMEINPUT_DEVICE, &mut out), S_OK);
+        assert_eq!(query(device.cast(), &DEVICE_IID, &mut out), S_OK);
         assert_eq!(out, device.cast());
         out = std::ptr::dangling::<c_void>();
         assert_eq!(
-            query(device.cast(), &IID_IGAMEINPUT, &mut out),
+            query(device.cast(), &INPUT_IID, &mut out),
             E_NOINTERFACE
         );
         assert!(out.is_null());
 
-        // The SDK's 22-slot device table: the typed stubs at 0x38, 0xa0 and
+        // The 22-slot device table: the typed stubs at 0x38, 0xa0 and
         // 0xa8 answer (false / nothing) rather than E_NOTIMPL.
         let powered = slot::<extern "system" fn(*const Device, u32) -> bool, _>(device, 0x38);
         assert!(!powered(device, 0));
@@ -1605,7 +1605,7 @@ mod tests {
         let query = slot::<Query, _>(reading, 0);
         out = std::ptr::dangling::<c_void>();
         assert_eq!(
-            query(reading.cast(), &IID_IGAMEINPUT_READING, &mut out),
+            query(reading.cast(), &READING_IID, &mut out),
             S_OK
         );
         assert_eq!(out, reading.cast());
