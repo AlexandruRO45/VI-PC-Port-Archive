@@ -594,81 +594,9 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(
-            tiled.len(),
-            mip,
-            slice,
-            linear.len(),
-            row_pitch,
-            depth_pitch,
-            |height| 0..height,
-            |t, l, len| {
-                linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
-            },
-        )
-    }
-
-    /// Copy a renderer upload into mapped staging memory. Large, tiled 2D mips
-    /// can use independent row bands. Small mips stay on the calling thread.
-    #[cfg(feature = "parallel-detile")]
-    pub fn detile_upload(
-        &self,
-        tiled: &[u8],
-        mip: u32,
-        slice: u32,
-        output: &mut [u8],
-        row_pitch: usize,
-        depth_pitch: usize,
-    ) -> Result<(), Error> {
-        use rayon::prelude::*;
-
-        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
-        let row_bytes = m.width as usize * self.desc.element_bytes as usize;
-        let payload = row_bytes as u64 * u64::from(m.height);
-        // Count active bytes only. Small uploads are faster on the caller.
-        if self.desc.dimension == Dimension::Tex2d
-            && self.desc.swizzle != Swizzle::LINEAR
-            && payload >= 4 << 20
-            && m.height >= 4
-            && slice < self.slices
-            && self.addressable()
-            && tiled.len() >= self.size as usize
-            && let Some((pool, _slot)) = upload_pool()
-        {
-            let height = m.height as usize;
-            let need = (height - 1)
-                .checked_mul(row_pitch)
-                .and_then(|n| n.checked_add(row_bytes))
-                .ok_or(Error::TooSmall)?;
-            if row_pitch < row_bytes || output.len() < need {
-                return Err(Error::TooSmall);
-            }
-            let rows = height.div_ceil(pool.current_num_threads());
-            let band_bytes = rows * row_pitch;
-            pool.install(|| {
-                output[..need]
-                    .par_chunks_mut(band_bytes)
-                    .enumerate()
-                    .try_for_each(|(index, band)| {
-                        let start = index * rows;
-                        let end = (start + rows).min(height);
-                        self.walk(
-                            tiled.len(),
-                            mip,
-                            slice,
-                            band.len(),
-                            row_pitch,
-                            depth_pitch,
-                            |_| start as u32..end as u32,
-                            |src, dst, len| {
-                                band[dst..][..len].copy_from_slice(&tiled[src..][..len]);
-                            },
-                        )
-                    })
-            })
-        } else {
-            self.detile(tiled, mip, slice, output, row_pitch, depth_pitch)
-        }
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+        })
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -681,23 +609,31 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(
-            tiled.len(),
-            mip,
-            slice,
-            linear.len(),
-            row_pitch,
-            depth_pitch,
-            |height| 0..height,
-            |t, l, len| {
-                tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
-            },
-        )
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+            tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
+        })
     }
 
     /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
     #[allow(clippy::too_many_arguments)]
     fn walk(
+        &self,
+        tiled_len: usize,
+        mip: u32,
+        slice: u32,
+        linear_len: usize,
+        row_pitch: usize,
+        depth_pitch: usize,
+        copy: impl FnMut(usize, usize, usize),
+    ) -> Result<(), Error> {
+        self.walk_rows(
+            tiled_len, mip, slice, linear_len, row_pitch, depth_pitch, |height| 0..height, copy,
+        )
+    }
+
+    /// Visits contiguous runs in the requested band, relative to its first row.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_rows(
         &self,
         tiled_len: usize,
         mip: u32,
@@ -782,6 +718,71 @@ impl Layout {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "parallel-detile")]
+impl Layout {
+    /// Copy a renderer upload into mapped staging memory. Large, tiled 2D mips
+    /// can use independent row bands. Small mips stay on the calling thread.
+    pub fn detile_upload(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        output: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        use rayon::prelude::*;
+
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let row_bytes = m.width as usize * self.desc.element_bytes as usize;
+        let payload = row_bytes as u64 * u64::from(m.height);
+        // Count active bytes only. Small uploads are faster on the caller.
+        if self.desc.dimension == Dimension::Tex2d
+            && self.desc.swizzle != Swizzle::LINEAR
+            && payload >= 4 << 20
+            && m.height >= 4
+            && slice < self.slices
+            && self.addressable()
+            && tiled.len() >= self.size as usize
+            && let Some((pool, _slot)) = upload_pool()
+        {
+            let height = m.height as usize;
+            let need = (height - 1)
+                .checked_mul(row_pitch)
+                .and_then(|n| n.checked_add(row_bytes))
+                .ok_or(Error::TooSmall)?;
+            if row_pitch < row_bytes || output.len() < need {
+                return Err(Error::TooSmall);
+            }
+            let rows = height.div_ceil(pool.current_num_threads());
+            let band_bytes = rows * row_pitch;
+            pool.install(|| {
+                output[..need]
+                    .par_chunks_mut(band_bytes)
+                    .enumerate()
+                    .try_for_each(|(index, band)| {
+                        let start = index * rows;
+                        let end = (start + rows).min(height);
+                        self.walk_rows(
+                            tiled.len(),
+                            mip,
+                            slice,
+                            band.len(),
+                            row_pitch,
+                            depth_pitch,
+                            |_| start as u32..end as u32,
+                            |src, dst, len| {
+                                band[dst..][..len].copy_from_slice(&tiled[src..][..len]);
+                            },
+                        )
+                    })
+            })
+        } else {
+            self.detile(tiled, mip, slice, output, row_pitch, depth_pitch)
+        }
     }
 }
 
