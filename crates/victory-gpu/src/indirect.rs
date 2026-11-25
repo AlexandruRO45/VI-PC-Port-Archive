@@ -494,20 +494,32 @@ fn record_clamp_as(
 }
 
 /// Whether every draw served from a window is checked against a fresh
-/// clamp of its record (`VICTORY_INDIRECT_WINDOW_CHECK=1`, with
-/// `VICTORY_INDIRECT_WINDOW=1`; off by default). A window clamps its
+/// clamp of its record (`VICTORY_INDIRECT_WINDOW_CHECK=1` to ask for it,
+/// `=0` to leave it out; **on by default** in this branch, with
+/// `VICTORY_INDIRECT_WINDOW`). A window clamps its
 /// records once, ahead of their draws; if anything wrote a record between
 /// the window's clamp and its draw, the draw reads the old one. The check
 /// clamps the record again just before the draw (into a buffer of its own,
 /// charging a budget of its own) and compares the two on the card: the
 /// counts are logged ("window check"), and the first record that differs in
-/// each run of a list is named. For telling whether windows can be trusted
-/// in a scene before they are on by default; it costs a clamp and a compare
-/// per window draw.
+/// each run of a list is named.
+///
+/// Why it is on here: windows are on by default now, and this is what
+/// makes them safe rather than fast-looking. It costs a clamp and a
+/// compare per window draw on the card (no wait, no submission: it is
+/// recorded in the same list), which is the price of a wrong picture not
+/// happening. `VICTORY_INDIRECT_WINDOW_CHECK=0` measures windows at their
+/// cheapest.
 pub(crate) fn window_check() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // A test that clamps records on its own (the warp budget benchmark)
+    // wants the plain clamp: windows' checks are not part of what it
+    // measures, and a check costs a clamp and a compare. `VICTORY_INDIRECT_WINDOW_CHECK`
+    // says so from outside too, which is how `cargo test` runs the crate
+    // (the tests are in the library itself, so they carry the release
+    // profile's settings).
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_INDIRECT_WINDOW_CHECK").is_some_and(|v| v == "1")
+        std::env::var("VICTORY_INDIRECT_WINDOW_CHECK").map_or(!cfg!(test), |v| v != "0")
     })
 }
 

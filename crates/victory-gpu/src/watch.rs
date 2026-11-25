@@ -543,7 +543,8 @@ struct Guards {
 }
 
 /// Whether a block once guarded stays known as view memory while its
-/// guard is open (`VICTORY_VIEW_KNOWN=1`; off by default).
+/// guard is open (`VICTORY_VIEW_KNOWN=0` turns it off; **on by default in
+/// this branch**).
 ///
 /// A range whose first block the title wrote since the last check has
 /// that block neither read-only nor noted absent, so nothing says it is a
@@ -556,7 +557,7 @@ struct Guards {
 /// maps or unmaps it ([`title_memory_remapped`]).
 fn view_known() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_KNOWN").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_VIEW_KNOWN").map_or(true, |v| v != "0"))
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
