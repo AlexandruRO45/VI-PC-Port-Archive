@@ -161,8 +161,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn nested_pack_shared_reader_blocks_exclusive_open() {
-        use std::os::windows::fs::OpenOptionsExt;
+    fn nested_pack_shared_reader_blocks_exclusive_open() {        use std::os::windows::fs::OpenOptionsExt;
         let dir = tempfile::tempdir().unwrap();
         installation(dir.path());
         let path = dir.path().join("pack/nested/member.rpf");
@@ -175,5 +174,27 @@ mod tests {
         drop(held);
         assert_eq!(scan(dir.path(), false), 0);
         assert!(options.share_mode(0).open(&path).is_ok());
+    }
+
+    #[test]
+    fn a_directory_where_a_file_belongs_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        installation(dir.path());
+        let movies = dir.path().join("movies.rpf");
+        fs::remove_file(&movies).unwrap();
+        fs::create_dir(&movies).unwrap();
+        // Opening a directory for reading succeeds on some platforms, so the
+        // check has to reject it on the kind, not only on the open result.
+        assert_eq!(scan(dir.path(), false), 1);
+    }
+
+    #[test]
+    fn the_warning_does_not_change_the_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(scan(dir.path(), false), 1);
+        assert_eq!(scan(dir.path(), true), 1);
+        installation(dir.path());
+        assert_eq!(scan(dir.path(), true), 0);
+        assert_eq!(scan(dir.path(), false), 0);
     }
 }
