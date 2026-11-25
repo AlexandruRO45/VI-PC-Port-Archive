@@ -6592,6 +6592,15 @@ impl Meter {
             );
             crate::tiles::status();
             {
+                let made = crate::descriptor::host::MIRROR_MADE.swap(0, Ordering::Relaxed) as f64 / frames;
+                let later = crate::descriptor::host::MIRROR_DEFERRED.swap(0, Ordering::Relaxed) as f64 / frames;
+                if made + later > 0.0 {
+                    tracing::info!(
+                        "descriptor views per frame: {made:.0} made, {later:.0} left to the draws that read them"
+                    );
+                }
+            }
+            {
                 let [hb, hc, tb, tc] =
                     [0, 1, 2, 3].map(|i| COPY_MOVED[i].swap(0, Ordering::Relaxed) as f64 / frames);
                 if hc + tc > 0.0 {

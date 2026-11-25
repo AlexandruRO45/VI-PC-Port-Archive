@@ -1949,8 +1949,10 @@ impl HostHeap {
             }
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
+                MIRROR_DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 None
             } else {
+                MIRROR_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 make(&view, self.cpu(index))
             };
             if kept.is_none() && !self.sampler {
@@ -2194,6 +2196,12 @@ fn sync_tables() -> bool {
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the last frame line: host descriptor views made for records that
+/// changed (`make`), and those left to the draw or the pass that reads them
+/// (buffer views and textures still waiting for a host copy).
+pub(crate) static MIRROR_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static MIRROR_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same
