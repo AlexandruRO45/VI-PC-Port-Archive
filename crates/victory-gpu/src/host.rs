@@ -14,7 +14,6 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
@@ -42,7 +41,6 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
-    event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
     /// A ring of depth views, used as `rtvs`.
@@ -199,7 +197,6 @@ fn create() -> windows::core::Result<Host> {
             ..Default::default()
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -242,7 +239,6 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
-            event,
             rtvs,
             rtv_size,
             dsvs,
@@ -255,6 +251,26 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
         })
+    }
+}
+
+/// Confirms completion even if the blocking wait could not be registered.
+/// The caller treats the device-removed sentinel as a failed submission.
+fn wait_for_fence_value(
+    fence: &ID3D12Fence,
+    value: u64,
+    waited: windows::core::Result<()>,
+) -> u64 {
+    if let Err(e) = waited {
+        tracing::warn!(error = %e, value, "host fence wait failed; checking completion directly");
+    }
+    loop {
+        // SAFETY: a live fence.
+        let completed = unsafe { fence.GetCompletedValue() };
+        if completed >= value {
+            return completed;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -327,6 +343,117 @@ mod tests {
         list.reset();
         assert_eq!(list.scratch(512).unwrap(), first);
         list.close();
+    }
+
+    #[test]
+    fn reset_waits_for_the_submission_holding_the_view_heap() {
+        use std::sync::{Arc, TryLockError, mpsc};
+        use std::time::Duration;
+
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let heap = crate::descriptor::host::HostHeap::new(false, 1).unwrap();
+        list.hold_view_heap(&heap);
+        list.keep(&heap.heap);
+        // SAFETY: an open list and a live shader-visible heap.
+        unsafe { list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]) };
+        let lease = Arc::downgrade(list.deferred().view_heaps.values().next().unwrap());
+        let (prepared, preparation) = mpsc::channel();
+        list.defer(move || {
+            let _ = prepared.send(());
+        });
+        list.close();
+
+        // SAFETY: a live device, queue and test fence. The queued wait
+        // keeps subsequent GPU work from finishing until this thread signals.
+        let gate: ID3D12Fence = unsafe {
+            let gate = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            host.queue.Wait(&gate, 1).unwrap();
+            gate
+        };
+
+        struct ConcurrentList<'a>(&'a HostList);
+
+        // SAFETY: this fixture holds only free-threaded D3D12 objects,
+        // including the heap erased to IUnknown. Its submit and reset
+        // methods use the same HostList synchronization as the title.
+        unsafe impl Sync for ConcurrentList<'_> {}
+
+        impl ConcurrentList<'_> {
+            fn submit(&self, host: &Host) {
+                host.execute(&[self.0]);
+            }
+
+            fn reset(&self) {
+                self.0.reset();
+            }
+        }
+
+        let concurrent = ConcurrentList(&list);
+        let (submitted, protected, reset_blocked, held_while_pending) = std::thread::scope(|scope| {
+            scope.spawn(|| concurrent.submit(host));
+            let submitted = preparation.recv_timeout(Duration::from_secs(3)).is_ok();
+            let protected = matches!(list.submitting.try_lock(), Err(TryLockError::WouldBlock));
+            let mut reset_blocked = false;
+            let mut held_while_pending = false;
+            if submitted && protected {
+                let (started, beginning) = mpsc::channel();
+                let (done, ending) = mpsc::channel();
+                let concurrent = &concurrent;
+                scope.spawn(move || {
+                    started.send(()).unwrap();
+                    concurrent.reset();
+                    done.send(()).unwrap();
+                });
+                reset_blocked = beginning.recv_timeout(Duration::from_secs(3)).is_ok()
+                    && matches!(ending.recv_timeout(Duration::from_millis(50)), Err(mpsc::RecvTimeoutError::Timeout));
+                held_while_pending = lease.strong_count() == 2;
+                // SAFETY: the test owns the fence behind its queue wait.
+                unsafe { gate.Signal(1) }.unwrap();
+                // Keep the receiver alive until reset has finished.
+                if reset_blocked {
+                    ending.recv_timeout(Duration::from_secs(3)).unwrap();
+                }
+            } else {
+                // Unblock the queue before reporting an earlier failure.
+                // SAFETY: the test owns the fence behind its queue wait.
+                unsafe { gate.Signal(1) }.unwrap();
+            }
+            (submitted, protected, reset_blocked, held_while_pending)
+        });
+        assert!(submitted, "the submission reached preparation");
+        assert!(protected, "the submission guards the recorded state");
+        assert!(held_while_pending, "the recorded lease is live while the fence is pending");
+        assert!(reset_blocked, "reset must wait for the queued fence");
+        assert_eq!(lease.strong_count(), 1, "reset drops the list's lease after the fence");
+    }
+
+    #[test]
+    fn a_failed_fence_wait_still_waits_for_completion() {
+        use std::sync::mpsc;
+
+        let Some(host) = host() else { return };
+        // SAFETY: a plain fence creation on the live device.
+        let fence: ID3D12Fence = unsafe {
+            host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap()
+        };
+        std::thread::scope(|scope| {
+            let (starting, started) = mpsc::channel();
+            let (completed, done) = mpsc::channel();
+            let fence = &fence;
+            scope.spawn(move || {
+                starting.send(()).unwrap();
+                let wait_error = windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL);
+                completed.send(wait_for_fence_value(fence, 1, Err(wait_error))).unwrap();
+            });
+            let began = started.recv_timeout(Duration::from_secs(3)).is_ok();
+            let before_signal = done.recv_timeout(Duration::from_millis(50));
+            // SAFETY: the test owns this fence.
+            unsafe { fence.Signal(1) }.unwrap();
+            assert!(began);
+            assert!(matches!(before_signal, Err(mpsc::RecvTimeoutError::Timeout)));
+            assert_eq!(done.recv_timeout(Duration::from_secs(3)).unwrap(), 1);
+        });
     }
 
     #[test]
@@ -463,6 +590,8 @@ mod tests {
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    /// Serializes reuse of this list and its allocator with submission.
+    submitting: Mutex<()>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -780,6 +909,7 @@ impl Host {
             Ok(HostList {
                 allocator,
                 list,
+                submitting: Mutex::default(),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -804,6 +934,15 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Keep the recorded commands, allocator and deferred holds (including
+        // the view heaps' leases) stable through preparation and copy-back.
+        // A submission can name the same list more than once.
+        let mut seen = std::collections::HashSet::new();
+        let lists_in_use: Vec<_> = runs
+            .iter()
+            .filter(|&&list| seen.insert(list.id))
+            .map(|list| list.submitting.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -897,19 +1036,24 @@ impl Host {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
+            // SAFETY: closed lists and a live fence. The signal follows the work.
+            let signalled = unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
-                }
+                self.queue.Signal(&self.fence, *submitted)
+            };
+            if let Err(e) = signalled {
+                fail(format_args!(
+                    "could not signal host submission {}: {e}{}{}",
+                    *submitted,
+                    self.removal_data(runs),
+                    last_notes(runs)
+                ));
+            }
+            // SAFETY: a live fence. A null event makes the call block.
+            let waited = unsafe { self.fence.SetEventOnCompletion(*submitted, HANDLE::default()) };
+            if wait_for_fence_value(&self.fence, *submitted, waited) == u64::MAX {
+                removed_in = Some(i);
+                break;
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
@@ -942,7 +1086,7 @@ impl Host {
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
         }
         // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+        if removed_in.is_some() || unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}{}",
                 runs.len(),
@@ -1014,6 +1158,7 @@ impl Host {
         // The submission has run and the next waits for our lock.
         release_retired();
         self.log_messages();
+        drop(lists_in_use);
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
         #[cfg(feature = "diagnostics")]
@@ -1364,9 +1509,9 @@ impl HostList {
         }
     }
 
-    /// Only after the list's last submission finished (every one is waited
-    /// for).
+    /// Reuses the allocator and recorded holds after any submission finishes.
     pub(crate) fn reset(&self) {
+        let _in_use = self.submitting.lock().unwrap_or_else(|e| e.into_inner());
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();

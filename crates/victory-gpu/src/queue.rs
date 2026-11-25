@@ -119,11 +119,7 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let host_lists: Vec<_> = lists
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        host.execute(&host_lists);
+        crate::list::with_submitted_lists(lists, |runs| host.execute(runs));
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);

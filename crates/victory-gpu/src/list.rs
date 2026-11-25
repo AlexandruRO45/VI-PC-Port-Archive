@@ -143,6 +143,30 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     unsafe { (*this.cast::<List>()).host.as_ref() }
 }
 
+/// Holds the title's list objects for the duration of host submission.
+#[cfg(windows)]
+pub(crate) fn with_submitted_lists(lists: &[This], run: impl FnOnce(&[&crate::host::HostList])) {
+    struct Retained(This);
+
+    impl Drop for Retained {
+        fn drop(&mut self) {
+            list_release(self.0);
+        }
+    }
+
+    let retained: Vec<_> = lists
+        .iter()
+        .copied()
+        .filter(|this| !this.is_null())
+        .map(|this| {
+            object::add_ref(this);
+            Retained(this)
+        })
+        .collect();
+    let host_lists: Vec<_> = retained.iter().filter_map(|list| host_list(list.0)).collect();
+    run(&host_lists);
+}
+
 pub(crate) extern "system" fn create_allocator(
     _: This,
     kind: u32,
@@ -276,15 +300,15 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // Every submission of the list has run (submissions are waited for).
-    // SAFETY: the title passes one of our lists.
-    let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
     #[cfg(windows)]
     with_state(this, |host, state| {
         host.reset();
         state.reset(pipeline);
     });
+    // The host reset waited for any submission using the recorded uploads.
+    // SAFETY: the title passes one of our lists.
+    let uploads = unsafe { &(*this.cast::<List>()).uploads };
+    uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
     crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
     let _ = this;
@@ -1543,6 +1567,21 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn submitted_title_list_survives_the_callers_release() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[0], &mut list), S_OK);
+        allocator_release(allocator);
+
+        with_submitted_lists(&[list], |_| {
+            assert_eq!(list_release(list), 1, "submission still owns the list");
+        });
+    }
     use crate::object::slot;
     use std::sync::{
         Arc,
