@@ -104,10 +104,11 @@ fn registered_buffer_replaces_loose_shadow_on_next_dispatch() {
     let pipe = Guest(pipe);
     assert!(crate::pipeline::host_pipeline(pipe.0).is_some(), "synthetic host pipeline");
 
-    let source_mem =
-        crate::resource::Memory::zeroed(TEXTURE_ALIGNMENT as u64, TEXTURE_ALIGNMENT as u64)
-            .unwrap();
-    let source = source_mem.address();
+    // Loose copies cover 4 MiB windows and survive the test. Reserve a
+    // complete aligned window so later submissions can still read it.
+    let window = 4 << 20;
+    let start = crate::watch::tests::pool(2 * window / crate::watch::PAGE);
+    let source = start.next_multiple_of(window) as u64;
     let source_words = [
         D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32,
         0,
