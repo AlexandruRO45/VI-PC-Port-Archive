@@ -41,6 +41,19 @@ function Format-Value($Value, [string] $Suffix = '') {
     return "$Value$Suffix"
 }
 
+function Get-ReasonCounts([string] $Text) {
+    $patterns = [ordered]@{
+        'descriptor read only as data' = 'descriptor read only as data'
+        'structured buffer of unknown stride' = 'structured buffer of unknown stride'
+        'console wave64 lanes' = 'console wave64 lanes'
+        'host texture refused' = 'host texture refused'
+    }
+    foreach ($name in $patterns.Keys) {
+        $count = ([regex]::Matches($Text, [regex]::Escape($patterns[$name]), 'IgnoreCase')).Count
+        if ($count) { "  {0}x  {1}" -f $count, $name }
+    }
+}
+
 $run = Join-Path ([IO.Path]::GetTempPath()) ("victory-bench-{0}" -f [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $run | Out-Null
 New-Item -ItemType Directory -Path $Output -Force | Out-Null
@@ -59,6 +72,7 @@ if ($arguments.Count) { $start.ArgumentList = $arguments }
 $process = Start-Process @start
 $peakRam = 0L
 $stopReason = 'completed'
+$samples = [System.Collections.Generic.List[object]]::new()
 try {
     while (-not $process.HasExited) {
         Start-Sleep -Seconds 3
@@ -66,6 +80,11 @@ try {
         if ($process.WorkingSet64 -gt $peakRam) { $peakRam = $process.WorkingSet64 }
         $elapsed = ((Get-Date) - $started).TotalSeconds
         $free = (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory * 1KB
+        $samples.Add([pscustomobject]@{
+            seconds = [math]::Round($elapsed, 1)
+            process_ram_gb = [math]::Round($process.WorkingSet64 / 1GB, 2)
+            free_system_gb = [math]::Round($free / 1GB, 2)
+        })
         if ($process.WorkingSet64 -gt ($MaxRamGB * 1GB)) { $stopReason = 'process memory limit'; break }
         if ($free -lt ($MinSysGB * 1GB)) { $stopReason = 'system free-memory limit'; break }
         if ($elapsed -ge $Seconds) { $stopReason = 'time limit'; break }
@@ -95,6 +114,7 @@ $crashRva = if ($crashText -match '(?i)(?:rva|title\+)\s*[:=]?\s*(0x[0-9a-f]+)')
 $report = Join-Path $Output ("report-{0}.md" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 $peak = [math]::Round($peakRam / 1GB, 2)
 $duration = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
+$reasons = @(Get-ReasonCounts $text)
 
 $baselineRows = ''
 if ($Baseline) {
@@ -127,6 +147,15 @@ $content = @"
 The report contains counts, timings, memory, and the faulting RVA only. It does not copy game files,
 logs, screenshots, shader data, or other proprietary material.
 "@
+if ($reasons.Count) {
+    $content += "`n## Failures by reason`n`n$($reasons -join "`n")`n"
+}
+if ($samples.Count) {
+    $content += "`n## Timeline (3-second samples)`n`n| seconds | process RAM (GB) | free system RAM (GB) |`n|---:|---:|---:|`n"
+    foreach ($sample in $samples) {
+        $content += "| $($sample.seconds) | $($sample.process_ram_gb) | $($sample.free_system_gb) |`n"
+    }
+}
 if ($baselineRows) {
     $content += @"
 
