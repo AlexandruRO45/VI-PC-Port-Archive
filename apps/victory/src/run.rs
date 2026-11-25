@@ -56,7 +56,9 @@ fn start_warm_up(title_dir: &Path) {
     let title_dir = title_dir.to_owned();
     let thread = std::thread::Builder::new().name("victory-prebuild".to_owned()).spawn(move || {
         crate::translate::use_progress(false);
-        // The scoped workers spawn from here (below the title's threads).
+        // The workers the warm-up makes start below the title's threads
+        // too (Windows does not hand a thread's priority on to them).
+        crate::translate::warm_below_normal();
         // SAFETY: a plain adjustment of our own thread's scheduling.
         unsafe {
             use windows_sys::Win32::System::Threading::*;
