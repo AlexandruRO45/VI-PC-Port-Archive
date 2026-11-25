@@ -2421,23 +2421,68 @@ mod tests {
         let (mut image, mut upload_buf, mut dst_aligned, mut dst_packed, mut dst_crop) =
             (null, null, null, null, null);
         assert_eq!(
-            create_committed(null, &PROPERTIES, 0, &tex_desc, 0, null.cast(), iid, &mut image),
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &tex_desc,
+                0,
+                null.cast(),
+                iid,
+                &mut image
+            ),
             S_OK
         );
         assert_eq!(
-            create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut upload_buf),
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(1024),
+                0,
+                null.cast(),
+                iid,
+                &mut upload_buf
+            ),
             S_OK
         );
         assert_eq!(
-            create_committed(null, &PROPERTIES, 0, &buffer(2048), 0, null.cast(), iid, &mut dst_aligned),
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(2048),
+                0,
+                null.cast(),
+                iid,
+                &mut dst_aligned
+            ),
             S_OK
         );
         assert_eq!(
-            create_committed(null, &PROPERTIES, 0, &buffer(256), 0, null.cast(), iid, &mut dst_packed),
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(256),
+                0,
+                null.cast(),
+                iid,
+                &mut dst_packed
+            ),
             S_OK
         );
         assert_eq!(
-            create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut dst_crop),
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(1024),
+                0,
+                null.cast(),
+                iid,
+                &mut dst_crop
+            ),
             S_OK
         );
 
@@ -2496,8 +2541,15 @@ mod tests {
             kind: u32,
             footprint: PlacedFootprint,
         }
-        type Copy =
-            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const [u32; 6]);
+        type Copy = extern "system" fn(
+            This,
+            *const Location,
+            u32,
+            u32,
+            u32,
+            *const Location,
+            *const [u32; 6],
+        );
         let copy = slot::<Copy>(list, 0x80);
 
         let full_rows = PlacedFootprint {
@@ -2511,7 +2563,10 @@ mod tests {
         let tex_loc = Location {
             resource: image,
             kind: 0,
-            footprint: PlacedFootprint { offset: 0, ..full_rows },
+            footprint: PlacedFootprint {
+                offset: 0,
+                ..full_rows
+            },
         };
         let up_loc = Location {
             resource: upload_buf,
@@ -2578,35 +2633,49 @@ mod tests {
             (full_rows, 1, 0, Some(crop_box)),
             (larger, 1, 1, None),
         ]
-        .map(
-            |(footprint, x, y, region)| {
-                let size = u64::from(footprint.row_pitch) * u64::from(footprint.height);
-                let mut output = null;
-                assert_eq!(
-                    create_committed(
-                        null, &PROPERTIES, 0, &buffer(size), 0, null.cast(), iid, &mut output,
-                    ),
-                    S_OK
-                );
-                let (data, len) = buffer_bytes(output).unwrap();
-                // SAFETY: fill this mapped destination before the GPU copy.
-                unsafe { data.write_bytes(0xa5, len as usize) };
-                let dst = Location {
-                    resource: output,
-                    kind: 1,
-                    footprint,
-                };
-                let src_box = region.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
-                copy(list, &dst, x, y, 0, &tex_loc, src_box);
-                (output, footprint, x, y, region)
-            },
-        );
+        .map(|(footprint, x, y, region)| {
+            let size = u64::from(footprint.row_pitch) * u64::from(footprint.height);
+            let mut output = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &buffer(size),
+                    0,
+                    null.cast(),
+                    iid,
+                    &mut output,
+                ),
+                S_OK
+            );
+            let (data, len) = buffer_bytes(output).unwrap();
+            // SAFETY: fill this mapped destination before the GPU copy.
+            unsafe { data.write_bytes(0xa5, len as usize) };
+            let dst = Location {
+                resource: output,
+                kind: 1,
+                footprint,
+            };
+            let src_box = region.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
+            copy(list, &dst, x, y, 0, &tex_loc, src_box);
+            (output, footprint, x, y, region)
+        });
 
         // 5) Console formats 118..=120 (3 B/texel) map to 4-byte PC formats
         // (45..=47): skipped cleanly without breaking Close() or touching dst.
         let mut dst_d16s8 = null;
         assert_eq!(
-            create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut dst_d16s8),
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(1024),
+                0,
+                null.cast(),
+                iid,
+                &mut dst_d16s8
+            ),
             S_OK
         );
         let d16s8_loc = Location {
@@ -2626,19 +2695,39 @@ mod tests {
         let committed = |desc: &ResourceDesc| {
             let mut resource = null;
             assert_eq!(
-                create_committed(null, &PROPERTIES, 0, desc, 0, null.cast(), iid, &mut resource),
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    desc,
+                    0,
+                    null.cast(),
+                    iid,
+                    &mut resource
+                ),
                 S_OK
             );
             resource
         };
         let read_back = |source| {
             let output = committed(&buffer(1024));
-            let from = Location { resource: source, kind: 0, footprint: full_rows };
-            let to = Location { resource: output, kind: 1, footprint: full_rows };
+            let from = Location {
+                resource: source,
+                kind: 0,
+                footprint: full_rows,
+            };
+            let to = Location {
+                resource: output,
+                kind: 1,
+                footprint: full_rows,
+            };
             copy(list, &to, 0, 0, 0, &from, std::ptr::null());
             output
         };
-        let cpu_desc = ResourceDesc { layout: 1, ..tex_desc };
+        let cpu_desc = ResourceDesc {
+            layout: 1,
+            ..tex_desc
+        };
         let cpu_source = committed(&cpu_desc);
         let (cpu_data, _) = texture_memory(cpu_source).unwrap();
         let cpu_size = texture_layout(&cpu_desc).unwrap().size;
@@ -2660,27 +2749,44 @@ mod tests {
         slot::<ClearRtv>(list, 0x1a0)(list, handle, &clear_color, 0, std::ptr::null());
         let target_result = read_back(target);
 
-        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
 
         // Verify 256-aligned readback at offset 256 (leading 256 bytes untouched).
         let (al_ptr, _) = buffer_bytes(dst_aligned).unwrap();
         // SAFETY: dst_aligned holds 2048 bytes.
         let al = unsafe { std::slice::from_raw_parts(al_ptr, 2048) };
-        assert!(al[..256].iter().all(|&b| b == 0), "bytes before offset touched");
+        assert!(
+            al[..256].iter().all(|&b| b == 0),
+            "bytes before offset touched"
+        );
         for row in 0..4 {
             let at = 256 + row * 256;
-            assert_eq!(al[at..at + 16], up[row * 256..row * 256 + 16], "aligned row {row}");
+            assert_eq!(
+                al[at..at + 16],
+                up[row * 256..row * 256 + 16],
+                "aligned row {row}"
+            );
         }
 
         // Verify unaligned packed readback (row_pitch 16, offset 32).
         let (pk_ptr, _) = buffer_bytes(dst_packed).unwrap();
         // SAFETY: dst_packed holds 256 bytes.
         let pk = unsafe { std::slice::from_raw_parts(pk_ptr, 256) };
-        assert!(pk[..32].iter().all(|&b| b == 0), "bytes before packed offset touched");
+        assert!(
+            pk[..32].iter().all(|&b| b == 0),
+            "bytes before packed offset touched"
+        );
         for row in 0..4 {
             let at = 32 + row * 16;
-            assert_eq!(pk[at..at + 16], up[row * 256..row * 256 + 16], "packed row {row}");
+            assert_eq!(
+                pk[at..at + 16],
+                up[row * 256..row * 256 + 16],
+                "packed row {row}"
+            );
         }
 
         // Verify 2x2 sub-box crop from (1, 1)..(3, 3).
@@ -2690,14 +2796,21 @@ mod tests {
         for row in 0..2 {
             let src_at = (row + 1) * 256 + 4; // x=1, y=row+1
             let dst_at = row * 256;
-            assert_eq!(cr[dst_at..dst_at + 8], up[src_at..src_at + 8], "crop row {row}");
+            assert_eq!(
+                cr[dst_at..dst_at + 8],
+                up[src_at..src_at + 8],
+                "crop row {row}"
+            );
         }
 
         // Verify skipped 118..=120 readback left its buffer untouched.
         let (d16_ptr, _) = buffer_bytes(dst_d16s8).unwrap();
         // SAFETY: dst_d16s8 holds 1024 bytes.
         let d16 = unsafe { std::slice::from_raw_parts(d16_ptr, 1024) };
-        assert!(d16.iter().all(|&b| b == 0), "mismatched format 118 buffer touched");
+        assert!(
+            d16.iter().all(|&b| b == 0),
+            "mismatched format 118 buffer touched"
+        );
 
         for (output, footprint, dst_x, dst_y, region) in partials {
             let [left, top, _, right, bottom, _] = region.unwrap_or([0, 0, 0, 4, 4, 1]);
@@ -2716,7 +2829,8 @@ mod tests {
                         &[0xa5; 4]
                     };
                     assert_eq!(
-                        &pixels[at..at + 4], expected,
+                        &pixels[at..at + 4],
+                        expected,
                         "pixel ({x}, {y}) in {footprint:?}"
                     );
                 }
@@ -2725,7 +2839,11 @@ mod tests {
 
         for (output, expected, label) in [
             (cpu_result, [0x5a; 4], "CPU-written linear texture"),
-            (target_result, [255, 0, 255, 255], "GPU-cleared linear render target"),
+            (
+                target_result,
+                [255, 0, 255, 255],
+                "GPU-cleared linear render target",
+            ),
         ] {
             let (data, len) = buffer_bytes(output).unwrap();
             // SAFETY: the queue submission completed and this buffer is live.
