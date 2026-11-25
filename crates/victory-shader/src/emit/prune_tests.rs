@@ -2,6 +2,9 @@
 //! (`emit_without_dead_branches`): the programs below, emitted with and
 //! without, give the same results on the default adapter (skipped without
 //! one, and off Windows), and what is left as it is stays as it was.
+//! What pruning changes is compared with the clean-up passes off
+//! ([`as_lowered`]), so those programs are validated and run in that form;
+//! one program checks with them on that pruning still changes the module.
 
 #[cfg(windows)]
 use super::host::{Dispatch, Host, Root, View};
@@ -75,6 +78,21 @@ const CONTAINER: crate::Container = crate::Container {
     version: (1, 0),
     parts: vec![],
 };
+
+/// `f` with the clean-up passes off on this thread: the module as the
+/// lowering made it. The passes fold a branch on a constant and drop what
+/// it no longer reaches, so on a program this small both forms can end the
+/// same.
+fn as_lowered<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<u32>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::PASSES_HERE.with(|p| p.set(self.0));
+        }
+    }
+    let _restore = Restore(super::PASSES_HERE.with(|p| p.replace(Some(0))));
+    f()
+}
 
 /// The program as [`super::emit`] emits it, and as it is (no branch left
 /// out).
@@ -152,7 +170,7 @@ const ONE_WAY: [u32; 6] = [
 fn a_branch_no_lane_takes_one_way_of_is_left_out() {
     let native = program(&ONE_WAY);
     assert_eq!(stages(&native).st.one_way().len(), 1);
-    let (pruned, plain) = both(&native, ALL_WAVES);
+    let (pruned, plain) = as_lowered(|| both(&native, ALL_WAVES));
     assert!(
         pruned.dxil.len() < plain.dxil.len(),
         "{} bytes pruned, {} as it is",
@@ -194,7 +212,7 @@ fn a_loop_stopped_at_the_iteration_limit_leaves_through_its_exit() {
     // Both branches are one way; only the first is left out.
     assert_eq!(s.st.one_way().len(), 2);
     assert!(s.st.one_way().iter().any(|&(b, _)| b == latch));
-    let (pruned, plain) = both(&native, ALL_WAVES);
+    let (pruned, plain) = as_lowered(|| both(&native, ALL_WAVES));
     assert!(pruned.dxil != plain.dxil, "not pruned");
     validate(&pruned);
     let Some((a, b)) = runs(&plain, &pruned) else {
@@ -340,18 +358,62 @@ fn a_program_that_lowers_only_threaded_is_emitted_threaded_not_pruned() {
         "{:?}",
         unthreaded.map(|_| ())
     );
-    let threaded = super::emit_threaded(
-        &CONTAINER, &native, &s.p, &s.st, &s.io, &s.res, ALL_WAVES, true,
-    )
-    .unwrap();
-    let emitted = super::emit(&CONTAINER, &native, &s.p, &s.st, &s.io, &s.res, ALL_WAVES).unwrap();
+    let (threaded, emitted, pruned) = as_lowered(|| {
+        let threaded = super::emit_threaded(
+            &CONTAINER, &native, &s.p, &s.st, &s.io, &s.res, ALL_WAVES, true,
+        )
+        .unwrap();
+        let emitted =
+            super::emit(&CONTAINER, &native, &s.p, &s.st, &s.io, &s.res, ALL_WAVES).unwrap();
+        // Without the check, `emit` would have given the pruned form.
+        let pruned = super::emit_without_dead_branches(
+            &CONTAINER, &native, &s.p, &s.st, &s.io, &s.res, ALL_WAVES,
+        )
+        .expect("not pruned");
+        (threaded, emitted, pruned)
+    });
     assert!(emitted == threaded, "pruned");
-    // Without the check, `emit` would have given the pruned form.
-    let pruned = super::emit_without_dead_branches(
-        &CONTAINER, &native, &s.p, &s.st, &s.io, &s.res, ALL_WAVES,
-    )
-    .expect("not pruned");
     assert!(pruned.dxil != threaded.dxil, "pruned as it is");
     validate(&emitted);
     validate(&pruned);
+}
+
+/// With the clean-up passes on, as shipped: a scalar from the group's x
+/// set on both ways of a branch no lane takes one way of. As it is, the
+/// join ranks each lane's way and takes the scalar from the lanes of the
+/// highest rank with wave operations, which the passes keep even once the
+/// branch is folded (the scalar is not a constant); pruned, the join has
+/// one way and none of that.
+#[test]
+fn pruning_still_changes_the_module_the_clean_up_passes_leave() {
+    let mut native = program(&[
+        0xBE88_037E, // s_mov_b32 s8, exec_lo
+        0x876A_087E, // s_and_b32 vcc_lo, exec_lo, s8
+        0xBF86_0002, // s_cbranch_vccz dead
+        0x8009_8101, // s_add_u32 s9, s1, 1
+        0xBF82_0001, // s_branch join
+        0x8009_8201, // dead: s_add_u32 s9, s1, 2
+        0x4A04_0009, // join: v_add_nc_u32 v2, s9, v0
+    ]);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 1 << 1 | 1 << 7, // the UAV table, then the group's x in s1
+        threads: [32, 1, 1],
+    });
+    assert_eq!(stages(&native).st.one_way().len(), 1);
+    let (pruned, plain) = both(&native, ALL_WAVES);
+    assert!(
+        pruned.dxil.len() < plain.dxil.len(),
+        "{} bytes pruned, {} as it is (depends on what the clean-up passes remove)",
+        pruned.dxil.len(),
+        plain.dxil.len()
+    );
+    validate(&pruned);
+    validate(&plain);
+    let Some((a, b)) = runs(&plain, &pruned) else {
+        return;
+    };
+    // One group: s1 is 0.
+    let want: Vec<u32> = (1..=32).collect();
+    assert_eq!(a, want);
+    assert_eq!(b, want);
 }

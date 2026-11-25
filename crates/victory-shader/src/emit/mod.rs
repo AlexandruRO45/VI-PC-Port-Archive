@@ -116,6 +116,8 @@ mod wave;
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
+#[cfg(test)]
+use std::cell::Cell;
 
 pub use rectangle::rectangle_geometry;
 pub use sampler::StaticSampler;
@@ -158,8 +160,18 @@ pub fn loop_limit() -> u32 {
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
+    #[cfg(test)]
+    if let Some(passes) = PASSES_HERE.with(Cell::get) {
+        return passes;
+    }
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The passes [`shader_opt`] gives on this thread instead (tests).
+    pub(crate) static PASSES_HERE: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
