@@ -272,6 +272,10 @@ impl Module {
     pub fn int_const(&mut self, ty: Ty, v: i64) -> V {
         self.constant(ty, Const::Int(v))
     }
+    pub fn i64(&mut self, v: u64) -> V {
+        let t = self.int(64);
+        self.int_const(t, v as i64)
+    }
     pub fn i32(&mut self, v: u32) -> V {
         let t = self.int(32);
         self.int_const(t, i64::from(v as i32))

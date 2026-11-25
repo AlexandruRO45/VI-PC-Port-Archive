@@ -248,6 +248,10 @@ fn program(body: &[u32], scalar: bool) -> Vec<u32> {
 /// bytes of LDS; one view table at s4 (the input buffer, then the output
 /// UAV), the group id in s6.
 fn lower_program(words: &[u32]) -> Result<HostShader, String> {
+    lower_program_with(words, false)
+}
+
+fn lower_program_with(words: &[u32], emulate_fma: bool) -> Result<HostShader, String> {
     let used = |kind, table_offset_dwords| UsedResource {
         kind,
         root: RootType::Table,
@@ -293,6 +297,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        emulate_fma,
     })
     .map_err(e)?;
     Ok(HostShader {
@@ -874,7 +879,19 @@ fn mul_legacy(a: u32, b: u32) -> u32 {
 }
 
 fn fma(a: u32, b: u32, c: u32) -> u32 {
-    out64(d(a).mul_add(d(b), d(c)))
+    let (a, b, c) = (d(a), d(b), d(c));
+    let p = a * b;
+    let s = p + c;
+    let ap = s - c;
+    let bp = s - ap;
+    let t = (p - ap) + (c - bp);
+    let bits = s.to_bits();
+    let r = if s.is_finite() && (bits & 1) == 0 && t != 0.0 {
+        f64::from_bits(if (s > 0.0) == (t > 0.0) { bits + 1 } else { bits - 1 })
+    } else {
+        s
+    };
+    out64(r)
 }
 
 /// `v_mad_f32`: the product rounded (and flushed) before the add.
@@ -2871,7 +2888,29 @@ fn f16_results_round_as_the_mode_says() {
 fn hosts_that_do_not_fuse_are_named() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if let Ok(warp) = Host::new(true) {
-        assert_eq!(warp.fuses_fmad(), Ok(true), "WARP");
+        assert_eq!(warp.fuses_fmad(), Ok(false), "WARP");
+        let mut p = vec![probe(
+            vop3(0x14B, 5, [v(1), v(2), v(3)], M::default()),
+            vec![
+                [0x3F80_0001, 0x3F7F_FFFF, 0x2800_0001, 0],
+                [0x0080_0000, 0x0080_0000, 0x0000_0000, 0],
+                [0x0080_0000, 0x0080_0000, 0x8000_0000, 0],
+                [0x8080_0000, 0x3F7F_FFFF, 0x0000_0000, 0],
+            ],
+            Kind::F32 { ulps: 0, any_zero: false },
+            |i| vec![fma(i[0], i[1], i[2])],
+        )];
+        p.extend(defective(arithmetic_probes(), FMA));
+        p.extend(defective(mix_probes(), FMA));
+        for probe in &p {
+            let shader = lower_program_with(&program(&probe.body, probe.scalar), true)
+                .expect("emulated fma lowers");
+            let got = run(&warp, &shader, &probe.inputs, probe.scalar).expect("runs on warp");
+            for (i, &inp) in probe.inputs.iter().enumerate() {
+                let want = (probe.model.as_ref().unwrap())(inp);
+                assert!(same(probe.kind, want[0], got[i][0]), "in {:08x?}: want {:08x?}, got {:08x?}", inp, want[0], got[i][0]);
+            }
+        }
     }
     if let Ok(hardware) = Host::new(false) {
         let fuses = hardware.fuses_fmad().expect("the check runs");

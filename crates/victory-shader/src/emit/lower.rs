@@ -81,6 +81,8 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
+    /// Emulates fused `f32` multiply-add in `f64` on unfused hosts.
+    pub emulate_fma: bool,
 }
 
 enum Stop {
@@ -2181,24 +2183,57 @@ impl<'a> Lower<'a> {
     }
 
     fn fma32(&mut self, a: V, b: V, c: V) -> V {
+        if !self.x.emulate_fma {
+            return self.fmad(a, b, c);
+        }
         self.s.flags |= flags::DOUBLES;
         let cur = self.cur;
         let f64t = self.s.t.f64;
+        let i64t = self.s.m.int(64);
         let (a, b, c) = (self.ftz(a), self.ftz(b), self.ftz(c));
         let a = self.s.m.cast(cur, Cast::FpExt, a, f64t);
         let b = self.s.m.cast(cur, Cast::FpExt, b, f64t);
         let c = self.s.m.cast(cur, Cast::FpExt, c, f64t);
-        let prod = self.s.m.bin(cur, Bin::Mul, a, b);
-        let r64 = self.s.m.bin(cur, Bin::Add, prod, c);
-        let (pmin32, nmin32, pzero32, nzero32) = (
+        let p = self.s.m.bin(cur, Bin::Mul, a, b);
+        let s = self.s.m.bin(cur, Bin::Add, p, c);
+        let ap = self.s.m.bin(cur, Bin::Sub, s, c);
+        let bp = self.s.m.bin(cur, Bin::Sub, s, ap);
+        let da = self.s.m.bin(cur, Bin::Sub, p, ap);
+        let db = self.s.m.bin(cur, Bin::Sub, c, bp);
+        let t = self.s.m.bin(cur, Bin::Add, da, db);
+        let (pmin32, nmin32, pzero32) = (
             self.s.m.f32(0x0080_0000),
             self.s.m.f32(0x8080_0000),
             self.s.m.f32(0),
-            self.s.m.f32(0x8000_0000),
         );
+        let zero64 = self.s.m.cast(cur, Cast::FpExt, pzero32, f64t);
+        let s_bits = self.s.m.cast(cur, Cast::Bitcast, s, i64t);
+        let (exp_mask, one64, zero64_i) = (
+            self.s.m.i64(0x7ff0_0000_0000_0000),
+            self.s.m.i64(1),
+            self.s.m.i64(0),
+        );
+        let s_exp = self.s.m.bin(cur, Bin::And, s_bits, exp_mask);
+        let finite = self.s.m.cmp(cur, pred::NE, s_exp, exp_mask);
+        let s_lsb = self.s.m.bin(cur, Bin::And, s_bits, one64);
+        let is_even = self.s.m.cmp(cur, pred::EQ, s_lsb, zero64_i);
+        let t_gt = self.s.m.cmp(cur, pred::OGT, t, zero64);
+        let t_lt = self.s.m.cmp(cur, pred::OLT, t, zero64);
+        let t_nz = self.s.m.bin(cur, Bin::Or, t_gt, t_lt);
+        let adj = self.s.m.bin(cur, Bin::And, finite, is_even);
+        let adj = self.s.m.bin(cur, Bin::And, adj, t_nz);
+        let s_gt = self.s.m.cmp(cur, pred::OGT, s, zero64);
+        let s_lt = self.s.m.cmp(cur, pred::OLT, s, zero64);
+        let both_pos = self.s.m.bin(cur, Bin::And, s_gt, t_gt);
+        let both_neg = self.s.m.bin(cur, Bin::And, s_lt, t_lt);
+        let same_sign = self.s.m.bin(cur, Bin::Or, both_pos, both_neg);
+        let s_inc = self.s.m.bin(cur, Bin::Add, s_bits, one64);
+        let s_dec = self.s.m.bin(cur, Bin::Sub, s_bits, one64);
+        let s_odd = self.s.m.select(cur, same_sign, s_inc, s_dec);
+        let r_bits = self.s.m.select(cur, adj, s_odd, s_bits);
+        let r64 = self.s.m.cast(cur, Cast::Bitcast, r_bits, f64t);
         let pos_min = self.s.m.cast(cur, Cast::FpExt, pmin32, f64t);
         let neg_min = self.s.m.cast(cur, Cast::FpExt, nmin32, f64t);
-        let zero64 = self.s.m.cast(cur, Cast::FpExt, pzero32, f64t);
         let lt_pos = self.s.m.cmp(cur, pred::OLT, r64, pos_min);
         let gt_zero = self.s.m.cmp(cur, pred::OGT, r64, zero64);
         let pos_tiny = self.s.m.bin(cur, Bin::And, lt_pos, gt_zero);
@@ -2206,8 +2241,9 @@ impl<'a> Lower<'a> {
         let lt_zero = self.s.m.cmp(cur, pred::OLT, r64, zero64);
         let neg_tiny = self.s.m.bin(cur, Bin::And, gt_neg, lt_zero);
         let tiny = self.s.m.bin(cur, Bin::Or, pos_tiny, neg_tiny);
-        let is_neg = self.s.m.cmp(cur, pred::OLT, r64, zero64);
-        let signed_zero = self.s.m.select(cur, is_neg, nzero32, pzero32);
+        let (nzero_i32, pzero_i32) = (self.s.m.i32(0x8000_0000), self.s.m.i32(0));
+        let zero_bits = self.s.m.select(cur, lt_zero, nzero_i32, pzero_i32);
+        let signed_zero = self.as_float(zero_bits);
         let trunc = self.s.m.cast(cur, Cast::FpTrunc, r64, self.s.t.f32);
         let r = self.s.m.select(cur, tiny, signed_zero, trunc);
         self.ftz(r)
@@ -10621,6 +10657,7 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
+            emulate_fma: false,
             native: &native,
             p: &p,
             st: &st,
@@ -10672,6 +10709,7 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
         let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
+            emulate_fma: false,
             native: &native,
             p: &p,
             st: &st,
@@ -10862,6 +10900,7 @@ mod tests {
         let io = io::raise(&p, &native).unwrap();
 
         let emitted = lower(&Parts {
+            emulate_fma: false,
             native: &native,
             p: &p,
             st: &st,

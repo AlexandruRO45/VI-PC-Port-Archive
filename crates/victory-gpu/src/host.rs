@@ -231,10 +231,13 @@ fn create() -> windows::core::Result<Host> {
         })
         .fuses_fmad()
         {
-            Ok(true) => {}
-            Ok(false) => tracing::warn!(
-                "the host GPU does not fuse multiply-adds: results of the console's fused v_fma and v_fmac can differ in kind here"
-            ),
+            Ok(true) => crate::shader_cache::set_emulate_fma(false),
+            Ok(false) => {
+                crate::shader_cache::set_emulate_fma(true);
+                tracing::warn!(
+                    "the host GPU does not fuse multiply-adds: emulating fused f32 multiply-add in f64"
+                );
+            }
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
         Ok(Host {
