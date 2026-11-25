@@ -1023,6 +1023,25 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // A texture flagged unordered-access must have a format an unordered
+    // view can take, itself or — where enhanced-barrier creation carries a
+    // cast list — by cast: AMD tolerates the flag on one that cannot
+    // (B5G5R5A1, B5G6R5, B4G4R4A4 and like elements), NVIDIA removes the
+    // device for it at GetResourceAllocationInfo. Drop the flag, as a
+    // depth target's above — an unordered view of it still will not make.
+    if d.flags & UNORDERED != 0 {
+        use windows::Win32::Graphics::Direct3D12::ID3D12Device10;
+        use windows::core::Interface;
+        let castable_uav = d.flags & DEPTH == 0
+            && crate::host::host()
+                .is_some_and(|h| h.device.cast::<ID3D12Device10>().is_ok())
+            && castable(d.format)
+                .into_iter()
+                .any(crate::descriptor::host::typed_store);
+        if !crate::descriptor::host::typed_store(d.format) && !castable_uav {
+            d.flags &= !UNORDERED;
+        }
+    }
     Some(d)
 }
 
@@ -1866,6 +1885,40 @@ mod tests {
         // Boundaries: 59 belongs to the preceding family, 66 is unmapped.
         assert_eq!(family(59), 53);
         assert_eq!(family(66), 66);
+    }
+
+    /// An unordered-access flag on a texture whose format no unordered
+    /// view can take — itself or, where creation carries a cast list, a
+    /// castable one — is refused by the host (NVIDIA removes the device at
+    /// `GetResourceAllocationInfo` for B5G5R5A1), so it is dropped.
+    #[test]
+    fn unordered_needs_a_format_unordered_views_take() {
+        // 86 B5G5R5A1_UNORM and 85 B5G6R5_UNORM: UAV-capable on no host.
+        for format in [86, 85] {
+            let d = ResourceDesc {
+                flags: UNORDERED,
+                ..texture(64, 64, format, 1)
+            };
+            assert_eq!(host_desc(&d).unwrap().flags & UNORDERED, 0, "format {format}");
+        }
+        // With a host: a UAV-capable format keeps the flag (28
+        // R8G8B8A8_UNORM is store-capable on every feature level), and a
+        // typeless one (27) keeps it only where the cast list can reach
+        // that format — else the flag is as illegal as on 86.
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let d = ResourceDesc {
+            flags: UNORDERED,
+            ..texture(64, 64, 28, 1)
+        };
+        assert_eq!(host_desc(&d).unwrap().flags & UNORDERED, UNORDERED);
+        let d = ResourceDesc { format: 27, ..d };
+        use windows::Win32::Graphics::Direct3D12::ID3D12Device10;
+        use windows::core::Interface;
+        let enhanced = host.device.cast::<ID3D12Device10>().is_ok();
+        let kept = host_desc(&d).unwrap().flags & UNORDERED != 0;
+        assert_eq!(kept, enhanced, "a typeless UAV flag needs the cast list");
     }
 
     type Release = extern "system" fn(This) -> u32;
