@@ -2639,6 +2639,22 @@ fn scalar_probes() -> Vec<Probe> {
             (r, Some(r != 0))
         }),
     ];
+    // s_bitset{0,1}_b32 change one bit of the destination's old value: the
+    // bit index is the low five bits of the source.
+    for (op, set) in [(0x1Bu16, false), (0x1D, true)] {
+        p.push(scalar(
+            [
+                sop1(0x03, 20, s(16)),
+                sop1(op, 20, s(17)),
+                vop1(0x01, 5, s(20)),
+            ],
+            pairs(&U32_EDGES[..24], &[0, 1, 16, 31, 32, 33, 0xFFFF_FFE1]),
+            move |i| {
+                let bit = 1u32 << (i[1] & 31);
+                vec![if set { i[0] | bit } else { i[0] & !bit }]
+            },
+        ));
+    }
     let bfe_u: fn(u32, u32) -> (u32, Option<bool>) = |a, b| {
         let (o, w) = (b & 31, b >> 16 & 0x7F);
         let x = a >> o;
