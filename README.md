@@ -33,7 +33,7 @@ Chapter 1 City produced in-range ray and triangle intersections on an RX 7900 XT
 
 ## Community gameplay results
 
-- Ryzen 7 5700X3D + Radeon RX 7800 XT 16 GB (driver 32.0.32029.2010), Windows 11, Series X profile, default renderer (no ray tracing): about 10 FPS in the world (2026-11-26, one machine).
+- Ryzen 7 5700X3D + Radeon RX 7800 XT 16 GB (driver 32.0.32029.2010), Windows 11, Series X profile, no ray tracing: about 10 FPS in the world with this branch's opt-in switches enabled (in-place copies, a second copy-queue pair, pooled staging, parallel refresh and copy-back, 1920x1080 present; 2026-11-26, one machine).
 <img width="1818" height="1020" alt="image" src="https://github.com/user-attachments/assets/a09d6b74-6e5b-43eb-a0ff-91b88a158903" />
 
 ## Changes in this snapshot
