@@ -185,6 +185,62 @@ def archive_request(archive, source, inputs):
 # about 18 s at -O0, so a 15 s cap refused it on every boot.
 O0_TIMEOUT = 90
 
+# A translator rebuild moves requests to a new runtime/<fingerprint> directory,
+# but most programs emit the same HLSL as before. DXIL is shared across those
+# directories under runtime/dxil/<DXC and DXV fingerprint>, keyed by the
+# emitted HLSL and its compiler profile. Bump DXIL_POLICY whenever the DXC
+# arguments chosen in compile_dxil change for a given profile.
+DXIL_POLICY = b"tuxbox-dxil-1"
+DXIL_STORE_ID = "dxil-id"
+
+
+def dxil_store(cache):
+    """The shared DXIL directory pinned for this cache, or None without one."""
+    try:
+        ident = (cache / DXIL_STORE_ID).read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not re.fullmatch(SOURCE_KEY, ident):
+        return None
+    store = cache.parent / "dxil" / ident
+    return store if store.is_dir() else None
+
+
+def hlsl_key(target, hlsl):
+    key = hashlib.sha256(DXIL_POLICY + b"\0" + target.encode("ascii") + b"\0")
+    key.update(hlsl.read_bytes())
+    return key.hexdigest()
+
+
+def publish_dxil(store, key, data, work):
+    """Share validated DXIL. The store only saves work, so failures are ignored."""
+    entry = store / (key + ".cso")
+    try:
+        shared, stamp = work / "shared.cso", work / "shared.sha256"
+        shared.write_bytes(data)
+        stamp.write_text(hashlib.sha256(data).hexdigest())
+        # Same order as the runtime cache: readers recheck the bytes they copied.
+        os.replace(shared, entry)
+        os.replace(stamp, entry.with_suffix(".sha256"))
+    except OSError:
+        pass
+
+
+def compile_dxil(dxc, target, hlsl, output):
+    entry = [] if target == "lib_6_3" else ["-E", "main"]
+    # cs_6_6 programs from this boot either finish default optimisation in
+    # under a second or sit in it until the cap. The ones that sit there
+    # compile at -O0 in a few seconds, and the driver optimises that DXIL
+    # again when it builds the pipeline.
+    if target == "cs_6_6":
+        run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=O0_TIMEOUT)
+    else:
+        try:
+            run_tool([dxc, "-T", target, *entry, "-Fo", output, hlsl], timeout=15)
+        except subprocess.TimeoutExpired:
+            output.unlink(missing_ok=True)
+            run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=O0_TIMEOUT)
+
 
 def compile_request(source, key, tools, cache, session, *, remember=None):
     linked = source.suffix == ".link"
@@ -272,23 +328,22 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
             target_stage = STAGE_IDS[target.split("_", 1)[0]]
             if target_stage not in stages:
                 raise ValueError("compiler profile differs from requested shader stage")
-            entry = [] if target == "lib_6_3" else ["-E", "main"]
-            # cs_6_6 programs from this boot either finish default optimisation in
-            # under a second or sit in it until the cap. The ones that sit there
-            # compile at -O0 in a few seconds, and the driver optimises that DXIL
-            # again when it builds the pipeline.
-            if target == "cs_6_6":
-                run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=O0_TIMEOUT)
+            store = dxil_store(cache)
+            dxil_key = hlsl_key(target, hlsl) if store is not None else None
+            data = None
+            if store is not None:
+                shared = store / (dxil_key + ".cso")
+                data = cache_snapshot(shared, shared.with_suffix(".sha256"), {target_stage})
+            if data is None:
+                compile_dxil(dxc, target, hlsl, output)
+                run_tool([dxv, output], timeout=10)
+                data = bounded_shader(output)
+                if portable_stage(data) != target_stage:
+                    raise ValueError("compiler returned invalid DXIL or a different shader stage")
+                if store is not None:
+                    publish_dxil(store, dxil_key, data, work)
             else:
-                try:
-                    run_tool([dxc, "-T", target, *entry, "-Fo", output, hlsl], timeout=15)
-                except subprocess.TimeoutExpired:
-                    output.unlink(missing_ok=True)
-                    run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=O0_TIMEOUT)
-            run_tool([dxv, output], timeout=10)
-            data = bounded_shader(output)
-            if portable_stage(data) != target_stage:
-                raise ValueError("compiler returned invalid DXIL or a different shader stage")
+                output.write_bytes(data)
             stamp = work / "sha256"
             stamp.write_text(hashlib.sha256(data).hexdigest())
             if session is not None:
@@ -357,6 +412,15 @@ def snapshot_compiler_cache(xshader, cache_root):
         fingerprint.update(bytes.fromhex(digest(Path(tool))))
     cache = cache_root / "runtime" / fingerprint.hexdigest()
     cache.mkdir(parents=True, exist_ok=True)
+    # DXIL depends on DXC and DXV only, so it survives translator rebuilds.
+    backend = hashlib.sha256(version)
+    for tool in (dxc, dxv):
+        backend.update(bytes.fromhex(digest(Path(tool))))
+    ident = backend.hexdigest()
+    (cache.parent / "dxil" / ident).mkdir(parents=True, exist_ok=True)
+    pending = cache / f"{DXIL_STORE_ID}.{os.getpid()}.tmp"
+    pending.write_text(ident, encoding="ascii")
+    pending.replace(cache / DXIL_STORE_ID)
     return tools, cache
 
 
