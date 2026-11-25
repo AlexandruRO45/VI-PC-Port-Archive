@@ -1580,7 +1580,8 @@ mod tests {
     }
 
     /// A title heap that hits `PORTABLE_VIEWS` keeps the full `DYNAMIC`
-    /// range (`2^18` slots) rather than shrinking to `MIN_DYNAMIC`.
+    /// range (`2^18` slots) rather than shrinking to `MIN_DYNAMIC`, while a
+    /// middle-range heap (`PORTABLE_VIEWS - MIN_DYNAMIC`) keeps every title slot.
     #[test]
     fn capped_heap_keeps_full_dynamic_range() {
         let Some(heap) = HostHeap::new(false, PORTABLE_VIEWS) else {
@@ -1588,5 +1589,12 @@ mod tests {
         };
         assert_eq!(heap.dynamic, DYNAMIC);
         assert!(heap.count + heap.dynamic >= PORTABLE_VIEWS);
+
+        let mid = PORTABLE_VIEWS - MIN_DYNAMIC;
+        let Some(mid_heap) = HostHeap::new(false, mid) else {
+            return; // no host GPU
+        };
+        assert_eq!(mid_heap.count, mid);
+        assert!(mid_heap.dynamic >= MIN_DYNAMIC);
     }
 }
