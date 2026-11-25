@@ -1,5 +1,6 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! (host slots 0-3), and a PlayStation pad (DualSense or DualShock 4) read straight from HID takes the first
+//! slot XInput leaves empty; while none is connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -8,6 +9,7 @@
 // would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ops::Deref;
@@ -16,6 +18,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
+
+mod playstation;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
@@ -113,6 +117,10 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// The vendor and product ids of the pad in `slot`, when known.
+    fn identity(&mut self, _slot: usize) -> Option<(u16, u16)> {
+        None
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -154,7 +162,8 @@ pub struct Device {
     vtable: &'static Table<21>,
     hub: *const Hub,
     index: usize,
-    info: DeviceInfo,
+    /// Written when a host pad connects (its vendor and product), read by the title.
+    info: UnsafeCell<DeviceInfo>,
 }
 
 /// What a device says about itself. The title reads `id` (+0x20); the rest
@@ -209,7 +218,18 @@ impl Device {
             vtable: &DEVICE,
             hub: std::ptr::null(),
             index,
-            info,
+            info: UnsafeCell::new(info),
+        }
+    }
+
+    /// Who made the host device behind this one (USB vendor and product ids);
+    /// a title picks its button glyphs by it.
+    fn set_identity(&self, vendor: u16, product: u16) {
+        // SAFETY: plain integer fields, written from the poll thread only.
+        unsafe {
+            let info = &mut *self.info.get();
+            info.vendor = vendor;
+            info.product = product;
         }
     }
 
@@ -404,6 +424,11 @@ impl Hub {
         let (pads, keys) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            for (slot, pad) in pads.iter().enumerate() {
+                if let (Some(_), Some((vendor, product))) = (pad, source.identity(slot)) {
+                    self.devices[slot].set_identity(vendor, product);
+                }
+            }
             (pads, source.keys())
         };
         let events = self.state().poll(&self.devices, pads, keys);
@@ -818,7 +843,10 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+            None => hub
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -845,7 +873,7 @@ extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRES
     }
     // SAFETY: checked non-null; the title passes a device id.
     let id = unsafe { &*id };
-    match hub(this).devices.iter().find(|d| d.info.id == *id) {
+    match hub(this).devices.iter().find(|d| unsafe { (*d.info.get()).id } == *id) {
         Some(device) => {
             // SAFETY: checked non-null.
             unsafe { out.write((device as *const Device).cast()) };
@@ -897,7 +925,7 @@ static INPUT: Table<22> = Table([
 
 extern "system" fn device_info(this: *const Device) -> *const DeviceInfo {
     // SAFETY: one of our devices.
-    unsafe { &(*this).info }
+    unsafe { (*this).info.get() }
 }
 extern "system" fn device_status(this: *const Device) -> u32 {
     // SAFETY: one of our devices.
@@ -1130,10 +1158,17 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// Vendor and product of each slot's pad, as of its last reading.
+        identities: [Option<(u16, u16)>; PADS],
     }
 
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+    /// Microsoft's id and the Xbox Series controller's: XInput does not say
+    /// which pad it is, and a title only needs to know it is an Xbox one.
+    const XBOX_IDENTITY: (u16, u16) = (0x045E, 0x0B12);
+
+    impl Host {
+        /// The XInput state of a slot, `None` while it is empty.
+        fn xinput(&mut self, slot: usize) -> Option<XINPUT_STATE> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1144,6 +1179,25 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
+            Some(state)
+        }
+    }
+
+    impl Source for Host {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            let Some(state) = self.xinput(slot) else {
+                // A PlayStation pad (over USB or Bluetooth) takes the first slot
+                // XInput leaves empty.
+                let first_free = (0..slot).all(|earlier| self.xinput(earlier).is_some());
+                if !first_free {
+                    self.identities[slot] = None;
+                    return None;
+                }
+                let (pad, identity) = super::playstation::connected_pad()?;
+                self.identities[slot] = Some(identity);
+                return Some(pad);
+            };
+            self.identities[slot] = Some(XBOX_IDENTITY);
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
             // The scripted keys (`VICTORY_KEYS`) also press the first
@@ -1153,7 +1207,9 @@ mod host {
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                    if let Some(&(_, button)) =
+                        super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk)
+                    {
                         pad.buttons |= button;
                     }
                 }
@@ -1186,6 +1242,10 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        fn identity(&mut self, slot: usize) -> Option<(u16, u16)> {
+            self.identities[slot]
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1283,6 +1343,7 @@ mod tests {
     #[derive(Default)]
     struct FakeHost {
         pads: [Option<PadState>; PADS],
+        identities: [Option<(u16, u16)>; PADS],
         keys: Vec<KeyState>,
         rumble: Vec<(usize, u16, u16)>,
     }
@@ -1298,6 +1359,9 @@ mod tests {
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
+        }
+        fn identity(&mut self, slot: usize) -> Option<(u16, u16)> {
+            self.0.lock().unwrap().identities[slot]
         }
     }
 
@@ -1488,6 +1552,22 @@ mod tests {
     }
 
     #[test]
+    fn a_connected_pad_tells_the_title_who_made_it() {
+        let (hub, host) = fake();
+        let device = &hub.devices[0];
+        // SAFETY: our device; plain integers.
+        let who = || unsafe { ((*device.info.get()).vendor, (*device.info.get()).product) };
+        assert_eq!(who(), (0, 0));
+        {
+            let mut host = host.lock().unwrap();
+            host.pads[0] = Some(PadState::default());
+            host.identities[0] = Some((0x054C, 0x0CE6));
+        }
+        hub.poll();
+        assert_eq!(who(), (0x054C, 0x0CE6));
+    }
+
+    #[test]
     fn keys_feed_the_keyboard_and_the_stand_in_pad() {
         let (hub, host) = fake();
         let log = Log::default();
@@ -1578,7 +1658,16 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                0,
+                context,
+                Some(slow),
+                &mut token
+            ),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());
@@ -1587,7 +1676,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
+        assert!(
+            !unregister(&hub.object, token, 5000),
+            "times out while it runs"
+        );
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);

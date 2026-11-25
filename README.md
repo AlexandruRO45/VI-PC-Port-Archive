@@ -38,9 +38,11 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 ```
 
 `scripts\play.ps1` keeps the shader cache and saves in folders you choose
-(`-Cache`, `-Data`) and presses no buttons for you. Controller: XInput pads
-(a DualShock/DualSense through DS4Windows works). With no pad connected the
-keyboard acts as one while the game window has focus.
+(`-Cache`, `-Data`) and presses no buttons for you. Controller: Xbox pads
+through XInput; a DualSense or DualShock 4 (USB or Bluetooth) is read directly,
+no DS4Windows or Steam Input needed, and takes the first slot XInput leaves
+empty. With no pad connected the keyboard acts as one while the game window
+has focus.
 
 ## Faster settings (optional, off by default)
 
