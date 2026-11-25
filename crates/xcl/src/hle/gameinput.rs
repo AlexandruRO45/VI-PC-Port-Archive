@@ -900,7 +900,8 @@ unsafe extern "system" fn register_reading_callback(_this: *mut Object, dev: *mu
     S_OK
 }
 
-fn dispatch_reading_callbacks(s: GamepadState) {
+/// Call the reading callbacks with `s`; `true` when at least one was called.
+fn dispatch_reading_callbacks(s: GamepadState) -> bool {
     let cbs: Vec<Arc<CallbackEntry>> = CALLBACKS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -908,6 +909,7 @@ fn dispatch_reading_callbacks(s: GamepadState) {
         .filter(|c| matches!(c.kind, CallbackKind::Reading { .. }))
         .cloned()
         .collect();
+    let mut called = false;
     for entry in cbs {
         let CallbackKind::Reading { ctx, cb } = entry.kind else { continue };
         let Some(_guard) = entry.try_enter() else { continue };
@@ -918,7 +920,9 @@ fn dispatch_reading_callbacks(s: GamepadState) {
             cb(entry.token, ctx as *mut c_void, r, false);
             reading_release(r);
         }
+        called = true;
     }
+    called
 }
 
 /// A thread that calls the reading callbacks when the gamepad's state changes.
@@ -931,16 +935,23 @@ fn start_poller() {
             loop {
                 std::thread::sleep(Duration::from_millis(4));
                 let s = poll_peek();
-                if s == last {
-                    continue;
+                if s != last {
+                    last = s;
+                    push_to_reading_callbacks(s);
                 }
-                last = s;
-                dispatch_reading_callbacks(s);
-                scripted_delivered();
-                note_first_presses(s.buttons);
             }
         });
     });
+}
+
+/// Hand a state from [`poll_peek`] to the title's reading callbacks. Only when one took it has
+/// the title seen it: with none registered (or all being unregistered), a press in it has not
+/// been read and must stay down for the next `GetCurrentReading`.
+fn push_to_reading_callbacks(s: GamepadState) {
+    if dispatch_reading_callbacks(s) {
+        scripted_delivered();
+        note_first_presses(s.buttons);
+    }
 }
 
 /// RegisterDeviceCallback(device, kind, status filter, enumeration kind, context, callback,
@@ -1506,6 +1517,37 @@ mod tests {
         // Must not fire again after self-unregister.
         dispatch_reading_callbacks(GamepadState { buttons: MENU, ..Default::default() });
         assert_eq!(ctx.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_press_due_after_the_last_reading_callback_is_unregistered_is_down_in_the_next_reading() {
+        // no other reading callback is registered meanwhile, so a push reaches none
+        let _serial = READING_CB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let gate = Arc::new(CallbackGate::new());
+        gate.release();
+        let g = input();
+        let mut token = 0u64;
+        unsafe {
+            assert_eq!(
+                register_reading_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0.0, Arc::as_ptr(&gate) as *mut c_void, Some(gated_reading_cb), &mut token),
+                S_OK
+            );
+        }
+        push_to_reading_callbacks(GamepadState { buttons: B, ..Default::default() });
+        assert_eq!(gate.calls.load(Ordering::Acquire), 1);
+        assert!(unsafe { unregister_callback(g, token, u64::MAX) });
+
+        // A is due and its 200 ms hold is over; the poller pushes it, but no callback takes it
+        let t = crate::log::uptime();
+        let saved = std::mem::replace(&mut *PRESS_LATCH.lock().unwrap_or_else(|e| e.into_inner()), PressLatch::new(vec![(t - 1.0, A)]));
+        let pushed = scripted(false);
+        push_to_reading_callbacks(GamepadState { buttons: pushed, ..Default::default() });
+        // the title's next GetCurrentReading
+        let read = scripted(true);
+        *PRESS_LATCH.lock().unwrap_or_else(|e| e.into_inner()) = saved;
+        assert_eq!(pushed, A);
+        assert_eq!(gate.calls.load(Ordering::Acquire), 1);
+        assert_eq!(read, A, "the press was let go before the title read it");
     }
 
     #[test]
