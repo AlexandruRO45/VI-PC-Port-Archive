@@ -4,6 +4,8 @@
 
 use std::ffi::{c_char, c_void};
 
+use super::xasync::{E_INVALIDARG, E_NOT_SUFFICIENT_BUFFER};
+use super::xgameruntime::S_OK;
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, put, text,
 };
@@ -127,10 +129,70 @@ fn last_error() -> HRESULT {
     (0x8007_0000 | (code & 0xffff)) as i32
 }
 
-// shortcut: screenshots fail as if capture were unavailable. Taking one needs
-// a hook in the GPU side: the last presented frame read back as BGRA8 (size,
-// row pitch, bytes) on request, e.g. `victory_gpu::last_frame() ->
-// Option<Frame>`, copied from the back buffer after `PresentX`.
+/// The title's screenshot: the next frame presented after this call, in
+/// BGRA8, written to the buffer it passes.
+///
+/// `result` describes where the bytes go. Its layout as the title (2026)
+/// passes it: `{ width: u32, height: u32, pitch: u32, _pad: u32,
+/// bytes: *mut u8, capacity: usize }`, and the call fills in `width`,
+/// `height`, `pitch` and `bytes` before returning. Anything else is refused
+/// rather than guessed at.
+#[cfg(windows)]
+extern "system" fn take_screenshot(_: This, _user: *const c_void, result: *mut c_void) -> HRESULT {
+    if result.is_null() {
+        return E_INVALIDARG;
+    }
+    #[repr(C)]
+    struct Shot {
+        width: u32,
+        height: u32,
+        pitch: u32,
+        pad: u32,
+        bytes: *mut u8,
+        capacity: usize,
+    }
+    // SAFETY: the title passes room for these fields; read only.
+    let (bytes, capacity) = unsafe {
+        let shot = &*(result as *const Shot);
+        (shot.bytes, shot.capacity)
+    };
+    if bytes.is_null() {
+        return E_INVALIDARG;
+    }
+    // Ask for the next presented frame and wait for it. The present runs on
+    // the title's recording thread; this call is on whichever thread asked
+    // for the screenshot, so waiting does not block the frame it waits for.
+    victory_gpu::screenshot::ask();
+    let frame = match victory_gpu::screenshot::take_blocking(std::time::Duration::from_millis(2000))
+    {
+        Some(f) => f,
+        None => {
+            tracing::info!("screenshot not taken: no frame presented");
+            return NOT_SUPPORTED;
+        }
+    };
+    let needed = frame.pitch * frame.height as usize;
+    if capacity < needed {
+        return E_NOT_SUFFICIENT_BUFFER;
+    }
+    // SAFETY: the title's buffer holds `capacity` bytes, checked above.
+    unsafe {
+        std::ptr::copy_nonoverlapping(frame.bgra.as_ptr(), bytes, needed);
+        let shot = &mut *(result as *mut Shot);
+        shot.width = frame.width;
+        shot.height = frame.height;
+        shot.pitch = frame.pitch as u32;
+    }
+    tracing::info!(
+        width = frame.width,
+        height = frame.height,
+        "screenshot taken"
+    );
+    S_OK
+}
+
+/// Without a GPU-side screenshot the call says so, as before.
+#[cfg(not(windows))]
 extern "system" fn take_screenshot(_: This, _user: *const c_void, _result: *mut c_void) -> HRESULT {
     tracing::info!("screenshot not taken");
     NOT_SUPPORTED

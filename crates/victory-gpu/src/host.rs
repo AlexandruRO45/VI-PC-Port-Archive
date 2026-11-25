@@ -5912,12 +5912,14 @@ impl Host {
                 return None;
             };
             // Sent ahead ([`late_free_present`]) unless the frame is to be
-            // read back at once (a saved or listed frame): then a list of
-            // its own, one whose last flight has finished or a new one.
+            // read back at once (a saved or listed frame, or a screenshot
+            // the title asked for): then a list of its own, one whose last
+            // flight has finished or a new one.
+            let shot = crate::screenshot::wanted();
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let read_now = shot || crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
-            let read_now = false;
+            let read_now = shot;
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -5948,6 +5950,11 @@ impl Host {
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
                 .flatten();
+            // A screenshot the title asked for: its own read-back of this
+            // frame, whatever the diagnostics switches say.
+            let grabbed = shot
+                .then(|| crate::screenshot::read_back(&self.device, list, texture))
+                .flatten();
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
@@ -5971,6 +5978,9 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
+            }
+            if let Some((buffer, footprint)) = grabbed {
+                crate::screenshot::fill(&buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
