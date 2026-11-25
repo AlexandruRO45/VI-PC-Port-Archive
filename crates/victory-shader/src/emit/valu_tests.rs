@@ -1759,11 +1759,36 @@ fn packed_fmac_multiplies_the_dpp_selected_lane() {
     let dpp = 0x3C << 25 | 1 << 9 | 0xFA;
     let ext = 0xF << 28 | 0xF << 24 | 1 << 19 | 0x111 << 8 | 2;
     let shader = build_valu_cs(&[vop1(0x001, 2, vgpr(1)), vop1(0x001, 0, 0x80), dpp, ext]);
-    run_cases(
-        &shader,
-        &[[0x4000_4000, 0, 0, 0]],
-        |backend, _, _, got| {
-            assert_eq!(got, 0, "{backend}: the DPP source is lane 0's own zero");
-        },
-    );
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // WARP refuses a pipeline for this program ("The parameter is
+    // incorrect"); the hardware runs it and is the reference for DPP.
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .unwrap_or_else(|e| panic!("compute_pipeline failed: {e}"));
+    let inputs = [0x4000_4000u32, 0, 0, 0];
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = match (u.root, u.slot) {
+            (RootType::Constants, 0) => inputs[u.dword as usize],
+            (RootType::Table, 1) => 0,
+            other => panic!("unexpected user data {other:?}"),
+        };
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(1)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    assert_eq!(out[0][0], 0, "the DPP source is lane 0's bound-control zero");
 }
