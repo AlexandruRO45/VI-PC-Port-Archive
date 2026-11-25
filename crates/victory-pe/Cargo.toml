@@ -11,5 +11,10 @@ publish.workspace = true
 object.workspace = true
 thiserror.workspace = true
 
+[features]
+# A hand-built PE32+ image, for this crate's tests and for dependents
+# that need one (see `fixtures`). Carries no code in a normal build.
+fixtures = []
+
 [lints]
 workspace = true

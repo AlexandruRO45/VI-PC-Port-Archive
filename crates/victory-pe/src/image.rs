@@ -405,9 +405,10 @@ fn va_to_rva(va: u64, image_base: u64) -> Result<u32, PeError> {
 mod tests {
     use super::*;
 
-    /// The test binary itself is a real MSVC-linked PE32+ image.
+    /// A PE32+ image built here, so these tests do not depend on the
+    /// host the test binary was compiled for.
     fn own_image() -> Vec<u8> {
-        std::fs::read(std::env::current_exe().unwrap()).unwrap()
+        crate::fixtures::executable()
     }
 
     #[test]

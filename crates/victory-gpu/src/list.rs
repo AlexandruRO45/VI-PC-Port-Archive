@@ -1796,6 +1796,7 @@ impl ValueWait {
         met
     }
 
+    #[cfg(windows)]
     fn holds(&self) -> bool {
         let bytes = if self.wide { 8 } else { 4 };
         if self.address == 0 {
@@ -1813,6 +1814,14 @@ impl ValueWait {
             return true;
         }
         self.holds_for(u64::from_le_bytes(raw))
+    }
+
+    /// Title memory is mapped by the Windows host only. With nothing to
+    /// read, the wait reports met, as it already does whenever the value
+    /// cannot be read.
+    #[cfg(not(windows))]
+    fn holds(&self) -> bool {
+        true
     }
 
     /// Where the value waited for is: address and bytes.
