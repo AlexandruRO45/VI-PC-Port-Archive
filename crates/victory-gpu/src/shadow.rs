@@ -1817,6 +1817,7 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod merge_tests {
     use super::{PIECE, back_piece, changed_runs};
+    use super::{give_back, pooled, take_snapshots, SNAPS};
 
     /// A piece put back takes the GPU's bytes where the copy changed and
     /// the title's everywhere else, reads and writes title memory only from
