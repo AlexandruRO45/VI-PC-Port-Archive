@@ -482,16 +482,36 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res)) {
-        // Discarded lanes kept on as helpers can read what no surviving
-        // lane does (a register only killed lanes skipped writing); such a
-        // program kills them as the console does (`structure::killing`).
-        Err(_) if !st.discards.is_empty() => {
-            let st = structure::killing(p)?;
-            let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
-        }
-        l => l?,
+    // A discard in a loop whose lanes leave it only by being killed (the
+    // console's "no live lane is left" exit): kept on as helpers, they never
+    // leave, and every such lane runs the loop to its limit (a box of light
+    // volumes took 0.4 s a draw where the host's `discard` demotes, as
+    // vkd3d-proton's does). Such a program kills them as the console does,
+    // first; the helper form if that does not lower.
+    let looped = st.discards.keys().any(|&(b, _)| in_cycle(p, b));
+    let kill_st;
+    let kill_res;
+    let mut first = None;
+    if looped {
+        kill_st = structure::killing(p)?;
+        kill_res = resource::track(p, &native.layout, native.stage, Some(&kill_st))?;
+        first = lower::lower(&parts(&kill_st, &kill_res)).ok();
+    }
+    let kill_st2;
+    let kill_res2;
+    let l = match first {
+        Some(l) => l,
+        None => match lower::lower(&parts(st, res)) {
+            // Discarded lanes kept on as helpers can read what no surviving
+            // lane does (a register only killed lanes skipped writing); such
+            // a program kills them as the console does (`structure::killing`).
+            Err(_) if !st.discards.is_empty() && !looped => {
+                kill_st2 = structure::killing(p)?;
+                kill_res2 = resource::track(p, &native.layout, native.stage, Some(&kill_st2))?;
+                lower::lower(&parts(&kill_st2, &kill_res2))?
+            }
+            l => l?,
+        },
     };
     Ok(HostShader {
         stage: native.stage,
@@ -523,6 +543,21 @@ pub fn emit_with(
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
+/// Whether block `b` of `p` is in a loop: reachable again from its successors.
+fn in_cycle(p: &ir::Program, b: usize) -> bool {
+    let mut seen = vec![false; p.blocks.len()];
+    let mut stack = p.blocks[b].exit.successors();
+    while let Some(n) = stack.pop() {
+        if n == b {
+            return true;
+        }
+        if n < seen.len() && !std::mem::replace(&mut seen[n], true) {
+            stack.extend(p.blocks[n].exit.successors());
+        }
+    }
+    false
+}
+
 fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
