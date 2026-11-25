@@ -3236,6 +3236,88 @@ void main(uint3 id : SV_DispatchThreadID) {
         state.reset(null);
     }
 
+    /// A clear of one view on both sides of a cut of the list (a wait that
+    /// moves the recording on to a new host list): the new segment takes a
+    /// slot of its own, since its view heap is bound afresh, while the old
+    /// segment's slot stays held, as its commands still name it, until the
+    /// list is reset. Both segments run in order, and each read sees the
+    /// clear recorded before it in its own segment.
+    #[test]
+    fn a_clear_after_a_cut_takes_a_new_slot_and_the_old_one_stays_held() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const N: u32 = 16;
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let heap_host = crate::descriptor::heap(heap).host().expect("a host view heap");
+        // R32_UINT.
+        let textures: Vec<This> = (0..2)
+            .map(|_| texture_at_address(title_memory(1 << 20), &texture_words(N, N, 42, 0x105, 4)))
+            .collect();
+        let uav = View::Unordered(textures[0] as usize, 0, Some([42, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+        let slots = Slots::new(2);
+        for (i, &t) in textures.iter().enumerate() {
+            slots.make(i as u32, &View::Shader(t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0])));
+        }
+        let read = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2)), UAV(u1)"
+Texture2D<uint> a : register(t0);
+Texture2D<uint> b : register(t1);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    int3 at = int3(id.xy, 0);
+    o.Store2((id.y * 16 + id.x) * 8, uint2(a.Load(at), b.Load(at)));
+}
+"#,
+        );
+        let srv = |list: &HostList| {
+            for t in &textures {
+                let srv = View::Shader(*t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0]));
+                readable(list, &used(ResourceType::Srv), &srv, false);
+            }
+        };
+        let outs: Vec<_> = (0..2).map(|_| host.shared_buffer(u64::from(N * N) * 8).unwrap()).collect();
+        let free = heap_host.dynamic_free();
+        let (first, second) = (host.new_list().unwrap(), host.new_list().unwrap());
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        assert!(state.clear_view(&first, &uav, [0x11, 0, 0, 0], false, &[]));
+        assert!(state.clear_view(&first, &uav, [0x33, 0, 0, 0], false, &[]));
+        assert_eq!(heap_host.dynamic_free(), free - 1, "one slot before the cut");
+        srv(&first);
+        run(&first, &slots, &read, 0, Some(&outs[0].0), (N / 8, N / 8));
+        first.close();
+        state.cut(&second);
+        assert_eq!(heap_host.dynamic_free(), free - 1, "the cut gives no slot back");
+        assert!(state.clear_view(&second, &uav, [0x22, 0, 0, 0], false, &[]));
+        assert_eq!(heap_host.dynamic_free(), free - 2, "the new segment's own slot; the old one held");
+        assert!(state.clear_view(&second, &uav, [0x44, 0, 0, 0], false, &[]));
+        assert_eq!(heap_host.dynamic_free(), free - 2, "shared again within the new segment");
+        srv(&second);
+        run(&second, &slots, &read, 0, Some(&outs[1].0), (N / 8, N / 8));
+        second.close();
+        host.execute(&[&first, &second]);
+        for (k, want) in [(0usize, 0x33), (1, 0x44)] {
+            for i in [0usize, 5, 7 * 16 + 9, 255] {
+                // SAFETY: inside the mapped output, after the lists ran.
+                let word = unsafe { (outs[k].1.add(i * 8) as *const u32).read() };
+                assert_eq!(word, want, "segment {k}, texel {i}: its last clear");
+            }
+        }
+        assert_eq!(heap_host.dynamic_free(), free - 2, "both slots held until reset");
+        first.reset();
+        second.reset();
+        state.reset(null);
+        assert_eq!(heap_host.dynamic_free(), free, "both slots come back at reset");
+    }
+
     /// A depth texture with stencil (the console's 16-bit depth, the
     /// host's 32-bit float) written through unordered views of its planes,
     /// then read as depth and stencil: the 16-bit depth arrives as the
