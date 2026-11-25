@@ -531,10 +531,8 @@ impl Shadow {
     /// copy-back neither takes them for the GPU's nor puts them back over a
     /// later title write.
     fn update_busy(&self, from: usize, to: usize) -> usize {
-        let Some(t) = &self.tracked else {
-            return 0;
-        };
-        let runs = t.take(from, to);
+        // Untracked memory is copied whole.
+        let runs = self.tracked.as_ref().map_or_else(|| vec![(from, to)], |t| t.take(from, to));
         if runs.is_empty() {
             return 0;
         }
@@ -1141,6 +1139,29 @@ mod tests {
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
         unregister(p, p as u64);
+    }
+
+    /// A buffer in memory the runtime does not watch (the title's C heap):
+    /// what the title wrote under a range an earlier list declared as written
+    /// by shaders still reaches the copy at submission.
+    #[test]
+    fn untracked_buffers_copy_title_writes_under_a_busy_range() {
+        let mut memory = vec![0u8; 4096];
+        let at = memory.as_mut_ptr() as usize;
+        register(at, at as u64, 4096);
+        let Some(copy) = find(at as u64, 4096) else {
+            unregister(at, at as u64);
+            return; // no host GPU here
+        };
+        assert!(copy.tracked.is_none(), "heap memory is not write-watched");
+        copy.update(at, 4096);
+        copy.writing(at, 4096, false);
+        // SAFETY: a byte of our vector.
+        unsafe { (at as *mut u8).add(100).write_volatile(0x55) };
+        assert!(copy.update(at + 96, 16) > 0, "the title's write is copied");
+        let host = copy.read_host((at + 100) as u64 & !3, 1)[0].to_le_bytes()[100 % 4];
+        assert_eq!(host, 0x55, "a later list reads the title's new byte");
+        unregister(at, at as u64);
     }
 
     /// Mark bits are handed out in runs and come back joined.
