@@ -51,6 +51,8 @@ use windows_sys::Win32::System::Memory as mem;
 
 /// The unit heaps and placed buffers are cut on, and the console's page.
 const K64: usize = 64 << 10;
+/// Block size (same as PAGE).
+const BLOCK: usize = K64;
 /// The host's write watching (not in windows-sys' memory module).
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
@@ -317,7 +319,12 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
     if !open.is_empty() {
-        crate::watch::views_mapped(&page_runs(open));
+        // Note all pages of these sections
+        for page in open {
+            let section = page / BLOCK;
+            let offset = (page % BLOCK) as u64;
+            crate::watch::views_mapped(section, offset, K64);
+        }
     }
 }
 
@@ -383,6 +390,17 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
         out.push((base, bytes));
     }
     out
+}
+
+/// The title views that cover `[section * BLOCK + offset, section * BLOCK + offset + len)`,
+/// as `(address, bytes)`. Returns empty if no view covers any of the range.
+pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let start = section * BLOCK + offset as usize;
+    let end = start.checked_add(len).unwrap_or(start);
+    views_between(start, end)
 }
 
 /// The address of the 64 KiB page shown at `page` in every title view that
