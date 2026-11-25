@@ -3,7 +3,7 @@
 //! its first frames), and the vectored handler steps over them here.
 //!
 //! Ported from XCL (github.com/ivall/xcl, GPL-2.0-only): `insn.rs` (decoder, as
-//! `console_insn_decode.rs`, unchanged) and `eh.rs` `emulate_console_only`.
+//! `console_insn_decode.rs`) and `eh.rs` `emulate_console_only`.
 
 #[path = "console_insn_decode.rs"]
 mod decode;
@@ -168,41 +168,30 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             ];
             let end = regs[end_reg as usize & 15] as usize;
             let start = ctx.Rax as usize;
-            if end <= start {
-                // The loop tests at its foot: it zeroes one line whatever the end is.
-                let line = start & !63;
-                if !writable(line, 64) {
-                    return 0; // the real instruction faults there too
-                }
-                // SAFETY: the 64-byte line is committed and writable.
-                unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
-                ctx.Rax = start.wrapping_add(64) as u64;
-            } else {
-                // A gigabyte at a time: a longer block (the title has heaps of more than
-                // two) goes on at the same instruction, as one cut short does below.
-                let stop = end.min(start.saturating_add(1 << 30));
-                // Region by region: a block may lie across several (the title's pages are
-                // mapped one view each), and one answer for all of it was a refusal, after
-                // which every 64-byte line took an exception of its own.
-                let mut at = start;
-                while at < stop {
-                    let Some(to) = writable_to(at, stop) else { break };
-                    // SAFETY: committed and writable from `at` to `to`.
-                    unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
-                    at = to;
-                }
-                if at == start {
-                    return 0;
-                }
-                ZEROED.fetch_add((at - start) as u64, Relaxed);
-                if at < end {
-                    // The rest of a long block, or what follows is not writable: the
-                    // loop goes on there (the same instruction again), where the real
-                    // one faults too.
-                    ctx.Rax = at as u64;
-                    return CONTINUE_EXECUTION;
-                }
-                ctx.Rax = end as u64;
+            let line = start & !63;
+            // The loop runs at least once and advances by whole lines, even if
+            // the limit falls inside one. Limit each batch to one GiB.
+            let lines = end.saturating_sub(start).div_ceil(64).clamp(1, (1 << 30) / 64);
+            let Some(stop) = line.checked_add(lines * 64) else { return 0 };
+            let mut at = line;
+            while at < stop {
+                let Some(to) = writable_to(at, stop) else { break };
+                // SAFETY: committed and writable from `at` to `to`.
+                unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
+                at = to;
+            }
+            if at == line {
+                return 0;
+            }
+            let bytes = at - line;
+            ZEROED.fetch_add(bytes as u64, Relaxed);
+            let next = start.wrapping_add(bytes);
+            ctx.Rax = next as u64;
+            ctx.EFlags = ctx.EFlags & !crate::crash::CMP_FLAGS
+                | crate::crash::cmp_flags(next as u64, end as u64);
+            if next < end {
+                // Resume the rest of the loop at the same instruction.
+                return CONTINUE_EXECUTION;
             }
         }
         ConsoleOnly::Rdpru => {
