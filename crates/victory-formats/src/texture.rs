@@ -612,7 +612,26 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, None, |t, l, len| {
+            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+        })
+    }
+
+    /// Detiles the selected range of element rows in a single-plane, single-
+    /// slice 2D layout, leaving other destination rows untouched. The slices
+    /// retain their full sizes and original origins; only the selected bytes
+    /// of either slice are read or written.
+    pub fn detile_rows(
+        &self,
+        tiled: &[u8],
+        linear: &mut [u8],
+        row_pitch: usize,
+        rows: std::ops::Range<u32>,
+    ) -> Result<(), Error> {
+        if self.desc.dimension != Dimension::Tex2d || self.slices != 1 || self.mips.len() != 1 {
+            return Err(Error::Invalid);
+        }
+        self.walk(tiled.len(), 0, 0, linear.len(), row_pitch, 0, Some(rows), |t, l, len| {
             linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
         })
     }
@@ -627,7 +646,7 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, None, |t, l, len| {
             tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
         })
     }
@@ -642,9 +661,14 @@ impl Layout {
         linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
+        rows: Option<std::ops::Range<u32>>,
         mut copy: impl FnMut(usize, usize, usize),
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let rows = rows.unwrap_or(0..m.height);
+        if rows.start > rows.end || rows.end > m.height {
+            return Err(Error::Invalid);
+        }
         let depth = m.depth;
         let first = if self.desc.dimension == Dimension::Tex3d {
             if slice != 0 {
@@ -707,7 +731,7 @@ impl Layout {
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
+            for y in rows.clone() {
                 let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
                 if linear {
                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;

@@ -316,6 +316,8 @@ fn copy_band(
 struct RowBand {
     top: u32,
     bottom: u32,
+    source_start: usize,
+    source_end: usize,
 }
 
 /// Convert a tracked byte envelope to a conservative full-width band. In
@@ -354,10 +356,14 @@ fn dirty_band(
         return None;
     }
     let texels = u64::from(group_rows) * u64::from(d.block);
-    let top = u32::try_from((low / stride) * texels).ok()?;
-    let bottom = ((high / stride + 1) * texels).min(u64::from(d.height)) as u32;
+    let (first, end) = (low / stride, high / stride + 1);
+    let top = u32::try_from(first * texels).ok()?;
+    let bottom = (end * texels).min(u64::from(d.height)) as u32;
+    let source_start = usize::try_from(m.offset + first * stride).ok()?;
+    let source_end = usize::try_from((m.offset + end * stride).min(layout.size)).ok()?;
     // Keep near-full copies on the regular path rather than issue a box.
-    (top < bottom && bottom - top <= d.height / 2).then_some(RowBand { top, bottom })
+    (top < bottom && bottom - top <= d.height / 2 && source_start < source_end)
+        .then_some(RowBand { top, bottom, source_start, source_end })
 }
 
 fn bands_enabled() -> bool {
@@ -413,12 +419,27 @@ impl Staging {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             last.read.resize(size, 0);
+            if let Some(band) = band {
+                let from = band.source_start;
+                let len = band.source_end - from;
+                crate::host::copy_mapped(
+                    last.read.as_mut_ptr().wrapping_add(from),
+                    self.memory.wrapping_add(from),
+                    len,
+                    false,
+                );
+                if self.detile(&last.read, Some(band)) {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::TexWatched, len as u64);
+                    return (len, true, Some(band));
+                }
+            }
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            let complete = self.detile(&last.read);
+            let complete = self.detile(&last.read, None);
             last.band_base = use_bands && complete;
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return (size, true, band.filter(|_| complete));
+            return (size, true, None);
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -439,16 +460,16 @@ impl Staging {
             return (size, false, None);
         }
         last.hash = Some(hash);
-        let _ = self.detile(tiled);
+        let _ = self.detile(tiled, None);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, true, None)
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) -> bool {
+    fn detile(&self, tiled: &[u8], band: Option<RowBand>) -> bool {
         #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
+        if band.is_none() && tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
                 memory = ?self.memory,
                 desc = ?self.layout.desc,
@@ -466,10 +487,13 @@ impl Staging {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            let result = if let Some(band) = band {
+                let block = self.layout.desc.block;
+                self.layout.detile_rows(tiled, linear, pitch, band.top / block..band.bottom / block)
+            } else {
+                self.layout.detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+            };
+            if let Err(e) = result {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return false;
             }
@@ -639,6 +663,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn partial_detile_matches_full_detile_without_touching_other_rows() {
+        use victory_formats::texture::Swizzle;
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_256B_S, Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
+            for block in [1, 4] {
+                let l = layout(260, 1032, block, swizzle);
+                let m = l.mips[0];
+                let pitch = (m.width * l.desc.element_bytes) as usize;
+                let tiled: Vec<u8> = (0..l.size as usize).map(|i| ((i ^ (i >> 8)) % 239) as u8).collect();
+                let mut full = vec![255; pitch * m.height as usize];
+                l.detile(&tiled, 0, 0, &mut full, pitch, 0).unwrap();
+                for y in [0, m.height / 2, m.height - 1] {
+                    let x = m.width / 2;
+                    let at = l.offset(0, x, y, 0).unwrap() as usize;
+                    let band = dirty_band(&l, at..at + l.desc.element_bytes as usize).unwrap();
+                    let rows = band.top / block..band.bottom / block;
+                    let mut staged = vec![255; tiled.len()];
+                    staged[band.source_start..band.source_end]
+                        .copy_from_slice(&tiled[band.source_start..band.source_end]);
+                    let mut partial = vec![255; full.len()];
+                    l.detile_rows(&staged, &mut partial, pitch, rows.clone()).unwrap();
+                    for (row, (a, b)) in partial.chunks_exact(pitch).zip(full.chunks_exact(pitch)).enumerate() {
+                        if rows.contains(&(row as u32)) {
+                            assert_eq!(a, b, "{swizzle:?} block {block} row {row}");
+                        } else {
+                            assert!(a.iter().all(|&value| value == 255));
+                        }
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn tracked_refresh_keeps_first_and_uncertain_uploads_full() {
         use windows_sys::Win32::System::Memory::{
