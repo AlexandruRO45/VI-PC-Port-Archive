@@ -20,7 +20,8 @@ pub(crate) struct HostHeap {
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// where the host takes them, else [`MIN_DYNAMIC`], fewer where the
+    /// heap ends at the null buffer views.
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -177,11 +178,24 @@ impl HostHeap {
                 host.device.GetDescriptorHandleIncrementSize(kind),
             )
         };
-        tracing::debug!(count, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let (gpu, total) = unsafe {
             (heap.GetGPUDescriptorHandleForHeapStart().ptr, heap.GetDesc().NumDescriptors)
         };
+        // A heap of exactly `views` slots (the cap, or title and dynamic
+        // slots that fit below it) still keeps its last three for the null
+        // buffer views and the clamped index: a title and dynamic range
+        // ending among them would leave both null views unmade.
+        let null = victory_shader::emit::null_buffer_view();
+        let (count, extra) = if !sampler && total == views {
+            let end = null - 1;
+            let count = count.min(end - MIN_DYNAMIC);
+            (count, extra.min(end - count))
+        } else {
+            (count, extra)
+        };
+        tracing::debug!(count, sampler, "host descriptor heap");
+        let null_buffers = !sampler && null > count + extra && null < total;
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
             u64::from(total) * u64::from(step),
@@ -199,10 +213,7 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
-            pairs_end: match victory_shader::emit::null_buffer_view() {
-                null if !sampler && null > count + extra && null < total => null - 1,
-                _ => total,
-            },
+            pairs_end: if null_buffers { null - 1 } else { total },
             strides,
             marks,
             addresses: std::sync::OnceLock::new(),
@@ -223,8 +234,7 @@ impl HostHeap {
         // What shaders read instead of a slot without a buffer view where
         // they take one at a computed index (`victory_shader::emit`, "Buffer
         // views at computed heap indices"): a null raw SRV, and UAV below it.
-        let null = victory_shader::emit::null_buffer_view();
-        if !sampler && null > count + extra && null < total {
+        if null_buffers {
             h.raw_view_at(null, None, 0, 0, false);
             h.raw_view_at(null - 1, None, 0, 0, true);
         } else if !sampler {
@@ -2235,6 +2245,35 @@ mod tests {
         assert!(heap.count + heap.dynamic < null, "room for the null buffer views");
         assert_eq!(heap.pairs_end, null - 1, "host copies' pairs stop below them");
         assert_eq!(null + 2, views, "the clamped index past them");
+    }
+
+    /// A title and dynamic range that fit a heap of exactly `heap_views()`
+    /// slots but end among its last three (an RTX 5080 report: 737,854 to
+    /// 737,856 and 934,462 to 934,464 title slots on a 1,000,000 cap) still
+    /// leave them to the null buffer views and the clamped index.
+    #[test]
+    fn a_range_ending_at_the_heap_end_keeps_the_null_buffer_views() {
+        let views = victory_shader::emit::heap_views();
+        let null = victory_shader::emit::null_buffer_view();
+        for dynamic in [DYNAMIC, MIN_DYNAMIC] {
+            for short in 0..=3 {
+                let requested = views - dynamic - short;
+                let Some(heap) = HostHeap::new(false, requested) else {
+                    return; // no host GPU
+                };
+                // SAFETY: a plain query of a live heap.
+                if unsafe { heap.heap.GetDesc().NumDescriptors } != views {
+                    continue; // the host took more: the reserved slots are past
+                }
+                assert!(heap.count + heap.dynamic < null, "{requested}: room for the null views");
+                assert_eq!(heap.pairs_end, null - 1, "{requested}: pairs stop below them");
+                let (_, data) = heap.strides.as_ref().expect("view strides");
+                // SAFETY: the last three slots lie inside the mapped table.
+                let strides = [null - 1, null, null + 1]
+                    .map(|slot| unsafe { (*data as *const u32).add(slot as usize).read_volatile() });
+                assert_eq!(strides, [4, 4, 0], "{requested}: null UAV, null SRV, clamped index");
+            }
+        }
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
