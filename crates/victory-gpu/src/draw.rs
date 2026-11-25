@@ -2465,7 +2465,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             // SAFETY: a live buffer.
             unsafe { made.GetDesc() }.Width
         };
-        assert_eq!(width(start + 456), 1 << 16, "on an element: the buffer's copy");
+        assert_eq!(width(start + 2 * 456), 1 << 16, "on a 16-byte-aligned element: the buffer's copy");
+        assert_eq!(width(start + 456), (4 * 456u64).next_multiple_of(256), "on an element not 16-byte aligned: its own raw-aligned copy");
         assert_eq!(width(start + 100), (4 * 456u64).next_multiple_of(256), "off: its own bytes");
         let (copy, address, len) = crate::descriptor::host::view_copy(&view(start + 100)).unwrap();
         assert_eq!((copy.range(), address, len), ((start + 100, 4 * 456), start + 100, 4 * 456));
