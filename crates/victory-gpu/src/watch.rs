@@ -974,8 +974,13 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // A page the lazy copy-back keeps from the CPU is given back first: the
-    // kernel cannot write a page with no access (`crate::lazyback`).
-    crate::lazyback::touched(at, len.min(usize::MAX - at));
+    // kernel cannot write a page with no access (`crate::lazyback`). Only
+    // while there is one: with the call made at every file read of the
+    // title's, the game crashed as its first cutscene started (a write to
+    // 0 in its own code), with no page card-only yet.
+    if crate::lazyback::any_card_only() {
+        crate::lazyback::touched(at, len.min(usize::MAX - at));
+    }
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
