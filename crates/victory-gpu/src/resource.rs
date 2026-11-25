@@ -1035,7 +1035,6 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     // allows both; Grand Theft Auto VI's shadow maps and material depth ask
     // for it): unordered views of such a texture write its twin
     // (`crate::twin`).
-    const RENDER_TARGET: u32 = 1;
     const DEPTH: u32 = 2;
     const UNORDERED: u32 = 4;
     if d.flags & DEPTH != 0 {
@@ -1057,8 +1056,6 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
 }
 
 const DEPTH: u32 = 2;
-#[cfg(windows)]
-const UNORDERED: u32 = 4;
 /// Render target, depth, unordered access: what a host texture allows.
 #[cfg(windows)]
 const USES: u32 = 0x7;

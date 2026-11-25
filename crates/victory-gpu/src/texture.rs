@@ -57,7 +57,6 @@ pub(crate) struct Staging {
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
-    read: Vec<u8>,
 }
 
 const MAX_READ_SCRATCH: usize = 4 << 20;

@@ -24,11 +24,6 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
-type SnapshotSegment = (usize, Vec<u8>);
-
-/// Maximum gap between two GPU-write snapshot ranges coalesced into one segment.
-const COALESCE_GAP: usize = 64 << 10;
-
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -101,64 +96,6 @@ fn give_back(v: Vec<u8>) {
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
-
-/// Merges `[from, to)` into sorted disjoint pre-write snapshot segments,
-/// copying newly covered bytes from `source` while keeping prior bytes intact.
-fn record_snapshot(
-    segments: &mut Vec<SnapshotSegment>,
-    from: usize,
-    to: usize,
-    source: &[u8],
-) {
-    if from >= to {
-        return;
-    }
-    if segments
-        .iter()
-        .any(|(at, bytes)| *at <= from && to <= at + bytes.len())
-    {
-        return;
-    }
-    let mut first = segments.len();
-    let mut last = 0usize;
-    let mut start = from;
-    let mut end = to;
-    for (i, (at, bytes)) in segments.iter().enumerate() {
-        let seg_end = at + bytes.len();
-        if from <= seg_end.saturating_add(COALESCE_GAP)
-            && *at <= to.saturating_add(COALESCE_GAP)
-        {
-            first = first.min(i);
-            last = last.max(i + 1);
-            start = start.min(*at);
-            end = end.max(seg_end);
-        }
-    }
-    if first >= last {
-        let mut buf = pooled(end - start);
-        buf.extend_from_slice(&source[start..end]);
-        let pos = segments.partition_point(|&(at, _)| at < start);
-        segments.insert(pos, (start, buf));
-        return;
-    }
-    let mut grown = pooled(end - start);
-    let mut cursor = start;
-    for (at, bytes) in segments.drain(first..last) {
-        if at > cursor {
-            grown.extend_from_slice(&source[cursor..at]);
-        }
-        if at + bytes.len() > cursor {
-            let skip = cursor.saturating_sub(at);
-            grown.extend_from_slice(&bytes[skip..]);
-            cursor = at + bytes.len();
-        }
-        give_back(bytes);
-    }
-    if cursor < end {
-        grown.extend_from_slice(&source[cursor..end]);
-    }
-    segments.insert(first, (start, grown));
-}
 
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.

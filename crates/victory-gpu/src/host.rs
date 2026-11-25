@@ -1024,7 +1024,7 @@ impl Host {
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(&group);
+                self.queue.ExecuteCommandLists(group);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -2041,9 +2041,11 @@ impl HostList {
 
 /// Maximum gap between two shadow refresh ranges that are coalesced into one
 /// watch/copy span (64 KiB, matching one watch page).
+#[cfg(test)]
 const COALESCE_GAP: usize = 64 << 10;
 
 /// Inserts `[from, to)` into sorted disjoint intervals, merging any within [`COALESCE_GAP`].
+#[cfg(test)]
 fn coalesce_interval(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
     if from >= to {
         return;
