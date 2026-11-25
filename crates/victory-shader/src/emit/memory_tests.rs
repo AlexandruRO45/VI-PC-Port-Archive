@@ -245,7 +245,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     let mut view_addresses = vec![0u32; 2 * 5];
     view_addresses[2..4].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -440,7 +440,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         .unwrap_or_else(|e| e.into_inner());
     let copy: Vec<u32> = (0..256).map(|k| 0x1000 + k).collect();
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -576,7 +576,7 @@ fn writes_through_views_mark_their_pages() {
     let value = 0x1234_5678;
     let marks = vec![100, 0xFFF0, super::VIEW_MARK_NONE, 0, 200, 0];
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;

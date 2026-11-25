@@ -548,8 +548,7 @@ fn defective(probes: Vec<Probe>, defect: &str) -> Vec<Probe> {
 /// (each with its first differing inputs).
 fn check(probes: &[Probe]) -> Vec<String> {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut hosts: Vec<(&str, bool, Host)> = [("hardware", false), ("warp", true)]
-        .into_iter()
+    let mut hosts: Vec<(&str, bool, Host)> = Host::test_backends()
         .filter_map(|(label, warp)| Host::new(warp).ok().map(|h| (label, warp, h)))
         .collect();
     assert!(!hosts.is_empty(), "no SM 6.6 device");
