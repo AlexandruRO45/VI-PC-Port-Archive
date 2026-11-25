@@ -803,6 +803,7 @@ pub(super) fn check_control_flow(insns: &[Insn], width: u32) -> Result<BTreeSet<
 // Only a complete, single guest wave64 may use group rendezvous. Every
 // branch must be proven group-uniform and every collective must be one of the
 // exact recognized reductions. All other programs keep the native path.
+#[cfg(test)]
 pub(super) fn portable_single_wave(insns: &[Insn]) -> bool {
     let mut covered = vec![false; insns.len()];
     let mut masks = Vec::new();
@@ -914,17 +915,6 @@ pub(super) fn portable_single_wave(insns: &[Insn]) -> bool {
 // A second barrier prevents a fast host subgroup from overwriting a slot
 // before the other subgroup has consumed it. The verifier above ensures
 // that every invocation reaches these barriers in the same order.
-pub(super) const PORTABLE_DECLARATIONS: &str = r#"
-groupshared uint tb_reduction_lanes[64];
-uint tb_reduction_read(uint lane, uint value, uint source) {
-    tb_reduction_lanes[lane] = value;
-    GroupMemoryBarrierWithGroupSync();
-    uint result = tb_reduction_lanes[source];
-    GroupMemoryBarrierWithGroupSync();
-    return result;
-}
-"#;
-
 #[cfg(test)]
 #[path = "../tests/hlsl/wave_sum.rs"]
 mod tests;

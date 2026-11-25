@@ -99,7 +99,10 @@ impl<'a> Emitter<'a> {
         let mut m = ins.mnemonic.clone();
         let s = &ins.src;
         let d = ins.dst.first().cloned().ok_or("no dst")?;
-        if self.required_wave_size == Some(64) && self.packed.as_ref().is_some_and(|p| p.lane_masks.contains(&self.cur_idx)) {
+        if (self.required_wave_size == Some(64) || self.portable_wave64)
+            && (self.packed.as_ref().is_some_and(|p| p.lane_masks.contains(&self.cur_idx))
+                || self.portable_w64.as_ref().is_some_and(|p| p.ballot_mask_reads.contains(&self.cur_idx)))
+        {
             self.touch(&hi(&s[2]));
         }
         if m == "tb_reflection_prefix32" {
@@ -128,8 +131,12 @@ impl<'a> Emitter<'a> {
                 format!("({lane} & {}u)", width - 1)
             } else { lane };
             let value = r(&s[0])?;
-            let read = if self.portable_wave64 {
-                format!("tb_reduction_read(gtid.x, {value}, {lane})")
+            let read = if let Some(plan) = &self.portable_w64 {
+                if self.hoisted_w64 == Some(self.cur_idx) {
+                    format!("w64_r{}", self.cur_idx)
+                } else {
+                    format!("tb_reduction_read({}, {value}, {lane})", plan.lane_expr())
+                }
             } else { format!("WaveReadLaneAt({value}, {lane})") };
             return self.ws(&d, &read);
         }
@@ -558,11 +565,18 @@ impl<'a> Emitter<'a> {
         }
         let mask = if matches!(self.exec_snapshots.sites.get(&self.cur_idx), Some(exec_snapshot::Site::LaneMask(..))) {
             format!("select_mask{}", self.cur_idx)
-        } else if self.packed.as_ref().is_some_and(|p| p.lane_masks.contains(&self.cur_idx)) {
-            let upper = if self.required_wave_size == Some(64) {
+        } else if self.portable_w64.as_ref().is_some_and(|p| p.ballot_mask_reads.contains(&self.cur_idx))
+            || self.packed.as_ref().is_some_and(|p| p.lane_masks.contains(&self.cur_idx))
+        {
+            let upper = if self.required_wave_size == Some(64) || self.portable_wave64 {
                 r(&hi(&s[2]))?
             } else { "0u".into() };
-            format!("(((WaveGetLaneIndex() < 32u) ? {c} : {upper}) >> (WaveGetLaneIndex() & 31u))")
+            if let Some(plan) = &self.portable_w64 {
+                let lane = plan.lane_expr();
+                format!("(((({lane} & 63u) < 32u) ? {c} : {upper}) >> ({lane} & 31u))")
+            } else {
+                format!("(((WaveGetLaneIndex() < 32u) ? {c} : {upper}) >> (WaveGetLaneIndex() & 31u))")
+            }
         } else if vop3 { c.clone() } else { "vcc_lo".to_string() };
         let e = match m.as_str() {
             "v_mov_b32" => a,

@@ -100,6 +100,7 @@ mod ray_resolve;
 mod fspx_wave;
 mod singleton_wave;
 mod wave_sum;
+mod portable_wave64;
 mod lockstep;
 mod wave_loops;
 mod raw_index;
@@ -312,6 +313,9 @@ struct Emitter<'a> {
     /// Structured loop latches with a verified guest trip bound.
     wave_bounded_latches: BTreeSet<usize>,
     portable_wave64: bool,
+    portable_w64: Option<portable_wave64::Plan>,
+    hoisted_w64: Option<usize>,
+    in_active_guard: bool,
     msel: HashMap<usize, MSel>,
     /// Buffer ops (MUBUF, s_buffer_load) whose descriptor register holds one of several
     /// descriptors: (register key, candidates as (descriptor id, resource)).

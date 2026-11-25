@@ -382,7 +382,12 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
                 writeln!(h, "    uint tb_wave_tid = gtid.x + {tx}u * (gtid.y + {ty_}u * gtid.z);").unwrap();
             }
             let masked_dpp = self.insns.iter().any(|i| i.op == OP_DPP_BINARY && group_extrema::destination_mask(i).is_some());
-            if self.compute_swizzle || self.indexed_lane || self.single_wave32 || masked_dpp {
+            if self.compute_swizzle
+                || self.indexed_lane
+                || self.single_wave32
+                || masked_dpp
+                || self.portable_w64.as_ref().is_some_and(|p| p.needs_tb_lane)
+            {
                 writeln!(h, "    uint tb_lane = gtid.x + {tx}u * (gtid.y + {ty_}u * gtid.z);").unwrap();
             }
             if self.resolve_wave32 {

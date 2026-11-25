@@ -161,6 +161,14 @@ impl<'a> Emitter<'a> {
                     self.line(&code);
                 }
             }
+            if self.portable_wave64 && !active.is_empty() {
+                if let Some(code) = portable_wave64::hoist_before(self, i, ins)? {
+                    self.end_guard(&mut open);
+                    cur.clear();
+                    self.line(&code);
+                    self.hoisted_w64 = Some(i);
+                }
+            }
             let mesh_condition = self.hoist_wave_exchanges && self.ex.stage == Stage::Mesh
                 && reads_scc(ins) && !self.in_loop(i) && scc_from_mask(&insns, i);
             if mesh_condition {
@@ -180,7 +188,7 @@ impl<'a> Emitter<'a> {
             {
                 active.clear();
             }
-            if self.compute_swizzle && exchanges(ins) && !active.is_empty() {
+            if self.compute_swizzle && exchanges(ins) && !active.is_empty() && self.hoisted_w64 != Some(i) {
                 self.end_guard(&mut open);
                 cur.clear();
                 self.emit_compute_swizzle(i, ins, &active)?;
@@ -312,8 +320,21 @@ impl<'a> Emitter<'a> {
                 // Publish every coarse luminance texel before this group takes its ticket.
                 self.line("AllMemoryBarrierWithGroupSync();");
             }
+            self.in_active_guard = !cur.is_empty();
             self.emit_insn(i, ins, is_ps, target.get(&i).copied())
                 .map_err(|e| format!("{e} [{} @ {:#x}]", ins.mnemonic, ins.offset))?;
+            self.hoisted_w64 = None;
+            self.in_active_guard = false;
+            if open {
+                if let Some((barriers, applies)) = portable_wave64::hoist_after(self, i, ins)? {
+                    self.end_guard(&mut open);
+                    self.line(&barriers);
+                    let c: Vec<String> = cur.iter().map(|t| format!("j{t}")).collect();
+                    self.line(&format!("if (!({})) {{", c.join(" || ")));
+                    open = true;
+                    self.line(&applies);
+                }
+            }
             if open && target.get(&i).is_some_and(|t| cur.contains(t)) {
                 // Another branch to an enclosing target just updated its flag.
                 // The following instruction must reevaluate the guard.

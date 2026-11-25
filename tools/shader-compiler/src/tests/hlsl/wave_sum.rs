@@ -278,7 +278,10 @@ fn bitwise_and_float_sum_reductions_use_shared_memory_only_for_a_single_wave64()
 
         shader.isa_preamble = [0, 128, 1, 1];
         let multi = super::super::translate(&shader).unwrap();
-        assert_eq!(multi.required_wave_size, Some(64));
+        assert_eq!(multi.required_wave_size, None);
+        assert!(multi.hlsl.contains("groupshared uint tb_w64_lanes[2][64];"));
+        assert!(multi.hlsl.lines().any(|line| line.contains("tb_reduction_read(tb_lane")
+            && line.contains(combine)));
     }
 }
 
@@ -297,7 +300,9 @@ fn portable_wave_can_scale_its_result_from_an_embedded_table() {
     shader.isa_data.extend([u32::MAX, 2].into_iter().flat_map(u32::to_le_bytes));
     assert_eq!(super::super::translate(&shader).unwrap().required_wave_size, None);
     shader.isa_preamble = [0, 128, 1, 1];
-    assert_eq!(super::super::translate(&shader).unwrap().required_wave_size, Some(64));
+    let multi = super::super::translate(&shader).unwrap();
+    assert_eq!(multi.required_wave_size, None);
+    assert!(multi.hlsl.contains("groupshared uint tb_w64_lanes[2][64];"));
 
     let mut ops = crate::rdna2::disassemble(&shader.isa);
     super::super::lower_wave_reductions(&mut ops).unwrap();
@@ -392,10 +397,11 @@ fn portable_wave64_requires_a_single_group_and_no_other_wave_operations() {
     assert!(!portable_single_wave(&changed));
 
     ex.isa_preamble = [0, 128, 1, 1];
-    let native = super::super::translate(&ex).unwrap();
-    assert_eq!(native.required_wave_size, Some(64));
-    assert!(native.hlsl.contains("[WaveSize(64)]"));
-    assert!(!native.hlsl.contains("tb_reduction_read("));
+    let multi = super::super::translate(&ex).unwrap();
+    assert_eq!(multi.required_wave_size, None);
+    assert!(!multi.hlsl.contains("[WaveSize(64)]"));
+    assert!(multi.hlsl.contains("groupshared uint tb_w64_lanes[2][64];"));
+    assert!(multi.hlsl.contains("tb_reduction_read(tb_lane"));
 }
 
 #[test]

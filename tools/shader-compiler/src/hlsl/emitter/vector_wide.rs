@@ -35,16 +35,23 @@ impl<'a> Emitter<'a> {
         return self.wv(&dh, &format!("t{t}h"));
     }
 
-    /// Vector compares into a lane mask.
-    pub(in crate::hlsl) fn emit_compare(&mut self, m: String, s: &[Opnd], d: Opnd, ins: &Insn) -> Result<(), String> {
+    /// Boolean condition expression for a `v_cmp_*` instruction.
+    pub(in crate::hlsl) fn compare_cond(&mut self, ins: &Insn) -> Result<String, String> {
+        let m = ins.mnemonic.as_str();
+        let s = &ins.src;
         let mask = ins.aux.mask;
-        let c = if m.ends_with("_i64") || m.ends_with("_u64") {
-            self.compare_int64(ins, mask)?
+        if m.ends_with("_i64") || m.ends_with("_u64") {
+            self.compare_int64(ins, mask)
         } else if m.ends_with("_f64") || m.ends_with("_f32") || m.ends_with("_f16") {
-            self.compare_float(ins, mask)?
+            self.compare_float(ins, mask)
         } else {
-            self.int_compare(&m, &s[0], &s[1])?
-        };
+            self.int_compare(m, &s[0], &s[1])
+        }
+    }
+
+    /// Vector compares into a lane mask.
+    pub(in crate::hlsl) fn emit_compare(&mut self, m: String, _s: &[Opnd], d: Opnd, ins: &Insn) -> Result<(), String> {
+        let c = self.compare_cond(ins)?;
         if self.resolve_wave32 {
             let vote = format!("WaveActiveBallot((exec_lo & tb_lane_bit) != 0u && {c}).x");
             return self.ws(if m.starts_with("v_cmpx_") { &Opnd::ExecLo } else { &d }, &vote);

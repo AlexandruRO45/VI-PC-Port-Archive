@@ -21,8 +21,14 @@ fn guarded_shader(width: u32, prefix: &[u32]) -> ShaderExtract {
 fn reduction_execz_votes_only_at_proven_guards() {
     for width in [32, 64] {
         let translated = translate(&guarded_shader(width, &[])).expect("guarded reduction");
-        assert_eq!(translated.required_wave_size, Some(width));
-        assert_eq!(translated.hlsl.matches("!WaveActiveAnyTrue((exec_lo & 1u) != 0u)").count(), 1);
+        if width == 32 {
+            assert_eq!(translated.required_wave_size, Some(32));
+            assert_eq!(translated.hlsl.matches("!WaveActiveAnyTrue((exec_lo & 1u) != 0u)").count(), 1);
+        } else {
+            assert_eq!(translated.required_wave_size, None);
+            assert!(!translated.hlsl.contains("[WaveSize(64)]"));
+            assert_eq!(translated.hlsl.matches("!tb_w64_any(gtid.x, (exec_lo & 1u) != 0u)").count(), 1);
+        }
         assert!(translated.hlsl.contains("if ((exec_lo & 1u) == 0u)"));
     }
 }
@@ -33,7 +39,12 @@ fn reduction_execz_accepts_direct_rejoin_at_vote() {
         // Skip one local vector instruction and rejoin exactly at the guard.
         let translated = translate(&guarded_shader(width, &[0xbf88_0002, 0x4a00_0081]))
             .expect("direct rejoin before wave vote");
-        assert_eq!(translated.hlsl.matches("!WaveActiveAnyTrue((exec_lo & 1u) != 0u)").count(), 1);
+        let needle = if width == 32 {
+            "!WaveActiveAnyTrue((exec_lo & 1u) != 0u)"
+        } else {
+            "!tb_w64_any(gtid.x, (exec_lo & 1u) != 0u)"
+        };
+        assert_eq!(translated.hlsl.matches(needle).count(), 1);
     }
 }
 
@@ -50,7 +61,12 @@ fn reduction_execz_behind_a_bypass_branches_with_the_whole_wave() {
         shader.isa_data = shader.isa.clone();
         // One targeted vote cannot cover this shape, so every branch votes.
         let translated = translate(&shader).expect("whole-wave branches");
-        assert_eq!(translated.hlsl.matches("!WaveActiveAnyTrue((exec_lo & 1u) != 0u)").count(), 2);
+        let needle = if width == 32 {
+            "!WaveActiveAnyTrue((exec_lo & 1u) != 0u)"
+        } else {
+            "!tb_w64_any(gtid.x, (exec_lo & 1u) != 0u)"
+        };
+        assert_eq!(translated.hlsl.matches(needle).count(), 2);
         assert!(!translated.hlsl.contains("if ((exec_lo & 1u) == 0u)"));
     }
 }

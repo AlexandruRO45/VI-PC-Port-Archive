@@ -149,7 +149,7 @@ impl<'a> Emitter<'a> {
             self.pixel_sum = m.starts_with("v_add");
             return self.wv(&d, &acc);
         }
-        let id = if self.portable_wave64 { "gtid.x" } else { "WaveGetLaneIndex()" };
+        let id = self.portable_w64.as_ref().map_or("WaveGetLaneIndex()", |p| p.lane_expr());
         let control = ins.raw[1] >> 8; // The reduction matcher verified this word.
         let lane = match (ins.aux.imm, control) {
             (0, _) => format!("{id} ^ 1u"),
@@ -162,7 +162,11 @@ impl<'a> Emitter<'a> {
             _ => return Err("invalid integer sum step".into()),
         };
         let partner = if self.portable_wave64 {
-            format!("tb_reduction_read(gtid.x, {acc}, {lane})")
+            if self.hoisted_w64 == Some(self.cur_idx) {
+                format!("w64_r{}", self.cur_idx)
+            } else {
+                format!("tb_reduction_read({id}, {acc}, {lane})")
+            }
         } else { format!("WaveReadLaneAt({acc}, {lane})") };
         let combined = match m.as_str() {
             "v_add_nc_u32" => format!("{partner} + {acc}"),
@@ -190,7 +194,8 @@ impl<'a> Emitter<'a> {
         let selector = ins.aux.imm as u32;
         let t = self.tmp;
         self.tmp += 1;
-        self.line(&format!("uint t{t} = tb_reduction_read(gtid.x, {a}, (gtid.x & ~7u) | (({selector:#x}u >> (3u * (gtid.x & 7u))) & 7u));"));
+        let id = self.portable_w64.as_ref().map_or("gtid.x", |p| p.lane_expr());
+        self.line(&format!("uint t{t} = tb_reduction_read({id}, {a}, ({id} & ~7u) | (({selector:#x}u >> (3u * ({id} & 7u))) & 7u));"));
         let value = match m.as_str() {
             "v_add_nc_u32" => format!("t{t} + {b}"),
             "v_and_b32" => format!("t{t} & {b}"),

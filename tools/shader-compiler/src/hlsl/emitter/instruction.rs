@@ -4,6 +4,9 @@ use super::*;
 impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn emit_insn(&mut self, idx: usize, ins: &Insn, is_ps: bool, br: Option<usize>) -> Result<(), String> {
         self.emit_insn_body(idx, ins, is_ps, br)?;
+        if portable_wave64::emit_post_votes(self, idx, ins)? {
+            return Ok(());
+        }
         if let Some(vote) = self.lockstep.as_ref().and_then(|votes| votes.get(&idx)).cloned() {
             let mask = r(&vote.mask)?;
             let not = if vote.none { "!" } else { "" };
@@ -49,6 +52,7 @@ impl<'a> Emitter<'a> {
             if wave_cull::emit(self, idx, ins, br)? { return Ok(()); }
         }
         if self.page_waves && page_waves::emit(self, idx, ins, br)? { return Ok(()); }
+        if self.portable_wave64 && portable_wave64::emit(self, idx, ins, br)? { return Ok(()); }
         match m {
             "tb_light_grid_reserve" => {
                 self.line(light_grid::RESERVE);

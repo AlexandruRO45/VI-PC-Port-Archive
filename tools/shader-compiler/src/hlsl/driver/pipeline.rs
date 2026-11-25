@@ -344,20 +344,39 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
             return Err(format!("wave operation requires complete {width}-lane compute waves"));
         }
     }
-    em.portable_wave64 = (straight_exchange || (required_wave_size == Some(64)
-        && compute_group(ex) == [64, 1, 1]))
-        && em.lockstep.is_none()
-        && ex.stage == Stage::Compute
-        && !wave_cull && !page_waves && !allocation_wave64 && !requires_ballot
-        && !em.compute_swizzle && !em.indexed_lane && !em.compute_heap
-        && em.packed.is_none() && !uses_quad_add && !uses_bpermute && !probe_trace
-        && scan_width.is_none() && !particle_sort && !hair_cluster_export && !hair_cluster
+    let portable_eligible = ex.stage == Stage::Compute
+        && !wave_cull && !page_waves && !lone_lane::on() && !resolve_wave32 && !light_grid
+        && !uses_quad_add && !uses_bpermute && !probe_trace
+        && !particle_sort && !hair_cluster_export && !hair_cluster
         && !instance_cull && !hzb_cull && view_cull.is_none() && !post_cull
         && !hair_visibility_indirect && !hair_visibility_single && hair_compact.is_none()
         && !subsurface_setup && !material_classify && !classify_tiles && !reflection && !group_extrema
-        && (straight_exchange || wave_sum::portable_single_wave(&em.insns));
-    if straight_exchange && !em.portable_wave64 {
-        return Err("straight DPP8 exchange conflicts with a specialized lowering".into());
+        && !em.single_wave32 && !em.one_word_vector_mask() && required_wave_size != Some(32);
+    if straight_exchange {
+        let straight_ok = portable_eligible && !allocation_wave64 && !requires_ballot
+            && !em.compute_swizzle && !em.indexed_lane && !em.compute_heap
+            && em.packed.is_none() && scan_width.is_none() && em.lockstep.is_none();
+        if !straight_ok {
+            return Err("straight DPP8 exchange conflicts with a specialized lowering".into());
+        }
+        em.portable_wave64 = true;
+        em.portable_w64 = Some(portable_wave64::Plan::straight_exchange());
+    } else if portable_eligible {
+        match portable_wave64::analyze(&em, required_wave_size, scan_width, shared_mask) {
+            portable_wave64::Analysis::Portable(plan) => {
+                if em.reflected_lds_words.is_none()
+                    && wave_cull::lds_words(&em).is_none()
+                    && em.insns.iter().any(|i| i.enc == Enc::Ds && i.mnemonic != "ds_swizzle_b32")
+                {
+                    em.reflected_lds_words =
+                        tuxbox_dxbc::fssm::compute_lds_bytes(&ex.fssm).map(|b| b / 4);
+                }
+                em.portable_wave64 = true;
+                em.portable_w64 = Some(plan);
+            }
+            portable_wave64::Analysis::RefuseDivergent(reason) => return Err(reason),
+            portable_wave64::Analysis::KeepNative | portable_wave64::Analysis::NotNeeded => {}
+        }
     }
     if is_ps {
         em.find_export_epilogs();
@@ -466,7 +485,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         hlsl.insert_str(0, instance_cull_hzb::HIDDEN_DECLARATIONS);
     }
     if light_grid { hlsl.insert_str(0, light_grid::DECLARATIONS); }
-    if em.portable_wave64 { hlsl.insert_str(0, wave_sum::PORTABLE_DECLARATIONS); }
+    if let Some(plan) = &em.portable_w64 { hlsl.insert_str(0, &plan.declarations()); }
     if shared_mask {
         hlsl.insert_str(0, &page_waves::ballot_declarations(compute_group(ex).into_iter().product()));
     }
@@ -504,6 +523,8 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         "cs_6_5"
     } else if is_ps && !em.uav.is_empty() {
         "ps_5_1"
+    } else if em.portable_wave64 && em.portable_w64.as_ref().is_some_and(|p| p.uses_ballot) {
+        "cs_6_0"
     } else {
         profile
     };

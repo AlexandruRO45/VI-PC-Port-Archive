@@ -138,6 +138,10 @@ pub(super) fn lds_words(em: &Emitter<'_>) -> Option<u32> {
 /// Scalar EXEC/VCC branches test all lanes, including on a loop backedge.
 pub(super) fn branch_condition(em: &Emitter<'_>, i: &Insn, fallback: &str) -> String {
     if em.lockstep.is_some() {
+        if let Some(plan) = &em.portable_w64 {
+            return super::portable_wave64::lockstep_branch_condition(i.op, plan.lane_expr())
+                .unwrap_or_else(|| fallback.into());
+        }
         return super::lockstep::branch_condition(i.op).unwrap_or_else(|| fallback.into());
     }
     if em.resolve_wave32 {
