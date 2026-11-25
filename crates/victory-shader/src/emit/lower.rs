@@ -4927,15 +4927,17 @@ impl<'a> Lower<'a> {
         } else {
             props
         };
-        // A descriptor from the resource heap itself: the host cannot tell
-        // which slots the program reads, or writes through unordered access.
-        if !sampler && self.is_heap_direct(src) {
+        let heap_indexed = self.is_heap_direct(src) || self.is_heap_table(src);
+        // A descriptor from the resource heap itself, or loaded dynamically
+        // from a table: the host cannot tell ahead of the draw which slots
+        // the program reads, or writes through unordered access.
+        if !sampler && heap_indexed {
             self.heap[0] = true;
             self.heap[1] |= props.0 & 0x1000 != 0;
         }
-        // Shader views read from the heap itself mark their slots in the
-        // heap-usage bitmap (`HostShader::heap_usage`).
-        let mark = !sampler && props.0 & 0x1000 == 0 && self.is_heap_direct(src) && heap_usage_marks();
+        // Shader views read dynamically mark their slots in the heap-usage
+        // bitmap (`HostShader::heap_usage`) so placed textures are made.
+        let mark = !sampler && props.0 & 0x1000 == 0 && heap_indexed && heap_usage_marks();
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props.0);
@@ -5149,6 +5151,41 @@ impl<'a> Lower<'a> {
                 .get(load)
                 .and_then(|a| self.x.native.layout.get(a.param))
                 .is_some_and(|p| p.root == RootType::ResourceHeap),
+            _ => false,
+        })
+    }
+
+    /// Whether a descriptor comes from a descriptor table at an offset the
+    /// static table mirror does not cover (computed offset, per-lane fetch,
+    /// or slot absent from `UsedResource`).
+    fn is_heap_table(&self, src: &Source) -> bool {
+        if !heap_table_marks() {
+            return false;
+        }
+        src.leaves().iter().any(|l| match l {
+            Source::Fetched { load, .. } => self
+                .scalar
+                .get(load)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == RootType::Table),
+            Source::Loaded { load, first } => self
+                .scalar
+                .get(load)
+                .and_then(|a| self.x.native.layout.get(a.param).map(|p| (a, p)))
+                .is_some_and(|(a, p)| {
+                    if p.root != RootType::Table {
+                        return false;
+                    }
+                    if a.dynamic.is_some() {
+                        return true;
+                    }
+                    let dword = (a.offset / 4) + u32::from(*first);
+                    !self.x.native.used.iter().any(|u| {
+                        u.root == RootType::Table
+                            && u.user_data == p.user_data
+                            && u.table_offset_dwords == dword
+                    })
+                }),
             _ => false,
         })
     }
@@ -10693,6 +10730,42 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_table_descriptors_mark_heap_and_usage() {
+        use crate::resource::tests::{
+            WATERFALL_FETCHED_WAVE32, WATERFALL_INDEXED_WAVE32, WATERFALL_JOINED_WAVE32,
+        };
+
+        // Dynamic/per-lane table reads (`VICTORY_HEAP_TABLE_MARKS=1`, default)
+        // set `heap` and emit heap-usage marks when usage marks are enabled.
+        for words in [
+            WATERFALL_INDEXED_WAVE32,
+            WATERFALL_FETCHED_WAVE32,
+            WATERFALL_JOINED_WAVE32,
+        ] {
+            let (layout, used) = texture_and_uav_tables();
+            let l = lower_with(words, layout.clone(), used.clone()).unwrap();
+            assert!(l.heap, "dynamic table read must enable bindless heap uploads");
+            assert!(!l.heap_writes);
+            let marked = super::TEST_USAGE_MARKS.with(|c| {
+                let prev = c.replace(Some(true));
+                let res = lower_with(words, layout.clone(), used.clone());
+                c.set(prev);
+                res
+            });
+            let marked = marked.unwrap();
+            assert!(marked.heap && marked.heap_usage, "dynamic table read must mark usage bitmap");
+
+            let disabled = super::TEST_TABLE_MARKS.with(|c| {
+                let prev = c.replace(Some(false));
+                let res = lower_with(words, layout, used);
+                c.set(prev);
+                res
+            });
+            assert!(!disabled.unwrap().heap, "VICTORY_HEAP_TABLE_MARKS=0 restores prior behavior");
+        }
+    }
+
+    #[test]
     fn scalar_bit_tests_lower() {
         // Each tests one bit of a constant into SCC and branches on it (only
         // code with an effect needs its operands).
@@ -10977,11 +11050,33 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_USAGE_MARKS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_TABLE_MARKS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether dynamic/uncovered `RootType::Table` descriptors count as
+/// heap-direct so shaders mark them in the heap-usage bitmap
+/// (`VICTORY_HEAP_TABLE_MARKS`, on unless `0`).
+fn heap_table_marks() -> bool {
+    #[cfg(test)]
+    if let Some(v) = TEST_TABLE_MARKS.with(|c| c.get()) {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_TABLE_MARKS").map_or(true, |v| v != "0"))
+}
+
 /// Whether translated shaders mark the heap slots they read
 /// (`VICTORY_HEAP_USAGE`, on unless 0). Off, shaders are as before.
 fn heap_usage_marks() -> bool {
     // shortcut: off in unit tests, whose hardware harness binds only the
     // root parameters each test names (the bitmap would be unbound).
+    #[cfg(test)]
+    if let Some(v) = TEST_USAGE_MARKS.with(|c| c.get()) {
+        return v;
+    }
     if cfg!(test) {
         return false;
     }

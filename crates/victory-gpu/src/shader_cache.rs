@@ -66,7 +66,7 @@ fn build() -> &'static [u8; 32] {
         }
         // The settings that change what the translator emits key the entry
         // too: a translation made with them off is not served with them on.
-        let flags = [u8::from(view_marks()), u8::from(heap_usage())];
+        let flags = [u8::from(view_marks()), u8::from(heap_usage()) | u8::from(heap_table_marks()) << 1];
         let mut h = blake3::Hasher::new();
         h.update(&key(victory_shader::SOURCE_HASH, ENCODING, limit));
         h.update(&flags);
@@ -87,6 +87,12 @@ pub(crate) fn view_marks() -> bool {
 /// (`VICTORY_HEAP_USAGE`, on unless 0): part of the cache key.
 fn heap_usage() -> bool {
     std::env::var("VICTORY_HEAP_USAGE").map_or(true, |v| v != "0")
+}
+
+/// Whether descriptors loaded dynamically from tables are marked too
+/// (`VICTORY_HEAP_TABLE_MARKS`, on unless 0): part of the cache key.
+fn heap_table_marks() -> bool {
+    std::env::var("VICTORY_HEAP_TABLE_MARKS").map_or(true, |v| v != "0")
 }
 
 /// This file, whose `encode` and `decode` define the entries.
@@ -472,7 +478,7 @@ mod tests {
             h.update(&flags);
             *h.finalize().as_bytes()
         };
-        assert_eq!(*build(), with([u8::from(view_marks()), u8::from(heap_usage())]));
+        assert_eq!(*build(), with([u8::from(view_marks()), u8::from(heap_usage()) | u8::from(heap_table_marks()) << 1]));
         assert_ne!(with([0, 1]), with([1, 1]), "view marks change the key");
         assert_ne!(with([0, 1]), with([0, 0]), "heap usage changes the key");
         // The encoding part is this file as built.
