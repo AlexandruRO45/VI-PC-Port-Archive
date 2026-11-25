@@ -227,6 +227,9 @@ mod tests {
     #[test]
     fn empty_and_incomplete_scans_are_reported() {
         assert!(check_warm_summary(None).is_err());
+        assert!(check_warm_summary(Some(
+            "progress 15 s  2000 shaders checked  1990 translated  100 compute pipelines"
+        )).is_err());
         assert!(
             check_warm_summary(Some(
                 "warm  0 translated, 0 refused; 0 compute pipelines, 0 refused; 0 s"
