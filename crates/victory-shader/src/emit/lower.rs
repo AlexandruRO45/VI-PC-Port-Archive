@@ -708,8 +708,15 @@ impl<'a> Lower<'a> {
                 all.dedup();
                 constant || all.into_iter().any(|g| numeric(&x.st.bools, g))
             };
-            console_lanes = reads_whole || masks_held || insts().any(in_half);
+            // SGPR spills keep main's per-lane form: on a host that runs the
+            // console's wave size, with that wave size and the lane writes
+            // emulated; elsewhere, with no wave size (each restore is its
+            // SGPR).
             let wave = if x.native.wave64 { 64 } else { 32 };
+            console_lanes = reads_whole
+                || masks_held
+                || insts().any(in_half)
+                || x.target.runs(wave) && insts().any(is_named_lane);
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             // On a host without 64-lane waves, a wave64 program whose lanes
             // read only their own half runs as two 32-lane waves: what each
