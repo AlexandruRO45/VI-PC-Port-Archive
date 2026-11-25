@@ -2833,7 +2833,7 @@ mod tests {
         };
 
         for len in [0, 1, 7, 8, 15, 31, 32, 33, 63, 64, 65, 127, 256, 4096] {
-            for pattern in 0..8 {
+            for pattern in 0..9 {
                 let old: Vec<u8> = (0..len).map(|_| next_u8()).collect();
                 let mut title = old.clone();
                 let mut host = old.clone();
@@ -2849,6 +2849,11 @@ mod tests {
                         let v = old[k].wrapping_add(3);
                         host[k] = v;
                         title[k] = v;
+                    }
+                    if pattern == 8 && (r & 0x07) == 0 {
+                        // Overlapping conflict: GPU and CPU write different values to the same byte (GPU wins).
+                        host[k] = old[k].wrapping_add(11);
+                        title[k] = old[k].wrapping_add(29);
                     }
                 }
 
