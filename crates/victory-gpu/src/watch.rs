@@ -994,16 +994,20 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        // VirtualAlloc can reuse an address whose page number is already in
+        // the global journal, so do not require the first answer to be empty
+        // (issue #102). What matters is that this write is new and every
+        // later asker still sees it.
+        let (before_at, _) = writes(start, end, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
         let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        assert!(now > before_at);
+        assert!(after.contains(&(p / PAGE + 1, now)));
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
-        assert_eq!(again, [(p / PAGE + 1, now)]);
+        assert!(again.contains(&(p / PAGE + 1, now)));
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
