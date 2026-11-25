@@ -1851,6 +1851,8 @@ fn twin_uav(
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    against_this_frame(view);
     let made = match cached(view, at) {
         Some(keeps) => Some(keeps),
         None => {
@@ -1956,6 +1958,47 @@ fn remember(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, keeps: &Kept) {
         std::ptr::copy_nonoverlapping(at.ptr as *const u8, bytes.as_mut_ptr(), 32);
     }
     map.insert(view.clone(), Made { bytes, keeps: keeps.clone() });
+}
+
+/// Counts the views of memory without a resource and the constant buffers a
+/// frame asks for, and how many of each were already asked for in the same
+/// frame: the first is whether that class repeats, the second is how big a
+/// 256-aligned staging copy of every distinct range would be.
+#[cfg(feature = "diagnostics")]
+fn against_this_frame(view: &View) {
+    use crate::copystat::{add, C};
+    match view {
+        View::Placed(..) => {
+            static SEEN: Mutex<Option<(u64, std::collections::HashSet<View>)>> = Mutex::new(None);
+            let frame = crate::frame::current();
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let (for_frame, set) = seen.get_or_insert_with(|| (frame, std::collections::HashSet::new()));
+            if *for_frame != frame {
+                set.clear();
+                *for_frame = frame;
+            }
+            add(C::PlacedAsked, 1);
+            if !set.insert(view.clone()) {
+                add(C::PlacedRepeat, 1);
+            }
+        }
+        View::Constant(address, size) => {
+            static SEEN: Mutex<Option<(u64, std::collections::HashSet<(u64, u32)>)>> = Mutex::new(None);
+            let frame = crate::frame::current();
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let (for_frame, set) = seen.get_or_insert_with(|| (frame, std::collections::HashSet::new()));
+            if *for_frame != frame {
+                set.clear();
+                *for_frame = frame;
+            }
+            add(C::CbAsked, 1);
+            if set.insert((*address, *size)) {
+                add(C::CbDistinct, 1);
+                add(C::CbStageBytes, u64::from(size.next_multiple_of(256)));
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The descriptor itself.
