@@ -150,7 +150,9 @@ pub(crate) enum C {
     WaitsForBuffers,
     IndirectBounded,
 }
-const COUNTERS: usize = 80;
+/// One slot per [`C`], so a counter added to the enum cannot index past the
+/// array that holds it (it did: 80 slots for 82 variants aborted the title).
+const COUNTERS: usize = C::IndirectBounded as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
