@@ -3015,9 +3015,16 @@ fn coalesce(refreshes: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, u
         Vec::with_capacity(refreshes.len());
     for (shadow, from, to) in refreshes.drain(..) {
         let mut joined = false;
+        // A copy that is not write-watched cannot tell which of the joined
+        // range's pages the title wrote: `Shadow::update` falls through to
+        // copying the whole envelope, so a 64 KiB gap would read up to 16
+        // pages nobody asked for and dirty as many of our own. Only a copy
+        // whose write watch answers gets the gap (`VICTORY_COALESCE_UNWATCHED`
+        // sets it, in bytes; 0 by default).
+        let gap = if shadow.unwatched() { copy_gap_unwatched() } else { COPY_GAP };
         if let Some((last, _, last_to)) = out.last_mut()
             && std::sync::Arc::ptr_eq(last, &shadow)
-            && from <= last_to.saturating_add(COPY_GAP)
+            && from <= last_to.saturating_add(gap)
         {
             *last_to = (*last_to).max(to);
             joined = true;
@@ -3027,6 +3034,19 @@ fn coalesce(refreshes: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, u
         }
     }
     *refreshes = out;
+}
+
+/// The gap under which two refreshes of a copy **without** a write watch are
+/// joined: 0 unless `VICTORY_COALESCE_UNWATCHED` says otherwise, because
+/// every byte between them is read and dirtied for nothing.
+fn copy_gap_unwatched() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_COALESCE_UNWATCHED")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    })
 }
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
