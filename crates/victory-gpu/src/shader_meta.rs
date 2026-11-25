@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
 
@@ -39,21 +39,42 @@ impl MetaStore {
     }
 }
 
-static STORE: OnceLock<RwLock<MetaStore>> = OnceLock::new();
+struct Store {
+    meta: RwLock<MetaStore>,
+    save: Mutex<()>,
+}
+
+impl Store {
+    fn empty() -> Self {
+        Self {
+            meta: RwLock::new(MetaStore::empty()),
+            save: Mutex::new(()),
+        }
+    }
+
+    fn load(dir: &Path) -> Self {
+        Self {
+            meta: RwLock::new(MetaStore::load(dir)),
+            save: Mutex::new(()),
+        }
+    }
+}
+
+static STORE: OnceLock<Store> = OnceLock::new();
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn global_store() -> &'static RwLock<MetaStore> {
-    STORE.get_or_init(|| RwLock::new(MetaStore::empty()))
+fn global_store() -> &'static Store {
+    STORE.get_or_init(Store::empty)
 }
 
 /// Loads `dir/shader-meta.bin` into the global metadata store.
 ///
 /// Missing or corrupt files silently start an empty store.
 pub(crate) fn init(dir: &Path) {
-    let loaded = MetaStore::load(dir);
-    if let Err(lock) = STORE.set(RwLock::new(loaded)) {
-        let mut guard = global_store().write().unwrap_or_else(|e| e.into_inner());
-        *guard = lock.into_inner().unwrap_or_else(|e| e.into_inner());
+    let loaded = Store::load(dir);
+    if let Err(store) = STORE.set(loaded) {
+        let mut guard = global_store().meta.write().unwrap_or_else(|e| e.into_inner());
+        *guard = store.meta.into_inner().unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -72,7 +93,7 @@ pub(crate) fn save(dir: &Path) {
 }
 
 fn get_or_compute_in<F>(
-    store: &RwLock<MetaStore>,
+    store: &Store,
     hash: &[u8; 32],
     compute: F,
 ) -> Result<Vec<UsedResource>, String>
@@ -80,7 +101,7 @@ where
     F: FnOnce() -> Result<Vec<UsedResource>, String>,
 {
     {
-        let guard = store.read().unwrap_or_else(|e| e.into_inner());
+        let guard = store.meta.read().unwrap_or_else(|e| e.into_inner());
         if let Some(used) = guard.map.get(hash) {
             return Ok(used.clone());
         }
@@ -89,7 +110,7 @@ where
     let used = compute()?;
 
     {
-        let mut guard = store.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = store.meta.write().unwrap_or_else(|e| e.into_inner());
         let mut inserted = false;
         guard.map.entry(*hash).or_insert_with(|| {
             inserted = true;
@@ -103,16 +124,22 @@ where
     Ok(used)
 }
 
-fn save_in(store: &RwLock<MetaStore>, dir: &Path) {
+fn save_in(store: &Store, dir: &Path) {
+    save_in_with_hook(store, dir, || {});
+}
+
+fn save_in_with_hook(store: &Store, dir: &Path, before_rename: impl FnOnce()) {
+    let _save_guard = store.save.lock().unwrap_or_else(|e| e.into_inner());
+
     {
-        let guard = store.read().unwrap_or_else(|e| e.into_inner());
+        let guard = store.meta.read().unwrap_or_else(|e| e.into_inner());
         if !guard.dirty {
             return;
         }
     }
 
     let bytes = {
-        let mut guard = store.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = store.meta.write().unwrap_or_else(|e| e.into_inner());
         if !guard.dirty {
             return;
         }
@@ -123,19 +150,25 @@ fn save_in(store: &RwLock<MetaStore>, dir: &Path) {
     let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!("{FILE_NAME}.tmp-{}-{n}", std::process::id()));
     let target = dir.join(FILE_NAME);
-    if let Err(e) = write_atomic(&tmp, &target, &bytes) {
+    if let Err(e) = write_atomic(&tmp, &target, &bytes, before_rename) {
         let _ = std::fs::remove_file(&tmp);
-        let mut guard = store.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = store.meta.write().unwrap_or_else(|e| e.into_inner());
         guard.dirty = true;
         tracing::warn!(path = %target.display(), error = %e, "failed to save shader metadata cache");
     }
 }
 
-fn write_atomic(tmp: &Path, target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_atomic(
+    tmp: &Path,
+    target: &Path,
+    bytes: &[u8],
+    before_rename: impl FnOnce(),
+) -> std::io::Result<()> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(tmp, bytes)?;
+    before_rename();
     std::fs::rename(tmp, target)?;
     Ok(())
 }
@@ -287,6 +320,9 @@ fn decode(bytes: &[u8]) -> Option<MetaMap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+    use tempfile::TempDir;
 
     fn sample_resources() -> Vec<UsedResource> {
         let kinds = [
@@ -356,9 +392,9 @@ mod tests {
 
     #[test]
     fn store_persists_to_disk_and_skips_recompute() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = RwLock::new(MetaStore::load(dir.path()));
-        assert!(!store.read().unwrap().dirty);
+        let dir = TempDir::new().unwrap();
+        let store = Store::load(dir.path());
+        assert!(!store.meta.read().unwrap().dirty);
 
         let hash = [0xABu8; 32];
         let expected = sample_resources();
@@ -371,7 +407,7 @@ mod tests {
         .unwrap();
         assert_eq!(got, expected);
         assert_eq!(runs.load(Ordering::Relaxed), 1);
-        assert!(store.read().unwrap().dirty);
+        assert!(store.meta.read().unwrap().dirty);
 
         let got2 = get_or_compute_in(&store, &hash, || {
             runs.fetch_add(1, Ordering::Relaxed);
@@ -386,12 +422,12 @@ mod tests {
 
         save_in(&store, dir.path());
         assert!(dir.path().join(FILE_NAME).is_file());
-        assert!(!store.read().unwrap().dirty);
+        assert!(!store.meta.read().unwrap().dirty);
 
         save_in(&store, dir.path());
-        assert!(!store.read().unwrap().dirty);
+        assert!(!store.meta.read().unwrap().dirty);
 
-        let reloaded = RwLock::new(MetaStore::load(dir.path()));
+        let reloaded = Store::load(dir.path());
         let got3 = get_or_compute_in(&reloaded, &hash, || {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(Vec::new())
@@ -399,5 +435,54 @@ mod tests {
         .unwrap();
         assert_eq!(got3, expected);
         assert_eq!(runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn concurrent_saves_publish_in_order_and_never_overwrite_newer_entries() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(Store::empty());
+
+        let hash_a = [0xAA; 32];
+        let val_a = sample_resources();
+        get_or_compute_in(&store, &hash_a, || Ok(val_a.clone())).unwrap();
+
+        let (at_rename_tx, at_rename_rx) = mpsc::channel();
+        let (allow_rename_tx, allow_rename_rx) = mpsc::channel();
+
+        let store_worker = Arc::clone(&store);
+        let worker_dir = dir.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            save_in_with_hook(&store_worker, &worker_dir, || {
+                at_rename_tx.send(()).unwrap();
+                allow_rename_rx.recv().unwrap();
+            });
+        });
+
+        at_rename_rx.recv().unwrap();
+
+        let hash_b = [0xBB; 32];
+        let val_b = sample_resources().into_iter().take(2).collect::<Vec<_>>();
+        get_or_compute_in(&store, &hash_b, || Ok(val_b.clone())).unwrap();
+
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::channel();
+        let store_shutdown = Arc::clone(&store);
+        let shutdown_dir = dir.path().to_path_buf();
+        let shutdown = std::thread::spawn(move || {
+            save_in(&store_shutdown, &shutdown_dir);
+            shutdown_done_tx.send(()).unwrap();
+        });
+
+        assert!(shutdown_done_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+
+        allow_rename_tx.send(()).unwrap();
+        worker.join().unwrap();
+        shutdown.join().unwrap();
+        assert!(shutdown_done_rx.recv().is_ok());
+
+        let disk = load_from(&dir.path().join(FILE_NAME)).unwrap();
+        assert_eq!(disk.get(&hash_a), Some(&val_a));
+        assert_eq!(disk.get(&hash_b), Some(&val_b));
     }
 }
