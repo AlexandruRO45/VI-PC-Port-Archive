@@ -26,6 +26,7 @@ use super::Shader;
 use super::hold_clock::{CLOCK, HoldClock};
 use super::host::{GraphicsState, HostPipeline, MeshPass1};
 use super::{pressure, telemetry as stats};
+use crate::drop_stats::Reason;
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -36,7 +37,7 @@ pub(crate) struct Pending {
     /// whether a worker took it (it may be in both queues).
     now: AtomicBool,
     taken: AtomicBool,
-    made: OnceLock<Option<HostPipeline>>,
+    made: OnceLock<Result<HostPipeline, Reason>>,
     mesh_pass1: Mutex<Option<MeshPass1>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
@@ -98,7 +99,7 @@ impl Pending {
             kernel_ms = kernel,
             "pipeline made"
         );
-        let _ = self.made.set(made);
+        let _ = self.made.set(made.ok_or(compile.failure));
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -116,29 +117,6 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
     }
     key.update(graphics.map(|g| g.describe()).unwrap_or_default().as_bytes());
     key.finalize().to_hex()[..32].to_owned()
-}
-
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
-#[cfg(feature = "diagnostics")]
-pub(crate) fn missing(p: &Pending) -> Option<String> {
-    match p.made.get() {
-        Some(Some(_)) => None,
-        None => Some("being made".into()),
-        Some(None) => {
-            let failed: Vec<String> = p
-                .shaders
-                .iter()
-                .filter(|s| matches!(s.translated.get(), Some(None)))
-                .map(|s| format!("{} {}", s.stage, s.hash))
-                .collect();
-            Some(if failed.is_empty() {
-                format!("refused {:?}", p.shaders)
-            } else {
-                failed.join(" + ")
-            })
-        }
-    }
 }
 
 /// Logs the library name of the host pipeline this thread just made or
@@ -229,7 +207,7 @@ pub(crate) fn waiting() -> u64 {
 
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
-pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+pub(crate) fn ready(p: &Arc<Pending>) -> Result<&HostPipeline, Reason> {
     // Listed for an early start in later runs from its first use, made or
     // not: one a run never got made is the one it should start early.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -241,7 +219,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, true);
         wait(p, crate::frame::current());
     }
-    p.made.get()?.as_ref()
+    match p.made.get() {
+        Some(Ok(host)) => Ok(host),
+        Some(Err(why)) => Err(*why),
+        None => Err(Reason::PipelinePending),
+    }
 }
 
 /// Queues `p` for the workers: once, and once more ahead of the early
@@ -352,13 +334,27 @@ pub(super) struct Compile<'a> {
     mode: CompileMode,
     requested: Option<&'a AtomicBool>,
     deferred: Option<Deferred>,
+    failure: Reason,
     /// Pass 1, if pass 2 was deferred. Tied to a single pending pipeline.
     pub(super) mesh_pass1: Option<MeshPass1>,
 }
 
 impl Compile<'_> {
     pub(super) fn new(mode: CompileMode) -> Self {
-        Self { mode, requested: None, deferred: None, mesh_pass1: None }
+        Self {
+            mode,
+            requested: None,
+            deferred: None,
+            failure: Reason::PipelineRefused,
+            mesh_pass1: None,
+        }
+    }
+
+    pub(super) fn translation<T>(&mut self, translated: Option<T>) -> Option<T> {
+        if translated.is_none() {
+            self.failure = Reason::ShaderTranslation;
+        }
+        translated
     }
 
     fn defer_for_memory(&mut self, paused: bool) -> bool {
@@ -807,7 +803,7 @@ mod tests {
         wait_pending(&pending, Instant::now(), Duration::from_millis(5), Some(&clock));
         assert!(!clock.unoccupied(), "spent time waiting for a pending PSO");
 
-        assert!(pending.made.set(None).is_ok());
+        assert!(pending.made.set(Err(Reason::PipelineRefused)).is_ok());
         let clock = HoldClock::default();
         wait_pending(&pending, Instant::now(), Duration::from_secs(1), Some(&clock));
         assert!(clock.unoccupied(), "PSO already answered");
@@ -818,12 +814,15 @@ mod tests {
     #[test]
     fn first_use_is_made_by_a_worker() {
         let p = Arc::new(Pending::new(Vec::new(), None));
-        assert!(ready(&p).is_none());
+        assert!(matches!(
+            ready(&p),
+            Err(Reason::PipelinePending | Reason::PipelineRefused)
+        ));
         assert!(p.queued.load(Ordering::Relaxed));
         let started = Instant::now();
         while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
             std::thread::yield_now();
         }
-        assert!(matches!(p.made.get(), Some(None)));
+        assert!(matches!(ready(&p), Err(Reason::PipelineRefused)));
     }
 }

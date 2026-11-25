@@ -261,8 +261,16 @@ pub(crate) fn bound(this: This) {
 /// use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+    require_host_pipeline(this).ok()
+}
+
+/// The result of the actual lookup, without a second observation for diagnostics.
+#[cfg(windows)]
+pub(crate) fn require_host_pipeline<'a>(
+    this: This,
+) -> Result<&'a host::HostPipeline, crate::drop_stats::Reason> {
     if this.is_null() {
-        return None;
+        return Err(crate::drop_stats::Reason::NoPipelineSet);
     }
     make::ready(&pipeline(this).host)
 }
@@ -272,11 +280,6 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 pub(crate) fn making() -> u64 {
     make::waiting()
 }
-
-/// Draws and dispatches dropped since the last [`take_drops`], by reason
-/// (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -327,41 +330,6 @@ pub(crate) fn shaders_of(this: This) -> String {
         return "no pipeline".into();
     }
     format!("{:?}", pipeline(this).shaders)
-}
-
-/// Counts a draw or dispatch of `this` intentionally skipped or dropped
-/// for want of a host pipeline (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn note_drop(this: This) {
-    let why = if this.is_null() {
-        Some("no pipeline set".to_owned())
-    } else {
-        let p = pipeline(this);
-        skipped_shader(p)
-            .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
-    };
-    if let Some(why) = why {
-        note_why(why);
-    }
-}
-
-/// Counts a draw or dispatch dropped for `why` (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn note_why(why: String) {
-    let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
-}
-
-/// The drops counted since the last call, most first (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn take_drops() -> Vec<(String, u64)> {
-    let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
-    // Frame reports only show the first 40 reasons. Keep ties ordered so
-    // a HashMap iteration order change cannot change which reasons appear.
-    drops.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    drops
 }
 
 /// The stage's container, if it has one.

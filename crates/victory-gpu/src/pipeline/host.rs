@@ -398,7 +398,7 @@ impl HostPipeline {
         };
         let host = host()?;
         if let Some(ps) = find("pixel")
-            && !pixel_features_supported(&ps.translated()?.host.dxil, || {
+            && !pixel_features_supported(&compile.translation(ps.translated())?.host.dxil, || {
                 host.barycentrics_supported()
             })
         {
@@ -413,7 +413,7 @@ impl HostPipeline {
             return mesh_fallback(ms, find("pixel"), g?, shaders, compile);
         }
         for (s, _) in &stages {
-            s.translated()?;
+            compile.translation(s.translated())?;
         }
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
         let atomics64 = stages.iter().any(|(s, _)| {
@@ -804,9 +804,9 @@ fn mesh_fallback(
     shaders: &[Arc<Shader>],
     compile: &mut super::make::Compile<'_>,
 ) -> Option<HostPipeline> {
-    let (cs, layout) = ms.mesh_fallback()?;
+    let (cs, layout) = compile.translation(ms.mesh_fallback())?;
     let pixel = match ps {
-        Some(ps) => Some(ps.translated()?),
+        Some(ps) => Some(compile.translation(ps.translated())?),
         None => None,
     };
     let vs =

@@ -2255,8 +2255,7 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
-    #[cfg(feature = "diagnostics")]
-    copy_stats_frames: u64,
+    logged_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
@@ -2269,8 +2268,7 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
-            #[cfg(feature = "diagnostics")]
-            copy_stats_frames: 0,
+            logged_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
@@ -2285,10 +2283,7 @@ impl Meter {
         crate::memory::log_frame();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
-        #[cfg(feature = "diagnostics")]
-        {
-            self.copy_stats_frames += 1;
-        }
+        self.logged_frames += 1;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -2310,23 +2305,18 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
-        let dropped = crate::draw::take_dropped() as f64 / frames;
-        let indirect = crate::list::take_indirect() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
-        // Over the same frames as the counts above.
-        #[cfg(feature = "diagnostics")]
-        let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            let logged_frames = std::mem::take(&mut self.logged_frames);
+            crate::drop_stats::log(logged_frames);
             crate::pipeline::library::trim_idle();
             tracing::info!(bytes = SCRATCH_BYTES.load(Ordering::Relaxed), "list scratch upload chunks");
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
-                 dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
-                making = crate::pipeline::making()
+                 GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame; \
+                 {root_views:.0} root-view slots/frame"
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             tracing::info!(
@@ -2340,16 +2330,10 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
-                let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
-                crate::copystat::log(copy_frames);
-                crate::bindless::log(copy_frames);
-                crate::shadow::log_views(copy_frames);
-                for (why, n) in drops.iter().take(40) {
-                    tracing::info!(
-                        "dropped {:.1}/frame without a host pipeline: {why}",
-                        *n as f64 / frames
-                    );
-                }
+                let logged_frames = logged_frames as f64;
+                crate::copystat::log(logged_frames);
+                crate::bindless::log(logged_frames);
+                crate::shadow::log_views(logged_frames);
             }
         }
         if self.caption.is_none() {

@@ -154,6 +154,39 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
     f(&list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// Runs one host draw/dispatch and captures its result at the command boundary.
+#[cfg(windows)]
+fn host_draw(
+    this: This,
+    _name: &'static str,
+    _kind: crate::drop_stats::Kind,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State) -> crate::drop_stats::Outcome,
+) -> crate::drop_stats::Outcome {
+    let mut outcome = Err(crate::drop_stats::Reason::NoHostList);
+    with_state(this, |list, state| {
+        outcome = f(list, state);
+        #[cfg(feature = "diagnostics")]
+        if let Err(why) = outcome {
+            state.note_dropped(
+                list, _name, why, matches!(_kind, crate::drop_stats::Kind::Direct),
+            );
+        }
+    });
+    outcome
+}
+
+#[cfg(windows)]
+fn direct_draw(
+    this: This,
+    name: &'static str,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State) -> crate::drop_stats::Outcome,
+) {
+    use crate::drop_stats::{self, Kind};
+    if let Err(why) = host_draw(this, name, Kind::Direct, f) {
+        drop_stats::record(Kind::Direct, why);
+    }
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
@@ -1208,13 +1241,13 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        super::direct_draw(this, "draw", |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        super::direct_draw(this, "dispatch", |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -1224,7 +1257,7 @@ mod state {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        super::direct_draw(this, "mesh", |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -1240,9 +1273,11 @@ mod state {
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            use crate::drop_stats::{self, Kind, Reason};
+            drop_stats::record(Kind::Indirect, Reason::Unsupported("DispatchMeshX indirect"));
             return;
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        super::direct_draw(this, "mesh", |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -1253,7 +1288,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        super::direct_draw(this, "indexed", |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
     }
@@ -1320,33 +1355,45 @@ extern "system" fn execute_indirect(
 ) {
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
+        #[cfg(windows)]
+        crate::drop_stats::record(
+            crate::drop_stats::Kind::Indirect,
+            crate::drop_stats::Reason::Indirect("signature layout unavailable"),
+        );
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
-    let mut ran = false;
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
-        && (count.is_null() || counter.is_some())
     {
-        const DISPATCH: u32 = 2;
-        const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
-        });
-    } else {
-        #[cfg(all(windows, feature = "diagnostics"))]
-        crate::pipeline::note_why(format!(
-            "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
-            address.is_some(),
-            count.is_null() || counter.is_some()
-        ));
+        use crate::drop_stats::{self, Kind, Reason};
+        let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+        let outcome = match (args, address, count.is_null() || counter.is_some()) {
+            ([[kind, ..]], Some(address), true) => {
+                const DISPATCH: u32 = 2;
+                const DISPATCH_SINGLE: u32 = 105;
+                let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+                let name = match kind {
+                    0 => "indirect draw",
+                    1 => "indirect indexed",
+                    DISPATCH => "indirect dispatch",
+                    10 => "indirect mesh",
+                    _ => "indirect",
+                };
+                host_draw(this, name, Kind::Indirect, |list, s| {
+                    s.execute_indirect(list, (kind, stride, max), address, counter)
+                })
+            }
+            (_, None, _) => Err(Reason::Indirect("argument resource is not a buffer")),
+            (_, _, false) => Err(Reason::Indirect("count resource is not a buffer")),
+            _ => Err(Reason::Unsupported("indirect signature layout")),
+        };
+        match outcome {
+            Ok(()) => return,
+            Err(why) => drop_stats::record(Kind::Indirect, why),
+        }
     }
-    if ran {
-        return;
-    }
-    INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(windows))]
+    let _ = (this, count_offset);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {
@@ -1362,11 +1409,6 @@ extern "system" fn execute_indirect(
     }
 }
 
-/// Indirect executions dropped since the last call.
-pub(crate) fn take_indirect() -> u64 {
-    INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
-}
-static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }

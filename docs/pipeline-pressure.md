@@ -20,3 +20,18 @@ can still obtain a cache hit; a draw/dispatch can promote a deferred job.
 Urgent work, the existing large-PSO lane limits, and the wait budget are
 unchanged. A compile already inside the driver is not interrupted. The
 standalone `translate --cache --pipelines` command does not use this gate.
+
+## Dropped host commands
+
+`host draw/dispatch drops` reports exact counts of direct and indirect
+commands dropped since the previous report, with `frames` giving the
+number of presents in that window. The `host draw/dispatch drop reason`
+lines sum to each total. One indirect command counts once even when it
+would execute many records. A native or fallback draw can fail during
+binding or scratch allocation even if the PSO is ready.
+
+`PipelinePending` means the PSO was not ready when that command tried to
+use it. `outstanding_psos` is a separate snapshot at report time, so it
+may read zero after a window with pending-PSO drops. Translation and
+terminal pipeline refusals have separate reasons; resource or binding
+failures are not reported as missing PSOs.
