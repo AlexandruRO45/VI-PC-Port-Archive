@@ -78,6 +78,15 @@ pub(crate) mod flags {
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
+    /// A `double` in the module, either way: `fptrunc` (`v_cvt_f32_f64`) and
+    /// `fpext` (`v_cvt_f64_f32`) both need it. The validator refuses a module
+    /// whose `SFI0` does not declare it — "Flags must match usage" — and the
+    /// declaration is `D3D_SHADER_FEATURE_DOUBLES`, `0x1`.
+    ///
+    /// `v_cvt_f64_f32` needs `flags::INT64` as well: its result is taken as
+    /// an `i64` to split into the pair, and the validator asks for that bit
+    /// too (`0x100000` is what it named when it was missing).
+    pub const DOUBLES: u64 = 1 << 2;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
@@ -89,6 +98,9 @@ pub(crate) struct Types {
     pub i1: Ty,
     pub i32: Ty,
     pub f32: Ty,
+    /// LLVM `double`: two VGPRs, used only by `v_cvt_f32_f64` and
+    /// `v_cvt_f64_f32`.
+    pub f64: Ty,
     pub handle: Ty,
     pub props: Ty,
     pub bind: Ty,
@@ -170,6 +182,7 @@ impl Shader {
         let i8 = m.int(8);
         let i32 = m.int(32);
         let f32 = m.float();
+        let f64 = m.double();
         let i8p = m.ptr(i8);
         let handle = m.named_struct("dx.types.Handle", vec![i8p]);
         let props = m.named_struct("dx.types.ResourceProperties", vec![i32, i32]);
@@ -187,6 +200,7 @@ impl Shader {
                 i1,
                 i32,
                 f32,
+                f64,
                 handle,
                 props,
                 bind,
@@ -402,7 +416,14 @@ impl Shader {
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
             let i32t = self.t.i32;
-            let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, null]);
+            let v = self.op(
+                block,
+                "binary.i32",
+                Attr::ReadNone,
+                i32t,
+                40,
+                &[index, null],
+            );
             self.m.tag(v, super::bitcode::Tag::Clamp);
             v
         } else if sampler {
@@ -413,7 +434,14 @@ impl Shader {
             // heap smaller than 2,048 would need.
             let last = self.m.i32(2047);
             let i32t = self.t.i32;
-            let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+            let v = self.op(
+                block,
+                "binary.i32",
+                Attr::ReadNone,
+                i32t,
+                40,
+                &[index, last],
+            );
             self.m.tag(v, super::bitcode::Tag::Clamp);
             v
         } else {
@@ -783,6 +811,11 @@ impl Shader {
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
+        }
+        if self.flags & flags::DOUBLES != 0 {
+            // `D3D_SHADER_FEATURE_DOUBLES`, d3dcommon.h: 0x1. Every other
+            // value in this list is that enum's, so this one is too.
+            features |= 0x1;
         }
         if self.flags & flags::BARYCENTRICS != 0 {
             features |= 0x2_0000;
