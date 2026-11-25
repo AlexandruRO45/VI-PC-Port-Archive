@@ -172,18 +172,7 @@ fn a_guard_added_after_query_is_never_retried() {
     for_mapped_write_regions(title.0 as usize, src.len(), |at, n| {
         attempts += 1;
         protect(title.0, PAGE_READWRITE | PAGE_GUARD);
-        let mut done = 0;
-        // SAFETY: the source is a local byte. The kernel checks the destination.
-        let ok = unsafe {
-            WriteProcessMemory(
-                GetCurrentProcess(),
-                at as _,
-                src.as_ptr().cast(),
-                n,
-                &mut done,
-            )
-        };
-        assert_eq!((ok, done), (0, 0));
+        assert!(!super::read(src.as_ptr(), at as *mut u8, n));
     });
     assert_eq!(attempts, 1);
     protect(title.0, PAGE_READWRITE);
