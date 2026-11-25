@@ -80,7 +80,8 @@ enum Command {
     Translate {
         paths: Vec<PathBuf>,
         /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
-        /// else the newest Windows SDK's).
+        /// else the newest Windows SDK's). A validator before 1.8 calls a
+        /// shader with a repeated semantic name invalid (#1945).
         #[arg(long)]
         validate: bool,
         /// Also create a host D3D12 pipeline for each emitted shader. With
