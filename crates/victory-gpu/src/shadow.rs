@@ -427,7 +427,10 @@ impl Shadow {
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
-    pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
+    /// `holes` are title addresses `[from, to)` inside the page whose bytes
+    /// stay as they are, in title memory and in the copy (a withheld range:
+    /// `keep_writes`).
+    pub(crate) fn copy_back_marked(&self, page: usize, holes: &[(usize, usize)]) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -451,14 +454,33 @@ impl Shadow {
         if !crate::host::read_into(from as *const u8, &mut title) {
             return 0;
         }
+        let held = |i: usize| holes.iter().any(|&(a, b)| a <= from + i && from + i < b);
         let written = match &saved {
             // The title's bytes are the copy's from before: what differs is
             // the shaders'.
-            None => (*host != title[..]).then_some(host.as_ptr()),
+            None if holes.is_empty() => (*host != title[..]).then_some(host.as_ptr()),
+            None => {
+                let mut changed = false;
+                for (i, (t, h)) in title.iter_mut().zip(host.iter()).enumerate() {
+                    if !held(i) && *t != *h {
+                        *t = *h;
+                        changed = true;
+                    }
+                }
+                changed.then_some(title.as_ptr())
+            }
             Some(before) => {
                 let before = &before[from - page..to - page];
                 let mut changed = false;
-                for ((t, h), b) in title.iter_mut().zip(host.iter_mut()).zip(before) {
+                for (i, ((t, h), b)) in title
+                    .iter_mut()
+                    .zip(host.iter_mut())
+                    .zip(before)
+                    .enumerate()
+                {
+                    if held(i) {
+                        continue;
+                    }
                     if *h != *b && *t != *h {
                         *t = *h;
                         changed = true;
@@ -473,6 +495,8 @@ impl Shadow {
             crate::host::write_mapped(from as *mut u8, bytes, n);
         }
         // Equal to title memory now: taken, unless it holds the page in part.
+        // Withheld bytes stay the copy's, as `keep_writes` leaves them (and
+        // as a withheld page was left before).
         if from == page && to == page + PAGE {
             t.taken(&[page / PAGE]);
         }
@@ -761,13 +785,16 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
             .collect()
     };
     for (copy, page) in pages {
-        if withheld
+        // A withheld range keeps its bytes out of title memory; the rest of
+        // the page (another list's valid write, say) still goes back. One
+        // page bit cannot tell whose write a byte is, so only the bytes
+        // inside withheld ranges are held, not the page.
+        let holes: Vec<(usize, usize)> = withheld
             .iter()
-            .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
-        {
-            continue;
-        }
-        let written = copy.copy_back_marked(page);
+            .filter(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
+            .map(|&(_, a, n)| (a.max(page), (a + n).min(page + PAGE)))
+            .collect();
+        let written = copy.copy_back_marked(page, &holes);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
@@ -1140,6 +1167,75 @@ mod tests {
         let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
+        unregister(p, p as u64);
+    }
+
+    /// A withheld range (a list whose shaders read memory with no copy,
+    /// #1976) keeps its bytes out of title memory, but only its own: another
+    /// list's valid write on the same marked page still goes back, and the
+    /// withheld bytes stay in the copy. A withheld range on another page
+    /// leaves this page's write alone.
+    #[test]
+    fn a_withheld_range_holds_only_its_own_bytes_of_a_marked_page() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap()) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        let bits = b.data as *mut u32;
+        let mark = |page: usize| {
+            let n = base + page;
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *bits.add(n / 32) |= 1 << (n % 32) };
+        };
+        let title = |at: usize| -> [u8; 4] {
+            let mut v = [0; 4];
+            for (i, x) in v.iter_mut().enumerate() {
+                // SAFETY: bytes of our pool.
+                *x = unsafe { ((p + at + i) as *const u8).read_volatile() };
+            }
+            v
+        };
+        let host = |at: usize| -> [u8; 4] {
+            let mut v = [0; 4];
+            // SAFETY: inside the copy's mapping.
+            unsafe { std::ptr::copy_nonoverlapping(copy.data.add(at), v.as_mut_ptr(), 4) };
+            v
+        };
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        // List A writes at 64 (valid), list B at 256 (withheld); one page.
+        copy.write_host((p + 64) as u64, &[0x5a; 4]);
+        copy.write_host((p + 256) as u64, &[0xa5; 4]);
+        mark(0);
+        copy_back_marks(&[(copy.clone(), p + 256, 4)]);
+        assert_eq!(
+            title(64),
+            [0x5a; 4],
+            "the valid write on the shared page goes back"
+        );
+        assert_eq!(title(256), [0; 4], "the withheld write does not");
+        assert_eq!(host(256), [0xa5; 4], "and the copy keeps it");
+        // B on the next page instead: A's page goes back whole.
+        copy.writing(p, len, true);
+        copy.write_host((p + 128) as u64, &[0x3c; 4]);
+        copy.write_host((p + PAGE + 256) as u64, &[0xc3; 4]);
+        mark(0);
+        mark(1);
+        copy_back_marks(&[(copy.clone(), p + PAGE + 256, 4)]);
+        assert_eq!(title(128), [0x3c; 4]);
+        assert_eq!(title(PAGE + 256), [0; 4]);
+        // Nothing withheld: both pages' writes go back.
+        copy.writing(p, len, true);
+        copy.write_host((p + 512) as u64, &[0x77; 4]);
+        copy.write_host((p + PAGE + 512) as u64, &[0x88; 4]);
+        mark(0);
+        mark(1);
+        copy_back_marks(&[]);
+        assert_eq!((title(512), title(PAGE + 512)), ([0x77; 4], [0x88; 4]));
         unregister(p, p as u64);
     }
 
