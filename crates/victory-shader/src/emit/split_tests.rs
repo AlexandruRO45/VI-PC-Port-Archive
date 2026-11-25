@@ -545,9 +545,33 @@ fn sgpr_spills_across_a_divergent_branch_stay_per_lane() {
         lanes_min: 32,
         lanes_max: 32,
     };
-    for target in [super::Target::ANY, wave32] {
+    // Main's per-lane form: the console's wave size where the host runs it
+    // (the lane writes emulated), none on a 32-lane host. Both are the
+    // first pass's: it does not ask for the console flow.
+    let code = crate::ir::build(&p.code, p.wave64, p.vgprs).unwrap();
+    let st = crate::structure::structure(&code).unwrap();
+    let res = crate::resource::track(&code, &p.layout, p.stage, Some(&st)).unwrap();
+    let io = crate::io::raise(&code, &p).unwrap();
+    for (target, want) in [(super::Target::ANY, Some(64)), (wave32, None)] {
         let cs = emit_for(&p, target).unwrap();
-        assert_eq!(wave_size(&cs.dxil), None);
+        assert_eq!(wave_size(&cs.dxil), want, "{target:?}");
+        let per_lane = super::lower::lower(&super::lower::Parts {
+            native: &p,
+            p: &code,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            target,
+            console_cf: false,
+            per_lane_only: false,
+            view_marks: false,
+        })
+        .unwrap_or_else(|e| panic!("{target:?}: {e}"));
+        assert_eq!(per_lane.dxil, cs.dxil, "{target:?}");
     }
     let Ok(warp) = Host::new(true) else {
         return;
