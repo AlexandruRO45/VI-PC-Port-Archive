@@ -221,6 +221,17 @@ else
     export VICTORY_NO_WATCHDOG=$no_watchdog
 fi
 
+# Shader caches live outside the prefix so a fresh prefix starts warm:
+# vkd3d-proton's pipeline cache and Mesa's RADV cache both key on the
+# shader bytes, not on the prefix. Without VKD3D_SHADER_CACHE_PATH the
+# vkd3d cache lands in the process cwd (the repo root); without
+# MESA_SHADER_CACHE_DIR Mesa uses ~/.cache/mesa_shader_cache. Both are
+# overridable from the environment.
+shader_cache=${XDG_DATA_HOME:-$HOME/.local/share}/victory/shader-cache
+mkdir -p "$shader_cache/vkd3d" "$shader_cache/mesa"
+export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$shader_cache/vkd3d}
+export MESA_SHADER_CACHE_DIR=${MESA_SHADER_CACHE_DIR:-$shader_cache/mesa}
+
 # MangoHud's Vulkan layer puts fps, frametimes and GPU load on screen —
 # the only view of the world's pace while the mesh layer presents black
 # (docs/proton.md). The system layer answers MANGOHUD=1; MANGOHUD_CONFIG

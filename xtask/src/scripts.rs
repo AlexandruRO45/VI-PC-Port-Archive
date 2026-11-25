@@ -40,7 +40,7 @@ mod tests {
                getcompatpath) printf 'Z:%s\\n' \"$2\" ;;\n\
                waitforexitandrun)\n\
                  shift\n\
-                 printf 'launched %s %s umu=%s overrides=%s copy=%s nowatchdog=%s mangohud=%s\\n' \"$0\" \"$*\" \"${{UMU_ID:-}}\" \"${{WINEDLLOVERRIDES:-}}\" \"${{VICTORY_COPY_MEMORY:-}}\" \"${{VICTORY_NO_WATCHDOG:-}}\" \"${{MANGOHUD:-}}\"\n\
+                 printf 'launched %s %s umu=%s overrides=%s copy=%s nowatchdog=%s mangohud=%s vkd3dcache=%s mesacache=%s\\n' \"$0\" \"$*\" \"${{UMU_ID:-}}\" \"${{WINEDLLOVERRIDES:-}}\" \"${{VICTORY_COPY_MEMORY:-}}\" \"${{VICTORY_NO_WATCHDOG:-}}\" \"${{MANGOHUD:-}}\" \"${{VKD3D_SHADER_CACHE_PATH:-}}\" \"${{MESA_SHADER_CACHE_DIR:-}}\"\n\
                  ;;\n\
                *) printf 'unexpected verb %s\\n' \"$1\" >&2; exit 2 ;;\n\
              esac\n"
@@ -207,7 +207,9 @@ mod tests {
                 .current_dir(root())
                 .env_remove("VICTORY_COPY_MEMORY")
                 .env_remove("VICTORY_NO_WATCHDOG")
-                .env_remove("MANGOHUD");
+                .env_remove("MANGOHUD")
+                .env_remove("VKD3D_SHADER_CACHE_PATH")
+                .env_remove("MESA_SHADER_CACHE_DIR");
             for (key, value) in env {
                 cmd.env(key, value);
             }
@@ -242,7 +244,7 @@ mod tests {
         // --no-mangohud leaves the overlay off; the other defaults stay.
         let stdout = stdout_of(&run(&["--no-mangohud"], &[]));
         assert!(
-            stdout.contains("mangohud=\n"),
+            stdout.contains("mangohud= "),
             "--no-mangohud must leave MANGOHUD unset: {stdout}"
         );
         assert!(
@@ -288,6 +290,63 @@ mod tests {
     }
 
     #[test]
+    fn proton_launcher_shader_caches_live_outside_the_prefix() {
+        let tmp = temp_dir("shader-cache");
+        let prefix = tmp.join("prefix");
+        let exe = tmp.join("victory.exe");
+        fs::write(&exe, b"not a real exe").expect("stand-in exe");
+        let proton = fake_proton(&tmp, &prefix, true);
+        let run = |env: &[(&str, &str)]| {
+            let mut cmd = Command::new("bash");
+            cmd.args(["proton/run.sh", "--prefix"])
+                .arg(&prefix)
+                .arg("--proton")
+                .arg(&proton)
+                .arg("--exe")
+                .arg(&exe)
+                .args(["--", "config"])
+                .current_dir(root())
+                .env_remove("VKD3D_SHADER_CACHE_PATH")
+                .env_remove("MESA_SHADER_CACHE_DIR");
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
+            let out = cmd.output().expect("bash");
+            assert!(
+                out.status.success(),
+                "run failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        // Both caches default outside the prefix, so a fresh prefix starts
+        // warm; the vkd3d one must not land in the repo cwd.
+        let stdout = run(&[]);
+        assert!(
+            stdout.contains("vkd3dcache=") && stdout.contains("/victory/shader-cache/vkd3d"),
+            "vkd3d cache must default outside the prefix: {stdout}"
+        );
+        assert!(
+            stdout.contains("mesacache=") && stdout.contains("/victory/shader-cache/mesa"),
+            "Mesa cache must default outside the prefix: {stdout}"
+        );
+        // The environment keeps its own cache directories.
+        let stdout = run(&[
+            ("VKD3D_SHADER_CACHE_PATH", "/tmp/opencode/vkd3d-elsewhere"),
+            ("MESA_SHADER_CACHE_DIR", "/tmp/opencode/mesa-elsewhere"),
+        ]);
+        assert!(
+            stdout.contains("vkd3dcache=/tmp/opencode/vkd3d-elsewhere"),
+            "the env must keep its vkd3d cache: {stdout}"
+        );
+        assert!(
+            stdout.contains("mesacache=/tmp/opencode/mesa-elsewhere"),
+            "the env must keep its Mesa cache: {stdout}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn proton_launcher_mangohud_is_family_conditional() {
         let tmp = temp_dir("mangohud-family");
         let prefix = tmp.join("prefix");
@@ -326,7 +385,7 @@ mod tests {
         );
         let stdout = run(&valve, &[]);
         assert!(
-            stdout.contains("mangohud=\n"),
+            stdout.contains("mangohud= "),
             "the Valve family must default the overlay off: {stdout}"
         );
         let stdout = run(&valve, &["--mangohud"]);
