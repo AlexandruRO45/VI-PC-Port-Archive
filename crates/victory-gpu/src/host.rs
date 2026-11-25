@@ -4574,6 +4574,7 @@ fn land() {
 /// value while the submitting thread waits for that thread would never
 /// see it.
 fn late_helper() {
+    above_normal();
     let Some(host) = host() else {
         return;
     };
@@ -4621,6 +4622,26 @@ fn late_helper() {
         }
         land();
         crate::queue::release_held(false);
+    }
+}
+
+/// The threads of [`late`] wake the title's threads that wait for the card
+/// and land what it ran: work on the frame's path. At the normal priority
+/// the title leaves its workers at, they took turns for a core with every
+/// other program's threads; a capture with all 32 cores busy (builds) had
+/// the settling thread ready but not running for 542 ms of 580, while the
+/// card and the title waited. One step above normal (the title's submitting
+/// thread runs higher still); `VICTORY_HELPER_PRIORITY=0` keeps them normal.
+fn above_normal() {
+    if std::env::var_os("VICTORY_HELPER_PRIORITY").is_some_and(|v| v == "0") {
+        return;
+    }
+    // SAFETY: a plain call on our own thread.
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+        if let Err(e) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) {
+            tracing::warn!(error = %e, "a helper thread stays at normal priority");
+        }
     }
 }
 
@@ -4718,6 +4739,7 @@ struct RelayFetch {
 /// anything a caller of [`Host::settle`] may hold: resetting the landed
 /// lists and looking at what queues hold are left to [`late_helper`].
 fn relay_worker() {
+    above_normal();
     let Some(host) = host() else {
         return;
     };
