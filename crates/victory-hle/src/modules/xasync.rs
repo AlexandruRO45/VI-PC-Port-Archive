@@ -399,27 +399,36 @@ pub fn XTaskQueueTerminate(
     };
     queue.terminated.store(true, Ordering::Release);
     let owner = Arc::as_ptr(&queue) as usize;
-    let mut others = Vec::new();
+    // This queue's tasks come out of each port; the others keep their FIFO
+    // place in the deque. Partitioning under the port's mutex: a task's
+    // cancellation callback may terminate another queue on the port or
+    // submit new work, and neither may see the other queues' tasks hidden
+    // in a local list (a nested terminate would pass them by, a submit
+    // would overtake them).
+    let mut cancelled = Vec::new();
     for port in &queue.ports {
-        // This queue's tasks out, the others in order.
-        let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
-        // Dispatches waiting on this queue end: nothing more will come.
-        // (Those of other queues on the port see theirs is open and wait
-        // on.) After the lock above, so none misses both flag and wake.
-        port.ready.notify_all();
-        for task in pending {
-            if task.owner == Some(owner) {
-                task.run(true);
-            } else {
-                others.push((Arc::clone(port), task));
+        {
+            let mut tasks = lock(&port.tasks);
+            // Partition in place: this queue's out, the others in order.
+            let mut i = 0;
+            while i < tasks.len() {
+                if tasks[i].owner == Some(owner) {
+                    cancelled.push(tasks.remove(i).unwrap());
+                } else {
+                    i += 1;
+                }
             }
+            // Dispatches waiting on this queue end: nothing more will come.
+            // (Those of other queues on the port see theirs is open and
+            // wait on.) After the lock above, so none misses both flag and
+            // wake.
+            port.ready.notify_all();
         }
     }
-    // Cancellation callbacks may submit again or take locks; these run
+    // Cancellation callbacks may submit again or take locks; they run
     // outside the port locks.
-    for (port, task) in others {
-        lock(&port.tasks).push_back(task);
-        port.ready.notify_one();
+    for task in cancelled {
+        task.run(true);
     }
     if let Some(callback) = callback {
         callback(context);
