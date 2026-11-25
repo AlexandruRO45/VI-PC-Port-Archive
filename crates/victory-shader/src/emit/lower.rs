@@ -1016,7 +1016,9 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
-pub(super) fn host_max_wave() -> u32 {
+/// The host's widest wave, as [`set_host_max_wave`] recorded it (0 if the
+/// host device has not asked yet).
+pub fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
         return lanes;
