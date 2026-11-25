@@ -211,6 +211,9 @@ def archive_request(archive, source, inputs):
 # compute program (CS_Emit_Dynamic_Model_Edge, 7,813 instructions) needs
 # about 18 s at -O0, so a 15 s cap refused it on every boot.
 O0_TIMEOUT = 90
+# Without lifetime markers, the six largest ProjectScarlett compute programs
+# optimised in 17-19 s each on one Ryzen 7 9800X3D core with DXC 1.9.2609.
+CS_OPTIMISED_TIMEOUT = 60
 
 
 def validated_dxil(dxv, output, stage):
@@ -238,11 +241,23 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
             return validated_dxil(dxv, output, stage)
         except (subprocess.TimeoutExpired, ValueError):
             output.unlink(missing_ok=True)
-    # cs_6_6 programs from this boot either finish default optimisation in
-    # under a second or sit in it until the cap. The ones that sit there
-    # compile at -O0 in a few seconds, and the driver optimises that DXIL
-    # again when it builds the pipeline. A request that timed out before goes
-    # straight to -O0 rather than spending the cap again.
+    # The largest ProjectScarlett cs_6_6 programs sit in Jump Threading under
+    # default optimisation, which is why cs_6_6 used -O0. Without lifetime
+    # markers they finish, and the driver compiles the smaller, optimised DXIL
+    # much faster than the -O0 output. A timeout, a DXC error or a DXV
+    # rejection marks the request, which then goes straight to -O0. Warm -O0
+    # entries stay valid, like every other compiler policy change.
+    if target == "cs_6_6" and not (store and store.is_slow(request, target)):
+        try:
+            run_tool([dxc, "-T", target, *entry, "-disable-lifetime-markers",
+                      "-Fo", output, hlsl], timeout=CS_OPTIMISED_TIMEOUT)
+            if not output.exists():
+                raise ValueError("compiler returned no DXIL output")
+            return validated_dxil(dxv, output, stage)
+        except (subprocess.TimeoutExpired, ValueError):
+            output.unlink(missing_ok=True)
+            if store:
+                store.mark_slow(request, target)
     if target == "cs_6_6" or (store and store.is_slow(request, target)):
         run_tool(unoptimised, timeout=O0_TIMEOUT)
         return validated_dxil(dxv, output, stage)
