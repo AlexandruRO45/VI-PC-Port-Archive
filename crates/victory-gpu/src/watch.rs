@@ -235,6 +235,32 @@ impl Guards {
     fn pinned(&self, block: usize) -> bool {
         self.pins.iter().any(|&(from, to, _)| from <= block && block < to)
     }
+
+    /// Removes block range `[from, to)` from active pins, splitting any pin
+    /// that extends past it so neighboring blocks stay pinned. Returns
+    /// whether any pin overlapped `[from, to)`.
+    fn drop_pins(&mut self, from: usize, to: usize) -> bool {
+        if self.pins.is_empty() || from >= to {
+            return false;
+        }
+        let mut changed = false;
+        let mut kept = Vec::with_capacity(self.pins.len());
+        for (p_from, p_to, until) in self.pins.drain(..) {
+            if p_to <= from || p_from >= to {
+                kept.push((p_from, p_to, until));
+            } else {
+                changed = true;
+                if p_from < from {
+                    kept.push((p_from, from, until));
+                }
+                if p_to > to {
+                    kept.push((to, p_to, until));
+                }
+            }
+        }
+        self.pins = kept;
+        changed
+    }
 }
 
 /// Views of one page past which its views are not guarded together (the
@@ -744,17 +770,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let end = at.saturating_add(len);
     {
         let mut g = guards();
-        let blocks: Vec<usize> = g
-            .protected
-            .range(at / BLOCK..end.div_ceil(BLOCK))
-            .copied()
-            .collect();
-        let holes: Vec<usize> = g
-            .holes
-            .range(at / BLOCK..end.div_ceil(BLOCK))
-            .copied()
-            .collect();
-        let changed = !holes.is_empty() || !blocks.is_empty();
+        let (from, to) = (at / BLOCK, end.div_ceil(BLOCK));
+        let blocks: Vec<usize> = g.protected.range(from..to).copied().collect();
+        let holes: Vec<usize> = g.holes.range(from..to).copied().collect();
+        let dropped_pins = g.drop_pins(from, to);
+        let changed = !holes.is_empty() || !blocks.is_empty() || dropped_pins;
         for block in holes {
             g.holes.remove(&block);
         }
@@ -778,7 +798,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
                 )
             };
         }
-        let aliased: Vec<usize> = g.aliased.range(at / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+        let aliased: Vec<usize> = g.aliased.range(from..to).copied().collect();
         for block in aliased {
             g.aliased.remove(&block);
         }
@@ -1157,5 +1177,106 @@ mod tests {
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// `Guards::drop_pins` removes only the remapped blocks from active pins,
+    /// splitting partially overlapping pins and leaving disjoint ones intact.
+    #[test]
+    fn remapping_drops_overlapping_pins_and_keeps_adjacent_ones() {
+        let until = std::time::Instant::now() + PIN;
+        let mut g = Guards {
+            protected: BTreeSet::new(),
+            clean: BTreeSet::new(),
+            holes: BTreeSet::new(),
+            aliased: BTreeSet::new(),
+            pins: vec![
+                (10, 12, until), // disjoint left
+                (14, 18, until), // right side overlaps [16, 20)
+                (17, 19, until), // wholly inside [16, 20)
+                (19, 23, until), // left side overlaps [16, 20)
+                (15, 22, until), // spans across [16, 20), splits into two
+                (25, 27, until), // disjoint right
+            ],
+        };
+        assert!(!g.drop_pins(30, 32));
+        assert!(g.drop_pins(16, 20));
+        assert_eq!(
+            g.pins,
+            vec![
+                (10, 12, until),
+                (14, 16, until),
+                (20, 23, until),
+                (15, 16, until),
+                (20, 22, until),
+                (25, 27, until),
+            ]
+        );
+        for b in 16..20 {
+            assert!(!g.pinned(b), "remapped block {b} must not stay pinned");
+        }
+        assert!(g.pinned(15));
+        assert!(g.pinned(20));
+    }
+
+    /// Unmapping and remapping a view clears any `writing()` pin on its blocks,
+    /// so a later view mapped at the same address is guarded cleanly instead
+    /// of inheriting the stale pin (#174).
+    #[test]
+    fn remapped_view_does_not_inherit_pins_from_earlier_writing() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+            (section, view)
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        writing(view + 100, 13);
+        assert!(guards().pinned(view / BLOCK));
+
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+        }
+        title_memory_remapped(view, 2 * BLOCK);
+        assert!(
+            !guards().pinned(view / BLOCK),
+            "pin must not outlive title_memory_remapped"
+        );
+
+        // Map a fresh view; if it lands at the same address, guarding must
+        // protect it rather than reporting it written on every check.
+        // SAFETY: same live pagefile section, mapped read-write.
+        let view2 = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize };
+        assert_ne!(view2, 0);
+        // First guard protects both blocks (reporting them written once); the
+        // second must see them clean rather than inheriting the stale pin.
+        assert_eq!(
+            guard(view2, view2 + 2 * BLOCK),
+            Some((view2 / PAGE..(view2 + 2 * BLOCK) / PAGE).collect())
+        );
+        assert_eq!(guard(view2, view2 + 2 * BLOCK), Some(Vec::new()));
+
+        // SAFETY: our view and section handle.
+        unsafe {
+            UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view2 as *mut _,
+            });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        title_memory_remapped(view2, 2 * BLOCK);
     }
 }
