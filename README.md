@@ -326,6 +326,12 @@ To compare hardware and software rendering, repeat with
 created. Compare the exception's module and offset, stack frames, and
 preceding messages across the two runs.
 
+## Performance notes
+
+- [Live switches](docs/live-switches.md): compare two settings in one session (`VICTORY_LIVE`, `VICTORY_METER_MS`).
+- [Raw descriptor sync](docs/descriptor-sync.md): what it costs per frame and its switch (`VICTORY_HEAP_SYNC`).
+- [64-lane programs on 32-lane GPUs](docs/wave64-on-wave32.md): the wave-wide form (`VICTORY_WAVE_WIDE_ONLY`).
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
