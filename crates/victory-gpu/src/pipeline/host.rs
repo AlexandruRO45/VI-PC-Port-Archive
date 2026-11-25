@@ -945,6 +945,26 @@ fn mesh_fallback(
             D3D12_ROOT_PARAMETER_TYPE_SRV,
             D3D12_SHADER_VISIBILITY_VERTEX,
         ));
+        #[cfg(feature = "diagnostics")]
+        {
+            static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            let _ = LOGGED.get_or_init(|| {
+                let n = g.targets.NumRenderTargets.min(8) as usize;
+                let masks: Vec<_> = g.blend.RenderTarget[..n]
+                    .iter()
+                    .map(|rt| rt.RenderTargetWriteMask)
+                    .collect();
+                tracing::info!(
+                    ?shaders,
+                    targets = n,
+                    formats = ?&g.targets.RTFormats[..n],
+                    write_masks = ?masks,
+                    independent_blend = g.blend.IndependentBlendEnable.0,
+                    dsv = g.depth_format.0,
+                    "mesh fallback graphics state"
+                );
+            });
+        }
         let (root, blob) = root_signature(device, &params, &samplers, false)?;
         let ps_bytes = pixel.map_or(&[][..], |p| p.host.dxil.as_slice());
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {

@@ -1872,6 +1872,22 @@ impl Host {
         size: (u32, u32),
         scalar_input: Option<&[u32]>,
     ) -> Result<Vec<[f32; 4]>, String> {
+        self.draw_mesh_fallback_targets(fb, ps, 1, groups, base_group, size, scalar_input)
+            .map(|targets| targets.into_iter().next().unwrap_or_default())
+    }
+
+    /// As [`Host::draw_mesh_fallback`], with `targets` render targets bound.
+    pub(super) fn draw_mesh_fallback_targets(
+        &self,
+        fb: &super::MeshFallbackShader,
+        ps: &HostShader,
+        targets: usize,
+        groups: u32,
+        base_group: u32,
+        size: (u32, u32),
+        scalar_input: Option<&[u32]>,
+    ) -> Result<Vec<Vec<[f32; 4]>>, String> {
+        assert!(targets > 0 && targets <= 8);
         let vs =
             super::emit_passthrough_vs(&fb.layout, Some(&ps.dxil)).map_err(|e| e.to_string())?;
         let dev = &self.device;
@@ -2003,37 +2019,42 @@ impl Host {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 None,
             )?;
-            let target = make(
-                D3D12_HEAP_TYPE_DEFAULT,
-                &D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                    Width: u64::from(w),
-                    Height: h,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-                    SampleDesc: DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
-                    },
-                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                    ..Default::default()
-                },
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                Some(&D3D12_CLEAR_VALUE {
-                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-                    Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0; 4] },
-                }),
-            )?;
+            let mut rtvs = Vec::with_capacity(targets);
+            let mut targets_gpu = Vec::with_capacity(targets);
             let rtv_heap: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                    NumDescriptors: 1,
+                    NumDescriptors: targets as u32,
                     ..Default::default()
                 })
                 .map_err(err)?;
-            let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
-            dev.CreateRenderTargetView(&target, None, rtv);
+            let mut at = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+            let increment = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            for _ in 0..targets {
+                let target = make(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: u64::from(w),
+                        Height: h,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    Some(&D3D12_CLEAR_VALUE {
+                        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                        Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0; 4] },
+                    }),
+                )?;
+                dev.CreateRenderTargetView(&target, None, at);
+                rtvs.push(at);
+                targets_gpu.push(target);
+                at.ptr += increment as usize;
+            }
             let rec_gpu = rec.GetGPUVirtualAddress();
 
             let input = if let Some(data) = scalar_input {
@@ -2097,11 +2118,13 @@ impl Host {
             )]);
 
             // Pass 2: pass-through VS pulls from `rec_gpu + base_group * stride`.
-            list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+            for rtv in &rtvs {
+                list.ClearRenderTargetView(*rtv, &[0.0; 4], None);
+            }
             list.SetGraphicsRootSignature(&gfx_root);
             list.SetPipelineState(&gfx_pso);
             list.SetGraphicsRootShaderResourceView(0, rec_gpu + u64::from(base_group) * stride);
-            list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.OMSetRenderTargets(rtvs.len() as u32, Some(rtvs.as_ptr()), false, None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
                 Height: h as f32,
@@ -2115,43 +2138,48 @@ impl Host {
             }]);
             list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             list.DrawInstanced(fb.layout.max_primitives * 3, groups, 0, 0);
-            list.ResourceBarrier(&[transition(
-                &target,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
-
             let pitch = (w as usize * 16).next_multiple_of(256);
-            let readback = make(
-                D3D12_HEAP_TYPE_READBACK,
-                &buf_desc((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-            )?;
-            let dst = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&readback),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-                            Width: w,
-                            Height: h,
-                            Depth: 1,
-                            RowPitch: pitch as u32,
+            let readbacks: Vec<_> = targets_gpu
+                .iter()
+                .map(|target| {
+                    list.ResourceBarrier(&[transition(
+                        target,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    let readback = make(
+                        D3D12_HEAP_TYPE_READBACK,
+                        &buf_desc((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                    )?;
+                    let dst = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&readback),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                                Offset: 0,
+                                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                    Width: w,
+                                    Height: h,
+                                    Depth: 1,
+                                    RowPitch: pitch as u32,
+                                },
+                            },
                         },
-                    },
-                },
-            };
-            let src = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&target),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    SubresourceIndex: 0,
-                },
-            };
-            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                    };
+                    let src = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(target),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: 0,
+                        },
+                    };
+                    list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                    Ok(readback)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
             list.Close().map_err(err)?;
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
@@ -2162,16 +2190,20 @@ impl Host {
                 }
                 std::thread::yield_now();
             }
-            let mut p = std::ptr::null_mut();
-            readback.Map(0, None, Some(&mut p)).map_err(err)?;
-            let mut out = Vec::with_capacity((w * h) as usize);
-            for y in 0..h as usize {
-                out.extend_from_slice(std::slice::from_raw_parts(
-                    p.cast::<u8>().add(y * pitch).cast::<[f32; 4]>(),
-                    w as usize,
-                ));
+            let mut out = Vec::with_capacity(targets);
+            for readback in &readbacks {
+                let mut p = std::ptr::null_mut();
+                readback.Map(0, None, Some(&mut p)).map_err(err)?;
+                let mut pixels = Vec::with_capacity((w * h) as usize);
+                for y in 0..h as usize {
+                    pixels.extend_from_slice(std::slice::from_raw_parts(
+                        p.cast::<u8>().add(y * pitch).cast::<[f32; 4]>(),
+                        w as usize,
+                    ));
+                }
+                readback.Unmap(0, None);
+                out.push(pixels);
             }
-            readback.Unmap(0, None);
             Ok(out)
         }
     }

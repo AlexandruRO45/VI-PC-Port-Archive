@@ -889,6 +889,82 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn test_mrt_ps() -> HostShader {
+        let mut s = Shader::new(true);
+        s.inputs = vec![
+            el("TEXCOORD", 0, 0, 9, 0, 0, 4),
+            SigElement {
+                interp: 1,
+                ..el("TEXCOORD", 1, 0, 5, 1, 0, 1)
+            },
+        ];
+        s.outputs = (0..3)
+            .map(|n| el("SV_Target", n, 16, 9, n, 0, 4))
+            .collect();
+        let (b, k0, k1, iu) = (s.entry, s.m.i32(0), s.m.i32(1), s.m.undef(s.t.i32));
+        let (f32t, i32t, void) = (s.t.f32, s.t.i32, s.t.void);
+        let (c0, fone, fhalf, fquarter, fthreeq, feighth) = (
+            s.m.i8(0),
+            s.m.f32(1.0f32.to_bits()),
+            s.m.f32(0.5f32.to_bits()),
+            s.m.f32(0.25f32.to_bits()),
+            s.m.f32(0.75f32.to_bits()),
+            s.m.f32(0.125f32.to_bits()),
+        );
+        let r = s.op(b, "loadInput.f32", Attr::ReadNone, f32t, 4, &[k0, k0, c0, iu]);
+        let pid = s.op(b, "loadInput.i32", Attr::ReadNone, i32t, 4, &[k1, k0, c0, iu]);
+        let pid = s.m.cast(b, Cast::UiToFp, pid, f32t);
+        let values = [
+            [r, r, r, fone],
+            [pid, fhalf, fquarter, fone],
+            [fthreeq, feighth, pid, fone],
+        ];
+        let target_ids: Vec<_> = (0..3).map(|n| s.m.i32(n)).collect();
+        let cols: Vec<_> = (0..4).map(|n| s.m.i8(n)).collect();
+        for (target, cols_values) in values.into_iter().enumerate() {
+            for (col, value) in cols_values.into_iter().enumerate() {
+                s.op(
+                    b, "storeOutput.f32", Attr::NoUnwind, void, 5,
+                    &[target_ids[target], k0, cols[col], value],
+                );
+            }
+        }
+        s.m.terminate(b, Term::Ret);
+        HostShader {
+            stage: HwStage::Ps,
+            dxil: s.finish(),
+            user_data: vec![],
+            samplers: vec![],
+            static_samplers: vec![],
+            root_cbvs: vec![],
+            root_srvs: vec![],
+            root_uavs: vec![],
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
+            heap: false,
+            heap_writes: false,
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn mesh_fallback_writes_every_render_target() {
+        let host = super::super::host::Host::new(false).expect("hardware SM 6.6 device");
+        let fb = synthetic_mesh(false, 3, 1, false, TRIANGLE);
+        let ps = test_mrt_ps();
+        let targets = host
+            .draw_mesh_fallback_targets(&fb, &ps, 3, 1, 0, (16, 16), None)
+            .unwrap();
+        assert_eq!(targets.len(), 3);
+        let at = 14 * 16 + 2;
+        assert_eq!(targets[0][at], [0.25, 0.25, 0.25, 1.0]);
+        assert_eq!(targets[1][at], [1.0, 0.5, 0.25, 1.0]);
+        assert_eq!(targets[2][at], [0.75, 0.125, 1.0, 1.0]);
+        assert!(targets.iter().all(|pixels| pixels.iter().any(|p| p[3] == 1.0)));
+    }
+
     #[test]
     #[cfg(windows)]
     fn bindless_scalar_load_survives_mesh_fallback() {
