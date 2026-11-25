@@ -152,10 +152,9 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         out.push((label, words[0].clone()));
     }
-    assert!(
-        !out.is_empty(),
-        "neither hardware nor WARP SM 6.6 device available"
-    );
+    if out.is_empty() {
+        eprintln!("no device ran the waterfall (no SM 6.6 device); skipped");
+    }
     out
 }
 

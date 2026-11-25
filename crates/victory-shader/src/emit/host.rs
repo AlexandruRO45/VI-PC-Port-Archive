@@ -129,6 +129,24 @@ impl Host {
         }
     }
 
+    /// Whether this device can run a program that asks for 32-lane waves:
+    /// WARP before Windows 11 and some integrated GPUs report fewer lanes
+    /// (4 or 16) and refuse such a pipeline.
+    pub fn wave32(&self) -> bool {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: a plain device query with a valid out pointer.
+        let ok = unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+        };
+        ok && options.WaveLaneCountMin <= 32 && 32 <= options.WaveLaneCountMax
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.
