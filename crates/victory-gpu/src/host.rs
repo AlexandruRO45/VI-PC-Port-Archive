@@ -2544,6 +2544,7 @@ impl Host {
                 if hdr_fence != 0 {
                     tracing::info!(target: "victory_gpu::hdr_trace", frame, fence = hdr_fence,
                         source_host_texture = ?texture.as_raw(),
+                        source_traced = ?crate::draw::hdr_trace::label(texture.as_raw() as usize),
                         swap_buffer = ?back.as_raw(), index, shown,
                         present_hr = format_args!("{:#x}", result.0),
                         samples = ?hdr.map(|s| s.words()), "actual DXGI Present");

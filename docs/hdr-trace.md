@@ -46,7 +46,9 @@ $env:VICTORY_HDR_TRACE        = '1'
 $env:VICTORY_DEPTH_EQUAL_RELAX = '1'
 $env:VICTORY_CAPTURE          = 'D:\GTA 6\wt\victory-data\captures\hdr-<stamp>'
 $env:VICTORY_CAPTURE_LISTED_ONLY = '1'
-$env:VICTORY_CAPTURE_WORLD    = '1'
+$env:VICTORY_CAPTURE_WORLD    = '2,20,120'
+# comma-separated offsets from the first world frame: one session can
+# compare an early and a settled frame; each selected Present flushes once
 $env:VICTORY_LOG              = 'info,victory_gpu::hdr_trace=info'
 ```
 

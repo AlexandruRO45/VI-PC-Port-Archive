@@ -142,6 +142,8 @@ pub(crate) fn take_frame() -> Vec<String> {
 #[cfg(feature = "diagnostics")]
 impl State {
     pub(crate) fn note_dropped(&self, list: &HostList, kind: &str, why: Reason, direct: bool) {
+        #[cfg(feature = "diagnostics")]
+        hdr_trace::dropped(&crate::pipeline::shaders_of(self.pipeline as This), &format!("{kind} {why:?}"));
         list.note_op(|| format!("DROPPED {kind} ({why:?}) {}", crate::pipeline::shaders_of(self.pipeline as This)));
         if direct && let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
             last.push_str(" DROPPED");
@@ -2246,6 +2248,20 @@ pub(crate) mod hdr_trace {
     }
 
     static PENDING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static BACKINGS: Mutex<Option<std::collections::HashMap<usize, String>>> = Mutex::new(None);
+
+    pub(crate) fn label(backing: usize) -> Option<String> {
+        BACKINGS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&backing).cloned())
+    }
+
+    pub(crate) fn dropped(shaders: &str, why: &str) {
+        if !enabled() { return; }
+        const HASHES: [&str; 7] = ["34fb51b8a0312e82", "68029c67dca01425", "1cd9bc634417a981",
+            "48e74d16cbfa45e3", "df11dcd012cd7382", "7c649c422f6208e4", "5970ee6dbc47ec61"];
+        if !HASHES.iter().any(|h| shaders.contains(h)) { return; }
+        PENDING.lock().unwrap_or_else(|e| e.into_inner())
+            .push(format!("dropped pipeline={shaders} reason={why}"));
+    }
 
     /// Lines kept for the frame now presenting; emitted only if it is the
     /// selected frame, and dropped either way.
@@ -2265,6 +2281,8 @@ pub(crate) mod hdr_trace {
         let mut events = list.hdr.lock().unwrap_or_else(|e| e.into_inner());
         if events.is_empty() { return; }
         let id = list.list.as_raw();
+        let mut labels = BACKINGS.lock().unwrap_or_else(|e| e.into_inner());
+        let labels = labels.get_or_insert_with(std::collections::HashMap::new);
         let mut lines = PENDING.lock().unwrap_or_else(|e| e.into_inner());
         for (op, e) in events.drain(..).enumerate() {
             let stable = e.bindings.iter().all(|b| b.info.is_none() || b.stable());
@@ -2275,6 +2293,9 @@ pub(crate) mod hdr_trace {
                 let expected_f32 = matches!(e.program, Program::Temporal | Program::Diffusion)
                     && e.program.takes_sample(b.slot, b.offset).is_some();
                 let integer = effective.is_some_and(|f| matches!(f, 3|4|7|8|12|14|17|18|25|30|32|36|38|42|43|50|52|57|59|62|64));
+                if let Some(backing) = b.backing.as_ref().map(Interface::as_raw) {
+                    labels.entry(backing as usize).or_insert_with(|| format!("{:?} s{}+{} {:?}", e.program, b.slot, b.offset, b.kind));
+                }
                 lines.push(format!(
                     "view slot={} dwords={} kind={:?} host_slot={} cpu={:#x} object={:#x} memory={:?} requested={:?} effective={:?} generation_at_bind={:?} generation_now={:?} stable={} backing={:?} twin={} null_or_unretained={} sub={:?} expected_f32={} class_mismatch={}",
                     b.slot, b.offset, b.kind, b.host_slot, b.cpu, b.object, b.memory, b.requested,
@@ -2284,6 +2305,7 @@ pub(crate) mod hdr_trace {
                     expected_f32 && integer));
             }
             for (mrt, t) in e.targets.iter().enumerate() {
+                labels.entry(t.backing.as_raw() as usize).or_insert_with(|| format!("{:?} MRT{mrt}", e.program));
                 lines.push(format!("render_target mrt={mrt} object={:#x} backing={:?} effective={:?} sub={:?}",
                     t.object, t.backing.as_raw(), t.format, t.sub));
             }
