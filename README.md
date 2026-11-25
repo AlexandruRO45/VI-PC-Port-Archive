@@ -69,8 +69,11 @@ Keep the build paths short. From a checkout about 170 characters deep, the
 `A1009: line too long`, even with long paths enabled in Windows, because
 its object files land under `target`. Set `CARGO_TARGET_DIR` to a short
 absolute path (`$env:CARGO_TARGET_DIR = 'C:\vt'`; `victory.exe` is then
-in `C:\vt\release` instead of `target\release`), or check out the
-repository nearer the drive's root.
+in `C:\vt\release` instead of `target\release`), check out the repository
+nearer the drive's root, or map a short drive over the checkout
+(`subst V: C:\that\long\path` and clone under `V:\`): the target directory
+is what grows the paths, so any of the three keeps them inside what the
+title's build scripts tolerate.
 
 A run in the world takes about 33 GB of Windows commit (RAM plus paging
 file) and about 10 GB of video memory. The tested machine has 32 GB of RAM
