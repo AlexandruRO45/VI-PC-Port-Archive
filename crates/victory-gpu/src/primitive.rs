@@ -69,7 +69,10 @@ fn components(format: u32) -> Option<(usize, Kind)> {
         54 => (1, Kind::F16),
         11 => (4, Kind::Unorm16),
         35 => (2, Kind::Unorm16),
+        56 => (1, Kind::Unorm16),
         28 | 29 | 87 | 91 => (4, Kind::Unorm8),
+        49 => (2, Kind::Unorm8),
+        61 => (1, Kind::Unorm8),
         _ => return None,
     })
 }
@@ -184,6 +187,24 @@ mod tests {
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x3e00), 1.5);
         assert_eq!(half_to_f32(0xc000), -2.0);
+    }
+
+    #[test]
+    fn compact_unorm_elements_get_the_fourth_corner() {
+        let vertex = |[r, g]: [u8; 2], mono, pad, wide: u16| {
+            let [lo, hi] = wide.to_le_bytes();
+            [r, g, mono, pad, lo, hi]
+        };
+        let src = [
+            vertex([20, 250], 70, 0xcc, 1000),
+            vertex([200, 10], 50, 0xdd, 300),
+            vertex([100, 80], 130, 0xee, 5000),
+        ]
+        .concat();
+        let mut dst = [0; 36];
+        // R8G8_UNORM, R8_UNORM, one padding byte, then R16_UNORM.
+        expand_rects(&src, &mut dst, 6, &[(0, 49), (2, 61), (4, 56)]);
+        assert_eq!(dst[30..], vertex([0, 255], 150, 0xcc, 5700));
     }
 
     /// A rounding that carries out of the mantissa raises the exponent
