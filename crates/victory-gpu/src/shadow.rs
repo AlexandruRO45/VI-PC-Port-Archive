@@ -225,6 +225,20 @@ impl CardNotes {
     /// they are noted with it, and the notes of sends up to `fetched` (no
     /// fetch still to be merged is older) are dropped.
     fn take(&mut self, number: u64, fetched: u64, relay: bool) -> Arc<[(usize, usize)]> {
+        if self.dirty.is_empty() {
+            // Nothing noted since the last send (most copies at most sends:
+            // ~600 copies, ~30 sends a frame, ~20 with notes): nothing to
+            // send, and no allocation for it. The notes of old sends are let
+            // go as below.
+            static NONE: std::sync::LazyLock<Arc<[(usize, usize)]>> = std::sync::LazyLock::new(|| Arc::from(Vec::new()));
+            self.sorted = 0;
+            self.second = 0;
+            self.loose = None;
+            if relay {
+                self.sent.retain(|s| s.0 > fetched);
+            }
+            return NONE.clone();
+        }
         let ranges: Arc<[(usize, usize)]> = joined(std::mem::take(&mut self.dirty)).into();
         self.sorted = 0;
         self.second = 0;

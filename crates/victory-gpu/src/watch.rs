@@ -156,6 +156,12 @@ pub(crate) fn slow_asks() -> [u64; 3] {
     [0, 1, 2].map(|i| SLOW[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
+/// Whether the submission's one asking stands ([`once`]): [`ask_ahead`]
+/// would ask nothing, and [`ask_ahead_done`] would leave the journal as it is.
+pub(crate) fn asking_stands() -> bool {
+    JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).kept
+}
+
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());

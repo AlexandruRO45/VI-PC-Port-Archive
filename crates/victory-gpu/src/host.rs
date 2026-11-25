@@ -9200,8 +9200,10 @@ impl Batch {
     fn flush(&mut self) {
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
-        // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        // not one per copy; none while the submission's one asking stands,
+        // where it would ask nothing (the ranges were gathered and sorted
+        // for every flush only to be dropped).
+        let ahead = self.refreshes.len() > 1 && !crate::watch::asking_stands();
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
