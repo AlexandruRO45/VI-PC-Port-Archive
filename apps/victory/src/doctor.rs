@@ -471,13 +471,15 @@ pub fn to_html(repo: &str, log: &Path, found: &[Failure]) -> String {
         let kind = ["crash", "fatal", "error", "warning"][usize::from(f.severity.min(3))];
         let draft = issue_draft(repo, f);
         let body = draft.split_once("\n\n").map_or(draft.as_str(), |(_, b)| b);
+        let cut = body.chars().count() > 6000;
         let mut body: String = body.chars().take(6000).collect();
-        if body.len() < draft.len() - f.title.len() - 9 {
+        if cut {
             body.push_str("\n(cut: the whole draft is in `victory doctor --draft`)");
         }
+        // The form's title is the draft's: no fault address goes to GitHub.
         let new_issue = format!(
             "https://github.com/{repo}/issues/new?title={}&body={}",
-            encode(&f.title),
+            encode(&public_title(f)),
             encode(&body)
         );
         let search = search_link(repo, f).map_or(String::new(), |l| {
@@ -820,13 +822,44 @@ VIctory: unhandled exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x
             .map(|s| s.split('"').next().unwrap())
             .collect();
         assert_eq!(forms.len(), found.len());
-        for form in forms {
-            assert!(
-                !form.contains("6f225b641c5b0708")
-                    && !form.contains("11223344")
-                    && !form.contains("peek")
-            );
+        for form in &forms {
+            for secret in [
+                "6f225b641c5b0708",
+                "11223344",
+                "peek",
+                "7ffe12345678",
+                "1a2b3c4d00",
+            ] {
+                assert!(!form.contains(secret), "{secret} in the form: {form}");
+            }
         }
+        // The crash's form title, decoded, keeps the access kind only.
+        let title = forms
+            .iter()
+            .filter_map(|f| f.strip_prefix("title=")?.split("&amp;").next())
+            .map(decode)
+            .find(|t| t.starts_with("Crash"))
+            .unwrap();
+        assert_eq!(title, "Crash: access violation at image+0x23cf683 (write)");
+    }
+
+    /// A query value back from [`encode`].
+    fn decode(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'+' => out.push(b' '),
+                b'%' if i + 2 < b.len() => {
+                    out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
+                    i += 2;
+                }
+                c => out.push(c),
+            }
+            i += 1;
+        }
+        String::from_utf8(out).unwrap()
     }
 
     #[test]
