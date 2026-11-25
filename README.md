@@ -42,6 +42,9 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 (a DualShock/DualSense through DS4Windows works). With no pad connected the
 keyboard acts as one while the game window has focus.
 
+The script exits with `victory.exe`'s own exit code, so `$LASTEXITCODE` after
+it tells a batch run whether the launch worked.
+
 ## Faster settings (optional, off by default)
 
 `VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1` cut frame
@@ -57,6 +60,31 @@ time on the test machines. Set them in PowerShell before running the script.
 | `VICTORY_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built |
 
 Diagnostics build: `cargo build --profile diag -p victory --features diagnostics`
+
+### Running with captures or scripted input
+
+`scripts\play.ps1` clears `VICTORY_CAPTURE`, `VICTORY_CAPTURE_FRAMES`,
+`VICTORY_DUMP_TARGETS` and `VICTORY_KEYS` by default, because a normal run
+should not capture or press anything. Pass `-Capture` to keep the capture
+variables, `-Keys` to keep the key schedule, or `-KeepScriptedInput` for both:
+
+```powershell
+$env:VICTORY_CAPTURE = "$env:TEMP\ztrx-captures"
+$env:VICTORY_CAPTURE_FRAMES = '60,120'
+powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<exe>" -Capture
+```
+
+Or run the diagnostics build directly, which the script is not involved in:
+
+```powershell
+cargo build --profile diag -p victory --features diagnostics
+$env:VICTORY_CAPTURE = "$env:TEMP\ztrx-captures"
+$env:VICTORY_CAPTURE_FRAMES = '60,120'
+& .\target\diag\victory.exe run '<path to executable>' --execute
+```
+
+Set `VICTORY_CACHE_DIR` and `VICTORY_DATA_DIR` to your `-Cache` and `-Data`
+paths to share the launcher's cache and saves.
 
 ## License
 
