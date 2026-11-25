@@ -10699,9 +10699,9 @@ mod tests {
             S_ENDPGM,
         ];
         let out = lowered(&words, 1 << 15).unwrap();
-        // Drivers do not implement `wavePrefixOp` kinds 2 and 3 (hardware
-        // readback on PR #470), so the min prefix must lower to a
-        // `WaveReadLaneAt` scan instead.
+        // Drivers do not implement `wavePrefixOp` kinds 2 and 3 (a hardware
+        // readback run showed no prefix min or max), so the min prefix must
+        // lower to a `WaveReadLaneAt` scan instead.
         assert_eq!(out.prefix_scans, 1, "a min prefix must scan, not prefix-op");
         // The scan ballots the active lanes, so an inactive source lane takes
         // the identity instead of an undefined `WaveReadLaneAt`.
@@ -10717,7 +10717,7 @@ mod tests {
         }
     }
 
-#[test]
+    #[test]
     fn a_value_no_lane_from_its_edge_reads_needs_no_form() {
         // s6 is a timestamp (no DXIL form) where the load is skipped and 5
         // where it runs; a flag in v1, set only with the load, guards the
