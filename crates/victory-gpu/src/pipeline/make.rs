@@ -29,6 +29,8 @@ pub(crate) struct Pending {
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
+    // Only waiters for this pipeline are notified when it completes.
+    done: (Mutex<()>, Condvar),
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -54,6 +56,7 @@ impl Pending {
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
+            done: (Mutex::new(()), Condvar::new()),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
@@ -62,9 +65,27 @@ impl Pending {
     fn make(&self) {
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
-        let (lock, done) = &DONE;
+        self.notify_done();
+    }
+
+    fn notify_done(&self) {
+        let (lock, done) = &self.done;
+        // Pair with the predicate check under the same lock to avoid a
+        // missed wake if completion races with a waiter going to sleep.
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+
+    fn wait_until_made(&self, started: Instant, left: Duration) {
+        let (lock, done) = &self.done;
+        let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while self.made.get().is_none() {
+            let rest = left.saturating_sub(started.elapsed());
+            if rest.is_zero() {
+                break;
+            }
+            held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        }
     }
 }
 
@@ -90,9 +111,6 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
         }
     }
 }
-
-/// Signalled whenever a worker has made a pipeline.
-static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
@@ -184,16 +202,7 @@ fn wait(p: &Pending, frame: u64) {
         return;
     }
     let started = Instant::now();
-    let (lock, done) = &DONE;
-    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
-        let rest = left.saturating_sub(started.elapsed());
-        if rest.is_zero() {
-            break;
-        }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
-    }
-    drop(held);
+    p.wait_until_made(started, left);
     let waited = started.elapsed().min(left);
     {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
@@ -361,6 +370,34 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn completion_waits_are_local_to_each_pipeline() {
+        let a = Pending::new(Vec::new(), None);
+        let b = Pending::new(Vec::new(), None);
+        let _held = a.done.0.lock().unwrap();
+        // Holding one pipeline's wait lock must not block another one.
+        assert!(b.done.0.try_lock().is_ok());
+        assert!(b.made.set(None).is_ok());
+        b.notify_done();
+        b.wait_until_made(Instant::now(), Duration::ZERO);
+        assert!(matches!(b.made.get(), Some(None)));
+        assert!(a.made.get().is_none());
+    }
+
+    #[test]
+    fn completion_racing_with_wait_is_not_lost() {
+        let p = Pending::new(Vec::new(), None);
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                p.wait_until_made(Instant::now(), Duration::from_secs(2));
+                assert!(matches!(p.made.get(), Some(None)));
+            });
+            assert!(p.made.set(None).is_ok());
+            p.notify_done();
+            waiter.join().unwrap();
+        });
     }
 
     #[test]
