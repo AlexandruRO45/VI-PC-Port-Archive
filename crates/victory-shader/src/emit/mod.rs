@@ -230,9 +230,10 @@ pub fn loop_limit() -> u32 {
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. The constant and the counter are `i32` in the emitted
-/// code and compared unsigned, so a value from 2^31 up would behave like no
-/// limit at all (two billion iterations, the hang the limit exists for):
-/// it is clamped to [`i32::MAX`]. Pure, for testing.
+/// code, so the value is clamped to [`i32::MAX`] to stay inside it. The
+/// compare itself is unsigned (`IULT`/`IUGE`), so a value from 2^31 up is a
+/// large count rather than a negative one; the clamp only keeps the
+/// constant representable. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
     let parsed = value.map(str::trim).and_then(|v| {
         let hex = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X"));
@@ -579,7 +580,7 @@ mod tests {
         assert_eq!(parse_loop_limit(Some("0X20")), 32);
         assert_eq!(parse_loop_limit(Some("\t256\n")), 256);
         assert_eq!(parse_loop_limit(Some("1")), 1);
-        // The count is an i32 in the emitted code: no negative limit.
+        // The constant is an i32 in the emitted code: 2^31 and up clamp to it.
         assert_eq!(parse_loop_limit(Some("2147483647")), i32::MAX as u32);
         assert_eq!(parse_loop_limit(Some("0xFFFFFFFF")), i32::MAX as u32);
         for bad in [
