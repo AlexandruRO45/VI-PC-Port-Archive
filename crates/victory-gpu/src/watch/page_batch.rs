@@ -73,7 +73,7 @@ mod tests {
         busy.swap_remove(0);
         assert_eq!(eligible(&pages, &busy), [0, 6]);
         busy.swap_remove(1);
-        assert_eq!(eligible(&pages, &busy), [0, 5, 6]);
+        assert_eq!(eligible(&pages, &busy), [0, 1, 6]);
     }
 
     #[test]
@@ -85,6 +85,8 @@ mod tests {
                 for &b in &ranges {
                     let busy = [a, b, a, b, (4, 4)];
                     assert_eq!(eligible(&pages, &busy), reference(&pages, &busy));
+                    let large = [5, 4, 3, 2, 1, 0, 4];
+                    assert_eq!(eligible(&large, &busy), reference(&large, &busy));
                 }
             }
         }
