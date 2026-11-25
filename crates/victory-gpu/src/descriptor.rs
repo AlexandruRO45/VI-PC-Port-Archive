@@ -92,6 +92,9 @@ impl Heap {
         {
             return None;
         }
+        if let Some(h) = self.host.get() {
+            return h.as_ref();
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // A recorder can take the fast path as soon as the OnceLock is
         // initialized: queued writes are replayed before it is published,
@@ -140,26 +143,49 @@ static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex
 /// so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
+    mirror_range(handle, 1, 0);
+}
+
+#[cfg(windows)]
+fn mirror_range(dst: u64, count: u32, step: u64) {
+    if count == 0 {
+        return;
+    }
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(&(_, _, at)) = heaps
+    let Some(&(_, end, at)) = heaps
         .iter()
-        .find(|&&(start, end, _)| (start..end).contains(&handle))
+        .find(|&&(start, end, _)| (start..end).contains(&dst))
     else {
         return;
     };
     // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
     // the `SHADER_HEAPS` lock we hold here.
     let heap = unsafe { &*(at as *const Heap) };
-    let Some(index) = heap.index(handle) else {
-        return;
-    };
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
-        None => pending.push(index),
+        None => {
+            for i in 0..u64::from(count) {
+                let h = dst + i * step;
+                if h >= end {
+                    break;
+                }
+                if let Some(index) = heap.index(h) {
+                    pending.push(index);
+                }
+            }
+        }
         Some(host) => {
             drop(pending);
             if let Some(host) = host {
-                host.mirror(index, handle, false);
+                for i in 0..u64::from(count) {
+                    let h = dst + i * step;
+                    if h >= end {
+                        break;
+                    }
+                    if let Some(index) = heap.index(h) {
+                        host.mirror(index, h, false);
+                    }
+                }
             }
         }
     }
@@ -349,7 +375,7 @@ struct Views {
     free: Vec<u32>,
 }
 
-static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
@@ -372,7 +398,7 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let i = match views.index.get(&view) {
         Some(&i) => i,
         None => {
@@ -403,7 +429,7 @@ fn record(handle: u64, view: View) {
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -428,7 +454,7 @@ pub(crate) fn forget(resource: usize) {
 /// stale: one look at the views for all.
 #[cfg(windows)]
 fn stale_views(entries: &[(u32, (u32, u32))]) -> Vec<(u32, (u32, u32))> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     entries
         .iter()
         .filter(|(_, (i, generation))| {
@@ -444,9 +470,26 @@ fn stale_views(entries: &[(u32, (u32, u32))]) -> Vec<(u32, (u32, u32))> {
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
+}
+
+/// Runs `f` on the view recorded at `handle`, if one is (and its resource
+/// is alive), without cloning it.
+#[cfg(windows)]
+pub(crate) fn with_view<R>(handle: u64, f: impl FnOnce(&View) -> R) -> Option<R> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag != VIEW_TAG {
+        return None;
+    }
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let (view, current) = views.list.get(i as usize)?;
+    (*current == generation).then(|| f(view))
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -456,9 +499,12 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    if tag != VIEW_TAG {
+        return None;
+    }
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    (*current == generation).then(|| view.clone())
 }
 
 /// A description of `N` words, if the title passes one.
@@ -564,9 +610,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+        mirror_range(dst, count, step);
     }
 }
 

@@ -412,7 +412,7 @@ pub(crate) fn bound_before(
     if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return None;
     }
-    let (dst, at) = clamps.clamp_room(bytes)?;
+    let (dst, at, bind) = clamps.clamp_room(bytes)?;
     // SAFETY: a live buffer.
     let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
     let constants = [kind, stride, records, args_offset, has_count, count_offset];
@@ -421,13 +421,15 @@ pub(crate) fn bound_before(
     // count, destination (writable: `clamp_room`) and budget buffers. The
     // clamps write apart and charge the budget atomically: no barriers.
     unsafe {
-        l.SetComputeRootSignature(&c.root);
-        l.SetPipelineState(&c.pso);
+        if bind {
+            l.SetComputeRootSignature(&c.root);
+            l.SetPipelineState(&c.pso);
+            l.SetComputeRootUnorderedAccessView(4, budget);
+        }
         l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
         l.SetComputeRootShaderResourceView(1, src_gpu);
         l.SetComputeRootShaderResourceView(2, count_gpu);
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-        l.SetComputeRootUnorderedAccessView(4, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
         // Mode 7: one clamp after another, so that the budget is charged in
         // the order of the draws as it is when each clamp precedes its draw.
