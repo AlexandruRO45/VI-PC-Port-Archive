@@ -18,9 +18,9 @@
 //!
 //! Based on the spill resolution in #54 by alessiodeia.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use crate::gfx10::{Fields, NULL, Operand};
+use crate::gfx10::{Encoding, Fields, NULL, Operand};
 use crate::ir::{Exit, Inst, Program, Reg, Value};
 
 /// Block and instruction index.
@@ -40,7 +40,7 @@ fn const_lane(op: Operand, wave64: bool) -> Option<u32> {
 /// A lane move without modifiers: `v_readlane_b32` or `v_writelane_b32`
 /// with the VGPR operand and the lane.
 fn lane_move<'a>(inst: &'a Inst, name: &str) -> Option<&'a crate::gfx10::Valu> {
-    if inst.name() != name {
+    if inst.machine.encoding != Encoding::Vop3 || inst.name() != name {
         return None;
     }
     let Fields::Valu(v) = &inst.fields else {
@@ -51,24 +51,30 @@ fn lane_move<'a>(inst: &'a Inst, name: &str) -> Option<&'a crate::gfx10::Valu> {
 
 struct Defs {
     /// Defining instruction of each value.
-    site: HashMap<Value, Site>,
+    site: Vec<Option<Site>>,
     /// Block and index of each phi value.
-    phi: HashMap<Value, Site>,
+    phi: Vec<Option<Site>>,
+    /// Whether each value is a program input.
+    input: Vec<bool>,
 }
 
 impl Defs {
-    fn new(p: &Program) -> Self {
+    fn new(p: &Program, n: usize) -> Self {
         let mut d = Defs {
-            site: HashMap::new(),
-            phi: HashMap::new(),
+            site: vec![None; n],
+            phi: vec![None; n],
+            input: vec![false; n],
         };
+        for &(_, v) in &p.inputs {
+            d.input[v.0 as usize] = true;
+        }
         for (b, block) in p.blocks.iter().enumerate() {
             for (i, phi) in block.phis.iter().enumerate() {
-                d.phi.insert(phi.value, (b, i));
+                d.phi[phi.value.0 as usize] = Some((b, i));
             }
             for (i, inst) in block.insts.iter().enumerate() {
                 for &(_, w) in &inst.writes {
-                    d.site.insert(w, (b, i));
+                    d.site[w.0 as usize] = Some((b, i));
                 }
             }
         }
@@ -86,7 +92,7 @@ fn spilled(
     lane: u32,
     seen: &mut Vec<Value>,
 ) -> Option<Option<Value>> {
-    if let Some(&(b, i)) = d.phi.get(&v) {
+    if let Some((b, i)) = d.phi[v.0 as usize] {
         if seen.contains(&v) {
             // A loop back to a join being followed adds nothing.
             return Some(None);
@@ -103,7 +109,7 @@ fn spilled(
         }
         return Some(found);
     }
-    let &(b, i) = d.site.get(&v)?;
+    let (b, i) = d.site[v.0 as usize]?;
     let inst = &p.blocks[b].insts[i];
     let w = lane_move(inst, "v_writelane_b32")?;
     let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
@@ -122,11 +128,32 @@ fn spilled(
 /// Gives every read of an SGPR reloaded from a VGPR lane the value spilled
 /// there. Returns whether anything changed.
 pub fn forward(p: &mut Program) -> bool {
-    let d = Defs::new(p);
+    // Most shaders have no SGPR spills to VGPR lanes: avoid building def maps
+    // and dominators unless both a lane write and a lane read exist.
+    let mut readlanes: Vec<Site> = Vec::new();
+    let mut has_writelane = false;
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if !matches!(inst.fields, Fields::Valu(_)) {
+                continue;
+            }
+            if lane_move(inst, "v_readlane_b32").is_some() {
+                readlanes.push((b, i));
+            } else if !has_writelane && lane_move(inst, "v_writelane_b32").is_some() {
+                has_writelane = true;
+            }
+        }
+    }
+    if readlanes.is_empty() || !has_writelane {
+        return false;
+    }
+
+    let n = p.value_count();
+    let d = Defs::new(p, n);
     let order = crate::ir::reverse_postorder(&p.blocks);
     let mut index = vec![usize::MAX; p.blocks.len()];
-    for (n, &b) in order.iter().enumerate() {
-        index[b] = n;
+    for (pos, &b) in order.iter().enumerate() {
+        index[b] = pos;
     }
     let idom = crate::ir::idoms(&p.blocks, &order, &index);
     let dominates = |a: usize, mut b: usize| {
@@ -144,46 +171,49 @@ pub fn forward(p: &mut Program) -> bool {
     };
     // The value must be there wherever the reload is.
     let available = |x: Value, (b, i): Site| {
-        if let Some(&(db, di)) = d.site.get(&x) {
+        if let Some((db, di)) = d.site[x.0 as usize] {
             dominates(db, b) && (db != b || di < i)
-        } else if let Some(&(db, _)) = d.phi.get(&x) {
+        } else if let Some((db, _)) = d.phi[x.0 as usize] {
             dominates(db, b)
         } else {
-            p.inputs.iter().any(|&(_, v)| v == x)
+            d.input[x.0 as usize]
         }
     };
 
-    let mut replace: HashMap<Value, Value> = HashMap::new();
-    for (b, block) in p.blocks.iter().enumerate() {
-        for (i, inst) in block.insts.iter().enumerate() {
-            let Some(v) = lane_move(inst, "v_readlane_b32") else {
-                continue;
-            };
-            let (Some(Operand::Scalar { code, .. }), [Operand::Vector { reg, .. }, at]) =
-                (v.dst, &v.src[..])
-            else {
-                continue;
-            };
-            let (Some(lane), Some(src), Some(out)) = (
-                const_lane(*at, p.wave64),
-                inst.read(Reg::V(*reg)),
-                inst.write(Reg::S(code)),
-            ) else {
-                continue;
-            };
-            if let Some(Some(x)) = spilled(p, &d, src, lane, &mut Vec::new())
-                && available(x, (b, i))
-            {
-                replace.insert(out, x);
-            }
+    let mut replace: Vec<Option<Value>> = vec![None; n];
+    let mut any_replace = false;
+    let mut seen = Vec::new();
+    for (b, i) in readlanes {
+        let inst = &p.blocks[b].insts[i];
+        let Some(v) = lane_move(inst, "v_readlane_b32") else {
+            continue;
+        };
+        let (Some(Operand::Scalar { code, .. }), [Operand::Vector { reg, .. }, at]) =
+            (v.dst, &v.src[..])
+        else {
+            continue;
+        };
+        let (Some(lane), Some(src), Some(out)) = (
+            const_lane(*at, p.wave64),
+            inst.read(Reg::V(*reg)),
+            inst.write(Reg::S(code)),
+        ) else {
+            continue;
+        };
+        seen.clear();
+        if let Some(Some(x)) = spilled(p, &d, src, lane, &mut seen)
+            && available(x, (b, i))
+        {
+            replace[out.0 as usize] = Some(x);
+            any_replace = true;
         }
     }
-    if replace.is_empty() {
+    if !any_replace {
         return false;
     }
     // A value reloaded and spilled again: its first source.
     let find = |mut v: Value| {
-        while let Some(&x) = replace.get(&v) {
+        while let Some(x) = replace[v.0 as usize] {
             v = x;
         }
         v
@@ -217,50 +247,85 @@ pub fn dead(p: &Program) -> HashSet<Site> {
     if p.blocks.iter().any(|b| b.exit == Exit::Indirect) {
         return out;
     }
-    let mut read: HashSet<Value> = HashSet::new();
-    for block in &p.blocks {
-        for phi in &block.phis {
-            read.extend(&phi.args);
-        }
-        for inst in &block.insts {
-            read.extend(inst.reads.iter().map(|r| r.1));
-        }
-    }
-    for (b, block) in p.blocks.iter().enumerate() {
-        for (i, inst) in block.insts.iter().enumerate() {
-            if lane_move(inst, "v_readlane_b32").is_some()
-                && inst.writes.iter().all(|w| !read.contains(&w.1))
-            {
-                out.insert((b, i));
-            }
-        }
-    }
-
-    // VGPR values that may hold only spilled lanes: lane writes and joins.
-    let mut candidates: HashSet<Value> = HashSet::new();
+    let mut readlanes: Vec<Site> = Vec::new();
     // Each lane write: its site, the value it writes, the value it keeps.
     let mut spills: Vec<(Site, Value, Option<Value>)> = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
-        for phi in &block.phis {
-            if matches!(phi.reg, Reg::V(_)) {
-                candidates.insert(phi.value);
-            }
-        }
         for (i, inst) in block.insts.iter().enumerate() {
-            if let Some(w) = lane_move(inst, "v_writelane_b32")
+            if !matches!(inst.fields, Fields::Valu(_)) {
+                continue;
+            }
+            if lane_move(inst, "v_readlane_b32").is_some() {
+                readlanes.push((b, i));
+            } else if let Some(w) = lane_move(inst, "v_writelane_b32")
                 && let Some(Operand::Vector { reg, .. }) = w.dst
                 && let Some(written) = inst.write(Reg::V(reg))
             {
-                candidates.insert(written);
                 spills.push(((b, i), written, inst.read(Reg::V(reg))));
             }
         }
     }
-    // Read by anything else than a dead reload or a lane write keeping it.
-    let mut escaped: HashSet<Value> = HashSet::new();
+    if readlanes.is_empty() && spills.is_empty() {
+        return out;
+    }
+
+    let n = p.value_count();
+    if !readlanes.is_empty() {
+        let mut read = vec![false; n];
+        for block in &p.blocks {
+            for phi in &block.phis {
+                for &a in &phi.args {
+                    read[a.0 as usize] = true;
+                }
+            }
+            for inst in &block.insts {
+                for &(_, v) in &inst.reads {
+                    read[v.0 as usize] = true;
+                }
+            }
+        }
+        for (b, i) in readlanes {
+            let inst = &p.blocks[b].insts[i];
+            if inst.writes.iter().all(|w| !read[w.1.0 as usize]) {
+                out.insert((b, i));
+            }
+        }
+    }
+    if spills.is_empty() {
+        return out;
+    }
+
+    // VGPR values that may hold only spilled lanes: lane writes and joins.
+    #[derive(Clone, Copy)]
+    enum CandDef {
+        Spill(Option<Value>),
+        Phi(usize, usize),
+    }
+    let mut cand_def: Vec<Option<CandDef>> = vec![None; n];
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, phi) in block.phis.iter().enumerate() {
+            if matches!(phi.reg, Reg::V(_)) {
+                cand_def[phi.value.0 as usize] = Some(CandDef::Phi(b, i));
+            }
+        }
+    }
+    for &(_, written, kept) in &spills {
+        cand_def[written.0 as usize] = Some(CandDef::Spill(kept));
+    }
+
+    // Read by anything other than a dead reload or a lane write keeping it.
+    let mut escaped = vec![false; n];
+    let mut work: Vec<Value> = Vec::new();
+    let mark = |v: Value, cand_def: &[Option<CandDef>], escaped: &mut [bool], work: &mut Vec<Value>| {
+        let idx = v.0 as usize;
+        if cand_def[idx].is_some() && !escaped[idx] {
+            escaped[idx] = true;
+            work.push(v);
+        }
+    };
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
-            if out.contains(&(b, i)) {
+            if !out.is_empty() && out.contains(&(b, i)) {
                 continue;
             }
             let kept = match lane_move(inst, "v_writelane_b32").and_then(|w| w.dst) {
@@ -268,39 +333,28 @@ pub fn dead(p: &Program) -> HashSet<Site> {
                 _ => None,
             };
             for &(r, v) in &inst.reads {
-                if Some(r) != kept && candidates.contains(&v) {
-                    escaped.insert(v);
+                if Some(r) != kept {
+                    mark(v, &cand_def, &mut escaped, &mut work);
                 }
             }
         }
     }
-    loop {
-        let before = escaped.len();
-        for &(_, written, kept) in &spills {
-            if escaped.contains(&written)
-                && let Some(k) = kept
-                && candidates.contains(&k)
-            {
-                escaped.insert(k);
-            }
-        }
-        for block in &p.blocks {
-            for phi in &block.phis {
-                if escaped.contains(&phi.value) {
-                    escaped.extend(phi.args.iter().filter(|a| candidates.contains(a)));
+    while let Some(v) = work.pop() {
+        match cand_def[v.0 as usize] {
+            Some(CandDef::Spill(Some(k))) => mark(k, &cand_def, &mut escaped, &mut work),
+            Some(CandDef::Phi(b, i)) => {
+                for &a in &p.blocks[b].phis[i].args {
+                    mark(a, &cand_def, &mut escaped, &mut work);
                 }
             }
-        }
-        if escaped.len() == before {
-            break;
+            _ => {}
         }
     }
-    out.extend(
-        spills
-            .into_iter()
-            .filter(|(_, written, _)| !escaped.contains(written))
-            .map(|(site, _, _)| site),
-    );
+    for (site, written, _) in spills {
+        if !escaped[written.0 as usize] {
+            out.insert(site);
+        }
+    }
     out
 }
 
@@ -528,6 +582,43 @@ mod tests {
         let before = p.clone();
         assert!(!forward(&mut p));
         assert_eq!(p, before);
+        assert!(dead(&p).is_empty());
+    }
+
+    #[test]
+    fn zero_spill_program_fast_paths_cleanly() {
+        let mut p = build(
+            &[
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0x4A04_0081, // v_add_nc_u32 v2, 1, v0
+                0xBF81_0000, // s_endpgm
+            ],
+            false,
+        );
+        let before = p.clone();
+        assert!(!forward(&mut p));
+        assert_eq!(p, before);
+        assert!(dead(&p).is_empty());
+    }
+
+    #[test]
+    fn dead_propagates_escapes_through_loop_phis() {
+        // v1 receives a spilled scalar before a loop, is joined at the loop
+        // header, and is read as an ordinary VGPR after the loop: the spill
+        // escapes through the phi and must stay live.
+        let mut p = build(
+            &[
+                0xD761_0001,
+                0x0001_0002, // v_writelane_b32 v1, s2, 0
+                0x4A00_0081, // 8: v_add_nc_u32 v0, 1, v0
+                0x7D84_0084, // v_cmp_eq_u32 vcc_lo, 4, v0
+                0xBF86_FFFD, // s_cbranch_vccz -> 8
+                0x4A04_0201, // v_add_nc_u32 v2, s1, v1 (v1 escapes as ordinary VGPR)
+                0xBF81_0000, // s_endpgm
+            ],
+            false,
+        );
+        assert!(!forward(&mut p));
         assert!(dead(&p).is_empty());
     }
 }

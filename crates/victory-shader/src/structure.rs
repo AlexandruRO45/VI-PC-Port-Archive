@@ -272,6 +272,12 @@ impl Bools {
     }
 
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
+        if a == b || a == Bool::FALSE || b == Bool::TRUE {
+            return true;
+        }
+        if a == Bool::TRUE || b == Bool::FALSE {
+            return false;
+        }
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE
     }
@@ -328,26 +334,137 @@ impl Bools {
         r
     }
 
+    /// Every `(var, value)` implied by a satisfiable reduced BDD `known`, in
+    /// ascending variable order. Peels pure conjunction prefixes directly and
+    /// sweeps any remaining sub-DAG once, avoiding per-variable `implies` calls.
+    fn decided_by(&self, known: Bool) -> Vec<(u32, bool)> {
+        let mut cur = known;
+        let mut out = Vec::new();
+        loop {
+            let (v, lo, hi) = self.nodes[cur.0 as usize];
+            if v == TERMINAL {
+                return out;
+            }
+            if lo == Bool::FALSE {
+                out.push((v, true));
+                cur = hi;
+            } else if hi == Bool::FALSE {
+                out.push((v, false));
+                cur = lo;
+            } else {
+                self.decided_general(cur, &mut out);
+                return out;
+            }
+        }
+    }
+
+    fn decided_general(&self, root: Bool, out: &mut Vec<(u32, bool)>) {
+        let mut seen = Seen::default();
+        let mut visited: Vec<(u32, Bool, Bool)> = Vec::new();
+        let mut vs: Vec<u32> = Vec::new();
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            let (v, lo, hi) = self.nodes[n.0 as usize];
+            if v == TERMINAL || !seen.insert(n) {
+                continue;
+            }
+            visited.push((v, lo, hi));
+            vs.push(v);
+            if lo != Bool::FALSE {
+                stack.push(lo);
+            }
+            if hi != Bool::FALSE {
+                stack.push(hi);
+            }
+        }
+        vs.sort_unstable();
+        vs.dedup();
+        let m = vs.len();
+        let mut can_false = vec![false; m];
+        let mut can_true = vec![false; m];
+        let mut skip_diff = vec![0i32; m + 1];
+        for &(v, lo, hi) in &visited {
+            let iv = vs.binary_search(&v).unwrap();
+            for (child, is_hi) in [(lo, false), (hi, true)] {
+                if child == Bool::FALSE {
+                    continue;
+                }
+                if is_hi {
+                    can_true[iv] = true;
+                } else {
+                    can_false[iv] = true;
+                }
+                let ic = if child == Bool::TRUE {
+                    m
+                } else {
+                    let cv = self.nodes[child.0 as usize].0;
+                    vs.binary_search(&cv).unwrap()
+                };
+                if iv + 1 < ic {
+                    skip_diff[iv + 1] += 1;
+                    skip_diff[ic] -= 1;
+                }
+            }
+        }
+        let mut skipped = 0i32;
+        for i in 0..m {
+            skipped += skip_diff[i];
+            if skipped == 0 {
+                if !can_false[i] {
+                    out.push((vs[i], true));
+                } else if !can_true[i] {
+                    out.push((vs[i], false));
+                }
+            }
+        }
+    }
+
+    /// `b` with each atom in `decided` (from [`Self::decided_by`]`(known)`)
+    /// replaced by its value, reusing `memo`.
+    fn given_with(
+        &mut self,
+        mut b: Bool,
+        known: Bool,
+        decided: &[(u32, bool)],
+        memo: &mut Map<Bool, Bool>,
+    ) -> Bool {
+        if b == Bool::FALSE || b == Bool::TRUE || known == Bool::TRUE {
+            return b;
+        }
+        if known == Bool::FALSE {
+            while self.nodes[b.0 as usize].0 != TERMINAL {
+                b = self.nodes[b.0 as usize].2;
+            }
+            return b;
+        }
+        if decided.is_empty() {
+            return b;
+        }
+        memo.clear();
+        self.restrict(b, decided, memo)
+    }
+
     /// `b` with each atom that `known` decides replaced by its value. The
     /// atoms are replaced together, in one walk of `b`: cofactors for
     /// different variables commute, and a walk per atom made this cost the
     /// size of `b` times the number of atoms.
+    #[cfg(test)]
     fn given(&mut self, b: Bool, known: Bool) -> Bool {
-        let mut values = Vec::new();
-        for v in self.vars(b) {
-            let x = self.mk(v, Bool::FALSE, Bool::TRUE);
-            let nx = self.not(x);
-            if self.implies(known, x) {
-                values.push((v, true));
-            } else if self.implies(known, nx) {
-                values.push((v, false));
-            }
-        }
-        if values.is_empty() {
+        if b == Bool::FALSE || b == Bool::TRUE || known == Bool::TRUE {
             return b;
         }
-        values.sort_unstable();
-        self.restrict(b, &values, &mut Map::default())
+        if known == Bool::FALSE {
+            let mut cur = b;
+            while self.nodes[cur.0 as usize].0 != TERMINAL {
+                cur = self.nodes[cur.0 as usize].2;
+            }
+            return cur;
+        }
+        let decided = self.decided_by(known);
+        if decided.is_empty() {
+            return b;
+        }
+        self.restrict(b, &decided, &mut Map::default())
     }
 }
 
@@ -442,9 +559,9 @@ struct Lanes<'a> {
     /// Per block, in predecessor order: (block, over its taken edge).
     incoming: Vec<Vec<(usize, bool)>>,
     /// Block and instruction index writing each value.
-    defs: Map<Value, (usize, usize)>,
+    defs: Vec<Option<(usize, usize)>>,
     /// Block and index of each phi value.
-    phis: Map<Value, (usize, usize)>,
+    phis: Vec<Option<(usize, usize)>>,
     /// Mask joins found wrong when resolved to a constant: atoms instead.
     unresolved: HashSet<Value>,
     b: Bools,
@@ -496,18 +613,19 @@ impl<'a> Lanes<'a> {
             index[b] = i;
         }
         check_reducible(p, &order, &index)?;
+        let n_vals = p.value_count();
         let mut incoming = vec![Vec::new(); blocks.len()];
-        let (mut defs, mut phis) = (Map::default(), Map::default());
+        let (mut defs, mut phis) = (vec![None; n_vals], vec![None; n_vals]);
         for (b, block) in blocks.iter().enumerate() {
             for (k, s) in block.exit.successors().into_iter().enumerate() {
                 incoming[s].push((b, k == 0));
             }
             for (i, phi) in block.phis.iter().enumerate() {
-                phis.insert(phi.value, (b, i));
+                phis[phi.value.0 as usize] = Some((b, i));
             }
             for (i, inst) in block.insts.iter().enumerate() {
                 for &(_, v) in &inst.writes {
-                    defs.insert(v, (b, i));
+                    defs[v.0 as usize] = Some((b, i));
                 }
             }
         }
@@ -579,15 +697,46 @@ impl<'a> Lanes<'a> {
             }
             // EXEC where known in this block (read or written so far).
             let mut now = None;
+            let mut last_exec: Option<(Key, Bool)> = None;
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
-                if inst.read(Reg::S(EXEC)).is_some() {
-                    let e = self.exec(inst);
+                if let Some(lo) = inst.read(Reg::S(EXEC)) {
+                    let e = if p.wave64 {
+                        match inst.read(Reg::S(EXEC + 1)) {
+                            Some(hi) => {
+                                let k = (lo, hi);
+                                if let Some((pk, pe)) = last_exec
+                                    && pk == k
+                                {
+                                    pe
+                                } else {
+                                    let e = self.mask(k).0;
+                                    last_exec = Some((k, e));
+                                    e
+                                }
+                            }
+                            None => Bool::TRUE,
+                        }
+                    } else {
+                        let k = (lo, lo);
+                        if let Some((pk, pe)) = last_exec
+                            && pk == k
+                        {
+                            pe
+                        } else {
+                            let e = self.mask(k).0;
+                            last_exec = Some((k, e));
+                            e
+                        }
+                    };
                     execs[b][i] = Some(e);
                     now = Some(e);
                 }
                 self.step(inst, now);
                 if let Some(k) = self.key(|r| inst.write(r), EXEC) {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
+                    if let Some(e) = now {
+                        last_exec = Some((k, e));
+                    }
                 }
             }
             if let Exit::Branch { .. } = p.blocks[b].exit
@@ -642,39 +791,52 @@ impl<'a> Lanes<'a> {
     ) -> Result<Structured, ShaderError> {
         let blocks = &self.p.blocks;
         let b = &mut self.b;
-        let guards = blocks
-            .iter()
-            .enumerate()
-            .map(|(n, block)| {
-                block
-                    .insts
-                    .iter()
-                    .zip(&execs[n])
-                    .map(|(inst, exec)| match (exec, &inst.fields) {
-                        (None, _)
-                        | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
-                            None
+        let mut restrict_memo = Map::default();
+        let mut guards = Vec::with_capacity(blocks.len());
+        let mut exits = Vec::with_capacity(blocks.len());
+        for (n, block) in blocks.iter().enumerate() {
+            let mut decided: Option<Vec<(u32, bool)>> = None;
+            let mut last: Option<(Bool, Option<Bool>)> = None;
+            let block_guards = block
+                .insts
+                .iter()
+                .zip(&execs[n])
+                .map(|(inst, exec)| match (exec, &inst.fields) {
+                    (None, _)
+                    | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => None,
+                    (&Some(e), _) => {
+                        if let Some((prev_e, prev_g)) = last
+                            && prev_e == e
+                        {
+                            return prev_g;
                         }
-                        (&Some(e), _) if b.implies(cond[n], e) => None,
-                        (&Some(e), _) => Some(b.given(e, cond[n])),
-                    })
-                    .collect()
-            })
-            .collect();
-        let exits = blocks
-            .iter()
-            .enumerate()
-            .map(|(n, block)| match block.exit {
+                        let g = if b.implies(cond[n], e) {
+                            None
+                        } else {
+                            let d = decided.get_or_insert_with(|| b.decided_by(cond[n]));
+                            Some(b.given_with(e, cond[n], d, &mut restrict_memo))
+                        };
+                        last = Some((e, g));
+                        g
+                    }
+                })
+                .collect();
+            guards.push(block_guards);
+            exits.push(match block.exit {
                 Exit::Jump(t) => LaneExit::Jump(t),
                 Exit::End => LaneExit::End,
                 Exit::Indirect => LaneExit::Indirect,
-                Exit::Branch { taken, not_taken } => LaneExit::Branch {
-                    when: b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n]),
-                    taken,
-                    not_taken,
-                },
-            })
-            .collect();
+                Exit::Branch { taken, not_taken } => {
+                    let w = self.when[n].unwrap_or(Bool::FALSE);
+                    let d = decided.get_or_insert_with(|| b.decided_by(cond[n]));
+                    LaneExit::Branch {
+                        when: b.given_with(w, cond[n], d, &mut restrict_memo),
+                        taken,
+                        not_taken,
+                    }
+                }
+            });
+        }
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
@@ -707,8 +869,8 @@ impl<'a> Lanes<'a> {
     }
 
     fn born(&self, v: Value) -> usize {
-        match (self.defs.get(&v), self.phis.get(&v)) {
-            (Some(&(b, _)), _) | (_, Some(&(b, _))) => self.index[b],
+        match (self.defs[v.0 as usize], self.phis[v.0 as usize]) {
+            (Some((b, _)), _) | (_, Some((b, _))) => self.index[b],
             _ => 0,
         }
     }
@@ -733,7 +895,7 @@ impl<'a> Lanes<'a> {
         let (m, derived) = match self.join(k) {
             Some(join) => join,
             None => {
-                let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
+                let (lo, hi) = (self.defs[k.0.0 as usize], self.defs[k.1.0 as usize]);
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
                 let m = match (lo, hi) {
                     (Some(at), Some(hi)) if at == hi => def(lo)
@@ -771,7 +933,7 @@ impl<'a> Lanes<'a> {
     /// is that constant, for a lane can only read it after arriving.
     fn join(&mut self, k: Key) -> Option<(Bool, bool)> {
         let p = self.p;
-        let (lo, hi) = (self.phis.get(&k.0).copied(), self.phis.get(&k.1).copied());
+        let (lo, hi) = (self.phis[k.0.0 as usize], self.phis[k.1.0 as usize]);
         let block = match (lo, hi) {
             (Some((a, _)), Some((b, _))) if a != b => return None,
             (Some((b, _)), _) | (_, Some((b, _))) => b,
@@ -976,7 +1138,8 @@ impl<'a> Lanes<'a> {
                         && code != NULL
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
-                        let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
+                        let phi = self.phis[k.0.0 as usize].is_some()
+                            || self.phis[k.1.0 as usize].is_some();
                         takes_mask |= self.masks.contains_key(&k) || phi && self.mask(k).1;
                     }
                 }
@@ -1020,14 +1183,6 @@ impl<'a> Lanes<'a> {
                 }
             }
             Fields::Valu(v) => {
-                let exec = self.exec(inst);
-                let lane = |l: &mut Self, k: Key| {
-                    let born = l.born(k.0);
-                    let a = l.b.atom(Atom::Lane(k.0), born);
-                    let m = l.b.and(exec, a);
-                    l.masks.insert(k, m);
-                    l.active.insert(k.0);
-                };
                 // A select reads a mask nothing else may: a join of compare
                 // results is resolved here, as for EXEC.
                 if name == "v_cndmask_b32"
@@ -1048,15 +1203,27 @@ impl<'a> Lanes<'a> {
                 }
                 if name.starts_with("v_cmpx") {
                     if let Some(k) = self.key(|r| inst.write(r), EXEC) {
-                        lane(self, k);
+                        let exec = exec.unwrap_or_else(|| self.exec(inst));
+                        let born = self.born(k.0);
+                        let a = self.b.atom(Atom::Lane(k.0), born);
+                        let m = self.b.and(exec, a);
+                        self.masks.insert(k, m);
+                        self.active.insert(k.0);
                     }
                 } else {
                     let compare = v.dst.filter(|_| name.starts_with("v_cmp"));
-                    for op in compare.iter().chain(&v.carry) {
-                        if let Operand::Scalar { code, .. } = *op
-                            && let Some(k) = self.key(|r| inst.write(r), code)
-                        {
-                            lane(self, k);
+                    if compare.is_some() || v.carry.is_some() {
+                        let exec = exec.unwrap_or_else(|| self.exec(inst));
+                        for op in compare.iter().chain(&v.carry) {
+                            if let Operand::Scalar { code, .. } = *op
+                                && let Some(k) = self.key(|r| inst.write(r), code)
+                            {
+                                let born = self.born(k.0);
+                                let a = self.b.atom(Atom::Lane(k.0), born);
+                                let m = self.b.and(exec, a);
+                                self.masks.insert(k, m);
+                                self.active.insert(k.0);
+                            }
                         }
                     }
                 }
@@ -1111,6 +1278,7 @@ impl<'a> Lanes<'a> {
         if let Some(&entry) = self.order.first() {
             cond[entry] = Bool::TRUE;
         }
+        let mut forget_memo = Map::default();
         for _ in 0..MAX_ROUNDS {
             let mut changed = false;
             for i in 1..self.order.len() {
@@ -1120,7 +1288,8 @@ impl<'a> Lanes<'a> {
                     let (q, taken) = self.incoming[s][k];
                     let mut e = self.edge(cond[q], q, taken);
                     if i <= self.index[q] {
-                        e = self.b.forget(e, i, &mut Map::default());
+                        forget_memo.clear();
+                        e = self.b.forget(e, i, &mut forget_memo);
                     }
                     c = self.b.or(c, e);
                 }
@@ -1454,6 +1623,33 @@ mod tests {
         assert_eq!(b.given(f, Bool::TRUE), f);
         let _ = b.given(f, Bool::FALSE);
         assert_eq!(b.given(Bool::TRUE, known), Bool::TRUE);
+    }
+
+    #[test]
+    fn decided_by_matches_implies_on_general_bdds() {
+        let (mut b, xs) = atoms(10);
+        for seed in 0..100 {
+            let known = mixed(&mut b, &xs, seed, 12);
+            if known == Bool::FALSE {
+                continue;
+            }
+            let got = b.decided_by(known);
+            let mut expect = Vec::new();
+            for (v, &x) in xs.iter().enumerate() {
+                let nx = b.not(x);
+                if b.implies(known, x) {
+                    expect.push((v as u32, true));
+                } else if b.implies(known, nx) {
+                    expect.push((v as u32, false));
+                }
+            }
+            assert_eq!(got, expect, "seed {seed}");
+            let f = mixed(&mut b, &xs, seed ^ 0x55AA, 18);
+            assert_eq!(b.given(f, known), given_by_walks(&mut b, f, known), "given seed {seed}");
+        }
+        // Contradiction (`known == FALSE`) matches `given_by_walks` too.
+        let f = mixed(&mut b, &xs, 42, 16);
+        assert_eq!(b.given(f, Bool::FALSE), given_by_walks(&mut b, f, Bool::FALSE));
     }
 
     #[test]

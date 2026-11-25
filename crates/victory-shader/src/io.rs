@@ -31,8 +31,6 @@
 //! lane sends the output counts (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices |
 //! primitives << 12).
 
-use std::collections::HashMap;
-
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{Inst, Program, Reg, Value};
@@ -400,13 +398,13 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
-    first_halves_read(p, &mut io);
+    first_halves_read(p, &mut io, halves.as_ref());
     Ok(io)
 }
 
 /// A first half some other instruction reads too (the compiler keeps
 /// P0 + i P10 for more than its second half) evaluates on its own as well.
-fn first_halves_read(p: &Program, io: &mut Io) {
+fn first_halves_read(p: &Program, io: &mut Io, halves: Option<&Halves<'_>>) {
     if !io
         .interps
         .iter()
@@ -414,23 +412,50 @@ fn first_halves_read(p: &Program, io: &mut Io) {
     {
         return;
     }
+    let owned_phis;
+    let phis: &[Option<(usize, usize)>] = match halves {
+        Some(h) => &h.phis,
+        None => {
+            let mut v = vec![None; p.value_count()];
+            for (b, block) in p.blocks.iter().enumerate() {
+                for (i, phi) in block.phis.iter().enumerate() {
+                    v[phi.value.0 as usize] = Some((b, i));
+                }
+            }
+            owned_phis = v;
+            &owned_phis
+        }
+    };
     // What instructions other than second halves read, and through phis.
-    let mut read: std::collections::HashSet<Value> = p
-        .blocks
-        .iter()
-        .flat_map(|b| &b.insts)
-        .filter(|i| !i.name().starts_with("v_interp_p2"))
-        .flat_map(|i| i.reads.iter().map(|r| r.1))
-        .collect();
-    loop {
-        let before = read.len();
-        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
-            if read.contains(&phi.value) {
-                read.extend(phi.args.iter().copied());
+    let mut read = vec![false; phis.len()];
+    let mut work: Vec<Value> = Vec::new();
+    for block in &p.blocks {
+        for inst in &block.insts {
+            if inst.name().starts_with("v_interp_p2") {
+                continue;
+            }
+            for &(_, v) in &inst.reads {
+                let idx = v.0 as usize;
+                if !read[idx] {
+                    read[idx] = true;
+                    if phis[idx].is_some() {
+                        work.push(v);
+                    }
+                }
             }
         }
-        if read.len() == before {
-            break;
+    }
+    while let Some(v) = work.pop() {
+        if let Some((b, i)) = phis[v.0 as usize] {
+            for &a in &p.blocks[b].phis[i].args {
+                let idx = a.0 as usize;
+                if !read[idx] {
+                    read[idx] = true;
+                    if phis[idx].is_some() {
+                        work.push(a);
+                    }
+                }
+            }
         }
     }
     let mut more = Vec::new();
@@ -443,7 +468,10 @@ fn first_halves_read(p: &Program, io: &mut Io) {
         };
         for &(b, i) in first {
             let known = |all: &[(Site, Interp)]| all.iter().any(|(s, _)| *s == (b, i));
-            if p.blocks[b].insts[i].writes.iter().any(|w| read.contains(&w.1))
+            if p.blocks[b].insts[i]
+                .writes
+                .iter()
+                .any(|w| read[w.1.0 as usize])
                 && !known(&io.interps)
                 && !known(&more)
             {
@@ -515,36 +543,25 @@ fn push_pair(io: &mut Io, site: Site, pair: Pair, attribute: Attribute) {
 /// Finds the first halves of interpolations.
 struct Halves<'a> {
     p: &'a Program,
-    defs: HashMap<Value, Site>,
-    phis: HashMap<Value, (usize, usize)>,
+    defs: Vec<Option<Site>>,
+    phis: Vec<Option<(usize, usize)>>,
 }
 
 impl<'a> Halves<'a> {
     fn new(p: &'a Program) -> Self {
-        let defs = p
-            .blocks
-            .iter()
-            .enumerate()
-            .flat_map(|(b, block)| {
-                block
-                    .insts
-                    .iter()
-                    .enumerate()
-                    .flat_map(move |(i, inst)| inst.writes.iter().map(move |w| (w.1, (b, i))))
-            })
-            .collect();
-        let phis = p
-            .blocks
-            .iter()
-            .enumerate()
-            .flat_map(|(b, block)| {
-                block
-                    .phis
-                    .iter()
-                    .enumerate()
-                    .map(move |(i, phi)| (phi.value, (b, i)))
-            })
-            .collect();
+        let n = p.value_count();
+        let mut defs = vec![None; n];
+        let mut phis = vec![None; n];
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (i, phi) in block.phis.iter().enumerate() {
+                phis[phi.value.0 as usize] = Some((b, i));
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                for &(_, w) in &inst.writes {
+                    defs[w.0 as usize] = Some((b, i));
+                }
+            }
+        }
         Self { p, defs, phis }
     }
 
@@ -605,15 +622,13 @@ impl<'a> Halves<'a> {
         seen: &mut Vec<Value>,
         out: &mut Vec<Site>,
     ) -> Result<(), &'static str> {
-        if let Some(&site) = self.defs.get(&v) {
+        if let Some(site) = self.defs[v.0 as usize] {
             if !out.contains(&site) {
                 out.push(site);
             }
             return Ok(());
         }
-        let &(b, i) = self
-            .phis
-            .get(&v)
+        let (b, i) = self.phis[v.0 as usize]
             .ok_or("an interpolation without its first half")?;
         if !seen.contains(&v) {
             seen.push(v);

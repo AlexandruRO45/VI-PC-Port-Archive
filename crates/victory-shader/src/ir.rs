@@ -50,6 +50,34 @@ pub struct Program {
     pub inputs: Vec<(Reg, Value)>,
 }
 
+impl Program {
+    /// One past the largest SSA value id referenced anywhere in the program,
+    /// for sizing dense `Vec` tables indexed by `Value.0`.
+    pub(crate) fn value_count(&self) -> usize {
+        let mut n = 0usize;
+        for &(_, v) in &self.inputs {
+            n = n.max(v.0 as usize + 1);
+        }
+        for block in &self.blocks {
+            for phi in &block.phis {
+                n = n.max(phi.value.0 as usize + 1);
+                for &a in &phi.args {
+                    n = n.max(a.0 as usize + 1);
+                }
+            }
+            for inst in &block.insts {
+                for &(_, v) in &inst.writes {
+                    n = n.max(v.0 as usize + 1);
+                }
+                for &(_, v) in &inst.reads {
+                    n = n.max(v.0 as usize + 1);
+                }
+            }
+        }
+        n
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     /// Byte offset of the block's first machine instruction (shared by a

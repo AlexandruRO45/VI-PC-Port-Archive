@@ -70,6 +70,67 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     if !code.len().is_multiple_of(4) {
         return Err(isa(code.len(), "code size is not a multiple of 4"));
     }
+    let n_words = code.len() / 4;
+    const UNSEEN: u32 = u32::MAX;
+    let mut slot = vec![UNSEEN; n_words];
+    let mut list: Vec<Instruction> = Vec::with_capacity(n_words / 2);
+    let mut sorted = true;
+    let mut last_off = 0usize;
+    let mut pending = vec![0usize];
+    while let Some(mut offset) = pending.pop() {
+        loop {
+            if !offset.is_multiple_of(4) {
+                return decode_unaligned(code);
+            }
+            let word_idx = offset / 4;
+            if word_idx < n_words && slot[word_idx] != UNSEEN {
+                break;
+            }
+            let inst = instruction(code, offset)?;
+            let next = offset + 4 * inst.words.len();
+            let flow = control(&inst, code.len(), |at| {
+                let mut w = at / 4;
+                while w > 0 {
+                    w -= 1;
+                    let idx = slot[w];
+                    if idx != UNSEEN {
+                        return Some(&list[idx as usize]);
+                    }
+                }
+                None
+            })?;
+            if !list.is_empty() && offset < last_off {
+                sorted = false;
+            }
+            last_off = offset;
+            slot[word_idx] = list.len() as u32;
+            list.push(inst);
+            match flow {
+                Flow::Next => offset = next,
+                Flow::Stop => break,
+                Flow::Jump(target) => offset = target,
+                Flow::Branch(target) => {
+                    pending.push(target);
+                    offset = next;
+                }
+            }
+        }
+    }
+    if !sorted {
+        list.sort_unstable_by_key(|i| i.offset);
+    }
+    if let Some(w) = list
+        .windows(2)
+        .find(|w| w[0].offset + 4 * w[0].words.len() > w[1].offset)
+    {
+        return Err(isa(w[1].offset, "a branch lands inside an instruction"));
+    }
+    Ok(list)
+}
+
+/// Fallback for synthetic inputs whose resolved far jump is not 4-byte aligned.
+#[cold]
+fn decode_unaligned(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     let mut found = BTreeMap::new();
     let mut pending = vec![0usize];
     while let Some(mut offset) = pending.pop() {
@@ -282,15 +343,76 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
             _ => return Err(isa(offset, "unknown encoding")),
         }
     };
+    let end = offset + 4 * len;
+    let slice = code
+        .get(offset..end)
+        .ok_or(isa(offset, "instruction runs past the end of the code"))?;
+    let mut words = Vec::with_capacity(len);
+    for &chunk in slice.as_chunks::<4>().0 {
+        words.push(u32::from_le_bytes(chunk));
+    }
     Ok(Instruction {
         offset,
         encoding,
         opcode: opcode as u16,
-        words: (0..len).map(word).collect::<Result<_, _>>()?,
+        words,
     })
 }
 
+const fn table_len(entries: &[(u16, &'static str)]) -> usize {
+    let mut max = 0usize;
+    let mut i = 0;
+    while i < entries.len() {
+        let end = entries[i].0 as usize + 1;
+        if end > max {
+            max = end;
+        }
+        i += 1;
+    }
+    max
+}
+
+const fn build_table<const N: usize>(
+    entries: &[(u16, &'static str)],
+) -> [Option<&'static str>; N] {
+    let mut table = [None; N];
+    let mut i = 0;
+    while i < entries.len() {
+        let (op, name) = entries[i];
+        table[op as usize] = Some(name);
+        i += 1;
+    }
+    table
+}
+
+macro_rules! direct_table {
+    ($name:ident, $src:expr) => {
+        const $name: [Option<&'static str>; table_len($src)] = build_table($src);
+    };
+}
+
+direct_table!(SOP2_DIRECT, opcodes::SOP2);
+direct_table!(SOPK_DIRECT, opcodes::SOPK);
+direct_table!(SOP1_DIRECT, opcodes::SOP1);
+direct_table!(SOPC_DIRECT, opcodes::SOPC);
+direct_table!(SOPP_DIRECT, opcodes::SOPP);
+direct_table!(SMEM_DIRECT, opcodes::SMEM);
+direct_table!(VOP2_DIRECT, opcodes::VOP2);
+direct_table!(VOP1_DIRECT, opcodes::VOP1);
+direct_table!(VOPC_DIRECT, opcodes::VOPC);
+direct_table!(VOP3_DIRECT, opcodes::VOP3);
+direct_table!(VOP3P_DIRECT, opcodes::VOP3P);
+direct_table!(VINTRP_DIRECT, opcodes::VINTRP);
+direct_table!(DS_DIRECT, opcodes::DS);
+direct_table!(MUBUF_DIRECT, opcodes::MUBUF);
+direct_table!(MTBUF_DIRECT, opcodes::MTBUF);
+direct_table!(MIMG_DIRECT, opcodes::MIMG);
+direct_table!(FLAT_DIRECT, opcodes::FLAT);
+direct_table!(GLOBAL_DIRECT, opcodes::GLOBAL);
+direct_table!(SCRATCH_DIRECT, opcodes::SCRATCH);
+
 impl Encoding {
+    #[cfg(test)]
     fn table(self) -> &'static [(u16, &'static str)] {
         use opcodes as t;
         match self {
@@ -316,8 +438,35 @@ impl Encoding {
             Self::Scratch => t::SCRATCH,
         }
     }
+
+    #[inline]
+    fn direct_table(self) -> &'static [Option<&'static str>] {
+        match self {
+            Self::Sop2 => &SOP2_DIRECT,
+            Self::Sopk => &SOPK_DIRECT,
+            Self::Sop1 => &SOP1_DIRECT,
+            Self::Sopc => &SOPC_DIRECT,
+            Self::Sopp => &SOPP_DIRECT,
+            Self::Smem => &SMEM_DIRECT,
+            Self::Vop2 => &VOP2_DIRECT,
+            Self::Vop1 => &VOP1_DIRECT,
+            Self::Vopc => &VOPC_DIRECT,
+            Self::Vop3 => &VOP3_DIRECT,
+            Self::Vop3p => &VOP3P_DIRECT,
+            Self::Vintrp => &VINTRP_DIRECT,
+            Self::Ds => &DS_DIRECT,
+            Self::Mubuf => &MUBUF_DIRECT,
+            Self::Mtbuf => &MTBUF_DIRECT,
+            Self::Mimg => &MIMG_DIRECT,
+            Self::Exp => &[Some("exp")],
+            Self::Flat => &FLAT_DIRECT,
+            Self::Global => &GLOBAL_DIRECT,
+            Self::Scratch => &SCRATCH_DIRECT,
+        }
+    }
 }
 
+#[inline]
 pub(crate) fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
     // VOP3 also encodes the VOPC, VOP2 and VOP1 opcodes at fixed bases.
     let (encoding, op) = match (encoding, opcode) {
@@ -326,11 +475,7 @@ pub(crate) fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
         (Encoding::Vop3, 0x180..0x200) => (Encoding::Vop1, opcode - 0x180),
         _ => (encoding, opcode),
     };
-    let table = encoding.table();
-    table
-        .binary_search_by_key(&op, |&(o, _)| o)
-        .ok()
-        .map(|i| table[i].1)
+    encoding.direct_table().get(op as usize).copied().flatten()
 }
 
 fn isa(offset: usize, reason: &'static str) -> ShaderError {
@@ -531,5 +676,53 @@ mod tests {
         );
         // s_cbranch_scc0 into the literal of the s_mov_b32 at 4.
         assert!(decode(&bytes(&[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM])).is_err());
+    }
+
+    #[test]
+    fn direct_name_tables_match_sorted_tables() {
+        let by_search = |encoding: Encoding, opcode: u16| -> Option<&'static str> {
+            let (encoding, op) = match (encoding, opcode) {
+                (Encoding::Vop3, 0x000..0x100) => (Encoding::Vopc, opcode),
+                (Encoding::Vop3, 0x100..0x140) => (Encoding::Vop2, opcode - 0x100),
+                (Encoding::Vop3, 0x180..0x200) => (Encoding::Vop1, opcode - 0x180),
+                _ => (encoding, opcode),
+            };
+            let table = encoding.table();
+            table
+                .binary_search_by_key(&op, |&(o, _)| o)
+                .ok()
+                .map(|i| table[i].1)
+        };
+        for &encoding in ENCODINGS {
+            for opcode in 0..=0x3FFu16 {
+                assert_eq!(
+                    name(encoding, opcode),
+                    by_search(encoding, opcode),
+                    "{encoding:?} {opcode:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_matches_btree_reference() {
+        let programs: &[&[u32]] = &[
+            &[sopp(0x04, 1), sopp(0x02, 1), S_ENDPGM, S_ENDPGM],
+            &[
+                sopp(0x02, 1),
+                S_ENDPGM,
+                0xBE88_1F00,
+                0x8008_FF08,
+                0xFFFF_FFF8,
+                0x8209_C109,
+                0xBE80_2008,
+            ],
+            &[0xBE80_03FF, 0x3F80_0000, 0x0600_0000, S_ENDPGM],
+        ];
+        for words in programs {
+            let raw = bytes(words);
+            assert_eq!(decode(&raw), decode_unaligned(&raw));
+        }
+        assert_eq!(decode(&[]), decode_unaligned(&[]));
     }
 }
