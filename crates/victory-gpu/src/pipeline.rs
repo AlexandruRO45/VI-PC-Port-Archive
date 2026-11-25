@@ -140,7 +140,13 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                // `VICTORY_WAVE_WIDE=<hash>,...`: these shaders' wave64 programs may take the
+                // wave-wide form, which the switch's `1` allows for all
+                let done = if victory_shader::emit::wave_wide_listed(&self.hash) {
+                    victory_shader::emit::with_wave_wide(|| translate(&self.container))
+                } else {
+                    translate(&self.container)
+                };
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {

@@ -217,6 +217,49 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+thread_local! {
+    /// See [`with_wave_wide`].
+    static WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the wave-wide form ([`widen`]) allowed for the console wave64 programs it
+/// translates on this thread, as `VICTORY_WAVE_WIDE=1` allows it for every program: for the
+/// shaders a run names by hash ([`wave_wide_listed`]).
+pub fn with_wave_wide<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WIDE_HERE.set(self.0);
+        }
+    }
+    let _restore = Restore(WIDE_HERE.replace(true));
+    f()
+}
+
+/// `VICTORY_WAVE_WIDE=<hash>,...`: whether the shader of this hash (the 16 hex digits a run's
+/// log names it by) is one whose console wave64 programs may take the wave-wide form. Other
+/// values (`1`, `0`) list none. The form puts group barriers inside branches, and the whole
+/// switch once lost the card with two particle programs: a list lets it carry the programs
+/// that need it without bringing those back.
+pub fn wave_wide_listed(hash: &str) -> bool {
+    static LISTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LISTED
+        .get_or_init(|| parse_hash_list(&std::env::var("VICTORY_WAVE_WIDE").unwrap_or_default()))
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(hash))
+}
+
+/// The 16-digit hex hashes of a comma-separated list, lower case; anything else is left out.
+/// Pure, for testing.
+fn parse_hash_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
@@ -380,8 +423,9 @@ pub fn emit(
         // waves: this form puts group barriers inside branches and loops, and runs 121-124
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // has no barrier, stays on. A run may name the shaders that take it
+        // (`VICTORY_WAVE_WIDE=<hash>,...`, [`with_wave_wide`]).
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.get();
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -840,6 +884,32 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), all);
+    }
+
+    #[test]
+    fn the_wave_wide_list_takes_shader_hashes_only() {
+        assert_eq!(
+            super::parse_hash_list(" 5DC3B25986622949, 6f225b641c5b0708 ,,abc,1"),
+            vec!["5dc3b25986622949".to_owned(), "6f225b641c5b0708".to_owned()]
+        );
+        for none in ["", "1", "0", "5dc3b2598662294", "5dc3b25986622949x", "zzzzzzzzzzzzzzzz"] {
+            assert!(super::parse_hash_list(none).is_empty(), "{none:?}");
+        }
+    }
+
+    #[test]
+    fn the_wave_wide_form_is_allowed_only_inside_with_wave_wide() {
+        assert!(!super::WIDE_HERE.get());
+        let inner = super::with_wave_wide(|| {
+            let nested = super::with_wave_wide(|| super::WIDE_HERE.get());
+            (nested, super::WIDE_HERE.get())
+        });
+        assert_eq!(inner, (true, true));
+        assert!(!super::WIDE_HERE.get());
+        // (a translator panic, which the shader cache catches, leaves it off too)
+        let panicked = std::panic::catch_unwind(|| super::with_wave_wide(|| panic!("translator")));
+        assert!(panicked.is_err());
+        assert!(!super::WIDE_HERE.get());
     }
 
     #[test]
