@@ -9176,8 +9176,9 @@ impl HostList {
 /// The write-watch journal and the guards are behind their own locks, as
 /// they are for the title's threads.
 fn wide_refresh() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    // Live ([`crate::live`]).
+    static ON: crate::live::Live = crate::live::Live::new("VICTORY_WIDE_REFRESH", false);
+    ON.on()
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
@@ -9784,6 +9785,17 @@ struct Presenter {
 
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
+/// How often the frame lines are logged (each holds the last second's
+/// numbers): `VICTORY_METER_MS`, 5 s by default; 1 s logs every second's,
+/// for comparisons over short stretches.
+fn meter_period() -> std::time::Duration {
+    static PERIOD: OnceLock<std::time::Duration> = OnceLock::new();
+    *PERIOD.get_or_init(|| {
+        let ms = std::env::var("VICTORY_METER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(5000u64);
+        std::time::Duration::from_millis(ms.max(1000))
+    })
+}
+
 struct Meter {
     since: std::time::Instant,
     frames: u32,
@@ -9979,7 +9991,7 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+        if self.logged.elapsed() >= meter_period() {
             self.logged = std::time::Instant::now();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",

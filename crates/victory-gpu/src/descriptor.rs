@@ -170,8 +170,10 @@ fn mirror(handle: u64) {
 
 #[cfg(windows)]
 fn heap_sync_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0"))
+    // Live ([`crate::live`]): a heap made while it is off is not tracked, so
+    // turning it on later reaches only heaps made since.
+    static ENABLED: crate::live::Live = crate::live::Live::new("VICTORY_HEAP_SYNC", true);
+    ENABLED.on()
 }
 
 /// Mirrors records copied directly into placed shader-visible heaps. The
