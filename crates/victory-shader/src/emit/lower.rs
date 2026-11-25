@@ -1197,10 +1197,8 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
                 let r = self.s.m.bin(c, Bin::And, r, low);
                 // Lane `hi` runs the section on the console even where it is
-                // elsewhere on the host; there it holds the identity.
-                if self.host_wave() < self.wave() {
-                    return Err("a cross-half wave scan on a 32-lane host");
-                }
+                // elsewhere on the host; there it holds the identity. On a
+                // host of 32-lane waves the scan stays within the half.
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let b = self
@@ -1853,9 +1851,8 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
-                if self.host_wave() < self.wave() {
-                    return Err("a 64-bit wave mask read as data on a 32-lane host");
-                }
+                // On a host of 32-lane waves the half's own lanes: its high
+                // dword is 0 (`Parts::host_wave32`).
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -2921,9 +2918,8 @@ impl<'a> Lower<'a> {
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
             return Err("a cross-lane operation outside compute");
         }
-        if !quad && self.host_wave() < self.wave() {
-            return Err("a cross-half operation on a 32-lane host");
-        }
+        // On a host of 32-lane waves, lanes read lanes of their own half
+        // (`Parts::host_wave32`, `Lower::host_lane`).
         debug_assert!(self.s.threads.is_none() || self.console_lanes);
         self.s.flags |= flags::WAVE_OPS;
         Ok(())

@@ -111,7 +111,8 @@ pub(crate) fn runs() -> bool {
             .map(|p| make::state(&p))
             .collect()
     };
-    let open = all_made(&states);
+    let halves = crate::host::host_wave32();
+    let open = opens(&states, halves);
     if open != decided.1 || !SAID.swap(true, Ordering::Relaxed) {
         let (made, refused) = (
             states.iter().filter(|s| **s == Some(true)).count(),
@@ -125,6 +126,8 @@ pub(crate) fn runs() -> bool {
             "BVH builder {}",
             if open {
                 "runs"
+            } else if halves {
+                "held back: 64-lane programs run as 32-lane halves here"
             } else {
                 "held back: not all its pipelines are made"
             }
@@ -138,6 +141,15 @@ pub(crate) fn runs() -> bool {
 /// `Some(false)`, those still being made `None`.
 fn all_made(states: &[Option<bool>]) -> bool {
     states.iter().all(|s| *s == Some(true))
+}
+
+/// Whether the builder runs: every pipeline made, on a host that runs
+/// 64-lane programs whole. Where they run as two 32-lane halves that each
+/// act as a wave (`crate::host::host_wave32`), the builder's
+/// programs, which exchange across the halves, hung the GPU within two
+/// minutes (RTX 4070 SUPER).
+fn opens(states: &[Option<bool>], halves: bool) -> bool {
+    !halves && all_made(states)
 }
 
 /// Tests that set the builder's image, one at a time; each starts with
@@ -162,6 +174,9 @@ mod tests {
         assert!(all_made(&[Some(true), Some(true)]));
         assert!(!all_made(&[Some(true), Some(false)]), "one refused");
         assert!(!all_made(&[Some(true), None]), "one still being made");
+        assert!(opens(&[Some(true)], false));
+        assert!(!opens(&[Some(true)], true), "64-lane programs run as halves");
+        assert!(!opens(&[], true));
     }
 
     /// Pipelines are the builder's by their bytecode in its image, or by

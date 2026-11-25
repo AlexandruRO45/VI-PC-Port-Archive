@@ -1799,7 +1799,7 @@ mod tests {
     }
 
     #[test]
-    fn wave64_cross_half_readlane_is_refused_on_wave32_host() {
+    fn wave64_readlane_reads_its_own_half_on_wave32_host() {
         // v_readlane_b32 s12, v5, 1; v_mov_b32 v3, s12; ds_write_b32 v0, v3; s_endpgm
         let words = [
             0xD760_000Cu32,
@@ -1832,12 +1832,9 @@ mod tests {
             host_wave32: true,
             ..Default::default()
         };
-        let err = super::emit_with(&c, &native, &p, &st, &io, &res, opts)
-            .expect_err("cross-half v_readlane_b32 must be refused on a 32-lane host");
-        assert!(
-            err.to_string().contains("cross-half"),
-            "unexpected refusal reason: {err}"
-        );
+        // Each 32-lane host wave stands for one half: lane 1 of its own.
+        super::emit_with(&c, &native, &p, &st, &io, &res, opts)
+            .expect("v_readlane_b32 translates on a 32-lane host");
     }
 
     #[test]
