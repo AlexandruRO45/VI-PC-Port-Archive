@@ -21,9 +21,8 @@ pub struct Counts {
     pub blocks: u64,
     /// Instructions, terminators among them.
     pub instructions: u64,
-    /// The same by kind: LLVM's name of the instruction (the integer name
-    /// for both forms of a binary operation: the record does not tell
-    /// `add` from `fadd`), and for a call the function called.
+    /// The same by kind: LLVM's name of the instruction, and for a call
+    /// the function called.
     pub kinds: BTreeMap<String, u64>,
 }
 
@@ -87,12 +86,22 @@ pub(crate) fn count(bitcode: &[u8]) -> Result<Counts, Why> {
     Ok(counts)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum Type {
     Void,
-    /// A function type and its return type.
+    Float,
+    Vector(u64),
+    Array(u64),
+    Struct(Vec<u64>),
     Function(u64),
     Other,
+}
+
+#[derive(Clone, Copy)]
+enum ValueType {
+    Void,
+    /// A result whose type cannot be a float or contain a float field.
+    Other,
+    Id(u64),
 }
 
 #[derive(Default)]
@@ -100,10 +109,8 @@ struct Module {
     types: Vec<Type>,
     /// Value ids run through globals, functions, constants, then the
     /// instructions that have a value.
-    globals: u64,
-    functions: u64,
-    constants: u64,
-    next: u64,
+    values: Vec<ValueType>,
+    constant_type: Option<u64>,
     names: BTreeMap<u64, String>,
     /// Calls by the value id called.
     calls: BTreeMap<u64, u64>,
@@ -115,9 +122,6 @@ impl Module {
     fn block(&mut self, r: &mut Bits, id: u64, width: u32) -> Result<(), Why> {
         if !(2..=32).contains(&width) {
             return Err("a block's abbreviation width");
-        }
-        if id == FUNCTION_BLOCK {
-            self.next = self.globals + self.functions + self.constants;
         }
         let mut ops = Vec::new();
         loop {
@@ -164,14 +168,21 @@ impl Module {
             // NUMENTRY and a struct's name make no type.
             (TYPE_BLOCK, 1 | 19) => {}
             (TYPE_BLOCK, 2) => self.types.push(Type::Void),
+            (TYPE_BLOCK, 3 | 4 | 10) => self.types.push(Type::Float),
+            (TYPE_BLOCK, 11) => self.types.push(Type::Array(op(1)?)),
+            (TYPE_BLOCK, 12) => self.types.push(Type::Vector(op(1)?)),
+            (TYPE_BLOCK, 18 | 20) => self
+                .types
+                .push(Type::Struct(ops.get(1..).ok_or("a short record")?.to_vec())),
             (TYPE_BLOCK, 21) => self.types.push(Type::Function(op(1)?)),
             (TYPE_BLOCK, _) => self.types.push(Type::Other),
-            (MODULE_BLOCK, 7) => self.globals += 1,
-            (MODULE_BLOCK, 8) => self.functions += 1,
+            (MODULE_BLOCK, 7 | 8) => self.values.push(ValueType::Other),
             (MODULE_BLOCK, _) => {}
             // SETTYPE makes no value.
-            (CONSTANTS_BLOCK, 1) => {}
-            (CONSTANTS_BLOCK, _) => self.constants += 1,
+            (CONSTANTS_BLOCK, 1) => self.constant_type = Some(op(0)?),
+            (CONSTANTS_BLOCK, _) => self.values.push(ValueType::Id(
+                self.constant_type.ok_or("a constant without its type")?,
+            )),
             (VALUE_SYMTAB_BLOCK, 1) => {
                 let name = ops[1.min(ops.len())..]
                     .iter()
@@ -187,60 +198,129 @@ impl Module {
         Ok(())
     }
 
+    /// The type of a leading relative operand and the index after it.
+    fn operand_type(&self, ops: &[u64]) -> Result<(ValueType, usize), Why> {
+        let relative = *ops.first().ok_or("a short record")?;
+        let next = self.values.len();
+        if let Some(ty) = next
+            .checked_sub(relative as usize)
+            .and_then(|id| self.values.get(id))
+        {
+            Ok((*ty, 1))
+        } else {
+            // A forward reference is followed by an explicit type id.
+            Ok((ValueType::Id(*ops.get(1).ok_or("a short record")?), 2))
+        }
+    }
+
+    fn ty(&self, id: u64) -> Result<&Type, Why> {
+        self.types.get(id as usize).ok_or("a type id")
+    }
+
+    fn is_float(&self, ty: ValueType) -> Result<bool, Why> {
+        let ValueType::Id(id) = ty else {
+            return Ok(false);
+        };
+        Ok(match self.ty(id)? {
+            Type::Float => true,
+            Type::Vector(element) => matches!(self.ty(*element)?, Type::Float),
+            _ => false,
+        })
+    }
+
+    fn extract_type(&self, mut ty: ValueType, indices: &[u64]) -> Result<ValueType, Why> {
+        for &index in indices {
+            let ValueType::Id(id) = ty else {
+                // The writer also extracts the integer result of cmpxchg.
+                return Ok(ValueType::Other);
+            };
+            ty = ValueType::Id(match self.ty(id)? {
+                Type::Array(element) => *element,
+                Type::Struct(fields) => *fields.get(index as usize).ok_or("a field index")?,
+                _ => return Err("an extract without an aggregate type"),
+            });
+        }
+        Ok(ty)
+    }
+
     fn instruction(&mut self, code: u64, ops: &[u64]) -> Result<(), Why> {
         let op = |i: usize| ops.get(i).copied().ok_or("a short record");
-        // The kind, and whether the instruction has a value.
-        let (kind, value) = match code {
-            2 => (
-                *[
-                    "add", "sub", "mul", "udiv", "sdiv", "urem", "srem", "shl", "lshr", "ashr",
-                    "and", "or", "xor",
-                ]
-                .get(op(2)? as usize)
-                .ok_or("a binary opcode")?,
-                true,
-            ),
-            3 => (
-                *[
+        let (kind, ty) = match code {
+            2 => {
+                let (ty, rhs) = self.operand_type(ops)?;
+                let opcode = op(rhs + 1)?;
+                let kind = match (opcode, self.is_float(ty)?) {
+                    (0, true) => "fadd",
+                    (1, true) => "fsub",
+                    (2, true) => "fmul",
+                    (4, true) => "fdiv",
+                    (6, true) => "frem",
+                    _ => *[
+                        "add", "sub", "mul", "udiv", "sdiv", "urem", "srem", "shl", "lshr", "ashr",
+                        "and", "or", "xor",
+                    ]
+                    .get(opcode as usize)
+                    .ok_or("a binary opcode")?,
+                };
+                (kind, ty)
+            }
+            3 => {
+                let (_, dest) = self.operand_type(ops)?;
+                let kind = *[
                     "trunc", "zext", "sext", "fptoui", "fptosi", "uitofp", "sitofp", "fptrunc",
                     "fpext", "ptrtoint", "inttoptr", "bitcast",
                 ]
-                .get(op(2)? as usize)
-                .ok_or("a cast opcode")?,
-                true,
-            ),
-            10 => ("ret", false),
-            11 => ("br", false),
-            16 => ("phi", true),
-            20 => ("load", true),
-            26 => ("extractvalue", true),
-            28 => (if op(2)? < 32 { "fcmp" } else { "icmp" }, true),
-            29 => ("select", true),
-            38 => ("atomicrmw", true),
-            43 => ("getelementptr", true),
-            44 => ("store", false),
-            46 => ("cmpxchg", true),
+                .get(op(dest + 1)? as usize)
+                .ok_or("a cast opcode")?;
+                (kind, ValueType::Id(op(dest)?))
+            }
+            10 => ("ret", ValueType::Void),
+            11 => ("br", ValueType::Void),
+            16 => ("phi", ValueType::Id(op(0)?)),
+            20 => ("load", ValueType::Id(op(self.operand_type(ops)?.1)?)),
+            26 => {
+                let (aggregate, first_index) = self.operand_type(ops)?;
+                op(first_index)?;
+                (
+                    "extractvalue",
+                    self.extract_type(aggregate, &ops[first_index..])?,
+                )
+            }
+            28 => {
+                let (_, rhs) = self.operand_type(ops)?;
+                (
+                    if op(rhs + 1)? < 32 { "fcmp" } else { "icmp" },
+                    ValueType::Other,
+                )
+            }
+            29 => ("select", self.operand_type(ops)?.0),
+            38 => ("atomicrmw", ValueType::Other),
+            43 => ("getelementptr", ValueType::Other),
+            44 => ("store", ValueType::Void),
+            46 => ("cmpxchg", ValueType::Other),
             34 => {
                 // [attributes, calling convention, function type, callee
                 // (relative), arguments...]
-                let callee = self
-                    .next
+                let callee = (self.values.len() as u64)
                     .checked_sub(op(3)?)
                     .ok_or("a call of a later value")?;
-                *self.calls.entry(callee).or_default() += 1;
-                let void = match self.types.get(op(2)? as usize) {
-                    Some(&Type::Function(ret)) => self.types.get(ret as usize) == Some(&Type::Void),
-                    _ => return Err("a call without its function type"),
+                let Type::Function(ret) = self.ty(op(2)?)? else {
+                    return Err("a call without its function type");
                 };
+                if !matches!(self.ty(*ret)?, Type::Void) {
+                    self.values.push(ValueType::Id(*ret));
+                }
+                *self.calls.entry(callee).or_default() += 1;
                 self.counts.instructions += 1;
-                self.next += u64::from(!void);
                 return Ok(());
             }
             _ => return Err("an instruction record of another kind"),
         };
         self.counts.instructions += 1;
         *self.counts.kinds.entry(kind.into()).or_default() += 1;
-        self.next += u64::from(value);
+        if !matches!(ty, ValueType::Void) {
+            self.values.push(ty);
+        }
         Ok(())
     }
 }
@@ -374,6 +454,61 @@ mod tests {
         );
         assert_eq!(c.instructions, c.kinds.values().sum::<u64>());
         assert_eq!(c.instructions, 23);
+    }
+
+    #[test]
+    fn counts_integer_and_float_binary_ops_separately() {
+        let mut m = Module::default();
+        let (void, float) = (m.void(), m.float());
+        let pair = m.named_struct("pair", vec![float, float]);
+        let load_ty = m.func_ty(pair, vec![]);
+        let load = m.function("load_pair", load_ty, None, false);
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+        let entry = m.new_block();
+
+        let i = m.i32(2);
+        let sum = m.bin(entry, Bin::Add, i, i);
+        let product = m.bin(entry, Bin::Mul, sum, i);
+        m.bin(entry, Bin::SDiv, product, i);
+
+        let pair = m.call(entry, load, vec![]);
+        let f = m.extract(entry, pair, 0);
+        let two = m.f32(2.0f32.to_bits());
+        let sum = m.bin(entry, Bin::Add, f, two);
+        let product = m.bin(entry, Bin::Mul, sum, two);
+        m.bin(entry, Bin::SDiv, two, product);
+        m.terminate(entry, Term::Ret);
+
+        let c = count(&m.write()).expect("counts");
+        assert_eq!(
+            kinds(&c),
+            [
+                ("add", 1),
+                ("extractvalue", 1),
+                ("fadd", 1),
+                ("fdiv", 1),
+                ("fmul", 1),
+                ("load_pair", 1),
+                ("mul", 1),
+                ("ret", 1),
+                ("sdiv", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn counts_float_binary_ops_with_forward_operand_types() {
+        // The writer emits neither vectors nor forward binary operands.
+        let mut m = super::Module::default();
+        m.record(TYPE_BLOCK, 10, &[]).unwrap(); // half
+        m.record(TYPE_BLOCK, 4, &[]).unwrap(); // double
+        m.record(TYPE_BLOCK, 12, &[2, 0]).unwrap(); // <2 x half>
+        let forward = u64::from(u32::MAX);
+        m.instruction(2, &[forward, 2, forward, 1]).unwrap(); // fsub of vectors
+        m.instruction(2, &[1, 1, 6]).unwrap(); // frem of vectors
+        m.instruction(2, &[forward, 1, forward, 0]).unwrap(); // fadd of doubles
+        assert_eq!(kinds(&m.counts), [("fadd", 1), ("frem", 1), ("fsub", 1)]);
     }
 
     /// Through a whole container, as a shader is handed to the host.
