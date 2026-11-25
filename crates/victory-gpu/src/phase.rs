@@ -36,6 +36,12 @@ pub enum Phase {
     Draw,
     /// Of a draw: binding its pipeline, roots and tables.
     Bind,
+    /// Of a bind: the heaps, the root signature and the pipeline state.
+    BindState,
+    /// Of a bind: the descriptor tables a shader's bindings are written into.
+    BindTables,
+    /// Of a bind: the root constants, views and unordered views.
+    BindViews,
     /// The shadow and address-space lookups, wherever they run.
     Shadow,
     /// A whole pipeline made in its worker, translation and driver included.
@@ -46,7 +52,7 @@ pub enum Phase {
     Loop,
 }
 
-const PHASES: usize = 7;
+const PHASES: usize = 10;
 
 static US: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
 static CALLS: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
@@ -95,11 +101,20 @@ pub(crate) fn line(frames: f64, ms: f64) {
     let (record, record_calls) = per(Phase::Record);
     let (draw, draw_calls) = per(Phase::Draw);
     let (bind, _) = per(Phase::Bind);
+    let (bind_state, _) = per(Phase::BindState);
+    let (bind_tables, _) = per(Phase::BindTables);
+    let (bind_views, _) = per(Phase::BindViews);
     let (shadow, shadow_calls) = per(Phase::Shadow);
     let (translate, translate_calls) = per(Phase::Translate);
     let (submit, submit_calls) = per(Phase::Submit);
     let (queue, _) = per(Phase::Loop);
     tracing::info!(
-        "where a frame's time goes per frame, of {ms:.1} ms: {queue:.1} ms in the queues' loop, {submit:.1} ms of it submitting ({submit_calls:.1} submissions); beside it on the title's threads {record:.1} ms recording {record_calls:.0} list calls, of it {draw:.1} ms in {draw_calls:.0} draws and dispatches ({bind:.1} ms binding them, {shadow:.1} ms in {shadow_calls:.0} shadow and address-space lookups); and {translate:.1} ms making {translate_calls:.1} pipelines. These are sums over threads: recording and making run beside the loop, so they can exceed the frame's wall clock"
+        "where a frame's time goes per frame, of {ms:.1} ms: {queue:.1} ms in the queues' loop, {submit:.1} ms \
+of it submitting ({submit_calls:.1} submissions); beside it on the title's threads {record:.1} ms \
+recording {record_calls:.0} list calls, of it {draw:.1} ms in {draw_calls:.0} draws and dispatches \
+({bind:.1} ms binding them: {bind_state:.1} ms state, {bind_tables:.1} ms descriptor tables, \
+{bind_views:.1} ms root views and constants; {shadow:.1} ms in {shadow_calls:.0} shadow and \
+address-space lookups); and {translate:.1} ms making {translate_calls:.1} pipelines. These are sums \
+over threads: recording and making run beside the loop, so they can exceed the frame's wall clock"
     );
 }

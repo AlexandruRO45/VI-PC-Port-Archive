@@ -849,6 +849,7 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let _binding = crate::phase::at(crate::phase::Phase::Bind);
+        let state = crate::phase::at(crate::phase::Phase::BindState);
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -897,11 +898,15 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        drop(state);
         for stage in &p.stages {
+            let tables = crate::phase::at(crate::phase::Phase::BindTables);
             let t = stage.translated();
             STORES.set(t.stores);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
+            drop(tables);
+            let _views = crate::phase::at(crate::phase::Phase::BindViews);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
