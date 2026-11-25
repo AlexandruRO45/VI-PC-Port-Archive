@@ -1660,8 +1660,12 @@ mod tests {
     /// atomic is on a typed resource, or on one from the heap.
     #[test]
     fn uses_tracks_atomic64_typed_and_heap_flags() {
-        // (kind, atomic, on the taken edge) -> (typed, heap)
-        let build = |kind: u32, name: &str, taken: bool| {
+        const HEAP: &str = "dx.op.createHandleFromHeap";
+        const BINDING: &str = "dx.op.createHandleFromBinding";
+        // (kind, the handle's source, atomic, on the taken edge) -> (typed,
+        // heap). The source's signature stands in for both calls: only its
+        // name is read.
+        let build = |kind: u32, source: &str, name: &str, taken: bool| {
             let (mut m, b, _sink) = module(3);
             let [entry, live, dead] = b[..] else { unreachable!() };
             let (i32t, i64t, handle_t) = (m.int(32), m.int(64), m.int(8));
@@ -1669,16 +1673,17 @@ mod tests {
             let annotate_ty = m.func_ty(handle_t, vec![i32t, handle_t, props_ty]);
             let annotate = m.function("dx.op.annotateHandle", annotate_ty, Some(Attr::ReadNone), false);
             let i1t = m.int(1);
-            let heap_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
-            let heap = m.function("dx.op.createHandleFromHeap", heap_ty, Some(Attr::ReadNone), false);
+            let make_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
+            let make = m.function(source, make_ty, Some(Attr::ReadNone), false);
             let atomic_ty = m.func_ty(i64t, vec![i32t, handle_t, i32t, i32t, i32t, i32t, i64t]);
             let atomic = m.function(name, atomic_ty, Some(Attr::NoUnwind), false);
-            let (op, zero, or, no, yes) = (m.i32(218), m.i32(0), m.i32(2), m.bool(false), m.bool(true));
+            let op = m.i32(if source == HEAP { 218 } else { 217 });
+            let (zero, or, no, yes) = (m.i32(0), m.i32(2), m.bool(false), m.bool(true));
             m.terminate(entry, Term::CondBr(yes, live, dead));
             m.terminate(live, Term::Ret);
             m.terminate(dead, Term::Ret);
             let at = if taken { live } else { dead };
-            let raw = m.call(at, heap, vec![op, zero, no, no]);
+            let raw = m.call(at, make, vec![op, zero, no, no]);
             let (annotate_op, p0, p1) = (m.i32(216), m.i32(kind), m.i32(0x105));
             let props = m.aggregate(props_ty, &[p0, p1]);
             let h = m.call(at, annotate, vec![annotate_op, raw, props]);
@@ -1689,11 +1694,13 @@ mod tests {
             (u.atomic64_typed, u.atomic64_heap)
         };
         // On a path no lane takes: nothing.
-        assert_eq!(build(2 | 0x1000, "dx.op.atomicBinOp.i64", false), (false, false));
+        assert_eq!(build(2 | 0x1000, HEAP, "dx.op.atomicBinOp.i64", false), (false, false));
         // A raw buffer from the heap: the heap feature only.
-        assert_eq!(build(11 | 0x1000, "dx.op.atomicBinOp.i64", true), (false, true));
+        assert_eq!(build(11 | 0x1000, HEAP, "dx.op.atomicBinOp.i64", true), (false, true));
+        // A typed texture from a binding: the typed feature only.
+        assert_eq!(build(2 | 0x1000, BINDING, "dx.op.atomicBinOp.i64", true), (true, false));
         // A typed texture from the heap, compare-exchange: both.
-        assert_eq!(build(2 | 0x1000, "dx.op.atomicCompareExchange.i64", true), (true, true));
+        assert_eq!(build(2 | 0x1000, HEAP, "dx.op.atomicCompareExchange.i64", true), (true, true));
     }
 
     #[test]
