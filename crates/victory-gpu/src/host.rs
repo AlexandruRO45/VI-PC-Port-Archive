@@ -5949,6 +5949,10 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+            crate::traffic::report(frames);
+        }
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(

@@ -54,6 +54,9 @@ pub(crate) struct Staging {
     /// of 1,120 textures in one frame of run 18.)
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
+    /// Detiles since this texture was made, for [`crate::traffic`]: a refresh
+    /// that raised it read changed bytes.
+    detiles: std::sync::atomic::AtomicU64,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
     /// Whether another view maps this texture's bytes too, so that a write
@@ -696,10 +699,23 @@ impl Staging {
     fn refresh_with(&self, held: Option<&crate::watch::Reading>) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let detiles = self.detiles.load(Relaxed);
         let read = self.refresh_now(held);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if read > 0 {
+            let changed = self.detiles.load(Relaxed) > detiles;
+            crate::traffic::note(
+                crate::traffic::Kind::Texture,
+                self.memory as usize,
+                self.layout.size as u64,
+                read as u64,
+                if changed { read as u64 } else { 0 },
+            );
+        }
     }
 
     /// Returns the bytes of title memory read.
@@ -906,6 +922,7 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.detiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -1201,6 +1218,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
+        detiles: std::sync::atomic::AtomicU64::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         second_view: std::sync::atomic::AtomicU8::new(0),
     });
