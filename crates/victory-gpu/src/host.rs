@@ -1829,7 +1829,10 @@ pub(crate) fn relay() -> bool {
 /// both wait for everything.
 fn relay_exact() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "2"))
+    // Stage 2 unless `VICTORY_RELAY=1` asks for the first one (the default
+    // since the walls of the first room were found drawn in every run with
+    // this set and in fewer than half without it).
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v == "2"))
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -1930,7 +1933,7 @@ mod relay_tests {
 fn default_late_most(video_memory: Option<[u64; 4]>) -> usize {
     const LOW_VRAM_BUDGET: u64 = 6 << 30;
     const LOW_VRAM_LISTS: usize = 64;
-    const DEFAULT_LISTS: usize = 128;
+    const DEFAULT_LISTS: usize = 256;
     match video_memory {
         Some([budget, ..]) if (1..=LOW_VRAM_BUDGET).contains(&budget) => LOW_VRAM_LISTS,
         _ => DEFAULT_LISTS,
@@ -1950,12 +1953,15 @@ fn resolve_late_most(
 }
 
 /// The most host lists in the air before the flights are settled
-/// (`VICTORY_LATE_WAIT_LISTS`, default 128, or 64 when the local VRAM budget is
-/// 6 GiB or less; 32 settled the flights three times a frame in run 92 and 64
-/// still 1.3-1.7 times in run 99 on a 12 GB card, with 12,919 tables asked and
-/// none refused; watch "tables asked, N refused"): their dynamic descriptor
-/// slots, upload memory and scratch chunks are held until then, and a frame's
-/// lists held all at once ran the slots out before (run 45).
+/// (`VICTORY_LATE_WAIT_LISTS`, default 256, or 64 when the local VRAM budget is
+/// 6 GiB or less; `=128` was the value before: with the relay it stopped the
+/// submitting thread twice a frame for 92-103 ms in all while the card stood
+/// idle 64-113 ms a frame, runs 158, 159 and 162; 32 settled the flights three
+/// times a frame in run 92 and 64 still 1.3-1.7 times in run 99 on a 12 GB
+/// card, with 12,919 tables asked and none refused; watch "tables asked, N
+/// refused"): their dynamic descriptor slots, upload memory and scratch chunks
+/// are held until then, and a frame's lists held all at once ran the slots out
+/// before (run 45).
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| {
@@ -2659,29 +2665,29 @@ mod late_tests {
     }
 
     #[test]
-    fn late_most_scales_with_vram_budget_and_honours_override() {
-        const MIB: u64 = 1 << 20;
-        const GIB: u64 = 1 << 30;
-        // 6 GB card (RTX 2060 reports ~5,187 MiB local DXGI budget) and <= 6 GiB boundary.
-        assert_eq!(default_late_most(Some([5187 * MIB, 0, 0, 0])), 64);
-        assert_eq!(default_late_most(Some([4 * GIB, 0, 0, 0])), 64);
-        assert_eq!(default_late_most(Some([6 * GIB, 0, 0, 0])), 64);
-        // Above 6 GiB (8 GB / 12 GB cards) keeps 128.
-        assert_eq!(default_late_most(Some([6 * GIB + 1, 0, 0, 0])), 128);
-        assert_eq!(default_late_most(Some([7200 * MIB, 0, 0, 0])), 128);
-        assert_eq!(default_late_most(Some([11000 * MIB, 0, 0, 0])), 128);
-        // Missing or zero budget falls back to 128.
-        assert_eq!(default_late_most(None), 128);
-        assert_eq!(default_late_most(Some([0, 100, 0, 0])), 128);
-        // Explicit env var always wins without querying video memory.
-        assert_eq!(resolve_late_most(Some("128"), || panic!("must not query DXGI")), 128);
-        assert_eq!(resolve_late_most(Some(" 32 "), || panic!("must not query DXGI")), 32);
-        assert_eq!(resolve_late_most(Some("0"), || panic!("must not query DXGI")), 1);
-        // Unset or unparseable env falls back to the VRAM-scaled default.
-        assert_eq!(resolve_late_most(None, || Some([5187 * MIB, 0, 0, 0])), 64);
-        assert_eq!(resolve_late_most(Some("bad"), || Some([5187 * MIB, 0, 0, 0])), 64);
-        assert_eq!(resolve_late_most(None, || Some([11000 * MIB, 0, 0, 0])), 128);
-    }
+fn late_most_scales_with_vram_budget_and_honours_override() {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    // 6 GB card (RTX 2060 reports ~5,187 MiB local DXGI budget) and <= 6 GiB boundary.
+    assert_eq!(default_late_most(Some([5187 * MIB, 0, 0, 0])), 64);
+    assert_eq!(default_late_most(Some([4 * GIB, 0, 0, 0])), 64);
+    assert_eq!(default_late_most(Some([6 * GIB, 0, 0, 0])), 64);
+    // Above 6 GiB (8 GB / 12 GB cards) keeps 256.
+    assert_eq!(default_late_most(Some([6 * GIB + 1, 0, 0, 0])), 256);
+    assert_eq!(default_late_most(Some([7200 * MIB, 0, 0, 0])), 256);
+    assert_eq!(default_late_most(Some([11000 * MIB, 0, 0, 0])), 256);
+    // Missing or zero budget falls back to 256.
+    assert_eq!(default_late_most(None), 256);
+    assert_eq!(default_late_most(Some([0, 100, 0, 0])), 256);
+    // Explicit env var always wins without querying video memory.
+    assert_eq!(resolve_late_most(Some("128"), || panic!("must not query DXGI")), 128);
+    assert_eq!(resolve_late_most(Some(" 32 "), || panic!("must not query DXGI")), 32);
+    assert_eq!(resolve_late_most(Some("0"), || panic!("must not query DXGI")), 1);
+    // Unset or unparseable env falls back to the VRAM-scaled default.
+    assert_eq!(resolve_late_most(None, || Some([5187 * MIB, 0, 0, 0])), 64);
+    assert_eq!(resolve_late_most(Some("bad"), || Some([5187 * MIB, 0, 0, 0])), 64);
+    assert_eq!(resolve_late_most(None, || Some([11000 * MIB, 0, 0, 0])), 256);
+}
 }
 
 /// Whether a title buffer copy that continues the one recorded before it
@@ -2874,6 +2880,27 @@ impl Host {
                 && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
             tracing::info!(mesh, "host mesh shader support");
             mesh
+        })
+    }
+
+    /// Whether the host GPU supports the depth bounds test; logged once.
+    pub(crate) fn depth_bounds(&self) -> bool {
+        static BOUNDS: OnceLock<bool> = OnceLock::new();
+        *BOUNDS.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+            // SAFETY: writes `options` of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS2,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let supported = ok && options.DepthBoundsTestSupported.as_bool();
+            tracing::info!(supported, "host depth bounds support");
+            supported
         })
     }
 
