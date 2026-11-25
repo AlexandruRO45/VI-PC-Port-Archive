@@ -22,6 +22,20 @@ platform; these notes are what has worked for testers.
   execution dropped`, and every indirect draw and dispatch is skipped: most
   of the world is not drawn.
 
+## Common snags
+
+From slauko's testing:
+
+- **The start screen waits for ever without a pad.** Wine's XInput can report
+  a "pad" that never presses anything (here a mouse's HID interface), and the
+  keyboard stands in for a pad only while there is none. The log shows
+  `input device device=0 connected=true` for that phantom pad.
+  `SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0000/0000` hides every pad from
+  Wine, and Return gets past the start screen.
+- **`VKD3D_SHADER_CACHE_PATH` is a folder, not a file.** Given a file,
+  vkd3d-proton logs `Failed to map read-only cache` and compiles every
+  pipeline again on every run.
+
 ## NVIDIA
 
 - Some translated shaders crash the driver's compiler, which ends the
