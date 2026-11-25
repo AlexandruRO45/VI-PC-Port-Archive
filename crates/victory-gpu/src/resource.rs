@@ -110,6 +110,7 @@ const _: () = assert!(size_of::<HeapDesc>() == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
 
 const BUFFER: u32 = 1;
+const TEXTURE_2D: u32 = 3;
 const TEXTURE_3D: u32 = 4;
 
 /// Bytes per element and the element's width in texels (4 for block
@@ -138,7 +139,6 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
 pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
     use texture::{Dimension, Swizzle, TextureDesc};
     const TEXTURE_1D: u32 = 2;
-    const TEXTURE_2D: u32 = 3;
     const RENDER_TARGET: u32 = 1;
     const DEPTH: u32 = 2;
     let dimension = match desc.dimension {
@@ -365,18 +365,33 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
     };
     let mip = index % mips;
     let plane = index / mips / slices;
-    let depth_stencil = matches!(desc.format, 19..=22 | 44..=47);
-    // Each plane contains all the mip levels and array slices. Depth and
-    // stencil copies use separate formats and 512-byte row alignment.
-    let (format, pitch_alignment) = match (depth_stencil, plane) {
-        (true, 0) => (39, 512), // DXGI_FORMAT_R32_TYPELESS
-        (true, 1) => (60, 512), // DXGI_FORMAT_R8_TYPELESS
-        (false, 0) => (desc.format, PITCH),
+    if matches!(desc.format, 103 | 104)
+        && (desc.dimension != TEXTURE_2D
+            || mips != 1
+            || desc.sample_count != 1
+            || desc.depth_or_array_size == 0
+            || desc.width < 2
+            || desc.height < 2
+            || !desc.width.is_multiple_of(2)
+            || !desc.height.is_multiple_of(2))
+    {
+        return None;
+    }
+    // Each plane contains all array slices. NV12 and P010 chroma has half
+    // the extent of luma and two components per sample.
+    let (format, pitch_alignment, shift) = match (desc.format, plane) {
+        (19..=22 | 44..=47, 0) => (39, 512, mip), // depth: R32_TYPELESS
+        (19..=22 | 44..=47, 1) => (60, 512, mip), // stencil: R8_TYPELESS
+        (103, 0) => (60, 512, 0),                 // NV12 luma: R8_TYPELESS
+        (103, 1) => (48, 512, 1),                 // NV12 chroma: R8G8_TYPELESS
+        (104, 0) => (53, 512, 0),                 // P010 luma: R16_TYPELESS
+        (104, 1) => (33, 512, 1),                 // P010 chroma: R16G16_TYPELESS
+        (format, 0) => (format, PITCH, mip),
         _ => return None,
     };
     let (element, block) = element(format)?;
-    let width = (desc.width >> mip).max(1).next_multiple_of(block);
-    let height = (u64::from(desc.height) >> mip)
+    let width = (desc.width >> shift).max(1).next_multiple_of(block);
+    let height = (u64::from(desc.height) >> shift)
         .max(1)
         .next_multiple_of(block);
     let depth = if desc.dimension == TEXTURE_3D {
@@ -397,7 +412,7 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
 }
 
 /// Places subresources at 512-byte boundaries in an upload buffer.
-/// Row pitch is aligned to 512 bytes for depth/stencil planes and 256 bytes
+/// Row pitch is aligned to 512 bytes for depth/stencil and NV12/P010 planes and 256 bytes
 /// otherwise. Unknown sizes give the documented all-ones values.
 pub(crate) extern "system" fn copyable_footprints(
     _: This,
@@ -2109,6 +2124,36 @@ mod tests {
         );
         allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
         assert_eq!(info.size, u64::MAX);
+    }
+
+    #[test]
+    fn planar_video_copy_footprints() {
+        for (format, y_format, uv_format, row_bytes, pitch) in
+            [(103, 60, 48, 514, 1024), (104, 53, 33, 1028, 1536)]
+        {
+            let mut desc = texture(514, 258, format, 1);
+            desc.depth_or_array_size = 3;
+            // All luma slices precede all chroma slices.
+            for index in 0..6 {
+                let (fp, rows, bytes) = subresource(&desc, index).unwrap();
+                let (plane_format, width, height) = if index < 3 {
+                    (y_format, 514, 258)
+                } else {
+                    (uv_format, 257, 129)
+                };
+                assert_eq!(
+                    (fp.format, fp.width, fp.height),
+                    (plane_format, width, height)
+                );
+                assert_eq!((rows, bytes, fp.row_pitch), (height, row_bytes, pitch));
+            }
+            assert!(subresource(&desc, 6).is_none());
+            desc.height = 257;
+            assert!(subresource(&desc, 0).is_none());
+            desc.height = 258;
+            desc.mip_levels = 2;
+            assert!(subresource(&desc, 0).is_none());
+        }
     }
 
     #[test]
