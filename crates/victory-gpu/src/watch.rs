@@ -1029,37 +1029,47 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
-    /// Unmapping or remapping a range clears its stale write-journal entries
-    /// so a fresh allocation at the same virtual address starts clean.
+    /// Unmapping or remapping a range clears stale write-journal entries for
+    /// fully covered pages while preserving partially covered neighbors.
     #[test]
     fn remapped_memory_clears_stale_write_journal() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(
                 std::ptr::null(),
-                2 * PAGE,
+                3 * PAGE,
                 MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
                 PAGE_READWRITE,
             )
         } as usize;
         assert_ne!(p, 0);
-        let (start, end) = (p, p + 2 * PAGE);
-        // SAFETY: committed page of ours.
-        unsafe { (p as *mut u8).write(1) };
+        let (start, end) = (p, p + 3 * PAGE);
+        let base = p / PAGE;
+        // SAFETY: committed pages of ours.
+        unsafe {
+            (p as *mut u8).write(1);
+            ((p + PAGE) as *mut u8).write(1);
+            ((p + 2 * PAGE) as *mut u8).write(1);
+        }
         let (first_write, written) = writes(start, end, false).expect("watched");
-        assert_eq!(written, [(p / PAGE, first_write)]);
+        assert_eq!(written, [(base, first_write), (base + 1, first_write), (base + 2, first_write)]);
 
-        title_memory_remapped(p, 2 * PAGE);
-        let (_, after_remap) = writes(start, end, false).expect("watched");
-        assert!(after_remap.is_empty());
+        // Partially overlaps page 0 and page 2, fully covers only page 1.
+        title_memory_remapped(p + 1, 2 * PAGE);
+        let (_, after_partial) = writes(start, end, false).expect("watched");
+        assert_eq!(after_partial, [(base, first_write), (base + 2, first_write)]);
+
+        title_memory_remapped(p, 3 * PAGE);
+        let (_, after_full) = writes(start, end, false).expect("watched");
+        assert!(after_full.is_empty());
 
         // SAFETY: committed page of ours.
         unsafe { ((p + PAGE) as *mut u8).write(2) };
         let (second_write, written) = writes(start, end, false).expect("watched");
         assert!(second_write > first_write);
-        assert_eq!(written, [(p / PAGE + 1, second_write)]);
+        assert_eq!(written, [(base + 1, second_write)]);
 
-        title_memory_remapped(p, 2 * PAGE);
+        title_memory_remapped(p, 3 * PAGE);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
