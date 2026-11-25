@@ -273,49 +273,64 @@ pub(crate) fn merged(shadow: &std::sync::Arc<crate::shadow::Shadow>, lo: usize, 
     install();
     let mut card = CARD.lock().unwrap_or_else(|e| e.into_inner());
     let mut shown = Vec::with_capacity(views.len());
+    // Each view's protection now, and that it is one we may take over:
+    // looked at before anything changes, so that a page we leave alone is
+    // left exactly as it was (the guards' too).
+    let mut was = Vec::with_capacity(views.len());
     for &view in &views {
-        let guarded = crate::watch::release(view);
-        let Some(protect) = protection(view) else { break };
-        // Given back read-write where the guards had it read-only: they let
-        // it go, and the bytes it gets back count as written.
-        let back = if guarded && protect == PAGE_READONLY { PAGE_READWRITE } else { protect };
-        if protect != PAGE_READWRITE && protect != PAGE_READONLY {
-            break;
+        match protection(view) {
+            Some(p) if p == PAGE_READWRITE || p == PAGE_READONLY => was.push((view, p)),
+            _ => return no(5),
         }
+    }
+    // In the lookup before any view is protected: a fault on one from now
+    // on is ours, and waits for [`CARD`]'s lock (held here) before it is
+    // given back or let go.
+    {
+        let mut map = SHOWN.write().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(HashMap::new);
+        for &(view, _) in &was {
+            map.insert(view, page);
+        }
+    }
+    EVER.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).extend(was.iter().map(|w| w.0));
+    ANY.store(true, Relaxed);
+    let forget = || {
+        let mut map = SHOWN.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = map.as_mut() {
+            for &(view, _) in &was {
+                map.remove(&view);
+            }
+            ANY.store(!map.is_empty(), Relaxed);
+        }
+    };
+    for &(view, protect) in &was {
         let mut old = 0;
         // SAFETY: a committed page of title view memory; only its
         // protection changes, and it is given back on a touch.
         if unsafe { VirtualProtect(view as *const _, PAGE, PAGE_NOACCESS, &mut old) } == 0 {
             break;
         }
-        shown.push((view, back));
+        shown.push((view, protect));
     }
     if shown.len() != views.len() {
         no(5);
-        // Not every view: none.
-        for &(view, back) in &shown {
+        // Not every view: none, each back to exactly what it was.
+        for &(view, protect) in &shown {
             let mut old = 0;
-            // SAFETY: as above, back to what it was.
-            unsafe { VirtualProtect(view as *const _, PAGE, back, &mut old) };
+            // SAFETY: as above.
+            unsafe { VirtualProtect(view as *const _, PAGE, protect, &mut old) };
         }
+        forget();
         return;
     }
-    {
-        let mut map = SHOWN.write().unwrap_or_else(|e| e.into_inner());
-        let map = map.get_or_insert_with(HashMap::new);
-        for &(view, _) in &shown {
-            map.insert(view, page);
+    // Only now do the guards let the page go: a block they had read-only
+    // comes back read-write on a give-back (they no longer watch it, and
+    // the bytes it gets back count as written).
+    for (view, back) in shown.iter_mut() {
+        if crate::watch::release(*view) && *back == PAGE_READONLY {
+            *back = PAGE_READWRITE;
         }
-    }
-    {
-        let mut ever = EVER.lock().unwrap_or_else(|e| e.into_inner());
-        ever.get_or_insert_with(Default::default).extend(shown.iter().map(|s| s.0));
-    }
-    ANY.store(true, Relaxed);
-    // A guard set again between its release and our protection is let go
-    // once more: from here on the guards leave the page alone.
-    for &(view, _) in &shown {
-        crate::watch::release(view);
     }
     card.get_or_insert_with(HashMap::new).insert(
         page,
