@@ -696,6 +696,96 @@ mod tests {
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
     }
 
+    /// Implicit-derivative samples (`image_sample`, `_b`, `_o`) translate in a
+    /// pixel program, where validator version 1.6 allows them (compute
+    /// refuses them: `implicit_derivative_samples_are_refused_in_compute`).
+    #[test]
+    fn implicit_derivative_samples_translate_in_a_pixel_program() {
+        for (op, name) in [
+            (0x20u32, "image_sample"),
+            (0x25, "image_sample_b"),
+            (0x30, "image_sample_o"),
+        ] {
+            let words = [
+                0xBE81_0380u32, // s_mov_b32 s1, 0
+                0xF40C_0000,
+                0xFA00_0000, // s_load_dwordx8 s[0:7], s[0:1], null
+                0xBE88_0380, // s_mov_b32 s8, 0
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xBE8A_0380, // s_mov_b32 s10, 0
+                0xBE8B_0380, // s_mov_b32 s11, 0
+                0x7E00_02F0, // v_mov_b32 v0, 0.5 (bias or offset)
+                0x7E02_02F0, // v_mov_b32 v1, 0.5 (u)
+                0x7E04_02F0, // v_mov_b32 v2, 0.5 (v)
+                0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+                0xF000_0108 | op << 18,
+                0x0040_0300, // sample v3, v[0:2], s[0:7], s[8:11]
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0xF800_180F,
+                0x0303_0303, // exp mrt0, v3, v3, v3, v3 done vm
+                0xBF81_0000,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![crate::native::RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![crate::native::UsedResource {
+                    kind: crate::native::ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 8,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let output = SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            };
+            let osg1 = container::signature(&[output], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let out = emit(&c, &native, &p, &st, &io, &res)
+                .unwrap_or_else(|e| panic!("{name} in a pixel program: {e}"));
+            #[cfg(windows)]
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone()).unwrap();
+            }
+            let _ = out;
+        }
+    }
+
     #[test]
     fn immediate_sampler_slots_distinguish_comparison_uses() {
         let words = [

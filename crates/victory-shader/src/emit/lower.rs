@@ -7904,13 +7904,19 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let (op, sample) = match name {
-            "image_sample" | "image_sample_o" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
-            "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
             "image_sample_d" | "image_sample_d_cl" => (63, true),
+            // Implicit derivatives: pixel shaders only. The module declares
+            // validator version 1.6, where DXC takes Sample, SampleBias,
+            // SampleCmp, CalculateLOD and the derivative ops as pixel-only
+            // (1.8 lifts that), so in any other stage (compute, mesh, vertex)
+            // they would be invalid DXIL: refuse them with the rest. A later
+            // change could lower them to SampleGrad with gradients from
+            // QuadOp-derived differences.
+            "image_sample" | "image_sample_o" if self.s.pixel => (60, true),
+            "image_sample_b" if self.s.pixel => (61, true),
             "image_get_lod" if self.s.pixel => (81, true),
-            // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l"
             | "image_gather4_l_o" => (73, true),

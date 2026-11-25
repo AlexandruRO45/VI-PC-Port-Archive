@@ -1173,6 +1173,15 @@ fn bfe_signed_and_unsigned_match_rdna2() {
 /// tables at s4 and s6 (slots 1 and 2); `used` lists (table user SGPR,
 /// kind, table offset in dwords, descriptor dwords).
 fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: bool) -> HostShader {
+    try_lower_cs32(words, used, validate).expect("lower")
+}
+
+/// [`lower_cs32`], returning the lowering's refusal instead of panicking.
+fn try_lower_cs32(
+    words: &[u32],
+    used: &[(u8, ResourceType, u32, u8)],
+    validate: bool,
+) -> Result<HostShader, crate::ShaderError> {
     let param = |root, user_data, slot| RootParam {
         root,
         table_offset_dwords: 0,
@@ -1226,8 +1235,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
-    })
-    .expect("lower");
+    })?;
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -1251,7 +1259,50 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         v.validate(&mut shader.dxil.clone())
             .expect("DXIL validation failed");
     }
-    shader
+    Ok(shader)
+}
+
+/// Implicit-derivative samples are pixel-only at validator version 1.6: in a
+/// compute program `image_sample`, `image_sample_o` and `image_sample_b` are
+/// refused (as `image_sample_c` always was) instead of emitting a `Sample`
+/// the validator rejects; an explicit-LOD sample of the same shape lowers.
+#[test]
+fn implicit_derivative_samples_are_refused_in_compute() {
+    let mut prefix = vec![s_mov_b32(5, 0x80), s_mov_b32(7, 0x80)];
+    // s[8:15] the texture, s[20:23] a raw UAV the result is stored to (a
+    // dead sample would be dropped before it could be refused), s[16:19]
+    // the sampler.
+    for (op, dst, base, offset) in [(3u32, 8u32, 4u32, 0u32), (2, 20, 4, 0x20), (2, 16, 6, 0)] {
+        prefix.extend([
+            0x3D << 26 | op << 18 | dst << 6 | base >> 1,
+            125 << 25 | offset,
+        ]);
+    }
+    let used = [
+        (4, ResourceType::Srv, 0, 8),
+        (4, ResourceType::Uav, 8, 4),
+        (6, ResourceType::Sampler, 0, 4),
+    ];
+    // MIMG sample v[5:8], v[1:2], s[8:15], s[16:19] dmask:0xf dim:2D
+    let sample = |op: u32| {
+        let mut w = prefix.clone();
+        w.extend([0xF000_0F08 | op << 18, 1 | 5 << 8 | 2 << 16 | 4 << 21]);
+        w.extend(buffer_store_dword(5, 20, 0));
+        w.push(S_ENDPGM);
+        w
+    };
+    for (op, name) in [
+        (0x20, "image_sample"),
+        (0x25, "image_sample_b"),
+        (0x30, "image_sample_o"),
+    ] {
+        match try_lower_cs32(&sample(op), &used, false) {
+            Err(crate::ShaderError::Unsupported { what, .. }) => assert_eq!(what, name),
+            other => panic!("{name} in compute: {:?}", other.err()),
+        }
+    }
+    // image_sample_lz (0x27) has an explicit level: still translated.
+    try_lower_cs32(&sample(0x27), &used, true).expect("image_sample_lz in compute");
 }
 
 /// User data for [`lower_cs32`]'s programs: the root constant `k`, both
@@ -1270,16 +1321,15 @@ fn user_data_cs32(shader: &HostShader, k: u32) -> Vec<u32> {
 
 /// Image addresses with `a16` after a whole-VGPR operand (the offset or
 /// bias keeps a VGPR; the coordinates share the next) and the clamp of
-/// `image_sample_d_cl` (after the coordinates). Program 1: a biased sample
-/// of 16-bit coordinates whose f16 bias is the root constant's low half.
-/// Program 2: a gather with an offset of 16-bit and of 32-bit coordinates
-/// (equal results), and a sample with gradients and the root constant as
-/// clamp. The samples read a 32x32 texture whose level `n` holds `n`, at
-/// level 1 by the derivatives, with a point sampler.
+/// `image_sample_d_cl` (after the coordinates): a gather with an offset of
+/// 16-bit and of 32-bit coordinates (equal results), and a sample with
+/// gradients and the root constant as clamp. (A biased sample of 16-bit
+/// coordinates was a program here until `image_sample_b` became pixel-only.)
+/// The samples read a 32x32 texture whose level `n` holds `n`, at level 1
+/// by the derivatives, with a point sampler.
 #[test]
 fn image_addresses_of_16_bits_and_clamps() {
     use windows::Win32::Graphics::Direct3D12::*;
-    let (v0, v3, v4) = (vgpr(0), vgpr(3), vgpr(4));
     // Descriptors: s[8:15] the levels texture (heap index 0), s[20:23] the
     // raw UAV (1), s[24:31] the 4x4 texture (2), s[16:19] the sampler.
     let mut prefix = vec![s_mov_b32(5, 0x80), s_mov_b32(7, 0x80)];
@@ -1301,31 +1351,9 @@ fn image_addresses_of_16_bits_and_clamps() {
         (6, ResourceType::Sampler, 0, 4),
     ];
 
-    // A 2x2 quad per four lanes: u = (4 + (l & 1)) / 16, v = (4 + (l >> 1 & 1)) / 16.
-    let mut biased = prefix.clone();
-    biased.push(0x1B << 25 | 3 << 17 | (v0 as u32 & 0xFF) << 9 | 129); // v_and_b32 v3, 1, v0
-    biased.extend(vop3(0x148, 4, v0, 129, 129)); // v_bfe_u32 v4, v0, 1, 1
-    biased.push(0x25 << 25 | 3 << 17 | (v3 as u32 & 0xFF) << 9 | 132); // v_add_nc_u32 v3, 4, v3
-    biased.push(0x25 << 25 | 4 << 17 | (v4 as u32 & 0xFF) << 9 | 132); // v_add_nc_u32 v4, 4, v4
-    biased.extend([vop1(0x006, 3, v3), vop1(0x006, 4, v4)]); // v_cvt_f32_u32
-    // v_mul_f32 v3, 1/16, v3; v_mul_f32 v4, 1/16, v4
-    biased.extend([
-        0x08 << 25 | 3 << 17 | (v3 as u32 & 0xFF) << 9 | 255,
-        0x3D80_0000,
-    ]);
-    biased.extend([
-        0x08 << 25 | 4 << 17 | (v4 as u32 & 0xFF) << 9 | 255,
-        0x3D80_0000,
-    ]);
-    biased.push(0x2F << 25 | 2 << 17 | (v4 as u32 & 0xFF) << 9 | v3 as u32); // v_cvt_pkrtz_f16_f32 v2, v3, v4
-    biased.push(vop1(0x001, 1, sgpr(0)));
-    // image_sample_b v[5:8], v[1:2], s[8:15], s[16:19] dmask:0xf dim:2D a16
-    biased.extend([0xF094_0F08, 1 | 5 << 8 | 2 << 16 | 4 << 21 | 1 << 30]);
-    biased.extend(buffer_store_dword(5, 20, 0));
-    biased.push(S_ENDPGM);
-    // The 1.6 validator refuses implicit derivatives in compute (1.8 takes
-    // them); the host runs them.
-    let biased = lower_cs32(&biased, &used, false);
+    // The program that sampled with a bias (`image_sample_b`, a16) is gone: an
+    // implicit-derivative sample is pixel-only at validator version 1.6, so
+    // compute refuses it (see `implicit_derivative_samples_are_refused_in_compute`).
 
     let mut gathers = prefix;
     // Offset (1, 0); coordinates (0.375, 0.625) as f16 in v2 and as f32 in
@@ -1370,12 +1398,7 @@ fn image_addresses_of_16_bits_and_clamps() {
     let f = |x: f32| x.to_bits();
     // Texels (2, 3), (3, 3), (3, 2), (2, 2) twice, then the level.
     let gathered = |level| [14.0, 15.0, 11.0, 10.0, 14.0, 15.0, 11.0, 10.0, level];
-    let cases: [(&HostShader, u32, &[f32]); 9] = [
-        (&biased, 0x3C00, &[2.0]),      // bias 1
-        (&biased, 0xABCD_BC00, &[0.0]), // bias -1, high half ignored
-        (&biased, 0x4000, &[3.0]),      // bias 2
-        (&biased, 0, &[1.0]),           // bias 0
-        (&biased, f(2.0), &[1.0]),      // low half 0
+    let cases: [(&HostShader, u32, &[f32]); 4] = [
         (&gathers, 0, &gathered(1.0)),  // clamp 0
         (&gathers, f(2.0), &gathered(2.0)),
         (&gathers, f(3.0), &gathered(3.0)),
