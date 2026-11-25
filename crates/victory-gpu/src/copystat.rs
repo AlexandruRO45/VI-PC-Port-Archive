@@ -87,6 +87,7 @@ pub(crate) enum C {
     CompareUs,
     ReservedBytesKept,
     TexIdentical,
+    TexDeferred,
     LazyProtectSkipped,
 }
 const COUNTERS: usize = C::LazyProtectSkipped as usize + 1;
@@ -284,6 +285,9 @@ pub(crate) fn log(frames: f64) {
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
     );
+    if c[C::TexDeferred as usize] > 0.0 {
+        tracing::info!("  texture re-uploads deferred per frame: {:.2}", c[C::TexDeferred as usize]);
+    }
     let held: Vec<String> = crate::watch::held_times()
         .iter()
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
