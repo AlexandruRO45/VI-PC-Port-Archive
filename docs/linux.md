@@ -6,10 +6,14 @@ platform. These notes are what has worked for testers.
 
 ## Setup
 
-- A Proton build with vkd3d-proton (tested: proton-cachyos 11.0 with the
-  vkd3d-proton it ships, which reports itself as 3.2.0, build `2576c0b4`;
-  GE-Proton 11 is reported to work too). Run
-  `victory.exe` with `proton runinprefix` in a prefix of its own.
+- A Proton build with vkd3d-proton (tested: proton-cachyos 11.0, with the
+  `d3d12.dll` and `d3d12core.dll` of Proton Experimental 11.0 next to
+  `victory.exe`, which report themselves as vkd3d-proton 3.2.0, build
+  `2576c0b4`; proton-cachyos 11.0's own vkd3d-proton is an older build,
+  `3dfc6f07`, and has not been measured here; GE-Proton 11 is reported to
+  work too). Run `victory.exe` with `proton runinprefix` in a prefix of
+  its own. A Proton's vkd3d-proton build is in
+  `files/lib/wine/vkd3d-proton/version`.
 - Use the native Direct3D 12 DLLs:
   `WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n,b"`, with vkd3d-proton's
   `d3d12.dll` and `d3d12core.dll` next to `victory.exe`. Wine's builtin
