@@ -296,6 +296,11 @@ struct SocketAddress {
     len: i32,
 }
 
+/// The most entries a `SOCKET_ADDRESS_LIST` given to `WSAConnectByList` may
+/// claim. Ours, not the host's: a title passes the few addresses one name
+/// resolved to, and the count is the title's word for how far to read.
+const MAX_CONNECT_LIST: usize = 64;
+
 /// Every candidate must be loopback.
 pub extern "system" fn WSAConnectByList(
     s: Socket,
@@ -308,15 +313,26 @@ pub extern "system" fn WSAConnectByList(
     reserved: *mut c_void,
 ) -> i32 {
     if !list.is_null() {
-        // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`.
-        let entries = unsafe {
-            let count = usize::try_from(list.cast::<i32>().read()).unwrap_or(0);
-            std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count)
-        };
-        if !entries
-            .iter()
-            .all(|e| reachable("network connect blocked", e.addr, e.len))
-        {
+        // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`, which starts
+        // with its count.
+        let count = unsafe { list.cast::<i32>().read_unaligned() };
+        // A negative count has no entries to vet; the host refuses it.
+        let count = usize::try_from(count).unwrap_or(0);
+        if count > MAX_CONNECT_LIST {
+            once("network connect list refused", format!("{count} entries"));
+            wsa_error(WSAEINVAL);
+            return 0;
+        }
+        let entries = list.wrapping_add(8).cast::<SocketAddress>();
+        // One entry at a time, stopping at the first one refused: never
+        // more of the list than the count says, and no slice over it.
+        let all_home = (0..count).all(|i| {
+            // SAFETY: `i` is below the title's count, at most
+            // `MAX_CONNECT_LIST`; entries are read as they come, unaligned.
+            let e = unsafe { entries.wrapping_add(i).read_unaligned() };
+            reachable("network connect blocked", e.addr, e.len)
+        });
+        if !all_home {
             return 0;
         }
     }
@@ -894,6 +910,62 @@ mod tests {
     // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
     const AWAY: [u8; 4] = [192, 0, 2, 1];
     const HOME: [u8; 4] = [127, 0, 0, 1];
+
+    /// A `SOCKET_ADDRESS_LIST` of `N` entries that says it has `count`.
+    #[repr(C)]
+    struct List<const N: usize> {
+        count: i32,
+        entries: [SocketAddress; N],
+    }
+
+    fn list<const N: usize>(count: i32, addr: &[u8; 16]) -> List<N> {
+        List {
+            count,
+            entries: std::array::from_fn(|_| SocketAddress {
+                addr: addr.as_ptr(),
+                len: 16,
+            }),
+        }
+    }
+
+    fn connect_by_list<const N: usize>(list: &List<N>) -> (i32, i32) {
+        // Starts Winsock, for the error code.
+        let _udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
+        let (n, null) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let got = WSAConnectByList(
+            INVALID_SOCKET,
+            (&raw const *list).cast(),
+            n,
+            null,
+            n,
+            null,
+            std::ptr::null(),
+            null,
+        );
+        (got, last_error())
+    }
+
+    #[test]
+    fn connect_by_list_vets_every_entry() {
+        let (home, away) = (v4(HOME, 9), v4(AWAY, 9));
+        let mut mixed = list::<2>(2, &home);
+        mixed.entries[1].addr = away.as_ptr();
+        assert_eq!(connect_by_list(&mixed), (0, WSAENETUNREACH));
+    }
+
+    /// A count past what a list can hold is refused before any entry is
+    /// read (the title's count alone once sized the walk, issue #428).
+    #[test]
+    fn connect_by_list_refuses_an_oversized_count() {
+        let away = v4(AWAY, 9);
+        let over = MAX_CONNECT_LIST + 1;
+        let full = list::<{ MAX_CONNECT_LIST + 1 }>(over as i32, &away);
+        assert_eq!(connect_by_list(&full), (0, WSAEINVAL));
+        // As large as an `i32` goes, over a single real entry.
+        let lying = list::<1>(i32::MAX, &away);
+        assert_eq!(connect_by_list(&lying), (0, WSAEINVAL));
+    }
 
     #[test]
     fn only_loopback_is_reachable() {
