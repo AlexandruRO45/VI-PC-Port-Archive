@@ -638,6 +638,7 @@ pub(crate) extern "system" fn create_graphics(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    crate::device::standard_pipeline(0x50);
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -660,6 +661,12 @@ pub(crate) extern "system" fn create_compute(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    crate::device::standard_pipeline(0x58);
+    compute(desc, iid, out)
+}
+
+/// What the two compute methods make.
+fn compute(desc: *const ComputeHead, iid: *const Iid, out: *mut This) -> HRESULT {
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -678,14 +685,15 @@ pub(crate) extern "system" fn create_compute(
 /// shortcut: the extensions (console shader settings) are ignored, as is
 /// the rest of the description.
 pub(crate) extern "system" fn create_compute_x(
-    this: This,
+    _: This,
     desc: *const ComputeHead,
     _extensions: u32,
     _extended: *const u8,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    create_compute(this, desc, iid, out)
+    crate::device::standard_pipeline(0x1f0);
+    compute(desc, iid, out)
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a
@@ -732,6 +740,7 @@ pub(crate) extern "system" fn create_stream(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    crate::device::standard_pipeline(0x2b0);
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
