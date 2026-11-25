@@ -766,7 +766,8 @@ pub struct Format {
     pub stencil: bool,
 }
 
-/// By DXGI format number. `None` for 96-bit, 1-bit and video formats.
+/// By DXGI format number. `None` for 96-bit, 1-bit and video formats,
+/// including packed 4:2:2 video.
 ///
 /// shortcut: those formats have no layout here; add them when a title uses
 /// one.
