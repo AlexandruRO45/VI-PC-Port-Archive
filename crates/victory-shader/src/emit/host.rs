@@ -247,6 +247,34 @@ impl Host {
         Ok((root, pso))
     }
 
+    /// The device takes the modules that flag 64-bit integer shaders and
+    /// atomics on typed resources and heap handles (D3D12 options 9 and
+    /// 11); drivers need not (the runtime rejects their pipelines).
+    pub fn atomic64_typed(&self) -> bool {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+        let mut heap = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+        // SAFETY: each query writes its own structure of the given size.
+        unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS9,
+                    (&raw mut options).cast(),
+                    std::mem::size_of_val(&options) as u32,
+                )
+                .is_ok()
+                && options.AtomicInt64OnTypedResourceSupported.as_bool()
+                && self
+                    .device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS11,
+                        (&raw mut heap).cast(),
+                        std::mem::size_of_val(&heap) as u32,
+                    )
+                    .is_ok()
+                && heap.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
+        }
+    }
+
     pub fn compute_pipeline_with(
         &self,
         root: &ID3D12RootSignature,

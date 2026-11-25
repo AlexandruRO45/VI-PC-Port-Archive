@@ -1474,6 +1474,12 @@ fn image_atomics_of_64_bits() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        // The module flags 64-bit atomics on typed resources; drivers need
+        // not carry them (NVIDIA's do not), WARP's device does.
+        if !host.atomic64_typed() {
+            eprintln!("no 64-bit typed atomics on {label} device; skipped");
+            continue;
+        }
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: {e}"));
