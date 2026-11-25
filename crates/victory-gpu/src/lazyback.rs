@@ -202,6 +202,12 @@ fn card_key(at: usize) -> Option<usize> {
 /// given back already.
 static CARD_COUNT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
+/// Since the last frame line (step 2): fetched pieces whose page did not
+/// become card-only, by why: a piece over two pages; not a candidate; no
+/// own views (`VICTORY_BACK_OWN_VIEW=0`); not view memory; too many views
+/// or the page not among them; a view's protection not ours to change.
+static REFUSED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
 /// Step 2, at a landing, before merging a fetched piece of `shadow` at
 /// offsets `[lo, hi)`: if its page is card-only, its bytes are kept for
 /// when it is given back and the merge is skipped (true).
@@ -232,8 +238,14 @@ pub(crate) fn merged(shadow: &std::sync::Arc<crate::shadow::Shadow>, lo: usize, 
     }
     let at = shadow.title_start() + lo;
     let page = at / PAGE * PAGE;
+    let no = |why: usize| {
+        REFUSED[why].fetch_add(1, Relaxed);
+    };
     // One piece, one page: what the copy-back cuts.
-    if (shadow.title_start() + hi - 1) / PAGE * PAGE != page || card_key(page).is_some() {
+    if (shadow.title_start() + hi - 1) / PAGE * PAGE != page {
+        return no(0);
+    }
+    if card_key(page).is_some() {
         return;
     }
     let frame = crate::frame::current().max(1);
@@ -244,13 +256,19 @@ pub(crate) fn merged(shadow: &std::sync::Arc<crate::shadow::Shadow>, lo: usize, 
         .and_then(|p| p.get(&(page / PAGE)).copied())
         .is_some_and(|p| p.fetched != 0 && p.candidate(frame));
     if !candidate {
-        return;
+        return no(1);
+    }
+    if !crate::inplace::back_own() {
+        return no(2);
     }
     // Only view memory, which our own view can write while the title's
     // views are kept from the CPU; every view of the page with it.
     let views = crate::inplace::pages_of(page);
-    if views.is_empty() || views.len() > crate::watch::MANY_VIEWS || !views.contains(&page) {
-        return;
+    if views.is_empty() {
+        return no(3);
+    }
+    if views.len() > crate::watch::MANY_VIEWS || !views.contains(&page) {
+        return no(4);
     }
     install();
     let mut card = CARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -273,6 +291,7 @@ pub(crate) fn merged(shadow: &std::sync::Arc<crate::shadow::Shadow>, lo: usize, 
         shown.push((view, back));
     }
     if shown.len() != views.len() {
+        no(5);
         // Not every view: none.
         for &(view, back) in &shown {
             let mut old = 0;
@@ -437,6 +456,17 @@ pub(crate) fn line(frames: f64) {
              instead of merged ({:.1} MB), given back for the title's CPU {cpu:.1}, for our own access {ours:.1}, faults after \
              a give-back {retried:.1}; {now} card-only now",
             kept_bytes / (1 << 20) as f64
+        );
+        let r = [0, 1, 2, 3, 4, 5].map(|i| REFUSED[i].swap(0, Relaxed) as f64 / frames);
+        tracing::info!(
+            "lazy copy-back, pieces whose page stayed as it is, per frame: over two pages {:.1}, not a candidate {:.1}, no own \
+             views {:.1}, not view memory {:.1}, too many views or not among them {:.1}, a view's protection not ours {:.1}",
+            r[0],
+            r[1],
+            r[2],
+            r[3],
+            r[4],
+            r[5]
         );
     }
 }
