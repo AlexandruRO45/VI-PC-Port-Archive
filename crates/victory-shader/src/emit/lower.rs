@@ -9998,18 +9998,12 @@ impl<'a> Lower<'a> {
             let spatial = coords - usize::from(kind == 6 || kind == 7);
             // A cube's gradients are the two of its face coordinates.
             let grads = if kind == 5 { 2 } else { spatial };
-            let deriv_regs = if op == 63 {
-                if *a16 {
-                    grads.div_ceil(2)
-                } else {
-                    grads
-                }
-            } else {
-                0
-            };
+            // Whole dwords, with a16 too: 16-bit gradients have opcodes of
+            // their own (`_g16`), which are not lowered.
+            let deriv_regs = if op == 63 { grads } else { 0 };
             let coord_base = first + 2 * deriv_regs;
             let mut cs = vec![fu; 4];
-            // With a16, sampling coordinates, gradients, LOD and clamp are f16.
+            // With a16, sampling coordinates, LOD and clamp are f16.
             let to_float = |l: &mut Self, x: V| {
                 if *a16 {
                     let f = l.s.t.f32;
@@ -10229,8 +10223,8 @@ impl<'a> Lower<'a> {
                     for (axis, slot) in len.iter_mut().enumerate() {
                         let mut sum = self.s.m.f32(0);
                         for k in 0..2 {
-                            let x = addr_packed(self, first + axis * deriv_regs, k)?;
-                            let x = to_float(self, x);
+                            let x = addr_u32(self, first + axis * deriv_regs + k)?;
+                            let x = self.as_float(x);
                             let sq = self.s.m.bin(c, Bin::Mul, x, x);
                             sum = self.s.m.bin(c, Bin::Add, sum, sq);
                         }
@@ -10257,10 +10251,10 @@ impl<'a> Lower<'a> {
                 63 => {
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
-                        let x = addr_packed(self, first, k)?;
-                        g[k] = to_float(self, x);
-                        let y = addr_packed(self, first + deriv_regs, k)?;
-                        g[3 + k] = to_float(self, y);
+                        let x = addr_u32(self, first + k)?;
+                        g[k] = self.as_float(x);
+                        let y = addr_u32(self, first + deriv_regs + k)?;
+                        g[3 + k] = self.as_float(y);
                     }
                     args.extend(&os);
                     args.extend(g);
