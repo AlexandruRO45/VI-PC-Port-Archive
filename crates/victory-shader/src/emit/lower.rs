@@ -1264,6 +1264,7 @@ impl<'a> Lower<'a> {
                     || n.contains("permute")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                    || n.starts_with("v_permlane")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
             }) || lane_constant_masks(x.st)
@@ -7235,6 +7236,88 @@ impl<'a> Lower<'a> {
                 }
                 let r = self.read_lane(a, lane);
                 int(self, r)
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // Lanes of each 16-lane row read a lane of the same row
+                // (`v_permlane16_b32`) or the opposite row of their 32-lane half
+                // (`v_permlanex16_b32`). Nibble `lane & 7` of `src1` selects for
+                // lanes 0..7 of the row, and of `src2` for lanes 8..15.
+                // `opsel` bit 0 is `fi` (fetch inactive), bit 1 is `bound_ctrl`
+                // (when `!fi` and the source lane is outside EXEC: return 0 if
+                // set, else leave the destination unchanged).
+                if v.opsel & !3 != 0 || v.clamp || v.omod != 0 || v.dpp.is_some() || v.sdwa.is_some() {
+                    return Err("permlane modifiers");
+                }
+                let (a, sel0, sel1) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                self.cross_lane(false)?;
+                let c = self.cur;
+                let lane = self.lane_index();
+                let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+                let (zero, one, two, seven, eight, fifteen, not15) = (
+                    k(self, 0),
+                    k(self, 1),
+                    k(self, 2),
+                    k(self, 7),
+                    k(self, 8),
+                    k(self, 15),
+                    k(self, !15),
+                );
+                let sel = if sel0 == sel1 {
+                    sel0
+                } else {
+                    let hi = self.s.m.bin(c, Bin::And, lane, eight);
+                    let in_hi = self.s.m.cmp(c, pred::NE, hi, zero);
+                    self.s.m.select(c, in_hi, sel1, sel0)
+                };
+                let idx = self.s.m.bin(c, Bin::And, lane, seven);
+                let shift = self.s.m.bin(c, Bin::Shl, idx, two);
+                let pick = self.s.m.bin(c, Bin::LShr, sel, shift);
+                let pick = self.s.m.bin(c, Bin::And, pick, fifteen);
+                let mut base = self.s.m.bin(c, Bin::And, lane, not15);
+                if name == "v_permlanex16_b32" {
+                    let sixteen = k(self, 16);
+                    base = self.s.m.bin(c, Bin::Xor, base, sixteen);
+                }
+                let src_lane = self.s.m.bin(c, Bin::Or, base, pick);
+                let fi = v.opsel & 1 != 0;
+                let bound_ctrl = v.opsel & 2 != 0;
+                if fi {
+                    let r = self.read_lane(a, src_lane);
+                    int(self, r)
+                } else {
+                    let active_bit = guard.unwrap_or_else(|| self.s.m.bool(true));
+                    let i32t = self.s.t.i32;
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let ballot =
+                        self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[active_bit]);
+                    let lo = self.s.m.extract(c, ballot, 0);
+                    let (word, bit_pos) = if self.s.wave_size != Some(32) {
+                        let hi = self.s.m.extract(c, ballot, 1);
+                        let k32 = k(self, 32);
+                        let k31 = k(self, 31);
+                        let in_lo = self.s.m.cmp(c, pred::IULT, src_lane, k32);
+                        let word = self.s.m.select(c, in_lo, lo, hi);
+                        let bit_pos = self.s.m.bin(c, Bin::And, src_lane, k31);
+                        (word, bit_pos)
+                    } else {
+                        (lo, src_lane)
+                    };
+                    let shifted = self.s.m.bin(c, Bin::LShr, word, bit_pos);
+                    let bit = self.s.m.bin(c, Bin::And, shifted, one);
+                    let src_active = self.s.m.cmp(c, pred::NE, bit, zero);
+                    let safe_src = self.s.m.select(c, src_active, src_lane, lane);
+                    let picked = self.read_lane(a, safe_src);
+                    if bound_ctrl {
+                        let r = self.s.m.select(c, src_active, picked, zero);
+                        int(self, r)
+                    } else {
+                        let write_guard = match guard {
+                            Some(g) => Some(self.s.m.bin(c, Bin::And, g, src_active)),
+                            None => Some(src_active),
+                        };
+                        self.write_i(inst, picked, write_guard)
+                    }
+                }
             }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.

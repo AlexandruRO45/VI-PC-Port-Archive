@@ -1264,3 +1264,194 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_permlane16_and_permlanex16_match_rdna2() {
+    // 32 threads (one wave32): v5 starts as 0xDEAD_0000 | lane, v4 is 0x1000_0000 | lane.
+    // Root constants: s0 = sel0 (lanes 0..7, 16..23), s1 = sel1 (lanes 8..15, 24..31),
+    // s2 = 32-bit EXEC mask. Each lane stores v5 to uav[lane].
+    let build = |op: u16, opsel: u8, branched: bool| -> HostShader {
+        let mut words = vec![
+            s_mov_b32(5, 0x80), // s5 = 0
+        ];
+        words.extend_from_slice(&s_load_dwordx4(8, 4));
+        words.extend_from_slice(&[
+            (0x1C << 25) | (5 << 17) | 0xFF,
+            0xDEAD_0000, // v_or_b32 v5, 0xDEAD0000, v0
+            (0x1C << 25) | (4 << 17) | 0xFF,
+            0x1000_0000, // v_or_b32 v4, 0x10000000, v0
+            vop1(0x001, 3, sgpr(2)), // v_mov_b32 v3, s2
+            (0x16 << 25) | (6 << 17) | (3 << 9) | vgpr(0) as u32, // v_lshrrev_b32 v6, v0, v3
+            (0x1B << 25) | (6 << 17) | (6 << 9) | 0x81, // v_and_b32 v6, 1, v6
+            0x7D8A_0C80, // v_cmp_ne_u32 vcc_lo, 0, v6
+            0xBE8C_3C6A, // s_and_saveexec_b32 s12, vcc_lo
+        ]);
+        if branched {
+            words.push(0xBF88_0002); // s_cbranch_execz +2 (skip 2-dword v_permlane*)
+        }
+        words.extend_from_slice(&[
+            (0x35 << 26) | ((op as u32) << 16) | ((opsel as u32) << 11) | 5,
+            (vgpr(4) as u32) | ((sgpr(0) as u32) << 9) | ((sgpr(1) as u32) << 18),
+            0xBEFE_030C, // s_mov_b32 exec_lo, s12
+            (0x1A << 25) | (7 << 17) | 0x82, // v_lshlrev_b32 v7, 2, v0
+            (0x38 << 26) | (0x1C << 18) | (1 << 12), // buffer_store_dword v5, v7, s[8:11], 0 offen
+            (0x80 << 24) | (2 << 16) | (5 << 8) | 7,
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [32, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res =
+            resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: res.root_indexed_views,
+        };
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        shader
+    };
+
+    let sel0 = 0xF1E2_D3C4u32;
+    let sel1 = 0x0A9B_8576u32;
+    let masks = [0xFFFF_FFFFu32, 0x00FF_0FFF, 0x5555_AAAA, 0x0000_00FF];
+    // Guarded covers all 4 (fi, bound_ctrl) combinations; branched covers fi=0 (both bound_ctrl).
+    let configs: &[(u16, bool, u8, bool)] = &[
+        (0x377, false, 0, false), // v_permlane16_b32, fi:0, bc:0, guarded
+        (0x377, false, 1, false), // v_permlane16_b32, fi:1, bc:0, guarded
+        (0x377, false, 2, false), // v_permlane16_b32, fi:0, bc:1, guarded
+        (0x377, false, 3, false), // v_permlane16_b32, fi:1, bc:1, guarded
+        (0x378, true, 0, false),  // v_permlanex16_b32, fi:0, bc:0, guarded
+        (0x378, true, 1, false),  // v_permlanex16_b32, fi:1, bc:0, guarded
+        (0x378, true, 2, false),  // v_permlanex16_b32, fi:0, bc:1, guarded
+        (0x378, true, 3, false),  // v_permlanex16_b32, fi:1, bc:1, guarded
+        (0x377, false, 0, true),  // v_permlane16_b32, fi:0, bc:0, branched
+        (0x377, false, 2, true),  // v_permlane16_b32, fi:0, bc:1, branched
+        (0x378, true, 0, true),   // v_permlanex16_b32, fi:0, bc:0, branched
+        (0x378, true, 2, true),   // v_permlanex16_b32, fi:0, bc:1, branched
+    ];
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let shaders: Vec<HostShader> = configs
+        .iter()
+        .map(|&(op, _, opsel, branched)| build(op, opsel, branched))
+        .collect();
+    // Fixed `WaveSize(32)` is rejected by WARP, so execute on the hardware adapter when present.
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    for (&(op, cross, opsel, branched), shader) in configs.iter().zip(&shaders) {
+        let Ok((root, pso)) = host.compute_pipeline(shader) else {
+            eprintln!("the hardware device does not take WaveSize(32); not run");
+            return;
+        };
+        let fi = opsel & 1 != 0;
+        let bc = opsel & 2 != 0;
+        for &mask in &masks {
+            let inputs = [sel0, sel1, mask, 0];
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if let (RootType::Constants, 0) = (u.root, u.slot) {
+                    ud[u.index as usize] = inputs[u.dword as usize];
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(32)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("hardware: dispatch failed: {e}"));
+            for lane in 0..32u32 {
+                let old = 0xDEAD_0000 | lane;
+                let want = if mask >> lane & 1 == 0 {
+                    old
+                } else {
+                    let sel = if lane & 8 != 0 { sel1 } else { sel0 };
+                    let pick = sel >> (4 * (lane & 7)) & 15;
+                    let base = (lane & !15) ^ if cross { 16 } else { 0 };
+                    let src = base | pick;
+                    if fi || mask >> src & 1 != 0 {
+                        0x1000_0000 | src
+                    } else if bc {
+                        0
+                    } else {
+                        old
+                    }
+                };
+                assert_eq!(
+                    out[0][lane as usize], want,
+                    "hardware: op={op:#x} opsel={opsel} branched={branched} mask={mask:#010x} lane={lane}",
+                );
+            }
+        }
+    }
+}

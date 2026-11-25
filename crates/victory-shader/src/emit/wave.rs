@@ -435,22 +435,34 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     })
                     .collect()
             }
-            ("v_permlanex16_b32", Some(a)) => {
-                // Lanes of each row read the other row of their half; lane
-                // i's pick is nibble i of {src2, src1}.
+            ("v_permlane16_b32" | "v_permlanex16_b32", Some(a)) => {
+                // Lanes of each row read their own row (`permlane16`) or the
+                // other row of their half (`permlanex16`); lane i's pick is
+                // nibble i of {src2, src1}. `opsel` bit 0 is `fi`, bit 1 is `bound_ctrl`.
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
                 };
+                let xor = if name == "v_permlanex16_b32" { 16 } else { 0 };
+                let fi = v.opsel & 1 != 0;
+                let bound_ctrl = v.opsel & 2 != 0;
                 match (sel(1), sel(2)) {
-                    (Some(s1), Some(s2)) => {
+                    (Some(s1), Some(s2)) if v.opsel & !3 == 0 => {
                         let s = u64::from(s1) | u64::from(s2) << 32;
                         (0..wave)
                             .map(|l| {
-                                let other = (l & !31) | ((l & 16) ^ 16);
+                                let base = (l & !15) ^ xor;
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                a[(other | pick) as usize]
+                                let src = base | pick;
+                                if fi || exec >> src & 1 != 0 {
+                                    a[src as usize]
+                                } else if bound_ctrl {
+                                    Sym::K(0)
+                                } else {
+                                    writes &= !(1u64 << l);
+                                    Sym::Unknown
+                                }
                             })
                             .collect()
                     }
@@ -1060,5 +1072,42 @@ mod tests {
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
         }
+    }
+
+    #[test]
+    fn permlane16_and_permlanex16_flags_in_section() {
+        let permlane = |op: u32, vdst: u32, vsrc: u32, opsel: u32| -> [u32; 2] {
+            [
+                (0x35 << 26) | (op << 16) | (opsel << 11) | vdst,
+                (256 + vsrc) | (0x80 << 9) | (0x80 << 18), // src1 = 0, src2 = 0
+            ]
+        };
+        let readlane = |sdst: u32, vsrc: u32, lane_const: u32| -> [u32; 2] {
+            [
+                (0x35 << 26) | (0x360 << 16) | sdst,
+                (256 + vsrc) | (lane_const << 9),
+            ]
+        };
+        let mut w = vec![
+            sop1(0, 0x3D, 193), // s_or_saveexec_b32 s0, -1
+            vop1(1, 0x01, 135), // v_mov_b32 v1, 7
+            vop1(2, 0x01, 137), // v_mov_b32 v2, 9
+        ];
+        w.extend_from_slice(&permlane(0x377, 3, 1, 0)); // v_permlane16_b32 v3, v1, 0, 0 -> 7
+        w.extend_from_slice(&[sop1(EXEC, 0x03, 0xFF), 0xFFFF_0000]); // EXEC = lanes 16..31
+        w.extend_from_slice(&permlane(0x378, 2, 1, 0)); // fi:0, bc:0 -> keeps 9 everywhere
+        w.extend_from_slice(&permlane(0x378, 4, 1, 2)); // fi:0, bc:1 -> 0 in lanes 16..31
+        w.extend_from_slice(&readlane(1, 4, 144)); // s1 = lane 16 of v4 -> 0
+        w.extend_from_slice(&permlane(0x378, 5, 1, 1)); // fi:1, bc:0 -> 7 in lanes 16..31
+        w.extend_from_slice(&readlane(2, 5, 144)); // s2 = lane 16 of v5 -> 7
+        w.push(sop1(EXEC, 0x03, 0)); // s_mov_b32 exec_lo, s0
+
+        let p = build(&w, false);
+        let insts = &p.blocks[0].insts;
+        let sec = &sections(&p, 0)[&0];
+        assert_eq!(sec.shapes.get(&insts[3].write(Reg::V(3)).unwrap()), Some(&Shape::K(7)));
+        assert_eq!(sec.shapes.get(&insts[5].write(Reg::V(2)).unwrap()), Some(&Shape::K(9)));
+        assert_eq!(sec.shapes.get(&insts[7].write(Reg::S(1)).unwrap()), Some(&Shape::K(0)));
+        assert_eq!(sec.shapes.get(&insts[9].write(Reg::S(2)).unwrap()), Some(&Shape::K(7)));
     }
 }

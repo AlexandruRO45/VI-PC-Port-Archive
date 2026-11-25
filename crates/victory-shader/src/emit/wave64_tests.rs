@@ -450,3 +450,143 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// A 64-lane console wave using only `v_permlane16_b32` / `v_permlanex16_b32` (no half-crossing
+/// operations): lowers cleanly both split into 32-lane halves (`WaveSize(32)` on 32-lane hosts)
+/// and natively in 64-lane waves (`WaveSize(64)`), including 64-bit EXEC masks.
+#[test]
+fn permlane16_and_permlanex16_match_on_wave64_in_halves_and_whole_waves() {
+    let build_program = |op: u16, opsel: u8| -> NativeProgram {
+        let words = [
+            (0x1C << 25) | (5 << 17) | 0xFF,
+            0xDEAD_0000, // v_or_b32 v5, 0xDEAD0000, v0 (old dst)
+            (0x1C << 25) | (4 << 17) | 0xFF,
+            0x1000_0000, // v_or_b32 v4, 0x10000000, v0 (src)
+            0x7E04_0202, // v_mov_b32 v2, s2 (low 32 mask)
+            0x7E06_0203, // v_mov_b32 v3, s3 (high 32 mask)
+            0x7D88_00A0, // v_cmp_gt_u32 vcc, 32, v0 (v0 < 32)
+            (0x01 << 25) | (3 << 17) | (2 << 9) | (256 + 3), // v_cndmask_b32 v3, v3, v2, vcc
+            (0x1B << 25) | (6 << 17) | 0x9F, // v_and_b32 v6, 31, v0
+            (0x16 << 25) | (6 << 17) | (3 << 9) | (256 + 6), // v_lshrrev_b32 v6, v6, v3
+            (0x1B << 25) | (6 << 17) | (6 << 9) | 0x81, // v_and_b32 v6, 1, v6
+            0x7D8A_0C80, // v_cmp_ne_u32 vcc, 0, v6
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            (0x35 << 26) | ((op as u32) << 16) | ((opsel as u32) << 11) | 5,
+            (256 + 4) | (1 << 18), // v_permlane* v5, v4, s0, s1
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            (0x1A << 25) | (7 << 17) | 0x82, // v_lshlrev_b32 v7, 2, v0
+            (0x38 << 26) | (0x1C << 18) | (1 << 12), // buffer_store_dword v5, v7, s[8:11], 0 offen
+            (0x80 << 24) | (2 << 16) | (5 << 8) | 7,
+        ];
+        native(&words)
+    };
+    let lower_for = |native: &NativeProgram, host_wave: Option<u32>, want_wave: u32| -> HostShader {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))
+            .expect("resource::track");
+        let io = io::raise(&p, native).expect("io::raise");
+        let was = lower::TEST_HOST_WAVE.replace(host_wave);
+        let lowered = lower::lower(&lower::Parts {
+            native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        });
+        lower::TEST_HOST_WAVE.set(was);
+        let lowered = lowered.expect("lower");
+        assert_eq!(lowered.wave_size, Some(want_wave));
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: res.root_indexed_views,
+        };
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        shader
+    };
+
+    let sel0 = 0x71E2_D304u32;
+    let sel1 = 0xFA9B_856Cu32;
+    let mask64: u64 = 0x5555_0FFF_00FF_AAAA;
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).ok();
+
+    for &(label, host_wave, want_wave) in &[
+        ("wave32-halves", Some(32), 32u32),
+        ("wave64-native", None, 64u32),
+    ] {
+        for &(op, cross) in &[(0x377u16, false), (0x378u16, true)] {
+            for opsel in 0..4u8 {
+                let prog = build_program(op, opsel);
+                let shader = lower_for(&prog, host_wave, want_wave);
+                let Some(host) = host.as_ref() else {
+                    continue;
+                };
+                let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+                    continue;
+                };
+                let inputs = [sel0, sel1, mask64 as u32, (mask64 >> 32) as u32];
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    if let (RootType::Constants, 0) = (u.root, u.slot) {
+                        ud[u.index as usize] = inputs[u.dword as usize];
+                    }
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[View::RawUav(64)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                let fi = opsel & 1 != 0;
+                let bc = opsel & 2 != 0;
+                for lane in 0..64u32 {
+                    let old = 0xDEAD_0000 | lane;
+                    let want = if mask64 >> lane & 1 == 0 {
+                        old
+                    } else {
+                        let sel = if lane & 8 != 0 { sel1 } else { sel0 };
+                        let pick = sel >> (4 * (lane & 7)) & 15;
+                        let base = (lane & !15) ^ if cross { 16 } else { 0 };
+                        let src = base | pick;
+                        if fi || mask64 >> src & 1 != 0 {
+                            0x1000_0000 | src
+                        } else if bc {
+                            0
+                        } else {
+                            old
+                        }
+                    };
+                    assert_eq!(
+                        out[0][lane as usize], want,
+                        "{label}: op={op:#x} opsel={opsel} lane={lane}",
+                    );
+                }
+            }
+        }
+    }
+}
