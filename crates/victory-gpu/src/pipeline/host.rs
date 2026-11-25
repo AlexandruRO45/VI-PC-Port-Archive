@@ -96,7 +96,7 @@ impl Default for GraphicsState {
 fn integer_target(format: u32) -> bool {
     matches!(
         format,
-        3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 37 | 39 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64
+        3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64
     )
 }
 
@@ -904,7 +904,7 @@ mod tests {
         let mut g = GraphicsState::default();
         g.targets.NumRenderTargets = 6;
         // UNORM, FLOAT, R8_UINT, R16G16_UINT, R16G16_SINT, R10G10B10A2_UNORM.
-        for (i, f) in [29u32, 10, 62, 37, 39, 24].into_iter().enumerate() {
+        for (i, f) in [29u32, 10, 62, 36, 38, 24].into_iter().enumerate() {
             g.targets.RTFormats[i] = DXGI_FORMAT(f as i32);
         }
         for t in &mut g.blend.RenderTarget {
