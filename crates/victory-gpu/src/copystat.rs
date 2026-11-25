@@ -14,6 +14,7 @@ pub(crate) enum C {
     CopyBytes,
     Refreshes,
     RefreshBytes,
+    /// Explicit refresh requests skipped because the tracked copy is clean.
     Skipped,
     SkippedBytes,
     Runs,

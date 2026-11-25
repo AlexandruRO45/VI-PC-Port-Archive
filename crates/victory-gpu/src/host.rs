@@ -2271,6 +2271,8 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        #[cfg(feature = "diagnostics")]
+        let (mut requests, mut bytes, mut skipped, mut skipped_bytes) = (0, 0, 0, 0);
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
@@ -2307,12 +2309,19 @@ impl HostList {
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
+                    let clean = shadow.clean();
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Refreshes, 1);
-                        add(C::RefreshBytes, *len as u64);
+                        requests += 1;
+                        bytes += *len as u64;
+                        if clean {
+                            skipped += 1;
+                            skipped_bytes += *len as u64;
+                        }
                     }
-                    batch.add(shadow, *address, *len);
+                    if !clean {
+                        batch.add_dirty(shadow, *address, *len);
+                    }
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
@@ -2339,16 +2348,23 @@ impl HostList {
                 // Brought up to date before the submission's lists were made.
                 Step::Texture(..) => continue,
                 Step::Heap(viewed) => {
-                    crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    crate::bindless::refresh(viewed, |s, a, l| batch.add_dirty(s, a, l));
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    crate::memory::prepare(heap, |s, a, l| batch.add_dirty(s, a, l));
                     continue;
                 }
             };
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
+        #[cfg(feature = "diagnostics")]
+        if requests != 0 {
+            add(C::Refreshes, requests);
+            add(C::RefreshBytes, bytes);
+            add(C::Skipped, skipped);
+            add(C::SkippedBytes, skipped_bytes);
         }
     }
 }
@@ -2378,12 +2394,8 @@ struct Batch {
 }
 
 impl Batch {
-    fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        // Nothing to copy: a world submission asks for every copy its heaps'
-        // views and page tables reach (~9,000), a few of them written.
-        if shadow.clean() {
-            return;
-        }
+    /// The caller has already checked the shadow or its cached dirty bit.
+    fn add_dirty(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
         if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
             return;
@@ -3504,22 +3516,22 @@ mod batch {   // `mod tests` is already taken at the top of this file
             return; // no host GPU here
         };
         let mut batch = Batch::default();
-        batch.add(&copy, p, len);
+        batch.add_dirty(&copy, p, len);
         assert_eq!(batch.flush(), len, "all of it at first");
         // SAFETY: our pool, guarded since the copy took it.
         unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(7) };
         // The next submission: two lists ask for the copy.
         let mut batch = Batch::default();
-        batch.add(&copy, p, len);
-        batch.add(&copy, p + 100, 200);
+        batch.add_dirty(&copy, p, len);
+        batch.add_dirty(&copy, p + 100, 200);
         assert_eq!(batch.flush(), PAGE, "the page written");
         assert_eq!(copy.read_host((p + PAGE + 8) as u64, 1)[0], 7);
         // SAFETY: as above.
         unsafe { (p as *mut u8).write_volatile(1) };
-        batch.add(&copy, p, len);
+        batch.add_dirty(&copy, p, len);
         assert_eq!(batch.flush(), 0, "nothing again in the submission");
         batch.title_written();
-        batch.add(&copy, p, len);
+        batch.add_dirty(&copy, p, len);
         assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
         crate::shadow::unregister(p, p as u64);
         drop(copy);
