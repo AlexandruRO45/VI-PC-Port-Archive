@@ -1,5 +1,5 @@
 //! What the title's Bink decoder is handed, and what it puts there
-//! (`VICTORY_BINK_TRACE=1`, diagnostics only).
+//! (`VICTORY_BINK_TRACE=1` for the report, `=0` to wrap nothing).
 //!
 //! The title decodes its movies with the Bink 2 decoder it ships
 //! (`Bink2Scarlett.dll`), which the loader maps as a title DLL, so its
@@ -21,9 +21,11 @@
 //! - at every wait, whether each of those buffers still holds what it held;
 //!   a decoder writing frames changes them about thirty times a second.
 //!
-//! Nothing is wrapped unless the switch is on and [`attach`] has been told
-//! where the decoder's own functions are, so a run without the switch binds
-//! exactly what it did before.
+//! Nothing is wrapped until [`attach`] has been told where the decoder's own
+//! functions are, and the buffers are recorded on every run, because the
+//! texture path hashes a movie's own buffers at every refresh and needs to
+//! know where they are (`victory_gpu::movie::only`). `VICTORY_BINK_TRACE=0`
+//! binds exactly what the imports bound before this module existed.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -51,12 +53,27 @@ const NEXT_FRAME: usize = 4;
 /// The decoder's own function for each wrapped symbol, as `attach` found it.
 static REAL: [AtomicUsize; SYMBOLS.len()] = [const { AtomicUsize::new(0) }; SYMBOLS.len()];
 
-/// `VICTORY_BINK_TRACE=1`.
+/// Whether the decoder's imports are wrapped at all: on, unless
+/// `VICTORY_BINK_TRACE=0`, which binds exactly what it bound before this
+/// module existed. The wrappers are what registers the frame buffers with
+/// `victory_gpu::movie`, and the texture path hashes a movie's own buffers at
+/// every refresh instead of every texture another view maps, so this is on by
+/// default.
 fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_BINK_TRACE").is_some_and(|v| v == "1" || v == "true")
-    })
+    *ON.get_or_init(|| !std::env::var_os("VICTORY_BINK_TRACE")
+        .is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("false")))
+}
+
+/// `VICTORY_BINK_TRACE=1`: say in the log what the decoder was handed and
+/// what it put there — the structures as raw words, every wait's sample of
+/// each buffer, every frame asked for. Off by default: this reads 192 KiB of
+/// the title's memory a wait and writes a line for it, which is worth it when
+/// a movie is being read and not while the world is running.
+fn trace() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("VICTORY_BINK_TRACE")
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")))
 }
 
 /// Records the decoder's own exports, from the title DLLs the loader mapped.
@@ -127,12 +144,14 @@ unsafe extern "system" fn get_frame_buffers_info(bink: u64, fbs: u64, _c: u64, _
     };
     // SAFETY: the title's own arguments, passed on unchanged.
     let out = unsafe { f(bink, fbs, 0, 0) };
-    dump("get frame buffers", fbs, 0x00);
-    tracing::info!(
-        bink = format_args!("{bink:#x}"),
-        fbs = format_args!("{fbs:#x}"),
-        "bink: frame buffers asked for"
-    );
+    if trace() {
+        dump("get frame buffers", fbs, 0x00);
+        tracing::info!(
+            bink = format_args!("{bink:#x}"),
+            fbs = format_args!("{fbs:#x}"),
+            "bink: frame buffers asked for"
+        );
+    }
     out
 }
 
@@ -143,16 +162,18 @@ unsafe extern "system" fn register_frame_buffers(bink: u64, fbs: u64, _c: u64, _
     let before = dump("register frame buffers", fbs, 0x00);
     // SAFETY: the title's own arguments, passed on unchanged.
     let out = unsafe { f(bink, fbs, 0, 0) };
-    let after = dump("register frame buffers, after", fbs, 0x00);
     let mut pointers = Vec::new();
-    for (i, (was, now)) in before.iter().zip(&after).enumerate() {
-        if was != now {
-            tracing::info!(
-                offset = format_args!("{:#x}", i * 4),
-                was = format_args!("{was:#x}"),
-                now = format_args!("{now:#x}"),
-                "bink: the registered structure changed in the call"
-            );
+    if trace() {
+        let after = dump("register frame buffers, after", fbs, 0x00);
+        for (i, (was, now)) in before.iter().zip(&after).enumerate() {
+            if was != now {
+                tracing::info!(
+                    offset = format_args!("{:#x}", i * 4),
+                    was = format_args!("{was:#x}"),
+                    now = format_args!("{now:#x}"),
+                    "bink: the registered structure changed in the call"
+                );
+            }
         }
     }
     // A buffer is a pointer and a pitch, and the pitch is the word after
@@ -177,16 +198,18 @@ unsafe extern "system" fn register_frame_buffers(bink: u64, fbs: u64, _c: u64, _
         };
         let size = (pitch * height).max(1);
         pointers.push((off, word as usize, size));
-        tracing::info!(
-            offset = format_args!("{off:#x}"),
-            at = format_args!("{word:#x}"),
-            pitch,
-            height,
-            size,
-            len = format_args!("{size:#x}"),
-            word = i,
-            "bink: a registered buffer"
-        );
+        if trace() {
+            tracing::info!(
+                offset = format_args!("{off:#x}"),
+                at = format_args!("{word:#x}"),
+                pitch,
+                height,
+                size,
+                len = format_args!("{size:#x}"),
+                word = i,
+                "bink: a registered buffer"
+            );
+        }
     }
     note_planes(&pointers);
     tracing::info!(
@@ -220,7 +243,9 @@ unsafe extern "system" fn do_frame_async_wait(bink: u64, a: u64, _b: u64, _c: u6
     };
     // SAFETY: the title's own arguments, passed on unchanged.
     let out = unsafe { f(bink, a, 0, 0) };
-    advances(a);
+    if trace() {
+        advances(a);
+    }
     out
 }
 
@@ -230,14 +255,16 @@ unsafe extern "system" fn next_frame(bink: u64, _a: u64, _b: u64, _c: u64) -> u6
     };
     // SAFETY: the title's own argument, passed on unchanged.
     let out = unsafe { f(bink, 0, 0, 0) };
-    static ADVANCED: AtomicUsize = AtomicUsize::new(0);
-    let n = ADVANCED.fetch_add(1, Ordering::Relaxed) + 1;
-    tracing::info!(
-        bink = format_args!("{bink:#x}"),
-        advanced = n,
-        out,
-        "bink: next frame"
-    );
+    if trace() {
+        static ADVANCED: AtomicUsize = AtomicUsize::new(0);
+        let n = ADVANCED.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::info!(
+            bink = format_args!("{bink:#x}"),
+            advanced = n,
+            out,
+            "bink: next frame"
+        );
+    }
     out
 }
 
@@ -256,13 +283,15 @@ fn dump(what: &str, at: u64, len: usize) -> Vec<u32> {
     if words.is_empty() {
         return Vec::new();
     }
-    for line in words.chunks(8) {
-        let text = line
-            .iter()
-            .map(|(off, w)| format!("{off:#04x}:{w:#010x}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        tracing::info!("bink: {what}: {text}");
+    if trace() {
+        for line in words.chunks(8) {
+            let text = line
+                .iter()
+                .map(|(off, w)| format!("{off:#04x}:{w:#010x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!("bink: {what}: {text}");
+        }
     }
     words.into_iter().map(|(_, w)| w).collect()
 }
