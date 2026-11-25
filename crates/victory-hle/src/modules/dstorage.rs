@@ -156,6 +156,9 @@ extern "system" fn create_status_array(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     tracing::info!(
         capacity,
         name = text(name),
@@ -187,6 +190,9 @@ extern "system" fn create_queue(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     // SAFETY: the title passes its description (null tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -1791,5 +1797,45 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn null_out_is_rejected_before_creating_status_array_or_queue() {
+        let factory = factory();
+        let make_array: extern "system" fn(
+            *mut c_void,
+            u32,
+            *const c_char,
+            *const Guid,
+            Out,
+        ) -> HRESULT = call(factory, 0x28);
+        assert_eq!(
+            make_array(
+                factory,
+                4,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            ),
+            E_INVALIDARG
+        );
+
+        let desc = QueueDesc {
+            source_type: 0,
+            capacity: 4,
+            priority: 0,
+            name: std::ptr::null(),
+            unknown: 1,
+        };
+        let make_queue: extern "system" fn(
+            *mut c_void,
+            *const QueueDesc,
+            *const Guid,
+            Out,
+        ) -> HRESULT = call(factory, 0x50);
+        assert_eq!(
+            make_queue(factory, &desc, std::ptr::null(), std::ptr::null_mut()),
+            E_INVALIDARG
+        );
     }
 }

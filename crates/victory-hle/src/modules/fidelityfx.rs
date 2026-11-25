@@ -176,10 +176,20 @@ pub(crate) fn serving() -> bool {
 
 fn load(dir: &Path) -> Result<(Host, String), String> {
     use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
         LoadLibraryExW,
     };
+
+    struct ModuleGuard(HMODULE);
+    impl Drop for ModuleGuard {
+        fn drop(&mut self) {
+            // SAFETY: module handle returned by `LoadLibraryExW` and not yet freed.
+            unsafe { FreeLibrary(self.0) };
+        }
+    }
+
     // The search flags below want a full path.
     let path = std::path::absolute(dir.join(DLL)).map_err(|e| e.to_string())?;
     if !path.is_file() {
@@ -196,6 +206,7 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
             std::io::Error::last_os_error()
         ));
     }
+    let guard = ModuleGuard(module);
     let find = |name: &CStr| {
         // SAFETY: a loaded module and a NUL-terminated name.
         unsafe { GetProcAddress(module, name.as_ptr().cast()) }
@@ -215,6 +226,7 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
         }
     };
     let versions = versions(&host)?;
+    std::mem::forget(guard);
     Ok((host, versions))
 }
 
