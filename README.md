@@ -58,6 +58,35 @@ time on the test machines. Set them in PowerShell before running the script.
 
 Diagnostics build: `cargo build --profile diag -p victory --features diagnostics`
 
+### Shader GPU tests with Agility SDK
+
+On Windows x64 with the MSVC toolchain, the shader test executable can use
+a local Agility SDK when the system D3D12 runtime lacks shader model 6.6.
+Set the numeric version exported by the x64 `D3D12Core.dll` (608 for
+package 1.608.2). Build the tests, then put the DLL in a `D3D12` folder
+beside the test executable. Use SDK layers from the same package if
+enabling the D3D12 debug layer.
+
+```powershell
+$env:VICTORY_TEST_AGILITY_SDK_VERSION = '608'
+$env:CARGO_TARGET_DIR = Join-Path $PWD 'target\shader-agility'
+$test = (cargo test --locked -p victory-shader --lib --no-run --message-format=json |
+    ForEach-Object { ConvertFrom-Json $_ } |
+    Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'victory_shader' -and $_.executable } |
+    Select-Object -Last 1).executable
+if ($LASTEXITCODE -ne 0 -or -not $test) { throw 'Shader test build failed' }
+$sdk = Join-Path (Split-Path $test) 'D3D12'
+New-Item -ItemType Directory -Force -Path $sdk | Out-Null
+Copy-Item 'C:\path\to\sdk\x64\D3D12Core.dll' $sdk
+& $test emit::host::sm66_device_probe --exact --ignored --nocapture
+```
+
+The probe reports which adapters can create a device with shader model 6.6.
+Run the same executable with `--test-threads=1` for the normal shader suite.
+Set `VICTORY_DXIL` to the path of the x64 `dxil.dll` if you need to pin
+the validator version across runs.
+Unset both environment variables to return to the default build.
+
 ## License
 
 GPL-3.0-or-later (see `LICENSE`). Based on VIctory (Marvisak) and victory-fork (fxceless).

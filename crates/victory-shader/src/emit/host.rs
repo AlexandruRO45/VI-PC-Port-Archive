@@ -62,10 +62,36 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+fn device_error(stage: &str, error: windows::core::Error) -> String {
+    format!(
+        "{stage}: {} (HRESULT {:#010x})",
+        error.message(),
+        error.code().0 as u32
+    )
+}
+
+fn adapter_name(desc: &DXGI_ADAPTER_DESC1) -> String {
+    String::from_utf16_lossy(&desc.Description)
+        .trim_end_matches('\0')
+        .to_owned()
+}
+
+// The D3D12 loader looks for these exports in the process's executable.
+// Place the matching SDK's DLLs in D3D12 next to the shader test executable.
+#[cfg(all(test, victory_test_agility))]
+#[unsafe(no_mangle)]
+pub static D3D12SDKVersion: u32 = include!(concat!(env!("OUT_DIR"), "/test_agility_version.rs"));
+#[cfg(all(test, victory_test_agility))]
+#[unsafe(no_mangle)]
+pub static D3D12SDKPath: &[u8; 9] = b".\\D3D12\\\0";
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
-        let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        Self::new_for_adapter(warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1"))
+    }
+
+    fn new_for_adapter(warp: bool) -> Result<Self, String> {
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
@@ -78,45 +104,60 @@ impl Host {
                     debug.EnableDebugLayer();
                 }
             }
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
+                .map_err(|e| device_error("CreateDXGIFactory2", e))?;
             let mut device: Option<ID3D12Device> = None;
             if warp {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                let adapter: IDXGIAdapter = factory
+                    .EnumWarpAdapter()
+                    .map_err(|e| device_error("EnumWarpAdapter", e))?;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                    .map_err(|e| device_error("D3D12CreateDevice(WARP)", e))?;
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-                // A machine without a graphics card gives the software
-                // adapter as its default device (a hosted test runner,
-                // whose first adapter is a display stub that cannot make a
-                // device): that is no hardware device, and the tests that
-                // ask for one skip it, as they do where there is none.
-                if let Some(made) = &device {
-                    let factory: IDXGIFactory4 =
-                        CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
-                        && let Ok(desc) = adapter.GetDesc1()
-                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
-                    {
-                        return Err("the default device is the software adapter".to_owned());
-                    }
-                }
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
+                    .map_err(|e| device_error("D3D12CreateDevice(default)", e))?;
             }
-            let device = device.ok_or("no device")?;
-            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
-            };
-            device
-                .CheckFeatureSupport(
-                    D3D12_FEATURE_SHADER_MODEL,
-                    (&raw mut sm).cast(),
-                    size_of_val(&sm) as u32,
-                )
-                .map_err(err)?;
-            if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+            let device = device.ok_or("D3D12CreateDevice returned no device")?;
+            let desc = factory
+                .EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid())
+                .and_then(|adapter| adapter.GetDesc1())
+                .ok();
+            // A hosted test runner may expose a software adapter as its
+            // default device. Report it separately from a hardware device.
+            if !warp && let Some(desc) = &desc
+                && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
+            {
                 return Err(format!(
-                    "the device supports SM {:#x} only",
-                    sm.HighestShaderModel.0
+                    "the default device is the software adapter ({})",
+                    adapter_name(desc)
+                ));
+            }
+            let name = || desc.as_ref().map_or_else(|| "unknown adapter".to_owned(), adapter_name);
+            let shader_model = |request| {
+                let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                    HighestShaderModel: request,
+                };
+                device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_SHADER_MODEL,
+                        (&raw mut sm).cast(),
+                        size_of_val(&sm) as u32,
+                    )
+                    .map(|()| sm.HighestShaderModel)
+            };
+            let sm = shader_model(D3D_SHADER_MODEL_6_6).map_err(|error| {
+                let error = device_error("CheckFeatureSupport(SM 6.6)", error);
+                if let Ok(lower) = shader_model(D3D_SHADER_MODEL_6_5) {
+                    format!("{}: {error}; SM {:#x} available", name(), lower.0)
+                } else {
+                    format!("{}: {error}", name())
+                }
+            })?;
+            if sm.0 < D3D_SHADER_MODEL_6_6.0 {
+                return Err(format!(
+                    "{} supports SM {:#x} only (requires 6.6)",
+                    name(),
+                    sm.0
                 ));
             }
             Ok(Host { device })
@@ -507,6 +548,34 @@ impl Host {
         // SAFETY: the stream points at live data and outlives the call.
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "checks the local D3D12 adapters"]
+fn sm66_device_probe() {
+    let mut found = false;
+    for (label, warp) in [("hardware", false), ("WARP", true)] {
+        match Host::new_for_adapter(warp) {
+            Ok(host) => {
+                found = true;
+                // SAFETY: plain queries on a live device and its adapter.
+                let adapter = unsafe {
+                    CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                        .and_then(|factory| {
+                            factory.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid())
+                        })
+                        .and_then(|adapter| adapter.GetDesc1())
+                };
+                let name = adapter
+                    .as_ref()
+                    .map_or_else(|e| device_error("adapter query", e.clone()), adapter_name);
+                eprintln!("{label}: {name}, supports SM 6.6");
+            }
+            Err(error) => eprintln!("{label}: {error}"),
+        }
+    }
+    assert!(found, "neither hardware nor WARP exposed SM 6.6");
 }
 
 /// A vertex shader that feeds `ps`'s inputs (zeros) and a position.
