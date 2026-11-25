@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GTA6 PC Port Archive</title>
-<meta name="description" content="Archive of the open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory, hyphenn, AnyXboxX, ztrx, DexNom Runtime, VIctory-Belobug-AMD, Xbox2Windows and TuxBox. Code, branches, pull requests, issues and comments, synced hourly. Projects removed from GitHub stay here.">
+<meta name="description" content="Archive of the open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory, hyphenn, AnyXboxX, ztrx, DexNom Runtime, VIctory-Belobug-AMD, VIctory-7900XTX, Xbox2Windows and TuxBox. Code, branches, pull requests, issues and comments, synced hourly. Projects removed from GitHub stay here.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <script>
   // old links pointed issues at index.html#project/number; they live on browse.html now ("leonida" is now "leonida-old")
-  if (/^#(leonida|leonida-old|leonida-new|xcl|victory|xbox2windows|tuxbox|hyphenn|victory-fork|anyxboxx|ztrx|dexnom|belobug|victory-gta6)(\/\d+)?$/.test(location.hash))
+  if (/^#(leonida|leonida-old|leonida-new|xcl|victory|xbox2windows|tuxbox|hyphenn|victory-fork|anyxboxx|ztrx|dexnom|belobug|victory-7900xtx|victory-gta6)(\/\d+)?$/.test(location.hash))
     location.replace("browse.html" + location.hash.replace(/^#leonida(?=\/|$)/, "#leonida-old").replace(/^#victory-(gta6|fork)/, "#hyphenn"));
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -170,7 +170,7 @@
 </main>
 
 <footer><div class="wrap">
-  <span>Licenses: Leonida (old and new) GPL-3.0 · xcl GPL-2.0 · VIctory GPL-3.0 · Xbox2Windows MIT · TuxBox Apache-2.0 · hyphenn GPL-3.0 · AnyXboxX GPL-3.0 · ztrx GPL-3.0 · DexNom Runtime GPL-3.0 · VIctory-Belobug-AMD GPL-3.0</span>
+  <span>Licenses: Leonida (old and new) GPL-3.0 · xcl GPL-2.0 · VIctory GPL-3.0 · Xbox2Windows MIT · TuxBox Apache-2.0 · hyphenn GPL-3.0 · AnyXboxX GPL-3.0 · ztrx GPL-3.0 · DexNom Runtime GPL-3.0 · VIctory-Belobug-AMD GPL-3.0 · VIctory-7900XTX GPL-3.0</span>
   <a href="https://github.com/Guernica4u/GTA6-PC-Port-Archive">GitHub repository</a>
 </div></footer>
 
@@ -215,6 +215,9 @@ const PROJECTS = {
   belobug: { repo: "Belobug/VIctory-Belobug-AMD", saved: "25 Nov 2026", name: "VIctory-Belobug-AMD", gta: true, top: 2, lic: "GPL-3.0", branch: "belobug", up: "https://github.com/Belobug/VIctory-Belobug-AMD",
     desc: "A VIctory fork for AMD Radeon cards that renders the world lit, with textures, people, vehicles and water.", reached: 4,
     note: "The world renders lit at 5-7 fps on an RX 9070 XT and saves work. Not playable yet: the phone turns the world black and there is no ray-traced light.", src: "https://github.com/Belobug/VIctory-Belobug-AMD#state-of-this-fork-2026-11-25" },
+  "victory-7900xtx": { repo: "avatarmanz/VIctory-7900XTX", saved: "25 Nov 2026", name: "VIctory-7900XTX", gta: true, lic: "GPL-3.0", branch: "victory-7900xtx", up: "https://github.com/avatarmanz/VIctory-7900XTX",
+    desc: "A VIctory fork tuned for speed on an AMD RX 7900 XTX.", reached: 5,
+    note: "Plays the prologue and the first mission at 13-22 fps, and 6-10 fps in busy street chases. Ran 41 minutes without a crash. Needs about 64 GB of RAM.", src: "https://github.com/avatarmanz/VIctory-7900XTX#where-it-stands-2026-11-25" },
 };
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));

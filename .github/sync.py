@@ -21,6 +21,7 @@ PROJECTS = {
     "anyxboxx": ("LooperSalty/AnyXboxX", r"> \*\*Where we are"),
     "dexnom": ("DexNom/VIctory", r"## Changes in this snapshot"),
     "belobug": ("Belobug/VIctory-Belobug-AMD", r"## State of this fork"),
+    "victory-7900xtx": ("avatarmanz/VIctory-7900XTX", r"## Where it stands"),
 }
 PUSH_BUDGET = 300  # seconds of branch pushing per project per run; the rest waits for the next run
 TODAY = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
