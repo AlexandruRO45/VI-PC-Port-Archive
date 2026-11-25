@@ -1008,8 +1008,129 @@ fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, O
 /// format of its family takes the texture's format unless it is castable.
 /// shortcut: such a view (sRGB of UNORM, say, on a texture the host made
 /// without castable formats) reads without its conversion.
+/// Synthesizes a default shader resource view description for a typeless host
+/// texture when the title omitted `pDesc`. Typed host textures stay `None` so
+/// D3D12 fills in its own defaults.
+fn default_srv_desc(
+    resource: crate::object::This,
+    texture: &ID3D12Resource,
+) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if !crate::resource::is_typeless(d.Format.0 as u32) {
+        return None;
+    }
+    let mips = u32::from(d.MipLevels);
+    let slices = u32::from(d.DepthOrArraySize);
+    let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT(crate::resource::view_format(resource).unwrap_or(0) as i32),
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if slices <= 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+            desc.Anonymous.Texture1D = D3D12_TEX1D_SRV {
+                MipLevels: mips,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+            desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV {
+                MipLevels: mips,
+                ArraySize: slices,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.SampleDesc.Count > 1 && slices <= 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.SampleDesc.Count > 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+            desc.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV {
+                ArraySize: slices,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if slices <= 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                MipLevels: mips,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                MipLevels: mips,
+                ArraySize: slices,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_SRV {
+                MipLevels: mips,
+                ..Default::default()
+            };
+        }
+        _ => return None,
+    }
+    Some(desc)
+}
+
+/// Synthesizes a default unordered access view description (mip 0) for a
+/// typeless host texture when the title omitted `pDesc`.
+fn default_uav_desc(
+    resource: crate::object::This,
+    texture: &ID3D12Resource,
+) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if !crate::resource::is_typeless(d.Format.0 as u32) || d.SampleDesc.Count > 1 {
+        return None;
+    }
+    let slices = u32::from(d.DepthOrArraySize);
+    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT(crate::resource::view_format(resource).unwrap_or(0) as i32),
+        ..Default::default()
+    };
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if slices <= 1 => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+            desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
+                ArraySize: slices,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if slices <= 1 => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                ArraySize: slices,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+                WSize: slices,
+                ..Default::default()
+            };
+        }
+        _ => return None,
+    }
+    Some(desc)
+}
+
 fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
-    use crate::resource::{DEPTH_FORMATS, family};
+    use crate::resource::{DEPTH_FORMATS, concrete_view_format, family, is_typeless};
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     let allowed = if unordered {
@@ -1027,8 +1148,9 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         );
         return false;
     }
+    let depth = d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0;
     // Every family has more than one format, its typeless one first.
-    let typeless = family(own) == own && family(own + 1) == own;
+    let typeless = is_typeless(own);
     if let Some(format) = format.as_deref_mut()
         && unordered
         && let Some(&(_, linear)) = crate::resource::SRGB
@@ -1039,7 +1161,17 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        if !typeless {
+            return true;
+        }
+        let Some(format) = format else {
+            return false;
+        };
+        let Some(concrete) = concrete_view_format(own, depth, unordered) else {
+            return false;
+        };
+        *format = DXGI_FORMAT(concrete as i32);
+        return true;
     }
     let cast = castable.contains(&view);
     if family(view) != family(own) && !cast {
@@ -1050,11 +1182,15 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         once!(view, own, "an unordered view in a format the host cannot store");
         return false;
     }
-    if let Some(format) = format
-        && !typeless
-        && !cast
-    {
-        *format = d.Format;
+    if let Some(format) = format {
+        if !typeless && !cast {
+            *format = d.Format;
+        } else if typeless {
+            let Some(concrete) = concrete_view_format(view, depth, unordered) else {
+                return false;
+            };
+            *format = DXGI_FORMAT(concrete as i32);
+        }
     }
     true
 }
@@ -1138,7 +1274,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let resource = *resource as crate::object::This;
             if let Some(copy) = crate::resource::host_copy(resource) {
                 let texture = &copy.texture;
-                let mut desc = desc.as_ref().map(srv_desc);
+                let mut desc = desc
+                    .as_ref()
+                    .map(srv_desc)
+                    .or_else(|| default_srv_desc(resource, texture));
                 if desc.is_none() && !default_view(resource) {
                     return None;
                 }
@@ -1179,7 +1318,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 return crate::twin::uav(resource, &copy, desc.as_ref(), at)
                     .map(|twin| Some((twin, None)));
             }
-            let mut desc = desc.as_ref().map(uav_desc);
+            let mut desc = desc
+                .as_ref()
+                .map(uav_desc)
+                .or_else(|| default_uav_desc(resource, texture));
             if desc.is_none() && !default_view(resource) {
                 return None;
             }
