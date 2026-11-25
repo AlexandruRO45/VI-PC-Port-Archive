@@ -50,6 +50,7 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 pub mod movie;
+pub(crate) mod phase;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;

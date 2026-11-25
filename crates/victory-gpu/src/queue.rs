@@ -514,6 +514,7 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    let _loop_ = crate::phase::at(crate::phase::Phase::Loop);
     if lists.is_null() {
         return;
     }

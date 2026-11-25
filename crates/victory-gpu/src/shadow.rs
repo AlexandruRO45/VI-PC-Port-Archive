@@ -2751,6 +2751,7 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let _lookup = crate::phase::at(crate::phase::Phase::Shadow);
     lookup(address, len, false)
 }
 

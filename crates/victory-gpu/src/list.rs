@@ -144,6 +144,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
+    let _recording = crate::phase::at(crate::phase::Phase::Record);
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
@@ -1594,12 +1595,16 @@ mod state {
     ) {
         super::count_draw();
         with_state(this, |list, s| {
+            let _draw = crate::phase::at(crate::phase::Phase::Draw);
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| {
+            let _draw = crate::phase::at(crate::phase::Phase::Draw);
+            s.dispatch(list, x, y, z)
+        });
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -1609,7 +1614,10 @@ mod state {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        with_state(this, |list, s| {
+            let _draw = crate::phase::at(crate::phase::Phase::Draw);
+            s.dispatch_mesh(list, x)
+        });
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -1639,6 +1647,7 @@ mod state {
     ) {
         super::count_draw();
         with_state(this, |list, s| {
+            let _draw = crate::phase::at(crate::phase::Phase::Draw);
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
     }

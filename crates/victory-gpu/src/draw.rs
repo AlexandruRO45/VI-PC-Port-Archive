@@ -848,6 +848,7 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let _binding = crate::phase::at(crate::phase::Phase::Bind);
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
