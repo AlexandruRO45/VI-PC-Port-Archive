@@ -3,7 +3,7 @@
 //! with the frame-rate line. `VICTORY_COPY_MODE=plain` copies without the
 //! mapped-page guard, `none` skips the copies (both for timing only).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -408,10 +408,35 @@ mod command_tests {
 
 #[cfg(test)]
 mod heap_tests {
-    use super::segment_heap;
+    use super::{other_heaps, segment_heap};
+    use std::collections::HashMap;
     use windows_sys::Win32::System::Memory::{
         GetProcessHeap, HeapAlloc, HeapCreate, HeapDestroy, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
+
+    /// A 15.8 MB allocation whose header names no heap is counted apart, not
+    /// as a heap at 0x0 "in 0 segments", and is not counted as a heap.
+    #[test]
+    fn allocations_with_no_heap_header_are_counted_apart() {
+        let owner = HashMap::from([(0x1000, 0xa000), (0x2000, 0xa000), (0x3000, 0xb000)]);
+        let mb = 1 << 20;
+        let regions = [
+            (0x1000, 10 * mb),
+            (0x2000, 5 * mb),
+            (0x4000, 3 * mb),
+            (0x4000, mb),
+            (0x5000, mb),
+        ];
+        let (count, lines) = other_heaps(&owner, 0xb000, &regions);
+        assert_eq!(count, 1);
+        assert_eq!(
+            lines,
+            [
+                "heap 0xa000: 15 MB in 2 segments",
+                "5 MB in 2 allocations with no readable heap header"
+            ]
+        );
+    }
 
     /// A segment names its heap: the process heap's first segment is the
     /// heap itself, and a private heap filled past its first segment names
@@ -548,6 +573,49 @@ fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, presen
     }
     asked.clear();
     stands.clear();
+}
+
+/// The memory map's line about the heaps other than the process heap: how
+/// many there are, and the five holding the most bytes, with their segments.
+/// `owner` maps each 15.8 MB allocation to the heap its header names;
+/// `regions` are the committed regions (allocation base, bytes) of those the
+/// process heap does not own. An allocation whose header could not be read
+/// names no heap: those are counted apart, not as a heap.
+fn other_heaps(
+    owner: &HashMap<usize, usize>,
+    process_heap: usize,
+    regions: &[(usize, usize)],
+) -> (usize, Vec<String>) {
+    let mut heaps: HashMap<usize, (u64, u64)> = HashMap::new();
+    for heap in owner.values().filter(|&&heap| heap != process_heap) {
+        heaps.entry(*heap).or_default().0 += 1;
+    }
+    let mut unread = HashSet::new();
+    for &(base, bytes) in regions {
+        let heap = owner.get(&base).copied().unwrap_or(0);
+        if heap == 0 {
+            unread.insert(base);
+        }
+        heaps.entry(heap).or_default().1 += bytes as u64;
+    }
+    if let Some(entry) = heaps.get_mut(&0) {
+        entry.0 = unread.len() as u64;
+    }
+    let count = heaps.keys().filter(|&&heap| heap != 0).count();
+    let mut heaps: Vec<(usize, (u64, u64))> = heaps.into_iter().collect();
+    heaps.sort_by_key(|h| std::cmp::Reverse(h.1.1));
+    let biggest = heaps
+        .iter()
+        .take(5)
+        .map(|&(heap, (n, bytes))| match heap {
+            0 => format!(
+                "{} MB in {n} allocations with no readable heap header",
+                bytes >> 20
+            ),
+            _ => format!("heap {heap:#x}: {} MB in {n} segments", bytes >> 20),
+        })
+        .collect();
+    (count, biggest)
 }
 
 /// The heap whose segment starts at `base`, from the segment's header (an
@@ -717,31 +785,15 @@ fn log_memory_map() {
         started.elapsed().as_millis(),
         text.join("; ")
     );
-    // The heaps other than the process heap, biggest first: their segments
-    // and the bytes committed in them (heap 0: no header could be read).
-    let mut heaps: HashMap<usize, (u64, u64)> = HashMap::new();
-    for heap in owner.values().filter(|&&heap| heap != process_heap) {
-        heaps.entry(*heap).or_default().0 += 1;
-    }
-    for r in regions.iter().filter(|r| r.3 && kind(r) == 10) {
-        heaps
-            .entry(owner.get(&r.0).copied().unwrap_or(0))
-            .or_default()
-            .1 += r.2 as u64;
-    }
-    if !heaps.is_empty() {
-        let mut heaps: Vec<(usize, (u64, u64))> = heaps.into_iter().collect();
-        heaps.sort_by_key(|h| std::cmp::Reverse(h.1.1));
-        let biggest: Vec<String> = heaps
-            .iter()
-            .take(5)
-            .map(|(heap, (segments, bytes))| {
-                format!("heap {heap:#x}: {} MB in {segments} segments", bytes >> 20)
-            })
-            .collect();
+    let other: Vec<(usize, usize)> = regions
+        .iter()
+        .filter(|r| r.3 && kind(r) == 10)
+        .map(|r| (r.0, r.2))
+        .collect();
+    let (count, biggest) = other_heaps(&owner, process_heap, &other);
+    if !biggest.is_empty() {
         tracing::info!(
-            "memory map, heaps other than the process heap ({}, the biggest first): {}",
-            heaps.len(),
+            "memory map, heaps other than the process heap ({count}, the biggest first): {}",
             biggest.join("; ")
         );
     }
