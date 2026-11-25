@@ -201,8 +201,9 @@ for the title's setup and menus.
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics
-.\tools\playtest.ps1 -Victory .\target\diag\victory.exe -Title $titleExe `
-    -Config $testConfig -Keys '18:Enter,26:Enter,35:Enter' -Seconds 120
+powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\tools\playtest.ps1 `
+    -Victory .\target\diag\victory.exe -Title $titleExe -Config $testConfig `
+    -Keys '18:Enter,26:Enter,35:Enter' -Seconds 120
 ```
 
 Each run writes both logs and a `summary.json` with sampled frame rates,
