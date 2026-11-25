@@ -87,6 +87,8 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Last descriptor headers seen in a placed heap, including API writes.
+    copied: Option<Mutex<Vec<[u32; 3]>>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -866,6 +868,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            copied: None,
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -1528,6 +1531,16 @@ impl HostHeap {
         }
     }
 
+    pub(crate) fn track_copied_records(&mut self) {
+        self.copied = Some(Mutex::new(vec![[0; 3]; self.count as usize]));
+    }
+
+    /// Mirrors a changed header from the kernel's snapshot of a heap page.
+    pub(crate) fn mirror_copied(&self, index: u32, handle: u64, bytes: &[u8; 12]) -> bool {
+        let words = [0, 4, 8].map(|at| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()));
+        self.mirror_words(index, handle, words, false, true).1
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -1548,10 +1561,30 @@ impl HostHeap {
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        self.mirror_words(index, handle, words, for_draw, false).0
+    }
+
+    fn mirror_words(
+        &self,
+        index: u32,
+        handle: u64,
+        words: [u32; 3],
+        for_draw: bool,
+        copied: bool,
+    ) -> (Option<View>, bool) {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(records) = &self.copied {
+            let mut records = records.lock().unwrap_or_else(|e| e.into_inner());
+            let record = &mut records[index as usize];
+            if copied && *record == words {
+                return (None, false);
+            }
+            *record = words;
+        }
+        let [tag, i, generation] = words;
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -1560,11 +1593,11 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
-            } else if for_draw {
+            } else if for_draw || copied {
                 // Left for later and stale since: out of the sets and the stride table.
                 let _ = self.note_buffer(index, None, false);
             }
-            return None;
+            return (None, true);
         };
         if made[index as usize] != key {
             // Views of other textures in the memory this one describes
@@ -1597,7 +1630,7 @@ impl HostHeap {
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(view);
+                return (Some(view), true);
             }
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
@@ -1610,7 +1643,18 @@ impl HostHeap {
             }
             self.keep(index, kept.flatten());
         }
-        Some(view)
+        (Some(view), true)
+    }
+
+    /// The view ticket mirrored at `index` (tests).
+    #[cfg(test)]
+    pub(crate) fn made_key(&self, index: u32) -> Option<u64> {
+        self.made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .copied()
+            .filter(|&key| key != 0)
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no

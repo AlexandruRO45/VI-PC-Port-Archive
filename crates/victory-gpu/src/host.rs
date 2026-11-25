@@ -7673,6 +7673,8 @@ impl Host {
         if late && !relay_exact() && staging_in_flight(runs) {
             self.settle(&mut submitted, WHY_READ);
         }
+        // The title also writes descriptors without calling a descriptor API.
+        crate::descriptor::sync_heaps();
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -9758,6 +9760,7 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
+        crate::descriptor::sync_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {
