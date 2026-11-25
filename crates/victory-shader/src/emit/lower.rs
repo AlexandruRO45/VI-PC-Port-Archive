@@ -10703,6 +10703,9 @@ mod tests {
         // readback on PR #470), so the min prefix must lower to a
         // `WaveReadLaneAt` scan instead.
         assert_eq!(out.prefix_scans, 1, "a min prefix must scan, not prefix-op");
+        // The scan ballots the active lanes, so an inactive source lane takes
+        // the identity instead of an undefined `WaveReadLaneAt`.
+        assert!(out.wave_ops, "the scan must ballot the active lanes");
         // dxil.dll, where there is one, checks the scan's module too.
         #[cfg(windows)]
         {
