@@ -113,8 +113,8 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
-    /// Scripted diagnostic keys (`VICTORY_KEYS`), independent of focus.
-    #[cfg(any(test, feature = "diagnostics"))]
+    /// Scripted keys (`VICTORY_KEYS_FILE`, and `VICTORY_KEYS` in
+    /// diagnostics builds), independent of focus.
     fn scripted_keys(&mut self) -> Vec<KeyState> {
         Vec::new()
     }
@@ -144,8 +144,7 @@ fn fallback(keys: &[KeyState]) -> PadState {
     }
 }
 
-/// Combines `extra` (from `VICTORY_KEYS`) onto `base` (a physical host pad).
-#[cfg(any(test, feature = "diagnostics"))]
+/// Combines `extra` (scripted keys) onto `base` (a physical host pad).
 fn merge_pad(base: PadState, extra: PadState) -> PadState {
     PadState {
         buttons: base.buttons | extra.buttons,
@@ -447,7 +446,6 @@ impl Hub {
             if let Some(pad) = pads.iter_mut().flatten().next() {
                 apply_keyboard(pad, &fallback(&keys));
             }
-            #[cfg(any(test, feature = "diagnostics"))]
             let keys = {
                 let mut keys = keys;
                 let scripted = source.scripted_keys();
@@ -1244,16 +1242,12 @@ mod host {
                 .collect()
         }
 
-        #[cfg(any(test, feature = "diagnostics"))]
         fn scripted_keys(&mut self) -> Vec<KeyState> {
+            #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
+            let mut keys = asked_keys();
             #[cfg(feature = "diagnostics")]
-            {
-                scripted().into_iter().map(key_state).collect()
-            }
-            #[cfg(not(feature = "diagnostics"))]
-            {
-                Vec::new()
-            }
+            keys.extend(scripted());
+            keys.into_iter().map(key_state).collect()
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1266,6 +1260,65 @@ mod host {
         }
     }
 
+    /// A key's virtual-key code: a letter, a digit, or `Enter`, `Esc`,
+    /// `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`.
+    fn key_code(key: &str) -> Option<u8> {
+        Some(match key {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase(),
+            _ => return None,
+        })
+    }
+
+    /// Test aid: `VICTORY_KEYS_FILE=<file>`. A script writes lines
+    /// `<key> <seconds>` into the file (keys as [`key_code`] names them);
+    /// the next look, at most 50 ms later, holds each key that long, focus
+    /// or not, and removes the file. A measuring script can then answer
+    /// what is on screen (the account screen's prompt, a turn of the
+    /// camera) while someone else uses the desktop. Unset: nothing is read.
+    fn asked_keys() -> Vec<u8> {
+        static FILE: LazyLock<Option<std::path::PathBuf>> =
+            LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FILE").map(Into::into));
+        /// Keys held, until when; when the file was last looked at.
+        type Held = (Vec<(Instant, u8)>, Option<Instant>);
+        static HELD: Mutex<Held> = Mutex::new((Vec::new(), None));
+        let Some(file) = &*FILE else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+        if held.1.is_none_or(|last| now.duration_since(last) >= Duration::from_millis(50)) {
+            held.1 = Some(now);
+            if let Ok(text) = std::fs::read_to_string(file) {
+                let _ = std::fs::remove_file(file);
+                held.0.extend(asked(&text, now));
+            }
+        }
+        held.0.retain(|&(until, _)| until > now);
+        held.0.iter().map(|&(_, vk)| vk).collect()
+    }
+
+    /// The keys of a [`asked_keys`] file read at `now`: each with the time
+    /// it is held until. Lines that do not read as `<key> <seconds>` are
+    /// left out.
+    pub(super) fn asked(text: &str, now: Instant) -> Vec<(Instant, u8)> {
+        text.lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                let vk = key_code(words.next()?)?;
+                let long = Duration::try_from_secs_f64(words.next()?.parse().ok()?).ok()?;
+                Some((now + long, vk))
+            })
+            .collect()
+    }
+
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
@@ -1276,20 +1329,7 @@ mod host {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = key_code(key.trim())?;
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
                     vk,
@@ -1313,6 +1353,21 @@ mod host {
             GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
             process == GetCurrentProcessId()
         }
+    }
+
+    #[test]
+    fn a_keys_file_holds_each_key_for_its_seconds() {
+        let now = Instant::now();
+        let asked = asked("Enter 0.2
+J 1.5
+not a key 3
+W -1
+X
+", now);
+        assert_eq!(
+            asked,
+            [(now + Duration::from_millis(200), 0x0D), (now + Duration::from_millis(1500), b'J')]
+        );
     }
 
     #[test]
