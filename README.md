@@ -701,7 +701,10 @@ In the 2026-11-25 Series X run, the game requested 33.333 ms and the 40 Hz
 override supplied 25 ms. The menu reached 40 FPS. In the boat scene, a later
 60.55-second sample measured 11.68 FPS average (P50 86 ms, P95 137 ms, P99
 167 ms, two frames over 250 ms, worst 822 ms). The 40 FPS reading was reached
-in the menu; the boat-scene sample remains below the 40 FPS target.
+in the menu; the boat-scene sample remains below the 40 FPS target. This
+timing experiment used upstream `32b31f7` before the VRAM and overlay changes
+in this PR, so it measures the frame-rate override rather than the complete PR
+build.
 
 The overlay's `AVG MS` is the reciprocal of its rolling FPS rate. CPU is the
 process's share of available logical-processor capacity; GPU is timed work
