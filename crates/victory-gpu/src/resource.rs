@@ -2018,6 +2018,15 @@ pub(crate) extern "system" fn create_at_address(
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// The two padding words of `ResourceDesc` may differ between otherwise
+/// identical descriptors. Only the fields describe the placed resource.
+#[cfg(windows)]
+fn placed_texture_key(address: u64, mut words: [u32; 14]) -> (u64, [u32; 14]) {
+    words[1] = 0;
+    words[13] = 0;
+    (address, words)
+}
+
 /// The bytes of title memory a texture with the resource description
 /// `desc` (as words) takes where the title placed it; `None` for a buffer
 /// and for a description without a size.
@@ -2035,8 +2044,9 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let key = placed_texture_key(address, *desc);
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&r) = map.get(&(address, *desc)) {
+    if let Some(&r) = map.get(&key) {
         return Some(r as This);
     }
     // SAFETY: 56 bytes in the description's layout.
@@ -2057,7 +2067,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
-    map.insert((address, *desc), out as usize);
+    map.insert(key, out as usize);
     resource(out)
         .host
         .placed
@@ -2130,8 +2140,9 @@ pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -
             r[8] = wanted;
         }
     }
+    let key = placed_texture_key(address, r);
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&existing) = map.get(&(address, r)) {
+    if let Some(&existing) = map.get(&key) {
         return Some(existing as This);
     }
     // SAFETY: 56 bytes in the description's layout.
@@ -2150,7 +2161,7 @@ pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -
     if made != S_OK {
         return None;
     }
-    map.insert((address, r), out as usize);
+    map.insert(key, out as usize);
     resource(out)
         .host
         .placed
@@ -2373,6 +2384,22 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn placed_texture_key_ignores_only_descriptor_padding() {
+        assert_eq!(std::mem::offset_of!(ResourceDesc, alignment), 8);
+        assert_eq!(std::mem::offset_of!(ResourceDesc, flags), 48);
+        let address = 0x10000;
+        let words = std::array::from_fn(|i| i as u32 + 1);
+        let key = placed_texture_key(address, words);
+        for i in 0..words.len() {
+            let mut changed = words;
+            changed[i] ^= u32::MAX;
+            assert_eq!(key == placed_texture_key(address, changed), i == 1 || i == 13, "word {i}");
+        }
+        assert_ne!(key, placed_texture_key(address + 0x1000, words));
     }
 
     fn heap(size: u64) -> This {
