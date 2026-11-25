@@ -283,10 +283,13 @@ fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32) -> (Vec<u32>, Vec<usiz
     let mut full = false;
     for &k in &order {
         let (start, len) = copies[k];
-        if len == 0 || start + len > 1 << 40 {
+        let Some(end) = start.checked_add(len) else {
+            continue;
+        };
+        if len == 0 || end > 1 << 40 {
             continue;
         }
-        for page in start >> 16..=(start + len - 1) >> 16 {
+        for page in start >> 16..=(end - 1) >> 16 {
             let l1 = (page >> 12) as usize;
             if level1[l1] == 0 {
                 if blocks.len() > CAPACITY {
@@ -300,7 +303,7 @@ fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32) -> (Vec<u32>, Vec<usiz
             let entry = level1[l1] as usize * BLOCK + (page & 0xFFF) as usize;
             // Larger copies come first: a copy holding the whole page takes
             // it from them; one holding part of it only takes it if free.
-            let whole = page << 16 >= start && (page + 1) << 16 <= start + len;
+            let whole = page << 16 >= start && (page + 1) << 16 <= end;
             if whole || owner[entry].is_none() {
                 owner[entry] = Some((k, whole));
             }
@@ -330,6 +333,12 @@ impl Shared {
         crate::host::name(&table, || "title memory page table".into());
         let null = heap.pair()?;
         heap.raw_pair_at(null, None, 0);
+        // Initialize level 1 and block 0 to the null pair so a list submitted
+        // after its heap was released never reads descriptor slot 0.
+        let (empty, _, _) = self::table(&[], &[], null);
+        // SAFETY: `table` has room for `LEVEL1 + (CAPACITY + 1) * BLOCK * 2`
+        // dwords, strictly larger than `empty.len() == LEVEL1 + BLOCK * 2`.
+        unsafe { std::ptr::copy_nonoverlapping(empty.as_ptr(), data.cast::<u32>(), empty.len()) };
         // SAFETY: a live buffer.
         let gpu = unsafe { table.GetGPUVirtualAddress() };
         Some(Shared {
@@ -611,6 +620,22 @@ mod tests {
         assert_eq!(dwords.len(), LEVEL1 + (CAPACITY + 1) * BLOCK * 2);
         assert_eq!(look_up(&dwords, (CAPACITY as u64 + 1) << 28).0, pairs[CAPACITY + 1]);
         assert_eq!(look_up(&dwords, 0).0, 4, "the smallest copy is left out");
+    }
+
+    #[test]
+    fn overflowing_copy_ranges_are_ignored_and_empty_table_routes_to_null() {
+        let copies = [(u64::MAX - 8, 16), (0x10_0000, u64::MAX), (0x20_0000, 0)];
+        let (dwords, blocks, _) = table(&copies, &[10, 12, 14], 42);
+        assert_eq!(blocks.len(), 1, "only the null block");
+        assert_eq!(look_up(&dwords, 0).0, 42);
+        assert_eq!(look_up(&dwords, 0x10_0000).0, 42);
+        assert_eq!(look_up(&dwords, 0x20_0000).0, 42);
+        assert_eq!(look_up(&dwords, u64::MAX - 4).0, 42);
+
+        let (empty, empty_blocks, _) = table(&[], &[], 99);
+        assert_eq!(empty_blocks.len(), 1);
+        assert_eq!(look_up(&empty, 0).0, 99);
+        assert_eq!(look_up(&empty, 0x40_0000_1234).0, 99);
     }
 
     /// Reads 4 dwords of title memory at (`lo`, `hi`) through the page
