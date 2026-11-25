@@ -437,6 +437,29 @@ impl Shader {
         self.annotate(block, h, props.0, props.1)
     }
 
+    /// A view heap handle for a buffer's size alone (`getDimensions`), one
+    /// the driver's compiler cannot take for the handle that reads and
+    /// writes of the same descriptor go through: its index is bounded one
+    /// slot below theirs ([`VIEW_LIMIT`]), or with no limit at 2^26 - 1,
+    /// past any host heap but below what an index made from a 32-bit
+    /// address can be, so that no compiler can drop the bound. AMD's
+    /// compiler (driver 32.0.32029.2010, RDNA 4) crashes building a program
+    /// that reads or writes a buffer at an offset made from that same
+    /// buffer's size (an access violation reading 0x8 at
+    /// `amdxc64.dll+0x861b9f`); the title reads buffers' last records so,
+    /// from the record count in their descriptors (`descriptor_data`).
+    // shortcut: with a limit, an index at or past the slot below the null
+    // one reads that slot's size, where reads go to the null slot; neither
+    // slot holds one of the title's views.
+    pub fn size_handle(&mut self, block: usize, index: V, nonuniform: bool, props: (u32, u32)) -> V {
+        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        let bound = self.m.i32(if limit != 0 { limit - 1 } else { (1 << 26) - 1 });
+        let i32t = self.t.i32;
+        let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, bound]);
+        self.m.tag(v, super::bitcode::Tag::Clamp);
+        self.heap_handle(block, v, false, nonuniform, props)
+    }
+
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);

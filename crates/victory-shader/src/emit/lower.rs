@@ -5630,7 +5630,14 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
-        let h = self.handle(site, &src, false, props)?;
+        // A buffer's size through a handle of its own (`size_handle`).
+        let h = if image.is_none() {
+            let index = self.heap_index(site, first, false)?;
+            let per_lane = self.x.res.waterfall.loads.contains(&site);
+            self.s.size_handle(self.cur, index, per_lane, props)
+        } else {
+            self.handle(site, &src, false, props)?
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
