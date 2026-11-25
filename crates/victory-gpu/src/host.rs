@@ -3626,9 +3626,10 @@ mod batch {   // `mod tests` is already taken at the top of this file
     }
 
     /// Two flushes that each copy part of one page do not make the page
-    /// current: what they copied meets inside the page, and `Tracked::take`
-    /// took nothing of it, so a later whole-page request in the same
-    /// submission must still refresh (the split page of #2473).
+    /// current: the page is guarded only by a flush covering it whole, so
+    /// what the halves copied must not join, and a later whole-page
+    /// request in the same submission still refreshes (the split page
+    /// of #2473).
     #[test]
     fn a_page_copied_in_two_halves_is_refreshed_whole() {
         use crate::watch::PAGE;
@@ -3641,10 +3642,11 @@ mod batch {   // `mod tests` is already taken at the top of this file
         };
         let mut batch = Batch::default();
         batch.add(&copy, p, PAGE / 2);
-        assert_eq!(batch.flush(), 0, "half a page is not taken");
+        assert_eq!(batch.flush(), PAGE / 2, "the first half is copied");
         batch.add(&copy, p + PAGE / 2, PAGE / 2);
-        assert_eq!(batch.flush(), 0, "the other half is not taken either");
-        // The two halves together must not skip the page they never took.
+        assert_eq!(batch.flush(), PAGE / 2, "the other half is copied");
+        // Neither flush guarded the page, so the two halves must not join
+        // into a current range covering it: the page is still refreshed.
         batch.add(&copy, p, PAGE);
         assert_eq!(batch.flush(), PAGE, "the whole page is refreshed");
         crate::shadow::unregister(p, p as u64);
