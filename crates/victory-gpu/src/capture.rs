@@ -556,7 +556,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
     }
 }
 
-/// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
+/// Rows of a host format as 8-bit RGBA: unsigned 8-bit color as is, everything else
 /// as channel values scaled so the largest finite one is white (single
 /// channels: lowest black, highest white, as grey). `None` for formats not
 /// handled.
@@ -568,7 +568,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     // Channel values as floats, then scaled.
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
-        27..=32 => {
+        27..=30 => {
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
@@ -577,6 +577,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             }
             return Some(out);
         }
+        31..=32 => (4, Box::new(|b| [0, 1, 2].map(|i| f32::from(b[i] as i8)))),
         // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
         87 | 88 | 90..=93 => {
             for y in 0..h {
@@ -603,14 +604,16 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         })),
         15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
         35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
-        48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
+        48..=50 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
+        51..=52 => (2, Box::new(|b| [f32::from(b[0] as i8), f32::from(b[1] as i8), 0.0])),
         // Single channels (and depth planes): shown as grey.
         39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
         55..=59 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
-        60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
+        60..=62 | 65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
+        63..=64 => (1, Box::new(|b| [f32::from(b[0] as i8); 3])),
         _ => return None,
     };
     let values: Vec<[f32; 3]> = (0..h)
@@ -859,5 +862,44 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    #[test]
+    fn signed_rgba8_clamps_negative_colour_and_keeps_alpha_opaque() {
+        let rows = [0xff, 64, 32, 0];
+        let actual = [31, 32].map(|format| super::to_rgba(format, 1, 1, 4, &rows).unwrap());
+        assert_eq!(actual, [[0, 255, 127, 255]; 2]);
+    }
+
+    #[test]
+    fn signed_rg8_clamps_negative_colour() {
+        let rows = [0xff, 64];
+        let actual = [51, 52].map(|format| super::to_rgba(format, 1, 1, 2, &rows).unwrap());
+        assert_eq!(actual, [[0, 255, 0, 255]; 2]);
+    }
+
+    #[test]
+    fn signed_r8_grayscale_uses_signed_extrema() {
+        let rows = [0x80, 0xff, 0, 0x7f];
+        let actual = [63, 64].map(|format| super::to_rgba(format, 4, 1, 4, &rows).unwrap());
+        let expected = [0, 127, 128, 255].map(|grey| [grey, grey, grey, 255]).concat();
+        assert_eq!(actual, [expected.clone(), expected]);
+    }
+
+    #[test]
+    fn unsigned_srgb_and_alpha_only_keep_their_byte_interpretation() {
+        let rows = [0xff, 64, 32, 0];
+        for format in [27, 28, 29, 30] {
+            assert_eq!(super::to_rgba(format, 1, 1, 4, &rows).unwrap(), [255, 64, 32, 255]);
+        }
+        for format in [48, 49, 50] {
+            assert_eq!(super::to_rgba(format, 1, 1, 2, &rows).unwrap(), [255, 64, 0, 255]);
+        }
+        for format in [60, 61, 62, 65] {
+            assert_eq!(
+                super::to_rgba(format, 2, 1, 2, &rows).unwrap(),
+                [255, 255, 255, 255, 0, 0, 0, 255],
+            );
+        }
     }
 }
