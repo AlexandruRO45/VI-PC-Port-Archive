@@ -262,30 +262,46 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
 }
 #[test]
 fn immediate_sampler_chosen_by_control_flow() {
-    check_immediate_sampler_choice(false);
+    check_immediate_sampler_choice(SampleOperation::Sample);
 }
 
 #[test]
 fn immediate_sampler_choice_packs_d16_after_the_join() {
-    check_immediate_sampler_choice(true);
+    check_immediate_sampler_choice(SampleOperation::SampleD16);
 }
 
-fn check_immediate_sampler_choice(d16: bool) {
+#[test]
+fn comparison_gather_uses_the_sampler_chosen_by_control_flow() {
+    check_immediate_sampler_choice(SampleOperation::GatherCmp);
+}
+
+#[derive(Clone, Copy)]
+enum SampleOperation {
+    Sample,
+    SampleD16,
+    GatherCmp,
+}
+
+fn check_immediate_sampler_choice(operation: SampleOperation) {
+    let d16 = matches!(operation, SampleOperation::SampleD16);
+    let cmp = matches!(operation, SampleOperation::GatherCmp);
     let s_mov_lit = |dst: u8, lit: u32| [0xBE80_03FF | (dst as u32) << 16, lit];
     let s_mov_zero = |dst: u8| 0xBE80_0380 | (dst as u32) << 16;
     let s_load_x8 = |dst: u8, base: u8| [0x3D << 26 | 0x03 << 18 | (dst as u32) << 6 | (base as u32 >> 1), 125 << 25];
     let s_load_x4_off = |dst: u8, base: u8, off: u32| [0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1), 125 << 25 | off];
-    // image_sample_lz v4, v[2:3], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D
+    // image_sample_lz takes v2..v3; image_gather4_c_lz also takes the reference in v1.
     let dmask = if d16 { 3 } else { 1 };
-    let image_sample_lz: [u32; 2] = [
-        0x3C << 26 | 0x21 << 18 | dmask << 8 | 1 << 3,
-        u32::from(d16) << 31 | (16u32 >> 2) << 21 | (8u32 >> 2) << 16 | 4 << 8 | 2,
+    let opcode = if cmp { 0x4F } else { 0x21 };
+    let vaddr = if cmp { 1 } else { 2 };
+    let image_sample: [u32; 2] = [
+        0x3C << 26 | opcode << 18 | dmask << 8 | 1 << 3,
+        u32::from(d16) << 31 | (16u32 >> 2) << 21 | (8u32 >> 2) << 16 | 4 << 8 | vaddr,
     ];
     // buffer_store_dword v4, off, s[20:23], 0
     let buf_store: [u32; 2] = [0x38 << 26 | 0x1C << 18, 0x80 << 24 | (20u32 >> 2) << 16 | 4 << 8];
 
     // Two distinct valid immediate sampler descriptors (different wrap/filter bits).
-    let samp_a: [u32; 4] = [0x0000_0092, 0x00C0_0000, 0x1850_0000, 0];
+    let samp_a: [u32; 4] = [if cmp { 0x7092 } else { 0x92 }, 0x00C0_0000, 0x1850_0000, 0];
     let samp_b: [u32; 4] = [0x0000_0092, 0x00C0_0000, 0x1850_0001, 0];
 
     for (case_name, alt) in [("same_sampler", samp_a), ("different_samplers", samp_b)] {
@@ -295,6 +311,9 @@ fn check_immediate_sampler_choice(d16: bool) {
         words.push(s_mov_zero(3));
         words.extend_from_slice(&s_load_x8(8, 2)); // s[8:15] = texture SRV (offset 0)
         words.extend_from_slice(&s_load_x4_off(20, 2, 64)); // s[20:23] = raw UAV (offset 16 dwords = 64B)
+        if cmp {
+            words.push(0x7E00_02F0 | (1 << 17)); // v_mov_b32 v1, 0.5 (reference)
+        }
         // v2 = 0.5, v3 = 0.5 (sample coordinates).
         words.push(0x7E00_02F0 | (2 << 17)); // v_mov_b32 v2, 0.5
         words.push(0x7E00_02F0 | (3 << 17)); // v_mov_b32 v3, 0.5
@@ -316,7 +335,7 @@ fn check_immediate_sampler_choice(d16: bool) {
         let join_pc = words.len();
         words[br_else] = 0xBF84_0000 | ((else_pc - br_else - 1) as u32 & 0xFFFF);
         words[br_join] = 0xBF82_0000 | ((join_pc - br_join - 1) as u32 & 0xFFFF);
-        words.extend_from_slice(&image_sample_lz);
+        words.extend_from_slice(&image_sample);
         words.extend_from_slice(&buf_store);
         words.push(0xBF81_0000); // s_endpgm
 
@@ -391,7 +410,14 @@ fn check_immediate_sampler_choice(d16: bool) {
         let static_samplers = lowered
             .samplers
             .iter()
-            .map(|&w| super::StaticSampler::from_words(w))
+            .enumerate()
+            .map(|(n, &w)| {
+                let mut sampler = super::StaticSampler::from_words(w);
+                if lowered.cmp_samplers >> n & 1 != 0 {
+                    sampler.filter |= 0x80;
+                }
+                sampler
+            })
             .collect();
         let shader = HostShader {
             stage: HwStage::Cs,
@@ -431,23 +457,31 @@ fn check_immediate_sampler_choice(d16: bool) {
                     };
                 }
                 let texels = [[1.0f32, 0.5, 0.0, 1.0]];
+                let depth = [0.75f32];
+                let texture = if cmp {
+                    View::ComparisonTexture(1, 1, &depth)
+                } else {
+                    View::Texture(1, 1, &texels)
+                };
                 let out = host
                     .dispatch(
                         &root,
                         &pso,
                         &Dispatch {
                             roots: vec![(0, Root::Constants(ud))],
-                            views: &[
-                                View::Texture(1, 1, &texels),
-                                View::Texture(1, 1, &texels),
-                                View::RawUav(1),
-                            ],
+                            views: &[texture, texture, View::RawUav(1)],
                             samplers: &[],
                             groups: [1, 1, 1],
                         },
                     )
                     .unwrap_or_else(|e| panic!("{case_name}/{label}: dispatch failed: {e}"));
-                let expected = if d16 { 0x3800_3c00 } else { 1.0f32.to_bits() };
+                let expected = match operation {
+                    SampleOperation::Sample => 1.0f32.to_bits(),
+                    SampleOperation::SampleD16 => 0x3800_3c00,
+                    // The first sampler always compares true, the alternate never does.
+                    SampleOperation::GatherCmp if branch == 1 && alt == samp_b => 0,
+                    SampleOperation::GatherCmp => 1.0f32.to_bits(),
+                };
                 assert_eq!(out[0][0], expected, "{case_name}/{label} branch={branch}");
             }
         }

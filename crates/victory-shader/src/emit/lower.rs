@@ -10309,14 +10309,7 @@ impl<'a> Lower<'a> {
                         args.push(self.s.m.i32(dmask.trailing_zeros()));
                         let reference = addr_u32(self, first - 1)?;
                         args.push(self.as_float(reference));
-                        self.s.op(
-                            c,
-                            "textureGatherCmp.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            74,
-                            &args,
-                        )
+                        call_sample(self, "textureGatherCmp.f32", 74, &args, &mut gathered)
                     } else {
                         args.extend(&os[..2]);
                         args.push(self.s.m.i32(dmask.trailing_zeros()));
