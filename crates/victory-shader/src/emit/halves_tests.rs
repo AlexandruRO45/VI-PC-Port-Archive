@@ -174,7 +174,18 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 5] = [
+    let programs: [(Vec<u32>, &[&str]); 6] = [
+        (
+            every_id(3, 2),
+            &[
+                "v_lshlrev_b32 v3, 2, v2",
+                "v_add_nc_u32 v3, v1, v3",
+                "v_lshlrev_b32 v3, 3, v3",
+                "v_add_nc_u32 v2, v0, v3",
+                "v_lshlrev_b32 v16, 2, v2",
+                "v_mov_b32 v3, 1",
+            ],
+        ),
         (
             in_halves(),
             &[
@@ -321,7 +332,10 @@ fn reads_across_32_lane_halves_are_refused_with_their_reason() {
     assert_eq!(refusal(&unused_first, 64, 0), "translated");
     // A buffer dword loaded at an offset the same in every lane, through a
     // scalar descriptor, is one value: its first lane is the console's.
-    assert_eq!(refusal(&first_lane_of_a_buffer_load(3), 64, 0), "translated");
+    assert_eq!(
+        refusal(&first_lane_of_a_buffer_load(3), 64, 0),
+        "translated"
+    );
     let why = refusal(&first_lane_of_a_buffer_load(0), 64, 0);
     assert!(
         why.contains("a first-lane read of a value that may differ between 32-lane halves"),
@@ -505,9 +519,9 @@ fn first_lane_of_a_buffer_load(offset: u32) -> Vec<u32> {
         0x7E06_0284, // v_mov_b32 v3, 4
         0xE030_1000,
         0x800B_0400 | offset, // buffer_load_dword v4, v<offset>, s[44:47], 0 offen
-        0xBF8C_3F70,         // s_waitcnt vmcnt(0)
-        0x7E18_0504,         // v_readfirstlane_b32 s12, v4
-        0x7E0A_020C,         // v_mov_b32 v5, s12
+        0xBF8C_3F70,          // s_waitcnt vmcnt(0)
+        0x7E18_0504,          // v_readfirstlane_b32 s12, v4
+        0x7E0A_020C,          // v_mov_b32 v5, s12
     ]);
     w.extend(store(5, 0));
     w.push(S_ENDPGM);
@@ -545,6 +559,141 @@ fn first_lanes_kept_in_halves_match_the_console_on_every_gpu() {
     let want: Vec<u32> = (0..128).flat_map(|l| [l >> 6, l & 63]).collect();
     failed.extend(differences(&first_lane_alike(), 128, 2, &want));
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// A group of `[x, y, z]` threads (thread ids in v0-v2) running `words`.
+fn native_shaped(words: &[u32], [x, y, z]: [u32; 3]) -> NativeProgram {
+    let mut n = native(words, true, x * y * z, 0);
+    if let StageIo::Cs(cs) = &mut n.io {
+        cs.threads = [x, y, z];
+        cs.rsrc2 |= 2 << 11; // TIDIG_COMP_CNT 2: v1 holds y, v2 holds z
+    }
+    n
+}
+
+/// Each thread of a group `1 << sx` wide and `1 << sy` high (any depth)
+/// stores 1 at its flat id `(z << sy | y) << sx | x`, with console lanes
+/// (`v_mbcnt`): a thread id two threads share leaves another one unstored.
+fn every_id(sx: u32, sy: u32) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0xD765_0005,
+        0x0001_00C1,              // v_mbcnt_lo_u32_b32 v5, -1, 0
+        0x3406_0400 | (128 + sy), // v_lshlrev_b32 v3, sy, v2
+        0x4A06_0701,              // v_add_nc_u32 v3, v1, v3
+        0x3406_0600 | (128 + sx), // v_lshlrev_b32 v3, sx, v3
+        0x4A04_0700,              // v_add_nc_u32 v2, v0, v3
+        0x3420_0482,              // v_lshlrev_b32 v16, 2, v2
+        0x7E06_0281,              // v_mov_b32 v3, 1
+    ]);
+    w.extend(store(3, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// A group of several rows whose rows a 32-lane host wave may tile is
+/// refused in halves; narrower rows, and one row, are not.
+#[test]
+fn groups_a_host_wave_may_tile_are_refused_in_halves() {
+    let why =
+        |shape: [u32; 3], sx, sy| match lowered(&native_shaped(&every_id(sx, sy), shape), true) {
+            Ok(_) => "translated".to_string(),
+            Err(e) => e.to_string(),
+        };
+    for (shape, sx, sy) in [
+        ([32, 2, 1], 5, 1),
+        ([64, 4, 1], 6, 2),
+        ([32, 2, 2], 5, 1),
+        ([6, 6, 1], 3, 3),
+    ] {
+        let w = why(shape, sx, sy);
+        assert!(
+            w.contains("a group whose rows a 32-lane host wave may tile"),
+            "{shape:?}: {w}"
+        );
+    }
+    for (shape, sx, sy) in [
+        ([8, 8, 1], 3, 3),
+        ([16, 2, 1], 4, 1),
+        ([4, 4, 4], 2, 2),
+        ([64, 1, 1], 6, 0),
+    ] {
+        assert_eq!(why(shape, sx, sy), "translated", "{shape:?}");
+    }
+}
+
+/// The groups halves keep give every thread its own id on every hardware
+/// adapter, in halves and as one wave64 where the adapter runs those.
+#[test]
+fn every_thread_keeps_its_own_id_in_halves_on_every_gpu() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hosts = Host::each_hardware();
+    if hosts.is_empty() {
+        eprintln!("no SM 6.6 hardware device; skipped");
+    }
+    let mut failed = Vec::new();
+    for (shape, sx, sy) in [
+        ([8, 8, 1], 3, 3),
+        ([16, 2, 1], 4, 1),
+        ([4, 4, 4], 2, 2),
+        ([64, 1, 1], 6, 0),
+    ] {
+        let n = native_shaped(&every_id(sx, sy), shape);
+        let threads = shape.iter().product::<u32>();
+        for (form, halves) in [("halves", true), ("wave64", false)] {
+            let s = shader(lowered(&n, halves).expect("lowers"));
+            for (adapter, host) in &hosts {
+                let label = format!("{adapter} {shape:?} ({form})");
+                let Ok((root, pso)) = host.compute_pipeline(&s) else {
+                    assert!(
+                        !halves && host.wave32().unwrap_or(false),
+                        "{label}: no pipeline"
+                    );
+                    continue;
+                };
+                let ud = vec![0u32; s.user_data_dwords().max(1) as usize];
+                let views = [
+                    View::Texture(1, 1, &[[0.0; 4]]),
+                    View::Buffer {
+                        data: &[0; 4],
+                        stride: Stride::Structured(16),
+                    },
+                    View::RawUav(threads),
+                ];
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &views,
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                let stored = out[0]
+                    .iter()
+                    .take(threads as usize)
+                    .filter(|&&v| v == 1)
+                    .count();
+                eprintln!("{label}: {stored} of {threads} ids stored");
+                if stored != threads as usize {
+                    failed.push(format!("{label}: {stored} of {threads} ids stored"));
+                }
+            }
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{}",
+        failed.join(
+            "
+"
+        )
+    );
 }
 
 /// [`in_halves`] on every hardware adapter: in halves, and as one wave64

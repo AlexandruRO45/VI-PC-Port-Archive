@@ -621,7 +621,8 @@ impl<'a> Lower<'a> {
             let needs_wave = console_lanes || one_wave && s.lds_dwords > 0;
             halves = Self::halves_wanted(x, needs_wave);
             if halves {
-                halves_refused = Self::halves_lds(group, s.lds_dwords);
+                halves_refused =
+                    Self::halves_lds(group, s.lds_dwords).or(Self::halves_tiles(cs.threads));
             }
             if needs_wave {
                 s.wave_size = Some(if halves { 32 } else { wave });
