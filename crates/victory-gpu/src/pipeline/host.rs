@@ -288,6 +288,35 @@ impl GraphicsState {
         })
     }
 
+    /// Depth-only passes (shadow maps, depth prepasses) supply later draws.
+    pub(super) fn writes_depth_only(&self) -> bool {
+        self.targets.NumRenderTargets == 0
+            && self.depth_format != DXGI_FORMAT_UNKNOWN
+            && self.depth.DepthEnable.as_bool()
+            && self.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_depth_only() -> Self {
+        Self {
+            depth_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT,
+            depth: D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: true.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_screen_pass() -> Self {
+        Self {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ..Default::default()
+        }
+    }
+
     /// Whether these are a pass over the screen's draws: no vertex input, no
     /// depth or stencil. Such passes fill tables once; their shaders are few.
     pub(crate) fn screen_pass(&self) -> bool {
@@ -920,5 +949,31 @@ mod tests {
         let mut t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         assert_eq!(host_blend(&blending(false), &t), blending(false));
+    }
+
+    #[test]
+    fn writes_depth_only_requires_zero_targets_and_writable_depth() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT;
+        let mut s = GraphicsState {
+            depth_format: DXGI_FORMAT_D32_FLOAT,
+            depth: D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: true.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(s.writes_depth_only());
+        s.targets.NumRenderTargets = 1;
+        assert!(!s.writes_depth_only());
+        s.targets.NumRenderTargets = 0;
+        s.depth_format = DXGI_FORMAT_UNKNOWN;
+        assert!(!s.writes_depth_only());
+        s.depth_format = DXGI_FORMAT_D32_FLOAT;
+        s.depth.DepthEnable = false.into();
+        assert!(!s.writes_depth_only());
+        s.depth.DepthEnable = true.into();
+        s.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        assert!(!s.writes_depth_only());
     }
 }
