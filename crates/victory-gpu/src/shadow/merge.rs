@@ -6,14 +6,18 @@
 pub(super) fn merge(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
     assert_eq!(title.len(), host.len());
     assert_eq!(title.len(), old.len());
-    #[cfg(target_arch = "x86_64")]
-    if title.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
-        // SAFETY: the CPU supports AVX2; all three slices have equal length.
-        return unsafe { avx2(title, host, old) };
+    // Select the merged byte before recording a change, allowing vectorization.
+    let mut changed = false;
+    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+        let merged = if *h == *o { *t } else { *h };
+        changed |= merged != *t;
+        *t = merged;
+        *h = merged;
     }
-    scalar(title, host, old)
+    changed
 }
 
+#[cfg(test)]
 fn scalar(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
     let mut changed = false;
     for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
@@ -24,33 +28,6 @@ fn scalar(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
         *h = *t;
     }
     changed
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn avx2(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
-    use std::arch::x86_64::*;
-
-    let end = title.len() / 32 * 32;
-    let mut changed = _mm256_setzero_si256();
-    for at in (0..end).step_by(32) {
-        // SAFETY: each offset has 32 accessible bytes in all three
-        // equally sized slices. Unaligned loads/stores are intentional.
-        // The mutable slices are disjoint by Rust's borrowing rules.
-        unsafe {
-            let t = _mm256_loadu_si256(title.as_ptr().add(at).cast());
-            let h = _mm256_loadu_si256(host.as_ptr().add(at).cast());
-            let o = _mm256_loadu_si256(old.as_ptr().add(at).cast());
-            // A byte the GPU did not change keeps the CPU's current byte.
-            let unchanged = _mm256_cmpeq_epi8(h, o);
-            let merged = _mm256_blendv_epi8(h, t, unchanged);
-            changed = _mm256_or_si256(changed, _mm256_xor_si256(merged, t));
-            _mm256_storeu_si256(title.as_mut_ptr().add(at).cast(), merged);
-            _mm256_storeu_si256(host.as_mut_ptr().add(at).cast(), merged);
-        }
-    }
-    let tail = scalar(&mut title[end..], &mut host[end..], &old[end..]);
-    _mm256_testz_si256(changed, changed) == 0 || tail
 }
 
 #[cfg(test)]
