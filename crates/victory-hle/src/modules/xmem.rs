@@ -690,7 +690,20 @@ const WHOLE: usize = 1 << 30;
 /// where the title puts a page is where in the section it goes (pages hold
 /// nothing before they are first mapped). True if done.
 fn map_whole(physical: &mut Physical, base: usize, pages: &[usize]) -> bool {
-    let end = base + pages.len() * PAGE;
+    // Tiny reservations stay per page: the whole view is for the title's
+    // large GPU heap mappings (185 MB), and a small reservation's pages are
+    // expected to keep their own state when one of them is unmapped
+    // (issue #8). The debug line below already looks at the same threshold.
+    if pages.len() <= 64 {
+        return false;
+    }
+    let Some(end) = pages
+        .len()
+        .checked_mul(PAGE)
+        .and_then(|len| base.checked_add(len))
+    else {
+        return false;
+    };
     let Some(first) = physical.pages.get(&pages[0]).cloned() else {
         return false;
     };
