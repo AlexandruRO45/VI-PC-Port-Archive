@@ -470,11 +470,13 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         let flags = context_flags(|f| f.get(&(unsafe { *context } as usize)).copied()).unwrap_or(0);
         let (depth, motion) = (title.resources[1], title.resources[2]);
         if !depth.resource.is_null() && !motion.resource.is_null() {
+            let frame = frame_inputs(&title, flags);
+            once!(info, result = code, render = ?frame.render, "FidelityFX: first successful host upscale");
             victory_gpu::external::frame_generation_inputs(
                 list,
                 depth.resource.cast::<Object>().cast_const(),
                 motion.resource.cast::<Object>().cast_const(),
-                frame_inputs(&title, flags),
+                frame,
             );
         }
     }
