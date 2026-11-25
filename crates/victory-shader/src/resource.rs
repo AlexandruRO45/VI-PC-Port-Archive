@@ -1068,12 +1068,19 @@ impl<'a> Tracer<'a> {
         })
     }
 
-    /// `hi` is `high` (0 for a table), possibly plus a carry.
+    /// `hi` is `high` (0 for a table), possibly plus a carry or masked to
+    /// its low bits.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
         let want = high.map_or(Term::Const(0), Term::Value);
+        // (`s_and_b32` with a mask of the low bits, 0xff for a 40-bit
+        // address, keeps a high half that fits it)
+        let low_mask = |t: Term| matches!(t, Term::Const(c) if c >= 0xff && c.wrapping_add(1).is_power_of_two());
         hi == want
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
+            ))
+            || matches!(hi, Term::Value(v) if self.sop2(v, &["s_and_b32"]).is_some_and(
+                |(_, [a, b])| a == want && low_mask(b) || b == want && low_mask(a)
             ))
     }
 
@@ -3947,6 +3954,26 @@ pub(crate) mod tests {
         // The root parameters of the title sit after it, in the same stage.
         let r = track_words(&load_b8(8), &[param(Table, 2, 1)], HwStage::Gs);
         assert_eq!(r.scalar, [((0, 0), at(RUNTIME_TABLE, 0xB8))]);
+    }
+
+    /// The title's geometry programs take the table's high half masked to its
+    /// low byte (a 40-bit address): `s_and_b32 s1, s9, 0xff`, then the load
+    /// through s[0:1] with s0 = s8. A mask that keeps fewer bits is refused.
+    #[test]
+    fn a_runtime_table_high_half_masked_to_its_low_bits_is_the_table() {
+        let words = |mask: u32| {
+            let and = 0x8000_0000 | 0x0e << 23 | 1 << 16 | 255 << 8 | 9; // s_and_b32 s1, s9, lit
+            let [load, offset, end] = load_b8(0);
+            [and, mask, 0xBE80_0308, load, offset, end] // s_mov_b32 s0, s8
+        };
+        let r = track_words(&words(0xFF), &[], HwStage::Gs);
+        assert_eq!(r.scalar.iter().map(|s| s.1).collect::<Vec<_>>(), [at(RUNTIME_TABLE, 0xB8)]);
+        let r = track_words(&words(0xFFFF), &[], HwStage::Gs);
+        assert_eq!(r.scalar.iter().map(|s| s.1).collect::<Vec<_>>(), [at(RUNTIME_TABLE, 0xB8)]);
+        for mask in [0x7F, 0xFF00] {
+            let err = track_error(&words(mask), &[], HwStage::Gs);
+            assert!(matches!(err, ShaderError::Unsupported { .. }), "{mask:#x}: {err:?}");
+        }
     }
 
     /// Only a layout that holds both halves' parameters can say the first two

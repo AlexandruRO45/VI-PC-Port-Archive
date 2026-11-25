@@ -39,7 +39,8 @@ use std::collections::HashMap;
 use super::container::SigElement;
 use crate::ShaderError::{self, Unsupported};
 use crate::handoff::{Handoff, Access, VertexRead, own_accesses};
-use crate::ir::Program;
+use crate::gfx10::{Fields, Operand};
+use crate::ir::{Program, Reg};
 use crate::merged::{GsMessage, MergedGs, limits, message_of};
 use crate::native::{NativeProgram, StageIo, Usage, VsOutput};
 
@@ -53,13 +54,13 @@ fn unsupported(what: &'static str) -> ShaderError {
 /// messages.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GsPlan {
-    /// Reads of an input vertex's record.
-    pub reads: HashMap<Site, VertexRead>,
+    /// Reads of an input vertex's record (two at a paired read).
+    pub reads: HashMap<Site, Vec<VertexRead>>,
     /// Writes to the program's own array: (first dword in it, dwords, first
-    /// VGPR).
-    pub stores: HashMap<Site, (u32, u32, u8)>,
+    /// VGPR), two at a paired write.
+    pub stores: HashMap<Site, Vec<(u32, u32, u8)>>,
     /// Reads back from it.
-    pub loads: HashMap<Site, (u32, u32, u8)>,
+    pub loads: HashMap<Site, Vec<(u32, u32, u8)>>,
     /// `GS_EMIT` and friends: the emit's number and the message.
     pub messages: HashMap<Site, (u32, GsMessage)>,
     /// Dwords of an output record.
@@ -107,6 +108,34 @@ pub(crate) fn vertex_id_input() -> Vec<SigElement> {
     }]
 }
 
+/// The merged wave's thread-count masks as no-ops: each half of the console
+/// stage starts by setting `exec` to the lanes below its ES or GS thread
+/// count (`s_bfm_b64 exec`, then `s_cselect_b64 exec, -1, exec` for a full
+/// wave); a host invocation is one thread, which runs.
+pub(crate) fn drop_thread_masks(code: &mut [u8], p: &Program) -> Result<(), ShaderError> {
+    const S_NOP: u32 = 0xBF80_0000;
+    const EXEC: u8 = 126;
+    let Some(entry) = p.blocks.first() else { return Ok(()) };
+    for inst in &entry.insts {
+        if !inst.writes.iter().any(|w| w.0 == Reg::S(EXEC)) {
+            continue;
+        }
+        let mask = match (inst.name(), &inst.fields) {
+            ("s_bfm_b64", _) => true,
+            ("s_cselect_b64", Fields::Sop { src, .. }) => {
+                matches!(src.as_slice(), [Operand::Const(193), Operand::Scalar { code: EXEC, .. }])
+            }
+            _ => false,
+        };
+        if mask {
+            let at = inst.machine.offset;
+            let word = code.get_mut(at..at + 4).ok_or(unsupported("an exec mask outside the code"))?;
+            word.copy_from_slice(&S_NOP.to_le_bytes());
+        }
+    }
+    Ok(())
+}
+
 /// The ES half as a vertex shader: `code` with the record writes as exports
 /// (see the module notes) and the I/O of a vertex shader whose outputs are the
 /// record's rows.
@@ -125,19 +154,28 @@ pub(crate) fn es_as_vertex_shader(
         }
         Ok(())
     };
-    for s in &handoff.es.stores {
-        let inst = &es.blocks[s.site.0].insts[s.site.1];
-        let (row, ch) = (s.dword / 4, s.dword % 4);
-        if ch + s.count > 4 {
-            return Err(unsupported("a record write across two registers"));
+    // One export per write instruction: the two stores of a paired write
+    // (`ds_write2_*`) must fall in one record row.
+    let mut sites: Vec<_> = handoff.es.stores.iter().map(|s| s.site).collect();
+    sites.dedup();
+    for site in sites {
+        let inst = &es.blocks[site.0].insts[site.1];
+        let (mut row, mut en, mut regs) = (None, 0u32, [0u32; 4]);
+        for s in handoff.es.stores.iter().filter(|s| s.site == site) {
+            let (r, ch) = (s.dword / 4, s.dword % 4);
+            let bits = ((1u32 << s.count) - 1) << ch;
+            if ch + s.count > 4 || row.is_some_and(|x| x != r) || en & bits != 0 {
+                return Err(unsupported("a record write across two registers"));
+            }
+            row = Some(r);
+            en |= bits;
+            for k in 0..s.count {
+                regs[(ch + k) as usize] = u32::from(s.reg) + k;
+            }
         }
+        let Some(row) = row else { continue };
         // exp param<row>, the written VGPRs in their channels
-        let en = ((1u32 << s.count) - 1) << ch;
         let word0 = 0xF800_0000 | (32 + row) << 4 | en;
-        let mut regs = [0u32; 4];
-        for k in 0..s.count {
-            regs[(ch + k) as usize] = u32::from(s.reg) + k;
-        }
         let word1 = regs[0] | regs[1] << 8 | regs[2] << 16 | regs[3] << 24;
         put(inst.machine.offset, &[word0, word1])?;
     }
@@ -214,7 +252,17 @@ pub(crate) fn plan(gs: &Program, handoff: &Handoff, outputs: &[SigElement]) -> R
     let lo = writes.clone().map(|a| a.byte / 4).min().ok_or(unsupported("a geometry program that writes no output record"))?;
     let hi = writes.map(|a| a.byte / 4 + a.count).max().unwrap_or(lo);
     let array_dwords = emits * record_dwords;
-    if hi - lo != array_dwords || record_dwords == 0 {
+    // (the last row of a record may hold fewer than four values: the
+    // program need not write the dwords past them in the last record)
+    let last = outputs.iter().filter_map(|e| e.row).max().unwrap_or(0);
+    let last_cols = outputs
+        .iter()
+        .filter(|e| e.row == Some(last))
+        .map(|e| u32::from(e.col) + u32::from(e.cols))
+        .max()
+        .unwrap_or(4)
+        .min(4);
+    if record_dwords == 0 || hi - lo != array_dwords && hi - lo != array_dwords - 4 + last_cols {
         return Err(unsupported("the output records do not fit the output signature"));
     }
     let mut p = GsPlan {
@@ -230,13 +278,12 @@ pub(crate) fn plan(gs: &Program, handoff: &Handoff, outputs: &[SigElement]) -> R
             return Err(unsupported("a geometry output access outside the records"));
         }
         let entry = (at - lo, a.count, a.reg);
-        if a.write {
-            p.stores.insert(a.site, entry);
-        } else {
-            p.loads.insert(a.site, entry);
-        }
+        let at = if a.write { &mut p.stores } else { &mut p.loads };
+        at.entry(a.site).or_default().push(entry);
     }
-    p.reads = handoff.reads.iter().map(|r| (r.site, *r)).collect();
+    for r in &handoff.reads {
+        p.reads.entry(r.site).or_default().push(*r);
+    }
     Ok(p)
 }
 
@@ -356,6 +403,60 @@ pub(crate) mod tests {
         assert_eq!(outputs.iter().map(|o| (o.row, o.param)).collect::<Vec<_>>(), [(0, 0), (1, 1)]);
     }
 
+    /// The merged wave's thread-count prologue of the title's halves:
+    /// `s_bfe_i32 s0, s3, <count>`, `s_bfm_b64 exec, s0, 0`, `s_cmp_eq_u32
+    /// s0, 64`, `s_cselect_b64 exec, -1, exec`. The two exec writes become
+    /// no-ops; other selects stay.
+    #[test]
+    fn the_thread_count_masks_become_no_ops() {
+        let words = [
+            0x8000_0000 | 0x28 << 23 | 255 << 8 | 3, // s_bfe_i32 s0, s3, lit
+            0x0008_0008,
+            0x92FE_8000, // s_bfm_b64 exec, s0, 0
+            0xBF06_C000, // s_cmp_eq_u32 s0, 64
+            0x85FE_7EC1, // s_cselect_b64 exec, -1, exec
+            0x8586_807E, // s_cselect_b64 s[6:7], exec, 0
+            S_ENDPGM,
+        ];
+        let mut code = bytes(&words);
+        let before = program(&words);
+        let exec_writes = |p: &Program| {
+            p.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.writes.iter().any(|w| w.0 == Reg::S(126))).count()
+        };
+        assert_eq!(exec_writes(&before), 2);
+        drop_thread_masks(&mut code, &before).unwrap();
+        let after = crate::ir::build(&code, true, 64).unwrap();
+        assert_eq!(exec_writes(&after), 0);
+        let names: Vec<_> = after.blocks.iter().flat_map(|b| b.insts.iter().map(|i| i.name())).collect();
+        assert_eq!(names, ["s_bfe_i32", "s_cmp_eq_u32", "s_cselect_b64", "s_endpgm"]);
+    }
+
+    /// A paired write of the ES half is one export of both elements.
+    #[test]
+    fn a_paired_record_write_is_one_export() {
+        let es = [
+            vop2(V_LSHLREV, 1, 133, 0),
+            ds(DS_WRITE2_B64, 1 << 8),
+            ds_regs2(1, 4, 6, 0),
+            ds(DS_WRITE_B32, 16),
+            ds_regs(1, 8, 0),
+            S_BARRIER,
+            S_SETPC,
+        ];
+        let es_c = container_parts(&[(HwStage::Es, &bytes(&es)), (HwStage::Vs, &bytes(&[S_ENDPGM]))], &[]);
+        let (merged, h) = super::super::merged_halves(&es_c, &gs_container(3)).unwrap();
+        let ir = crate::spill::build(&merged.es).unwrap();
+        let vs = es_as_vertex_shader(&merged, &ir, &h).unwrap();
+        let ir = crate::spill::build(&vs).unwrap();
+        let exps: Vec<_> = ir.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.name() == "exp").collect();
+        assert_eq!(exps.len(), 2);
+        // exp param0 with all four channels: v4, v5, v6, v7
+        let at = exps[0].machine.offset;
+        let w0 = u32::from_le_bytes(vs.code[at..at + 4].try_into().unwrap());
+        let w1 = u32::from_le_bytes(vs.code[at + 4..at + 8].try_into().unwrap());
+        assert_eq!((w0 >> 4 & 0x3F, w0 & 0xF, w1), (32, 0xF, 4 | 5 << 8 | 6 << 16 | 7 << 24));
+    }
+
     #[test]
     fn the_gs_plan_numbers_the_emits_and_places_the_records() {
         let (_, h) = super::super::merged_halves(&es_container(), &gs_container(3)).unwrap();
@@ -367,12 +468,41 @@ pub(crate) mod tests {
         m.sort_by_key(|x| x.0);
         assert_eq!(m[2], (2, GsMessage::EmitCut { stream: 0 }));
         assert_eq!(p.stores.len(), 15);
-        assert!(p.stores.values().all(|s| s.0 % 4 == 0 && s.1 == 4));
+        assert!(p.stores.values().flatten().all(|s| s.0 % 4 == 0 && s.1 == 4));
         assert_eq!(p.reads.len(), 2);
         // Records that do not fill the signature's size are refused.
         let (_, h2) = super::super::merged_halves(&es_container(), &gs_container(2)).unwrap();
         let gs2 = crate::spill::build(&native_of(&gs_container(2))).unwrap();
         assert!(plan(&gs2, &h2, &outs[..4]).is_err());
+    }
+
+    /// The title's last output row holds three values: the program writes
+    /// twelve bytes of it, and the last record ends a dword early.
+    #[test]
+    fn the_last_row_of_a_record_may_be_short() {
+        const DS_WRITE_B96: u32 = 0xde;
+        let mut w = gs_words(3);
+        // the last row of each record: 12 bytes
+        for n in 0..3 {
+            let k = w.iter().position(|&x| x == ds(DS_WRITE_B128, n * 80 + 64)).unwrap();
+            w[k] = ds(DS_WRITE_B96, n * 80 + 64);
+        }
+        let short = osg1(&[
+            ("SV_Position", 0, 1, 3, 0, 0xF),
+            ("TEXCOORD", 0, 0, 3, 1, 0xF),
+            ("TEXCOORD", 1, 0, 3, 2, 0xF),
+            ("TEXCOORD", 2, 0, 3, 3, 0xF),
+            ("TEXCOORD", 3, 0, 3, 4, 0x7),
+        ]);
+        let gs_c = container_parts(&[(HwStage::Gs, &bytes(&w))], &[(FourCC::OSG1, &short)]);
+        let (_, h) = super::super::merged_halves(&es_container(), &gs_c).unwrap();
+        let gs = crate::spill::build(&native_of(&gs_c)).unwrap();
+        let outs = signature_of(&gs_c, FourCC::OSG1);
+        let p = plan(&gs, &h, &outs).unwrap();
+        assert_eq!((p.record_dwords, p.array_dwords), (20, 60));
+        // With four values in that row, a dword is missing: refused.
+        let full = signature_of(&gs_container(3), FourCC::OSG1);
+        assert!(plan(&gs, &h, &full).is_err());
     }
 
     /// A merged stage of synthetic programs comes out as a vertex shader and

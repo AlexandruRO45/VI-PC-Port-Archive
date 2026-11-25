@@ -124,18 +124,43 @@ impl<'a> Eval<'a> {
 
     fn inst(&self, inst: &Inst, v: Value, depth: u32) -> Lin {
         let opaque = Lin::of(Base::Opaque(v));
+        // (a constant the code puts in an SGPR, such as a shift amount)
+        if let Fields::Sop { src, .. } = &inst.fields
+            && inst.name() == "s_mov_b32"
+        {
+            return src
+                .first()
+                .and_then(|o| self.operand(inst, o, depth))
+                .filter(Lin::is_constant)
+                .unwrap_or(opaque);
+        }
         let Fields::Valu(f) = &inst.fields else {
             return opaque;
         };
         let args: Option<Vec<Lin>> = f.src.iter().map(|s| self.operand(inst, s, depth)).collect();
-        let Some(a) = args else { return opaque };
+        let Some(mut a) = args else { return opaque };
         let c = |l: &Lin| l.is_constant().then_some(l.add);
+        let plain = |x: &Lin| x.mul == 1 && x.add == 0;
+        // SDWA: a whole-dword result of word selects (`src1_sel:WORD_1` is
+        // the high half of a VGPR as it arrived).
+        if let Some(sd) = f.sdwa {
+            if sd.dst_sel != 6 || sd.sext != 0 || f.neg != 0 || f.abs != 0 || f.clamp || f.omod != 0 {
+                return opaque;
+            }
+            for (x, sel) in a.iter_mut().zip(sd.src_sel) {
+                *x = match (sel, x.base) {
+                    (6, _) => *x,
+                    (4 | 5, _) if x.is_constant() => Lin::constant(x.add >> (16 * u32::from(sel - 4)) & 0xFFFF),
+                    (4 | 5, Base::Input(reg)) if plain(x) => Lin::of(Base::Half { reg, high: sel == 5 }),
+                    _ => return opaque,
+                };
+            }
+        }
         let shifted = |x: Lin, s: u32| Lin {
             base: x.base,
             mul: x.mul.wrapping_shl(s),
             add: x.add.wrapping_shl(s),
         };
-        let plain = |x: &Lin| x.mul == 1 && x.add == 0;
         match (inst.name(), a.as_slice()) {
             ("v_mov_b32", [x]) => *x,
             ("v_and_b32", [x, y]) | ("v_and_b32", [y, x]) if c(y) == Some(0xFFFF) => match x.base {
@@ -143,6 +168,19 @@ impl<'a> Eval<'a> {
                 Base::Half { .. } if plain(x) => *x,
                 _ => opaque,
             },
+            // (the shift first: `(v << n) & (0xFFFF << n)` is the low half, scaled)
+            ("v_and_b32", [x, y]) | ("v_and_b32", [y, x])
+                if x.add == 0
+                    && (2..=1 << 16).contains(&x.mul)
+                    && x.mul.is_power_of_two()
+                    && c(y) == Some(0xFFFF * x.mul) =>
+            {
+                match x.base {
+                    Base::Input(reg) => Lin { base: Base::Half { reg, high: false }, ..*x },
+                    Base::Half { .. } => *x,
+                    _ => opaque,
+                }
+            }
             ("v_lshrrev_b32", [s, x]) if c(s) == Some(16) => match x.base {
                 Base::Input(reg) if plain(x) => Lin::of(Base::Half { reg, high: true }),
                 _ => opaque,
@@ -187,6 +225,34 @@ fn width(name: &str) -> Option<u32> {
         "ds_read_b64" | "ds_write_b64" => Some(2),
         "ds_read_b96" | "ds_write_b96" => Some(3),
         "ds_read_b128" | "ds_write_b128" => Some(4),
+        _ => None,
+    }
+}
+
+/// The elements an LDS read or write moves: (byte offset from its address,
+/// dwords). One for a single address (`ds_read_b32`...), two for a pair
+/// (`ds_read2_b32`, `ds_write2_b64`...: each offset counts elements, ×64 for
+/// `st64`); `None` for anything else (bytes and halves, atomics, exchanges).
+/// The k-th element goes to or comes from the k-th data operand of a write,
+/// and the k-th group of `dwords` destination VGPRs of a read.
+fn elements(name: &str, offset0: u8, offset1: u8) -> Option<Vec<(u32, u32)>> {
+    if let Some(w) = width(name) {
+        return Some(vec![(u32::from(offset0) | u32::from(offset1) << 8, w)]);
+    }
+    let w = match name {
+        "ds_read2_b32" | "ds_read2st64_b32" | "ds_write2_b32" | "ds_write2st64_b32" => 1,
+        "ds_read2_b64" | "ds_read2st64_b64" | "ds_write2_b64" | "ds_write2st64_b64" => 2,
+        _ => return None,
+    };
+    let scale = 4 * w * if name.contains("st64") { 64 } else { 1 };
+    Some(vec![(u32::from(offset0) * scale, w), (u32::from(offset1) * scale, w)])
+}
+
+/// The first VGPR of element `k` of an LDS access (see [`elements`]).
+fn element_reg(write: bool, data: &[Operand], dst: Option<Operand>, k: usize, dwords: u32) -> Option<u8> {
+    match (write, data.get(k), dst) {
+        (true, Some(&Operand::Vector { reg, .. }), _) => Some(reg),
+        (false, _, Some(Operand::Vector { reg, .. })) => Some(reg + (k as u32 * dwords) as u8),
         _ => None,
     }
 }
@@ -290,14 +356,11 @@ pub fn es_record(p: &Program) -> Result<EsRecord, ShaderError> {
             if no_memory(name) {
                 continue;
             }
-            let Some(count) = width(name).filter(|_| name.starts_with("ds_write") && !gds) else {
+            let Some(parts) = elements(name, *offset0, *offset1).filter(|_| name.starts_with("ds_write") && !gds) else {
                 return Err(unsupported("an LDS access of the ES half other than a record write"));
             };
             let Some(Operand::Vector { reg: a, .. }) = *addr else {
                 return Err(unsupported("an LDS write without an address"));
-            };
-            let Some(Operand::Vector { reg: d, .. }) = data.first().copied() else {
-                return Err(unsupported("an LDS write without data"));
             };
             let lin = eval.value(inst.read(Reg::V(a)).ok_or(unsupported("an unread LDS address"))?, 0);
             if lin.is_constant() {
@@ -308,11 +371,14 @@ pub fn es_record(p: &Program) -> Result<EsRecord, ShaderError> {
                 Some(first) if first == (lin.base, lin.mul) => {}
                 Some(_) => return Err(unsupported("ES record writes at more than one base")),
             }
-            let byte = lin.add.wrapping_add(u32::from(*offset0) | u32::from(*offset1) << 8);
-            if byte % 4 != 0 {
-                return Err(unsupported("a record write off a dword"));
+            for (k, (off, count)) in parts.into_iter().enumerate() {
+                let reg = element_reg(true, data, None, k, count).ok_or(unsupported("an LDS write without data"))?;
+                let byte = lin.add.wrapping_add(off);
+                if byte % 4 != 0 {
+                    return Err(unsupported("a record write off a dword"));
+                }
+                stores.push(Store { site: (b, i), dword: byte / 4, count, reg });
             }
-            stores.push(Store { site: (b, i), dword: byte / 4, count, reg: d });
         }
     }
     let dwords = stores.iter().map(|s| s.dword + s.count).max().ok_or(unsupported("an ES half that writes no record"))?;
@@ -358,17 +424,17 @@ pub fn vertex_reads(p: &Program) -> Result<Vec<VertexRead>, ShaderError> {
             if lin.mul != 4 {
                 return Err(unsupported("a vertex offset not scaled to bytes"));
             }
-            let Some(count) = width(name) else {
+            let Some(parts) = elements(name, *offset0, *offset1) else {
                 return Err(unsupported("an LDS read of a vertex record that is not whole dwords"));
             };
-            let Some(Operand::Vector { reg: d, .. }) = *dst else {
-                return Err(unsupported("an LDS read without a destination"));
-            };
-            let byte = lin.add.wrapping_add(u32::from(*offset0) | u32::from(*offset1) << 8);
-            if byte % 4 != 0 {
-                return Err(unsupported("a vertex read off a dword"));
+            for (k, (off, count)) in parts.into_iter().enumerate() {
+                let reg = element_reg(false, &[], *dst, k, count).ok_or(unsupported("an LDS read without a destination"))?;
+                let byte = lin.add.wrapping_add(off);
+                if byte % 4 != 0 {
+                    return Err(unsupported("a vertex read off a dword"));
+                }
+                out.push(VertexRead { site: (b, i), vertex: vertex as u8, dword: byte / 4, count, reg });
             }
-            out.push(VertexRead { site: (b, i), vertex: vertex as u8, dword: byte / 4, count, reg: d });
         }
     }
     Ok(out)
@@ -391,8 +457,8 @@ pub struct Access {
 }
 
 /// The LDS accesses of a GS program that are not reads of input vertices, in
-/// code order. Fails on any other LDS operation (atomics, paired reads and
-/// writes, bytes and halves).
+/// code order (a paired read or write is two). Fails on any other LDS
+/// operation (atomics, bytes and halves).
 pub fn own_accesses(p: &Program) -> Result<Vec<Access>, ShaderError> {
     let eval = Eval::new(p);
     let mut out = Vec::new();
@@ -406,7 +472,7 @@ pub fn own_accesses(p: &Program) -> Result<Vec<Access>, ShaderError> {
                 continue;
             }
             let write = name.starts_with("ds_write");
-            let Some(count) = width(name).filter(|_| !gds) else {
+            let Some(parts) = elements(name, *offset0, *offset1).filter(|_| !gds) else {
                 return Err(unsupported("an LDS operation of the GS half beyond whole-dword reads and writes"));
             };
             let Some(Operand::Vector { reg: a, .. }) = *addr else {
@@ -416,15 +482,14 @@ pub fn own_accesses(p: &Program) -> Result<Vec<Access>, ShaderError> {
             if matches!(lin.base, Base::Half { .. }) && !write {
                 continue; // an input vertex ([`vertex_reads`])
             }
-            let reg = match (write, data.first(), dst) {
-                (true, Some(Operand::Vector { reg, .. }), _) | (false, _, Some(Operand::Vector { reg, .. })) => *reg,
-                _ => return Err(unsupported("an LDS access without a register")),
-            };
-            let byte = lin.add.wrapping_add(u32::from(*offset0) | u32::from(*offset1) << 8);
-            if byte % 4 != 0 {
-                return Err(unsupported("an LDS access off a dword"));
+            for (k, (off, count)) in parts.into_iter().enumerate() {
+                let reg = element_reg(write, data, *dst, k, count).ok_or(unsupported("an LDS access without a register"))?;
+                let byte = lin.add.wrapping_add(off);
+                if byte % 4 != 0 {
+                    return Err(unsupported("an LDS access off a dword"));
+                }
+                out.push(Access { site: (b, i), write, base: lin.base, mul: lin.mul, byte, count, reg });
             }
-            out.push(Access { site: (b, i), write, base: lin.base, mul: lin.mul, byte, count, reg });
         }
     }
     Ok(out)
@@ -491,6 +556,15 @@ pub(crate) mod tests {
     pub const DS_WRITE_B128: u32 = 0x0df;
     pub const DS_READ_B32: u32 = 0x36;
     pub const DS_READ_B128: u32 = 0x0ff;
+    pub const DS_WRITE2_B32: u32 = 0x0e;
+    pub const DS_WRITE2ST64_B32: u32 = 0x0f;
+    pub const DS_WRITE2_B64: u32 = 0x4e;
+    pub const DS_READ2_B32: u32 = 0x37;
+
+    /// The second dword of a DS instruction with two data operands.
+    pub fn ds_regs2(addr: u32, data0: u32, data1: u32, dst: u32) -> u32 {
+        dst << 24 | data1 << 16 | data0 << 8 | addr
+    }
 
     pub fn program(words: &[u32]) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -520,6 +594,32 @@ pub(crate) mod tests {
         let at: Vec<_> = r.stores.iter().map(|s| (s.dword, s.count, s.reg)).collect();
         assert_eq!(at, [(0, 4, 4), (4, 1, 8)]);
         assert!(r.writes(3) && r.writes(4) && !r.writes(5));
+    }
+
+    /// The title's ES halves write their records with `ds_write2_b64`: two
+    /// stores at one site, each offset counting 8-byte elements.
+    #[test]
+    fn a_paired_write_is_two_stores_at_one_site() {
+        let words = [
+            vop2(V_LSHLREV, 1, 133, 0), // v_lshlrev_b32 v1, 5, v0
+            ds(DS_WRITE2_B64, 1 << 8),  // offset0:0 offset1:1
+            ds_regs2(1, 4, 6, 0),       // v[4:5], v[6:7]
+            ds(DS_WRITE_B32, 16),
+            ds_regs(1, 8, 0),
+            S_BARRIER,
+            S_SETPC,
+        ];
+        let r = es_record(&program(&words)).unwrap();
+        let at: Vec<_> = r.stores.iter().map(|s| (s.dword, s.count, s.reg)).collect();
+        assert_eq!(at, [(0, 2, 4), (2, 2, 6), (4, 1, 8)]);
+        assert_eq!(r.stores[0].site, r.stores[1].site);
+        assert_eq!(r.dwords, 5);
+        // st64: an offset counts 64 elements (of 4 bytes here).
+        let mut st64 = words;
+        st64[1] = ds(DS_WRITE2ST64_B32, 1 << 8);
+        let r = es_record(&program(&st64)).unwrap();
+        let at: Vec<_> = r.stores.iter().map(|s| (s.dword, s.count, s.reg)).collect();
+        assert_eq!(at, [(0, 1, 4), (64, 1, 6), (4, 1, 8)]);
     }
 
     #[test]
@@ -620,6 +720,69 @@ pub(crate) mod tests {
         assert_eq!(at, [(0, 0, 4, 4), (1, 4, 1, 8)]);
     }
 
+    /// The title's GS halves compute the offsets the other way round: vertex 0
+    /// and 2 shift first and mask with `0xffff << 2`, vertex 1 is an SDWA
+    /// shift of the high word of v0 by an SGPR that holds 2; and they read
+    /// with `ds_read2_b32`.
+    #[test]
+    fn the_gs_half_reads_vertices_by_shifted_and_selected_halves() {
+        const SDWA: u32 = 0xF9;
+        let words = [
+            vop2(V_LSHLREV, 3, 130, 0), // v_lshlrev_b32 v3, 2, v0
+            vop2(V_AND, 10, 255, 3),    // v_and_b32 v10, 0x3fffc, v3
+            0x3FFFC,
+            ds(DS_READ2_B32, 1 << 8), // ds_read2_b32 v[4:5], v10 offset1:1
+            ds_regs(10, 0, 4),
+            0xBE81_0382, // s_mov_b32 s1, 2
+            // v_lshlrev_b32 v8, s1, v0 dst_sel:DWORD src0_sel:DWORD src1_sel:WORD_1
+            vop2(V_LSHLREV, 8, SDWA, 0),
+            1 | 6 << 8 | 6 << 16 | 1 << 23 | 5 << 24,
+            ds(DS_READ_B32, 8), // ds_read_b32 v6, v8 offset:8
+            ds_regs(8, 0, 6),
+            vop2(V_LSHLREV, 9, 130, 1), // v_lshlrev_b32 v9, 2, v1
+            vop2(V_AND, 7, 255, 9),     // v_and_b32 v7, 0x3fffc, v9
+            0x3FFFC,
+            ds(DS_READ2_B32, 4 | 5 << 8), // ds_read2_b32 v[12:13], v7 offset0:4 offset1:5
+            ds_regs(7, 0, 12),
+            S_ENDPGM,
+        ];
+        let r = vertex_reads(&program(&words)).unwrap();
+        let at: Vec<_> = r.iter().map(|r| (r.vertex, r.dword, r.count, r.reg)).collect();
+        assert_eq!(at, [(0, 0, 1, 4), (0, 1, 1, 5), (1, 2, 1, 6), (2, 4, 1, 12), (2, 5, 1, 13)]);
+        // A byte select is no half: that read is the program's own memory.
+        let mut byte = words;
+        byte[7] = 1 | 6 << 8 | 6 << 16 | 1 << 23 | 1 << 24;
+        let r = vertex_reads(&program(&byte)).unwrap();
+        assert!(r.iter().all(|r| r.vertex != 1));
+        // A mask that is not the scaled half is no offset either.
+        let mut mask = words;
+        mask[2] = 0xFFFF;
+        let r = vertex_reads(&program(&mask)).unwrap();
+        assert!(r.iter().all(|r| r.reg != 4));
+    }
+
+    /// A shifted half is `(v << n) & (0xffff << n)` only up to n = 16: past
+    /// it the mask loses top bits, so it is no half (and is no overflow).
+    #[test]
+    fn a_shifted_half_mask_holds_only_up_to_a_shift_of_16() {
+        let read = |shift: u32, mask: u32| {
+            let words = [
+                vop2(V_LSHLREV, 3, 128 + shift, 0), // v_lshlrev_b32 v3, n, v0
+                vop2(V_AND, 10, 255, 3),            // v_and_b32 v10, mask, v3
+                mask,
+                ds(DS_READ_B32, 0),
+                ds_regs(10, 0, 4),
+                S_ENDPGM,
+            ];
+            vertex_reads(&program(&words))
+        };
+        // n = 2 reads vertex 0 (but a stride of 4 is the only one accepted),
+        // n = 17 keeps 15 bits only: no vertex read, no panic.
+        assert_eq!(read(2, 0x3FFFC).unwrap().len(), 1);
+        assert!(read(17, 0xFFFE_0000).map_or(true, |r| r.is_empty()));
+        assert!(read(31, 0x8000_0000).map_or(true, |r| r.is_empty()));
+    }
+
     #[test]
     fn an_input_offset_is_scaled_to_bytes() {
         // v_lshlrev_b32 v2, 3, v2 instead of 2: not a dword offset.
@@ -668,6 +831,24 @@ pub(crate) mod tests {
         assert_eq!((a[0].base, a[0].mul), (a[1].base, a[1].mul));
         // An input vertex read is not among them.
         assert!(own_accesses(&program(&gs_words())).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_paired_access_of_the_gs_halfs_own_memory_is_two() {
+        // v_lshlrev_b32 v2, 2, v15, ds_write2_b32 v2, v4, v5 offset0:2
+        // offset1:3, ds_read2_b32 v[8:9], v2 offset0:2 offset1:3.
+        let words = [
+            vop2(V_LSHLREV, 2, 130, 15),
+            ds(DS_WRITE2_B32, 2 | 3 << 8),
+            ds_regs2(2, 4, 5, 0),
+            ds(DS_READ2_B32, 2 | 3 << 8),
+            ds_regs(2, 0, 8),
+            S_ENDPGM,
+        ];
+        let a = own_accesses(&program(&words)).unwrap();
+        let at: Vec<_> = a.iter().map(|a| (a.write, a.byte, a.count, a.reg)).collect();
+        assert_eq!(at, [(true, 8, 1, 4), (true, 12, 1, 5), (false, 8, 1, 8), (false, 12, 1, 9)]);
+        assert!(a[0].site == a[1].site && a[2].site == a[3].site && a[0].site != a[2].site);
     }
 
     #[test]

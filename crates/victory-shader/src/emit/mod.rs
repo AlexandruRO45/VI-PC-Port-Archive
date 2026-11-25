@@ -367,7 +367,12 @@ pub fn merged_halves(
                 what: "a container without the ES or GS program of a merged stage",
             })
     };
-    let merged = crate::merged::pair_es_gs(stage_of(es, HwStage::Es)?, stage_of(gs, HwStage::Gs)?)?;
+    let mut merged = crate::merged::pair_es_gs(stage_of(es, HwStage::Es)?, stage_of(gs, HwStage::Gs)?)?;
+    // (before anything numbers the instructions: the no-ops are dropped)
+    for half in [&mut merged.es, &mut merged.gs] {
+        let ir = crate::spill::build(half)?;
+        gs::drop_thread_masks(&mut half.code, &ir)?;
+    }
     let es_native = NativeProgram {
         layout: merged.layout.clone(),
         ..merged.es.clone()

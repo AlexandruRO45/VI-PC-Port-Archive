@@ -4379,50 +4379,62 @@ impl<'a> Lower<'a> {
         let Some(g) = x.gs.as_ref() else {
             return Ok(false);
         };
-        let Fields::Ds { data, .. } = &inst.fields else {
+        let Fields::Ds { .. } = &inst.fields else {
             unreachable!()
         };
         let guard = self.guard(site.0, site.1)?;
         let c = self.cur;
-        if let Some(r) = g.reads.get(&site) {
-            for k in 0..r.count {
-                let d = r.dword + k;
-                let (id, col) = (d / 4, d % 4);
-                let known = self.s.inputs.get(id as usize).is_some_and(|e| u32::from(e.cols) > col);
-                if !known {
-                    return Err("a read of a record dword the signature does not have");
+        if let Some(reads) = g.reads.get(&site) {
+            for r in reads {
+                for k in 0..r.count {
+                    let d = r.dword + k;
+                    let (id, col) = (d / 4, d % 4);
+                    let known = self.s.inputs.get(id as usize).is_some_and(|e| u32::from(e.cols) > col);
+                    if !known {
+                        return Err("a read of a record dword the signature does not have");
+                    }
+                    let args = [
+                        self.s.m.i32(id),
+                        self.s.m.i32(0),
+                        self.s.m.i8(col as u8),
+                        self.s.m.i32(u32::from(r.vertex)),
+                    ];
+                    let i32t = self.s.t.i32;
+                    let v = self.s.op(c, "loadInput.i32", Attr::ReadNone, i32t, 4, &args);
+                    self.write(inst, Reg::V(r.reg + k as u8), v, guard);
                 }
-                let args = [
-                    self.s.m.i32(id),
-                    self.s.m.i32(0),
-                    self.s.m.i8(col as u8),
-                    self.s.m.i32(u32::from(r.vertex)),
-                ];
-                let i32t = self.s.t.i32;
-                let v = self.s.op(c, "loadInput.i32", Attr::ReadNone, i32t, 4, &args);
-                self.write(inst, Reg::V(r.reg + k as u8), v, guard);
             }
             return Ok(true);
         }
-        if let Some(&(at, count, _)) = g.stores.get(&site) {
-            let vals = self.vgprs(inst, data.first().ok_or("an LDS write")?, count as u8)?;
+        if let Some(stores) = g.stores.get(&site) {
+            // (each element's data from its own operand: the plan has its
+            // first VGPR)
+            let mut vals = Vec::new();
+            for &(at, count, reg) in stores {
+                let op = Operand::Vector { reg, dwords: count as u8 };
+                for (k, v) in self.vgprs(inst, &op, count as u8)?.into_iter().enumerate() {
+                    vals.push((at + k as u32, v));
+                }
+            }
             let arr = self.s.lds();
             let open = self.begin_guarded(guard);
-            for (k, v) in vals.into_iter().enumerate() {
-                let index = self.s.m.i32(at + k as u32);
+            for (at, v) in vals {
+                let index = self.s.m.i32(at);
                 let p = self.s.m.element(self.cur, arr, index);
                 self.s.m.store(self.cur, p, v);
             }
             self.end_guarded(open, &[]);
             return Ok(true);
         }
-        if let Some(&(at, count, reg)) = g.loads.get(&site) {
+        if let Some(loads) = g.loads.get(&site) {
             let arr = self.s.lds();
-            for k in 0..count {
-                let index = self.s.m.i32(at + k);
-                let p = self.s.m.element(c, arr, index);
-                let v = self.s.m.load(c, p);
-                self.write(inst, Reg::V(reg + k as u8), v, guard);
+            for &(at, count, reg) in loads {
+                for k in 0..count {
+                    let index = self.s.m.i32(at + k);
+                    let p = self.s.m.element(c, arr, index);
+                    let v = self.s.m.load(c, p);
+                    self.write(inst, Reg::V(reg + k as u8), v, guard);
+                }
             }
             return Ok(true);
         }
