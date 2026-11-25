@@ -77,7 +77,11 @@ impl Host {
                 factory.EnumWarpAdapter().map_err(err)?
             } else {
                 let adapter = factory.EnumAdapters1(0).map_err(err)?;
-                if adapter.GetDesc1().map_err(err)?.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                let desc = adapter.GetDesc1().map_err(err)?;
+                // The Microsoft Basic Render Driver (a runner without a GPU)
+                // is WARP but does not set the software flag.
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                    || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
                 {
                     return Err("no hardware adapter".into());
                 }
