@@ -159,10 +159,14 @@ pub(crate) enum C {
     ViewsSampler,
     ViewsOther,
     ViewsNs,
+    /// Descriptors this frame's own cache already held (a 32-byte copy) and
+    /// the ones the driver had to make.
+    ViewsHit,
+    ViewsMiss,
 }
 /// One slot per [`C`], so a counter added to the enum cannot index past the
 /// array that holds it (it did: 80 slots for 82 variants aborted the title).
-const COUNTERS: usize = C::ViewsNs as usize + 1;
+const COUNTERS: usize = C::ViewsMiss as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1130,7 +1134,7 @@ pub(crate) fn log(frames: f64) {
           same contents, {:.0} made, {:.0} slots hashed in {:.2} ms and {:.0} slots copied in \
           {:.2} ms; entries brought up to date: {:.0} in {:.2} ms; host views made: {:.0} of a \
           constant buffer, {:.0} of a resource, {:.0} unordered, {:.0} samplers, {:.0} other, in \
-          {:.2} ms; notes {:.1} ms; shader-written ranges: {:.0} steps in {:.1} submissions, \
+          {:.2} ms ({:.0} copied from this frame's cache, {:.0} made); notes {:.1} ms;           shader-written ranges: {:.0} steps in {:.1} submissions, \
           snapshots {:.1} ms, {:.1} MB \
           compared back; sparse reads {:.1} ms; guards {:.1} ms; {:.1} MB copied whole (memory \
           not watched); {:.1} frame waits sleeping {:.1} ms (all threads); ranges of shaders \
@@ -1156,6 +1160,8 @@ pub(crate) fn log(frames: f64) {
         c[C::ViewsSampler as usize],
         c[C::ViewsOther as usize],
         c[C::ViewsNs as usize] / 1e6,
+        c[C::ViewsHit as usize],
+        c[C::ViewsMiss as usize],
         c[C::NoteNs as usize] / 1e6,
         c[C::GpuWrites as usize],
         c[C::BackSubmissions as usize],
