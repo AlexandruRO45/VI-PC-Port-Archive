@@ -327,10 +327,13 @@ pub(crate) fn save(now: bool) {
             }
         }
     };
-    let used = USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
+    let used = early_text(USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref());
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
+        .and_then(|()| match &used {
+            Some((_, text)) => write_atomically(&dir.join(EARLY_FILE), text.as_bytes()),
+            None => Ok(()),
+        })
         .and_then(|()| match &prebuilt {
             Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
             None => Ok(()),
@@ -340,7 +343,7 @@ pub(crate) fn save(now: bool) {
     match written {
         Ok(()) => tracing::info!(
             bytes = blob.len(),
-            early = used.len(),
+            early = used.as_ref().map_or(0, |u| u.0),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
@@ -406,6 +409,13 @@ impl Used {
     }
 }
 
+/// The early list's key count and its file's text, or none while it is not
+/// loaded (nothing used it yet): the file of earlier runs then stays.
+fn early_text(used: Option<&Used>) -> Option<(usize, String)> {
+    let list = used?.list();
+    Some((list.len(), list.join("\n")))
+}
+
 static USED: Mutex<Option<Used>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
@@ -466,6 +476,18 @@ mod tests {
         assert_eq!(list.len(), EARLY_MAX);
         assert!(used.now.iter().all(|k| list.contains(k)));
         assert_eq!(list.iter().collect::<HashSet<_>>().len(), EARLY_MAX, "no key twice");
+    }
+
+    /// A save before the early list was loaded keeps the file of earlier
+    /// runs: nothing is written for it.
+    #[test]
+    fn an_unloaded_early_list_is_not_written_empty() {
+        assert_eq!(early_text(None), None);
+        let used = Used { before: ["a".repeat(32)].into(), now: ["b".repeat(32)].into() };
+        let (n, text) = early_text(Some(&used)).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(text.lines().count(), 2);
+        assert_eq!(early_text(Some(&Used::default())), Some((0, String::new())), "loaded and empty is empty");
     }
 
     /// The pre-build's list holds only for the library bytes it was
