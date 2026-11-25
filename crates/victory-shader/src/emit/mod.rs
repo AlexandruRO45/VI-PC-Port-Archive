@@ -1001,6 +1001,9 @@ mod tests {
         .ok();
         let at = triangle_mesh_sized(TRIANGLE, (100, 40), (10, 10, false))
             .unwrap_or_else(|e| panic!("at the budget: {e}"));
+        // Only the validator below reads it, and that is Windows-only.
+        #[cfg(not(windows))]
+        let _ = &at;
         #[cfg(windows)]
         if let Some(v) = validator.as_mut() {
             v.validate(&mut at.dxil.clone())
