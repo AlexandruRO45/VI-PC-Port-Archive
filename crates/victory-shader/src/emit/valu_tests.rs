@@ -1945,6 +1945,177 @@ fn f64_arithmetic_reads_sgpr_pairs() {
     });
 }
 
+/// Inputs for [`f64_reads_uniform_pairs_at_odd_dwords`]: v[2:3] and the
+/// pair it would be with its high dword lost, (v2, v2), differ in each.
+const ODD_PAIR_INPUTS: [[u32; 4]; 4] = [
+    [0, 0x3ff8_0000, 0x4000_0000, 0],
+    [0x1111_1111, 0x3ff8_0000, 0x4000_0000, 0x4010_0000],
+    [0x89ab_cdef, 0x4049_0fdb, 0xc008_0000, 0x3fd0_0000],
+    // v[1:2] = 1.5 lies between v[2:3] and (v2, v2).
+    [0, 0x3ff8_0000, 0x3ff0_0000, 0x4000_0000],
+];
+
+/// The 64 bits in `v[n:n+1]` of a [`build_valu_cs`] program's inputs.
+fn bits_at(x: &[u32; 4], n: usize) -> u64 {
+    u64::from(x[n]) << 32 | u64::from(x[n - 1])
+}
+
+fn f64_at(x: &[u32; 4], n: usize) -> f64 {
+    f64::from_bits(bits_at(x, n))
+}
+
+#[test]
+fn f64_reads_uniform_pairs_at_odd_dwords() {
+    // FIND-21: v1..v4 are the four root constants, one load. Before the
+    // lowering XORed register-pair dwords with an opaque zero, doubles at
+    // dwords 1 and 2 (v[2:3]), alone or sharing a dword with another source,
+    // came out of AMD's compiler with the low dword as both halves; WARP and
+    // NVIDIA were right. The 64-bit integer cases were right on AMD too.
+    type Wide = (&'static str, Vec<u32>, fn(&[u32; 4]) -> u64);
+    let op3 = |op, a, b, c| vop3(op, 6, a, b, c).to_vec();
+    let wide: [Wide; 13] = [
+        (
+            "v_add_f64 v[6:7], v[1:2], v[3:4]",
+            op3(0x164, vgpr(1), vgpr(3), 0),
+            |x| (f64_at(x, 1) + f64_at(x, 3)).to_bits(),
+        ),
+        (
+            "v_add_f64 v[6:7], v[2:3], 1.0",
+            op3(0x164, vgpr(2), 242, 0),
+            |x| (f64_at(x, 2) + 1.0).to_bits(),
+        ),
+        (
+            "v_add_f64 v[6:7], v[2:3], v[2:3]",
+            op3(0x164, vgpr(2), vgpr(2), 0),
+            |x| (f64_at(x, 2) + f64_at(x, 2)).to_bits(),
+        ),
+        (
+            "v_add_f64 v[6:7], v[2:3], v[3:4]",
+            op3(0x164, vgpr(2), vgpr(3), 0),
+            |x| (f64_at(x, 2) + f64_at(x, 3)).to_bits(),
+        ),
+        (
+            "v_add_f64 v[6:7], v[1:2], v[2:3]",
+            op3(0x164, vgpr(1), vgpr(2), 0),
+            |x| (f64_at(x, 1) + f64_at(x, 2)).to_bits(),
+        ),
+        (
+            "v_mul_f64 v[6:7], v[1:2], v[2:3]",
+            op3(0x165, vgpr(1), vgpr(2), 0),
+            |x| (f64_at(x, 1) * f64_at(x, 2)).to_bits(),
+        ),
+        (
+            "v_fma_f64 v[6:7], v[2:3], v[3:4], v[1:2]",
+            op3(0x14c, vgpr(2), vgpr(3), vgpr(1)),
+            |x| f64_at(x, 2).mul_add(f64_at(x, 3), f64_at(x, 1)).to_bits(),
+        ),
+        (
+            "v_max_f64 v[6:7], v[2:3], 1.0",
+            op3(0x167, vgpr(2), 242, 0),
+            |x| f64_at(x, 2).max(1.0).to_bits(),
+        ),
+        (
+            "v_min_f64 v[6:7], v[2:3], 4.0",
+            op3(0x166, vgpr(2), 246, 0),
+            |x| f64_at(x, 2).min(4.0).to_bits(),
+        ),
+        (
+            "v_cvt_f64_f32 v[6:7], v2",
+            vec![vop1(0x010, 6, vgpr(2))],
+            |x| f64::from(f32::from_bits(x[1])).to_bits(),
+        ),
+        // 64-bit integer pairs.
+        (
+            "v_lshlrev_b64 v[6:7], v1, v[2:3]",
+            op3(0x2ff, vgpr(1), vgpr(2), 0),
+            |x| bits_at(x, 2) << (x[0] & 63),
+        ),
+        (
+            "v_lshrrev_b64 v[6:7], v4, v[2:3]",
+            op3(0x300, vgpr(4), vgpr(2), 0),
+            |x| bits_at(x, 2) >> (x[3] & 63),
+        ),
+        (
+            "v_mad_u64_u32 v[6:7], null, v1, v4, v[2:3]",
+            {
+                // VOP3B: the carry goes to null.
+                let mut w = op3(0x176, vgpr(1), vgpr(4), vgpr(2));
+                w[0] |= 125 << 8;
+                w
+            },
+            |x| (u64::from(x[0]) * u64::from(x[3])).wrapping_add(bits_at(x, 2)),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, words, reference) in wide {
+        run_f64_raw(&words, &ODD_PAIR_INPUTS, |backend, i, got| {
+            let want = reference(&ODD_PAIR_INPUTS[i]);
+            let float = name.contains("f64");
+            let same = if float {
+                same_f64(got, f64::from_bits(want))
+            } else {
+                got == want
+            };
+            if !same {
+                wrong.push(format!(
+                    "{backend}: {name} on input {i}: {got:#018x}, want {want:#018x}"
+                ));
+            }
+        });
+    }
+
+    // Results in v0: conversions and compares (through v_cndmask_b32_e64
+    // v0, 0, 1, s20).
+    type Narrow = (&'static str, Vec<u32>, fn(&[u32; 4]) -> u32);
+    let compare = |op: u16, a: u16, b: u16| {
+        let mut body = vop3(op, 20, a, b, 0x80).to_vec();
+        body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+        body
+    };
+    let narrow: [Narrow; 5] = [
+        (
+            "v_cvt_f32_f64 v0, v[2:3]",
+            vec![vop1(0x00f, 0, vgpr(2))],
+            |x| (f64_at(x, 2) as f32).to_bits(),
+        ),
+        (
+            "v_cvt_i32_f64 v0, v[2:3]",
+            vec![vop1(0x003, 0, vgpr(2))],
+            |x| f64_at(x, 2) as i32 as u32,
+        ),
+        (
+            "v_cvt_u32_f64 v0, v[2:3]",
+            vec![vop1(0x015, 0, vgpr(2))],
+            |x| f64_at(x, 2) as u32,
+        ),
+        (
+            "v_cmp_gt_f64 s20, v[2:3], 2.0",
+            compare(0x024, vgpr(2), 244),
+            |x| u32::from(f64_at(x, 2) > 2.0),
+        ),
+        (
+            "v_cmp_lt_f64 s20, v[1:2], v[2:3]",
+            compare(0x021, vgpr(1), vgpr(2)),
+            |x| u32::from(f64_at(x, 1) < f64_at(x, 2)),
+        ),
+    ];
+    for (name, body, reference) in narrow {
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &ODD_PAIR_INPUTS, |backend, i, _, got| {
+            let want = reference(&ODD_PAIR_INPUTS[i]);
+            if got != want {
+                wrong.push(format!(
+                    "{backend}: {name} on input {i}: {got:#010x}, want {want:#010x}"
+                ));
+            }
+        });
+    }
+    for w in &wrong {
+        eprintln!("{w}");
+    }
+    assert!(wrong.is_empty(), "{} wrong results", wrong.len());
+}
+
 #[test]
 fn v_cmp_f64_matches_ieee() {
     // v_cmp_<op>_f64 s20, v[1:2], v[3:4] (VOPC 0x020-0x02f in VOP3);

@@ -30,6 +30,32 @@ const INLINE_FLOATS: [u64; 9] = [
 const SPLIT_DOUBLE: &str = "dx.types.splitdouble";
 
 impl Lower<'_> {
+    /// The dwords of a register pair read as a double, each XORed with a
+    /// zero the host compiler cannot prove (the lane index shifted right
+    /// by 31).
+    ///
+    /// AMD's D3D12 compiler (RDNA2 and RDNA3) gets a double wrong whose
+    /// dwords are uniform and sit at an odd offset of one load, such as
+    /// dwords 1 and 2 of the root constants: it reads the low dword as
+    /// both halves. Built from these values instead, the double comes out
+    /// right there; WARP and NVIDIA give the same results either way. The
+    /// cost is one XOR per dword.
+    fn unfolded_pair(&mut self, (lo, hi): (V, V)) -> (V, V) {
+        self.s.flags |= flags::WAVE_OPS;
+        let e = self.s.entry;
+        let i32t = self.s.t.i32;
+        let lane = self
+            .s
+            .op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let k31 = self.s.m.i32(31);
+        let zero = self.s.m.bin(e, Bin::LShr, lane, k31);
+        let c = self.cur;
+        (
+            self.s.m.bin(c, Bin::Xor, lo, zero),
+            self.s.m.bin(c, Bin::Xor, hi, zero),
+        )
+    }
+
     /// The low and high dwords of 64-bit float source `k`, with its abs and
     /// neg modifiers applied to the sign bit (abs first).
     fn fparts64(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
@@ -41,9 +67,13 @@ impl Lower<'_> {
         }
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let (lo, mut hi) = match op {
-            Operand::Vector { reg, .. } => self.read_pair(inst, Reg::V(reg), Reg::V(reg + 1))?,
+            Operand::Vector { reg, .. } => {
+                let pair = self.read_pair(inst, Reg::V(reg), Reg::V(reg + 1))?;
+                self.unfolded_pair(pair)
+            }
             Operand::Scalar { code, .. } if code != NULL => {
-                self.read_pair(inst, Reg::S(code), Reg::S(code + 1))?
+                let pair = self.read_pair(inst, Reg::S(code), Reg::S(code + 1))?;
+                self.unfolded_pair(pair)
             }
             Operand::Const(code @ 240..=248) => {
                 let bits = INLINE_FLOATS[usize::from(code - 240)];
