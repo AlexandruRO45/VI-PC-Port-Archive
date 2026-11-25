@@ -60,6 +60,8 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    #[cfg(windows)]
+    full_hash: [u8; 32],
     container: Vec<u8>,
     /// Its result is replaced by the stand-in for indirect light
     /// ([`crate::ambient`]).
@@ -118,6 +120,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
+                #[cfg(windows)]
+                full_hash: *full.as_bytes(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 resolves_light: crate::ambient::resolves(bytes),
