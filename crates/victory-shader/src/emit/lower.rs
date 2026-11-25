@@ -5285,35 +5285,40 @@ impl<'a> Lower<'a> {
                 Ok(ha)
             }
             Source::Phi { block, args } => {
-                // Each predecessor computes its heap index at its end; the
-                // join picks one with a phi. An edge no active lane takes
-                // gives index 0.
                 let _ = site;
-                let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let Some(tail) = self.tail[q] else {
-                        return Err("a descriptor chosen by control flow");
-                    };
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    let index = match arg {
-                        Some(Source::Loaded { load, first }) => {
-                            let here = std::mem::replace(&mut self.cur, at);
-                            let index = self.heap_index(*load, *first, sampler);
-                            self.cur = here;
-                            index?
+                let index = if descriptor_phi_enabled() {
+                    self.phi_heap_index(src, sampler)?
+                } else {
+                    // Each predecessor computes its heap index at its end; the
+                    // join picks one with a phi. An edge no active lane takes
+                    // gives index 0.
+                    let mut incoming = Vec::new();
+                    for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                        if self.block[q].is_none() {
+                            continue;
                         }
-                        None => self.s.m.i32(0),
-                        Some(_) => return Err("a descriptor chosen by control flow"),
-                    };
-                    incoming.push((index, at));
-                }
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let phi = self.s.m.phi(join, self.s.t.i32);
-                self.s.m.set_phi(phi, incoming);
-                let index = self.buffer_guard(src, phi, sampler, props);
+                        let Some(tail) = self.tail[q] else {
+                            return Err("a descriptor chosen by control flow");
+                        };
+                        let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                        let index = match arg {
+                            Some(Source::Loaded { load, first }) => {
+                                let here = std::mem::replace(&mut self.cur, at);
+                                let index = self.heap_index(*load, *first, sampler);
+                                self.cur = here;
+                                index?
+                            }
+                            None => self.s.m.i32(0),
+                            Some(_) => return Err("a descriptor chosen by control flow"),
+                        };
+                        incoming.push((index, at));
+                    }
+                    let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
+                    let phi = self.s.m.phi(join, self.s.t.i32);
+                    self.s.m.set_phi(phi, incoming);
+                    phi
+                };
+                let index = self.buffer_guard(src, index, sampler, props);
                 if mark {
                     self.mark_heap_use(index, true);
                 }
@@ -5321,20 +5326,24 @@ impl<'a> Lower<'a> {
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
-                let [
-                    Source::Loaded { load: a, first: fa },
-                    Source::Loaded { load: b, first: fb },
-                ] = args[..]
-                else {
-                    return Err("a descriptor chosen by a condition");
+                let index = if descriptor_phi_enabled() {
+                    self.phi_heap_index(src, sampler)?
+                } else {
+                    let [
+                        Source::Loaded { load: a, first: fa },
+                        Source::Loaded { load: b, first: fb },
+                    ] = args[..]
+                    else {
+                        return Err("a descriptor chosen by a condition");
+                    };
+                    let cond = match self.get(*scc)? {
+                        Val::Bit(x) => x,
+                        _ => return Err("SCC without a value"),
+                    };
+                    let set = self.heap_index(a, fa, sampler)?;
+                    let clear = self.heap_index(b, fb, sampler)?;
+                    self.s.m.select(self.cur, cond, set, clear)
                 };
-                let cond = match self.get(*scc)? {
-                    Val::Bit(x) => x,
-                    _ => return Err("SCC without a value"),
-                };
-                let set = self.heap_index(a, fa, sampler)?;
-                let clear = self.heap_index(b, fb, sampler)?;
-                let index = self.s.m.select(self.cur, cond, set, clear);
                 let index = self.buffer_guard(src, index, sampler, props);
                 if mark {
                     self.mark_heap_use(index, true);
@@ -5432,6 +5441,53 @@ impl<'a> Lower<'a> {
                 }),
             _ => false,
         })
+    }
+
+    /// The heap index of a uniform descriptor chosen by control flow or SCC
+    /// (`Loaded`, nested `Phi`, `Select`).
+    fn phi_heap_index(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
+        match src {
+            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
+            Source::Select { scc, args } => {
+                let [a, b] = &args[..] else {
+                    return Err("a descriptor chosen by a condition");
+                };
+                let cond = match self.get(*scc)? {
+                    Val::Bit(x) => x,
+                    _ => return Err("SCC without a value"),
+                };
+                let set = self.phi_heap_index(a, sampler)?;
+                let clear = self.phi_heap_index(b, sampler)?;
+                Ok(self.s.m.select(self.cur, cond, set, clear))
+            }
+            Source::Phi { block, args } => {
+                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
+                let mut incoming = Vec::new();
+                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                    if self.block[q].is_none() {
+                        continue;
+                    }
+                    let Some(tail) = self.tail[q] else {
+                        return Err("a descriptor chosen by control flow");
+                    };
+                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    let index = match arg {
+                        Some(arg) => {
+                            let here = std::mem::replace(&mut self.cur, at);
+                            let index = self.phi_heap_index(arg, sampler);
+                            self.cur = here;
+                            index?
+                        }
+                        None => self.s.m.i32(0),
+                    };
+                    incoming.push((index, at));
+                }
+                let phi = self.s.m.phi(join, self.s.t.i32);
+                self.s.m.set_phi(phi, incoming);
+                Ok(phi)
+            }
+            _ => Err("a descriptor chosen by control flow"),
+        }
     }
 
     /// The heap index of a descriptor that may differ between lanes,
@@ -11597,6 +11653,56 @@ mod tests {
         lower_wave(&add_f64, vec![], vec![], true)
             .expect("v_add_f64 whole-wave sum should lower");
     }
+
+    #[test]
+    fn a_nested_descriptor_phi_lowers() {
+        // Outer diamond joins a nested inner diamond (`Source::Phi` of
+        // `Source::Loaded`) with a third table descriptor load before
+        // reading through `s_buffer_load_dword`.
+        let words = [
+            0xBE84_0300, // 0x00: s_mov_b32 s4, s0
+            0xBE85_0380, // 0x04: s_mov_b32 s5, 0
+            0xBF06_800A, // 0x08: s_cmp_eq_u32 s10, 0
+            0xBF85_0008, // 0x0c: s_cbranch_scc1 -> 0x30 (else_outer)
+            0xBF06_800B, // 0x10: s_cmp_eq_u32 s11, 0
+            0xBF85_0003, // 0x14: s_cbranch_scc1 -> 0x24 (inner_b)
+            0xF408_0202,
+            0xFA00_0000, // 0x18: s_load_dwordx4 s[8:11], s[4:5], null
+            0xBF82_0002, // 0x20: s_branch -> 0x2c (inner_join)
+            0xF408_0202,
+            0xFA00_0020, // 0x24: s_load_dwordx4 s[8:11], s[4:5], 0x20
+            0xBF82_0002, // 0x2c: s_branch -> 0x38 (outer_join)
+            0xF408_0202,
+            0xFA00_0040, // 0x30: s_load_dwordx4 s[8:11], s[4:5], 0x40
+            0xBF8C_C07F, // 0x38: s_waitcnt lgkmcnt(0)
+            0xF420_0304,
+            0xFA00_0000, // 0x3c: s_buffer_load_dword s12, s[8:11], null
+            0xBF8C_C07F, // 0x44: s_waitcnt lgkmcnt(0)
+            0xBF06_800C, // 0x48: s_cmp_eq_u32 s12, 0
+            0xBF85_0001, // 0x4c: s_cbranch_scc1 -> end
+            0xBE80_0380, // 0x50: s_mov_b32 s0, 0
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_wave(&words, layout, used, false).expect("nested descriptor phi should lower");
+    }
+}
+
+/// Whether nested `Source::Phi` / `Source::Select` heap indices lower
+/// recursively (`VICTORY_DESCRIPTOR_PHI`, on unless 0).
+fn descriptor_phi_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DESCRIPTOR_PHI").map_or(true, |v| v != "0"))
 }
 
 /// Whether extended whole-wave section lowering (`v_readlane_b32` per-lane
