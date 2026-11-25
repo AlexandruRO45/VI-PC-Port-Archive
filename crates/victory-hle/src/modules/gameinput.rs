@@ -1182,9 +1182,15 @@ mod host {
         hide_pads: bool,
     }
 
+    /// Whether `VICTORY_NO_HOST_PAD`'s value turns the switch on: set, and
+    /// not `0`, like the other on/off switches.
+    pub(super) fn switch_on(value: Option<&std::ffi::OsStr>) -> bool {
+        value.is_some_and(|v| v != std::ffi::OsStr::new("0"))
+    }
+
     impl Default for Host {
         fn default() -> Self {
-            let hide_pads = std::env::var_os("VICTORY_NO_HOST_PAD").is_some();
+            let hide_pads = switch_on(std::env::var_os("VICTORY_NO_HOST_PAD").as_deref());
             if hide_pads {
                 tracing::info!("VICTORY_NO_HOST_PAD: ignoring XInput pads");
             }
@@ -1790,5 +1796,14 @@ mod tests {
         let r = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(pad(r), physical);
         release(r);
+    }
+
+    #[test]
+    fn the_no_host_pad_switch_is_off_when_zero() {
+        use std::ffi::OsStr;
+        assert!(super::host::switch_on(Some(OsStr::new("1"))));
+        assert!(super::host::switch_on(Some(OsStr::new("yes"))));
+        assert!(!super::host::switch_on(Some(OsStr::new("0"))));
+        assert!(!super::host::switch_on(None));
     }
 }
