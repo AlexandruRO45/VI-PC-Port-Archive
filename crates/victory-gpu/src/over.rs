@@ -314,13 +314,51 @@ pub(crate) fn record(
 /// output stayed black. This pass stands in for it: each output texel is the
 /// bilinear sample of the rendered part of the colour input.
 ///
-/// shortcut: no temporal accumulation, sharpening or use of the depth and
-/// motion inputs: an image, not the upscaler's quality.
+/// With `VICTORY_UPSCALE_SHARP` above 0 (at most 1), each output texel is a
+/// Catmull-Rom (bicubic) sample of the colour input instead, clamped to its
+/// four neighbours (no ringing), then sharpened by their contrast as AMD's
+/// CAS does, `SHARP` setting how much; both in a reversible tone-mapped
+/// space, since the input is HDR.
+///
+/// shortcut: no temporal accumulation or use of the depth and motion
+/// inputs: an image, not the upscaler's quality.
 const STRETCH: &str = r#"
+#ifndef SHARP
+#define SHARP 0.0
+#endif
 cbuffer Sizes : register(b0) { float2 scale; float2 texel; };
 Texture2D<float4> source : register(t0);
 RWTexture2D<float4> target : register(u0);
 SamplerState bilinear : register(s0);
+// Reversible: max(tm(c)) = m / (1 + m) < 1, and itm(tm(c)) = c.
+float3 tm(float3 c) { return c / (1.0 + max(max(c.r, c.g), max(c.b, 0.0))); }
+float3 itm(float3 c) { return c / max(1e-4, 1.0 - max(max(c.r, c.g), c.b)); }
+float4 tap(float2 at, float2 hi) { return source.SampleLevel(bilinear, min(at, hi), 0); }
+// Catmull-Rom in nine bilinear taps.
+float4 catmull(float2 uv, float2 size, float2 hi) {
+    float2 pos = uv * size;
+    float2 t1 = floor(pos - 0.5) + 0.5;
+    float2 f = pos - t1;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 p0 = (t1 - 1.0) / size;
+    float2 p3 = (t1 + 2.0) / size;
+    float2 p12 = (t1 + w2 / w12) / size;
+    float4 r = 0;
+    r += tap(float2(p0.x, p0.y), hi) * w0.x * w0.y;
+    r += tap(float2(p12.x, p0.y), hi) * w12.x * w0.y;
+    r += tap(float2(p3.x, p0.y), hi) * w3.x * w0.y;
+    r += tap(float2(p0.x, p12.y), hi) * w0.x * w12.y;
+    r += tap(float2(p12.x, p12.y), hi) * w12.x * w12.y;
+    r += tap(float2(p3.x, p12.y), hi) * w3.x * w12.y;
+    r += tap(float2(p0.x, p3.y), hi) * w0.x * w3.y;
+    r += tap(float2(p12.x, p3.y), hi) * w12.x * w3.y;
+    r += tap(float2(p3.x, p3.y), hi) * w3.x * w3.y;
+    return r;
+}
 [numthreads(8, 8, 1)]
 void stretch(uint3 id : SV_DispatchThreadID) {
     // Groups are 8 by 8: the last ones reach past a size that is not a
@@ -333,10 +371,53 @@ void stretch(uint3 id : SV_DispatchThreadID) {
     // texel inside it, or the filter takes in what is beside it.
     uint sw, sh;
     source.GetDimensions(sw, sh);
-    at = min(at, scale - 0.5 / float2(sw, sh));
-    target[id.xy] = source.SampleLevel(bilinear, at, 0);
+    float2 size = float2(sw, sh);
+    float2 hi = scale - 0.5 / size;
+    at = min(at, hi);
+    if (SHARP <= 0.0) {
+        target[id.xy] = source.SampleLevel(bilinear, at, 0);
+        return;
+    }
+    float2 d = 1.0 / size;
+    float4 cr = catmull(at, size, hi);
+    float3 n = tm(tap(at - float2(0, d.y), hi).rgb);
+    float3 s = tm(tap(at + float2(0, d.y), hi).rgb);
+    float3 w = tm(tap(at - float2(d.x, 0), hi).rgb);
+    float3 e = tm(tap(at + float2(d.x, 0), hi).rgb);
+    float3 c = tm(max(cr.rgb, 0.0));
+    float3 mn = min(min(n, s), min(w, e));
+    float3 mx = max(max(n, s), max(w, e));
+    c = clamp(c, mn, mx);
+    mn = min(mn, c);
+    mx = max(mx, c);
+    // CAS: the more the neighbourhood already spans, the less it sharpens.
+    float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-4)));
+    float3 lobe = amp * (-1.0 / lerp(8.0, 5.0, SHARP));
+    float3 o = (c + (n + s + w + e) * lobe) / (1.0 + 4.0 * lobe);
+    target[id.xy] = float4(itm(saturate(o)), cr.a);
 }
 "#;
+
+/// `VICTORY_UPSCALE_SHARP`'s value: 0 (the plain bilinear stretch) when
+/// unset or unreadable, at most 1.
+fn upscale_sharp() -> f32 {
+    static SHARP: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SHARP.get_or_init(|| parse_sharp(std::env::var("VICTORY_UPSCALE_SHARP").ok().as_deref()))
+}
+
+/// Pure, for testing.
+fn parse_sharp(value: Option<&str>) -> f32 {
+    value
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map_or(0.0, |v| v.min(1.0))
+}
+
+/// The stretch's source with its sharpness.
+fn stretch_source(sharp: f32) -> String {
+    format!("#define SHARP {sharp:.3}
+{STRETCH}")
+}
 
 struct Stretch {
     root: ID3D12RootSignature,
@@ -360,7 +441,7 @@ const STRETCH_RING: u32 = 64;
 
 fn make_stretch(device: &ID3D12Device) -> windows::core::Result<Stretch> {
     use windows::core::s;
-    let cs = crate::host::compile(STRETCH, s!("stretch"), s!("cs_5_1"))?;
+    let cs = crate::host::compile(&stretch_source(upscale_sharp()), s!("stretch"), s!("cs_5_1"))?;
     let views = [
         range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0),
         range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1),
@@ -548,6 +629,24 @@ mod tests {
     fn the_stretch_writes_inside_its_target_only() {
         assert!(STRETCH.contains("numthreads(8, 8, 1)"));
         assert!(STRETCH.contains("if (id.x >= width || id.y >= height) return;"));
+    }
+
+    /// The sharpness switch parses and stays in bounds; both forms of the
+    /// stretch compile.
+    #[test]
+    fn the_sharpened_stretch_compiles_and_its_switch_parses() {
+        assert_eq!(super::parse_sharp(None), 0.0);
+        assert_eq!(super::parse_sharp(Some("0.5")), 0.5);
+        assert_eq!(super::parse_sharp(Some("3")), 1.0);
+        for bad in ["", "x", "0", "-1", "NaN"] {
+            assert_eq!(super::parse_sharp(Some(bad)), 0.0, "{bad:?}");
+        }
+        use windows::core::s;
+        for sharp in [0.0, 0.6] {
+            let source = super::stretch_source(sharp);
+            assert!(source.starts_with("#define SHARP"));
+            crate::host::compile(&source, s!("stretch"), s!("cs_5_1")).expect("the stretch compiles");
+        }
     }
 }
 
