@@ -6846,8 +6846,8 @@ fn refresh_once() -> bool {
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// union of the requested ranges: done before a step that writes title
+/// memory or gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -6855,7 +6855,7 @@ fn refresh_once() -> bool {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<ShadowRefresh>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -6870,15 +6870,60 @@ struct Batch {
     textures: std::collections::HashSet<usize>,
 }
 
+type ShadowRefresh = (std::sync::Arc<crate::shadow::Shadow>, RefreshRanges);
+
+/// Keep a single range inline. Merge accumulated overlaps before refreshing.
+enum RefreshRanges {
+    One((usize, usize)),
+    Many(Vec<(usize, usize)>),
+}
+
+impl RefreshRanges {
+    fn add(&mut self, (from, to): (usize, usize)) {
+        match self {
+            Self::One((start, end)) if from <= *end && *start <= to => {
+                *start = (*start).min(from);
+                *end = (*end).max(to);
+            }
+            Self::One(previous) => *self = Self::Many(vec![*previous, (from, to)]),
+            Self::Many(ranges) => ranges.push((from, to)),
+        }
+    }
+
+    fn merge(&mut self) {
+        if let Self::Many(ranges) = self {
+            ranges.sort_unstable();
+            // dedup_by passes the later element first and removes it on true.
+            ranges.dedup_by(|next, previous| {
+                if next.0 > previous.1 {
+                    return false;
+                }
+                previous.1 = previous.1.max(next.1);
+                true
+            });
+        }
+    }
+
+    fn as_slice(&self) -> &[(usize, usize)] {
+        match self {
+            Self::One(range) => std::slice::from_ref(range),
+            Self::Many(ranges) => ranges,
+        }
+    }
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
+        if len == 0 {
+            return;
+        }
+        let range = (address, address + len);
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         // Brought up to date in this submission already ([`refresh_once`];
         // nothing is in `current` without the switch).
         if let Some(&(_, from, to)) = self.current.get(&key)
             && from <= address
-            && end <= to
+            && range.1 <= to
         {
             #[cfg(feature = "diagnostics")]
             {
@@ -6888,13 +6933,10 @@ impl Batch {
             return;
         }
         match self.index.get(&key) {
-            Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
-            }
+            Some(&at) => self.refreshes[at].1.add(range),
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), RefreshRanges::One(range)));
             }
         }
     }
@@ -6905,46 +6947,49 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, mut ranges) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
-        Self::brought(&mut self.current, &shadow, from, to);
+        ranges.merge();
+        Self::update(&shadow, &ranges);
+        Self::brought(&mut self.current, &shadow, &ranges);
     }
 
-    /// With [`refresh_once`]: `[from, to)` of `shadow`'s copy was brought
-    /// up to date. Kept: its union with what was up to date if they touch,
-    /// else the larger of the two.
+    /// With [`refresh_once`], record the refreshed intervals one by one so
+    /// an unrequested gap never counts as current. Keep one interval per
+    /// copy: join touching intervals and otherwise retain the larger one.
     fn brought(
         current: &mut std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
-        from: usize,
-        to: usize,
+        ranges: &RefreshRanges,
     ) {
-        if !refresh_once() || from >= to {
+        if !refresh_once() {
             return;
         }
-        let entry = current
-            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-            .or_insert_with(|| (shadow.clone(), from, to));
-        if from <= entry.2 && entry.1 <= to {
-            (entry.1, entry.2) = (entry.1.min(from), entry.2.max(to));
-        } else if to - from > entry.2 - entry.1 {
-            (entry.1, entry.2) = (from, to);
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        for &(from, to) in ranges.as_slice() {
+            let entry = current.entry(key).or_insert_with(|| (shadow.clone(), from, to));
+            if from <= entry.2 && entry.1 <= to {
+                (entry.1, entry.2) = (entry.1.min(from), entry.2.max(to));
+            } else if to - from > entry.2 - entry.1 {
+                (entry.1, entry.2) = (from, to);
+            }
         }
     }
 
-    /// Brings `[from, to)` of a copy up to date, timed.
-    fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
-        let started = std::time::Instant::now();
-        let copied = shadow.update(from, to - from);
-        let us = started.elapsed().as_micros() as u64;
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::range(from, to - from, us, 0);
-        preparing(0, us);
-        preparing(1, copied as u64);
+    /// Brings each requested range of a copy up to date, timed.
+    fn update(shadow: &crate::shadow::Shadow, ranges: &RefreshRanges) {
+        for &(from, to) in ranges.as_slice() {
+            let started = std::time::Instant::now();
+            let copied = shadow.update(from, to - from);
+            let us = started.elapsed().as_micros() as u64;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::range(from, to - from, us, 0);
+            preparing(0, us);
+            preparing(1, copied as u64);
+        }
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -6987,16 +7032,19 @@ impl Batch {
 
     fn flush(&mut self) {
         self.index.clear();
-        // One write-watch asking for the copies that lie close together,
-        // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        for (_, ranges) in &mut self.refreshes {
+            ranges.merge();
+        }
+        // One write-watch asking for ranges that lie close together.
+        let ahead = self.refreshes.len() > 1
+            || self.refreshes.first().is_some_and(|(_, ranges)| ranges.as_slice().len() > 1);
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
                 .refreshes
                 .iter()
-                .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .filter(|(shadow, _)| !shadow.unwatched())
+                .flat_map(|(_, ranges)| ranges.as_slice().iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             preparing(0, started.elapsed().as_micros() as u64);
@@ -7008,13 +7056,13 @@ impl Batch {
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
             // Noted now: nothing reads the notes before the jobs are done.
-            for (shadow, from, to) in &self.refreshes {
-                Self::brought(&mut self.current, shadow, *from, *to);
+            for (shadow, ranges) in &self.refreshes {
+                Self::brought(&mut self.current, shadow, ranges);
             }
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, ranges)| Box::new(move || Self::update(&shadow, &ranges)) as Box<dyn FnOnce() + Send>)
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
@@ -7022,9 +7070,9 @@ impl Batch {
             PREPARING[0].fetch_sub(over, Ordering::Relaxed);
             crate::framelog::sub(crate::framelog::T::CopyUs, over);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
-                Self::brought(&mut self.current, &shadow, from, to);
+            for (shadow, ranges) in self.refreshes.drain(..) {
+                Self::update(&shadow, &ranges);
+                Self::brought(&mut self.current, &shadow, &ranges);
             }
         }
         if ahead {
@@ -8297,8 +8345,51 @@ mod spare {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, RefreshRanges};
     use std::sync::Arc;
+
+    fn assert_refresh_range_union(requests: &[(usize, usize)], expected: &[(usize, usize)]) {
+        let (&first, rest) = requests.split_first().unwrap();
+        let mut ranges = RefreshRanges::One(first);
+        for &request in rest {
+            ranges.add(request);
+        }
+
+        ranges.merge();
+        assert_eq!(ranges.as_slice(), expected, "requests: {requests:?}");
+        ranges.merge();
+        assert_eq!(ranges.as_slice(), expected, "second merge of {requests:?}");
+    }
+
+    #[test]
+    fn refresh_ranges_merges_adjacent_inline_ranges() {
+        for requests in [[(10, 20), (20, 30)], [(20, 30), (10, 20)]] {
+            assert_refresh_range_union(&requests, &[(10, 30)]);
+        }
+    }
+
+    #[test]
+    fn refresh_ranges_merges_accumulated_ranges() {
+        let cases: &[(&[(usize, usize)], &[(usize, usize)])] = &[
+            // Disjoint ranges added in reverse order.
+            (&[(30, 40), (10, 20)], &[(10, 20), (30, 40)]),
+            // Adjacency, containment, and a duplicate after promotion to Many.
+            (
+                &[(30, 40), (10, 20), (20, 25), (12, 16), (10, 20)],
+                &[(10, 25), (30, 40)],
+            ),
+            // A bridge closes a previously disjoint gap.
+            (&[(30, 40), (10, 20), (20, 30)], &[(10, 40)]),
+            // Chained overlaps collapse while the final gap stays open.
+            (
+                &[(50, 60), (10, 20), (35, 55), (18, 30), (28, 40), (75, 85)],
+                &[(10, 60), (75, 85)],
+            ),
+        ];
+        for &(requests, expected) in cases {
+            assert_refresh_range_union(requests, expected);
+        }
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
@@ -8327,6 +8418,131 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "requires an isolated process with VICTORY_D3D12_WARP=1"]
+    fn disjoint_refresh_leaves_the_dirty_gap_pending() {
+        use super::{IDXGIAdapter1, Interface, Ordering, PREPARING, host, warp_adapter};
+        use crate::{shadow, watch::PAGE};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+
+        assert!(std::env::var_os("VICTORY_D3D12_WARP").is_some());
+        let host = host().expect("WARP host device");
+        // SAFETY: the WARP adapter and the device are both live.
+        let (adapter, device_luid) = unsafe {
+            (
+                warp_adapter().unwrap().cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap(),
+                host.device.GetAdapterLuid(),
+            )
+        };
+        assert_eq!(device_luid.HighPart, adapter.AdapterLuid.HighPart);
+        assert_eq!(device_luid.LowPart, adapter.AdapterLuid.LowPart);
+        println!("WARP {:04x}:{:04x}", adapter.VendorId, adapter.DeviceId);
+
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const SIZE: usize = 3 * PAGE;
+        // SAFETY: a new committed, write-watched allocation owned by the test.
+        let title = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                SIZE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(title, 0);
+        let fill_page = move |page: usize, value: u8| {
+            assert!(page < 3);
+            // SAFETY: the test retains the committed allocation until all lists finish.
+            unsafe { ((title + page * PAGE) as *mut u8).write_bytes(value, PAGE) };
+        };
+        shadow::register(title, title as u64, SIZE as u64);
+        let shadow = shadow::find(title as u64, SIZE as u64).expect("shared shadow buffer");
+
+        enum AfterRefresh {
+            None,
+            Write,
+            RequestGap,
+        }
+        let submit = |ranges: &[(usize, usize)], after: AfterRefresh| {
+            let list = host.new_list().unwrap();
+            let readback = host.read_back_buffer(SIZE as u64).unwrap();
+            let copied = || PREPARING[1].load(Ordering::Relaxed);
+            let before = copied();
+            for &(offset, len) in ranges {
+                shadow.refresh(&list, (title + offset) as u64, len as u64);
+            }
+            if !matches!(after, AfterRefresh::None) {
+                shadow.gpu_writes(&list, title as u64, 4);
+                list.defer_host(move || {
+                    let drained = copied() - before;
+                    println!("copied bytes at GPU write declaration: {drained}");
+                    assert_eq!(drained, (2 * PAGE) as u64, "GPU write drains both ranges");
+                });
+            }
+            match after {
+                AfterRefresh::None => {}
+                AfterRefresh::Write => {
+                    // A title write after the declaration makes the third page stale again.
+                    list.defer(move || fill_page(2, 66));
+                    shadow.refresh(&list, (title + 2 * PAGE) as u64, PAGE as u64);
+                }
+                AfterRefresh::RequestGap => {
+                    // Ask again in the same batch, while refresh-once still has its notes.
+                    shadow.refresh(&list, (title + PAGE) as u64, PAGE as u64);
+                }
+            }
+            // SAFETY: both buffers cover SIZE bytes and live through synchronous execution.
+            unsafe { list.list.CopyBufferRegion(&readback, 0, &shadow.buffer, 0, SIZE as u64) };
+            let mut data = vec![0u8; SIZE];
+            list.defer_read_back(readback, data.as_mut_ptr(), [SIZE, 1, SIZE]);
+            list.close();
+            host.execute(&[&list]);
+            let markers = std::array::from_fn(|page| {
+                let bytes = &data[page * PAGE..(page + 1) * PAGE];
+                assert!(bytes.iter().all(|&byte| byte == bytes[0]), "page {page} is uniform");
+                bytes[0]
+            });
+            (copied() - before, markers)
+        };
+
+        for (page, value) in [1, 2, 3].into_iter().enumerate() {
+            fill_page(page, value);
+        }
+        assert_eq!(submit(&[(0, SIZE)], AfterRefresh::None), (SIZE as u64, [1, 2, 3]));
+        for (page, value) in [11, 22, 33].into_iter().enumerate() {
+            fill_page(page, value);
+        }
+        if super::refresh_once() {
+            let result = submit(&[(2 * PAGE, PAGE), (0, PAGE)], AfterRefresh::RequestGap);
+            println!("refresh-once copied bytes and page contents: {result:?}");
+            assert_eq!(result, (SIZE as u64, [11, 22, 33]));
+        } else {
+            let first = submit(&[(2 * PAGE, PAGE), (0, PAGE)], AfterRefresh::None);
+            let gap = submit(&[(PAGE, PAGE)], AfterRefresh::None);
+
+            fill_page(0, 44);
+            let overlap = submit(&[(PAGE / 2, PAGE / 2), (0, 3 * PAGE / 4)], AfterRefresh::None);
+            fill_page(0, 55);
+            fill_page(2, 60);
+            let write = submit(&[(0, PAGE), (2 * PAGE, PAGE)], AfterRefresh::Write);
+
+            println!("copied bytes and page contents: first {first:?}, gap {gap:?}, overlap {overlap:?}, write {write:?}");
+            assert_eq!(overlap, (PAGE as u64, [44, 22, 33]));
+            assert_eq!(write, (SIZE as u64, [55, 22, 66]));
+            assert_eq!(first, ((2 * PAGE) as u64, [11, 2, 33]));
+            assert_eq!(gap, (PAGE as u64, [11, 22, 33]));
+        }
+
+        drop(shadow);
+        shadow::unregister(title, title as u64);
+        // SAFETY: the allocation is no longer used by any list or shadow.
+        assert_ne!(unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) }, 0);
     }
 
     /// The hashing a submission does for textures in physical-page memory,
