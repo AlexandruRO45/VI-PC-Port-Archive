@@ -409,11 +409,81 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Resolved query results waiting to be copied to title memory: the
+    /// read-back buffer, the title address, bytes.
+    resolves: Vec<(ID3D12Resource, *mut u8, u64)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
 
 impl Host {
+    /// A query heap of `count` queries of the console kind: 0 occlusion, 1
+    /// binary occlusion, 2 timestamp, 3 pipeline statistics.
+    pub(crate) fn query_heap(&self, kind: u32, count: u32) -> Option<ID3D12QueryHeap> {
+        let r#type = match kind {
+            0 | 1 => D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+            2 => D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+            3 => D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
+            _ => return None,
+        };
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        // SAFETY: plain object creation.
+        unsafe {
+            self.device
+                .CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: r#type,
+                        Count: count.max(1),
+                        NodeMask: 0,
+                    },
+                    &mut heap,
+                )
+                .ok()?;
+        }
+        let heap = heap?;
+        name(&heap, || format!("query heap kind {kind} x{count}"));
+        Some(heap)
+    }
+
+    /// A read-back buffer of `size` bytes a query resolution lands in: the
+    /// host GPU writes it, the CPU reads it after the submission.
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let readback = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(8).next_multiple_of(256),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain object creation.
+        unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &readback,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+                .ok()?;
+        }
+        let buffer = buffer?;
+        name(&buffer, || format!("query read-back {size:#x}"));
+        Some(buffer)
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
@@ -601,6 +671,21 @@ impl Host {
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
+            }
+            // Query results land in read-back buffers: copy them out while
+            // the buffers are alive and the GPU is done writing them.
+            for (back, title, bytes) in &list.deferred().resolves {
+                let mut data = std::ptr::null_mut();
+                let range = D3D12_RANGE {
+                    Begin: 0,
+                    End: *bytes as usize,
+                };
+                // SAFETY: a read-back buffer this finished list resolved into.
+                if unsafe { back.Map(0, Some(&range), Some(&mut data)) }.is_ok() {
+                    copy_mapped(*title, data.cast(), *bytes as usize, true);
+                    // SAFETY: the buffer is mapped above.
+                    unsafe { back.Unmap(0, None) };
+                }
             }
         }
         self.log_messages();
@@ -1063,6 +1148,12 @@ impl HostList {
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
+    }
+
+    /// Copies a resolved query heap's results from `back` to `title` (the
+    /// title buffer the resolution names) once the list has run.
+    pub(crate) fn defer_resolve(&self, back: ID3D12Resource, title: *mut u8, bytes: u64) {
+        self.deferred().resolves.push((back, title, bytes));
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
