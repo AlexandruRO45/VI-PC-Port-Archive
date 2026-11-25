@@ -893,7 +893,14 @@ extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRES
     }
     // SAFETY: checked non-null; the title passes a device id.
     let id = unsafe { &*id };
-    match hub(this).devices.iter().find(|d| d.info.id == *id) {
+    let hub = hub(this);
+    let state = hub.state();
+    // A slot has a reading after its first connection. Its history also
+    // keeps the device known if it later disconnects.
+    let known = hub.devices.iter().find(|device| {
+        device.info.id == *id && !state.slots[device.index].history.is_empty()
+    });
+    match known {
         Some(device) => {
             // SAFETY: checked non-null.
             unsafe { out.write((device as *const Device).cast()) };
@@ -1698,6 +1705,27 @@ mod tests {
         assert_eq!(FROM_INSIDE.load(Ordering::SeqCst), 1);
         poller.join().unwrap();
         leave.join().unwrap();
+    }
+
+    #[test]
+    fn lookup_by_id_only_finds_devices_that_have_been_seen() {
+        let (hub, host) = fake();
+        let device = &hub.devices[2];
+        type Find = extern "system" fn(This, *const [u8; 32], Out) -> HRESULT;
+        let find = slot::<Find, _>(&hub.object, 0x80);
+        let mut out = std::ptr::from_ref(&hub.devices[KEYBOARD]).cast();
+        assert_eq!(
+            find(&hub.object, &device.info.id, &mut out),
+            DEVICE_NOT_FOUND
+        );
+        assert!(out.is_null());
+
+        for state in [Some(PadState::default()), None, Some(PadState::default())] {
+            host.lock().unwrap().pads[2] = state;
+            hub.poll();
+            assert_eq!(find(&hub.object, &device.info.id, &mut out), S_OK);
+            assert_eq!(out, std::ptr::from_ref(device).cast());
+        }
     }
 
     #[test]
