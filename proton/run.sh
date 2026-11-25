@@ -26,8 +26,14 @@ usage: proton/run.sh [options] [--] [victory args...]
   --texture-wait leave VICTORY_TEXTURE_NO_WAIT unset (the default is 1)
   --texture-no-wait
                  accepted for compatibility; the default is already on
+  --watchdog     keep the title's stall watchdog (the default disarms it
+                 with the VICTORY_NO_WATCHDOG hooks; docs/proton.md)
+  --no-watchdog  accepted for compatibility; the default is already on
 
 Notes:
+  VICTORY_COPY_MEMORY defaults to 1: under Wine the title memory used in
+  place is never seen by the GPU and every frame stays black (#19, #53).
+
   The title's start screen listens to a pad. On a machine without one, a
   diagnostics build needs VICTORY_KEYS to leave it, for example
   VICTORY_KEYS=25:Enter,40:Enter,55:Enter,70:Enter; the release build has
@@ -47,6 +53,7 @@ z_dir=""
 config=""
 d3dcompiler=""
 texture_no_wait=1
+watchdog=""
 
 while [[ $# -gt 0 && $1 != -- ]]; do
     case "$1" in
@@ -58,6 +65,8 @@ while [[ $# -gt 0 && $1 != -- ]]; do
         --d3dcompiler) d3dcompiler=$2; shift 2 ;;
         --texture-wait)    texture_no_wait=""; shift ;;
         --texture-no-wait) texture_no_wait=1; shift ;;
+        --watchdog)    watchdog=1; shift ;;
+        --no-watchdog) watchdog=""; shift ;;
         -h|--help) usage; exit 0 ;;
         *)      break ;;
     esac
@@ -170,6 +179,27 @@ export WINEDLLOVERRIDES=$overrides
 # frame for it (#178). --texture-wait leaves the wait in place.
 if [[ -n $texture_no_wait ]]; then
     export VICTORY_TEXTURE_NO_WAIT=1
+fi
+
+# Under Wine the in-place title-memory windows are made without an error,
+# but the GPU never sees what the title writes there: every frame stays
+# black from the first one (#19). Copying is the working path, and #53
+# makes it the code default under Wine; until then the launcher sets it.
+# VICTORY_COPY_MEMORY=0 keeps the memory in place once #53 lands.
+export VICTORY_COPY_MEMORY=${VICTORY_COPY_MEMORY:-1}
+
+# The title's stall watchdog ends the process when its main loop has not
+# advanced for ~30 s; a cold pipeline compile under Wine stalls longer,
+# so runs loop on the loading screen and then end themselves
+# (victory-fork#416). The loader's VICTORY_NO_WATCHDOG hooks
+# (victory-fork#364) jump over the kill; they are opt-in there and on by
+# default here. --watchdog (or the variable set 0) keeps the title's
+# watchdog — a real hang then ends the run as before.
+no_watchdog=${VICTORY_NO_WATCHDOG:-1}
+if [[ -n $watchdog || $no_watchdog == 0 ]]; then
+    unset VICTORY_NO_WATCHDOG
+else
+    export VICTORY_NO_WATCHDOG=$no_watchdog
 fi
 
 # Wine resolves the process' Unix cwd through its Z: mapping, so a config

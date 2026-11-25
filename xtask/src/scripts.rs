@@ -40,7 +40,7 @@ mod tests {
                getcompatpath) printf 'Z:%s\\n' \"$2\" ;;\n\
                waitforexitandrun)\n\
                  shift\n\
-                 printf 'launched %s %s umu=%s overrides=%s\\n' \"$0\" \"$*\" \"${{UMU_ID:-}}\" \"${{WINEDLLOVERRIDES:-}}\"\n\
+                 printf 'launched %s %s umu=%s overrides=%s copy=%s nowatchdog=%s\\n' \"$0\" \"$*\" \"${{UMU_ID:-}}\" \"${{WINEDLLOVERRIDES:-}}\" \"${{VICTORY_COPY_MEMORY:-}}\" \"${{VICTORY_NO_WATCHDOG:-}}\"\n\
                  ;;\n\
                *) printf 'unexpected verb %s\\n' \"$1\" >&2; exit 2 ;;\n\
              esac\n"
@@ -98,6 +98,7 @@ mod tests {
             "--config",
             "--d3dcompiler",
             "--texture-wait",
+            "--watchdog",
         ] {
             assert!(text.contains(flag), "usage misses {flag}");
         }
@@ -180,6 +181,82 @@ mod tests {
         assert!(
             stdout.contains("d3dcompiler_47=n"),
             "the native DLL must be forced: {stdout}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn proton_launcher_defaults_the_wine_workarounds() {
+        let tmp = temp_dir("wine-defaults");
+        let prefix = tmp.join("prefix");
+        let proton = fake_proton(&tmp.join("proton"), &prefix, true);
+        let exe = tmp.join("victory.exe");
+        fs::write(&exe, b"not a real exe").expect("stand-in exe");
+
+        let run = |extra: &[&str], env: &[(&str, &str)]| {
+            let mut cmd = Command::new("bash");
+            cmd.args(["proton/run.sh", "--prefix"])
+                .arg(&prefix)
+                .arg("--proton")
+                .arg(&proton)
+                .arg("--exe")
+                .arg(&exe)
+                .args(extra)
+                .args(["--", "config"])
+                .current_dir(root())
+                .env_remove("VICTORY_COPY_MEMORY")
+                .env_remove("VICTORY_NO_WATCHDOG");
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
+            cmd.output().expect("bash")
+        };
+        let stdout_of = |out: &Output| {
+            assert!(
+                out.status.success(),
+                "run failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        // In-place title memory is black under Wine (#19) and the stall
+        // watchdog kills a cold compile (victory-fork#416): both workarounds
+        // default on.
+        let stdout = stdout_of(&run(&[], &[]));
+        assert!(
+            stdout.contains("copy=1"),
+            "title memory must be copied: {stdout}"
+        );
+        assert!(
+            stdout.contains("nowatchdog=1"),
+            "the watchdog hooks must default on: {stdout}"
+        );
+
+        // --watchdog keeps the title's watchdog; the copy default stays.
+        let stdout = stdout_of(&run(&["--watchdog"], &[]));
+        assert!(
+            stdout.contains("copy=1"),
+            "the copy default must stay: {stdout}"
+        );
+        assert!(
+            stdout.contains("nowatchdog=\n"),
+            "--watchdog must leave VICTORY_NO_WATCHDOG unset: {stdout}"
+        );
+
+        // The environment opts out of both (0 keeps the memory in place
+        // once #53 lands, and keeps the watchdog armed).
+        let stdout = stdout_of(&run(
+            &[],
+            &[("VICTORY_COPY_MEMORY", "0"), ("VICTORY_NO_WATCHDOG", "0")],
+        ));
+        assert!(
+            stdout.contains("copy=0"),
+            "the env must override the copy: {stdout}"
+        );
+        assert!(
+            stdout.contains("nowatchdog=\n"),
+            "VICTORY_NO_WATCHDOG=0 must keep the watchdog: {stdout}"
         );
         let _ = fs::remove_dir_all(&tmp);
     }
