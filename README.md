@@ -18,7 +18,7 @@ publisher.
 - Save recovery limits cleanup to the staging names it owns. See
   [VIctory #2716](https://github.com/Marvisak/VIctory/pull/2716).
 - Shader fixes improve normalized buffer conversion and declare the required
-  feature for writeable views in vertex, geometry, and mesh shaders. The
+  feature for writable views in vertex, geometry, and mesh shaders. The
   compute test harness clears its output buffers and textures before dispatch.
 - Texture copies between aliases of the same host subresource avoid invalid
   Direct3D 12 commands. Capture logs include alpha ranges and traced barriers.
