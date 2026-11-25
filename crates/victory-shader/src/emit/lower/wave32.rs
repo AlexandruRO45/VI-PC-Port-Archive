@@ -1,5 +1,7 @@
 //! Native scalar control for a complete 32-lane compute wave. All lanes
 //! visit the same IR blocks. EXEC guards vector writes and memory effects.
+//! AMD's *RDNA 2 Instruction Set Architecture*, §§3.3, 3.6 and 4.1,
+//! describes the wave's EXEC mask, scalar registers and program flow.
 
 use super::{Attr, Bin, EXEC, Fields, Inst, Lower, Reg, V, Val, Value, Why};
 
@@ -158,10 +160,8 @@ impl Lower<'_> {
         let views = self.s.view_addresses_handle();
         let stride = self.s.m.i32(crate::emit::VIEW_ADDRESS_BYTES);
         let record = self.s.m.bin(block, Bin::Mul, index, stride);
-        let third = self.s.m.i32(8);
-        let offset = self.s.m.bin(block, Bin::Add, record, third);
         self.cur = block;
-        let word = self.raw_dword(views, offset);
+        let word = self.raw_dword(views, record);
         self.cur = saved.1;
         self.vals.insert(value, Val::I32(word));
         Ok(word)

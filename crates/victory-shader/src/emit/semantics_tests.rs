@@ -361,13 +361,13 @@ fn run(
     ];
     let mut roots = vec![(0, Root::Constants(ud))];
     if shader.view_addresses {
-        // Two heap slots with distinct native base words. The first two
-        // fields are unused by this probe and deliberately differ from them.
+        // The first slot has a buffer address. The second has only a native
+        // base word. An SGPR reading word zero sees both at the same stride.
         roots.push((
             1,
             Root::View {
                 srv: true,
-                data: vec![11, 12, 0x1234_5600, 21, 22, 0x89AB_CD00],
+                data: vec![0x1234_5600, 12, 0x89AB_CD00, super::VIEW_BASE_ONLY],
             },
         ));
     }

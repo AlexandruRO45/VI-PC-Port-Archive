@@ -23,8 +23,8 @@ pub(crate) struct HostHeap {
     /// where the host takes them, else [`MIN_DYNAMIC`].
     dynamic: u32,
     sampler: bool,
-    /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    /// The guest descriptor in each title slot, including deferred textures.
+    made: Mutex<Mirrored>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -55,6 +55,12 @@ pub(crate) struct HostHeap {
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
+}
+
+struct Mirrored {
+    keys: Vec<u64>,
+    /// Placed textures whose host descriptor will be made at the next draw.
+    deferred: std::collections::HashSet<u32>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -190,7 +196,10 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made: Mutex::new(Mirrored {
+                keys: vec![0; count as usize],
+                deferred: Default::default(),
+            }),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -550,7 +559,7 @@ impl HostHeap {
             )?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
-            for (i, &key) in slots.iter().enumerate() {
+            for (i, &key) in slots.keys.iter().enumerate() {
                 let view = (key != 0)
                     .then(|| view_at(key as u32, (key >> 32) as u32))
                     .flatten();
@@ -662,14 +671,15 @@ impl HostHeap {
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
+            if made.keys[index as usize] != 0 {
+                made.keys[index as usize] = 0;
+                made.deferred.remove(&index);
                 self.make_null(index);
                 self.note_address(index, None);
             }
             return None;
         };
-        if made[index as usize] != key {
+        if made.keys[index as usize] != key || (for_draw && made.deferred.contains(&index)) {
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -679,7 +689,12 @@ impl HostHeap {
             // staging copy) for each of the ~20,000 the title has views of
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
-            made[index as usize] = if later { 0 } else { key };
+            made.keys[index as usize] = key;
+            if later {
+                made.deferred.insert(index);
+            } else {
+                made.deferred.remove(&index);
+            }
             let (kept, mark) = if later {
                 (None, None)
             } else {
@@ -702,7 +717,7 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).keys.get(index as usize)?;
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
@@ -721,7 +736,8 @@ impl HostHeap {
     /// Whether slot `index` was made from a record (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
-        self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        made.keys[index as usize] != 0 && !made.deferred.contains(&index)
     }
 }
 
@@ -810,14 +826,15 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// Guest buffer-address pair followed by native resource descriptor word
-/// zero. GFX10 image bases are expressed in units of 256 bytes.
-fn address_words(view: Option<&View>) -> [u32; 3] {
-    let buffer = view.and_then(buffer_range).map(|(address, _)| address);
-    let base = match (buffer, view) {
-        (Some(address), _) => address as u32,
-        (_, Some(View::Constant(address, _))) => *address as u32,
-        (_, Some(View::Shader(r, _) | View::Unordered(r, _, _))) => {
+/// Two dwords per title slot. RDNA 2 ISA §§8.1.8 and 8.2.6 define a
+/// buffer's byte address and an image's base in 256-byte units.
+fn address_words(view: Option<&View>) -> [u32; 2] {
+    if let Some((address, _)) = view.and_then(buffer_range) {
+        return [address as u32, (address >> 32) as u32 & 0xFFFF];
+    }
+    let base = match view {
+        Some(View::Constant(address, _)) => *address as u32,
+        Some(View::Shader(r, _) | View::Unordered(r, _, _)) => {
             let resource = *r as crate::object::This;
             if let Some((address, _)) = crate::resource::texture_memory(resource) {
                 ((address as u64) >> 8) as u32
@@ -826,21 +843,20 @@ fn address_words(view: Option<&View>) -> [u32; 3] {
                     .map_or(0, |(address, _)| address as usize as u32)
             }
         }
-        (_, Some(View::Placed(_, resource, desc))) if resource[0] != 1 => {
+        Some(View::Placed(_, resource, desc)) if resource[0] != 1 => {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             (address >> 8) as u32
         }
         _ => 0,
     };
-    let address = buffer.unwrap_or(0);
-    [address as u32, (address >> 32) as u32 & 0xFFFF, base]
+    if base == 0 { [0, 0] } else { [base, victory_shader::emit::VIEW_BASE_ONLY] }
 }
 
 fn write_address(data: usize, index: usize, view: Option<&View>) {
-    const { assert!(size_of::<[u32; 3]>() == victory_shader::emit::VIEW_ADDRESS_BYTES as usize) };
-    // SAFETY: the mapped table holds one three-dword record per title slot.
+    const { assert!(size_of::<[u32; 2]>() == victory_shader::emit::VIEW_ADDRESS_BYTES as usize) };
+    // SAFETY: the mapped table holds one two-dword record per title slot.
     unsafe {
-        (data as *mut [u32; 3])
+        (data as *mut [u32; 2])
             .add(index)
             .write_unaligned(address_words(view))
     };
@@ -1470,7 +1486,8 @@ mod tests {
         desc[11] = (address >> 32) as u32;
         resource[0] = 3; // 2D texture
         let image = View::Placed(false, resource, desc);
-        assert_eq!(address_words(Some(&image)), [0, 0, 0x1234_5678]);
+        let image_words = [0x1234_5678, victory_shader::emit::VIEW_BASE_ONLY];
+        assert_eq!(address_words(Some(&image)), image_words);
         resource[0] = 1; // Buffer SRV with a nonzero FirstElement
         desc[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
         desc[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
@@ -1478,15 +1495,84 @@ mod tests {
         desc[6] = 16;
         desc[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
         let buffer = View::Placed(false, resource, desc);
+        assert_eq!(address_words(Some(&buffer)), [0x3456_7814, 0x12]);
+        assert_eq!(address_words(None), [0, 0]);
+    }
+
+    #[test]
+    fn a_reused_title_slot_publishes_the_native_base_word() {
+        use crate::descriptor as d;
+        use victory_shader::emit::VIEW_BASE_ONLY;
+
+        let Some(device) = host() else { return };
+        let submit = || {
+            let list = device.new_list().expect("command list");
+            list.close();
+            device.execute(&[&list]);
+        };
+        let desc = [0u32, 2, 1, 0, 0, 0, 0, 0];
+        let mut object = std::ptr::null();
+        let null = std::ptr::null();
         assert_eq!(
-            address_words(Some(&buffer)),
-            [0x3456_7814, 0x12, 0x3456_7814]
+            d::create_heap(null, desc.as_ptr().cast(), &d::HEAP_IIDS[0], &mut object),
+            crate::object::S_OK
         );
-        let mut table = [[u32::MAX; 3]; 2];
-        write_address(table.as_mut_ptr() as usize, 1, Some(&image));
-        assert_eq!(table, [[u32::MAX; 3], [0, 0, 0x1234_5678]]);
-        write_address(table.as_mut_ptr() as usize, 1, None);
-        assert_eq!(table[1], [0; 3]);
+        let title = d::heap(object);
+        let heap = title.host().expect("host view heap");
+        let slot = title.start + u64::from(d::increment(d::VIEWS_KIND).unwrap());
+        let pool = crate::watch::tests::pool(1);
+        let address = pool as u64;
+        crate::shadow::register(pool, address, crate::watch::PAGE as u64);
+        let neighbour = address + 256;
+        d::create_cbv(null, &[neighbour as u32, (neighbour >> 32) as u32, 256, 0], title.start);
+        let mut image = [0; 14];
+        image[0] = 3;
+        let image_address = address + 512;
+        let mut desc = [0; 16];
+        desc[0] = DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32;
+        desc[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+        desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc[5] = 1;
+        desc[10] = image_address as u32;
+        desc[11] = (image_address >> 32) as u32;
+        d::create_placed_srv(null, &image, &desc, slot);
+        submit();
+        heap.view_addresses().expect("mapped view addresses");
+        let data = heap.addresses.get().unwrap().as_ref().unwrap().1 as *const [u32; 2];
+        let check = |want| {
+            // SAFETY: two mapped entries in this live heap, after submission.
+            unsafe {
+                assert_eq!(data.read_volatile(), [neighbour as u32, VIEW_BASE_ONLY]);
+                assert_eq!(data.add(1).read_volatile(), want);
+            }
+        };
+        check([(image_address >> 8) as u32, VIEW_BASE_ONLY]);
+
+        // Clear a deferred image before any draw materializes its texture.
+        // SAFETY: slot 1 of the live title heap.
+        unsafe { (slot as *mut [u32; 3]).write_unaligned([0; 3]) };
+        heap.mirror(1, slot, false);
+        submit();
+        check([0, 0]);
+
+        let mut buffer = [0; 14];
+        buffer[0] = 1;
+        buffer[4] = 256;
+        desc[10] = address as u32;
+        desc[11] = (address >> 32) as u32;
+        desc[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+        desc[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        desc[4] = 4; // Raw D3D12 SRVs start on a 16-byte boundary.
+        desc[5] = 0;
+        desc[6] = 16;
+        desc[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+        d::create_placed_srv(null, &buffer, &desc, slot);
+        submit();
+        let first = address + 4 * 4;
+        check([first as u32, (first >> 32) as u32 & 0xFFFF]);
+        d::release(object);
+        crate::shadow::unregister(pool, address);
+        crate::watch::tests::free(pool);
     }
 
     /// The world's 16-byte view of 0 elements removed the device.

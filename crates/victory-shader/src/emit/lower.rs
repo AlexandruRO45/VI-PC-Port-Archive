@@ -4584,9 +4584,14 @@ impl<'a> Lower<'a> {
                 let c = self.cur;
                 let stride = self.s.m.i32(super::VIEW_ADDRESS_BYTES);
                 let at = self.s.m.bin(c, Bin::Mul, index, stride);
-                let w = self.s.m.i32(4 * word);
-                let at = self.s.m.bin(c, Bin::Add, at, w);
-                Val::I32(self.raw_dword(views, at))
+                let four = self.s.m.i32(4);
+                let hi_at = self.s.m.bin(c, Bin::Add, at, four);
+                let hi = self.raw_dword(views, hi_at);
+                let value = if word == 0 { self.raw_dword(views, at) } else { hi };
+                let base_only = self.s.m.i32(super::VIEW_BASE_ONLY);
+                let tagged = self.s.m.cmp(c, pred::EQ, hi, base_only);
+                let zero = self.s.m.i32(0);
+                Val::I32(self.s.m.select(c, tagged, zero, value))
             } else {
                 Val::Missing(OTHER)
             };
