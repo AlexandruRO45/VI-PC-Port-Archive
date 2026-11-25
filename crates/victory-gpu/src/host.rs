@@ -1651,6 +1651,21 @@ impl Host {
         (frequency > 0).then_some(Clock { gpu, at: i128::from(title_now) - since, frequency, now: title_now })
     }
 
+    /// [`Host::removal_data`] over the lists of the submissions still in
+    /// flight; over none if another thread holds them now.
+    fn removal_data_in_flight(&self) -> String {
+        let lists: Vec<std::sync::Arc<HostList>> = match self.in_flight.try_lock() {
+            Ok(in_flight) => in_flight
+                .iter()
+                .filter_map(|f| f.finish.as_ref())
+                .flat_map(|f| f.lists.iter().cloned())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
+        self.removal_data(&runs)
+    }
+
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
     /// it lies in (by the names we give them) or the title memory copy just
     /// below it; for each list that did not finish, the command it stopped
@@ -4488,7 +4503,14 @@ fn wait_if_removed(device: &ID3D12Device, error: &windows::core::Error) {
     ONCE.call_once(|| {
         // SAFETY: a plain query.
         let reason = unsafe { device.GetDeviceRemovedReason() };
-        tracing::error!(?reason, layer = ?host().and_then(|h| h.log_messages()), "host GPU device gone");
+        // Asynchronous submissions are not waited for where they are made,
+        // so that path never reports the device-removed data: it is read
+        // here, over the lists still in flight.
+        let dred = host()
+            .filter(|_| dred_on())
+            .map(|h| h.removal_data_in_flight())
+            .unwrap_or_default();
+        tracing::error!(?reason, layer = ?host().and_then(|h| h.log_messages()), %dred, "host GPU device gone");
     });
     std::thread::sleep(std::time::Duration::from_secs(20));
 }
