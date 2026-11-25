@@ -19,7 +19,8 @@ Disabled, it costs one cached boolean and allocates nothing.
 1. The first real occurrence of each of these programs, as the host recorded
    it: `34fb51b8a0312e82`, `68029c67dca01425`, `1cd9bc634417a981`,
    `48e74d16cbfa45e3`, `df11dcd012cd7382`, `7c649c422f6208e4`,
-   `5970ee6dbc47ec61`.
+   `5970ee6dbc47ec61`, and the upscale `4f4ec7b16673362f` (its
+   render target joins the presented source).
 2. For each selected table slot: static slot and dword offset, SRV/UAV,
    host slot, descriptor address, object and title VA (placed views),
    requested and **observed** effective format, mip/array/plane, generation

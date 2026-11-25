@@ -2063,7 +2063,7 @@ pub(crate) mod hdr_trace {
 
     #[derive(Clone, Copy, Debug)]
     #[repr(usize)]
-    pub(super) enum Program { Temporal, Diffusion, Tiled, TiledNoDir, Taa, Composite, CompositeNoise }
+    pub(super) enum Program { Temporal, Diffusion, Tiled, TiledNoDir, Taa, Composite, CompositeNoise, Upscale }
 
     impl Program {
         pub(super) fn from_hash(hash: &str) -> Option<Self> {
@@ -2075,12 +2075,13 @@ pub(crate) mod hdr_trace {
                 "df11dcd012cd7382" => Self::Taa,
                 "7c649c422f6208e4" => Self::Composite,
                 "5970ee6dbc47ec61" => Self::CompositeNoise,
+                "4f4ec7b16673362f" => Self::Upscale,
                 _ => return None,
             })
         }
 
         fn graphics(self) -> bool {
-            matches!(self, Self::Tiled | Self::TiledNoDir | Self::Composite | Self::CompositeNoise)
+            matches!(self, Self::Tiled | Self::TiledNoDir | Self::Composite | Self::CompositeNoise | Self::Upscale)
         }
 
         fn tiled(self) -> bool {
