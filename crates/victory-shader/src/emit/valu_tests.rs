@@ -1513,21 +1513,21 @@ fn v_div_scale_f32_matches_rdna2() {
         // Normal range: unscaled, flag=0
         (f(7.0), f(3.0), f(7.0), f(7.0), 0),
         (f(3.0), f(3.0), f(7.0), f(3.0), 0),
-        // Clause 1: zero denominator or numerator -> qNaN, flag=0
+        // Clause 1: zero (or FTZ-flushed subnormal) denominator or numerator -> qNaN, flag=0
         (f(1.0), 0x0000_0000, f(1.0), qnan, 0),
         (f(1.0), 0x8000_0000, f(1.0), qnan, 0),
         (0x0000_0000, f(1.0), 0x0000_0000, qnan, 0),
         (0x8000_0000, f(1.0), 0x8000_0000, qnan, 0),
+        // Subnormal inputs flush to signed zero under RDNA2 default FLOAT_MODE=0xc0 (mode 0)
+        (0x0000_0001, 0x0000_0001, f(2.0), qnan, 0),
+        (f(2.0), 0x0000_0001, f(2.0), qnan, 0),
+        (0x0040_0000, f(2.0), 0x0040_0000, qnan, 0),
+        (f(2.0), f(2.0), 0x0040_0000, qnan, 0),
+        (0x0040_0000, pow2(-100), 0x0040_0000, qnan, 0),
         // Clause 2: e2 - e1 >= 96 -> flag=1, scale only denominator (S0 == S1) by +64
         (pow2(-36), pow2(-36), pow2(60), pow2(28), 1), // diff == 96, S0==S1
         (pow2(60), pow2(-36), pow2(60), pow2(60), 1),  // diff == 96, S0==S2
         (pow2(-35), pow2(-35), pow2(60), pow2(-35), 0), // diff == 95 (below threshold)
-        // Clause 2 with subnormal S1: e1=0, e2=128 (2.0), diff=128 >= 96 -> normalize+scale S1
-        (0x0000_0001, 0x0000_0001, f(2.0), pow2(-85), 1),
-        (f(2.0), 0x0000_0001, f(2.0), f(2.0), 1),
-        // Clause 3: S1 denormal (e1 == 0, diff < 96) -> flag=0, scale both by +64 (FTZ-proof!)
-        (0x0000_0001, 0x0000_0001, 0x0040_0000, pow2(-85), 0),
-        (0x0040_0000, 0x0000_0001, 0x0040_0000, pow2(-63), 0),
         // Clause 4: 1/S1 denormal AND S2/S1 denormal -> flag=1, scale only S1 by -64
         (pow2(127), pow2(127), f(1.0), pow2(63), 1),
         (f(1.0), pow2(127), f(1.0), f(1.0), 1),
@@ -1545,12 +1545,7 @@ fn v_div_scale_f32_matches_rdna2() {
         (0x2000_0000, 0x5F40_0000, 0x2000_0000, 0x4000_0000, 1), // 2^-63 / (1.5*2^63) -> denorm
         (0x2000_0000, 0x5F00_0000, 0x2000_0000, 0x2000_0000, 0), // 2^-63 / 2^63 == 2^-126 normal
         (0x2040_0000, 0x5F00_0000, 0x2040_0000, 0x2040_0000, 0), // 1.5*2^-63 / 2^63 normal
-        // Subnormal S2: S2/S1 denormal (Clause 6) vs S2/S1 normal (Clause 7!)
-        (0x0040_0000, f(2.0), 0x0040_0000, pow2(-63), 1), // 2^-127 / 2 -> denorm
-        (f(2.0), f(2.0), 0x0040_0000, f(2.0), 1),
-        (0x0040_0000, pow2(-100), 0x0040_0000, pow2(-63), 0), // 2^-127 / 2^-100 = 2^-27 normal -> Clause 7
-        (pow2(-100), pow2(-100), 0x0040_0000, pow2(-36), 0),  // Clause 7 scales S1 too!
-        // Clause 7: tiny numerator e2 <= 23 -> flag=0, scale both by +64
+        // Clause 7: tiny normal numerator e2 <= 23 -> flag=0, scale both by +64
         (pow2(-104), pow2(-100), pow2(-104), pow2(-40), 0), // e2 == 23
         (pow2(-100), pow2(-100), pow2(-104), pow2(-36), 0),
         (pow2(-103), pow2(-100), pow2(-103), pow2(-103), 0), // e2 == 24 (unscaled)
@@ -1649,17 +1644,16 @@ fn v_div_fmas_f32_matches_rdna2() {
             [f(1.0), f(2.0), f(1.0), 0],
             f32::from_bits(((128 - 64) << 23) | 0x40_0000).to_bits(),
         ), // 3 * 2^-64
-        // Subnormal output preserved even on FTZ hosts:
-        // 2^-63 (0x2000_0000) * 2^-64 = 2^-127 (0x0040_0000)
-        ([f(0.0), f(0.0), pow2(-63), 0], 0x0040_0000),
-        // Exact IEEE-754 round-to-nearest-even at subnormal boundary exp == 41 (2^-86):
-        // tie to even -> 0; strictly above tie -> 0x0000_0001 (2^-149)
-        ([f(0.0), f(0.0), pow2(-86), 0], 0x0000_0000),
-        ([f(0.0), f(0.0), pow2(-86) | 1, 0], 0x0000_0001),
-        // Subnormal carry into smallest normal: (2 - 2^-23) * 2^-63 * 2^-64 -> 2^-126 (0x0080_0000)
-        ([f(0.0), f(0.0), 0x207F_FFFF, 0], 0x0080_0000),
-        // Negative subnormal and overflow to +/-Inf and -0.0 preservation
-        ([f(0.0), f(0.0), pow2(-63) | 0x8000_0000, 0], 0x8040_0000),
+        // Subnormal outputs flush to signed zero (RDNA2 f32 FTZ mode 0):
+        // exp == 65 stays smallest normal (2^-62 * 2^-64 = 2^-126); exp <= 64 flushes to +/-0.0.
+        ([f(0.0), f(0.0), pow2(-62), 0], 0x0080_0000),
+        ([f(0.0), f(0.0), pow2(-63), 0], 0x0000_0000),
+        ([f(0.0), f(0.0), 0x207F_FFFF, 0], 0x0000_0000),
+        ([f(0.0), f(0.0), pow2(-63) | 0x8000_0000, 0], 0x8000_0000),
+        // Subnormal input flushes to signed zero before scaling
+        ([f(0.0), f(0.0), 0x0040_0000, 0], 0x0000_0000),
+        ([f(-0.0), f(1.0), 0x8040_0000, 0], 0x8000_0000),
+        // Overflow to +/-Inf and -0.0 preservation
         ([f(0.0), f(0.0), pow2(80), 0], f32::INFINITY.to_bits()),
         (
             [f(0.0), f(0.0), pow2(80) | 0x8000_0000, 0],
@@ -1763,22 +1757,18 @@ fn rdna2_fdiv32_pipeline_with_div_scale_and_div_fmas() {
         // Huge quotient near FLT_MAX (Clause 2: VCC=1, +64)
         (f_exp(60, 0), f_exp(-50, 0)),
         (f_exp(100, 0x40_0000), f_exp(-20, 0x20_0000)),
-        // Subnormal denominator (Clause 3: VCC=0, both +64)
-        (f32::from_bits(0x0040_0000), f32::from_bits(0x0000_0200)),
-        // Subnormal denominator + huge quotient (Clause 2: VCC=1, denom +64)
-        (1.0, f32::from_bits(0x0040_0000)),
-        // Huge denominator (1/D denorm) + denormal quotient (Clause 4: VCC=1, denom -64)
+        // Huge denominator (1/D denorm) + denormal quotient (Clause 4: VCC=1, denom -64 -> FTZ +/-0.0)
         (1.0, f_exp(127, 0)),
         (-3.0, f_exp(127, 0x40_0000)),
         // Huge denominator (1/D denorm) + normal quotient (Clause 5: VCC=0, both -64)
         (f_exp(100, 0), f_exp(127, 0)),
         (f_exp(127, 0x40_0000), f_exp(127, 0x20_0000)),
-        // Normal denominator + denormal quotient (Clause 6: VCC=1, num +64)
+        // Normal denominator + denormal quotient (Clause 6: VCC=1, num +64 -> FTZ +/-0.0)
         (f_exp(-64, 0), f_exp(64, 0)),
-        (f_exp(-70, 0x40_0000), f_exp(60, 0)),
-        // Tiny numerator + normal quotient (Clause 7: VCC=0, both +64)
+        (-f_exp(-70, 0x40_0000), f_exp(60, 0)),
+        // Tiny normal numerator + normal quotient (Clause 7: VCC=0, both +64)
         (f_exp(-110, 0), f_exp(-105, 0)),
-        (f32::from_bits(0x0008_0000), f_exp(-100, 0)),
+        (f_exp(-125, 0x40_0000), f_exp(-100, 0)),
     ];
 
     let inputs: Vec<[u32; 4]> = pairs
@@ -1787,12 +1777,17 @@ fn rdna2_fdiv32_pipeline_with_div_scale_and_div_fmas() {
         .collect();
     run_cases(&fdiv, &inputs, |backend, i, _, got| {
         let (n, d) = pairs[i];
-        let want = (n / d).to_bits();
-        let ulp = got.abs_diff(want);
-        let max_ulp = if (want & 0x7F80_0000) == 0 { 1 } else { 0 };
-        assert!(
-            ulp <= max_ulp,
-            "{backend}: fdiv32 case {i} ({n:e} / {d:e}): got {got:#010x} ({:e}), want {want:#010x} ({:e}), ulp={ulp}",
+        let raw_want = (n / d).to_bits();
+        // RDNA2 f32 FTZ mode 0 flushes subnormal quotients to a zero of their sign.
+        let want = if (raw_want & 0x7F80_0000) == 0 {
+            raw_want & 0x8000_0000
+        } else {
+            raw_want
+        };
+        assert_eq!(
+            got,
+            want,
+            "{backend}: fdiv32 case {i} ({n:e} / {d:e}): got {got:#010x} ({:e}), want {want:#010x} ({:e})",
             f32::from_bits(got),
             f32::from_bits(want),
         );
