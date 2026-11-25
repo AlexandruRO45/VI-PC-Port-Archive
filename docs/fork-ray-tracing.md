@@ -69,37 +69,55 @@ shaders and emulates the one instruction.
   pipelines").
 - **The title then crashes within seconds** of the first builder frame, on
   several threads at once, each following a pointer field of one of its own
-  objects (title heap, around `0xd3..` to `0xe1..`) that holds `+inf`, `-inf`
-  or a pair such as `0xff8000007f800000`.
+  objects into memory that holds `+inf`, `-inf` or a pair such as
+  `0xff8000007f800000`.
 - **`VICTORY_BVH_QUARANTINE=1` leaked**: copy-backs are declared per list, so
   another shader's declaration in the same list carried the builder's stores
   back too. Fixed (`HostList::quarantine`: a list with a quarantined builder
   stage copies nothing back). With the fixed quarantine the title ran 74 s with
   the builder on and no such crash, then the card was lost (`0x887A0006`) with
   frames at 1.1 s of GPU time.
-- **No path of ours writes those infinities into the title's objects**
-  (`VICTORY_BVH_TRACE=1`): shader copy-backs carry none before the builder
-  runs and many after (36 to 66 blocks of 4 MiB), none of them in the blocks
-  of the corrupted objects; title buffer copies and texture read-backs carry
-  none. The title's own code writes them, presumably from results of the
-  builder it reads (bounds, sizes) that are wrong.
-- **Not the first frames alone**: `VICTORY_BVH_WARMUP=10` (quarantined for
-  the builder's first 10 frames) crashes as soon as the results are let
-  through.
-- **Not the float atomics**: the builder folds bounds with 129
-  `global_atomic_fmin` and 129 `global_atomic_fmax`, which the translator
-  emulates with a compare-exchange loop; that loop, run by 65,536 threads on
-  one address in a custom write-back L0 buffer (as the 4 MiB windows are made)
-  and in a default buffer, gives the exact minimum, maximum and count.
-- **Faults come from the title's walkers, not the builder**: with fault
-  records naming the program and instruction, the lost accesses in a frame
-  were by three title compute programs that walk the structures (one of them
-  most), through real title addresses whose pages had no copy yet.
+- **What the title finds there is structure nodes** (`VICTORY_CRASH_REGMEM=1`,
+  memory around the registers at a crash): 128-byte box nodes, four child
+  words `0xffffffff` and four boxes, real (`(-1.30, -2.02, -2.85)` to
+  `(2.03, 2.85, ..)`) or empty (`+inf` x3, `-inf` x3), where the title keeps
+  tables of its own inside the structures and reads them on the CPU.
+- **They come from the rehydrate stages.** The title rehydrates the
+  dehydrated bottom-level structures it ships, in place, through the builder
+  DLL's rehydrate entry point. That call writes nothing itself (every byte of
+  the structure and of the 64 KiB after it is unchanged when it returns): it
+  records builder stages into the command list. Each call names the
+  structure twice, by its GPU address and by that address minus
+  `0x6_0000_0000`, two views of the same pages (both mapped views here, with
+  the same bytes), which is where the title reads it from on the CPU. The
+  crash's object lies inside such a structure.
+- **Dropping only those stages removes the crash**: with
+  `VICTORY_BVH_SKIP_REHYDRATE=1` the builder's other stages run, nothing is
+  quarantined, and the title ran on with no fault. The rehydrate records four
+  builder programs (`28918b7150a7aad5`, `4ddd6f9702fab2a7`, `5e68767498c57eb6`,
+  `caa78b8ca62bc3d6`).
+- **One of them loses its reads**: with fault records naming the program and
+  instruction, the lost raw-address accesses of a frame were nearly all by
+  `5e68767498c57eb6`, at a dozen instructions, through real title addresses
+  whose pages had no copy yet. Those reads give zeros, and a rehydrate runs
+  once per structure, so the expanded nodes land where the zeros send them,
+  over the tables the title then reads. The likely fix is to have every page
+  a rehydrate stage reads ready before it runs (the extent of the title's
+  allocation around each address, see the shortcut in `memory.rs`).
+- **Ruled out on the way**: the first frames alone (`VICTORY_BVH_WARMUP=10`,
+  quarantined for the builder's first 10 frames, crashes as soon as the
+  results are let through); the float atomics (the compare-exchange loop the
+  translator emits for the builder's 258 `global_atomic_fmin/fmax`, run by
+  65,536 threads on one address in a custom write-back L0 buffer, as the 4 MiB
+  windows are made, and in a default buffer, gives exact results).
+  An earlier reading of `VICTORY_BVH_TRACE` blamed the title's own code: the
+  infinities land at the structures' GPU addresses, and the crash reads them
+  through the other view.
 
 ## Known gaps
 
-- With the builder on, the title's own objects are corrupted (above); the
-  wrong result of the builder that causes it is not found yet.
+- With the builder on, the rehydrate stages overwrite tables the title reads
+  (above), until the pages they read are ready before they run.
 - Five shadow-mask trace programs do not translate yet.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
@@ -117,6 +135,9 @@ shaders and emulates the one instruction.
   and raw addresses.
 - `crates/victory-gpu/src/pipeline.rs`, `draw.rs`: the builder rule and the
   host side of root views and title memory.
+- `crates/victory-loader/src/bvhcalls.rs` and `victory_core::bvh`
+  (diagnostics, `VICTORY_BVH_SKIP_REHYDRATE=1`): rehydrate calls marked, the
+  stages they record dropped (`pipeline::rehydrate_skipped`).
 - `crates/victory-gpu/src/bvhtrace.rs` (diagnostics, `VICTORY_BVH_TRACE=1`):
   where infinities land in title memory, the arguments of builder dispatches,
   the copies reachable by address, and each lost access with its program

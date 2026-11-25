@@ -175,6 +175,18 @@ impl ImportResolver for WithTitleDlls<'_> {
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(dll))
             .and_then(|(_, image)| image.export_symbol(symbol))
+            .map(|address| {
+                // `VICTORY_BVH_SKIP_REHYDRATE=1`: the structure builder
+                // DLL's rehydrate calls, marked on their way through.
+                #[cfg(feature = "diagnostics")]
+                if crate::bvhcalls::on()
+                    && dll.to_ascii_lowercase().contains("bvhbuilder")
+                    && let ImportSymbol::Name { name, .. } = symbol
+                {
+                    return crate::bvhcalls::shim(name, address);
+                }
+                address
+            })
             .map_or(Resolution::Missing, |address| Resolution::Found {
                 address,
                 provenance: Provenance::Title,

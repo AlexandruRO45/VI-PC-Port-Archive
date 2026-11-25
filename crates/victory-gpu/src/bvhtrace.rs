@@ -93,6 +93,7 @@ pub(crate) fn copied(dst: usize, src: usize, len: usize) {
     if !on() || len < 8 {
         return;
     }
+    watched(if src == 0 { "read-back" } else { "title copy" }, dst, len);
     // Read back through the kernel: part of the destination may be unmapped.
     let mut bytes = vec![0u8; len.min(64 << 20)];
     if !crate::host::read_into(dst as *const u8, &mut bytes) {
@@ -156,6 +157,41 @@ pub(crate) fn fault(page: u32, lo: u32, pc: u32, program: u32) {
     }
 }
 
+/// `VICTORY_BVH_WATCH=<start>,<len>` (hex or decimal): every write of ours
+/// into that title range is logged, whatever it carries (`path` says which).
+pub(crate) fn watched(path: &str, dst: usize, len: usize) {
+    static RANGE: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    let range = *RANGE.get_or_init(|| {
+        let v = std::env::var("VICTORY_BVH_WATCH").ok()?;
+        let mut it = v.split(',').map(|x| {
+            let x = x.trim();
+            x.strip_prefix("0x").map_or_else(|| x.parse().ok(), |h| usize::from_str_radix(h, 16).ok())
+        });
+        let (start, n) = (it.next()??, it.next()??);
+        tracing::info!(start = format_args!("{start:#x}"), len = n, "bvh trace: watching title memory");
+        Some((start, start + n))
+    });
+    let Some((start, end)) = range else { return };
+    if dst < end && start < dst + len {
+        static LINES: AtomicU32 = AtomicU32::new(0);
+        if take(&LINES) {
+            let around = crate::shadow::find(dst as u64, 1).map(|s| {
+                let (a, n) = s.span();
+                format!("{a:#x}..{:#x}", a + n)
+            });
+            tracing::warn!(
+                frame = crate::frame::current(),
+                path,
+                dst = format_args!("{dst:#x}"),
+                len,
+                copy = ?around,
+                builder_seen = BUILDER_SEEN.load(Ordering::Relaxed),
+                "bvh trace: a write of ours into the watched range"
+            );
+        }
+    }
+}
+
 /// Whether `VICTORY_BVH_TRACE=1`.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -172,8 +208,7 @@ fn take(counter: &AtomicU32) -> bool {
 
 /// A copy got number `n` in the raw-address directory.
 pub(crate) fn numbered(n: usize, start: u64, len: u64) {
-    static LINES: AtomicU32 = AtomicU32::new(0);
-    if on() && take(&LINES) {
+    if on() {
         tracing::info!(
             n,
             start = format_args!("{start:#x}"),
@@ -232,6 +267,7 @@ pub(crate) fn landing(dst: usize, src: *const u8, len: usize) {
     if !on() || len < 8 {
         return;
     }
+    watched("copy-back (any)", dst, len);
     // SAFETY: the caller's source holds `len` bytes.
     let bytes = unsafe { std::slice::from_raw_parts(src, len) };
     let skip = (4 - dst % 4) % 4;
@@ -254,12 +290,14 @@ pub(crate) fn landing(dst: usize, src: *const u8, len: usize) {
         t[after] += infinities as u64;
         t[2 + after] += 1;
     }
+    // A summary every 200 ranges with infinities, past the line limit too.
+    static RANGES: AtomicU32 = AtomicU32::new(0);
+    if RANGES.fetch_add(1, Ordering::Relaxed) % 200 == 199 {
+        summary();
+    }
     // Ranges are listed once the builder runs; before it only counted.
     if !BUILDER_SEEN.load(Ordering::Relaxed) || !take(&LINES) {
         return;
-    }
-    if LINES.load(Ordering::Relaxed) % 25 == 0 {
-        summary();
     }
     let around = crate::shadow::find(dst as u64, 1)
         .map(|s| {

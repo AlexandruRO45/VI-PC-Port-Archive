@@ -23,6 +23,8 @@
 
 #[cfg(windows)]
 mod console_insn;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod bvhcalls;
 mod crash;
 pub mod prepare;
 pub mod resolve;

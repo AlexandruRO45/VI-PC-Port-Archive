@@ -509,6 +509,10 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
+    #[cfg(feature = "diagnostics")]
+    for l in register_memory(context) {
+        line(l);
+    }
     if to_file {
         let said = title_output();
         eprint!("{said}");
@@ -525,6 +529,94 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
             file.display()
         );
     }
+}
+
+/// `VICTORY_CRASH_REGMEM=1` (diagnostics): for the first few reports, the
+/// memory around each general register that holds a readable address
+/// (0x40 bytes before, 0xc0 after), as dwords, `+inf`/`-inf` marked, and
+/// once more around the pointer each such register's first eight dwords
+/// hold, so that what overwrote an object (whose field a crash followed)
+/// shows. Read through the kernel: an unmapped page prints as such.
+#[cfg(feature = "diagnostics")]
+fn register_memory(context: &CONTEXT) -> Vec<String> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    static REPORTS: AtomicU32 = AtomicU32::new(0);
+    let on = std::env::var_os("VICTORY_CRASH_REGMEM").is_some_and(|v| v == "1");
+    if !on || REPORTS.fetch_add(1, Ordering::Relaxed) >= 4 {
+        return Vec::new();
+    }
+    let read = |at: usize, out: &mut [u8]| -> bool {
+        let mut done = 0;
+        // SAFETY: the kernel checks the source; `out` is ours.
+        unsafe { ReadProcessMemory(GetCurrentProcess(), at as _, out.as_mut_ptr().cast(), out.len(), &mut done) != 0 }
+    };
+    let plausible = |v: u64| (0x1_0000_0000..0x100_0000_0000).contains(&v) || (0x7ff0_0000_0000..0x8000_0000_0000).contains(&v);
+    let dump = |name: &str, v: u64, lines: &mut Vec<String>| {
+        let start = (v as usize & !0xF).saturating_sub(0x40);
+        let mut bytes = [0u8; 0x100];
+        if !read(start, &mut bytes) {
+            lines.push(format!("  mem {name}={v:#x}: not readable"));
+            return;
+        }
+        lines.push(format!("  mem {name}={v:#x}:"));
+        for (row, chunk) in bytes.chunks_exact(16).enumerate() {
+            let words: Vec<String> = chunk
+                .chunks_exact(4)
+                .map(|w| {
+                    let x = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                    match x {
+                        0x7f80_0000 => "    +inf".to_owned(),
+                        0xff80_0000 => "    -inf".to_owned(),
+                        _ => format!("{x:08x}"),
+                    }
+                })
+                .collect();
+            let floats: Vec<String> = chunk
+                .chunks_exact(4)
+                .map(|w| format!("{:.6e}", f32::from_le_bytes([w[0], w[1], w[2], w[3]])))
+                .collect();
+            let addr = start + row * 16;
+            let mark = if (addr..addr + 16).contains(&(v as usize)) { ">" } else { " " };
+            lines.push(format!("   {mark}{addr:#014x}  {}   {}", words.join(" "), floats.join(" ")));
+        }
+    };
+    let regs = [
+        ("rax", context.Rax),
+        ("rbx", context.Rbx),
+        ("rcx", context.Rcx),
+        ("rdx", context.Rdx),
+        ("rsi", context.Rsi),
+        ("rdi", context.Rdi),
+        ("rbp", context.Rbp),
+        ("r8", context.R8),
+        ("r9", context.R9),
+        ("r10", context.R10),
+        ("r11", context.R11),
+        ("r12", context.R12),
+        ("r13", context.R13),
+        ("r14", context.R14),
+        ("r15", context.R15),
+    ];
+    let mut lines = Vec::new();
+    for (name, v) in regs {
+        if !plausible(v) {
+            continue;
+        }
+        dump(name, v, &mut lines);
+        // One level down: pointers in the object's first eight dwords.
+        let mut head = [0u8; 32];
+        if read(v as usize, &mut head) {
+            for (i, q) in head.chunks_exact(8).enumerate() {
+                let p = u64::from_le_bytes(q.try_into().unwrap_or([0; 8]));
+                if plausible(p) && p != v {
+                    dump(&format!("[{name}+{:#x}]", i * 8), p, &mut lines);
+                }
+            }
+        }
+    }
+    lines
 }
 
 /// Return addresses of the faulting thread's frames, from the faulting

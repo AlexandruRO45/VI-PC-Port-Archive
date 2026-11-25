@@ -2066,6 +2066,11 @@ impl State {
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::rehydrate_skipped(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -2904,6 +2909,10 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
+            return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::rehydrate_skipped(self.pipeline as This) {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {

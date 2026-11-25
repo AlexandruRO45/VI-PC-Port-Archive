@@ -403,6 +403,26 @@ pub(crate) fn builder_runs() -> bool {
     true
 }
 
+/// At a dispatch: whether it is a stage of the structure builder recorded
+/// by the builder DLL's rehydrate entry point (`victory_core::bvh`), and
+/// `VICTORY_BVH_SKIP_REHYDRATE=1` asks for those to be dropped. Each such
+/// pipeline is logged once (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn rehydrate_skipped(this: This) -> bool {
+    if !is_builder(this) || !victory_core::bvh::rehydrating() {
+        return false;
+    }
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let name = pipeline(this).shaders.iter().map(|s| s.hash.clone()).collect::<Vec<_>>().join("+");
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&name) {
+        tracing::info!(pipeline = %name, "a stage of the structure builder recorded by a rehydrate");
+        seen.push(name);
+    }
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| std::env::var_os("VICTORY_BVH_SKIP_REHYDRATE").is_some_and(|v| v == "1"))
+}
+
 /// The frame the builder first ran in (0: not yet).
 #[cfg(windows)]
 static BUILDER_FROM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
