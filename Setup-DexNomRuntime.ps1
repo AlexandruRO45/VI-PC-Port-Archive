@@ -79,18 +79,18 @@ try {
     [IO.File]::WriteAllText($config, $game.FullName, [Text.UTF8Encoding]::new($false))
 } finally { $lock.Dispose() }
 
-$launcher = Join-Path $InstallDir 'victory-play.exe'
 Write-Host "Installed DexNom Runtime in $InstallDir"
 [IO.Directory]::CreateDirectory($ShortcutDirectory) | Out-Null
 $shell = New-Object -ComObject WScript.Shell
 foreach ($entry in @(
-    @{ Name = 'DexNom Runtime'; Arguments = '' }
-    @{ Name = 'DexNom Runtime (Experimental RT)'; Arguments = '--rt' }
+    @{ Name = 'DexNom Runtime'; Program = 'victory-play.exe'; Arguments = '' }
+    @{ Name = 'DexNom Runtime (Experimental RT)'; Program = 'victory-play.exe'; Arguments = '--rt' }
+    @{ Name = 'DexNom Runtime (Preload and Play)'; Program = 'victory-warm.exe'; Arguments = '--play' }
 )) {
     $shortcut = $shell.CreateShortcut((Join-Path $ShortcutDirectory ($entry.Name + '.lnk')))
-    $shortcut.TargetPath = $launcher
+    $shortcut.TargetPath = Join-Path $InstallDir $entry.Program
     $shortcut.Arguments = $entry.Arguments
     $shortcut.WorkingDirectory = $InstallDir
     $shortcut.Save()
 }
-Write-Host "Open DexNom Runtime from $ShortcutDirectory to play, or select DexNom Runtime (Experimental RT) to try ray tracing."
+Write-Host "Open DexNom Runtime from $ShortcutDirectory to play. The Preload and Play shortcut finishes shader preloading before launch."

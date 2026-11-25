@@ -13,12 +13,14 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     let folder = launcher.parent().context("Launcher folder is missing")?;
     let runtime = folder.join("victory.exe");
     let mut args = std::env::args_os().skip(1).peekable();
-    let (mut warp, mut rt) = (false, false);
+    let (mut warp, mut rt, mut play) = (false, false, !warm);
     while let Some(option) = args.peek() {
         if option == "--warp" {
             warp = true;
         } else if option == "--rt" {
             rt = true;
+        } else if warm && option == "--play" {
+            play = true;
         } else {
             break;
         }
@@ -34,7 +36,8 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         }
     };
     if args.next().is_some() {
-        bail!("Usage\n{} [--rt] [--warp] [game executable]", launcher.display());
+        let play_flag = if warm { " [--play]" } else { "" };
+        bail!("Usage\n{}{play_flag} [--rt] [--warp] [game executable]", launcher.display());
     }
     if !game.is_file() || !runtime.is_file() {
         bail!(
@@ -72,39 +75,48 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         runtime.display(),
         game.display()
     )?;
-    let latest = if warm {
-        "latest-warm.txt"
-    } else {
-        "latest.txt"
-    };
-    fs::write(logs.join(latest), path.display().to_string())?;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut child = Command::new(&runtime);
     if rt {
-        child
-            .env("VICTORY_BVH_BUILDER", "1")
-            .env("VICTORY_BVH_QUARANTINE", "0")
-            .env("VICTORY_ACTIVATE_RAYS", "1")
-            .env("VICTORY_RT_RESOLVE", "1");
         writeln!(log, "Experimental ray tracing requested")?;
     }
-    if warp {
-        child.env("VICTORY_D3D12_WARP", "1");
+    let new_child = |log: &File| -> anyhow::Result<Command> {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut child = Command::new(&runtime);
+        if rt {
+            child
+                .env("VICTORY_BVH_BUILDER", "1")
+                .env("VICTORY_BVH_QUARANTINE", "0")
+                .env("VICTORY_ACTIVATE_RAYS", "1")
+                .env("VICTORY_RT_RESOLVE", "1");
+        }
+        if warp {
+            child.env("VICTORY_D3D12_WARP", "1");
+        }
+        if std::env::var_os("VICTORY_DEBUG_HUD").is_none() {
+            child.env("VICTORY_DEBUG_HUD", "1");
+        }
+        child
+            .current_dir(folder)
+            .env("VICTORY_DATA_DIR", &state)
+            .env("VICTORY_CACHE_DIR", &cache)
+            .stdin(Stdio::null())
+            .stderr(log.try_clone()?)
+            .creation_flags(CREATE_NO_WINDOW);
+        Ok(child)
+    };
+    if warm {
+        fs::write(logs.join("latest-warm.txt"), path.display().to_string())?;
+        let status = preload(&mut new_child(&log)?, &game, &cache, &path, &mut log)?;
+        if !status.success() {
+            bail!("Shader preload exited with {status}.\n\nLog file\n{}", path.display());
+        }
     }
-    if std::env::var_os("VICTORY_DEBUG_HUD").is_none() {
-        child.env("VICTORY_DEBUG_HUD", "1");
-    }
-    child
-        .current_dir(folder)
-        .env("VICTORY_DATA_DIR", &state)
-        .env("VICTORY_CACHE_DIR", &cache)
-        .stdin(Stdio::null())
-        .stderr(log.try_clone()?)
-        .creation_flags(CREATE_NO_WINDOW);
-    let status = if warm {
-        preload(&mut child, &game, &cache, &path, &mut log)?
-    } else {
-        let status = child
+    if play {
+        if warm {
+            writeln!(log, "Shader preload finished. Starting the game.")?;
+            println!("Shader preload finished. Starting the game.");
+        }
+        fs::write(logs.join("latest.txt"), path.display().to_string())?;
+        let status = new_child(&log)?
             .arg("run")
             .arg(&game)
             .args([
@@ -118,13 +130,9 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
             .status()
             .with_context(|| format!("Could not start {}", runtime.display()))?;
         writeln!(log, "VIctory exited with {status}")?;
-        status
-    };
-    if !status.success() {
-        bail!(
-            "VIctory exited with {status}.\n\nLog file\n{}",
-            path.display()
-        );
+        if !status.success() {
+            bail!("VIctory exited with {status}.\n\nLog file\n{}", path.display());
+        }
     }
     Ok(())
 }

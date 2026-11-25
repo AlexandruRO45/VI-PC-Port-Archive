@@ -315,6 +315,9 @@ pub fn run(
 /// `victory warm`: fills the caches a run reads (`Command::Warm`).
 pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    if pipelines {
+        victory_hle::modules::d3d12x::check_preload_device()?;
+    }
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
