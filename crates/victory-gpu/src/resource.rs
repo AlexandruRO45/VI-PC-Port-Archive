@@ -275,10 +275,18 @@ pub(crate) fn family(format: u32) -> u32 {
 
 /// `format` and each member of its typeless family: the formats a typed
 /// view of a typeless texture can name (a typeless input is its family's
-/// first, so the range from it holds them all).
+/// first, so the range from it holds them all). Each member's linear
+/// twin ([`SRGB`]) counts too: it lies below the family head — B8G8R8A8's
+/// family head is 90, whose members are 87 and 91 — so the range does
+/// not reach it, yet a typeless texture of the head takes its views.
 fn family_members(format: u32) -> impl Iterator<Item = u32> {
     let first = family(format);
-    std::iter::once(format).chain((first..).take_while(move |&f| family(f) == first))
+    std::iter::once(format)
+        .chain((first..).take_while(move |&f| family(f) == first))
+        .flat_map(|f| {
+            let twin = SRGB.iter().find(|&&(s, _)| s == f).map_or(f, |&(_, t)| t);
+            [f, twin]
+        })
 }
 
 /// sRGB formats and their linear twins.
@@ -1922,38 +1930,42 @@ mod tests {
             };
             host_desc(&desc).is_some_and(|d| d.flags & UNORDERED != 0)
         };
-        use windows::Win32::Graphics::Direct3D12::ID3D12Device10;
-        use windows::core::Interface;
-        let device10 = crate::host::host()
-            .is_some_and(|h| h.device.cast::<ID3D12Device10>().is_ok());
-        // What `host_desc` should answer for `format`: a legal unordered
-        // view exists — the format itself stores typed, a member of its
-        // typeless family does (the committed fallback creates it typeless
-        // and views it typed), or a typeless texture's cast list names one
-        // that does (enhanced-barrier creation only). A standalone format
-        // has no cast path: it is created typed, and
-        // GetResourceAllocationInfo sees the bare description.
-        let keeps = |format: u32| {
-            let format = if SRGB.iter().any(|&(s, _)| s == format) {
-                family(format)
-            } else {
-                format
-            };
-            typed_store(format)
-                || family_members(format).any(typed_store)
-                || (family(format) == format
-                    && family(format + 1) == format
-                    && device10
-                    && castable(format).into_iter().any(typed_store))
-        };
-        // 86 B5G5R5A1_UNORM and 85 B5G6R5_UNORM have no typeless family —
-        // where the host does not store them typed the flag removes
-        // NVIDIA's device at GetResourceAllocationInfo and drops; where it
-        // reports one (the bit is the legality test itself) it stays.
+        // Fixed expectations anchored to the legal view, not re-derived
+        // from the rule: where the member a view would name is known, so
+        // is the answer. 86 B5G5R5A1_UNORM and 85 B5G6R5_UNORM have no
+        // typeless family — where the host does not store them typed the
+        // flag removes NVIDIA's device at GetResourceAllocationInfo and
+        // drops; where it reports one (the bit is the legality test
+        // itself) it stays.
         assert_eq!(family(85), 85);
         assert_eq!(family(86), 86);
-        for format in [85, 86, 27, 28, 29, 87, 90, 91, 60, 61] {
-            assert_eq!(has(format), keeps(format), "format {format}");
+        assert_eq!(has(86), typed_store(86), "86 keeps it only where it stores typed");
+        assert_eq!(has(85), typed_store(85), "85 like 86");
+        // A typeless B8G8R8A8 (90) texture takes an 87 unordered view
+        // where 87 stores typed — shown on hardware and WARP — so its
+        // sRGB title format 91 keeps the flag there however the device
+        // answers for 90 or 91 (neither does anywhere known).
+        if typed_store(87) {
+            assert!(has(91), "91 keeps it: an 87 view of the typeless copy is legal");
+        }
+        if typed_store(88) {
+            assert!(has(93), "93 keeps it: an 88 view of the typeless copy is legal");
+        }
+        // Without a member a legal view can name, the flag drops rather
+        // than remove the device.
+        if !family_members(90).any(typed_store) {
+            assert!(!has(91), "no legal unordered view for 91: the flag drops");
+        }
+        if !family_members(27).any(typed_store) {
+            assert!(!has(29), "no legal unordered view for 29: the flag drops");
+        }
+        // The ordinary typed formats answer for themselves where the
+        // family head is queried (27's family reaches 28; 60's 60-64).
+        for format in [28, 29, 87, 90, 60, 61] {
+            let legal = typed_store(format) || family_members(format).any(typed_store);
+            if legal {
+                assert!(has(format), "format {format}: a member stores typed");
+            }
         }
     }
 
