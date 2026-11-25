@@ -785,14 +785,15 @@ impl Staging {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-            };
+            let depth_pitch = pitch * rows as usize;
+            let offset = footprint.Offset as usize;
+            // GetCopyableFootprints can omit the padding after the last row.
+            let len = (depth_pitch * f.Depth as usize).min(self.bytes as usize - offset);
+            // SAFETY: the footprint starts inside this mapping and len ends within it.
+            let linear = unsafe { std::slice::from_raw_parts_mut(self.data.add(offset), len) };
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile_upload(tiled, mip, slice, linear, pitch, depth_pitch)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;

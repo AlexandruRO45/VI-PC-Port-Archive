@@ -594,9 +594,81 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
-        })
+        self.walk(
+            tiled.len(),
+            mip,
+            slice,
+            linear.len(),
+            row_pitch,
+            depth_pitch,
+            |height| 0..height,
+            |t, l, len| {
+                linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+            },
+        )
+    }
+
+    /// Copy a renderer upload into mapped staging memory. Large, tiled 2D mips
+    /// can use independent row bands. Small mips stay on the calling thread.
+    #[cfg(feature = "parallel-detile")]
+    pub fn detile_upload(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        output: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        use rayon::prelude::*;
+
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let row_bytes = m.width as usize * self.desc.element_bytes as usize;
+        let payload = row_bytes as u64 * u64::from(m.height);
+        // Count active bytes only. Small uploads are faster on the caller.
+        if self.desc.dimension == Dimension::Tex2d
+            && self.desc.swizzle != Swizzle::LINEAR
+            && payload >= 4 << 20
+            && m.height >= 4
+            && slice < self.slices
+            && self.addressable()
+            && tiled.len() >= self.size as usize
+            && let Some((pool, _slot)) = upload_pool()
+        {
+            let height = m.height as usize;
+            let need = (height - 1)
+                .checked_mul(row_pitch)
+                .and_then(|n| n.checked_add(row_bytes))
+                .ok_or(Error::TooSmall)?;
+            if row_pitch < row_bytes || output.len() < need {
+                return Err(Error::TooSmall);
+            }
+            let rows = height.div_ceil(pool.current_num_threads());
+            let band_bytes = rows * row_pitch;
+            pool.install(|| {
+                output[..need]
+                    .par_chunks_mut(band_bytes)
+                    .enumerate()
+                    .try_for_each(|(index, band)| {
+                        let start = index * rows;
+                        let end = (start + rows).min(height);
+                        self.walk(
+                            tiled.len(),
+                            mip,
+                            slice,
+                            band.len(),
+                            row_pitch,
+                            depth_pitch,
+                            |_| start as u32..end as u32,
+                            |src, dst, len| {
+                                band[dst..][..len].copy_from_slice(&tiled[src..][..len]);
+                            },
+                        )
+                    })
+            })
+        } else {
+            self.detile(tiled, mip, slice, output, row_pitch, depth_pitch)
+        }
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -609,9 +681,18 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
-        })
+        self.walk(
+            tiled.len(),
+            mip,
+            slice,
+            linear.len(),
+            row_pitch,
+            depth_pitch,
+            |height| 0..height,
+            |t, l, len| {
+                tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
+            },
+        )
     }
 
     /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
@@ -624,9 +705,11 @@ impl Layout {
         linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
+        band: impl FnOnce(u32) -> std::ops::Range<u32>,
         mut copy: impl FnMut(usize, usize, usize),
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let rows = band(m.height);
         let depth = m.depth;
         let first = if self.desc.dimension == Dimension::Tex3d {
             if slice != 0 {
@@ -646,7 +729,7 @@ impl Layout {
         let bytes = m.width as usize * n;
         let need = (depth as usize - 1)
             .checked_mul(depth_pitch)
-            .zip((m.height as usize - 1).checked_mul(row_pitch))
+            .zip((rows.len() - 1).checked_mul(row_pitch))
             .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
             .and_then(|offset| offset.checked_add(bytes))
             .ok_or(Error::TooSmall)?;
@@ -681,8 +764,8 @@ impl Layout {
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+            for y in rows.clone() {
+                let linear_row = z as usize * depth_pitch + (y - rows.start) as usize * row_pitch;
                 if linear {
                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
                     copy(tiled_row as usize, linear_row, bytes);
@@ -700,6 +783,35 @@ impl Layout {
         }
         Ok(())
     }
+}
+
+#[cfg(feature = "parallel-detile")]
+fn upload_pool() -> Option<(
+    &'static rayon::ThreadPool,
+    std::sync::MutexGuard<'static, ()>,
+)> {
+    // Keep callers writing on their own threads once two large uploads are
+    // using the pool. Queueing every upload on four workers limits throughput
+    // when several submission threads refresh independent textures together.
+    static SLOTS: [std::sync::Mutex<()>; 2] = [const { std::sync::Mutex::new(()) }; 2];
+    let slot = SLOTS.iter().find_map(|slot| slot.try_lock().ok())?;
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    let pool = POOL
+        .get_or_init(|| {
+            // Leave execution capacity for the guest and bound the total worker
+            // count even if several upload callers arrive at the same time.
+            let workers = (std::thread::available_parallelism().ok()?.get() / 2).min(4);
+            if workers < 2 {
+                return None;
+            }
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .thread_name(|i| format!("victory-detile-{i}"))
+                .build()
+                .ok()
+        })
+        .as_ref()?;
+    Some((pool, slot))
 }
 
 /// Copy micro-tile runs inline at a known width, or use each run's length for N = 0.
@@ -945,6 +1057,12 @@ mod tests {
                     l.tile(&mut tiled, mip, slice, &linear, row, plane).unwrap();
                     let mut back = vec![0xcc; linear.len()];
                     l.detile(&tiled, mip, slice, &mut back, row, plane).unwrap();
+                    #[cfg(feature = "parallel-detile")]
+                    {
+                        let mut upload = vec![0xcc; linear.len()];
+                        l.detile_upload(&tiled, mip, slice, &mut upload, row, plane).unwrap();
+                        assert_eq!(upload, back);
+                    }
                     for z in 0..m.depth {
                         let base = z as usize * plane;
                         for y in 0..m.height {
@@ -966,6 +1084,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A large odd-width array slice takes the worker path on a multicore
+    /// host. The shortest legal output leaves padding off the very last row.
+    #[cfg(feature = "parallel-detile")]
+    #[test]
+    fn upload_bands_preserve_padding_and_validate_before_writing() {
+        let desc = Desc {
+            depth: 2,
+            ..desc(2049, 513, 2, 4, Swizzle::SW_64KB_D)
+        };
+        let layout = Layout::new(&desc).unwrap();
+        let source: Vec<u8> = (0..layout.size as usize)
+            .map(|i| ((i >> 13) ^ (i >> 7) ^ i) as u8)
+            .collect();
+        let row_bytes = desc.width as usize * 4;
+        let pitch = row_bytes.next_multiple_of(256);
+        let need = (desc.height as usize - 1) * pitch + row_bytes;
+
+        for extra in [0, pitch * 5] {
+            let mut expected = vec![0xbd; need + extra];
+            let mut actual = expected.clone();
+            layout
+                .detile(&source, 0, 1, &mut expected, pitch, 0)
+                .unwrap();
+            layout
+                .detile_upload(&source, 0, 1, &mut actual, pitch, 0)
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+
+        let mut guard = vec![0xbd; need];
+        for (source_len, dest_len, pitch, slice, mip, error) in [
+            (source.len(), need - 1, pitch, 1, 0, Error::TooSmall),
+            (source.len() - 1, need, pitch, 1, 0, Error::TooSmall),
+            (source.len(), need, row_bytes - 1, 1, 0, Error::TooSmall),
+            (source.len(), need, usize::MAX, 1, 0, Error::TooSmall),
+            (source.len(), need, pitch, 2, 0, Error::Invalid),
+            (source.len(), need, pitch, 1, 2, Error::Invalid),
+        ] {
+            let result = layout.detile_upload(
+                &source[..source_len],
+                mip,
+                slice,
+                &mut guard[..dest_len],
+                pitch,
+                0,
+            );
+            assert_eq!(result, Err(error));
+        }
+        assert!(guard.iter().all(|&v| v == 0xbd));
     }
 
     /// Hand-checked: in a 64 KiB `D` block of 4-byte elements, x bits go to
