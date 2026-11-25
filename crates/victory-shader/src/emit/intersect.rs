@@ -384,9 +384,12 @@ impl<'a> Lower<'a> {
                 .set_phi(phi, vec![(floats[n], wide_end), (halves[n], half_block)]);
             coords.push(phi);
         }
-        let resident_all = self.s.m.phi(join, self.s.t.i1);
+        let second_half_resident = self.s.m.phi(join, self.s.t.i1);
         let yes = self.s.m.bool(true);
-        self.s.m.set_phi(resident_all, vec![(resident, wide_end), (yes, half_block)]);
+        self.s.m.set_phi(
+            second_half_resident,
+            vec![(resident, wide_end), (yes, half_block)],
+        );
         // The inverse direction held finite ([`bvh::boxes`]).
         let (most, least) = (
             self.s.m.f32(f32::MAX.to_bits()),
@@ -427,8 +430,12 @@ impl<'a> Lower<'a> {
             let on = self.s.m.bool(true);
             let on = self.s.m.bin(c, Bin::Xor, off, on);
             let hit = self.s.m.bin(c, Bin::And, through, before);
-            let hit = self.s.m.bin(c, Bin::And, hit, on);
-            let hit = self.s.m.bin(c, Bin::And, hit, resident_all);
+            let mut hit = self.s.m.bin(c, Bin::And, hit, on);
+            // Only box32 children 2 and 3 read bounds from the second 64 bytes;
+            // children 0 and 1 fit in the resident first half alongside all 4 pointers.
+            if n >= 2 {
+                hit = self.s.m.bin(c, Bin::And, hit, second_half_resident);
+            }
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }

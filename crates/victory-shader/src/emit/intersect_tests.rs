@@ -677,7 +677,8 @@ fn traversal_requires_resident_bvh_pages_and_requests_only_the_pages_it_reads() 
     let mut records = vec![0; (NODES / 4) as usize];
     let items = [
         (4 * PAGE + 0x180, 5, true), // one page
-        (5 * PAGE - 64, 5, true),    // two pages in separate copies
+        (5 * PAGE - 64, 5, true),    // two pages in separate copies (first 64B on page 4, tail on page 5)
+        (4 * PAGE + 0x200, 4, true), // resident all-zero box16: valid zero child IDs
         (6 * PAGE + 0x180, 5, true), // missing box
         (6 * PAGE + 0x1c0, 0, true), // missing triangle
         (7 * PAGE - 64, 5, true),    // missing first span: do not request page 7
@@ -730,7 +731,8 @@ fn traversal_requires_resident_bvh_pages_and_requests_only_the_pages_it_reads() 
                 groups: [1, 1, 1],
             }).expect("dispatch with the production memory bindings");
             let miss = [bvh::NONE; 4];
-            let wanted = [hit, if tail_ready { hit } else { miss }, miss, bvh::MISS.map(f32::to_bits), miss, BEFORE];
+            let partial = [hit[0], hit[1], bvh::NONE, bvh::NONE];
+            let wanted = [hit, if tail_ready { hit } else { partial }, [0; 4], miss, bvh::MISS.map(f32::to_bits), miss, BEFORE];
             for (i, expected) in wanted.iter().enumerate() {
                 assert_eq!(&out[0][i * 4..][..4], expected, "warp={warp}, tail_ready={tail_ready}, lane {i}");
             }
