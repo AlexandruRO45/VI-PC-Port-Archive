@@ -811,26 +811,39 @@ pub fn writing(at: usize, len: usize) {
         return;
     }
     let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
-    let mut g = guards();
-    let until = std::time::Instant::now() + PIN;
-    g.pins.push((first, last, until));
-    open(&mut g, at, at + len);
-    if !view_guard() {
-        return;
-    }
-    // The same pages at their other views: the write lands in them too, so
-    // their copies must take them again, now and when it has landed.
-    for block in first..last {
-        let shown = aliases(block * BLOCK);
-        if shown.len() < 2 || shown.len() > MANY_VIEWS {
-            continue;
-        }
-        for alias in shown {
-            if alias / BLOCK != block {
-                g.pins.push((alias / BLOCK, alias / BLOCK + 1, until));
-                open_here(&mut g, alias, alias + BLOCK);
+    // Textures placed where the write lands, at any view of its pages.
+    let mut stale = vec![(at, at + len)];
+    {
+        let mut g = guards();
+        let until = std::time::Instant::now() + PIN;
+        g.pins.push((first, last, until));
+        open(&mut g, at, at + len);
+        if view_guard() {
+            // The same pages at their other views: the write lands in them
+            // too, so their copies must take them again, now and when it
+            // has landed.
+            for block in first..last {
+                let shown = aliases(block * BLOCK);
+                if shown.len() < 2 || shown.len() > MANY_VIEWS {
+                    continue;
+                }
+                for alias in shown {
+                    if alias / BLOCK != block {
+                        g.pins.push((alias / BLOCK, alias / BLOCK + 1, until));
+                        open_here(&mut g, alias, alias + BLOCK);
+                        stale.push((alias, alias + BLOCK));
+                    }
+                }
             }
         }
+    }
+    // Uploaded again at their next use: what the GPU wrote into a texture's
+    // memory through another view of it (a buffer) and we copy back reached
+    // the texture only when its turn to be looked at again came, if ever
+    // (tattoos and skin of noise on people: right with every texture looked
+    // at at every use, VICTORY_TEXTURES=always).
+    for (from, to) in stale {
+        crate::resource::textures_rewritten(from as u64, to as u64);
     }
 }
 
