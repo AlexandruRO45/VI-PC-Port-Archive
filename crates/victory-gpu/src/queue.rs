@@ -178,7 +178,8 @@ extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token:
     execute(this, count, lists);
 }
 /// Signal with sync settings for the top and bottom of the pipe; our
-/// submissions are complete when they return, so it signals at once.
+/// submissions are waited for (any asynchronous one is, when the signal
+/// runs), so it is [`signal`]: it runs once the queue's work before it has.
 extern "system" fn signal2_x(
     this: This,
     fence: This,

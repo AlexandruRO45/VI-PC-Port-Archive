@@ -7,13 +7,13 @@
 //! - `CardState::staging` (`L0` WRITE_BACK, mapped as `Shadow::data`) receives
 //!   CPU title-memory updates and simultaneously serves as the exact
 //!   pre-submission snapshot (zero snapshot `memcpy` in `Shadow::writing`!).
-//! - Before a submission (`card_before`), only CPU-modified ranges are uploaded
+//! - Before a submission (`record_before`), only CPU-modified ranges are uploaded
 //!   via `CopyBufferRegion` and re-hashed on the GPU (if the buffer has hashes).
-//! - At the end of a submission (`card_after`), `CARD_COMPARE` dispatches one
+//! - At the end of a submission (`record_after`), `CARD_COMPARE` dispatches one
 //!   64-thread workgroup per declared 64 KiB page in VRAM (64 coalesced
 //!   1024-byte bursts per page, 64x less sequential latency than 1 thread/page),
 //!   writing a 4-byte dirty flag per page to a small readback buffer.
-//! - After the fence (`card_back`), ONLY pages flagged dirty are copied from
+//! - After the fence (`finish_back`), ONLY pages flagged dirty are copied from
 //!   VRAM to a readback buffer and merged into title memory + `staging`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -326,7 +326,7 @@ fn byte_ranges_to_piece_runs(ranges: &[(usize, usize)], max_pieces: u32) -> Vec<
     out
 }
 
-/// Per-submission plan built in `card_before` and consumed in `card_after` + `card_back`.
+/// Per-submission plan built in `record_before` and consumed in `record_after` + `finish_back`.
 pub(crate) struct CardPlan {
     entries: Vec<CardWriteEntry>,
     total_pieces: u32,

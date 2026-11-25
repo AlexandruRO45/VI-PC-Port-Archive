@@ -330,7 +330,7 @@ fn record_clamp(
 
 /// How clamps of indirect draws are recorded: 0 each before its draw; 1 in
 /// a list of their own before the list that draws, so that a run of draws
-/// is not interleaved with our dispatches (the default); 2 as 1, with a
+/// is not interleaved with our dispatches; 2 as 1, with a
 /// barrier for shader writes before each draw as the clamps had.
 /// To find faults: 3 as 1 for mesh dispatches only, 4 as 1 for draws only,
 /// 5 as 1 with a new list for the clamps always, 6 the lists cut as for 1
@@ -419,7 +419,8 @@ pub(crate) fn bound_before(
     let l = &clamps.list;
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, destination (writable: `clamp_room`) and budget buffers. The
-    // clamps write apart and charge the budget atomically: no barriers.
+    // clamps write apart and charge the budget atomically: no barriers,
+    // but in mode 7 (below), which orders the charges.
     unsafe {
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);

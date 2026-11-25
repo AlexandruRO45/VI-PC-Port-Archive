@@ -1,8 +1,10 @@
 //! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
-//! shortcut: every submission is waited for, so CPU and GPU never overlap;
-//! overlap them with per-submission fences once more than clears run.
+//! shortcut: a submission is waited for, so CPU and GPU do not overlap, except
+//! with `VICTORY_ASYNC_SUBMIT=1` for one with nothing to copy back (it is
+//! waited for before the next submission); overlap them all with
+//! per-submission fences once more than clears run.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -1012,7 +1014,7 @@ impl Host {
             );
             if !target.runs(64) {
                 tracing::warn!(
-                    "the host has no 64-lane waves: console wave64 compute programs that read                      other lanes do not translate, and their dispatches are dropped"
+                    "the host has no 64-lane waves: console wave64 compute programs that read other lanes do not translate, and their dispatches are dropped"
                 );
             }
             target
@@ -2489,7 +2491,8 @@ impl HostList {
 
     /// Queues submission-time materialization and refresh of the bindless
     /// slots in `heap`, once per list; `writes`: the draw's shaders may write
-    /// memory, so the slots' unordered access ranges go back to title memory.
+    /// memory (their unordered access ranges are copied back only in tests,
+    /// see `Batch::prepare_bindless`).
     pub(crate) fn defer_bindless(
         &self,
         heap: &std::sync::Arc<crate::descriptor::host::HostHeap>,
@@ -2651,7 +2654,8 @@ struct Batch {
     /// Their plans, which hold the host resources the slots view until the
     /// submission has run.
     plans: Vec<std::sync::Arc<crate::descriptor::host::BindlessPlan>>,
-    /// Bindless unordered access ranges, copied back after the submission.
+    /// Bindless unordered access ranges, copied back after the submission
+    /// (filled only in tests, see `prepare_bindless`).
     bindless_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
 }
 
@@ -2725,8 +2729,10 @@ impl Batch {
     /// After every list's steps (no title copy follows): each directly
     /// indexed heap's slots, once per submission however many lists and
     /// draws use it. What they read is refreshed (unchanged pages cost only
-    /// the write-watch's answer); their unordered access ranges are kept
-    /// for copy-back only when a shader that may write memory uses the heap.
+    /// the write-watch's answer); in tests their unordered access ranges are
+    /// kept for copy-back when a shader that may write memory uses the heap
+    /// (outside tests what shaders write stays in the copy: see the shortcut
+    /// below).
     fn prepare_bindless(&mut self) {
         self.flush();
         for (heap, writes) in std::mem::take(&mut self.bindless) {

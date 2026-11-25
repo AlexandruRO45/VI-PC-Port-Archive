@@ -365,8 +365,10 @@ pub fn XTaskQueueSubmitDelayedCallback(
     }
 }
 
-/// Cancels what is still queued (callbacks see `canceled`), refuses new
-/// work, then calls `callback`.
+/// Cancels what is still queued on manual and serialized ports (callbacks
+/// see `canceled`), refuses new work, then calls `callback`. Work already
+/// handed to the thread pool, and delayed callbacks still waiting, are not
+/// canceled.
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
     _wait: bool,

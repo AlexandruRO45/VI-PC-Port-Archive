@@ -143,7 +143,8 @@ pub(crate) fn take_frame() -> Vec<String> {
 }
 
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
-/// (no host pipeline) since the last call.
+/// (no host pipeline, state it could not bind, or past its limits) since the
+/// last call.
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
@@ -694,8 +695,6 @@ impl State {
         true
     }
 
-    /// A descriptor a shader reads through a table: its host slot made if
-    /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
@@ -1107,6 +1106,8 @@ impl State {
         }
     }
 
+    /// A descriptor a shader reads through a table: its host slot made if
+    /// it changed, constant data copied, textures made readable.
     fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
@@ -1827,9 +1828,7 @@ impl State {
     }
 }
 
-/// The host command signature for one argument of `kind` with records
-/// `stride` bytes apart (no root arguments, so no root signature), made
-/// `n` dwords of title memory at `address` (diagnostics).
+/// `n` dwords of title memory at `address` in hexadecimal (diagnostics).
 #[cfg(feature = "diagnostics")]
 fn title_words(address: u64, n: usize) -> String {
     let mut words = vec![0u32; n];
@@ -1841,6 +1840,8 @@ fn title_words(address: u64, n: usize) -> String {
     format!("{words:x?}")
 }
 
+/// The host command signature for one argument of `kind` with records
+/// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =

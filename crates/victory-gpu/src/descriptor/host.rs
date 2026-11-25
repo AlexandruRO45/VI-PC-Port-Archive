@@ -38,10 +38,9 @@ pub(crate) struct HostHeap {
     /// slot viewing a pooled texture, so the backing heap cannot be freed while
     /// a shader-visible descriptor slot still points into it.
     kept_textures: Mutex<HashMap<u32, Arc<crate::resource::HostTexture>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    /// Where the next search starts, the slots taken, and the smallest run
-    /// known not to be free since the last release (`usize::MAX`: none).
+    /// Where the next search for free dynamic slots starts, the slots taken
+    /// (by lists not yet reset), and the smallest run known not to be free
+    /// since the last release (`usize::MAX`: none).
     next: Mutex<(u32, Vec<bool>, usize)>,
     /// Per-slot element byte stride (`u32`) for structured buffers whose
     /// stride shader analysis could not recover statically.

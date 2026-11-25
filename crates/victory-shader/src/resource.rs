@@ -155,9 +155,6 @@ pub struct Waterfall {
     pub unset: Vec<Value>,
 }
 
-/// Traces every descriptor and scalar address of `p`, which runs as
-/// `stage`, to the root parameters in `layout`. Fails on the first one it
-/// cannot trace.
 /// Whether the program intersects rays with an acceleration structure.
 pub fn traces_rays(p: &Program) -> bool {
     p.blocks
@@ -166,6 +163,9 @@ pub fn traces_rays(p: &Program) -> bool {
         .any(|i| i.name().starts_with("image_bvh"))
 }
 
+/// Traces every descriptor and scalar address of `p`, which runs as
+/// `stage`, to the root parameters in `layout`. Fails on the first one it
+/// cannot trace.
 pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resources, ShaderError> {
     track_with(p, layout, stage, false)
 }
@@ -621,8 +621,6 @@ impl<'a> Tracer<'a> {
         self.origin(v)
     }
 
-    /// A global memory address: an SGPR pair plus a VGPR offset, or a VGPR
-    /// pair.
     /// The address a `buffer_load_dword*` reads in each lane, for a buffer
     /// whose descriptor is built around an address (a heap or a table, say):
     /// that address plus the VGPR offset (`offen`), `soffset` and the
@@ -683,6 +681,8 @@ impl<'a> Tracer<'a> {
         Ok(a)
     }
 
+    /// A global memory address: an SGPR pair plus a VGPR offset, or a VGPR
+    /// pair.
     fn flat_address(
         &self,
         inst: &Inst,

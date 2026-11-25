@@ -1446,8 +1446,9 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 }
 
 /// Draw state the host has no use for (root signatures: ours come with
-/// the pipeline; depth bounds, depth order and shading rate hints): any
-/// arguments, nothing returned.
+/// the pipeline; depth order and shading rate hints): any arguments,
+/// nothing returned. Depth bounds are set where the host list has them
+/// (`depth_bounds`).
 extern "system" fn ignored_state(_: This) {}
 
 extern "system" fn depth_bounds(this: This, min: f32, max: f32) {

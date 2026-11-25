@@ -9079,8 +9079,6 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, x, m))
     }
 
-    /// Packed 16-bit operations (`v_pk_*`): each half computed as the
-    /// 16-bit operation does, f16 through f32 as in [`Self::valu16`].
     /// `v_pk_fmac_f16`: each half of the destination plus the product of the
     /// sources' halves.
     // shortcut: FMad in f32, as v_fma_f16 (a second rounding).
@@ -9121,6 +9119,8 @@ impl<'a> Lower<'a> {
         self.write_i(inst, x, guard)
     }
 
+    /// Packed 16-bit operations (`v_pk_*`): each half computed as the
+    /// 16-bit operation does, f16 through f32 as in [`Self::valu16`].
     fn packed16(&mut self, inst: &Inst, op: &str, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -12918,8 +12918,6 @@ impl<'a> Lower<'a> {
     }
 }
 
-/// The DXIL interpolation mode of a kind of barycentrics (none for the
-/// pull model).
 /// The host's limit on a mesh shader's vertex plus primitive outputs
 /// (DXC's `kMaxMSOutputTotalBytes`).
 const MAX_MESH_OUTPUT_BYTES: u32 = 32768;
@@ -13011,6 +13009,8 @@ pub(super) fn settle_position_mode(inputs: &mut [SigElement]) {
     }
 }
 
+/// The DXIL interpolation mode of a kind of barycentrics (none for the
+/// pull model).
 fn interp_mode(kind: Barycentric) -> Option<u8> {
     Some(match kind {
         Barycentric::PerspectiveCenter => 2,

@@ -12,8 +12,9 @@
 //! elements keep the first vertex's values.
 //!
 //! shortcut: the whole buffer is expanded for every draw (twice its size in
-//! a buffer the list keeps), and vertex strides, element offsets and the
-//! buffer's address must be multiples of 4 bytes; other draws are dropped.
+//! a buffer the list keeps), the vertex stride and the buffer's address must
+//! be multiples of 4 bytes, and there are at most [`ELEMENTS`] elements per
+//! buffer; other draws are dropped.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;

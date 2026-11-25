@@ -1314,11 +1314,6 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<Arc<Shado
     })
 }
 
-/// Copies of title memory the host GPU cannot use in place: a buffer as long
-/// as the address space chunk it stands for, with memory behind the 64 KiB
-/// tiles that were brought up to date. Reads of the others give zeros, where
-/// a copy ending too soon was a GPU page fault; and memory many buffers of
-/// the title overlap in is copied once.
 /// The first 32 words of `size` bytes of title memory, in hexadecimal.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn words_text(address: u64, size: usize) -> String {
@@ -1422,6 +1417,11 @@ impl std::hash::Hasher for Mix {
     }
 }
 
+/// Copies of title memory the host GPU cannot use in place: a buffer as long
+/// as the address space chunk it stands for, with memory behind the 64 KiB
+/// tiles that were brought up to date. Reads of the others give zeros, where
+/// a copy ending too soon was a GPU page fault; and memory many buffers of
+/// the title overlap in is copied once.
 struct Sparse {
     /// By tile: where the CPU writes it, and where it is in which heap.
     tiles: Mutex<std::collections::HashMap<u32, Tile, Mix>>,
@@ -2300,7 +2300,8 @@ pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
-/// gets copies of the aligned windows it touches.
+/// is in a sparse copy of its chunk where there is one ([`sparse`]), else in
+/// copies of the aligned windows it touches.
 /// shortcut: copies of windows are never freed; key them to the title's
 /// allocations if memory use grows.
 const WINDOW: u64 = 4 << 20;

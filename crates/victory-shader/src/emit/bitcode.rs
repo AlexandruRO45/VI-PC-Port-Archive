@@ -107,8 +107,9 @@ pub(crate) mod pred {
     pub const OGE: u8 = 3;
     pub const OLT: u8 = 4;
     pub const OLE: u8 = 5;
-    // Not emitted: the AMD D3D12 driver treats it as UNE, so `v_cmp_lg`
-    // lowers as OLT | OGT instead.
+    // Not for `v_cmp_lg`: the AMD D3D12 driver treats it as UNE, so that
+    // lowers as OLT | OGT instead. Only the ray-triangle test (`intersect`)
+    // emits it.
     #[allow(dead_code)]
     pub const ONE: u8 = 6;
     pub const ORD: u8 = 7;
@@ -561,7 +562,6 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
-    /// The module as bitcode.
     /// Which instructions are written: every body instruction, the branch
     /// conditions, and whatever they read, transitively (a phi nothing reads
     /// is dropped). A worklist visits each instruction once, so a long chain
@@ -593,6 +593,7 @@ impl Module {
         live
     }
 
+    /// The module as bitcode.
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");

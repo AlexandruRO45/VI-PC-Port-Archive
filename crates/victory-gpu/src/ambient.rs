@@ -6,10 +6,11 @@
 //! whatever the sun does not reach directly is black. Right after that
 //! program, its output is replaced by a constant (it used to be a floor
 //! under what the program wrote, but that is garbage: see the shader). The
-//! constant is the same everywhere: the light in these images does not go with the title's exposure
-//! (well-lit surfaces hold about the same in a shot at -5.5 EV and in one at
-//! -9.75). The title's own lighting then applies it with the surfaces'
-//! colors. Raised, not added: the result is the next frame's history.
+//! constant is the same everywhere: the light in these images does not go
+//! with the title's exposure (well-lit surfaces hold about the same in a
+//! shot at -5.5 EV and in one at -9.75). The title's own lighting then
+//! applies it with the surfaces' colors. Replaced, not added: the result is
+//! the next frame's history.
 //!
 //! `VICTORY_AMBIENT=<level>` sets it (0.6 by default, 0 for none); `off`
 //! keeps the title's own output.
@@ -36,7 +37,7 @@ pub(crate) const LIGHT: (u8, u32) = (1, 176);
 /// title's resolve wrote; 0 is no indirect diffuse light at all.
 const DEFAULT: f32 = 0.6;
 
-/// The floor; `None` if off.
+/// The constant; `None` if off.
 pub(crate) fn level() -> Option<f32> {
     static LEVEL: OnceLock<f32> = OnceLock::new();
     let level = *LEVEL.get_or_init(|| {
@@ -161,9 +162,9 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
 
-/// Raises what `light` holds to the floor, in `list`, after the program that
-/// wrote it as an image. Whether it recorded anything (the list's bindings
-/// are then ours).
+/// Replaces what `light` holds by the constant, in `list`, after the program
+/// that wrote it as an image. Whether it recorded anything (the list's
+/// bindings are then ours).
 pub(crate) fn raise(list: &HostList, light: This) -> bool {
     let (Some(level), Some(host)) = (level(), host()) else {
         return false;
