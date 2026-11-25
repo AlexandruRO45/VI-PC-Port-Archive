@@ -3544,4 +3544,285 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             before.as_secs_f64() / after.as_secs_f64()
         );
     }
+    #[test]
+    fn vram_dirty_sync_survives_title_written_and_only_copies_changed_pages() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        let Some(copy) = crate::shadow::Shadow::new_with_vram(p as u64, len as u64) else {
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, len);
+        batch.title_written(); // clears `batch.current`
+        let syncs = batch.take_vram_syncs();
+        assert_eq!(syncs.len(), 1);
+        assert_eq!(syncs[0].1, vec![(0, len as u64)]);
+        assert!(!copy.has_vram_dirty());
+
+        // Second batch touching only page 3 after a write.
+        // SAFETY: our pool, guarded since the first flush took it.
+        unsafe { ((p + 3 * PAGE + 8) as *mut u32).write_volatile(0x1234) };
+        let mut batch2 = Batch::default();
+        batch2.add(&copy, p, len);
+        assert_eq!(batch2.flush(), PAGE);
+        let syncs2 = batch2.take_vram_syncs();
+        assert_eq!(syncs2.len(), 1);
+        assert_eq!(syncs2[0].1, vec![((3 * PAGE) as u64, PAGE as u64)]);
+
+        drop(batch);
+        drop(batch2);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    #[test]
+    fn vram_copy_syncs_dirty_pages_and_reads_back_gpu_writes() {
+        use crate::watch::PAGE;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::s;
+
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        const SRC: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer buf : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint a = buf.Load(0);
+    uint b = buf.Load(2 * 65536);
+    buf.Store(65536, a + b);
+    buf.Store(65536 + 4, buf.Load(65536 + 16));
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: static shader text and valid output pointers.
+        unsafe {
+            D3DCompile(
+                SRC.as_ptr().cast(),
+                SRC.len(),
+                s!("vram_test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        // SAFETY: compiled shader blob bytes; root signature embedded.
+        let (root, pso) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        let Some(copy) = crate::shadow::Shadow::new_with_vram(p as u64, len as u64) else {
+            crate::watch::tests::free(p);
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let record_run = |list: &super::HostList| {
+            copy.refresh(list, p as u64, len as u64);
+            copy.gpu_writes(list, (p + PAGE) as u64, PAGE as u64, false);
+            // SAFETY: open list, live root signature/pipeline, and valid VRAM GPU VA.
+            unsafe {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetComputeRootUnorderedAccessView(0, copy.gpu(p as u64));
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+        };
+        let read_u32 = |off: usize| -> u32 {
+            // SAFETY: our pool.
+            unsafe { ((p + off) as *const u32).read_volatile() }
+        };
+        let write_u32 = |off: usize, val: u32| {
+            // SAFETY: our pool.
+            unsafe { ((p + off) as *mut u32).write_volatile(val) };
+        };
+
+        // Round 1: initial sync of all pages + GPU write readback.
+        write_u32(0, 10);
+        write_u32(2 * PAGE, 20);
+        record_run(&list);
+        host.execute(&[&list]);
+        assert_eq!(read_u32(PAGE), 30);
+
+        // Round 2: write only page 2 + concurrent title write in page 1 (+16).
+        list.reset();
+        record_run(&list);
+        write_u32(2 * PAGE, 55);
+        write_u32(PAGE + 16, 0x7777);
+        host.execute(&[&list]);
+        assert_eq!(read_u32(PAGE), 65);
+        assert_eq!(read_u32(PAGE + 16), 0x7777);
+
+        // Round 3: no title writes; shader reads concurrent title write pushed to VRAM.
+        list.reset();
+        record_run(&list);
+        host.execute(&[&list]);
+        assert_eq!(read_u32(PAGE + 4), 0x7777);
+
+        drop(list);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    #[test]
+    fn vram_copy_reads_back_view_marked_pages_before_copy_back_marks() {
+        use crate::watch::PAGE;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::s;
+
+        let (Some(host), Some(marks_gpu)) = (super::host(), crate::shadow::view_writes()) else {
+            return; // no host GPU here
+        };
+        const SRC: &str = r#"
+#define RS "UAV(u0), UAV(u1), RootConstants(num32BitConstants=2, b0)"
+RWByteAddressBuffer buf : register(u0);
+RWByteAddressBuffer marks : register(u1);
+cbuffer C : register(b0) { uint mark_word; uint mark_mask; };
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint a = buf.Load(0);
+    uint b = buf.Load(2 * 65536);
+    buf.Store(65536, a + b);
+    buf.Store(65536 + 4, buf.Load(65536 + 16));
+    uint prev;
+    marks.InterlockedOr(mark_word * 4, mark_mask, prev);
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: static shader text and valid output pointer.
+        unsafe {
+            D3DCompile(
+                SRC.as_ptr().cast(),
+                SRC.len(),
+                s!("vram_marks_test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        // SAFETY: compiled shader blob bytes; root signature embedded.
+        let (root, pso) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        let Some(copy) = crate::shadow::Shadow::new_with_vram(p as u64, len as u64) else {
+            crate::watch::tests::free(p);
+            return;
+        };
+        let Some((bit, _)) = copy.mark_entry((p + PAGE) as u64) else {
+            drop(copy);
+            crate::watch::tests::free(p);
+            return;
+        };
+        let mark_consts = [bit / 32, 1u32 << (bit % 32)];
+        let list = host.new_list().unwrap();
+        let record_run = |list: &super::HostList| {
+            copy.refresh(list, p as u64, len as u64);
+            copy.gpu_writes(list, p as u64, len as u64, true);
+            // SAFETY: open list, live root signature/pipeline, and valid VRAM/bitmap GPU VAs.
+            unsafe {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetComputeRootUnorderedAccessView(0, copy.gpu(p as u64));
+                list.list.SetComputeRootUnorderedAccessView(1, marks_gpu);
+                list.list.SetComputeRoot32BitConstants(2, 2, mark_consts.as_ptr().cast(), 0);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+        };
+        let read_u32 = |off: usize| -> u32 {
+            // SAFETY: our pool.
+            unsafe { ((p + off) as *const u32).read_volatile() }
+        };
+        let write_u32 = |off: usize, val: u32| {
+            // SAFETY: our pool.
+            unsafe { ((p + off) as *mut u32).write_volatile(val) };
+        };
+
+        // Round 1: shader writes page 1 in VRAM and marks its bit; readback happens before `copy_back_marks`.
+        write_u32(0, 10);
+        write_u32(2 * PAGE, 20);
+        record_run(&list);
+        host.execute(&[&list]);
+        assert_eq!(read_u32(PAGE), 30);
+
+        // Round 2: write page 2 + concurrent title write in page 1 (+16) while page 1 is marked.
+        list.reset();
+        record_run(&list);
+        write_u32(2 * PAGE, 55);
+        write_u32(PAGE + 16, 0x7777);
+        host.execute(&[&list]);
+        assert_eq!(read_u32(PAGE), 65);
+        assert_eq!(read_u32(PAGE + 16), 0x7777);
+
+        // Round 3: concurrent title write merged by `copy_back_marked` was pushed back to VRAM.
+        list.reset();
+        record_run(&list);
+        host.execute(&[&list]);
+        assert_eq!(read_u32(PAGE + 4), 0x7777);
+
+        drop(list);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
 }
