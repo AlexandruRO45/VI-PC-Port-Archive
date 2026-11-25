@@ -13,7 +13,7 @@
 set -eu
 here=$(dirname "$(readlink -f "$0")")
 game=${VICTORY_GAME_DIR:-"$here/../GTA6.Xbox.v1.0.2.1"}
-proton=${PROTON:-/usr/share/steam/compatibilitytools.d/proton-cachyos-slr}
+proton_dir=${PROTON:-/usr/share/steam/compatibilitytools.d/proton-cachyos-slr}
 exe="$here/target/x86_64-pc-windows-msvc/release/victory.exe"
 
 [ -x "$exe" ] || {
@@ -28,18 +28,26 @@ exe="$here/target/x86_64-pc-windows-msvc/release/victory.exe"
 export WINEPREFIX=${WINEPREFIX:-"$HOME/.local/share/victory-proton/pfx"}
 export WINEDLLOVERRIDES=${WINEDLLOVERRIDES:-"d3d12=n;d3d12core=n;dxgi=n"}
 export WINEDEBUG=${WINEDEBUG:--all}
-wine=${WINE:-"$proton/files/bin/wine"}
+wine=${WINE:-"$proton_dir/files/bin/wine"}
 
-gamew=$("$wine" winepath -w "$game" 2>/dev/null | tr -d '\r')
-exew=$("$wine" winepath -w "$game/game_scarlett_master.exe" 2>/dev/null | tr -d '\r')
-case $gamew in
-    [A-Za-z]:\\*) ;;
-    *) printf 'winepath did not map %s (%s)\n' "$game" "$gamew" >&2; exit 1 ;;
-esac
+# Convert a Unix path to a Windows path, failing loudly if Wine can't map it.
+towin() {
+    w=$("$wine" winepath -w "$1" 2>/dev/null | tr -d '\r') || w=
+    case $w in
+        [A-Za-z]:\\*) printf '%s' "$w" ;;
+        *) printf 'winepath did not map %s (got: %s)\n' "$1" "$w" >&2; return 1 ;;
+    esac
+}
+
+data=${VICTORY_DATA_DIR:-"$(dirname "$here")/victory-data"}
+cache=${VICTORY_CACHE_DIR:-"$(dirname "$here")/victory-cache"}
+mkdir -p "$data" "$cache"
+
+gamew=$(towin "$game") || exit 1
+exew=$(towin "$game/game_scarlett_master.exe") || exit 1
 
 export VICTORY_GAME_DIR="$gamew"
-export VICTORY_DATA_DIR=${VICTORY_DATA_DIR:-"$(dirname "$here")/victory-data"}
-export VICTORY_CACHE_DIR=${VICTORY_CACHE_DIR:-"$(dirname "$here")/victory-cache"}
-mkdir -p "$VICTORY_DATA_DIR" "$VICTORY_CACHE_DIR"
+export VICTORY_DATA_DIR=$(towin "$data") || exit 1
+export VICTORY_CACHE_DIR=$(towin "$cache") || exit 1
 
 exec "$wine" "$exe" run "$exew" --execute "$@"
