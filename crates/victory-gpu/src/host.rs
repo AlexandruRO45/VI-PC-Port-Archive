@@ -9672,8 +9672,9 @@ fn read_kernel(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    // kernel checks the source. A read that stops short is a failed read:
+    // the rest of `dst` holds what it held before.
+    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 && done == len }
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]

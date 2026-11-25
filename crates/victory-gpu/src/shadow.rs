@@ -3080,8 +3080,7 @@ impl Shadow {
         let last = last_difference(now, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
-        title.clear();
-        title.resize(n, 0);
+        let title = scratch_prefix(title, n);
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
         if !crate::host::read_into((start + at) as *const u8, title) {
@@ -3729,8 +3728,7 @@ impl Shadow {
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
-        title.clear();
-        title.resize(n, 0);
+        let title = scratch_prefix(title, n);
         let mut written = 0;
         if crate::host::read_into((start + at) as *const u8, title) {
             // As in `copy_back`: the card's byte where it is not what it
@@ -3804,8 +3802,7 @@ impl Shadow {
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         let skip = card.notes.lock().unwrap_or_else(|e| e.into_inner()).over(at, at + n, fetched_after);
-        title.clear();
-        title.resize(n, 0);
+        let title = scratch_prefix(title, n);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
@@ -3888,6 +3885,29 @@ impl Shadow {
         let notes = card.notes.lock().unwrap_or_else(|e| e.into_inner());
         (joined(notes.dirty.clone()), notes.sent.iter().map(|(number, ranges)| (*number, ranges.to_vec())).collect())
     }
+}
+
+/// The first `len` bytes of `scratch`, grown with zeros if it is shorter.
+/// A merge reads title memory over all of them before it looks at any, so
+/// what an earlier, longer merge left there need not be cleared again: the
+/// list's room and bytes are reused across the pieces of a landing.
+fn scratch_prefix(scratch: &mut Vec<u8>, len: usize) -> &mut [u8] {
+    if scratch.len() < len {
+        scratch.resize(len, 0);
+    }
+    &mut scratch[..len]
+}
+
+#[cfg(test)]
+#[test]
+fn a_merge_scratch_keeps_its_room_and_bytes_for_shorter_reads() {
+    let mut scratch = Vec::new();
+    scratch_prefix(&mut scratch, 128).fill(0xcc);
+    let room = scratch.as_ptr();
+    assert_eq!(scratch_prefix(&mut scratch, 3).len(), 3);
+    assert_eq!(scratch.as_ptr(), room);
+    assert_eq!(scratch.len(), 128);
+    assert_eq!(scratch_prefix(&mut scratch, 129)[128], 0);
 }
 
 struct Entry {
