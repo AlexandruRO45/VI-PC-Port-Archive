@@ -1926,7 +1926,7 @@ impl Batch {
             .pending
             .entry(key)
             .or_insert_with(|| (shadow.clone(), vec![]));
-        push_range(ranges, address, end);
+        push_range(ranges, COALESCE, address, end);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -1962,7 +1962,7 @@ impl Batch {
                     .current
                     .entry(key)
                     .or_insert_with(|| (shadow.clone(), vec![]));
-                push_range(current, from, to);
+                push_range(current, 0, from, to);
             }
         }
         total
@@ -1974,15 +1974,17 @@ impl Batch {
 const COALESCE: usize = crate::watch::PAGE;
 
 /// Adds `[address, end)` to `ranges`, kept disjoint: what the range
-/// overlaps, or lies within [`COALESCE`] of, merges into it — and ranges
-/// it now bridges merge together.
-fn push_range(ranges: &mut Vec<(usize, usize)>, address: usize, end: usize) {
+/// overlaps, or lies within `gap` of, merges into it — and ranges it now
+/// bridges merge together. The ranges to copy take [`COALESCE`] (one
+/// kernel copy is cheaper than two across a page's gap); the ranges
+/// copied take no gap, so coverage never claims a byte no flush copied
+/// (a request inside a gap would be wrongly skipped).
+fn push_range(ranges: &mut Vec<(usize, usize)>, gap: usize, address: usize, end: usize) {
     let (mut from, mut to) = (address, end);
     let mut i = 0;
     while i < ranges.len() {
         let (a, e) = ranges[i];
-        let near = |x: usize, y: usize| x <= y.saturating_add(COALESCE);
-        if near(a, to) && near(from, e) {
+        if a <= to.saturating_add(gap) && from <= e.saturating_add(gap) {
             ranges.remove(i);
             from = from.min(a);
             to = to.max(e);
@@ -2977,13 +2979,13 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     #[test]
     fn ranges_of_a_copy_stay_disjoint() {
         let mut rs = vec![];
-        push_range(&mut rs, 0x1_0000, 0x1_1000);
-        push_range(&mut rs, 0x40_0000, 0x40_1000);
+        push_range(&mut rs, COALESCE, 0x1_0000, 0x1_1000);
+        push_range(&mut rs, COALESCE, 0x40_0000, 0x40_1000);
         assert_eq!(rs, [(0x1_0000, 0x1_1000), (0x40_0000, 0x40_1000)]);
         assert!(covered(&rs, 0x1_0000, 0x1_1000));
         assert!(!covered(&rs, 0x1_0000, 0x2_0000));
         // A page's gap coalesces ...
-        push_range(&mut rs, 0x1_1000 + crate::watch::PAGE, 0x1_2000 + crate::watch::PAGE);
+        push_range(&mut rs, COALESCE, 0x1_1000 + crate::watch::PAGE, 0x1_2000 + crate::watch::PAGE);
         assert_eq!(
             rs,
             [
@@ -2994,14 +2996,58 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // ... a page and one byte more stays apart.
         push_range(
             &mut rs,
+            COALESCE,
             0x1_2000 + 2 * crate::watch::PAGE + 1,
             0x1_2900 + 2 * crate::watch::PAGE + 1,
         );
         assert_eq!(rs.len(), 3);
         // A range bridging all of them coalesces them into one.
-        push_range(&mut rs, 0x1_3000 + crate::watch::PAGE, 0x50_0000);
+        push_range(&mut rs, COALESCE, 0x1_3000 + crate::watch::PAGE, 0x50_0000);
         assert_eq!(rs, [(0x1_0000, 0x50_0000)]);
         assert!(covered(&rs, 0x2_0000, 0x4f_0000));
+    }
+
+    /// The ranges a flush copied merge only where they touch: a page's
+    /// gap coalesces what to copy, never what has been copied (a missed
+    /// refresh found on hardware: pages 0, 2 and 1 flushed in that order
+    /// copied pages 0 and 2 and skipped 1).
+    #[test]
+    fn the_gap_between_copied_ranges_is_not_covered() {
+        let mut copied = vec![(0x1_0000, 0x1_1000)];
+        push_range(&mut copied, 0, 0x2_1000, 0x2_2000);
+        // A page apart: not merged, the gap between them stays pending.
+        assert_eq!(copied, [(0x1_0000, 0x1_1000), (0x2_1000, 0x2_2000)]);
+        assert!(!covered(&copied, 0x1_1000, 0x2_1000));
+        // Touching: merged, so a request inside is skipped.
+        push_range(&mut copied, 0, 0x2_1000, 0x2_2000);
+        push_range(&mut copied, 0, 0x1_1000, 0x2_1000);
+        assert_eq!(copied, [(0x1_0000, 0x2_2000)]);
+        assert!(covered(&copied, 0x1_1000, 0x2_1000));
+    }
+
+    /// The pages between two flushed ranges of one copy are refreshed
+    /// when asked for (pages 0, 2 and 1, in that order).
+    #[test]
+    fn a_page_between_flushed_ranges_is_refreshed_when_asked_for() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, PAGE);
+        assert_eq!(batch.flush(), PAGE, "page 0");
+        batch.add(&copy, p + 2 * PAGE, PAGE);
+        assert_eq!(batch.flush(), PAGE, "page 2");
+        // The middle page has not been copied: asking for it refreshes it.
+        batch.add(&copy, p + PAGE, PAGE);
+        assert_eq!(batch.flush(), PAGE, "page 1");
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
     }
 
     /// A submission asking for distant parts of one copy refreshes them
