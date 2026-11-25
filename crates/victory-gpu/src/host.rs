@@ -1811,6 +1811,12 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
     line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
 }
 
+/// A completed host fence needs no event registration or OS wait. D3D12
+/// reports UINT64_MAX on device removal; leave that to the existing error path.
+fn fence_reached(completed: u64, target: u64) -> bool {
+    completed != u64::MAX && completed >= target
+}
+
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
 /// holds, for every piece of every range of the plan, the copy, the
 /// piece's number in the copy and whether the compare flagged it there (or
@@ -1825,7 +1831,17 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{fence_reached, flagged_pieces, landable};
+
+    #[test]
+    fn completed_fence_can_skip_event_wait() {
+        assert!(!fence_reached(4, 5));
+        assert!(fence_reached(5, 5));
+        assert!(fence_reached(6, 5));
+        assert!(fence_reached(0, 0));
+        assert!(!fence_reached(u64::MAX, 5));
+        assert!(!fence_reached(u64::MAX, u64::MAX));
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -3748,14 +3764,18 @@ impl Host {
                 // SAFETY: the fence and event are ours, under the
                 // submission lock; `submitted` is the last value signalled.
                 unsafe {
-                    match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                        Ok(()) => {
-                            working(false);
-                            WaitForSingleObject(self.event, INFINITE);
-                            stood(waiting);
-                            working(true);
+                    // The late helper may already have waited for this value.
+                    // Only register an event if the host has not reached it.
+                    if !fence_reached(self.fence.GetCompletedValue(), *submitted) {
+                        match self.fence.SetEventOnCompletion(*submitted, self.event) {
+                            Ok(()) => {
+                                working(false);
+                                WaitForSingleObject(self.event, INFINITE);
+                                stood(waiting);
+                                working(true);
+                            }
+                            Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
                         }
-                        Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
                     }
                 }
                 let gpu = waiting.elapsed();
