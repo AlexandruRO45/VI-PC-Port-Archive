@@ -483,6 +483,11 @@ pub(crate) fn preparing(number: u64) {
     PREPARED.store(number, Ordering::Relaxed);
 }
 
+/// The submission being prepared ([`preparing`]).
+pub(crate) fn prepared() -> u64 {
+    PREPARED.load(Ordering::Relaxed)
+}
+
 /// With [`relay`]: the number of the last send of changed ranges to the
 /// card (`crate::host`'s order of the queue) that every fetch still to be
 /// merged came after. Notes of sends up to it are of no use any more.
@@ -1978,6 +1983,7 @@ impl Shadow {
                 }
                 if differs != 0 {
                     crate::watch::writing(start + at, n);
+crate::host::copy_source_written(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                     written += n;
                 }
@@ -2067,6 +2073,7 @@ impl Shadow {
             return 0;
         }
         crate::watch::writing(start + at, n);
+crate::host::copy_source_written(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
     }
@@ -2694,6 +2701,7 @@ impl Shadow {
             }
             if differs != 0 {
                 crate::watch::writing(start + at, n);
+crate::host::copy_source_written(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
             }
@@ -2769,6 +2777,7 @@ impl Shadow {
             return 0;
         }
         crate::watch::writing(start + at, n);
+crate::host::copy_source_written(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
     }

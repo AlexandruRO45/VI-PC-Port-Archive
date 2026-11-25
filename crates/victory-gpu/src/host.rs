@@ -2532,6 +2532,181 @@ fn flying() -> bool {
     line.settling || line.line.iter().any(|l| matches!(l, Late::Run(_)))
 }
 
+/// Whether a title buffer copy whose source alone lies in memory that
+/// flights' shaders may write runs without waiting for them
+/// (`VICTORY_COPY_NO_WAIT=1`). The title's 174 MiB heap is declared written
+/// whole by a table view, and one 20 KiB copy out of it a frame waited about
+/// 40 ms for bytes no shader writes. Off: such a copy waits, like every read.
+fn copy_no_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_NO_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// Whether a title buffer copy must wait for the flights that declared
+/// `written`: always for its destination, and for its source unless
+/// `no_wait` ([`copy_no_wait`]).
+fn copy_blocks(written: &[(usize, usize)], dst: usize, src: usize, len: usize, no_wait: bool) -> bool {
+    touches(written, dst, dst + len) || !no_wait && touches(written, src, src + len)
+}
+
+/// A title buffer copy that ran while a flight could still write its source.
+struct UnsettledCopy {
+    dst: usize,
+    src: usize,
+    len: usize,
+    /// The last submission whose shaders the copy must see.
+    until: u64,
+    /// A copy-back wrote over the source since the copy ran.
+    written: bool,
+}
+
+/// The copies [`copy_no_wait`] let run: if a flight's copy-back writes over
+/// a source, the copy is made again when that flight has landed, as the
+/// console's copy, in order after those shaders, would have read it.
+/// shortcut: a write by a shader that follows the copy in its own
+/// submission is taken too, and a source the title has used again by then
+/// gives its new bytes; neither was seen (0 of about 9,000 copies had a
+/// copy-back over their source at all).
+struct Unsettled(Vec<UnsettledCopy>);
+
+impl Unsettled {
+    /// A copy ran during the preparing of submission `until`. An earlier
+    /// copy into the same bytes is not made again.
+    fn ran(&mut self, dst: usize, src: usize, len: usize, until: u64) {
+        self.0.retain(|c| !(c.dst < dst + len && dst < c.dst + c.len));
+        self.0.push(UnsettledCopy {
+            dst,
+            src,
+            len,
+            until,
+            written: false,
+        });
+    }
+
+    /// The copy-back writes title memory `[at, at + len)`.
+    fn written(&mut self, at: usize, len: usize) {
+        for c in &mut self.0 {
+            if c.src < at + len && at < c.src + c.len {
+                c.written = true;
+            }
+        }
+    }
+
+    /// The copies to make again (destination, source, bytes), each once
+    /// per write over its source.
+    fn due(&mut self) -> Vec<(usize, usize, usize)> {
+        let due = self.0.iter().filter(|c| c.written).map(|c| (c.dst, c.src, c.len)).collect();
+        for c in &mut self.0 {
+            c.written = false;
+        }
+        due
+    }
+
+    /// Every flight up to `last` has landed.
+    fn landed(&mut self, last: u64) {
+        self.0.retain(|c| c.until > last);
+    }
+}
+
+static UNSETTLED: Mutex<Unsettled> = Mutex::new(Unsettled(Vec::new()));
+/// Copies let run without waiting, and copies made again, for the log.
+static COPY_NO_WAIT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn unsettled() -> std::sync::MutexGuard<'static, Unsettled> {
+    UNSETTLED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A title buffer copy ran at a submission's preparing.
+fn copy_ran(dst: usize, src: usize, len: usize) {
+    if copy_no_wait() && late() {
+        unsettled().ran(dst, src, len, crate::shadow::prepared());
+    }
+}
+
+/// The copy-back writes title memory `[at, at + len)` (`crate::shadow`).
+pub(crate) fn copy_source_written(at: usize, len: usize) {
+    if copy_no_wait() {
+        unsettled().written(at, len);
+    }
+}
+
+/// After a landing's copy-backs: makes again the copies whose source they
+/// wrote over.
+fn recopy_written_sources() {
+    if !copy_no_wait() {
+        return;
+    }
+    let due = unsettled().due();
+    for (dst, src, len) in due {
+        if COPY_NO_WAIT[1].fetch_add(1, Ordering::Relaxed) == 0 {
+            tracing::warn!(dst, src, len, "a flight's shaders wrote the source of a title buffer copy that had not waited: copied again");
+        }
+        crate::watch::writing(dst, len);
+        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+    }
+}
+
+/// Every flight up to `last` has landed: their copies are settled.
+fn copies_settled(last: u64) {
+    if copy_no_wait() {
+        unsettled().landed(last);
+    }
+}
+
+#[cfg(test)]
+mod copy_no_wait_tests {
+    use super::{Unsettled, copy_blocks};
+
+    #[test]
+    fn a_copy_waits_for_its_destination_and_for_its_source_unless_told_not_to() {
+        let written = [(0x1000, 0x2000)];
+        // source inside, destination outside
+        assert!(copy_blocks(&written, 0x9000, 0x1800, 0x100, false));
+        assert!(!copy_blocks(&written, 0x9000, 0x1800, 0x100, true));
+        // destination inside: waits either way
+        assert!(copy_blocks(&written, 0x1800, 0x9000, 0x100, true));
+        assert!(copy_blocks(&written, 0x1800, 0x9000, 0x100, false));
+        // neither
+        assert!(!copy_blocks(&written, 0x9000, 0xa000, 0x100, false));
+    }
+
+    #[test]
+    fn a_copy_is_made_again_once_when_a_copy_back_writes_its_source() {
+        let mut u = Unsettled(Vec::new());
+        u.ran(0x9000, 0x1800, 0x100, 7);
+        u.ran(0xa000, 0x3000, 0x100, 7);
+        // beside both sources, then over the end of the first
+        u.written(0x1900, 0x10);
+        assert!(u.due().is_empty());
+        u.written(0x18ff, 1);
+        assert_eq!(u.due(), [(0x9000, 0x1800, 0x100)]);
+        assert!(u.due().is_empty(), "once per write");
+    }
+
+    #[test]
+    fn a_later_copy_into_the_same_bytes_replaces_the_earlier_one() {
+        let mut u = Unsettled(Vec::new());
+        u.ran(0x9000, 0x1800, 0x100, 7);
+        u.ran(0x9080, 0x5000, 0x100, 8);
+        u.written(0x1800, 0x100);
+        assert!(u.due().is_empty(), "the newer copy's bytes stay");
+        u.written(0x5000, 1);
+        assert_eq!(u.due(), [(0x9080, 0x5000, 0x100)]);
+    }
+
+    #[test]
+    fn a_copy_is_settled_when_its_own_submission_has_landed() {
+        let mut u = Unsettled(Vec::new());
+        u.ran(0x9000, 0x1800, 0x100, 7);
+        u.landed(6);
+        u.written(0x1800, 1);
+        assert_eq!(u.due().len(), 1, "flight 7 can still write it");
+        u.landed(7);
+        u.written(0x1800, 1);
+        assert!(u.due().is_empty());
+    }
+}
+
 /// With flights in the air ([`late`]): why `runs` cannot be prepared
 /// before they are settled, if so. Preparing reads title memory on the
 /// CPU (the title's buffer copies, fills of upload memory, textures) and
@@ -2559,7 +2734,11 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
-                    if touches(written, src, src + len) || touches(written, dst, dst + len) {
+                    let no_wait = copy_no_wait();
+                    if count && no_wait && copy_blocks(written, dst, src, len, false) && !copy_blocks(written, dst, src, len, true) {
+                        COPY_NO_WAIT[0].fetch_add(1, Ordering::Relaxed);
+                    }
+                    if copy_blocks(written, dst, src, len, no_wait) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                         }
@@ -4304,6 +4483,7 @@ impl Host {
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
+        recopy_written_sources();
         // In the order given: what tells the title the card is done.
         let mut last = 0;
         let mut landed = Vec::new();
@@ -4330,6 +4510,7 @@ impl Host {
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
             bury(last);
+            copies_settled(last);
         }
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -4717,6 +4898,7 @@ impl Host {
                 hand_back(&back);
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
+            recopy_written_sources();
             // In the order given: what tells the title the card is done.
             let mut last = 0;
             let mut landed = Vec::new();
@@ -4739,6 +4921,7 @@ impl Host {
             if last > 0 {
                 FINISHED.store(last, Ordering::Release);
                 bury(last);
+                copies_settled(last);
             }
             line().landed.extend(landed);
         }
@@ -6067,6 +6250,7 @@ impl HostList {
                     }
                     batch.title_written();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    copy_ran(dst, src, len);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     len
@@ -6837,6 +7021,13 @@ impl Meter {
                     "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
                      (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
                     if join_copies() { "on" } else { "off" }
+                );
+            }
+            let [through, again] = [0, 1].map(|i| COPY_NO_WAIT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if through + again > 0.0 {
+                tracing::info!(
+                    "title buffer copies whose source flights may write, per frame (VICTORY_COPY_NO_WAIT=1): {through:.1} ran \
+                     without waiting, {again:.2} were made again after a copy-back wrote the source"
                 );
             }
         }
