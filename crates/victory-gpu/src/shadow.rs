@@ -91,16 +91,310 @@ struct Card {
     /// first declared for the copy, and compared with the card's side, on
     /// the card, after each submission that declares some.
     before: Mutex<Option<ID3D12Resource>>,
-    /// Offsets of the copy whose bytes changed on the CPU's side and have
-    /// not gone to the card's side yet.
-    dirty: Mutex<Vec<(usize, usize)>>,
-    /// With [`relay`]: the offsets that went from `dirty` to the card's
-    /// side, each with the number of the send that took it
-    /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
-    /// Locked inside `dirty`'s lock.
-    sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// Offsets of the copy whose bytes changed on the CPU's side: those
+    /// not gone to the card's side yet, and with [`relay`] those each send
+    /// took.
+    notes: Mutex<CardNotes>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+}
+
+/// [`Card`]'s offsets whose bytes changed on the CPU's side: those that
+/// have not gone to the card's side yet (`dirty`), and with [`relay`] the
+/// ones each send took to it, with the send's number ([`card_dirty`]),
+/// kept until a fetch sent after it has been merged.
+///
+/// A merge of the relay asks, for each piece, which of them lie over it
+/// ([`CardNotes::over`]). With dword patches a send takes up to a million
+/// ranges, and a pass over all of them for each piece (630 a frame) cost
+/// the relay's thread 15-107 ms a frame with 80-262 thousand. So each
+/// send's ranges are kept in order and apart, and searched; and the ranges
+/// not sent yet in parts, each searched: `dirty[..sorted]` (the main part)
+/// and `dirty[sorted..second]` (the second part) in order and apart, then
+/// those noted since, in order and apart as they came up to the first noted
+/// out of order (`loose`), and the rest as they came. The title's bytes put
+/// in under flights come in order, page after page, so most notes stay in
+/// order; where some do not and grow long, a merge puts them in order: those
+/// alone, and with the ones noted in order before them into the second part
+/// (`CardNotes::order`). Putting every range not sent yet in order each time
+/// cost the merge's question 0.8-12 ms with 80 thousand to 1.4 million of
+/// them in order (the review's bench), under the notes' lock and the CPU
+/// side's, which the submitting thread's merges wait for.
+#[derive(Default)]
+pub(crate) struct CardNotes {
+    dirty: Vec<(usize, usize)>,
+    /// How many of `dirty`, from the first, are in order and apart: the
+    /// main part.
+    sorted: usize,
+    /// Where the second part ends: `dirty[sorted..second]` is in order and
+    /// apart too (it may overlap the main part).
+    second: usize,
+    /// Where the ranges noted out of order begin, if any were:
+    /// `dirty[second..]` is in order and apart up to there (all of it
+    /// without them).
+    loose: Option<usize>,
+    /// Per send still of use: its number and the ranges it took, in order
+    /// and apart.
+    sent: Vec<(u64, Arc<[(usize, usize)]>)>,
+}
+
+/// How many of [`CardNotes`]'s ranges noted out of order are passed over
+/// one by one; past that a merge puts them in order first.
+const LOOSE_NOTES: usize = 256;
+
+/// [`CardNotes`]'s second part goes into the main part once it holds more
+/// than this share of it (an eighth): each range is merged into the main
+/// part about once for every eight noted after it, and a question searches
+/// three parts at most.
+const SECOND_SHARE: usize = 8;
+
+/// Of `ranges` (in order and apart), those over `[lo, hi)`, appended to
+/// `out`: found by a search, and not by a pass over all of them.
+fn over_in(ranges: &[(usize, usize)], lo: usize, hi: usize, out: &mut Vec<(usize, usize)>) {
+    let first = ranges.partition_point(|r| r.1 <= lo);
+    out.extend(ranges[first..].iter().take_while(|r| r.0 < hi));
+}
+
+/// `ranges` from `from` on, in order already as runs or not, put in order
+/// and joined where they overlap or touch, in place. A stable sort finds
+/// the runs that are in order and merges them: it costs the ranges out of
+/// order their sort, and the others a pass.
+fn order_from(ranges: &mut Vec<(usize, usize)>, from: usize) {
+    ranges[from..].sort();
+    let mut end = from;
+    for i in from..ranges.len() {
+        let (a, b) = ranges[i];
+        if end > from && a <= ranges[end - 1].1 {
+            ranges[end - 1].1 = ranges[end - 1].1.max(b);
+        } else {
+            ranges[end] = (a, b);
+            end += 1;
+        }
+    }
+    ranges.truncate(end);
+}
+
+impl CardNotes {
+    /// The CPU side's bytes `[from, to)` changed (`from < to`): joined with
+    /// the last range noted where they touch, as before.
+    fn changed(&mut self, from: usize, to: usize) {
+        let rest = self.dirty.len() > self.second;
+        match self.dirty.last_mut() {
+            Some(last) if rest && from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+            _ => self.dirty.push((from, to)),
+        }
+        // What is noted after the parts stays in order while each range
+        // starts past the end of the one before it.
+        let n = self.dirty.len();
+        if self.loose.is_none() && n >= self.second + 2 && self.dirty[n - 2].1 > self.dirty[n - 1].0 {
+            self.loose = Some(n - 1);
+        }
+    }
+
+    /// The ranges noted out of order put in order (their sort alone), and
+    /// with those noted in order before them and the second part into the
+    /// second part; the second part into the main one once it holds more
+    /// than an eighth of it. The main part is not touched otherwise: a long
+    /// tail out of order costs its own sort, not that of every range not
+    /// sent yet.
+    fn order(&mut self) {
+        let Some(loose) = self.loose.take() else {
+            return;
+        };
+        // With no second part, what came in order after the main part is
+        // the main part's own continuation where it starts past its end
+        // (as notes do after a send took them all): it joins it as it is.
+        if self.second == self.sorted
+            && loose > self.sorted
+            && (self.sorted == 0 || self.dirty[self.sorted - 1].1 < self.dirty[self.sorted].0)
+        {
+            self.sorted = loose;
+        }
+        order_from(&mut self.dirty, self.sorted);
+        self.second = self.dirty.len();
+        if self.second - self.sorted > self.sorted / SECOND_SHARE {
+            // Two runs in order: the stable sort merges them.
+            order_from(&mut self.dirty, 0);
+            self.sorted = self.dirty.len();
+            self.second = self.sorted;
+        }
+    }
+
+    /// The ranges not sent yet, in order and joined where they touch,
+    /// taken by send `number` ([`card_dirty`]). With [`relay`] (`relay`)
+    /// they are noted with it, and the notes of sends up to `fetched` (no
+    /// fetch still to be merged is older) are dropped.
+    fn take(&mut self, number: u64, fetched: u64, relay: bool) -> Arc<[(usize, usize)]> {
+        let ranges: Arc<[(usize, usize)]> = joined(std::mem::take(&mut self.dirty)).into();
+        self.sorted = 0;
+        self.second = 0;
+        self.loose = None;
+        if relay {
+            self.sent.retain(|s| s.0 > fetched);
+            if !ranges.is_empty() {
+                self.sent.push((number, ranges.clone()));
+            }
+        }
+        ranges
+    }
+
+    /// The ranges over `[lo, hi)` that a merge of bytes fetched after send
+    /// `fetched_after` leaves out (`Shadow::card_merge_relay`): those not
+    /// sent yet, and those of later sends. There the CPU's side holds
+    /// title bytes the card had not received when the fetch ran. In no
+    /// particular order; they may overlap.
+    fn over(&mut self, lo: usize, hi: usize, fetched_after: u64) -> Vec<(usize, usize)> {
+        if self.loose.is_some_and(|at| self.dirty.len() - at > LOOSE_NOTES) {
+            self.order();
+        }
+        let mut out = Vec::new();
+        let in_order = self.loose.unwrap_or(self.dirty.len());
+        over_in(&self.dirty[..self.sorted], lo, hi, &mut out);
+        over_in(&self.dirty[self.sorted..self.second], lo, hi, &mut out);
+        over_in(&self.dirty[self.second..in_order], lo, hi, &mut out);
+        out.extend(self.dirty[in_order..].iter().filter(|r| r.0 < hi && r.1 > lo));
+        for (number, ranges) in &self.sent {
+            if *number > fetched_after {
+                over_in(ranges, lo, hi, &mut out);
+            }
+        }
+        out
+    }
+}
+
+/// What the title's bytes put in under flights ([`Shadow::merge_under_writes`])
+/// may still take of what goes up to copies in the card's memory before
+/// one submission (`crate::host`'s `card_before`, which sends it): runs of
+/// [`crate::host::CARD_PATCH_RUN`] bytes or more go up by a copy each, at
+/// most [`crate::host::CARD_COPIES_MOST`] of them as before; shorter ones
+/// as dword patches, as many as [`crate::host::CARD_PATCH_BYTES_MOST`]
+/// bytes of patches hold. Past either a settle is due. Without patches
+/// (the patch did not compile, or there was no memory for the buffer they
+/// go up in) every run takes a copy, as before.
+///
+/// A run that starts where the runs taken before it end, or before (they
+/// touch or overlap), is one with them, as `card_dirty` joins them (the
+/// last run of a page and the first of the next): the merge takes a copy's
+/// runs in the order of their offsets (`busy_in`), so the runs taken before
+/// are the last group alone. Bytes noted otherwise (a refresh, which copies
+/// the gaps between the ranges flights write and so meets them at their
+/// ends, or a merge of what the card wrote) can still make a short run a
+/// long one where they meet it: one copy more for each such place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Room {
+    /// Copies left.
+    pub(crate) copies: usize,
+    /// Dword patches left; `None` without patches.
+    pub(crate) patches: Option<usize>,
+    /// The last group of runs taken, joined (offsets in its copy), and
+    /// what it took.
+    last: Option<((usize, usize), Takes)>,
+}
+
+/// What a range takes going up to a copy in the card's memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Takes {
+    Copy,
+    /// This many dword patches.
+    Patches(usize),
+}
+
+/// Why runs did not fit in a [`Room`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Over {
+    Copies,
+    Patches,
+}
+
+/// How many dwords bytes `[a, b)` (`a < b`) lie in: the patches they take
+/// at most (a dword a range shares with the one before it is one patch for
+/// both, `dword_patches`).
+pub(crate) fn dwords_of(a: usize, b: usize) -> usize {
+    (b - 1) / 4 - a / 4 + 1
+}
+
+impl Room {
+    /// A submission's room; `patches`: whether short runs go up as patches.
+    pub(crate) fn new(patches: bool) -> Self {
+        Room {
+            copies: crate::host::CARD_COPIES_MOST,
+            patches: patches.then_some(crate::host::CARD_PATCH_BYTES_MOST / 12),
+            last: None,
+        }
+    }
+
+    /// Another copy's runs come next: none of them is one with a run
+    /// taken before.
+    pub(crate) fn next_copy(&mut self) {
+        self.last = None;
+    }
+
+    fn takes(&self, (a, b): (usize, usize), patchable: bool) -> Takes {
+        if patchable && self.patches.is_some() && b - a < crate::host::CARD_PATCH_RUN {
+            Takes::Patches(dwords_of(a, b))
+        } else {
+            Takes::Copy
+        }
+    }
+
+    fn spend(&mut self, takes: Takes) -> Result<(), Over> {
+        match takes {
+            Takes::Copy => self.copies = self.copies.checked_sub(1).ok_or(Over::Copies)?,
+            Takes::Patches(n) => {
+                let left = self.patches.unwrap_or(0);
+                self.patches = Some(left.checked_sub(n).ok_or(Over::Patches)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn give_back(&mut self, takes: Takes) {
+        match takes {
+            Takes::Copy => self.copies += 1,
+            Takes::Patches(n) => self.patches = self.patches.map(|left| left + n),
+        }
+    }
+
+    /// Takes room for `runs` of a copy (offsets in it, in order, after
+    /// those taken before for it): all of them, or none and why. A run
+    /// that touches or overlaps the group taken before it joins it, and
+    /// the group takes what the joined range takes. `patchable`: whether
+    /// the copy takes patches.
+    pub(crate) fn take(&mut self, runs: impl IntoIterator<Item = (usize, usize)>, patchable: bool) -> Result<(), Over> {
+        let mut room = *self;
+        for (a, b) in runs {
+            let range = match room.last {
+                Some(((first, end), took)) if a <= end => {
+                    room.give_back(took);
+                    (first.min(a), end.max(b))
+                }
+                _ => (a, b),
+            };
+            let takes = room.takes(range, patchable);
+            room.spend(takes)?;
+            room.last = Some((range, takes));
+        }
+        *self = room;
+        Ok(())
+    }
+}
+
+/// A copy's `ranges` going up before a submission (in order and apart, as
+/// [`card_dirty`] takes them): those that go by a copy each, and those that
+/// go as patches (`patchable`, shorter than
+/// [`crate::host::CARD_PATCH_RUN`]) while `room` (dword patches) lasts;
+/// the short ones past it go by copies.
+pub(crate) fn card_split(ranges: &[(usize, usize)], patchable: bool, room: &mut usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    let (mut copied, mut patched) = (Vec::new(), Vec::new());
+    for &(a, b) in ranges {
+        if patchable && b - a < crate::host::CARD_PATCH_RUN && dwords_of(a, b) <= *room {
+            *room -= dwords_of(a, b);
+            patched.push((a, b));
+        } else {
+            copied.push((a, b));
+        }
+    }
+    (copied, patched)
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -161,9 +455,10 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
-/// Since the last frame line: bytes copied to card sides and the ranges
-/// they were; pieces compared on the card, pieces fetched and their
-/// bytes; the waits for the card the fetches added and their microseconds.
+/// Since the last frame line: bytes sent up to card sides (by copies and by
+/// dword patches) and the ranges they were; pieces compared on the card,
+/// pieces fetched and their bytes; the waits for the card the fetches added
+/// and their microseconds.
 pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
@@ -284,13 +579,14 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// they touch. The ranges are taken: the caller copies them to the card's
 /// side (`Host::card_before`).
 ///
-/// With [`relay`], `sent_as` is the number of the send that takes them
+/// With the relay (`relay`: `crate::host`'s, whose thread merges with
+/// these notes), `sent_as` is the number of the send that takes them
 /// (`crate::host`'s order of the queue): each range is noted with it, in
 /// the same lock that took it, so that a merge of pieces fetched before
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
-pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+pub(crate) fn card_dirty(sent_as: u64, relay: bool) -> Vec<(Arc<Shadow>, Arc<[(usize, usize)]>)> {
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
@@ -301,23 +597,58 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         let ranges = shadow
             .card
             .as_ref()
-            .map(|c| {
-                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = std::mem::take(&mut *dirty);
-                if relay() {
-                    let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.retain(|s| s.2 > fetched);
-                    sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
-                }
-                ranges
-            })
-            .unwrap_or_default();
-        if !ranges.is_empty() {
-            out.push((shadow, joined(ranges)));
+            .map(|c| c.notes.lock().unwrap_or_else(|e| e.into_inner()).take(sent_as, fetched, relay));
+        if let Some(ranges) = ranges.filter(|r| !r.is_empty()) {
+            out.push((shadow, ranges));
         }
         true
     });
     out
+}
+
+/// `ranges` of `data` (offsets in order, apart) as patches of dwords
+/// (`crate::host::CARD_PATCH`), appended to `out`: the dword's index, its
+/// bytes from `data` where the ranges hold them (zero elsewhere), and the
+/// mask of those bytes. A dword two ranges share is one patch, so that no
+/// two threads of the patch write the same dword.
+pub(crate) fn dword_patches(ranges: &[(usize, usize)], data: &[u8], out: &mut Vec<[u32; 3]>) {
+    let first = out.len();
+    for &(a, b) in ranges {
+        for (at, &byte) in data[a..b].iter().enumerate().map(|(i, v)| (a + i, v)) {
+            let (dword, shift) = ((at / 4) as u32, (at % 4) * 8);
+            let (byte, mask) = (u32::from(byte) << shift, 0xFFu32 << shift);
+            let ours = out.len() > first;
+            match out.last_mut() {
+                Some(p) if ours && p[0] == dword => {
+                    p[1] |= byte;
+                    p[2] |= mask;
+                }
+                _ => out.push([dword, byte, mask]),
+            }
+        }
+    }
+}
+
+/// `ranges` cut to the first `mapped` bytes (a range past them loses its
+/// bytes there, or goes): as is, where none reaches past them.
+fn cut_to(ranges: &[(usize, usize)], mapped: usize) -> std::borrow::Cow<'_, [(usize, usize)]> {
+    if ranges.iter().all(|r| r.1 <= mapped) {
+        return std::borrow::Cow::Borrowed(ranges);
+    }
+    std::borrow::Cow::Owned(ranges.iter().map(|&(a, b)| (a, b.min(mapped))).filter(|&(a, b)| a < b).collect())
+}
+
+/// Of the ranges flights' shaders may write (`pending`, as they were
+/// declared), those over `[from, to)`, cut to it, in order and joined where
+/// they overlap or touch: the merge under them ([`Shadow::merge_under_writes`])
+/// looks at each page once and finds a copy's runs in the order of their
+/// offsets, the order its [`Room`] joins them in, as `card_dirty` does.
+/// Declared ranges come in any order (the world's heap declares dozens of
+/// overlapping views), and taken as declared two that touch, the higher
+/// first, gave two short runs the room took apart and `card_dirty` sent as
+/// one long range: a copy the room never counted.
+fn busy_in(pending: &[(usize, usize)], from: usize, to: usize) -> Vec<(usize, usize)> {
+    joined(pending.iter().filter(|&&(a, e)| a < to && e > from).map(|&(a, e)| (a.max(from), e.min(to))).collect())
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -353,6 +684,39 @@ pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
     out
 }
 
+/// The runs of pieces hashed again after `ranges` (offsets, in order and
+/// apart) of a copy of title memory `(start, len)` went up to its card side
+/// (`crate::host`'s `card_before`): every piece of the copy with `whole`
+/// (its hashes were just made), else a run per range, or with `join` the
+/// runs joined where they touch or overlap, each piece once, as
+/// [`joined_piece_runs`] joins them: here as they come, the ranges being in
+/// order (a send of 1.4 million short ranges made as many runs, 28 MB, to
+/// sort and join).
+pub(crate) fn card_hash_runs((start, len): (usize, usize), ranges: &[(usize, usize)], whole: bool, join: bool) -> Vec<CardSpan> {
+    if whole {
+        return vec![card_run_of(start, len, 0, usize::MAX)];
+    }
+    let runs = ranges.iter().map(|&(a, b)| card_run_of(start, len, a, b));
+    if !join {
+        return runs.collect();
+    }
+    let mut out: Vec<CardSpan> = Vec::new();
+    for run in runs {
+        match out.last_mut() {
+            // Not in order after all: joined after a sort.
+            Some(last) if run.first < last.first => {
+                return joined_piece_runs(ranges.iter().map(|&(a, b)| card_run_of(start, len, a, b)).collect());
+            }
+            Some(last) if run.first <= last.first + last.pieces => {
+                last.pieces = last.pieces.max(run.first + run.pieces - last.first);
+                last.to = last.to.max(run.to);
+            }
+            _ => out.push(run),
+        }
+    }
+    out
+}
+
 /// A declared range of a copy in the card's memory, as the compare on the
 /// card takes it: its offsets in the copy, its first 64 KiB piece (pieces
 /// are cut at multiples of 64 KiB of title memory; piece 0 holds offset
@@ -364,6 +728,14 @@ pub(crate) struct CardSpan {
     pub(crate) first: u32,
     pub(crate) pieces: u32,
     pub(crate) skew: u32,
+}
+
+/// The pieces that hold offsets `[from, to)` of a copy of `len` bytes of
+/// title memory from `start` on (cut to it), as the card's hashing takes
+/// them ([`card_hash_runs`]).
+fn card_run_of(start: usize, len: usize, from: usize, to: usize) -> CardSpan {
+    let to = to.min(len);
+    card_span_of(start, from.min(to.saturating_sub(1)), to)
 }
 
 /// [`CardSpan`] for offsets `[from, to)` (`from < to`) of a copy of title
@@ -389,7 +761,555 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{
+        CardNotes, CardSpan, LOOSE_NOTES, Over, PIECE, Room, SECOND_SHARE, busy_in, card_hash_runs, card_piece_of, card_span_of,
+        card_split, cut_to, dword_patches, dwords_of, joined, joined_piece_runs, outside,
+    };
+    use crate::host::{CARD_COPIES_MOST, CARD_PATCH_BYTES_MOST, CARD_PATCH_RUN};
+
+    /// Numbers for the tests that draw at random (xorshift).
+    struct Draw(u64);
+
+    impl Draw {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// In `[0, n)`.
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// The merge's room for a submission (`Room`): runs of 256 bytes or
+    /// more take a copy each, at most 512 as before the patches, and the
+    /// 513th leaves a settle due; short runs take dword patches, as many as
+    /// 16 MiB of them hold, so a hundred thousand runs of 3 bytes leave none
+    /// due, and runs past the patch bytes do. Without patches (none, or a
+    /// copy that takes none) every run takes a copy, as before. A page's
+    /// runs go in all together or not at all.
+    #[test]
+    fn long_runs_are_held_to_the_copies_and_short_ones_to_the_patch_bytes() {
+        let most_patches = CARD_PATCH_BYTES_MOST / 12;
+        let long = |i: usize| (i * 1000, i * 1000 + CARD_PATCH_RUN);
+        let mut room = Room::new(true);
+        room.take((0..CARD_COPIES_MOST).map(long), true).unwrap();
+        assert_eq!((room.copies, room.patches), (0, Some(most_patches)));
+        let full = room;
+        assert_eq!(room.take([long(CARD_COPIES_MOST)], true), Err(Over::Copies), "a long run past the copies");
+        assert_eq!(room, full, "takes nothing");
+        // Runs of 3 bytes, a dword each, need no copies.
+        room.take((0..100_000).map(|i| (600_001 + i * 8, 600_004 + i * 8)), true).unwrap();
+        assert_eq!((room.copies, room.patches), (0, Some(most_patches - 100_000)));
+        // The patch bytes: runs of 255 bytes from byte 2 of a dword lie in 65.
+        let mut room = Room::new(true);
+        let short = |i: usize| (i * 512 + 2, i * 512 + 2 + 255);
+        assert_eq!(dwords_of(short(0).0, short(0).1), 65);
+        let fit = most_patches / 65;
+        room.take((0..fit).map(short), true).unwrap();
+        assert_eq!(room.take([short(fit)], true), Err(Over::Patches));
+        assert_eq!(room.copies, CARD_COPIES_MOST, "short runs took no copy");
+        // Without patches every run is a copy.
+        for (patches, patchable) in [(false, true), (true, false)] {
+            let mut room = Room::new(patches);
+            room.take((0..CARD_COPIES_MOST).map(|i| (i * 8, i * 8 + 3)), patchable).unwrap();
+            assert_eq!(room.take([(1 << 20, (1 << 20) + 3)], patchable), Err(Over::Copies));
+        }
+        // All or none: a page with one long run too many takes none of its runs.
+        let mut room = Room::new(true);
+        room.take((0..CARD_COPIES_MOST - 1).map(long), true).unwrap();
+        let before = room;
+        let last = long(CARD_COPIES_MOST);
+        let page = [last, (last.1 + 5, last.1 + 8), long(CARD_COPIES_MOST + 1)];
+        assert_eq!(room.take(page, true), Err(Over::Copies));
+        assert_eq!(room, before);
+    }
+
+    /// Runs that touch (a page's last and the next page's first) go up as
+    /// one range (`card_dirty` joins them), and the room counts them so:
+    /// two short ones that make a long one take a copy and give their
+    /// patches back; a run joining a long one takes nothing more. A run of
+    /// another copy is not joined.
+    #[test]
+    fn touching_runs_take_the_room_of_the_range_they_go_up_as() {
+        let mut room = Room::new(true);
+        let full = room;
+        let patches = |room: &Room| full.patches.unwrap() - room.patches.unwrap();
+        room.take([(PIECE - 200, PIECE)], true).unwrap();
+        assert_eq!((full.copies - room.copies, patches(&room)), (0, 50));
+        room.take([(PIECE, PIECE + 100)], true).unwrap();
+        assert_eq!((full.copies - room.copies, patches(&room)), (1, 0), "300 bytes in all: a copy");
+        room.take([(PIECE + 100, PIECE + 104), (PIECE + 112, PIECE + 115)], true).unwrap();
+        assert_eq!((full.copies - room.copies, patches(&room)), (1, 1), "4 bytes joined the copy, 3 apart");
+        room.next_copy();
+        room.take([(PIECE + 115, PIECE + 116)], true).unwrap();
+        assert_eq!((full.copies - room.copies, patches(&room)), (1, 2), "another copy's run on its own");
+        // A run that overlaps the group before it joins it too, and the
+        // group keeps the farther end: 100..200 over 10..120 is 190 bytes,
+        // 48 patches (dwords 2 to 49), and 300..310 then goes on its own.
+        let mut room = Room::new(true);
+        room.take([(10, 120), (100, 200), (150, 160), (300, 310)], true).unwrap();
+        assert_eq!((full.copies - room.copies, patches(&room)), (0, 48 + 3), "overlapping runs as one range");
+        room.take([(305, 600)], true).unwrap();
+        assert_eq!((full.copies - room.copies, patches(&room)), (1, 48), "an overlap that makes a long range takes a copy");
+    }
+
+    /// The merge takes a copy's busy ranges in order and joined
+    /// (`busy_in`), cut to what it is asked for, however they were
+    /// declared.
+    #[test]
+    fn busy_ranges_are_taken_in_order_and_joined() {
+        let pending = [(500, 600), (100, 200), (300, 400), (200, 300), (150, 250), (700, 800), (590, 650)];
+        assert_eq!(busy_in(&pending, 0, usize::MAX), [(100, 400), (500, 650), (700, 800)]);
+        assert_eq!(busy_in(&pending, 120, 520), [(120, 400), (500, 520)]);
+        assert!(busy_in(&pending, 400, 500).is_empty(), "touching the ask is not over it");
+    }
+
+    /// What the merge took room for goes up within that room: runs taken
+    /// page by page as the merge does (stopping at the first page that does
+    /// not fit), joined as `card_dirty` takes them and split as
+    /// `card_before` sends them, are exactly the copies and the dword
+    /// patches (at most) the room counted, and never more than it had.
+    #[test]
+    fn what_the_room_took_goes_up_within_it() {
+        let mut draw = Draw(0x2545_f491_4f6c_dd1d);
+        let mut stopped = 0;
+        for round in 0..300 {
+            let mut room = Room::new(true);
+            let full = room;
+            // Rounds of short runs only, and rounds that reach the copies.
+            let longest = [40, 600, 4000][round % 3];
+            let mut taken: Vec<(usize, usize)> = Vec::new();
+            let mut at = draw.below(PIECE as u64) as usize;
+            'pages: for page in at / PIECE..at / PIECE + 64 {
+                let end = (page + 1) * PIECE;
+                let mut runs = Vec::new();
+                while at < end {
+                    let n = (1 + draw.below(longest) as usize).min(end - at);
+                    runs.push((at, at + n));
+                    // Apart within a page; a run may end on the page's end
+                    // and the next page's first start there.
+                    at += n + 1 + draw.below(40) as usize;
+                }
+                if room.take(runs.iter().copied(), true).is_err() {
+                    stopped += 1;
+                    break 'pages;
+                }
+                taken.extend(runs.iter().map(|&(a, b)| (a, b.min(end))));
+                at = at.max(end) - draw.below(2) as usize * (at.max(end) - end);
+            }
+            let ranges = joined(taken);
+            let (copied, patched) = card_split(&ranges, true, &mut { usize::MAX });
+            let dwords: usize = patched.iter().map(|&(a, b)| dwords_of(a, b)).sum();
+            assert_eq!(copied.len(), full.copies - room.copies, "round {round}");
+            assert_eq!(dwords, full.patches.unwrap() - room.patches.unwrap(), "round {round}");
+            assert!(copied.len() <= CARD_COPIES_MOST);
+            let mut patches = Vec::new();
+            dword_patches(&patched, &vec![0u8; at + PIECE], &mut patches);
+            assert!(patches.len() <= dwords);
+        }
+        assert!((100..300).contains(&stopped), "{stopped} rounds reached the copies");
+    }
+
+    /// `card_before`'s split: short ranges go as patches while the buffer's
+    /// room lasts, and the ones past it, and every long one, by copies.
+    #[test]
+    fn short_ranges_past_the_patches_room_go_by_copies() {
+        // (501, 756): 255 bytes from byte 1 of a dword, in 64 dwords.
+        let ranges = [(0, 3), (8, 8 + CARD_PATCH_RUN), (400, 403), (501, 756), (800, 801)];
+        let (copied, patched) = card_split(&ranges, true, &mut { usize::MAX });
+        assert_eq!(copied, [(8, 8 + CARD_PATCH_RUN)]);
+        assert_eq!(patched, [(0, 3), (400, 403), (501, 756), (800, 801)]);
+        let mut room = 2;
+        let (copied, patched) = card_split(&ranges, true, &mut room);
+        assert_eq!((patched, room), (vec![(0, 3), (400, 403)], 0));
+        assert_eq!(copied, [(8, 8 + CARD_PATCH_RUN), (501, 756), (800, 801)]);
+        let mut room = 66;
+        let (copied, patched) = card_split(&ranges, true, &mut room);
+        assert_eq!((patched, room), (vec![(0, 3), (400, 403), (501, 756)], 0), "64 dwords fit, the next one not");
+        assert_eq!(copied, [(8, 8 + CARD_PATCH_RUN), (800, 801)]);
+        let (copied, patched) = card_split(&ranges, false, &mut { usize::MAX });
+        assert_eq!((copied, patched), (ranges.to_vec(), vec![]));
+    }
+
+    /// [`CardNotes`] as they were kept before: the ranges not sent as they
+    /// came (joined with the last where they touch), each range sent with
+    /// its send's number, and a merge's question a pass over all of them.
+    #[derive(Default)]
+    struct OldNotes {
+        dirty: Vec<(usize, usize)>,
+        sent: Vec<(usize, usize, u64)>,
+    }
+
+    impl OldNotes {
+        fn changed(&mut self, from: usize, to: usize) {
+            match self.dirty.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+                _ => self.dirty.push((from, to)),
+            }
+        }
+
+        fn take(&mut self, number: u64, fetched: u64) -> Vec<(usize, usize)> {
+            let ranges = std::mem::take(&mut self.dirty);
+            self.sent.retain(|s| s.2 > fetched);
+            self.sent.extend(ranges.iter().map(|&(a, b)| (a, b, number)));
+            joined(ranges)
+        }
+
+        fn over(&self, lo: usize, hi: usize, fetched_after: u64) -> Vec<(usize, usize)> {
+            self.dirty
+                .iter()
+                .copied()
+                .chain(self.sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
+                .filter(|&(a, b)| a < hi && b > lo)
+                .collect()
+        }
+    }
+
+    /// The notes kept in order and searched say what the pass over all of
+    /// them said, for random changes (mostly in order, as the title's bytes
+    /// put in under flights come, some anywhere, as refreshes come), sends
+    /// and merges' questions: the same bytes left out of every piece, and
+    /// the same ranges sent. A long part noted out of order is put in order
+    /// by the question that finds it.
+    #[test]
+    fn notes_searched_in_order_leave_out_what_a_pass_over_all_left_out() {
+        let mut draw = Draw(0x9e37_79b9_7f4a_7c15);
+        let (mut new, mut old) = (CardNotes::default(), OldNotes::default());
+        let (mut number, mut fetched, mut at) = (0u64, 0u64, 0usize);
+        let mut ordered = 0;
+        // Few changes a send, then thousands.
+        for sends_one_in in [3u64, 40, 2000, 20_000] {
+            for step in 0..40_000 {
+                match draw.below(100) {
+                    0..=59 => {
+                        let n = 1 + draw.below(300) as usize;
+                        let from = if draw.below(10) == 0 { draw.below(400_000) as usize } else { at + draw.below(64) as usize };
+                        at = from + n;
+                        new.changed(from, from + n);
+                        old.changed(from, from + n);
+                    }
+                    60..=79 if draw.below(sends_one_in) == 0 => {
+                        number += 1;
+                        fetched = fetched.max(draw.below(number + 1));
+                        assert_eq!(&new.take(number, fetched, true)[..], &old.take(number, fetched)[..], "send {number}");
+                        at = draw.below(400_000) as usize;
+                    }
+                    _ => {
+                        let lo = draw.below(420_000) as usize;
+                        let hi = lo + 1 + draw.below(80_000) as usize;
+                        let after = draw.below(number + 2);
+                        let loose = new.loose.is_some_and(|at| new.dirty.len() - at > LOOSE_NOTES);
+                        let got = outside(lo, hi, new.over(lo, hi, after));
+                        assert_eq!(got, outside(lo, hi, old.over(lo, hi, after)), "step {step} of one send in {sends_one_in}");
+                        if loose {
+                            assert_eq!((new.second, new.loose), (new.dirty.len(), None), "put in order");
+                            assert!(new.second - new.sorted <= new.sorted / SECOND_SHARE, "the second part within an eighth of the main one");
+                            parts_in_order(&new);
+                            ordered += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(ordered > 0, "a long part out of order was asked about");
+        assert!(new.sent.iter().all(|(_, ranges)| ranges.windows(2).all(|w| w[0].1 < w[1].0)));
+    }
+
+    /// Each part of `notes` that is kept in order is in order and apart.
+    fn parts_in_order(notes: &CardNotes) {
+        let apart = |part: &[(usize, usize)]| part.windows(2).all(|w| w[0].1 < w[1].0);
+        let in_order = notes.loose.unwrap_or(notes.dirty.len());
+        assert!(notes.sorted <= notes.second && notes.second <= in_order && in_order <= notes.dirty.len());
+        assert!(apart(&notes.dirty[..notes.sorted]), "the main part");
+        assert!(apart(&notes.dirty[notes.sorted..notes.second]), "the second part");
+        assert!(apart(&notes.dirty[notes.second..in_order]), "the part noted in order");
+    }
+
+    /// A long tail noted out of order is put in order alone: the ranges
+    /// noted in order before it become the main part as they are (they
+    /// follow it), the tail the second part, and the main part is not
+    /// touched again until the second one holds more than an eighth of it;
+    /// then it takes it in. Every question meanwhile finds what a pass over
+    /// all the notes finds.
+    #[test]
+    fn a_tail_out_of_order_is_put_in_order_without_the_main_part() {
+        let n = 100_000usize;
+        let mut notes = CardNotes::default();
+        let mut all: Vec<(usize, usize)> = Vec::new();
+        for i in 0..n {
+            notes.changed(i * 8, i * 8 + 3);
+            all.push((i * 8, i * 8 + 3));
+        }
+        let main: Vec<(usize, usize)> = all.clone();
+        let mut draw = Draw(0x51_7cc1_b727_220a);
+        let ask = |notes: &mut CardNotes, all: &[(usize, usize)], lo: usize, hi: usize| {
+            let mut got = notes.over(lo, hi, 0);
+            got.sort_unstable();
+            let mut wanted: Vec<(usize, usize)> = all.iter().copied().filter(|r| r.0 < hi && r.1 > lo).collect();
+            wanted.sort_unstable();
+            assert_eq!(outside(lo, hi, got), outside(lo, hi, wanted));
+        };
+        let (mut rounds, mut added) = (0, 0usize);
+        loop {
+            rounds += 1;
+            // Notes out of order until a question puts them in order.
+            while !notes.loose.is_some_and(|at| notes.dirty.len() - at > LOOSE_NOTES) {
+                let at = draw.below(n as u64) as usize * 8 + 4;
+                notes.changed(at, at + 2);
+                all.push((at, at + 2));
+                added += 1;
+            }
+            let lo = draw.below(n as u64 * 8) as usize;
+            ask(&mut notes, &all, lo, lo + 4 * PIECE);
+            assert_eq!(notes.loose, None, "round {rounds}: the tail was put in order");
+            parts_in_order(&notes);
+            if notes.second > notes.sorted {
+                assert_eq!(notes.sorted, n, "round {rounds}: the main part is the ranges noted in order");
+                assert_eq!(&notes.dirty[..n], &main[..], "round {rounds}: and it was not touched");
+            } else {
+                // Taken in once past an eighth of the main part.
+                assert!(added > n / SECOND_SHARE, "round {rounds}: taken in too early, {added} notes");
+                assert!(added <= 2 * (n / SECOND_SHARE), "round {rounds}: taken in too late, {added} notes");
+                assert_eq!(notes.sorted, notes.dirty.len());
+                break;
+            }
+        }
+        assert!(rounds > 2, "the second part grew over rounds before it was taken in");
+        let lo = draw.below(n as u64 * 8) as usize;
+        ask(&mut notes, &all, lo, lo + 4 * PIECE);
+    }
+
+    /// What the patch shader does with `patches` to `card` (one thread per
+    /// patch; they name distinct dwords).
+    fn apply(card: &mut [u8], patches: &[[u32; 3]]) {
+        for &[dword, value, mask] in patches {
+            let at = dword as usize * 4;
+            let old = u32::from_le_bytes(card[at..at + 4].try_into().unwrap());
+            card[at..at + 4].copy_from_slice(&((old & !mask) | (value & mask)).to_le_bytes());
+        }
+    }
+
+    /// Patches put in exactly the bytes of the ranges, as a copy per range
+    /// would, and keep every other byte as the card holds it (a flight's
+    /// writes beside them, in the same dwords too); a dword two ranges
+    /// share is one patch.
+    #[test]
+    fn patches_put_in_the_ranges_bytes_and_nothing_else() {
+        const N: usize = 96;
+        let cpu: Vec<u8> = (0..N as u32).map(|i| (i * 7 + 3) as u8).collect();
+        let card0: Vec<u8> = (0..N as u32).map(|i| (i * 13 + 200) as u8).collect();
+        // Runs of one to five bytes, at every alignment; 9..10 and 11..13
+        // share dword 2, 13..14 is the next byte of the same dword's end.
+        let ranges = [(0usize, 1usize), (5, 8), (9, 10), (11, 13), (17, 22), (40, 41), (63, 64), (90, 96)];
+        let mut patches = vec![[u32::MAX; 3]];
+        dword_patches(&ranges, &cpu, &mut patches);
+        assert_eq!(patches[0], [u32::MAX; 3], "what was in `out` before is left alone");
+        let patches = &patches[1..];
+        let dwords: Vec<u32> = patches.iter().map(|p| p[0]).collect();
+        let mut distinct = dwords.clone();
+        distinct.dedup();
+        assert_eq!(dwords, distinct, "each dword once, in order");
+        assert_eq!(dwords, [0, 1, 2, 3, 4, 5, 10, 15, 22, 23]);
+        let mut card = card0.clone();
+        apply(&mut card, patches);
+        let mut copied = card0.clone();
+        for &(a, b) in &ranges {
+            copied[a..b].copy_from_slice(&cpu[a..b]);
+        }
+        assert_eq!(card, copied);
+        for p in patches {
+            assert_eq!(p[1] & !p[2], 0, "no byte outside the mask");
+        }
+    }
+
+    /// Review: `merge_under_writes` walked a copy's busy ranges in the
+    /// order flights declared them (`pending`), not by address. Two
+    /// declared ranges that touch, the higher one declared first, gave two
+    /// short runs the room took apart (its join looked only at the run just
+    /// before, and only where it ended), and `card_dirty` joined them into
+    /// one long range: a copy the room never counted. 600 such pairs: 600
+    /// copies, none counted. Three ranges that touch, the middle one last,
+    /// did the same with the room's join as it is now. The merge now takes
+    /// them as `busy_in` gives them, and stops at the first page the room
+    /// refuses (a settle is due): what goes up is what the room counted,
+    /// 512 copies at most.
+    #[test]
+    fn rv_busy_ranges_out_of_order_take_copies_the_room_never_counted() {
+        // As `pending` holds them: per pair the higher range first, per
+        // three the middle one last; each group inside one page, the title
+        // rewrote every byte of it.
+        let mut pairs = Vec::new();
+        let mut threes = Vec::new();
+        for i in 0..600usize {
+            let base = i * 1024;
+            pairs.push((base + 128, base + 256));
+            pairs.push((base, base + 128));
+            threes.extend([(base, base + 100), (base + 200, base + 300), (base + 100, base + 200)]);
+        }
+        for pending in [pairs, threes] {
+            let mut room = Room::new(true);
+            room.next_copy();
+            let full = room;
+            let mut taken = Vec::new();
+            for (a, e) in busy_in(&pending, 0, usize::MAX) {
+                // One page of the range, every byte changed: one run.
+                if room.take([(a, e)], true).is_err() {
+                    break;
+                }
+                taken.push((a, e));
+            }
+            let ranges = joined(taken);
+            let (copied, patched) = card_split(&ranges, true, &mut { usize::MAX });
+            let counted = full.copies - room.copies;
+            assert!(
+                copied.len() <= counted.max(CARD_COPIES_MOST),
+                "{} copies go up, the room counted {counted} (limit {CARD_COPIES_MOST})",
+                copied.len()
+            );
+            assert_eq!((copied.len(), counted, patched.len()), (CARD_COPIES_MOST, CARD_COPIES_MOST, 0));
+        }
+    }
+
+    /// Review: the same runs taken in address order (`busy` sorted, as
+    /// `Shadow::update` sorts it): the room joins the pairs and counts every
+    /// copy, and the 513th pair finds no room.
+    #[test]
+    fn rv_busy_ranges_in_order_are_counted() {
+        let mut busy = Vec::new();
+        for i in 0..600usize {
+            let base = i * 1024;
+            busy.push((base + 128, base + 256));
+            busy.push((base, base + 128));
+        }
+        busy.sort_unstable();
+        let mut room = Room::new(true);
+        room.next_copy();
+        let mut pairs_in = 0;
+        for pair in busy.chunks(2) {
+            if room.take(pair.iter().copied(), true).is_err() {
+                break;
+            }
+            pairs_in += 1;
+        }
+        assert_eq!((pairs_in, room.copies), (CARD_COPIES_MOST, 0));
+    }
+
+    /// Review (timing, not a check): what a merge's question costs the
+    /// relay's thread when it puts the ranges not sent yet in order, for
+    /// `n` of them in order and 257 noted out of order since (refreshes
+    /// come in the order of the lists' steps), on average and at most.
+    #[test]
+    #[ignore = "review timing"]
+    fn rv_time_a_question_that_puts_the_notes_in_order() {
+        for n in [80_000usize, 400_000, 1_398_101] {
+            let mut notes = CardNotes::default();
+            for i in 0..n {
+                notes.changed(i * 8, i * 8 + 3);
+            }
+            let _ = notes.over(0, 1, 0);
+            let rounds = 20u32;
+            let mut draw = Draw(0x1234_5678_9abc_def1);
+            let mut sorts = 0;
+            let (mut took, mut most) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+            for _ in 0..rounds {
+                for _ in 0..=LOOSE_NOTES {
+                    let at = draw.below(n as u64) as usize * 8 + 4;
+                    notes.changed(at, at + 2);
+                }
+                let will_sort = notes.loose.is_some_and(|at| notes.dirty.len() - at > LOOSE_NOTES);
+                let started = std::time::Instant::now();
+                let _ = std::hint::black_box(notes.over(PIECE, 2 * PIECE, 0));
+                let question = started.elapsed();
+                took += question;
+                most = most.max(question);
+                sorts += usize::from(will_sort);
+            }
+            eprintln!(
+                "rv timing: {n} notes in order: {sorts} of {rounds} questions sorted, {:?} a question, {most:?} the longest",
+                took / rounds
+            );
+        }
+    }
+
+    /// Review (timing, not a check): the hash runs of a send of the most
+    /// short ranges the room takes (1,398,101 ranges of 3 bytes, 8 apart):
+    /// a span per range, then joined. `Host::card_before` made them under
+    /// the queue order's and the card work's locks; now its plan makes them
+    /// before it takes either (`card_hash_runs`, what is timed here).
+    #[test]
+    #[ignore = "review timing"]
+    fn rv_time_the_hash_runs_made_under_the_queue_order() {
+        let ranges: Vec<(usize, usize)> = (0..1_398_101usize).map(|i| (i * 8, i * 8 + 3)).collect();
+        let len = ranges.last().unwrap().1;
+        let started = std::time::Instant::now();
+        let joined_runs = card_hash_runs((0, len), &ranges, false, true);
+        let took = started.elapsed();
+        eprintln!("rv timing: {} ranges, {} hash runs, {took:?}", ranges.len(), joined_runs.len());
+    }
+
+    /// The pieces hashed again after a send: all of a copy whose hashes
+    /// were just made, else those of the ranges sent, a run per range or
+    /// joined (each piece once), cut to the copy.
+    #[test]
+    fn the_pieces_hashed_again_are_those_of_the_ranges_sent() {
+        let start = 3 * PIECE + 0x1f00;
+        let len = 5 * PIECE + 4096;
+        let ranges = [(0, 3), (100, 200), (PIECE, PIECE + 8), (3 * PIECE + 5, 3 * PIECE + 9), (len - 2, len + 50)];
+        let whole = card_hash_runs((start, len), &ranges, true, false);
+        assert_eq!(whole, [card_span_of(start, 0, len)]);
+        let apart = card_hash_runs((start, len), &ranges, false, false);
+        assert_eq!(apart.len(), ranges.len());
+        assert_eq!(apart[4], card_span_of(start, len - 2, len), "cut to the copy");
+        // What the hashing takes of a run: its pieces and the copy's skew.
+        let hashed = |runs: &[CardSpan]| -> Vec<(u32, u32, u32)> { runs.iter().map(|r| (r.first, r.pieces, r.skew)).collect() };
+        let joined_runs = card_hash_runs((start, len), &ranges, false, true);
+        assert_eq!(hashed(&joined_runs), hashed(&joined_piece_runs(apart.clone())));
+        let pieces = |runs: &[CardSpan]| -> Vec<u32> {
+            let mut p: Vec<u32> = runs.iter().flat_map(|r| r.first..r.first + r.pieces).collect();
+            p.sort_unstable();
+            p.dedup();
+            p
+        };
+        assert_eq!(pieces(&joined_runs), pieces(&apart));
+        assert!(joined_runs.len() < apart.len());
+        let backwards: Vec<(usize, usize)> = ranges.iter().rev().copied().collect();
+        assert_eq!(
+            hashed(&card_hash_runs((start, len), &backwards, false, true)),
+            hashed(&joined_runs),
+            "out of order: joined all the same"
+        );
+        // Joined as they come, the runs are those a sort and a join make.
+        let mut draw = Draw(0x6a09_e667_f3bc_c908);
+        for _ in 0..200 {
+            let len = PIECE * (1 + draw.below(40) as usize) + draw.below(PIECE as u64) as usize;
+            let mut at = draw.below(1000) as usize;
+            let mut ranges = Vec::new();
+            while at < len + 100 {
+                let n = 1 + draw.below(3 * PIECE as u64 / 2) as usize;
+                ranges.push((at, at + n));
+                let gap = [16, 4 * PIECE as u64][draw.below(2) as usize];
+                at += n + 1 + draw.below(gap) as usize;
+            }
+            let start = draw.below(1 << 40) as usize;
+            let apart: Vec<CardSpan> = card_hash_runs((start, len), &ranges, false, false);
+            assert_eq!(hashed(&card_hash_runs((start, len), &ranges, false, true)), hashed(&joined_piece_runs(apart)));
+        }
+    }
+
+    /// The ranges `card_patches` reads of a copy's CPU side stay inside its
+    /// mapping: one past it is cut there, one wholly past it goes, and
+    /// ranges inside are given as they are.
+    #[test]
+    fn patched_ranges_are_cut_to_the_mapping() {
+        let ranges = [(0usize, 4usize), (10, 20), (30, 40)];
+        assert_eq!(&cut_to(&ranges, 15)[..], [(0, 4), (10, 15)]);
+        assert_eq!(&cut_to(&ranges, 30)[..], [(0, 4), (10, 20)]);
+        assert!(matches!(cut_to(&ranges, 40), std::borrow::Cow::Borrowed(_)));
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -1347,14 +2267,15 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 
 /// Since the last frame-rate line, why [`Shadow::merge_under_writes`] left
 /// a settle due: a copy not write-watched, title writes not known (the
-/// kernel and the guards had no answer), more changed runs than are put
-/// in by copies in the card's memory (and the runs of the page that
-/// passed the limit), a copy without its snapshot.
-static UNMERGED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// kernel and the guards had no answer), more long changed runs than a
+/// submission sends up by copies to copies in the card's memory (and the
+/// runs of the page that passed a limit, either one), a copy without its
+/// snapshot, more short ones than its patches take ([`Room`]).
+static UNMERGED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// [`UNMERGED`], taken.
-pub(crate) fn unmerged_stats() -> [u64; 5] {
-    [0, 1, 2, 3, 4].map(|i| UNMERGED[i].swap(0, Ordering::Relaxed))
+pub(crate) fn unmerged_stats() -> [u64; 6] {
+    std::array::from_fn(|i| UNMERGED[i].swap(0, Ordering::Relaxed))
 }
 
 /// The runs of bytes where `now` differs from `was` (of one length), as
@@ -2259,29 +3180,25 @@ crate::host::copy_source_written(start + at, n);
     /// that the title wrote since the copy last took it, title memory as
     /// it is now is compared with what the copy held when the range was
     /// given to the shaders: the copy's CPU side for a copy in the card's
-    /// memory (the changed runs go up before the next submission, each a
-    /// copy of its own bytes, `runs_left` of them at most), the snapshot
-    /// for the others (the changed bytes go into the copy and into the
-    /// snapshot, so the compare after the card ran takes them for the
-    /// title's and not the shaders').
+    /// memory (the changed runs go up before the next submission, as much
+    /// as `room` takes: a copy of its own for a long run, dword patches for
+    /// a short one), the snapshot for the others (the changed bytes go into
+    /// the copy and into the snapshot, so the compare after the card ran
+    /// takes them for the title's and not the shaders').
     ///
     /// Whether the caller must still settle the flights: the journal
-    /// cannot say what was written, a snapshot is missing, or `runs_left`
-    /// ran out. Pages done before that stay done.
-    pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+    /// cannot say what was written, a snapshot is missing, or a page's runs
+    /// did not fit in `room`. Pages done before that stay done.
+    pub(crate) fn merge_under_writes(&self, address: usize, len: usize, room: &mut Room) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        room.next_copy();
+        // In order and joined: each page once, the runs in the order of
+        // their offsets (`busy_in`).
+        let busy = busy_in(&self.pending.lock().unwrap_or_else(|e| e.into_inner()), from, to);
         if busy.is_empty() {
             return false;
         }
@@ -2333,17 +3250,17 @@ crate::host::copy_source_written(start + at, n);
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
                 let at = lo - start;
-                if self.card.is_some() {
+                if let Some(card) = &self.card {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = changed_runs(title, held);
-                    if runs.len() > *runs_left {
-                        UNMERGED[2].fetch_add(1, Ordering::Relaxed);
+                    let patchable = crate::host::card_patchable(card.size);
+                    if let Err(over) = room.take(runs.iter().map(|&(r, m)| (at + r, at + r + m)), patchable) {
+                        UNMERGED[if over == Over::Copies { 2 } else { 5 }].fetch_add(1, Ordering::Relaxed);
                         UNMERGED[3].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         return true;
                     }
-                    *runs_left -= runs.len();
                     for (r, m) in runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         self.card_changed(at + r, at + r + m);
@@ -2575,11 +3492,31 @@ crate::host::copy_source_written(start + at, n);
         if from >= to {
             return;
         }
-        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        match dirty.last_mut() {
-            Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
-            _ => dirty.push((from, to)),
+        card.notes.lock().unwrap_or_else(|e| e.into_inner()).changed(from, to);
+    }
+
+    /// Of a copy in the card's memory: `ranges` of its CPU side (offsets,
+    /// in order and apart) as patches of dwords ([`dword_patches`]),
+    /// appended to `out`. Under the CPU side's lock, which the merges that
+    /// write it hold ([`Shadow::merge_under_writes`],
+    /// [`Shadow::card_merge_relay`]): the bytes are taken now, where a copy
+    /// takes them when the card runs it; both are the title's bytes noted
+    /// as changed by then. Cut to the CPU side's mapping, as far as a copy
+    /// of a range may reach (no range noted goes past the title buffer).
+    pub(crate) fn card_patches(&self, ranges: &[(usize, usize)], out: &mut Vec<[u32; 3]>) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        if ranges.is_empty() {
+            return;
         }
+        let mapped = card.size as usize;
+        let ranges = cut_to(ranges, mapped);
+        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the CPU side's mapping holds the card side's size in
+        // bytes (`Card::staging`), and the ranges are cut to it.
+        let data = unsafe { std::slice::from_raw_parts(self.data, mapped) };
+        dword_patches(&ranges, data, out);
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -2615,13 +3552,6 @@ crate::host::copy_source_written(start + at, n);
     pub(crate) fn card_span(&self, address: usize, end: usize) -> Option<CardSpan> {
         let (from, to) = self.inside(address, end.saturating_sub(address));
         (from < to).then(|| card_span_of(self.start as usize, from, to))
-    }
-
-    /// The pieces that hold offsets `[from, to)` of the copy (cut to it),
-    /// as the card's hashing takes them.
-    pub(crate) fn card_run(&self, from: usize, to: usize) -> CardSpan {
-        let to = to.min(self.len as usize);
-        card_span_of(self.start as usize, from.min(to.saturating_sub(1)), to)
     }
 
     /// The offsets of piece `i` of `span` that lie in the span.
@@ -2755,16 +3685,7 @@ crate::host::copy_source_written(start + at, n);
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
-        let skip: Vec<(usize, usize)> = {
-            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-            let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            dirty
-                .iter()
-                .copied()
-                .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
-                .filter(|&(a, b)| a < at + n && b > at)
-                .collect()
-        };
+        let skip = card.notes.lock().unwrap_or_else(|e| e.into_inner()).over(at, at + n, fetched_after);
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
@@ -2782,6 +3703,66 @@ crate::host::copy_source_written(start + at, n);
 crate::host::copy_source_written(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
+    }
+}
+
+/// For tests of the paths through the host (`crate::host`'s): copies in the
+/// card's memory made by hand, and what their CPU side and notes hold.
+#[cfg(test)]
+impl Shadow {
+    /// A copy in the card's memory of title memory `[start, start + len)`,
+    /// as `lookup` makes one for a big title buffer: a buffer on the card
+    /// for shaders, and one in the PC's memory for the CPU's side. With
+    /// `listed` it is among the copies whose notes `card_dirty` takes (a
+    /// test that sends must hold the submission lock: any submission takes
+    /// them).
+    pub(crate) fn on_card_for_test(host: &crate::host::Host, start: usize, len: usize, listed: bool) -> Option<Arc<Shadow>> {
+        let size = (len as u64).next_multiple_of(1 << 16);
+        let (staging, data) = host.shared_buffer(size)?;
+        let buffer = host.uav_buffer(size)?;
+        // Counted as `card_for` counts a copy; its drop takes it back.
+        CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(buffer, data, gpu, start as u64, len as u64);
+        shadow.card = Some(Card {
+            staging,
+            before: Mutex::default(),
+            notes: Mutex::default(),
+            size,
+        });
+        let shadow = Arc::new(shadow);
+        if listed {
+            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        }
+        Some(shadow)
+    }
+
+    /// The CPU side's bytes (as many as the card side has).
+    pub(crate) fn cpu_side_for_test(&self) -> Vec<u8> {
+        let size = self.card.as_ref().map_or(self.len, |c| c.size) as usize;
+        // SAFETY: the mapping holds that many bytes.
+        unsafe { std::slice::from_raw_parts(self.data, size) }.to_vec()
+    }
+
+    /// Writes `bytes` into the CPU side at offset `at` and notes them as
+    /// changed, as a refresh does.
+    pub(crate) fn refresh_for_test(&self, at: usize, bytes: &[u8]) {
+        let size = self.card.as_ref().map_or(self.len, |c| c.size) as usize;
+        assert!(at + bytes.len() <= size);
+        // SAFETY: inside the mapping (checked).
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
+        self.card_changed(at, at + bytes.len());
+    }
+
+    /// The ranges not sent yet (joined), and per send still noted its
+    /// number and ranges.
+    pub(crate) fn notes_for_test(&self) -> (Vec<(usize, usize)>, Vec<(u64, Vec<(usize, usize)>)>) {
+        let Some(card) = &self.card else {
+            return (Vec::new(), Vec::new());
+        };
+        let notes = card.notes.lock().unwrap_or_else(|e| e.into_inner());
+        (joined(notes.dirty.clone()), notes.sent.iter().map(|(number, ranges)| (*number, ranges.to_vec())).collect())
     }
 }
 
@@ -2945,8 +3926,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 let card = Card {
                     staging: buffer,
                     before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
+                    notes: Mutex::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -3161,8 +4141,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             let card = Card {
                 staging: buffer,
                 before: Mutex::default(),
-                dirty: Mutex::default(),
-                sent: Mutex::default(),
+                notes: Mutex::default(),
                 size: len,
             };
             (on_card, Some(card))
