@@ -6,7 +6,8 @@
 //! every quarter second; a `NAME=VALUE` line there overrides the variable
 //! (`0` is off, anything else on; a name left out goes back to the
 //! variable's value). Each change is logged ("live switch NAME=VALUE"), so a
-//! log can be cut into the stretches each value held.
+//! log can be cut into the stretches each value held. A read that fails
+//! (the file being rewritten, say) leaves the values as they are.
 //!
 //! Only switches whose code reads them afresh each time, with no state that
 //! a change in the middle would leave inconsistent, are made live.
@@ -117,7 +118,10 @@ fn watch() {
         let _ = std::thread::Builder::new().name("victory-live".into()).spawn(move || {
             let mut last: Option<String> = None;
             loop {
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    std::thread::sleep(LOOK);
+                    continue;
+                };
                 if last.as_deref() != Some(text.as_str()) {
                     apply(parse(&text));
                     last = Some(text);
