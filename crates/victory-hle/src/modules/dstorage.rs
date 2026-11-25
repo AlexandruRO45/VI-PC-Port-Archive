@@ -1166,12 +1166,14 @@ fn into_destination(
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    // A page number not known yet: the title may fill the array after it
-    // enqueued the request, and a queue submits on its own once half full,
-    // so a worker can come to it first. (Failed at once, 302 requests of a
-    // burst at the opening's loading went unwritten in one run, 44 and 9 in
-    // others; one was known 17 us later.) The numbers are read again for a
-    // while.
+    // A page number not known yet: the title fills the array after it
+    // enqueued the request, right before its Submit. A queue that submits
+    // itself half full leaves such a read for that Submit
+    // (`Lanes::submit_as`), so a worker comes to one first only where a
+    // full queue's held reads start before it (`queue`). (Before reads were
+    // held, 302 requests of a burst at the opening's loading went unwritten
+    // in one run, 44 and 9 in others; one number was known 17 us later.)
+    // The numbers are read again for a while.
     let waiting = std::time::Instant::now();
     let mut waited = 0u32;
     while !super::xmem::pages_known(&pages, offset, n) && waiting.elapsed() < std::time::Duration::from_millis(250) {
@@ -1861,6 +1863,50 @@ mod tests {
         };
         assert_eq!(second, plain);
         assert!(first.iter().all(|&b| b == 0), "the old page was written");
+    }
+
+    #[test]
+    fn a_page_number_written_after_its_read_started_is_read_again() {
+        use crate::modules::xmem;
+        let (mut given, mut pages) = (1usize, [0usize; 1]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, pages.as_ptr()), mapped);
+        // The title's page list: no number in it yet when the read starts,
+        // as where a full queue's held reads go before the title's Submit.
+        let mut numbers = [0usize];
+        let list = numbers.as_mut_ptr();
+        let plain = pattern(4096);
+        let (queue, array) = (new_queue(1), status_array(1));
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        // Time for a worker to take the read and find no page.
+        std::thread::sleep(Duration::from_millis(20));
+        // SAFETY: the list outlives the request, which reads it while it runs.
+        unsafe { std::ptr::write_volatile(list, pages[0]) };
+        assert_eq!(wait(array, 0), S_OK);
+        // SAFETY: the page is mapped read-write.
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
+        assert_eq!(seen, plain);
     }
 
     #[test]
