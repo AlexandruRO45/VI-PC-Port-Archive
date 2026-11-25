@@ -844,8 +844,14 @@ impl State {
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
+                .filter_map(|&h| {
+                    let heap = crate::descriptor::heap(h as This);
+                    let host = heap.host()?;
+                    if !heap.samplers() {
+                        list.hold_view_heap(host);
+                    }
+                    Some(Some(host.heap.clone()))
+                })
                 .collect();
             if memory_heap && let Some(h) = crate::memory::heap() {
                 heaps.insert(0, Some(h.heap.clone()));
@@ -1869,6 +1875,9 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod placed_buffer_tests;
 
 #[cfg(test)]
 mod tests {

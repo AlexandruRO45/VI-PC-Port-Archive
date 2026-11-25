@@ -1,17 +1,24 @@
-use super::{PIPELINE_IIDS, Shader, Translated, hand_out, host_pipeline};
 use crate::object::{S_OK, This, guid, slot};
-use std::sync::{Arc, OnceLock};
-use victory_shader::native::{ComputeIo, StageIo};
-use victory_shader::{
-    Container, HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, emit, io,
-    ir, resource, structure,
-};
+use std::sync::Arc;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::Interface;
 
-/// Synthetic compute shader reading a raw buffer and storing it at texel (0, 0).
-fn store_shader() -> Arc<Shader> {
+struct Guest(This);
+
+impl Drop for Guest {
+    fn drop(&mut self) {
+        slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+    }
+}
+
+const TEXTURE_ALIGNMENT: usize = 64 << 10;
+
+/// A compute dispatch reading a raw buffer and storing it at texel (0, 0).
+fn program() -> victory_shader::NativeProgram {
+    use victory_shader::native::{ComputeIo, StageIo};
+    use victory_shader::{HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource};
+
     let words: [u32; 16] = [
         0xBE82_0300,
         0xBE83_0380, // s_mov_b32 s2, s0; s3, 0
@@ -51,7 +58,7 @@ fn store_shader() -> Arc<Shader> {
         user_data: slot,
         slot,
     };
-    let native = NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 8,
@@ -65,41 +72,8 @@ fn store_shader() -> Arc<Shader> {
             threads: [1, 1, 1],
         }),
         code,
-    };
-
-    // Compute has no input/output signatures. Supply just the DXBC header.
-    let mut container = vec![0; 32];
-    container[..4].copy_from_slice(b"DXBC");
-    container[20..24].copy_from_slice(&1u32.to_le_bytes());
-    container[24..28].copy_from_slice(&32u32.to_le_bytes());
-    let c = Container::parse(&container).unwrap();
-    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let st = structure::structure(&p).unwrap();
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-    let io = io::raise(&p, &native).unwrap();
-    let host = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
-    Arc::new(Shader {
-        stage: "compute",
-        hash: blake3::hash(&native.code).to_hex()[..16].to_owned(),
-        container,
-        translated: OnceLock::from(Some(Translated {
-            host,
-            used: native.used,
-        })),
-    })
-}
-
-struct Guest(This);
-
-impl Drop for Guest {
-    fn drop(&mut self) {
-        slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
     }
 }
-
-// The cached placement must stay live for the process. Align within the array.
-const TEXTURE_ALIGNMENT: usize = 64 << 10;
-static BACKING: [u8; 2 * TEXTURE_ALIGNMENT] = [0; 2 * TEXTURE_ALIGNMENT];
 
 #[test]
 fn registered_buffer_replaces_loose_shadow_on_next_dispatch() {
@@ -124,11 +98,11 @@ fn registered_buffer_replaces_loose_shadow_on_next_dispatch() {
     let null = std::ptr::null();
     let mut pipe = null;
     assert_eq!(
-        hand_out(vec![store_shader()], None, &PIPELINE_IIDS[0], &mut pipe),
+        crate::pipeline::test_compute_pipeline(program(), &mut pipe),
         S_OK
     );
     let pipe = Guest(pipe);
-    assert!(host_pipeline(pipe.0).is_some(), "synthetic host pipeline");
+    assert!(crate::pipeline::host_pipeline(pipe.0).is_some(), "synthetic host pipeline");
 
     let source_mem =
         crate::resource::Memory::zeroed(TEXTURE_ALIGNMENT as u64, TEXTURE_ALIGNMENT as u64)
@@ -168,7 +142,8 @@ fn registered_buffer_replaces_loose_shadow_on_next_dispatch() {
         0,
         0,
     ];
-    let dest_address = (BACKING.as_ptr() as usize).next_multiple_of(TEXTURE_ALIGNMENT) as u64;
+    // The placed texture cache keeps the address for the process.
+    let dest_address = crate::watch::tests::pool(1) as u64;
     let format = DXGI_FORMAT_R32G32B32A32_FLOAT.0 as u32;
     let dest_words = [
         D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32,
@@ -231,7 +206,14 @@ fn registered_buffer_replaces_loose_shadow_on_next_dispatch() {
         crate::descriptor::create_uav(null, output, null, &output_view, handle + 32);
         Guest(views)
     };
-    let render = |views: &Guest| {
+    struct Recorded {
+        state: crate::draw::State,
+        list: crate::host::HostList,
+        readback: ID3D12Resource,
+        footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    }
+
+    let record = |views: &Guest| {
         let handle = crate::descriptor::heap(views.0).start;
         let list = host.new_list().unwrap();
         crate::texture::upload(&list, output, texture);
@@ -250,25 +232,32 @@ fn registered_buffer_replaces_loose_shadow_on_next_dispatch() {
         let (readback, footprint) =
             crate::capture::read_back(&host.device, &list.list, texture).unwrap();
         list.close();
-        host.execute(&[&list]);
+        Recorded { state, list, readback, footprint }
+    };
+    let submit = |recorded: &Recorded| {
+        host.execute(&[&recorded.list]);
         // SAFETY: the readback contains the RGBA32_FLOAT texel after completion.
         unsafe {
             let mut data = std::ptr::null_mut();
-            readback.Map(0, None, Some(&mut data)).unwrap();
+            recorded.readback.Map(0, None, Some(&mut data)).unwrap();
             let texel = data
                 .cast::<u8>()
-                .add(footprint.Offset as usize)
+                .add(recorded.footprint.Offset as usize)
                 .cast::<[f32; 4]>()
                 .read_unaligned();
-            readback.Unmap(0, None);
+            recorded.readback.Unmap(0, None);
             assert!(host.device.GetDeviceRemovedReason().is_ok());
-            texel
+            (texel, !recorded.state.fresh_tables.is_empty())
         }
     };
 
+    let render = |views: &Guest| submit(&record(views));
     let heap = new_heap();
     let loose = crate::shadow::find(source, TEXTURE_ALIGNMENT as u64).expect("loose shadow");
-    assert_eq!(render(&heap), [0.0; 4], "before buffer registration");
+    let old = record(&heap);
+    assert_eq!(submit(&old), ([0.0; 4], false), "before buffer registration");
+    // Keep a second old list recorded but unsubmitted during the change.
+    let unsubmitted = record(&heap);
 
     let mut buffer = null;
     let iid = ID3D12Resource::IID;
@@ -291,15 +280,23 @@ fn registered_buffer_replaces_loose_shadow_on_next_dispatch() {
     assert!(!Arc::ptr_eq(&loose, &registered));
     // SAFETY: the first dword of source_mem, still live throughout the test.
     unsafe { (source as *mut u32).write(1.25f32.to_bits()) };
-    let existing = render(&heap);
+    let want = [1.25, 0.0, 0.0, 0.0];
     assert_eq!(
-        render(&new_heap()),
-        [1.25, 0.0, 0.0, 0.0],
-        "fresh descriptor control"
+        render(&heap),
+        (want, true),
+        "a new dispatch uses a fresh table while old lists can still execute"
     );
+    drop(old);
     assert_eq!(
-        existing,
-        [1.25, 0.0, 0.0, 0.0],
-        "existing descriptor must use the registered buffer"
+        render(&heap),
+        (want, true),
+        "the recorded but unsubmitted list still needs the original slot"
     );
+    drop(unsubmitted);
+    assert_eq!(
+        render(&heap),
+        (want, false),
+        "the permanent slot follows the backing once old lists retire"
+    );
+    assert_eq!(render(&new_heap()), (want, false), "fresh descriptor control");
 }
