@@ -1290,6 +1290,9 @@ impl<'a> Lower<'a> {
         if paired {
             s.threads = Some([32, 1, 1]);
             s.wave_size = Some(32);
+            if let StageIo::Cs(cs) = x.native.io {
+                s.lds_dwords = cs.lds_bytes() / 4;
+            }
             console_lanes = true;
         } else if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -2321,6 +2324,7 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let paired_lds = self.twin.is_some() && self.s.lds_dwords != 0;
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2331,7 +2335,9 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            dxil: self.s.finish(),
+            dxil: self.s.finish_checked(paired_lds).ok_or_else(|| {
+                unsupported(0, "an uncertified paired LDS convergence or address proof")
+            })?,
             user_data,
             samplers: self.samplers,
         })
@@ -4555,14 +4561,26 @@ impl<'a> Lower<'a> {
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
         // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        let index = |l: &mut Self, bytes: u32| -> V {
             let c = l.cur;
-            let o = l.s.m.i32(bytes);
-            let at = l.s.m.bin(c, Bin::Add, a, o);
-            let two = l.s.m.i32(2);
-            let index = l.s.m.bin(c, Bin::LShr, at, two);
+            if l.twin.is_some() {
+                // Add in dwords so an out-of-range byte address plus the
+                // immediate cannot wrap into the LDS allocation.
+                let two = l.s.m.i32(2);
+                let base = l.s.m.bin(c, Bin::LShr, a, two);
+                let offset = l.s.m.i32(bytes / 4);
+                l.s.m.bin(c, Bin::Add, base, offset)
+            } else {
+                let o = l.s.m.i32(bytes);
+                let at = l.s.m.bin(c, Bin::Add, a, o);
+                let two = l.s.m.i32(2);
+                l.s.m.bin(c, Bin::LShr, at, two)
+            }
+        };
+        let dword = |l: &mut Self, bytes: u32| -> V {
+            let index = index(l, bytes);
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            l.s.m.element(l.cur, lds, index)
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -4667,8 +4685,19 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
-                    let x = self.s.m.load(self.cur, p);
+                    let x = if self.twin.is_some() {
+                        let index = index(self, off + 4 * k);
+                        let valid = self.paired_lds_in_bounds(index, guard);
+                        let at = self.begin_guarded(Some(valid));
+                        let lds = self.s.lds();
+                        let p = self.s.m.element(self.cur, lds, index);
+                        let x = self.s.m.load(self.cur, p);
+                        let zero = self.s.m.i32(0);
+                        self.end_guarded(at, &[(x, zero)])[0]
+                    } else {
+                        let p = dword(self, off + 4 * k);
+                        self.s.m.load(self.cur, p)
+                    };
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -4728,7 +4757,14 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
+        let paired_index = self.twin.is_some().then(|| index(self, offset));
+        let (p, guard) = if let Some(index) = paired_index {
+            let guard = self.paired_lds_in_bounds(index, guard);
+            let lds = self.s.lds();
+            (self.s.m.element(self.cur, lds, index), Some(guard))
+        } else {
+            (dword(self, offset), guard)
+        };
         if let Some(max) = match op.as_str() {
             "max_f32" => Some(true),
             "min_f32" => Some(false),
@@ -4756,6 +4792,12 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, None);
         }
         Ok(())
+    }
+
+    fn paired_lds_in_bounds(&mut self, index: V, exec: Option<V>) -> V {
+        let len = self.s.m.i32(self.s.lds_dwords);
+        let in_bounds = self.s.m.cmp(self.cur, pred::IULT, index, len);
+        exec.map_or(in_bounds, |exec| self.s.m.bin(self.cur, Bin::And, exec, in_bounds))
     }
 
     /// `ds_max_f32` (`max`) or `ds_min_f32` on the LDS dword at `p` with

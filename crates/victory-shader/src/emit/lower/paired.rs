@@ -267,7 +267,13 @@ impl<'a> Lower<'a> {
         self.swap_lanes();
         let r = self.inst(b, i);
         self.swap_lanes();
-        r
+        r?;
+        if matches!(inst.fields, Fields::Ds { .. }) {
+            // Both logical halves have left their EXEC guards. Complete
+            // this guest instruction before either half accesses LDS again.
+            self.group_sync(self.cur);
+        }
+        Ok(())
     }
 
     fn mirror(&mut self, inst: &Inst) {

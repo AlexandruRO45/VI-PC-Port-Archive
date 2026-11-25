@@ -444,7 +444,11 @@ impl Shader {
     }
 
     /// The finished container.
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
+        self.finish_checked(false).expect("ordinary shader serialization")
+    }
+
+    pub(super) fn finish_checked(mut self, paired_lds: bool) -> Option<Vec<u8>> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -466,6 +470,9 @@ impl Shader {
                     self.flags &= !flag;
                 }
             }
+        }
+        if paired_lds && !self.m.certifies_paired_lds(self.threads, self.wave_size) {
+            return None;
         }
         let mut resources = None;
         let mut bindings = Vec::new();
@@ -836,7 +843,7 @@ impl Shader {
             parts.push((b"PSG1", &psg1));
         }
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
-        container::build(&parts)
+        Some(container::build(&parts))
     }
 
     /// The user-data buffer's annotation carries its size, known only now.

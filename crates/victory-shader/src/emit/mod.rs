@@ -558,24 +558,42 @@ fn paired_wave(
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const GROUP: ShaderError = ShaderError::Unsupported {
         offset: 0,
-        what: "paired lanes require one full console wave without shared memory",
+        what: "paired lanes require one full console wave and synchronized shared memory",
     };
     let crate::native::StageIo::Cs(cs) = native.io else {
         return Err(GROUP);
     };
-    if cs.threads.into_iter().try_fold(1u32, u32::checked_mul) != Some(64) || cs.lds_bytes() != 0 {
+    if cs.threads.into_iter().try_fold(1u32, u32::checked_mul) != Some(64)
+        || cs.lds_bytes() > 32768
+        || cs.lds_bytes() != 0 && group_sync() == 0
+    {
         return Err(GROUP);
     }
     if let Some(inst) = p.blocks.iter().flat_map(|b| &b.insts).find(|i| {
         let name = i.name();
-        matches!(i.fields, crate::gfx10::Fields::Ds { .. })
+        let unsupported_ds = match i.fields {
+            crate::gfx10::Fields::Ds { gds: false, offset0, .. } => {
+                match name {
+                    "ds_write2_b32" | "ds_read2_b32" => false,
+                    "ds_write_b32" | "ds_read_b32" | "ds_add_u32" | "ds_or_b32"
+                    | "ds_min_u32" | "ds_max_u32" => offset0 % 4 != 0,
+                    _ => true,
+                }
+            }
+            crate::gfx10::Fields::Ds { .. }
+            | crate::gfx10::Fields::Buffer { lds: true, .. }
+            | crate::gfx10::Fields::Flat { lds: true, .. } => true,
+            _ => false,
+        };
+        unsupported_ds
             || name.contains("barrier")
+            || cs.lds_bytes() != 0 && i.write(ir::Reg::S(ir::M0)).is_some()
             || matches!(i.fields, crate::gfx10::Fields::Smem { .. })
                 && (name.contains("store") || name.contains("atomic"))
     }) {
         return Err(ShaderError::Unsupported {
             offset: inst.machine.offset,
-            what: "paired lanes with shared memory, a barrier or a scalar memory write",
+            what: "paired lanes with an unsupported shared-memory instruction or scalar write",
         });
     }
     let mut wide = std::collections::HashSet::new();
