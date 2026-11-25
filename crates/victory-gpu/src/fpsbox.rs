@@ -146,7 +146,10 @@ struct Made {
 unsafe impl Send for Made {}
 
 /// The boxes made so far, by text, format and scale.
-static MADE: Mutex<Option<HashMap<(u32, i32, u32), Made>>> = Mutex::new(None);
+static MADE: Mutex<Option<Boxes>> = Mutex::new(None);
+
+/// Boxes by text, format and scale.
+type Boxes = HashMap<(u32, i32, u32), Made>;
 
 /// Copies the frame rate's box onto `back`, a back buffer of `width` by
 /// `height` pixels of `format` that `list` holds as a copy's destination.
