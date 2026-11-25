@@ -251,10 +251,18 @@ fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Guards the other mappings of taken pages.
-fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) {
+/// Guards the other mappings of taken pages. Returns the taken pages that
+/// must stay changed: one of their mappings is busy under a write the guards
+/// do not see, or could not be guarded, so a write through it would not mark
+/// them and their copies would miss it (#2454).
+fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) -> std::collections::BTreeSet<usize> {
     let others: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
-    protect(g, &others);
+    let guarded: std::collections::BTreeSet<usize> = protect(g, &others).into_iter().collect();
+    pairs
+        .iter()
+        .filter(|(_, alias)| !guarded.contains(alias))
+        .map(|&(page, _)| page)
+        .collect()
 }
 
 /// Tracks `[start, start + len)` if it is the runtime's GPU memory (every
@@ -455,11 +463,15 @@ impl Tracked {
         #[cfg(feature = "diagnostics")]
         let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
         let others = aliases(&g, &whole);
-        guard_aliases(&mut g, &others);
+        let blocked = guard_aliases(&mut g, &others);
         #[cfg(feature = "diagnostics")]
         drop(asked);
+        // A page one of whose mappings could not be guarded is not taken: it
+        // stays changed and keeps what it saved, so the write through that
+        // mapping is copied and not lost (#2454).
+        let take: Vec<usize> = whole.iter().copied().filter(|p| !blocked.contains(p)).collect();
         let mut unmapped = Vec::new();
-        for page in protect_noting(&mut g, &whole, &mut unmapped) {
+        for page in protect_noting(&mut g, &take, &mut unmapped) {
             changed.remove(&page);
             self.changed.taken(page);
         }
@@ -493,8 +505,9 @@ impl Tracked {
         let mut g = guards();
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         let others = aliases(&g, pages);
-        guard_aliases(&mut g, &others);
-        for page in protect(&mut g, pages) {
+        let blocked = guard_aliases(&mut g, &others);
+        let take: Vec<usize> = pages.iter().copied().filter(|p| !blocked.contains(p)).collect();
+        for page in protect(&mut g, &take) {
             changed.remove(&page);
             self.changed.taken(page);
         }
@@ -778,8 +791,15 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
             }
         }
     }
-    if others.iter().any(|&o| g.protected.contains(&(o / PAGE))) {
-        protect(&mut g, &[page]);
+    if others.iter().any(|&o| g.protected.contains(&(o / PAGE)))
+        && protect(&mut g, &[page]).is_empty()
+    {
+        // The new mapping of a guarded page cannot be guarded (busy under a
+        // write the guards do not see, or a failed protect): it must not stay
+        // current, or the tracked mappings would miss what is written through
+        // it (#2454). Mark it changed without saving, so what was saved for a
+        // marked write is kept.
+        changed(&mut g, page, page + 1, false);
     }
 }
 
@@ -1211,6 +1231,57 @@ pub(crate) mod tests {
         // SAFETY: a page of our pool, guarded: the handler opens it.
         unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(1) };
         assert!(copy.changed(p / PAGE + 1) && texture.changed(p / PAGE + 1), "a title write marks both");
+    }
+
+    /// A page whose other mapping is busy under a write the guards do not see
+    /// is not taken (#2454): it stays changed and keeps what it saved, so the
+    /// write through that mapping is not lost.
+    #[test]
+    fn a_page_whose_other_mapping_is_busy_is_not_taken() {
+        let (a, b) = (pool(1), pool(1));
+        let t = track(a, PAGE, true).expect("tracked");
+        t.take(a, a + PAGE);
+        t.arm(a, a + PAGE);
+        title_memory_aliased(a, &[b]);
+        // A kernel write through `b`: it cannot be guarded meanwhile.
+        let pending = writing(b, PAGE);
+        // A refresh takes `a`, which guards every address showing it.
+        t.take(a, a + PAGE);
+        assert!(t.changed(a / PAGE), "not taken while a mapping of it cannot be guarded");
+        assert!(t.saved(a / PAGE).is_some(), "and what it saved is kept");
+        drop(pending);
+        // Once the write ended, `b` can be guarded and the page is taken.
+        t.take(a, a + PAGE);
+        assert!(!t.changed(a / PAGE));
+        // Leave no links or guards behind for the tests that reuse the pages.
+        title_memory_remapped(a, PAGE);
+        title_memory_remapped(b, PAGE);
+        drop(t);
+        open(&mut guards(), b / PAGE);
+        free(a);
+        free(b);
+    }
+
+    /// A mapping that cannot be guarded when it is linked to a tracked page
+    /// leaves that page changed (#2454): its copy picks the writes through the
+    /// new mapping up instead of staying current.
+    #[test]
+    fn linking_an_unguardable_mapping_keeps_the_tracked_page_changed() {
+        let (a, b) = (pool(1), pool(1));
+        let t = track(a, PAGE, true).expect("tracked");
+        t.take(a, a + PAGE);
+        t.arm(a, a + PAGE);
+        // A kernel write through `b` is under way when the runtime maps `b`
+        // where `a` shows the same page: `b` cannot be guarded.
+        let pending = writing(b, PAGE);
+        title_memory_aliased(b, &[a]);
+        assert!(t.changed(a / PAGE), "the tracked page stays changed");
+        drop(pending);
+        // Leave no links behind for the tests that reuse the pages.
+        title_memory_remapped(b, PAGE);
+        drop(t);
+        free(a);
+        free(b);
     }
 
     /// A write or mapping that runs past the end of the address space (a
