@@ -475,8 +475,8 @@ fn remove_older(files: &[(u64, PathBuf)], generation: u64) {
 /// build that writes only the original filename, as earlier ones did, is
 /// not outvoted by an older numbered file), then by generation. A file that
 /// does not open (empty, gone, or held by another process for the moment)
-/// leaves the next older one to try. The others are removed where they can
-/// be, and so are staging files of runs that ended in a save.
+/// leaves the next older one to try. The older ones are removed where they
+/// can be, and so are staging files of processes that ended during a save.
 fn load_blob(dir: &Path) -> io::Result<Option<MappedBlob>> {
     remove_stale_staging(dir);
     let mut files = generations(dir)?;
@@ -485,10 +485,11 @@ fn load_blob(dir: &Path) -> io::Result<Option<MappedBlob>> {
     for (i, (_, path)) in files.iter().enumerate().rev() {
         match MappedBlob::open(path) {
             Ok(Some(blob)) => {
-                for (k, (_, other)) in files.iter().enumerate() {
-                    if k != i {
-                        let _ = std::fs::remove_file(other);
-                    }
+                // The older ones only: a newer one that did not open now
+                // (held for the moment, or dated before its time by a clock
+                // set back) is left for the next start.
+                for (_, older) in &files[..i] {
+                    let _ = std::fs::remove_file(older);
                 }
                 return Ok(Some(blob));
             }
@@ -535,9 +536,10 @@ fn running(pid: u32) -> bool {
     // SAFETY: a plain query; the handle is closed below.
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if process.is_null() {
-        // Gone, or not ours to ask: only the first is safe to clean up
-        // after, and an access error says the process is there.
-        return io::Error::last_os_error().raw_os_error() == Some(5);
+        // Only "no such process" is safe to clean up after: any other
+        // failure (access denied, among others) counts as running.
+        const ERROR_INVALID_PARAMETER: i32 = 87;
+        return io::Error::last_os_error().raw_os_error() != Some(ERROR_INVALID_PARAMETER);
     }
     let mut code = 0;
     // SAFETY: a live process handle and a valid out pointer.
@@ -559,7 +561,8 @@ fn save_blob(dir: &Path, bytes: &[u8]) -> io::Result<()> {
     for _ in 0..TRIES {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let tmp = dir.join(format!("{LIBRARY_FILE}{STAGING}{}-{n}", std::process::id()));
-        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+        // Not shared: no one deletes it while it is written.
+        match OpenOptions::new().write(true).create_new(true).share_mode(0).open(&tmp) {
             Ok(file) => {
                 staged = Some((tmp, file));
                 break;
@@ -757,8 +760,13 @@ mod tests {
         let blob = load_blob(dir.path()).unwrap().unwrap();
         assert_eq!(blob.bytes(), b"first", "the generation before an empty one");
         drop(blob);
-        // Written later than any numbered one, under the original name.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Written later than any numbered one, under the original name (the
+        // times are set: a file system may keep them to the second).
+        let numbered = generations(dir.path()).unwrap();
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        for (_, path) in &numbered {
+            File::options().write(true).open(path).unwrap().set_modified(earlier).unwrap();
+        }
         std::fs::write(dir.path().join(LIBRARY_FILE), b"from another build").unwrap();
         let blob = load_blob(dir.path()).unwrap().unwrap();
         assert_eq!(blob.bytes(), b"from another build");
