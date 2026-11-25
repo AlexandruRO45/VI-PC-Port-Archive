@@ -302,6 +302,10 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
 /// (the view-stride table holds 0 there; a texture here) reads the host's
 /// null buffer view instead (`emit`, "Buffer views at computed heap
 /// indices"): a texture descriptor read as a buffer one is a wild address.
+    /// A host that caps its shader-visible heaps below `HEAP_VIEWS`
+    /// (D3D12 guarantees only 2^20 slots; an Intel Arc B580 enforces the
+    /// limit) has no slot at that far end: the hardware leg is skipped
+    /// there, and WARP still runs.
 #[test]
 fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
     let shader = build(
@@ -325,6 +329,10 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        if !warp && !host.takes_null_view_heap() {
+            eprintln!("no HEAP_VIEWS view heap on {label}; skipped");
+            continue;
+        }
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));

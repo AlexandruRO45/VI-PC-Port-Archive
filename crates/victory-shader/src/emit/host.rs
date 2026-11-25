@@ -1282,6 +1282,29 @@ pub struct Dispatch<'a> {
 
 #[cfg(test)]
 impl Host {
+    /// Whether the device takes a shader-visible view heap of
+    /// [`HEAP_VIEWS`](super::HEAP_VIEWS) slots: the null buffer view a
+    /// heap-indexed read falls back to lives at its far end, so a test
+    /// that covers it (a `NullBuffers` view) cannot run on a host that
+    /// refuses the heap. D3D12 guarantees only
+    /// `D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2` (2^20)
+    /// shader-visible slots, and a conformant host that enforces the
+    /// limit (an Intel Arc B580) answers `E_INVALIDARG` to the heap
+    /// these tests would create: they skip the leg instead of failing.
+    pub fn takes_null_view_heap(&self) -> bool {
+        // SAFETY: plain heap creation, dropped at once.
+        unsafe {
+            self.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: super::HEAP_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+                .is_ok()
+        }
+    }
+
     /// Runs a compute pipeline and returns each UAV's contents in heap
     /// order (texels as float bits, row by row).
     pub fn dispatch(
