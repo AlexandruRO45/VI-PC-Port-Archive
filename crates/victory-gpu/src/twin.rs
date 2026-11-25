@@ -719,7 +719,7 @@ mod tests {
     /// When the shader blob carries no embedded root signature (as with Wine's
     /// builtin `d3dcompiler_47`, which drops `[RootSignature]`), the converter
     /// builds its signature via `D3D12SerializeRootSignature` and converts
-    /// 16-bit depth to 24-bit and back.
+    /// 16-bit depth to float depth and back.
     #[test]
     fn converter_falls_back_when_shader_blob_has_no_root_signature() {
         let Some(host) = host() else {
@@ -729,7 +729,7 @@ mod tests {
         assert_ne!(stripped, SOURCE);
         let c = compile_source(&stripped).expect("fallback converter");
         let (buf, data) = host.shared_buffer(512).unwrap();
-        // 4x4 16-bit depth at offset 0 (pitch 8), 24-bit depth at offset 256 (pitch 16).
+        // 4x4 16-bit depth at offset 0 (pitch 8), 32-bit depth at offset 256 (pitch 16).
         for i in 0..16usize {
             // SAFETY: inside the mapped 512-byte buffer.
             unsafe { (data.add(i * 2) as *mut u16).write(0x1234) };
@@ -752,14 +752,15 @@ mod tests {
         for i in 0..16usize {
             // SAFETY: inside the mapped 512-byte buffer.
             let got = unsafe { (data.add(256 + i * 4) as *const u32).read() };
-            assert_eq!(got, 0x123412, "24-bit depth at texel {i}");
+            let want = (f32::from(0x1234u16) * f32::from_bits(0x3780_0080)).to_bits();
+            assert_eq!(got, want, "float depth at texel {i}");
         }
-        // Reverse: 24-bit 0.5 (0x800000) -> 16-bit 32768 (0x8000).
+        // Reverse: float depth 0.5 -> 16-bit 32768 (0x8000).
         for i in 0..16usize {
             // SAFETY: inside the mapped 512-byte buffer.
             unsafe {
                 (data.add(i * 2) as *mut u16).write(0);
-                (data.add(256 + i * 4) as *mut u32).write(0x800000);
+                (data.add(256 + i * 4) as *mut u32).write(0.5f32.to_bits());
             }
         }
         list.reset();
