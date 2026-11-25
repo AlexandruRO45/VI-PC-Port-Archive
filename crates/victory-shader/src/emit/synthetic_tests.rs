@@ -65,6 +65,10 @@ fn program(whole: bool) -> Vec<u32> {
 }
 
 fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    build_group(words, 32)
+}
+
+fn build_group(words: &[u32], threads: u32) -> Result<HostShader, crate::ShaderError> {
     let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
         root: RootType::Table,
@@ -94,7 +98,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 1 << 1,
-            threads: [32, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -440,11 +444,12 @@ fn a_mask_joined_with_data_at_a_uniform_loop_is_its_number() {
 
 /// A lane mask a compare makes inside a region the other lanes skip, joined
 /// with data in the same register on the skip edge (a reused register): the
-/// skipping lanes read 0, their bit of the compare, as on the console. A
-/// mask holding lanes outside its edge (the saved EXEC) stays refused.
+/// skipping lanes read 0, their bit of the compare. Copying the saved EXEC
+/// instead sets every lane's bit, including lanes outside the compare region.
+/// Lowering that copy requires a complete Wave32 group.
 #[test]
 fn a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there() {
-    let mut words = vec![
+    let mut words = [
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF408_0A02,
@@ -464,10 +469,19 @@ fn a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there() {
         0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
     ];
-    let shader = build(&words).expect("lower");
+    let compare = build(&words).expect("lower compare");
+    words[10..12].copy_from_slice(&[0xBE86_0308, 0xBF80_0000]); // s_mov_b32 s6, s8; s_nop 0
+    let saved = build(&words).expect("lower saved EXEC for a complete wave");
+    let Err(crate::ShaderError::Unsupported { what, .. }) = build_group(&words, 16) else {
+        panic!("expected a partial wave to refuse the saved EXEC join");
+    };
+    assert_eq!(what, "a lane-mask join of an untracked mask");
+
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
+        for (name, shader) in [("compare", &compare), ("saved EXEC", &saved)] {
+            v.validate(&mut shader.dxil.clone())
+                .unwrap_or_else(|e| panic!("{name}: DXIL validation failed: {e}"));
+        }
     }
     let views = [
         View::Texture(1, 1, &[[0.0; 4]]),
@@ -477,21 +491,18 @@ fn a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there() {
         },
         View::RawUav(32),
     ];
-    let want: Vec<u32> = (0..32).map(|lane| u32::from(lane < 8)).collect();
-    {
-        let _one = super::valu_tests::ONE_AT_A_TIME
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for (label, warp) in [("hardware", false), ("warp", true)] {
-            let Ok(host) = Host::new(warp) else {
-                eprintln!("no SM 6.6 {label} device; skipped");
-                continue;
-            };
-            let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-                assert!(warp, "{label}: no pipeline for a wave of 32");
-                eprintln!("{label}: no pipeline for a wave of 32; skipped");
-                continue;
-            };
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let check = |name: &str, shader: &HostShader, want: [u32; 32]| {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}: {name} pipeline failed: {e}"));
             let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             let out = host
                 .dispatch(
@@ -504,17 +515,20 @@ fn a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there() {
                         groups: [1, 1, 1],
                     },
                 )
-                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            assert_eq!(out[0], want, "{label}");
+                .unwrap_or_else(|e| panic!("{label}: {name} dispatch failed: {e}"));
+            assert_eq!(out[0], want, "{label}: {name}");
+        };
+        check(
+            "compare",
+            &compare,
+            std::array::from_fn(|i| u32::from(i < 8)),
+        );
+        if warp && !host.supports_wave32().expect("query WARP wave sizes") {
+            eprintln!("{label}: saved EXEC requires Wave32; skipped");
+            continue;
         }
+        check("saved EXEC", &saved, [1; 32]);
     }
-    // The saved EXEC instead (every lane): the skipping lanes' bit would be
-    // 1 on the console.
-    words[10..12].copy_from_slice(&[0xBE86_0308, 0xBF80_0000]); // s_mov_b32 s6, s8; s_nop 0
-    let Err(crate::ShaderError::Unsupported { what, .. }) = build(&words) else {
-        panic!("a mask holding lanes off its edge joined with data translated");
-    };
-    assert!(what.contains("lane-mask join"), "{what}");
 }
 
 /// A register array (v3-v14) indexed through M0 in waterfall loops, as

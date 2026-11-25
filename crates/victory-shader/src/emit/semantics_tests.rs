@@ -410,10 +410,6 @@ fn check_wave32(
     inputs: &[[u32; 4]],
     expected: impl Fn(usize) -> [u32; 4],
 ) {
-    use windows::Win32::Graphics::Direct3D12::{
-        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
-    };
-
     let shader =
         lower_program(&program(body, false)).unwrap_or_else(|e| panic!("lower {name}: {e}"));
     if let Ok(mut val) = validator::Validator::load(validator::Validator::default_path().as_deref())
@@ -428,20 +424,8 @@ fn check_wave32(
         eprintln!("no SM 6.6 device for {name}");
         return;
     };
-    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-    // SAFETY: the feature query writes the matching options structure.
-    let support = unsafe {
-        host.device.CheckFeatureSupport(
-            D3D12_FEATURE_D3D12_OPTIONS1,
-            (&raw mut waves).cast(),
-            size_of_val(&waves) as u32,
-        )
-    };
-    if support.is_err()
-        || !waves.WaveOps.as_bool()
-        || !(waves.WaveLaneCountMin..=waves.WaveLaneCountMax).contains(&32)
-    {
-        eprintln!("Wave32 unavailable for the loop test");
+    if !host.supports_wave32().unwrap_or(false) {
+        eprintln!("Wave32 unavailable for {name}");
         return;
     }
 
