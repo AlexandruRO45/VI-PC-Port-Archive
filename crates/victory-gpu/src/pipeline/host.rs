@@ -817,16 +817,24 @@ fn root_signature(
 mod tests {
     use super::*;
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ColorStream {
+        Unorm,
+        FloatFirst,
+        Constant,
+    }
+
     /// The rectangle position and color come from different vertex streams.
     /// A different corner order on the color stream corrupts the second triangle.
     #[test]
     fn cpu_rectangle_uses_the_position_corner_order_for_split_vertex_streams() {
-        for color_first in [false, true] {
-            check_split_rectangle(color_first);
+        for color in [ColorStream::Unorm, ColorStream::FloatFirst, ColorStream::Constant] {
+            check_split_rectangle(color);
         }
     }
 
-    fn check_split_rectangle(color_first: bool) {
+    fn check_split_rectangle(layout: ColorStream) {
+        let color_first = layout == ColorStream::FloatFirst;
         use crate::object::{S_OK, This, guid, slot};
         use victory_shader::{HwStage, emit::HostShader};
         use windows::Win32::Foundation::RECT;
@@ -954,20 +962,26 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
                 [-1.0, -1.0],
                 [1.0, 1.0],
             ]);
-            if color_first {
-                address(color).cast::<[[f32; 2]; 4]>().write_unaligned([
-                    [0.0; 2],
-                    [0.0, 0.0],
-                    [1.0, 1.0],
-                    [0.0, 1.0],
-                ]);
-            } else {
-                address(color).cast::<[[u8; 4]; 4]>().write_unaligned([
-                    [0; 4],
-                    [0, 0, 0, 255],
-                    [0, 255, 0, 255],
-                    [255, 0, 0, 255],
-                ]);
+            match layout {
+                ColorStream::FloatFirst => {
+                    address(color).cast::<[[f32; 2]; 4]>().write_unaligned([
+                        [0.0; 2],
+                        [0.0, 0.0],
+                        [1.0, 1.0],
+                        [0.0, 1.0],
+                    ]);
+                }
+                ColorStream::Unorm => {
+                    address(color).cast::<[[u8; 4]; 4]>().write_unaligned([
+                        [0; 4],
+                        [0, 0, 0, 255],
+                        [0, 255, 0, 255],
+                        [255, 0, 0, 255],
+                    ]);
+                }
+                ColorStream::Constant => {
+                    address(color).cast::<[u8; 4]>().write_unaligned([255, 0, 0, 255]);
+                }
             }
         }
         let allocator_iid = guid(
@@ -998,7 +1012,11 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
             size: u32,
             stride: u32,
         }
-        let color_stride = if color_first { 8 } else { 4 };
+        let (color_size, color_stride) = match layout {
+            ColorStream::Unorm => (16, 4),
+            ColorStream::FloatFirst => (32, 8),
+            ColorStream::Constant => (4, 0),
+        };
         let mut views = [
             Vb {
                 address: address(position) as u64,
@@ -1007,7 +1025,7 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
             },
             Vb {
                 address: address(color) as u64,
-                size: color_stride * 4,
+                size: color_size,
                 stride: color_stride,
             },
         ];
@@ -1132,12 +1150,12 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
         for o in [guest, allocator, pipeline, position, color] {
             assert_eq!(slot::<extern "system" fn(This) -> u32>(o, 0x10)(o), 0);
         }
-        let expected = if color_first {
-            [[0.25, 0.5, 0.0, 1.0], [0.75, 1.5, 0.0, 1.0]]
-        } else {
-            [[0.25, 0.25, 0.0, 1.0], [0.75, 0.75, 0.0, 1.0]]
+        let expected = match layout {
+            ColorStream::Unorm => [[0.25, 0.25, 0.0, 1.0], [0.75, 0.75, 0.0, 1.0]],
+            ColorStream::FloatFirst => [[0.25, 0.5, 0.0, 1.0], [0.75, 1.5, 0.0, 1.0]],
+            ColorStream::Constant => [[1.0, 0.0, 0.0, 1.0]; 2],
         };
-        assert_eq!(actual, expected, "color_first={color_first}");
+        assert_eq!(actual, expected, "{layout:?}");
     }
 
     fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {

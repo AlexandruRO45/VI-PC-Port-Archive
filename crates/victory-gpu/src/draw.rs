@@ -1548,6 +1548,15 @@ impl State {
             }
             let v = self.vertex[slot as usize];
             let stride = u64::from(v.stride);
+            if stride == 0
+                && v.address != 0
+                && v.size != 0
+                && crate::shadow::find(v.address, u64::from(v.size)).is_some()
+            {
+                // The input assembler reads the same data at every vertex.
+                // Use the view already bound by prepare.
+                continue;
+            }
             let from = v.address + u64::from(first) * stride;
             if v.address == 0
                 || stride == 0
