@@ -821,7 +821,7 @@ mod tests {
         let k1 = [0x11u8; 0x14];
         // One s_endpgm dword; metadata names that length.
         let code = [0x00u8, 0x00, 0x81, 0xBF];
-        let mut k7 = vec![0u8; 0x18 + 32];
+        let mut k7 = [0u8; 0x18 + 32];
         let meta_len = (k7.len() - 0x14) as u32;
         k7[0..4].copy_from_slice(&0x403u32.to_le_bytes());
         k7[4..8].copy_from_slice(&meta_len.to_le_bytes());
