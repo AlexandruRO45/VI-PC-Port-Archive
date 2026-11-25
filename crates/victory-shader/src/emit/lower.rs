@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
-use super::{TranslateOptions, UserData, Wave64Mode};
+use super::{Options, UserData, Wave64Mode};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -12341,7 +12341,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-            options: super::Options::default(),
+            options: super::super::Options::default(),
         })
         .map(|_| ())
     }
@@ -12392,7 +12392,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-            options: super::Options::default(),
+            options: super::super::Options::default(),
         })
     }
 
@@ -12612,7 +12612,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-            options: super::Options::default(),
+            options: super::super::Options::default(),
         })
         .unwrap();
 
