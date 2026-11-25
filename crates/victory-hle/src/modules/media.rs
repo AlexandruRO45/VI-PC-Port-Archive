@@ -47,14 +47,29 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
         let b = s.as_bytes();
         b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
     };
+    let is_sep = |b: u8| matches!(b, b'/' | b'\\');
     let host_of = |rest: &str| rest.split(['/', '\\']).next().unwrap_or("").to_string();
-    let path = if let Some(rest) = text.strip_prefix(r"\\?\") {
-        if !drive(rest) {
-            return Err(("unc".into(), host_of(rest.trim_start_matches("UNC\\"))));
+    fn strip_unc(rest: &str) -> &str {
+        if rest.len() >= 4
+            && rest.as_bytes()[..3].eq_ignore_ascii_case(b"unc")
+            && matches!(rest.as_bytes()[3], b'/' | b'\\')
+        {
+            &rest[4..]
+        } else {
+            rest
         }
-        text.clone()
-    } else if let Some(rest) = text.strip_prefix(r"\\").or_else(|| text.strip_prefix("//")) {
-        return Err(("unc".into(), host_of(rest)));
+    }
+    let b = text.as_bytes();
+    let path = if b.len() >= 4 && is_sep(b[0]) && is_sep(b[1]) && b[2] == b'?' && is_sep(b[3]) {
+        let rest = &text[4..];
+        if !drive(rest) {
+            return Err(("unc".into(), host_of(strip_unc(rest))));
+        }
+        format!(r"\\?\{rest}")
+    } else if b.len() >= 4 && is_sep(b[0]) && b[1] == b'?' && b[2] == b'?' && is_sep(b[3]) {
+        return Err(("unc".into(), host_of(strip_unc(&text[4..]))));
+    } else if b.len() >= 2 && is_sep(b[0]) && is_sep(b[1]) {
+        return Err(("unc".into(), host_of(&text[2..])));
     } else if drive(&text) {
         text.clone()
     } else if let Some((scheme, rest)) = text.split_once(':').filter(|(s, _)| {
@@ -67,17 +82,26 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
         if scheme != "file" {
             return Err((scheme, authority.map(host_of).unwrap_or_default()));
         }
-        let path = match authority {
+        let tail = match authority {
             Some(rest) => {
-                let host = host_of(rest);
+                let raw_host = host_of(rest);
+                let host = percent_decode(&raw_host);
                 if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
                     return Err((scheme, host));
                 }
-                &rest[host.len()..]
+                &rest[raw_host.len()..]
             }
             None => rest,
         };
-        let path = percent_decode(path.trim_start_matches(['/', '\\'])).replace('/', "\\");
+        let tail = tail.strip_prefix(['/', '\\']).unwrap_or(tail);
+        let decoded = percent_decode(tail);
+        if decoded.starts_with(['/', '\\']) {
+            return Err((
+                scheme,
+                host_of(strip_unc(decoded.trim_start_matches(['/', '\\']))),
+            ));
+        }
+        let path = decoded.replace('/', "\\");
         if !drive(&path) {
             // A local file without a drive: the host resolves it as is.
             return Ok(with_nul(url));
@@ -100,19 +124,19 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        let hex = b
-            .get(i + 1..i + 3)
-            .and_then(|h| std::str::from_utf8(h).ok());
-        match (b[i], hex.and_then(|h| u8::from_str_radix(h, 16).ok())) {
-            (b'%', Some(v)) => {
-                out.push(v);
-                i += 3;
-            }
-            (c, _) => {
-                out.push(c);
-                i += 1;
-            }
+        if b[i] == b'%'
+            && let Some(h) = b.get(i + 1..i + 3)
+            && h[0].is_ascii_hexdigit()
+            && h[1].is_ascii_hexdigit()
+            && let Ok(hex) = std::str::from_utf8(h)
+            && let Ok(v) = u8::from_str_radix(hex, 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
         }
+        out.push(b[i]);
+        i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
@@ -521,6 +545,49 @@ mod tests {
             r"C:\Windows\a.wav"
         );
         assert_eq!(text(&local(&wide("clip.mp4")).unwrap()), "clip.mp4");
+    }
+
+    #[test]
+    fn unc_device_and_file_url_bypasses_are_refused() {
+        let refused = |url: &str| local(&wide(url)).unwrap_err();
+        assert_eq!(
+            refused(r"\/server\share\a.mp4"),
+            ("unc".into(), "server".into())
+        );
+        assert_eq!(
+            refused(r"/\server/share/a.mp4"),
+            ("unc".into(), "server".into())
+        );
+        assert_eq!(
+            refused(r"\??\UNC\server\share\a.mp4"),
+            ("unc".into(), "server".into())
+        );
+        assert_eq!(
+            refused(r"\\?\UNC\UNCOMPRESSED\share\a.mp4"),
+            ("unc".into(), "UNCOMPRESSED".into())
+        );
+        assert_eq!(
+            refused(r"\\?\unc\server\share\a.mp4"),
+            ("unc".into(), "server".into())
+        );
+        assert_eq!(
+            refused(r"\\?\UNCOMPRESSED\share\a.mp4"),
+            ("unc".into(), "UNCOMPRESSED".into())
+        );
+        assert!(local(&wide("file:////server/share/a.mp4")).is_err());
+        assert!(local(&wide("file://localhost//server/share/a.mp4")).is_err());
+        assert!(local(&wide(r"file:///\\server\share\a.mp4")).is_err());
+        assert!(local(&wide(r"file:\\server\share\a.mp4")).is_err());
+        assert!(local(&wide(r"file:/\server/share/a.mp4")).is_err());
+        assert!(local(&wide(r"file:///%5c%5cserver\share\a.mp4")).is_err());
+        assert_eq!(
+            refused("file://%73erver/share/a.mp4"),
+            ("file".into(), "server".into())
+        );
+        assert_eq!(
+            text(&local(&wide("file:///C:/Movies/100%+1.mp4")).unwrap()),
+            r"C:\Movies\100%+1.mp4"
+        );
     }
 
     #[test]
