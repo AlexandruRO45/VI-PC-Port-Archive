@@ -278,6 +278,12 @@ thread_local! {
     static WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether the program being translated may take the wave-wide form: `VICTORY_WAVE_WIDE=1`,
+/// or named by the caller ([`with_wave_wide`]).
+pub(crate) fn wave_wide_named() -> bool {
+    std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.with(|w| w.get())
+}
+
 /// Runs `f` with the wave-wide form allowed for the programs it translates
 /// on this thread, as `VICTORY_WAVE_WIDE=1` allows it for all: for the
 /// programs a caller names (`VICTORY_WAVE_WIDE_ONLY` in `victory-gpu`).
@@ -403,7 +409,7 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_HERE.with(|w| w.get());
+        let wide_on = wave_wide_named();
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -542,9 +548,10 @@ fn host_takes(r: Result<(HostShader, Option<u32>), ShaderError>) -> Result<HostS
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
-/// it translates or a branch cannot be widened. Only where a thread group is one console
-/// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
+/// it translates or a branch cannot be widened. Where a thread group is one console wave,
+/// or with `VICTORY_WAVE_WIDE=1` (or [`with_wave_wide`]) a whole number of them: the console
+/// waves of a group decide apart, so the host waves of each meet only each other
+/// (`lower`'s pair meetings) instead of at group barriers.
 fn widen(
     c: &Container,
     native: &NativeProgram,
@@ -559,6 +566,9 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && host_uses_wave32()) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs)
+            if cs.threads.iter().product::<u32>() % 64 == 0
+                && wave_wide_named() => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
