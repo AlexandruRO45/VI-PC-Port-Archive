@@ -12418,14 +12418,21 @@ impl<'a> Lower<'a> {
             // the console's only in a wave of the console's size. Lanes leave
             // a loop at different iterations only through a branch over more
             // than uniform values, so only then is the host asked for it (a
-            // host left to choose may run a wave64 program as wave32).
+            // host left to choose may run a wave64 program as wave32, and a
+            // wave32 one as wave64). A group no larger than the console's
+            // wave and the host's smallest is one wave at any size.
+            let wave = if self.x.native.wave64 { 64 } else { 32 };
+            let waves = self
+                .s
+                .threads
+                .is_some_and(|t| t.iter().product::<u32>() > wave.min(self.x.target.lanes_min));
             if took
                 && self.s.wave_size.is_none()
-                && self.x.native.wave64
-                && self.x.target.runs(64)
+                && waves
+                && self.x.target.runs(wave)
                 && self.divergent_exit(h)
             {
-                self.s.wave_size = Some(64);
+                self.s.wave_size = Some(wave);
             }
         }
     }

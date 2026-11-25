@@ -1338,6 +1338,17 @@ fn tbuffer_d16_loads_pack_two_channels_per_dword() {
 /// A wave64 compute program of 64 lanes (thread id in v0) with `body` between
 /// the descriptor load and the store of v0 at byte 4 * lane.
 fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
+    build_group_cs(body, true, 64, crate::emit::Target::ANY)
+}
+
+/// [`build_lanes_cs`] for a console wave of 64 or 32 lanes, a group of
+/// `threads`, and a host running `target`'s wave sizes.
+fn build_group_cs(
+    body: &[u32],
+    wave64: bool,
+    threads: u32,
+    target: crate::emit::Target,
+) -> Result<HostShader, String> {
     let mut words = Vec::new();
     words.push(s_mov_b32(5, 0x80));
     words.extend_from_slice(&s_load_dwordx4(8, 4));
@@ -1353,7 +1364,7 @@ fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: true,
+        wave64,
         vgprs: 16,
         layout: vec![
             RootParam {
@@ -1385,7 +1396,7 @@ fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1,
-            threads: [64, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code,
     };
@@ -1403,7 +1414,7 @@ fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        target: crate::emit::Target::ANY,
+        target,
         psv: None,
         console_cf: false,
         per_lane_only: false,
@@ -1637,4 +1648,88 @@ fn scalars_read_after_a_divergent_loop_ask_for_the_console_wave_size() {
     };
     assert_eq!(range(&divergent), (64, 64));
     assert_eq!(range(&uniform), (0, u32::MAX));
+}
+
+/// The divergent loop of `scalar_counted_in_a_divergent_loop_read_after_it`
+/// in a console wave32 program, with the exit mask in `s2`.
+const WAVE32_DIVERGENT_COUNT: [u32; 12] = [
+    0x7E14_0300, // v_mov_b32 v10, v0 (thread id kept)
+    0x4A02_0081, // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
+    0xBE82_0380, // s_mov_b32 s2, 0
+    0xBE86_0380, // s_mov_b32 s6, 0
+    0x8106_8106, // loop: s_add_u32 s6, s6, 1
+    0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+    0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+    0x8802_026A, // s_or_b32 s2, vcc_lo, s2
+    0x8A7E_027E, // s_andn2_b32 exec_lo, exec_lo, s2
+    0xBF89_FFFA, // s_cbranch_execnz loop
+    0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+    0x7E00_0206, // v_mov_b32 v0, s6
+];
+
+/// The same counter in a wave32 program whose group of 64 is two console
+/// waves: each reads its own wave's iterations (32 and 64). A host left to
+/// choose may run the group as one wave64 (RDNA3 does) and count 64 in all.
+#[test]
+fn scalar_counted_in_a_wave32_divergent_loop_read_after_it() {
+    let shader = build_group_cs(&WAVE32_DIVERGENT_COUNT, false, 64, crate::emit::Target::ANY)
+        .unwrap_or_else(|e| panic!("translation: {e}"));
+    let host = Host::new(false).unwrap();
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    let got: Vec<u32> = out[0][..64].to_vec();
+    assert!(
+        got[..32].iter().all(|&x| x == 32) && got[32..].iter().all(|&x| x == 64),
+        "iterations counted: {got:?}"
+    );
+}
+
+/// The console wave size is asked for a wave32 program too, and for neither
+/// where the group is one wave at any size the host runs (here 32 or 64).
+#[test]
+fn a_group_of_several_host_waves_asks_for_the_console_wave_size() {
+    let rdna = crate::emit::Target {
+        lanes_min: 32,
+        lanes_max: 64,
+    };
+    let range = |wave64: bool, threads: u32| {
+        let body = if wave64 {
+            vec![
+                0x7E14_0300, // v_mov_b32 v10, v0
+                0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+                0xBE82_0480, // s_mov_b64 s[2:3], 0
+                0xBE86_0380, // s_mov_b32 s6, 0
+                0x8106_8106, // loop: s_add_u32 s6, s6, 1
+                0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+                0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+                0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+                0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+                0xBF89_FFFA, // s_cbranch_execnz loop
+                0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+                0x7E00_0206, // v_mov_b32 v0, s6
+            ]
+        } else {
+            WAVE32_DIVERGENT_COUNT.to_vec()
+        };
+        psv_wave_range(
+            &build_group_cs(&body, wave64, threads, rdna)
+                .unwrap_or_else(|e| panic!("translation: {e}")),
+        )
+    };
+    assert_eq!(range(false, 64), (32, 32));
+    assert_eq!(range(true, 64), (64, 64));
+    assert_eq!(range(false, 32), (0, u32::MAX));
+    assert_eq!(range(true, 32), (0, u32::MAX));
 }
