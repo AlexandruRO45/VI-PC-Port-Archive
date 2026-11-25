@@ -1225,6 +1225,14 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Whether a descriptor load can be answered from the host's view of the one heap slot
+/// its address resolves to at bind: its address carries a dynamic term, so it is not a
+/// static table entry, and it brings at least a descriptor's dwords. A load whose index
+/// the host cannot name at bind is not one of these, and keeps refusing.
+fn one_heap_slot(count: u32, address: Option<&Address>) -> bool {
+    count >= 4 && address.is_some_and(|a| a.dynamic.is_some())
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -5617,7 +5625,19 @@ impl<'a> Lower<'a> {
                 .find_map(|(s, _)| use_of(*s))
         };
         let use_at = use_of(site).or_else(twin);
+        // The console compiler works a size out of a descriptor it picks from a heap at
+        // an index held once per draw, and never passes that descriptor to an image
+        // instruction: no leaf names the load and nothing reads its dwords except the
+        // arithmetic that divides by the size. The address is resolved at bind (the
+        // heap root plus a uniform index), so the host can name the resource the index
+        // selects, and its dimensions answer the same way a sampled descriptor's do.
         let Some((at, first)) = use_at else {
+            if one_heap_slot(count, self.scalar.get(&site)) {
+                let src = Source::Loaded { load: site, first: 0 };
+                let props = (2, 0x409);
+                let image = Some(2);
+                return self.descriptor_words(inst, site, code, count, &src, props, image, false, None);
+            }
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
             // that reaches those lanes reads one address. Each dword stands in as its place
@@ -5717,7 +5737,74 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
-        let h = self.handle(site, &src, false, props)?;
+        self.descriptor_words(inst, site, code, count, &src, props, image, uav, used)
+
+    }
+
+    /// `s_load_dword*` from the program's constant table.
+    fn code_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar load");
+        };
+        let count = match inst.name().strip_prefix("s_load_dword") {
+            Some("") => 1u32,
+            Some("x2") => 2,
+            Some("x4") => 4,
+            Some("x8") => 8,
+            Some("x16") => 16,
+            _ => return Err("a scalar load from the code"),
+        };
+        let c = self.cur;
+        let mut addr = self.s.m.i32(a.offset);
+        if let Some(value) = a.dynamic {
+            let mut d = self.i32_of(value)?;
+            // A term held per lane reached the address through
+            // `v_readfirstlane_b32`: the first lane's.
+            let per_lane = self.def_block.get(&value).is_some_and(|&b| {
+                let writes = |i: &Inst| i.writes.iter().any(|w| w.1 == value && matches!(w.0, Reg::V(_)));
+                self.x.p.blocks[b].insts.iter().any(writes)
+            });
+            if per_lane {
+                self.s.flags |= flags::WAVE_OPS;
+                let i32t = self.s.t.i32;
+                d = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
+            }
+            addr = self.s.m.bin(c, Bin::Add, addr, d);
+        }
+        for k in 0..count {
+            let off = self.s.m.i32(4 * k);
+            let at = self.s.m.bin(c, Bin::Add, addr, off);
+            let x = self.code_dword(at)?;
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
+    /// The dwords a descriptor's size is built from, from the host view's dimensions
+    /// in the GFX10 layout, written into `inst`'s destination scalar registers.
+    #[allow(clippy::too_many_arguments)]
+    fn descriptor_words(
+        &mut self,
+        inst: &Inst,
+        site: Site,
+        code: u8,
+        count: u32,
+        src: &Source,
+        props: (u32, u32),
+        image: Option<u32>,
+        uav: bool,
+        used: Option<&'a UsedResource>,
+    ) -> Result<(), Why> {
+        const OTHER: Why = "a descriptor's address or format read as data";
+        let first = match *src {
+            Source::Loaded { first, .. } => first,
+            _ => 0,
+        };
+        let h = self.handle(site, src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -5805,49 +5892,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        Ok(())
-    }
-
-    /// `s_load_dword*` from the program's constant table.
-    fn code_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
-        let Fields::Smem {
-            data: Some(Operand::Scalar { code, .. }),
-            ..
-        } = inst.fields
-        else {
-            return Err("a scalar load");
-        };
-        let count = match inst.name().strip_prefix("s_load_dword") {
-            Some("") => 1u32,
-            Some("x2") => 2,
-            Some("x4") => 4,
-            Some("x8") => 8,
-            Some("x16") => 16,
-            _ => return Err("a scalar load from the code"),
-        };
-        let c = self.cur;
-        let mut addr = self.s.m.i32(a.offset);
-        if let Some(value) = a.dynamic {
-            let mut d = self.i32_of(value)?;
-            // A term held per lane reached the address through
-            // `v_readfirstlane_b32`: the first lane's.
-            let per_lane = self.def_block.get(&value).is_some_and(|&b| {
-                let writes = |i: &Inst| i.writes.iter().any(|w| w.1 == value && matches!(w.0, Reg::V(_)));
-                self.x.p.blocks[b].insts.iter().any(writes)
-            });
-            if per_lane {
-                self.s.flags |= flags::WAVE_OPS;
-                let i32t = self.s.t.i32;
-                d = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
-            }
-            addr = self.s.m.bin(c, Bin::Add, addr, d);
-        }
-        for k in 0..count {
-            let off = self.s.m.i32(4 * k);
-            let at = self.s.m.bin(c, Bin::Add, addr, off);
-            let x = self.code_dword(at)?;
-            self.write(inst, Reg::S(code + k as u8), x, None);
-        }
+        
         Ok(())
     }
 
@@ -11189,6 +11234,44 @@ mod tests {
             0,
             "dynamic v_perm_b32 must not require INT64"
         );
+    }
+
+    #[test]
+    fn only_a_resolved_heap_slot_is_answered_from_the_host() {
+        let address = |dynamic| crate::resource::Address {
+            param: 0,
+            offset: 0,
+            dynamic,
+        };
+        // A heap slot whose index the host can name at bind, with a descriptor's dwords.
+        assert!(super::one_heap_slot(8, Some(&address(Some(crate::ir::Value(1))))));
+        assert!(super::one_heap_slot(4, Some(&address(Some(crate::ir::Value(1))))));
+        // A fixed address is a table entry that nothing resolved: it refuses.
+        assert!(!super::one_heap_slot(8, Some(&address(None))));
+        // Fewer than a descriptor's dwords has no size to answer.
+        assert!(!super::one_heap_slot(2, Some(&address(Some(crate::ir::Value(1))))));
+        // An untracked load has no address at all.
+        assert!(!super::one_heap_slot(8, None));
+    }
+
+    /// A table descriptor's dwords read by arithmetic: the address is fixed, so no index
+    /// names one resource and the sizes cannot come from the host. It keeps refusing.
+    #[test]
+    fn a_descriptor_read_as_numbers_at_a_fixed_address_still_refuses() {
+        let words = [
+            0xBE81_0380,              // s_mov_b32 s1, 0 (table address high)
+            0xF40C_0200, 0xFA00_0000, // s_load_dwordx8 s[8:15], s[0:1], 0
+            0x8010_810A,              // s_add_i32 s16, s10, 1: dword 2 as a number
+            0x7E00_0210,              // v_mov_b32 v0, s16
+            0xD834_0000,
+            0x0000_0100,              // ds_write_b32 v0, v0
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let Err(e) = lower_with(&words, layout, vec![]) else {
+            panic!("a fixed-address descriptor read as numbers must keep refusing");
+        };
+        assert!(format!("{e:?}").contains("descriptor"), "{e:?}");
     }
 
     #[test]
