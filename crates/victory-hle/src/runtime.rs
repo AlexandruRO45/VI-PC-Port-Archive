@@ -203,6 +203,9 @@ fn tag_end(text: &str) -> Option<usize> {
 
 static TITLE: Mutex<Option<Title>> = Mutex::new(None);
 
+#[cfg(test)]
+pub(crate) static TEST_TITLE_LOCK: Mutex<()> = Mutex::new(());
+
 pub fn set_title(title: Title) {
     *TITLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(title);
 }
