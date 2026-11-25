@@ -11,14 +11,16 @@ fn geometry_part() -> Vec<u8> {
 }
 
 fn geometry_part_with(params: bool) -> Vec<u8> {
-    fixture(params, false)
+    fixture(params, false, false)
 }
 
 /// The GS of [`geometry_part`]; with `params`, each vertex also carries its
 /// input row 1 (TEXCOORD0.xy, LDS dwords 4-5) in ring dwords 4-5, which the
 /// copy VS exports as param0 (signature row 1). With `rewrite`, the GS
-/// stores to vertex 0's slot again after emitting all three.
-fn fixture(params: bool, rewrite: bool) -> Vec<u8> {
+/// stores to vertex 0's slot again after emitting all three. With
+/// `batched`, it stores all three vertices before the first EMIT (a
+/// compiler batching ring writes).
+fn fixture(params: bool, rewrite: bool, batched: bool) -> Vec<u8> {
     let vertex_dwords = if params { 6 } else { 4 };
     let stride = 4 * 3 * vertex_dwords;
     let mut words = vec![
@@ -77,7 +79,12 @@ fn fixture(params: bool, rewrite: bool) -> Vec<u8> {
                 (src + 1) << 16 | src << 8 | 5,
             ]);
         }
-        words.push(0xbf900022); // emit
+        if !batched {
+            words.push(0xbf900022); // emit
+        }
+    }
+    if batched {
+        words.extend([0xbf900022; 3]);
     }
     if rewrite {
         words.extend([0xd8380100, 11 << 16 | 10 << 8 | 5]); // ds_write2_b32 v5, v10, v11 offsets 0, 1
@@ -389,12 +396,51 @@ fn geometry_parameters_raise_into_their_copy_export() {
 
 #[test]
 fn a_ring_store_after_its_vertex_was_emitted_is_refused() {
-    assert!(raised(&fixture(false, false)).is_ok());
+    assert!(raised(&fixture(false, false, false)).is_ok());
     assert!(matches!(
-        raised(&fixture(false, true)),
+        raised(&fixture(false, true, false)),
         Err(crate::ShaderError::Unsupported {
             what: "a geometry ring store to a vertex already emitted",
             ..
         })
     ));
+}
+
+/// A GS that stores every vertex's ring slots before the first EMIT (the
+/// write batching that made #1399 draw nothing): each EMIT still takes its
+/// own vertex's values, read from that vertex's input.
+#[test]
+fn ring_writes_batched_before_the_emits_stay_with_their_vertex() {
+    use crate::geometry::{Component, StreamOp};
+    let streams = raised(&fixture(false, false, true)).unwrap();
+    let read = |v: crate::ir::Value| {
+        streams
+            .reads
+            .values()
+            .flatten()
+            .find(|r| r.0 == v)
+            .map(|r| (r.1, r.2))
+    };
+    let emits: Vec<_> = streams
+        .messages
+        .values()
+        .filter_map(|m| match m {
+            StreamOp::Emit(outputs) => Some(outputs),
+            StreamOp::Cut => None,
+        })
+        .collect();
+    assert_eq!(emits.len(), 3);
+    for (k, outputs) in emits.into_iter().enumerate() {
+        let [pos] = outputs.as_slice() else {
+            panic!("copy exports: {outputs:?}");
+        };
+        // y, z, w come straight from vertex k's input dwords 1-3 (x of
+        // vertex 0 is moved by 0.5 before it is stored).
+        for ch in 1..4 {
+            let Some(Component::Value(v)) = pos.channels[ch] else {
+                panic!("emit {k} channel {ch}: {:?}", pos.channels[ch]);
+            };
+            assert_eq!(read(v), Some((k as u8, ch as u16)), "emit {k} channel {ch}");
+        }
+    }
 }
