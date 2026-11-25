@@ -123,6 +123,20 @@ allocations, and memory that is not one committed allocation (a buffer over
 many separately mapped pages, say), are still copied. Unset, nothing
 changes.
 
+With `VICTORY_IN_PLACE=1`, also set `VICTORY_IN_PLACE_VRAM=1`
+(experimental) to keep title buffers in place in video memory: each gets a
+buffer on the card that its shaders use, kept in step with title memory by
+the card. Before a submission's lists the pages the title wrote go up from
+the memory in place by GPU copies; after them a compute pass of ours writes
+back only the dwords the shaders changed (partial dwords by atomics, so the
+title's bytes beside them stay), before the submission is done. Nothing is
+copied, compared or hashed by the processor for these buffers, and shaders
+no longer read and write them across the bus. Buffers from 1 MiB
+(`VICTORY_IN_PLACE_VRAM_MIN_MB`) get one while the card's budget allows: 60%
+of it at most by default (`VICTORY_IN_PLACE_VRAM_MB`), and none past 80% of
+the budget in use. The log says every 5 seconds how many there are and what
+went up and back. Unset, nothing changes.
+
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 

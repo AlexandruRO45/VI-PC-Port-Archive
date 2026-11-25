@@ -1222,6 +1222,26 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // Title buffers kept in video memory (`crate::resident`): what the
+        // title wrote goes up before the lists, what their shaders wrote is
+        // merged back after them, both by the card.
+        let residents = crate::resident::prepare(
+            &runs
+                .iter()
+                .flat_map(|l| {
+                    l.deferred()
+                        .copies
+                        .iter()
+                        .filter_map(|s| match s {
+                            Step::GpuWrite(shadow, address, len, ..) => {
+                                shadow.resident().map(|r| (r.clone(), *address as u64, (*address + *len) as u64))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+        );
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1246,7 +1266,20 @@ impl Host {
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                // Lists of ours for residents, each in an
+                // `ExecuteCommandLists` of its own (buffers decay to the
+                // common state between them).
+                if i == 0
+                    && let Some(upload) = &residents.upload
+                {
+                    self.queue.ExecuteCommandLists(&[Some(upload.clone())]);
+                }
                 self.queue.ExecuteCommandLists(group);
+                if i + 1 == groups.len()
+                    && let Some(merge) = &residents.merge
+                {
+                    self.queue.ExecuteCommandLists(&[Some(merge.clone())]);
+                }
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -1386,6 +1419,26 @@ impl Host {
         for list in runs {
             for work in &list.deferred().after {
                 work();
+            }
+        }
+        // Pages of residents shaders wrote through the memory page table
+        // (known from its bitmaps only now): merged by the card before the
+        // title is told.
+        if let Some(merge) = crate::resident::merge_pages() {
+            *submitted += 1;
+            // SAFETY: a closed list of ours; the fence and event are ours.
+            unsafe {
+                self.queue.ExecuteCommandLists(&[Some(merge)]);
+                let waited = self
+                    .queue
+                    .Signal(&self.fence, *submitted)
+                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                match waited {
+                    Ok(()) => {
+                        WaitForSingleObject(self.event, INFINITE);
+                    }
+                    Err(e) => tracing::warn!(error = %e, "merge of pages written in video memory not waited for"),
+                }
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2881,6 +2934,8 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        // Its own line every 5 s, over the frames since.
+        crate::resident::line(frames);
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(

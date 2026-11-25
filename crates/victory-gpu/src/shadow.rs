@@ -59,6 +59,9 @@ pub(crate) struct Shadow {
     /// goes.
     base: u64,
     slice: Option<Slice>,
+    /// In place and kept in video memory (`crate::resident`): `buffer` is
+    /// the resident's `R`, fed from and merged into the buffer in place.
+    resident: Option<Arc<crate::resident::Resident>>,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -171,6 +174,11 @@ impl Shadow {
     // "copied" mark and is compared without the title-write check.
     pub(crate) fn copy_back_page(&self, page: usize) -> usize {
         if self.in_place {
+            // Kept in video memory: the page is in `R`, merged into title
+            // memory by the card before the title is told.
+            if let Some(resident) = &self.resident {
+                crate::resident::page_written(resident, page as u64);
+            }
             self.landed(page, PAGE);
             return 0;
         }
@@ -214,7 +222,11 @@ impl Shadow {
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         if self.in_place {
             self.keep_in_place(list);
-            return;
+            if self.resident.is_none() {
+                return;
+            }
+            // Kept in video memory: at submission the pages the title wrote
+            // go up ([`Shadow::update`]).
         }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
@@ -225,6 +237,11 @@ impl Shadow {
     /// so its heap, which a placed resource holds) until it is reset, for
     /// the title may release the buffer, or the heap be let go, before the
     /// list runs.
+    /// Kept in video memory: its resident.
+    pub(crate) fn resident(&self) -> Option<&Arc<crate::resident::Resident>> {
+        self.resident.as_ref()
+    }
+
     fn keep_in_place(&self, list: &HostList) {
         // By the buffer: kept, its address is not given out again meanwhile.
         list.keep_once(windows::core::Interface::as_raw(&self.buffer) as usize, &self.buffer);
@@ -255,6 +272,22 @@ impl Shadow {
         slice: Option<Slice>,
         heap: Option<HeapId>,
     ) -> Arc<Shadow> {
+        Shadow::make_resident(buffer, data, gpu, start, len, slice, heap, None)
+    }
+
+    /// [`Shadow::make`], `resident` given for a buffer in place kept in
+    /// video memory (`buffer` and `gpu` are then its `R`'s).
+    #[allow(clippy::too_many_arguments)]
+    fn make_resident(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        slice: Option<Slice>,
+        heap: Option<HeapId>,
+        resident: Option<Arc<crate::resident::Resident>>,
+    ) -> Arc<Shadow> {
         let in_place = heap.is_some();
         let tracked = if in_place { None } else { crate::watch::track_copy(start as usize, len as usize, true) };
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
@@ -272,6 +305,7 @@ impl Shadow {
             heap,
             base: slice.map_or(0, |s| s.offset),
             slice,
+            resident,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -401,6 +435,8 @@ impl Shadow {
         let (from, to) = (address.max(start), (address + len).min(end));
         if self.in_place && from < to {
             drop(crate::watch::writing(from, to - from));
+            // Residents over the same memory did not see the card write it.
+            crate::resident::written_beside(self.resident.as_deref(), from as u64, to as u64);
         }
     }
 
@@ -593,6 +629,10 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        if let Some(resident) = &self.resident {
+            resident.refresh(address as u64, (address + len) as u64);
+            return 0;
+        }
         if self.in_place || self.clean() {
             return 0;
         }
@@ -1096,7 +1136,15 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
             && let Some((buffer, gpu, heap)) = in_place_buffer(s0, l0)
         {
             crate::host::name(&buffer, || format!("title buffer in place {:#x}+{:#x}", key.0, entry.end - key.0));
-            entry.shadow = Some(Shadow::new_with(buffer, s0 as *mut u8, gpu, s0, l0, Some(heap)));
+            entry.shadow = Some(match crate::resident::Resident::make(&buffer, gpu, s0, l0) {
+                // Kept in video memory: views name `R`; the buffer in place
+                // stays the resident's.
+                Some(r) => {
+                    let (b, g) = (r.buffer.clone(), r.gpu);
+                    Shadow::make_resident(b, s0 as *mut u8, g, s0, l0, None, Some(heap), Some(r))
+                }
+                None => Shadow::new_with(buffer, s0 as *mut u8, gpu, s0, l0, Some(heap)),
+            });
             changed();
         }
     }
@@ -1130,7 +1178,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// `VICTORY_IN_PLACE=1` (experimental, #880): title buffers and loose
 /// windows are the title's memory itself, opened as a host heap, instead of
 /// copies.
-fn in_place_enabled() -> bool {
+pub(crate) fn in_place_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_IN_PLACE").is_some_and(|v| v == "1"))
 }
@@ -2610,9 +2658,91 @@ pub(crate) mod tests {
         }
     }
 
+    /// A title buffer in place kept in video memory: what the title wrote
+    /// goes up before the lists, what the card wrote in declared ranges goes
+    /// back into title memory once the submission ran, and of a dword the
+    /// card changed in part only its bytes do (a byte the CPU wrote meanwhile
+    /// in the same dword stays).
+    #[test]
+    fn a_buffer_in_video_memory_takes_the_titles_writes_and_gives_back_the_cards() {
+        let _one = IN_PLACE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::watch::tests::{free, pool};
+        let Some(host) = host() else { return };
+        let _on = crate::resident::tests::On::force();
+        let len = 16 * PAGE;
+        let p = pool(16);
+        touch(p, len);
+        let Some((buffer, gpu, heap)) = in_place_buffer(p as u64, len as u64) else {
+            free(p);
+            return; // no heaps from process memory on this host
+        };
+        let r = crate::resident::Resident::make(&buffer, gpu, p as u64, len as u64).expect("a resident over watched memory");
+        let shadow = Shadow::make_resident(r.buffer.clone(), p as *mut u8, r.gpu, p as u64, len as u64, None, Some(heap), Some(r.clone()));
+        let word = |at: usize| {
+            // SAFETY: inside the test's allocation.
+            unsafe { ((p + at) as *const u32).read_volatile() }
+        };
+        let set = |at: usize, v: u32| {
+            // SAFETY: inside the test's allocation.
+            unsafe { ((p + at) as *mut u32).write_volatile(v) }
+        };
+        // Submission 1: the title wrote at 8 and at PAGE + 8; the card reads
+        // 8 back into a readback buffer and writes 64 (from an upload).
+        set(8, 0x1122_3344);
+        set(PAGE + 8, 0x5566_7788);
+        let list = host.new_list().unwrap();
+        shadow.refresh(&list, p as u64, len as u64);
+        shadow.gpu_writes(&list, p as u64 + 64, 4, false);
+        let (up, up_at) = list.upload(host, 256).unwrap();
+        let (down, down_at) = list.readback(host, 256).unwrap();
+        // SAFETY: mapped upload memory of 256 bytes.
+        unsafe { (up_at as *mut u32).write_volatile(0xAABB_CCDD) };
+        // SAFETY: the list is open; `R` is promoted from the common state.
+        unsafe {
+            list.list.CopyBufferRegion(&down, 0, &r.buffer, 8, 4);
+            list.list.CopyBufferRegion(&down, 4, &r.buffer, PAGE as u64 + 8, 4);
+            list.list.CopyBufferRegion(&r.buffer, 64, &up, 0, 4);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: mapped readback memory; the submission has run.
+        let seen = unsafe { [(down_at as *const u32).read_volatile(), (down_at as *const u32).add(1).read_volatile()] };
+        let back = word(64);
+        list.reset();
+        // Submission 2: the CPU writes byte 1 of the dword at 128 while the
+        // card runs (unseen by the upload), the card writes its byte 0.
+        set(128, 0x0000_0000);
+        let list = host.new_list().unwrap();
+        shadow.refresh(&list, p as u64, len as u64);
+        shadow.gpu_writes(&list, p as u64 + 128, 4, false);
+        let (up, up_at) = list.upload(host, 256).unwrap();
+        // SAFETY: mapped upload memory of 256 bytes.
+        unsafe { up_at.write_volatile(0x5A) };
+        // SAFETY: the list is open.
+        unsafe { list.list.CopyBufferRegion(&r.buffer, 128, &up, 0, 1) };
+        list.close();
+        // The upload of submission 2 is recorded in `execute`, after this:
+        // the CPU's byte is written right after the refresh asked.
+        let cpu_byte = || {
+            // SAFETY: inside the test's allocation.
+            unsafe { ((p + 129) as *mut u8).write_volatile(0xC3) };
+            crate::resident::tests::unseen(p as u64, len as u64);
+        };
+        cpu_byte();
+        host.execute(&[&list]);
+        let partial = word(128);
+        list.reset();
+        drop((shadow, r));
+        let_go_in_place(p as u64, len as u64);
+        free(p);
+        assert_eq!(seen, [0x1122_3344, 0x5566_7788], "what the title wrote went up to the card");
+        assert_eq!(back, 0xAABB_CCDD, "what the card wrote went back into title memory");
+        assert_eq!(partial, 0x0000_C35A, "the card's byte merged, the CPU's beside it kept");
+    }
+
     /// The in-place tests share the heap cache and the queue of stale heaps
     /// (and may get each other's addresses back): one at a time.
-    static IN_PLACE_TESTS: Mutex<()> = Mutex::new(());
+    pub(crate) static IN_PLACE_TESTS: Mutex<()> = Mutex::new(());
 
     /// Writes every page of `[base, base + len)`, so the allocation counts as
     /// dense ([`dense`]).
