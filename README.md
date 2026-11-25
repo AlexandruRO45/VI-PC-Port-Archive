@@ -228,10 +228,18 @@ victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+                  [--host-lanes MIN-MAX]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
 ```
+
+`translate --host-lanes MIN-MAX` selects the host wave-size range used by the
+shader translator, for example `32-32` for NVIDIA or `32-64` for AMD RDNA.
+A single size such as `64` is also accepted. Without this option, translation
+accepts any host wave size unless `--pipelines` selects the current GPU's
+range. An explicit `--host-lanes` overrides that detected range. See
+[docs/wave64-on-wave32.md](docs/wave64-on-wave32.md) for the remaining limits.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
