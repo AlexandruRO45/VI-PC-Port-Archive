@@ -403,6 +403,14 @@ impl<'a> Lower<'a> {
             let on = self.s.m.bin(c, Bin::Xor, off, on);
             let hit = self.s.m.bin(c, Bin::And, through, before);
             let hit = self.s.m.bin(c, Bin::And, hit, on);
+            // Absent children can have finite bounds. They must keep the
+            // same sort key as misses, even if the ray crosses those bounds.
+            let hit = if sort {
+                let present = self.s.m.cmp(c, pred::NE, children[n], none);
+                self.s.m.bin(c, Bin::And, hit, present)
+            } else {
+                hit
+            };
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }
