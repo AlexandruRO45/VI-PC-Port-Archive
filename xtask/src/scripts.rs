@@ -290,6 +290,54 @@ mod tests {
     }
 
     #[test]
+    fn proton_launcher_borrows_vkd3d_next_to_the_exe() {
+        let tmp = temp_dir("vkd3d-borrow");
+        let prefix = tmp.join("prefix");
+        let exe = tmp.join("victory.exe");
+        fs::write(&exe, b"not a real exe").expect("stand-in exe");
+        let proton = fake_proton(&tmp, &prefix, true);
+        let donor = tmp.join("donor");
+        let vsrc = donor.join("files/lib/wine/vkd3d-proton/x86_64-windows");
+        fs::create_dir_all(&vsrc).expect("donor dirs");
+        fs::write(vsrc.join("d3d12.dll"), b"donor d3d12").expect("donor dll");
+        fs::write(vsrc.join("d3d12core.dll"), b"donor d3d12core").expect("donor dll");
+        let out = Command::new("bash")
+            .args(["proton/run.sh", "--prefix"])
+            .arg(&prefix)
+            .arg("--proton")
+            .arg(&proton)
+            .arg("--exe")
+            .arg(&exe)
+            .arg("--vkd3d")
+            .arg(&donor)
+            .args(["--", "config"])
+            .current_dir(root())
+            .output()
+            .expect("bash");
+        assert!(
+            out.status.success(),
+            "run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Next to the exe: the app dir wins the Wine dll search, and
+        // Proton's per-run prefix sync cannot overwrite the borrow.
+        assert_eq!(
+            fs::read(tmp.join("d3d12.dll")).expect("borrowed dll"),
+            b"donor d3d12"
+        );
+        assert_eq!(
+            fs::read(tmp.join("d3d12core.dll")).expect("borrowed dll"),
+            b"donor d3d12core"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("mangohud= "),
+            "a borrowed vkd3d 3.2 must default the overlay off: {stdout}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn proton_launcher_log_window_uses_the_wine_console() {
         let tmp = temp_dir("log-window");
         let prefix = tmp.join("prefix");

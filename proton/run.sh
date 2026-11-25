@@ -23,6 +23,8 @@ usage: proton/run.sh [options] [--] [victory args...]
                  copy a Win8.1/10-era d3dcompiler_47.dll into the prefix's
                  system32 and force it native; Wine's builtin lacks the
                  buffer intrinsics and [RootSignature(...)] (docs/proton.md)
+  --vkd3d DIR    borrow another Proton directory's vkd3d-proton DLLs (next
+                 to the exe, so Proton's prefix sync cannot overwrite them)
   --texture-wait leave VICTORY_TEXTURE_NO_WAIT unset (the default is 1)
   --texture-no-wait
                  accepted for compatibility; the default is already on
@@ -58,6 +60,7 @@ proton="${PROTON:-}"
 z_dir=""
 config=""
 d3dcompiler=""
+vkd3d=""
 texture_no_wait=1
 watchdog=""
 mangohud=1
@@ -72,6 +75,7 @@ while [[ $# -gt 0 && $1 != -- ]]; do
         --z)      z_dir=$2; shift 2 ;;
         --config) config=$2; shift 2 ;;
         --d3dcompiler) d3dcompiler=$2; shift 2 ;;
+        --vkd3d)  vkd3d=$2; shift 2 ;;
         --texture-wait)    texture_no_wait=""; shift ;;
         --texture-no-wait) texture_no_wait=1; shift ;;
         --watchdog)    watchdog=1; shift ;;
@@ -182,6 +186,22 @@ if [[ -n $d3dcompiler ]]; then
     [[ -f $d3dcompiler ]] || die "no $d3dcompiler"
     mkdir -p "$real/drive_c/windows/system32"
     cp -- "$d3dcompiler" "$real/drive_c/windows/system32/d3dcompiler_47.dll"
+fi
+
+# A Proton directory's vkd3d-proton can be borrowed for another Proton's
+# wine: GE-Proton11-11 ships vkd3d-proton 3.1, whose dxil-spirv structurizer
+# mis-lowers some of the title's loop shapes into SPIR-V Mesa rejects (the
+# world-entry exit 3). Proton re-syncs its own copies into the prefix every
+# run, so the borrowed DLLs go next to the exe — the app dir wins the Wine
+# dll search over system32.
+if [[ -n $vkd3d ]]; then
+    vsrc=$vkd3d/files/lib/wine/vkd3d-proton/x86_64-windows
+    [[ -f $vsrc/d3d12.dll && -f $vsrc/d3d12core.dll ]] ||
+        die "no vkd3d-proton x86_64-windows DLLs under $vkd3d"
+    cp -f -- "$vsrc/d3d12.dll" "$vsrc/d3d12core.dll" "$(dirname "$exe")/"
+    # vkd3d-proton 3.2 presents with SHARED_DEMAND_REFRESH_KHR, which
+    # MangoHud 0.8.x cannot handle: such runs end early with exit 5.
+    [[ -n $mangohud_forced ]] || mangohud=""
 fi
 
 # Wine's built-in d3d12/dxgi stubs answer E_INVALIDARG and draw nothing;
