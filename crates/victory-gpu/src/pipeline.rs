@@ -104,7 +104,7 @@ pub(crate) struct Translated {
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(windows, any(feature = "diagnostics", test)))]
 mod timing {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
@@ -127,18 +127,22 @@ mod timing {
         }
     }
 
+    #[cfg(feature = "diagnostics")]
     pub(super) static INITIALIZE: Counter = Counter {
         calls: AtomicU64::new(0),
         us: AtomicU64::new(0),
     };
+    #[cfg(feature = "diagnostics")]
     pub(super) static WAIT: Counter = Counter {
         calls: AtomicU64::new(0),
         us: AtomicU64::new(0),
     };
+    #[cfg(feature = "diagnostics")]
     pub(super) static HOST: Counter = Counter {
         calls: AtomicU64::new(0),
         us: AtomicU64::new(0),
     };
+    #[cfg(feature = "diagnostics")]
     pub(super) static WORK: Counter = Counter {
         calls: AtomicU64::new(0),
         us: AtomicU64::new(0),
@@ -155,6 +159,16 @@ mod timing {
         if let Some(value) = cell.get() {
             return value;
         }
+        lookup_uncached(cell, initialize, init, wait)
+    }
+
+    // A lookup that observed an empty cell may race with another initializer.
+    fn lookup_uncached<'a, T>(
+        cell: &'a OnceLock<T>,
+        initialize: impl FnOnce() -> T,
+        init: &Counter,
+        wait: &Counter,
+    ) -> &'a T {
         let started = Instant::now();
         let mut initialized = false;
         let result = cell.get_or_init(|| {
@@ -170,6 +184,7 @@ mod timing {
         result
     }
 
+    #[cfg(feature = "diagnostics")]
     pub(super) fn shader_lookup<T>(
         cell: &OnceLock<T>,
         initialize: impl FnOnce() -> T,
@@ -178,6 +193,7 @@ mod timing {
     }
 
     // Cumulative process totals; snapshots are approximate while work is active.
+    #[cfg(feature = "diagnostics")]
     pub(super) fn report() {
         let (initializations, initialization_us) = INITIALIZE.snapshot();
         let (dependency_lookups, dependency_lookup_us) = WAIT.snapshot();
@@ -212,21 +228,21 @@ mod timing {
         }
 
         #[test]
-        fn shared_initialization_runs_only_once() {
+        fn racing_completion_is_attributed_to_dependency_lookup() {
             let cell = OnceLock::new();
             let init = Counter::default();
             let wait = Counter::default();
-            let barrier = std::sync::Barrier::new(4);
-            std::thread::scope(|scope| {
-                for _ in 0..4 {
-                    scope.spawn(|| {
-                        barrier.wait();
-                        assert_eq!(*lookup(&cell, || 42, &init, &wait), 42);
-                    });
-                }
-            });
-            assert_eq!(init.snapshot().0, 1);
-            assert!(wait.snapshot().0 <= 3);
+            // Model a caller that observed an empty cell, then lost the race
+            // to a second caller before entering get_or_init.
+            assert!(cell.get().is_none());
+            assert_eq!(*lookup(&cell, || 42, &init, &wait), 42);
+            let before = init.snapshot();
+            assert_eq!(
+                *lookup_uncached(&cell, || panic!("must not initialize again"), &init, &wait),
+                42
+            );
+            assert_eq!(init.snapshot(), before);
+            assert_eq!(wait.snapshot().0, 1);
         }
 
         #[test]
@@ -242,11 +258,15 @@ mod timing {
         }
 
         #[test]
-        fn counter_accumulates_samples() {
-            let counter = Counter::default();
-            counter.record(7);
-            counter.record(13);
-            assert_eq!(counter.snapshot(), (2, 20));
+        fn separate_uncached_shaders_are_attributed_to_initialization() {
+            let init = Counter::default();
+            let wait = Counter::default();
+            let first = OnceLock::new();
+            let second = OnceLock::new();
+            assert_eq!(*lookup(&first, || 7, &init, &wait), 7);
+            assert_eq!(*lookup(&second, || 13, &init, &wait), 13);
+            assert_eq!(init.snapshot().0, 2);
+            assert_eq!(wait.snapshot(), (0, 0));
         }
     }
 }
