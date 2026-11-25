@@ -1,4 +1,14 @@
-# Run a bounded playtest and keep the frame-rate samples with its exit status.
+<#
+.SYNOPSIS
+Runs a bounded Windows playtest and saves logs, frame timings and the exit status.
+.DESCRIPTION
+Build the diagnostics launcher with cargo build --profile diag -p victory --features diagnostics.
+Use a config pointing to a test save directory. Results go to OutputDirectory.
+Exit code 124 means the time limit was reached and 125 means Windows ran low on
+available virtual memory. Otherwise the script returns the launcher exit code.
+.EXAMPLE
+powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\tools\playtest.ps1 -Victory .\target\diag\victory.exe -Title $titleExe -Config $testConfig -Keys '18:Enter,26:Enter,35:Enter' -Seconds 120
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$Victory,
@@ -90,16 +100,28 @@ try {
 }
 
 $culture = [System.Globalization.CultureInfo]::InvariantCulture
+$frameEvent = '^(?<utc>\S+)\s+INFO\s+victory_gpu::host:\s*'
+$number = '[0-9]+(?:\.[0-9]+)?'
+$frameSample = $frameEvent + "(?<fps>$number)\s+fps\b[, ]+" +
+    "(?<ms>$number)\s+ms/frame\b.*?\b(?<draws>[0-9]+)\s+draws/frame\b"
+$unparsedFrameLines = 0
 $samples = @(Get-Content -LiteralPath $stderr | ForEach-Object {
-    if ($_ -match '^(?<utc>\S+)\s+INFO\s+victory_gpu::host: (?<fps>[\d.]+) fps, (?<ms>[\d.]+) ms/frame .*?, (?<draws>\d+) draws/frame,') {
+    if ($_ -match $frameSample) {
         [ordered]@{
             utc = $Matches.utc
             fps = [double]::Parse($Matches.fps, $culture)
             milliseconds_per_frame = [double]::Parse($Matches.ms, $culture)
             draws_per_frame = [int]$Matches.draws
         }
+    } elseif ($_ -match ($frameEvent + '.*\b(?:fps|ms/frame|draws/frame)\b')) {
+        $unparsedFrameLines++
     }
 })
+if ($unparsedFrameLines -gt 0) {
+    Write-Warning "Could not parse $unparsedFrameLines frame timing lines. See $stderr."
+} elseif ($samples.Count -eq 0) {
+    Write-Warning "No frame timings were found. Check $stderr for startup errors or a change to the frame log."
+}
 $result = [ordered]@{
     reason = $reason
     process_exit_code = $exitCode
