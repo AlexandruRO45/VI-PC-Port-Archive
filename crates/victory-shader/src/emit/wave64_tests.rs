@@ -555,6 +555,40 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
 
+/// The program above for 64-lane console waves, two of them in a group of 128 threads, with
+/// the skip wave-wide: the halves of each console wave meet in pairs. The SCC joined after
+/// the skip is filled in once every block is lowered and closed, where no pair can meet: the
+/// translation refuses it instead of failing an assertion (it used to split the closed last
+/// block).
+#[test]
+fn an_scc_joined_after_a_wave_wide_skip_in_pairs_is_refused_not_a_panic() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0001, // s_cbranch_execz over the next
+        0xBF06_8701, // s_cmp_eq_u32 s1, 7
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xBF85_0002, // s_cbranch_scc1 to "seven"
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0xBF82_0001, // s_branch over the next
+        0x7E0A_0282, // seven: v_mov_b32 v5, 2
+        0x7DA4_009F, // v_cmpx_eq_u32 exec, 31, v0
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 5 << 8, // buffer_store_dword v5, off, s[8:11], 0
+    ];
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("the skip");
+    let result = std::panic::catch_unwind(|| lowered(&native, &p, &HashSet::from([branch])).map(|_| ()));
+    let result = result.expect("the translation panicked");
+    assert!(
+        matches!(&result, Err(ShaderError::Unsupported { what, .. }) if *what == lower::PAIR_PHI),
+        "{result:?}"
+    );
+}
+
 /// Issue #111: `v_writelane_b32` writes its target lane whenever any lane of
 /// the console wave is in EXEC, even if the target lane itself is outside EXEC;
 /// if no lane is in EXEC (the wave skipped), the write must not happen.

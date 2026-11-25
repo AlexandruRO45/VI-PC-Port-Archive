@@ -277,6 +277,9 @@ struct Lower<'a> {
     /// wave's meetings ([`Self::meet`]), and this thread's one, made in the entry block.
     pair_meet: Option<u32>,
     pair_counter: Option<V>,
+    /// Set once every block is lowered and closed ([`Self::fill_phis`]): a pair of halves
+    /// can no longer meet anywhere.
+    filling_phis: bool,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -1052,6 +1055,9 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
 /// A lane mask made in an earlier block, used where not every lane runs, in a group of several
 /// console waves: the halves meet where it is used (a wait splits the current block only).
 const PAIR_AWAY: Why = "a lane mask from an earlier block exchanged where not every lane runs";
+/// A join of a lane mask or of its SCC that needs the halves of a console wave to meet in
+/// pairs: joins are filled in after every block is closed, where no meeting can be added.
+pub(super) const PAIR_PHI: Why = "a lane mask joined where the halves of a console wave meet in pairs";
 
 /// The mode of a group barrier the translation adds (host waves meeting):
 /// a wait for the group with a shared-memory fence; the fence alone with
@@ -1814,6 +1820,7 @@ impl<'a> Lower<'a> {
             wave_base: None,
             pair_meet,
             pair_counter: None,
+            filling_phis: false,
             flat: None,
             no_barrier,
             fence_only,
@@ -3341,6 +3348,9 @@ impl<'a> Lower<'a> {
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
             None => {
+                if self.filling_phis && self.pair_meet.is_some() && self.exchange.is_some() && !self.local {
+                    return Err(PAIR_PHI);
+                }
                 let at = match self.def_block.get(&lo) {
                     // Program inputs (EXEC on entry).
                     None => self.s.entry,
@@ -3372,7 +3382,7 @@ impl<'a> Lower<'a> {
                         need(b.unwrap_or(0));
                         return Err("a lane mask exchanged where not every lane runs");
                     }
-                    if self.pair_meet.is_some() && at != self.cur {
+                    if self.pair_meet.is_some() && !self.local && at != self.cur {
                         // the halves meet here instead, where every lane of the console wave
                         // runs too; not kept for other uses, which this block may not reach
                         if !self.all_lanes(self.cur_ir) {
@@ -3881,6 +3891,9 @@ impl<'a> Lower<'a> {
         // (not for a console wave cut into host waves that do not exchange)
         if !self.console_lanes || self.local || self.exchange.is_none() && self.halves.is_some() {
             return Err(LANE_MASK);
+        }
+        if self.filling_phis && self.pair_meet.is_some() && self.exchange.as_ref().is_some_and(|e| !e.1) {
+            return Err(PAIR_PHI);
         }
         let made = self.def_block.get(&scc).copied();
         let at = match made {
@@ -11716,6 +11729,7 @@ impl<'a> Lower<'a> {
     }
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
+        self.filling_phis = true;
         let p = self.x.p;
         // Lane-mask joins first (what an edge brings may ask for more joins,
         // of masks and of numbers): each edge's mask as the structure
