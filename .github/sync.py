@@ -19,6 +19,7 @@ PROJECTS = {
     "tuxbox": ("brcly/TuxBox", r"\*\*GTA VI \(ProjectScarlett\)\*\*"),
     "victory-fork": ("fxceless/victory-fork", r"## Status of this fork"),
     "anyxboxx": ("LooperSalty/AnyXboxX", r"> \*\*Where we are"),
+    "ztrx": ("Zettrox/ztrx", r"## Status"),
 }
 PUSH_BUDGET = 300  # seconds of branch pushing per project per run; the rest waits for the next run
 TODAY = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")

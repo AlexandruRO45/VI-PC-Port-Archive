@@ -1,6 +1,6 @@
 # GTA6 PC Port Archive
 
-Archived copies of eight open-source projects that work on running GTA VI on PC, first saved on 2026-11-23 and updated on 2026-11-24.
+Archived copies of nine open-source projects that work on running GTA VI on PC, first saved on 2026-11-23 and updated on 2026-11-24.
 ZERO of Rockstars game assets, files, or leaked info is on this repo, NOTHING HERE IS BREAKING ANY LAW OR ANYONE'S TOS
 ## Important links
 
@@ -18,6 +18,7 @@ ZERO of Rockstars game assets, files, or leaked info is on this repo, NOTHING HE
 | [`tuxbox/`](tuxbox) | TuxBox: Xbox Series compatibility layer for Linux and Windows | `brcly/TuxBox` | Apache-2.0 |
 | [`victory-fork/`](victory-fork) | victory-fork: a fork of VIctory aimed at getting the world to render and run | `fxceless/victory-fork` (was `victory-gta6`) | GPL-3.0 |
 | [`anyxboxx/`](anyxboxx) | AnyXboxX: an Xbox Series X emulator prototype, aimed at GTA VI for now | `LooperSalty/AnyXboxX` | GPL-3.0 |
+| [`ztrx/`](ztrx) | ztrx: runs the Xbox Series build natively on Windows with NVIDIA cards, based on VIctory and victory-fork | `Zettrox/ztrx` | GPL-3.0 |
 | [`github-export/`](github-export) | each project's issues, pull requests and comments | | |
 
 Each project folder keeps its own license file. Leonida's (old and new) `third_party/rpf9-explorer` submodule
@@ -27,7 +28,7 @@ Each project folder keeps its own license file. Leonida's (old and new) `third_p
 
 The old Leonida's branches keep their original `leonida/` names.
 
-`main` is a single snapshot of all eight projects. Each project's original history, with its original commits, authors,
+`main` is a single snapshot of all nine projects. Each project's original history, with its original commits, authors,
 hashes and file paths, is on its own branches:
 
 | Project | Code | Pull requests | Issues and comments |
@@ -40,6 +41,7 @@ hashes and file paths, is on its own branches:
 | TuxBox | `tuxbox/main`, other branches as `tuxbox/branch/<name>` (2) | `tuxbox/pr/<number>` (68) | `tuxbox/github-export` |
 | victory-fork | `victory-fork/main` | `victory-fork/pr/<number>` (43) | `victory-fork/github-export` |
 | AnyXboxX | `anyxboxx/main`, other branches as `anyxboxx/branch/<name>` (2) | `anyxboxx/pr/<number>` (138) | `anyxboxx/github-export` |
+| ztrx | `ztrx/main` | `ztrx/pr/<number>` (20) | `ztrx/github-export` |
 
 Get one project on its own:
 
