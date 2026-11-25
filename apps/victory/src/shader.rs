@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use victory_game::sgd5;
@@ -10,7 +10,37 @@ use victory_shader::gfx10::{self, Instruction};
 use victory_shader::{Container, DxilProgram, FourCC, HwStage, ShaderError, native_programs};
 
 /// Files above this size are skipped (read whole into memory for now).
-pub(crate) const MAX_FILE: u64 = 2 << 30;
+const MAX_FILE: u64 = 2 << 30;
+
+/// Shader inputs under `root`. Report large regular files through the callback.
+pub(crate) fn shader_files(
+    root: &Path,
+    on_large_file: impl Fn(&Path),
+) -> impl Iterator<Item = walkdir::DirEntry> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(move |entry| {
+            let kind = entry.file_type();
+            if kind.is_symlink() {
+                // Inspect the target without changing which directories WalkDir traverses.
+                return std::fs::metadata(entry.path())
+                    .is_ok_and(|target| target.is_file() && target.len() <= MAX_FILE);
+            }
+            if !kind.is_file() {
+                return false;
+            }
+            if entry
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() > MAX_FILE)
+            {
+                on_large_file(entry.path());
+                return false;
+            }
+            // Keep attempting the read if regular-file metadata is unavailable.
+            true
+        })
+}
 
 /// A shader container in a file: as is, or packed in an SGD5 record.
 pub(crate) enum Source<'a> {
@@ -75,18 +105,10 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let mut t = Totals::default();
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
+        for entry in shader_files(root, |path| {
+            eprintln!("skipping large file {}", path.display());
+        }) {
             let path = entry.path();
-            if entry.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE {
-                eprintln!("skipping large file {}", path.display());
-                continue;
-            }
             let Ok(data) = std::fs::read(path) else {
                 continue;
             };
