@@ -44,8 +44,8 @@ proton/run.sh --z /mnt/games run "Z:\\games\\x64\\final.exe" --execute
 `proton/run.sh` picks the newest `GE-Proton*` first, then the newest plain
 `Proton-*`, keeps its prefix at `$XDG_DATA_HOME/victory/proton`
 (idempotent), and takes `--prefix`, `--exe`, `--proton` (a specific Proton
-dir or plain `wine`), `--z`, `--config`, `--d3dcompiler`, `--texture-wait`
-and `--texture-no-wait`.
+dir or plain `wine`), `--z`, `--config`, `--d3dcompiler`, `--texture-wait`,
+`--texture-no-wait`, `--watchdog` and `--no-watchdog`.
 
 The first run creates the prefix and its `dosdevices/`; on a plain-Wine
 or pre-10 prefix it links `z:` to `../drive_z`, and a second run reuses
@@ -86,6 +86,10 @@ sets the first for you:
   way keep the `d3dcompiler_47=n` override, and note the DLL is your
   data: the asset policy keeps it out of the repo.
 
+Two more Wine workarounds default on in `run.sh` — copied title memory
+(`VICTORY_COPY_MEMORY=1`) and the disarmed stall watchdog
+(`VICTORY_NO_WATCHDOG=1`); both are under "Known gaps" below.
+
 ## 3. The config for a Proton run
 
 `victory.toml` is read from the process' working directory, and Wine
@@ -119,14 +123,31 @@ Win10-era native `d3dcompiler_47` as above:
   banner, the title directory is reachable through the prefix, and `census`
   runs against it.
 - The whole `victory-gpu` test suite runs as a Windows binary under the same
-  prefix: **109 of 111 pass**, covering device creation, the newer device
-  levels, fences, heaps, copies, queue submission and the indirect-argument
-  clamp — i.e. Proton really does provide the D3D12 ground victory hosts on.
-  The one failure:
+  prefix. On the series this was ported from: **109 of 111 pass**, covering
+  device creation, the newer device levels, fences, heaps, copies, queue
+  submission and the indirect-argument clamp — i.e. Proton really does
+  provide the D3D12 ground victory hosts on. The one failure there:
   - `pipeline::library::tests::a_rejected_blob_gives_an_empty_library`:
     vkd3d-proton errors on `OpenPipelineLibrary` of a garbage blob where
     real D3D12 hands back an empty library. A platform expectation, not a
-    regression — it fails the same on plain `main` (fxceless/victory-fork#64).
+    regression (fxceless/victory-fork#64).
+
+  Re-run on this fork 2026-11-25 (same Proton, RX 7900 XT, rebased onto
+  `main`'s parallel-copy and ambient work): **106 of 115 pass, 4 ignored,
+  5 fail** — the library test above plus four this fork's newer code shows
+  under Wine, none investigated yet:
+  - `pipeline::library::tests::concurrent_atomic_writes_publish_one_complete_file`:
+    the atomic writes get `Access denied` (Os code 5) under Wine.
+  - `descriptor::host::tests::dynamic_slots_are_held_until_released`:
+    the first dynamic slot comes back 933440 where the test expects 4;
+    the heap layout numbers differ under vkd3d.
+  - `query::tests::host_queries_count_what_draws_did`: the pipeline
+    statistics vkd3d returns do not match the counts the test expects.
+  - `list::tests::lists_are_cut_at_waits_that_follow_work`: the split at
+    a wait that follows work leaves unmet waits not as expected.
+
+  The same five fail with `VICTORY_COPY_MEMORY` unset (memory in place),
+  so the launcher's copy default changes nothing here.
 
   With only the June-2010 redistributable instead, four fail: the three
   that compile `*_5_1` inline shaders (the 2010 build refuses the 5_1
@@ -134,9 +155,48 @@ Win10-era native `d3dcompiler_47` as above:
   library test. `crate::host::compile` retries 5_1 at 5_0 for compilers too
   old for the 5_1 profile, which helps Win8-era copies; it cannot rescue
   the 2010 one, so use the current winetricks DLL or a Win10-era copy.
+- A full title run on this fork, 2026-11-25 (same Proton and card, the
+  launcher's new defaults, a diagnostics build with scripted Enter
+  presses): the start screen, the intro cinematic at ~81 fps (12.4 ms a
+  frame) and the rendered "FINISH SETUP?" menu — on screen and in the
+  `VICTORY_CAPTURE` frames alike. Both watchdog hooks report `applied=2`
+  on the 1.0.2.1 build, and the run lived well past the ~30 s stall
+  window that used to end it. The capture PNGs are black only while the
+  intro video plays — that path bypasses the captured buffer — and show
+  the menus correctly.
 
 Known gaps and unverified areas (file an issue if you hit one):
 
+- **Black frames under Wine (#19).** This fork's in-place title memory
+  (`440589e`, "GPU: title memory used in place by the host GPU") makes its
+  windows without an error, but under Wine the GPU never sees what the
+  title writes there: every frame is black from the first one, the intro
+  video's audio plays, and the per-frame texture uploads stop after ~20 s.
+  sil-kong bisected it to that commit; `VICTORY_COPY_MEMORY=1` renders.
+  `run.sh` now defaults that variable to 1, and #53 makes copying the code
+  default under Wine — once it lands, `VICTORY_COPY_MEMORY=0` opts back
+  into in place, to try a vkd3d-proton where that works. The victory-fork
+  series this was ported from carries in-place code too, but its Proton
+  runs rendered past the intro (ztrx#2), so the gap is in this fork's
+  version of it, not the Proton path.
+- **The loading screen loops, then the run ends itself.** The title
+  carries a stall watchdog: when its main loop has not advanced for ~30
+  one-second ticks it deliberately writes to address 0 and the process
+  dies — no GPU fault, no error of ours (victory-fork#416 dissects it).
+  Under Wine a cold pipeline compile stalls the main loop longer than
+  that, so runs loop on the loading screen and then crash, or die a few
+  minutes into the world; victory-fork#364 reports every Linux/Proton run
+  ending at the kill site until the hooks, and a 122 s first cold-compile
+  frame on Windows with them. `run.sh` defaults `VICTORY_NO_WATCHDOG=1`:
+  the loader hooks carried from that PR check the build hash (Series X
+  1.0.2.1, `b99f876b74d4a77f`) and the exact bytes, then jump over the
+  kill; on any other build they do nothing. `--watchdog` (or
+  `VICTORY_NO_WATCHDOG=0`) keeps the title's watchdog — a real hang then
+  ends the run as before, which is how to tell a stall from a hang. The
+  hooks are opt-in upstream; here they default on because the stall is
+  the normal case under Wine. With both defaults on, the full title run
+  above reached the intro and the setup menus on this fork; the loading
+  stretch past them is the next step to record.
 - **Shader validation**: `DxcCreateInstance` needs dxcompiler — Wine has no
   DXC. Translation output skips validation as it does on Windows without
   `dxil.dll`; treat translation results under Wine as unvalidated.
@@ -158,8 +218,9 @@ Known gaps and unverified areas (file an issue if you hit one):
   diagnostics build. A run that never pressed anything is not evidence
   that loading is broken.
 - **HDR**: with HDR on, vkd3d-proton present throttles to ~400 ms a frame
-  and the 30 s watchdog ends a run within the first minute — keep HDR off
-  on the display for Proton runs (#41 measures the same on RADV). 10-bit
+  — and with the title's watchdog kept armed (`--watchdog`), its 30 s
+  countdown ends the run within the first minute. Keep HDR off on the
+  display for Proton runs (#41 measures the same on RADV). 10-bit
   output remains untested.
 - A full `victory run` under Proton works on AMD/RADV: menus, intro,
   loading, then world streaming at 1 777–5 292 draws a frame, 0.1–0.5 fps
