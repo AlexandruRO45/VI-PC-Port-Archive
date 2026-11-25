@@ -120,10 +120,48 @@ pub(crate) fn lower_with(
     match lower_for(parts, host_wave64) {
         Err(e) if !host_wave64 && approx && e.to_string().contains("without 64-lane waves") => {
             let _undeclared = super::shader::UndeclaredWave64::new();
+            let _capped = CappedLoops::new(APPROX_LOOP_LIMIT);
             lower_for(parts, true)
         }
         r => r,
     }
+}
+
+/// Iterations after which a loop of a program lowered approximately
+/// ([`lower_with`]) is left. Such a program's loops can wait for what the
+/// other half of a console wave was to give, which in the host's narrower
+/// waves never comes: at [`LOOP_LIMIT`] per lane, Grand Theft Auto VI's
+/// first 3D scene kept the GPU busy for minutes.
+/// shortcut: a genuine loop of more iterations in such a program is cut
+/// short too.
+const APPROX_LOOP_LIMIT: u32 = 64;
+
+thread_local! {
+    /// A lower iteration limit for programs lowered on this thread now
+    /// ([`CappedLoops`]).
+    static LOOP_CAP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// While this lives, loops of programs lowered on this thread stop after at
+/// most its iterations.
+struct CappedLoops(Option<u32>);
+
+impl CappedLoops {
+    fn new(limit: u32) -> Self {
+        CappedLoops(LOOP_CAP.replace(Some(limit)))
+    }
+}
+
+impl Drop for CappedLoops {
+    fn drop(&mut self) {
+        LOOP_CAP.set(self.0);
+    }
+}
+
+/// The iteration limit for loops of the program being lowered.
+fn loop_limit_now() -> u32 {
+    let limit = super::loop_limit();
+    LOOP_CAP.get().map_or(limit, |cap| cap.min(limit))
 }
 
 /// [`lower`] for a host that runs 64-lane waves (`host_wave64`) or not: a
@@ -10299,7 +10337,7 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
+        let limit = self.s.m.i32(loop_limit_now());
         self.counters
             .get_mut(&to)
             .expect("header")
