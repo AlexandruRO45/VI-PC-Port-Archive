@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod trees;
 
 type Why = &'static str;
 
@@ -204,6 +205,10 @@ struct Lower<'a> {
     phi_at: HashMap<Value, (usize, usize)>,
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
+    /// Descriptor index phis at a join some predecessor of which is not
+    /// lowered yet (a loop header's back edge): the phi, its block, its
+    /// sources and whether a sampler's; filled in [`Self::fill_phis`].
+    pending_descriptors: Vec<(V, usize, Vec<Source>, bool)>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
@@ -667,6 +672,7 @@ impl<'a> Lower<'a> {
             phi_at,
             mask_phis: HashMap::new(),
             pending_masks: Vec::new(),
+            pending_descriptors: Vec::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
@@ -5282,8 +5288,9 @@ impl<'a> Lower<'a> {
             return Err(WHY);
         }
         let index = match src {
-            Source::Loaded { load, first } => self.heap_index(*load, *first, false)?,
-            Source::Phi { .. } => return Err(WHY),
+            Source::Loaded { .. } | Source::Phi { .. } | Source::Select { .. } => {
+                self.uniform_heap_index(src, false)?
+            }
             _ => self.lane_heap_index(src, false)?,
         };
         let index = self.clamp_view_index(index);
@@ -5507,6 +5514,21 @@ impl<'a> Lower<'a> {
                 self.s.sampler_choices.push((ha, hb, phi));
                 Ok(ha)
             }
+            Source::Select { scc, args }
+                if sampler && matches!(args[..], [Source::Constant(_), Source::Constant(_)]) =>
+            {
+                // One of two immediate samplers, chosen by SCC: as for a
+                // join of two, the condition picks the result.
+                let [a, b] = &args[..] else { unreachable!() };
+                let cond = match self.get(*scc)? {
+                    Val::Bit(x) => x,
+                    _ => return Err("SCC without a value"),
+                };
+                let ha = self.handle(site, a, sampler, props)?;
+                let hb = self.handle(site, b, sampler, props)?;
+                self.s.sampler_choices.push((ha, hb, cond));
+                Ok(ha)
+            }
             Source::Phi { block, .. } => {
                 // One handle at the join for every access the choice reaches
                 // (each is in a block the join dominates).
@@ -5518,33 +5540,26 @@ impl<'a> Lower<'a> {
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
                 let here = std::mem::replace(&mut self.cur, join);
                 let index = self.uniform_heap_index(src, sampler);
+                let per_lane = self.waterfall_leaf(src);
                 let h = index.map(|index| {
                     let index = self.buffer_guard(src, index, sampler, props);
-                    self.s.heap_handle(self.cur, index, sampler, false, props)
+                    self.s
+                        .heap_handle(self.cur, index, sampler, per_lane, props)
                 });
                 self.cur = here;
                 let h = h?;
                 self.join_handles.insert(key, h);
                 Ok(h)
             }
-            Source::Select { scc, args } => {
-                // The heap index of each choice, picked by SCC (uniform).
-                let [
-                    Source::Loaded { load: a, first: fa },
-                    Source::Loaded { load: b, first: fb },
-                ] = args[..]
-                else {
-                    return Err("a descriptor chosen by a condition");
-                };
-                let cond = match self.get(*scc)? {
-                    Val::Bit(x) => x,
-                    _ => return Err("SCC without a value"),
-                };
-                let set = self.heap_index(a, fa, sampler)?;
-                let clear = self.heap_index(b, fb, sampler)?;
-                let index = self.s.m.select(self.cur, cond, set, clear);
+            Source::Select { .. } => {
+                // The heap index of each choice, picked by SCC (uniform);
+                // a choice may itself be a join or a select.
+                let index = self.uniform_heap_index(src, sampler)?;
                 let index = self.buffer_guard(src, index, sampler, props);
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                let per_lane = self.waterfall_leaf(src);
+                Ok(self
+                    .s
+                    .heap_handle(self.cur, index, sampler, per_lane, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
@@ -5622,41 +5637,6 @@ impl<'a> Lower<'a> {
         let addr = self.s.m.bin(entry, Bin::Add, base, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         self.s.m.bin(entry, Bin::LShr, addr, shift)
-    }
-
-    /// The heap index of a descriptor every lane shares, computed in the
-    /// current block. One chosen by control flow is a phi at its join of the
-    /// index each predecessor computes at its end; an edge may bring another
-    /// join's (nested if/else).
-    fn uniform_heap_index(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
-        match src {
-            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
-            Source::Phi { block, args } => {
-                let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    // No lane comes this way (`resource` gave it another
-                    // edge's source): any index will do.
-                    if self.never_taken(q, *block) {
-                        incoming.push((self.s.m.i32(0), at));
-                        continue;
-                    }
-                    let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.uniform_heap_index(arg, sampler);
-                    self.cur = here;
-                    incoming.push((index?, at));
-                }
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let phi = self.s.m.phi(join, self.s.t.i32);
-                self.s.m.set_phi(phi, incoming);
-                Ok(phi)
-            }
-            _ => Err("a descriptor chosen by control flow"),
-        }
     }
 
     /// The heap index of a descriptor that may differ between lanes,
@@ -10847,6 +10827,11 @@ impl<'a> Lower<'a> {
     }
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
+        while let Some((phi, b, args, sampler)) = self.pending_descriptors.pop() {
+            let offset = self.x.p.blocks[b].offset;
+            self.fill_descriptor_phi(phi, b, &args, sampler)
+                .map_err(|w| unsupported(offset, w))?;
+        }
         let p = self.x.p;
         let live = self.live_edges();
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
