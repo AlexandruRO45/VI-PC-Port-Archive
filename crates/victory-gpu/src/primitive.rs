@@ -23,29 +23,71 @@
 /// first float element of two or more components (taken as the position;
 /// none: at `v1`), `va` before it, `vb` after it and `v3 = va + vb - vc`.
 /// `elements` are (byte offset, format).
+#[cfg(test)]
 pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+    let rights = right_angles(src, stride, elements);
+    expand_rects_at(src, dst, stride, elements, &rights);
+}
+
+/// Whether `elements` of a `stride`-byte vertex hold a position: a float
+/// element of two or more components inside the vertex. The first one is.
+fn position(elements: &[(u32, u32)], stride: usize) -> Option<(usize, Kind)> {
+    elements.iter().find_map(|&(offset, format)| {
+        let at = offset as usize;
+        let (n, kind) = components(format)?;
+        let float = matches!(kind, Kind::F32 | Kind::F16);
+        (float && n >= 2 && stride.saturating_sub(at) / kind.bytes() >= 2).then_some((at, kind))
+    })
+}
+
+/// Whether a vertex slot with `elements` holds the position the right
+/// angles are found from ([`right_angles`]).
+pub(crate) fn has_position(elements: &[(u32, u32)], stride: usize) -> bool {
+    position(elements, stride).is_some()
+}
+
+/// The corner (0 to 2) each rectangle of `src` has its right angle at, from
+/// its position ([`has_position`]); corner 1 without one.
+pub(crate) fn right_angles(src: &[u8], stride: usize, elements: &[(u32, u32)]) -> Vec<usize> {
+    let Some(in_rect) = stride.checked_mul(3).filter(|&n| n > 0) else {
+        return Vec::new();
+    };
+    let position = position(elements, stride);
+    src.chunks_exact(in_rect)
+        .map(|rect| match position {
+            Some((at, kind)) => {
+                let v = |i: usize| &rect[i * stride..(i + 1) * stride];
+                right_angle([0, 1, 2].map(|i| [0, 1].map(|k| kind.read(&v(i)[at..], k))))
+            }
+            None => 1,
+        })
+        .collect()
+}
+
+/// As [`expand_rects`], with each rectangle's right angle given, one entry
+/// per rectangle (corner 1 past the end). A draw's slots all take theirs
+/// from the slot that holds the position, so each slot's attributes land on
+/// the same corners.
+pub(crate) fn expand_rects_at(
+    src: &[u8],
+    dst: &mut [u8],
+    stride: usize,
+    elements: &[(u32, u32)],
+    rights: &[usize],
+) {
     if stride == 0 {
         return;
     }
     let (Some(in_rect), Some(out_rect)) = (stride.checked_mul(3), stride.checked_mul(6)) else {
         return;
     };
-    for (rect, out) in src
+    for (r, (rect, out)) in src
         .chunks_exact(in_rect)
         .zip(dst.chunks_exact_mut(out_rect))
+        .enumerate()
     {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
-        let right = elements
-            .iter()
-            .find_map(|&(offset, format)| {
-                let at = offset as usize;
-                let (n, kind) = components(format)?;
-                let float = matches!(kind, Kind::F32 | Kind::F16);
-                (float && n >= 2 && stride.saturating_sub(at) / kind.bytes() >= 2).then(|| {
-                    right_angle([0, 1, 2].map(|i| [0, 1].map(|k| kind.read(&v(i)[at..], k))))
-                })
-            })
-            .unwrap_or(1);
+        let right = rights.get(r).copied().filter(|&c| c < 3).unwrap_or(1);
         let (a, b) = ((right + 2) % 3, (right + 1) % 3);
         for (slot, i) in [0, 1, 2, a, b].into_iter().enumerate() {
             out[slot * stride..(slot + 1) * stride].copy_from_slice(v(i));
@@ -417,5 +459,34 @@ mod tests {
             &dst[11 * 16..12 * 16],
             &v([14.0, 20.0, 1.0], [0.75, 0.5])[..]
         );
+    }
+
+    /// Positions in slot 0 and colours in slot 1 of one draw, the right angle
+    /// at corner 0: both slots put their corners in the same order, with the
+    /// right angle the position found, so each colour stays on its corner.
+    #[test]
+    fn every_slot_takes_the_right_angle_of_the_position() {
+        let positions: Vec<u8> = [[0.0f32, 0.0], [0.0, 1.0], [2.0, 0.0]]
+            .iter()
+            .flat_map(|p| p.iter().flat_map(|x| x.to_le_bytes()))
+            .collect();
+        let colours: Vec<u8> = [10u8, 20, 30].iter().flat_map(|&c| [c, c, c, 255]).collect();
+        let (pos, col) = (&[(0, 16)][..], &[(0, 28)][..]);
+        assert!(has_position(pos, 8) && !has_position(col, 4));
+        let rights = right_angles(&positions, 8, pos);
+        assert_eq!(rights, [0]);
+        let (mut p, mut c) = (vec![0u8; 6 * 8], vec![0u8; 6 * 4]);
+        expand_rects_at(&positions, &mut p, 8, pos, &rights);
+        expand_rects_at(&colours, &mut c, 4, col, &rights);
+        let corner = |d: &[u8], i: usize, n: usize| d[i * n..(i + 1) * n].to_vec();
+        let xy = |x: f32, y: f32| [x.to_le_bytes(), y.to_le_bytes()].concat();
+        let rgba = |v: u8| vec![v, v, v, 255];
+        // (v2, v1) then the fourth corner, opposite v0
+        assert_eq!(corner(&p, 3, 8), xy(2.0, 0.0));
+        assert_eq!(corner(&c, 3, 4), rgba(30));
+        assert_eq!(corner(&p, 4, 8), xy(0.0, 1.0));
+        assert_eq!(corner(&c, 4, 4), rgba(20));
+        assert_eq!(corner(&p, 5, 8), xy(2.0, 1.0));
+        assert_eq!(corner(&c, 5, 4), rgba(40));
     }
 }

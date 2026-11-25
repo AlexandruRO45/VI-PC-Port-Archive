@@ -2901,17 +2901,23 @@ impl State {
             return false;
         };
         let rects = u64::from(count / 3);
-        for slot in 0..32 {
-            let elements: Vec<(u32, u32)> = p
-                .inputs
-                .iter()
-                .filter(|e| e.slot == slot && !e.per_instance)
-                .map(|e| (e.offset, e.format))
-                .collect();
-            if elements.is_empty() {
-                continue;
-            }
-            let v = self.vertex[slot as usize];
+        let slots: Vec<(u32, Vec<(u32, u32)>)> = (0..32)
+            .map(|slot| {
+                let elements = p
+                    .inputs
+                    .iter()
+                    .filter(|e| e.slot == slot && !e.per_instance)
+                    .map(|e| (e.offset, e.format))
+                    .collect();
+                (slot, elements)
+            })
+            .filter(|(_, elements): &(u32, Vec<(u32, u32)>)| !elements.is_empty())
+            .collect();
+        // Where each slot's vertices are read: checked for every slot before
+        // any expansion is recorded.
+        let mut reads = Vec::with_capacity(slots.len());
+        for (slot, _) in &slots {
+            let v = self.vertex[*slot as usize];
             let stride = u64::from(v.stride);
             let from = v.address + u64::from(first) * stride;
             if v.address == 0
@@ -2919,14 +2925,28 @@ impl State {
                 || u64::from(first + count) * stride > u64::from(v.size)
                 || crate::shadow::find(from, rects * 3 * stride).is_none()
             {
-                once!(slot, "rectangle vertices outside their buffer");
+                once!(slot = *slot, "rectangle vertices outside their buffer");
                 return false;
             }
+            reads.push((from as usize, stride as usize));
+        }
+        // The right angles come from the slot holding the position, the
+        // first one with a float element of two or more components, for every
+        // slot alike: a slot of colours alone would find none of its own.
+        let position = slots
+            .iter()
+            .zip(&reads)
+            .find(|(slot, read)| crate::primitive::has_position(&slot.1, read.1))
+            .map(|(slot, read)| (read.0, read.1, slot.1.clone()));
+        for ((slot, elements), &(from, stride)) in slots.into_iter().zip(&reads) {
+            let v = self.vertex[slot as usize];
+            let stride = stride as u64;
             let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
                 return false;
             };
-            let (from, to, stride) = (from as usize, to as usize, stride as usize);
+            let (to, stride) = (to as usize, stride as usize);
             let n = rects as usize;
+            let position = position.clone();
             list.defer_host(move || {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
@@ -2940,7 +2960,17 @@ impl State {
                         std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
                     )
                 };
-                crate::primitive::expand_rects(src, dst, stride, &elements);
+                let rights = match &position {
+                    Some((at, pstride, pelements)) => {
+                        // SAFETY: the position slot's vertices lie in a title
+                        // buffer too, checked with the others when recorded.
+                        let positions =
+                            unsafe { std::slice::from_raw_parts(*at as *const u8, n * 3 * pstride) };
+                        crate::primitive::right_angles(positions, *pstride, pelements)
+                    }
+                    None => Vec::new(),
+                };
+                crate::primitive::expand_rects_at(src, dst, stride, &elements, &rights);
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
