@@ -177,8 +177,11 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod mesh_fallback;
 mod rect;
+pub use mesh_fallback::{MESH_HEADER_DWORDS, MeshRecordLayout, RecordElement, emit_passthrough_vs};
 pub use rect::rectangle_gs;
+pub use shader::MESH_RECORD_SPACE;
 #[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
@@ -369,6 +372,41 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+#[derive(Clone, Debug)]
+pub struct MeshFallbackShader {
+    pub compute: HostShader,
+    pub layout: MeshRecordLayout,
+}
+
+pub fn translate_mesh_fallback(bytes: &[u8]) -> Result<MeshFallbackShader, ShaderError> {
+    let c = Container::parse(bytes)?;
+    let code = c
+        .part(FourCC::DXIL)
+        .or(c.part(FourCC::ACCC))
+        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(code.data)?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Ms)
+        .ok_or(ShaderError::Malformed("no mesh program"))?;
+    let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io = io::raise(&p, &native)?;
+    emit_mesh_fallback(&c, &native, &p, &st?, &io, &res)
+}
+
+pub fn emit_mesh_fallback(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<MeshFallbackShader, ShaderError> {
+    let (compute, layout) = emit_mode(c, native, p, st, io, res, true)?;
+    let layout = layout.ok_or(ShaderError::Malformed("no mesh record layout"))?;
+    Ok(MeshFallbackShader { compute, layout })
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -378,6 +416,18 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    emit_mode(c, native, p, st, io, res, false).map(|(shader, _)| shader)
+}
+
+fn emit_mode(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    fallback: bool,
+) -> Result<(HostShader, Option<MeshRecordLayout>), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -434,7 +484,7 @@ pub fn emit(
         _ => 0,
     };
     let run = |st: &structure::Structured, res: &resource::Resources, native_barycentrics| {
-        lower::lower_with_barycentrics(
+        lower::lower_with_mode(
             &lower::Parts {
                 native,
                 p,
@@ -447,6 +497,7 @@ pub fn emit(
                 mesh_stride,
             },
             native_barycentrics,
+            fallback,
         )
     };
     let attempt = |native_barycentrics| {
@@ -471,32 +522,35 @@ pub fn emit(
         }) if pixel => attempt(true)?,
         result => result?,
     };
-    Ok(HostShader {
-        stage: native.stage,
-        dxil: l.dxil,
-        user_data: l.user_data,
-        static_samplers: l
-            .samplers
-            .iter()
-            .enumerate()
-            .map(|(n, &w)| {
-                let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
-                }
-                s
-            })
-            .collect(),
-        samplers: l.samplers,
-        root_cbvs: l.root_cbvs,
-        root_srvs: l.root_srvs,
-        root_uavs: l.root_uavs,
-        memory: l.memory,
-        memory_writes: l.memory_writes,
-        view_addresses: l.view_addresses,
-        heap: l.heap,
-        heap_writes: l.heap_writes,
-    })
+    Ok((
+        HostShader {
+            stage: if fallback { HwStage::Cs } else { native.stage },
+            dxil: l.dxil,
+            user_data: l.user_data,
+            static_samplers: l
+                .samplers
+                .iter()
+                .enumerate()
+                .map(|(n, &w)| {
+                    let mut s = StaticSampler::from_words(w);
+                    if l.cmp_samplers >> n & 1 != 0 {
+                        s.filter |= 0x80;
+                    }
+                    s
+                })
+                .collect(),
+            samplers: l.samplers,
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            memory: l.memory,
+            memory_writes: l.memory_writes,
+            view_addresses: l.view_addresses,
+            heap: l.heap,
+            heap_writes: l.heap_writes,
+        },
+        l.mesh_layout,
+    ))
 }
 
 /// The rows of an `ISG1`/`OSG1` part.

@@ -63,6 +63,8 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    mesh_fallback: OnceLock<Option<(Translated, victory_shader::emit::MeshRecordLayout)>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -93,6 +95,8 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            mesh_fallback: OnceLock::new(),
         }
     }
 }
@@ -106,6 +110,17 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    pub(crate) fn mesh_fallback(
+        &self,
+    ) -> Option<&(Translated, victory_shader::emit::MeshRecordLayout)> {
+        self.mesh_fallback.get_or_init(|| {
+            let result = victory_shader::emit::translate_mesh_fallback(&self.container)
+                .map_err(|e| e.to_string())
+                .and_then(|f| with_resources(&self.container, f.compute).map(|t| (t, f.layout)));
+            result.map_err(|error| tracing::warn!(shader = ?self, %error, "mesh fallback translation failed")).ok()
+        }).as_ref()
+    }
+
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -824,6 +839,50 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "run alone on hardware with VICTORY_NO_MESH_SHADERS=1"]
+    fn mesh_fallback_prebuild_loads_both_psos() {
+        use victory_shader::{native::HwStage, emit::{MeshRecordLayout, RecordElement}};
+        use windows::{core::s, Win32::Graphics::Direct3D::{ID3DBlob, Fxc::D3DCompile}};
+
+        let device = crate::host::host().expect("hardware host");
+        assert!(!device.mesh_shaders(), "set VICTORY_NO_MESH_SHADERS=1");
+        // Synthetic pretranslated CS: exercise the actual prebuild and worker
+        // pipeline paths without a title shader container or game assets.
+        let source = b"[numthreads(1,1,1)] void main() {}";
+        let mut blob: Option<ID3DBlob> = None;
+        let dxil = unsafe {
+            D3DCompile(source.as_ptr().cast(), source.len(), s!("mesh-fallback-fixture"),
+                None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut blob, None).unwrap();
+            let blob = blob.unwrap();
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()).to_vec()
+        };
+        let mut cs = victory_shader::emit::host::stub_ps();
+        cs.stage = HwStage::Cs;
+        cs.dxil = dxil;
+        let layout = MeshRecordLayout {
+            max_vertices: 3, max_primitives: 1, vert_dwords: 4, prim_idx_base: 16,
+            prim_attr_base: 17, prim_dwords: 0, record_dwords: 20,
+            vertices: vec![RecordElement {
+                name: "SV_Position".into(), index: 0, kind: 3, comp: 9, interp: 4,
+                row: Some(0), col: 0, cols: 4, offset: 0,
+            }],
+            prims: vec![],
+        };
+        let mesh = Arc::new(Shader::new("mesh", source));
+        assert!(mesh.mesh_fallback.set(Some((Translated { host: cs, used: vec![] }, layout))).is_ok());
+        let pre = Prebuild {
+            shaders: vec![mesh], graphics: Some(Box::new(host::GraphicsState::default())),
+        };
+        pre.make().unwrap();
+        let (made, hits) = pipeline_counts();
+        let mut compile = make::Compile::new(make::CompileMode::Worker);
+        let pipeline = host::HostPipeline::build(&pre.shaders, pre.graphics.as_deref(), &mut compile).unwrap();
+        assert!(pipeline.mesh_fallback.is_some());
+        assert_eq!(pipeline_counts(), (made, hits + 2));
+    }
+
     /// The pre-build reads a stream as the title's creation does: the same
     /// shaders and state, so the same key and the same host pipeline name.
     #[cfg(windows)]
@@ -838,10 +897,16 @@ mod tests {
             element[8 + 4 * i..12 + 4 * i].copy_from_slice(&w.to_le_bytes());
         }
         let mut stream = vec![0u8; 0x2b0];
-        let put = |s: &mut Vec<u8>, at: usize, v: u64| {
-            s[at..at + 8].copy_from_slice(&v.to_le_bytes())
-        };
-        let kinds = [(0x10, 1), (0x28, 2), (0x40, 3), (0x58, 4), (0x70, 5), (0x88, 8)];
+        let put =
+            |s: &mut Vec<u8>, at: usize, v: u64| s[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        let kinds = [
+            (0x10, 1),
+            (0x28, 2),
+            (0x40, 3),
+            (0x58, 4),
+            (0x70, 5),
+            (0x88, 8),
+        ];
         for (at, kind) in kinds.into_iter().chain([(0x210, 21), (0x250, 17)]) {
             put(&mut stream, at, kind);
         }

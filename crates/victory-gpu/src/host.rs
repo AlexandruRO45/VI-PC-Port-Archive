@@ -64,6 +64,7 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    mesh_records: Mutex<Option<(ID3D12Resource, u64)>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -262,6 +263,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            mesh_records: Mutex::new(None),
         })
     }
 }
@@ -578,6 +580,9 @@ impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
+        if std::env::var("VICTORY_NO_MESH_SHADERS").is_ok_and(|v| v == "1") {
+            return false;
+        }
         static MESH: OnceLock<bool> = OnceLock::new();
         *MESH.get_or_init(|| {
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
@@ -1650,7 +1655,6 @@ impl HostList {
 
     /// Resource, offset and CPU pointer for an indirect record written by
     /// the CPU, rather than a committed upload allocation per small record.
-    #[allow(dead_code)] // used by the mesh fallback port
     pub(crate) fn scratch_buffer(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
         let (buffer, offset, _, cpu) = self.scratch_alloc(len)?;
         Some((buffer, offset, cpu))
@@ -1688,7 +1692,6 @@ impl HostList {
 
     /// Space written by fallback compute and read by ExecuteIndirect.
     /// The fallback owns any barriers for this buffer.
-    #[allow(dead_code)] // callsite comes from the up-mesh port
     pub(crate) fn argument_space(&self, bytes: u64) -> Option<(ID3D12Resource, u64)> {
         let bytes = bytes.max(1).checked_next_multiple_of(16)?;
         let host = host()?;
@@ -2678,6 +2681,64 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         text.push_str(&format!("; command {i} (op {}): {marker}", op.0));
     }
     text
+}
+
+/// Draw arguments plus allocation cursor, followed by 16-byte dispatch records.
+pub(crate) const MESH_DRAW_BYTES: u64 = 32;
+pub(crate) const MESH_COMMAND_CAP: u32 = (((16 << 20) - MESH_DRAW_BYTES) / 16) as u32;
+const MESH_RECORD_MIN: u64 = 16 << 20;
+const MESH_RECORD_MAX: u64 = 64 << 20;
+static MESH_GROUPS_CLIPPED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn note_mesh_clipped(groups: u64) {
+    if groups != 0 {
+        let before = MESH_GROUPS_CLIPPED.fetch_add(groups, Ordering::Relaxed);
+        if before == 0 || (before + groups).ilog2() > before.ilog2() {
+            tracing::warn!(groups, total = before + groups, "mesh groups clipped by fallback capacity");
+        }
+    }
+}
+
+impl Host {
+    /// Mesh records rest in COMMON and are reused on the serialized host queue.
+    /// Lists retain the exact allocation they recorded, even after it grows.
+    pub(crate) fn mesh_records(&self, list: &HostList, bytes: u64) -> Option<(ID3D12Resource, u64)> {
+        let wanted = bytes.clamp(MESH_RECORD_MIN, MESH_RECORD_MAX).next_power_of_two();
+        let mut slot = self.mesh_records.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_none_or(|(_, size)| *size < wanted) {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: wanted,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut made = None;
+            // SAFETY: plain committed GPU buffer, no initial contents read.
+            let result = unsafe {
+                self.device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut made,
+                )
+            };
+            if let Err(error) = result {
+                tracing::warn!(%error, wanted, "mesh fallback record allocation failed");
+            } else if let Some(buffer) = made {
+                *slot = Some((buffer, wanted));
+            }
+        }
+        let (buffer, cap) = slot.as_ref()?;
+        list.keep(buffer);
+        Some((buffer.clone(), *cap))
+    }
 }
 
 pub(crate) fn transition(

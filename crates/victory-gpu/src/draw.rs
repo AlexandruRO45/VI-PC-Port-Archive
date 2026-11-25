@@ -505,6 +505,18 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.bind_as(list, p, compute, compute)
+    }
+
+    /// The fallback CS binds compute registers from the title's graphics
+    /// arguments, sharing all heap, page-table and resource preparation.
+    fn bind_as(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        compute: bool,
+        title_compute: bool,
+    ) -> bool {
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
@@ -557,7 +569,7 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, title_compute);
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
             // (root arguments are set below).
@@ -593,7 +605,7 @@ impl State {
                     if u.root == RootType::Descriptor
                         && u.dword == 0
                         && let Some(Root::View(address)) =
-                            self.roots_ref(compute).get(usize::from(u.slot))
+                            self.roots_ref(title_compute).get(usize::from(u.slot))
                         && let Some(shadow) = crate::shadow::find(*address, 1)
                     {
                         let uav = t.used.iter().any(|r| {
@@ -610,11 +622,12 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
                             // Where the root address lies in the copy its view shows.
-                            let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
-                                Some(&Root::View(address)) => crate::shadow::find(address, 1)
-                                    .and_then(|s| u32::try_from(s.offset(address)).ok()),
-                                _ => None,
-                            };
+                            let offset =
+                                match self.roots_ref(title_compute).get(usize::from(u.slot)) {
+                                    Some(&Root::View(address)) => crate::shadow::find(address, 1)
+                                        .and_then(|s| u32::try_from(s.offset(address)).ok()),
+                                    _ => None,
+                                };
                             match offset {
                                 Some(offset) => offset,
                                 None => return false,
@@ -622,12 +635,12 @@ impl State {
                         }
                         None if is_root_view(u) => {
                             let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
-                            match self.root_view(list, compute, u.slot, uav) {
+                            match self.root_view(list, title_compute, u.slot, uav) {
                                 Some((slot, _)) => slot,
                                 None => return false,
                             }
                         }
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
+                        None => self.user_value(title_compute, u.slot, u.root, u.dword),
                     };
                 }
                 // SAFETY: an open list; `values` covers the parameter.
@@ -665,7 +678,8 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                    let Some(Root::View(address)) =
+                        self.roots_ref(title_compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
@@ -990,23 +1004,195 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = self.prepare_for(list, false, true)
-            && match list.list.cast::<ID3D12GraphicsCommandList6>() {
-                Ok(l6) => {
-                    #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
-                    DRAWN.fetch_add(1, Ordering::Relaxed);
-                    true
-                }
-                Err(_) => false,
-            };
+        let ran = self.prepare_for(list, false, true) && self.dispatch_prepared_mesh(list, x);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "mesh");
         }
+    }
+
+    fn dispatch_prepared_mesh(&mut self, list: &HostList, x: u32) -> bool {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return false;
+        };
+        if let Some(f) = &p.mesh_fallback {
+            return self.run_mesh_fallback(list, p, f, x);
+        }
+        match list.list.cast::<ID3D12GraphicsCommandList6>() {
+            Ok(l6) => {
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                // SAFETY: an open list with everything set.
+                unsafe { l6.DispatchMesh(x, 1, 1) };
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn run_mesh_fallback(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        f: &crate::pipeline::host::MeshFallback,
+        x: u32,
+    ) -> bool {
+        if x == 0 {
+            return true;
+        }
+        let stride = u64::from(f.layout.record_bytes());
+        let Some((record, bytes)) =
+            crate::host::host().and_then(|h| h.mesh_records(list, u64::from(x) * stride))
+        else {
+            return false;
+        };
+        let groups = x.min(65_535).min((bytes / stride) as u32);
+        crate::host::note_mesh_clipped(u64::from(x - groups));
+        if groups == 0 || !self.bind_as(list, &f.compute, true, false) {
+            return false;
+        }
+        let l = &list.list;
+        // SAFETY: live scratch and PSOs retained by the list.
+        unsafe {
+            l.ResourceBarrier(&[crate::host::transition(
+                &record, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            l.SetComputeRootUnorderedAccessView(f.uav, record.GetGPUVirtualAddress());
+            l.SetComputeRoot32BitConstant(f.base, 0, 0);
+            l.Dispatch(groups, 1, 1);
+        }
+        self.draw_mesh_records(list, p, f, &record, |l| unsafe {
+            l.DrawInstanced(f.layout.max_primitives * 3, groups, 0, 0);
+        })
+    }
+
+    fn draw_mesh_records(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        f: &crate::pipeline::host::MeshFallback,
+        record: &ID3D12Resource,
+        draw: impl FnOnce(&ID3D12GraphicsCommandList),
+    ) -> bool {
+        let l = &list.list;
+        let (uav, srv) = (
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        );
+        // `bind_as` may switch heaps and invalidate graphics roots; bind the
+        // pixel pass again before the draw, not just its PSO.
+        let bound = self.bind(list, p, false);
+        // SAFETY: finish the UAV writes even on the failed pixel bind path,
+        // since the next fallback call can reuse the same records.
+        unsafe { l.ResourceBarrier(&[crate::host::transition(record, uav, srv)]) };
+        if bound {
+            // SAFETY: GPU records have been written, and the list holds the buffer.
+            unsafe {
+                l.SetGraphicsRootShaderResourceView(f.srv, record.GetGPUVirtualAddress());
+                l.IASetPrimitiveTopology(
+                    windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                );
+                draw(l);
+            }
+            self.set_topology(list, self.topology);
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: this list just transitioned the held buffer to SRV.
+        unsafe {
+            l.ResourceBarrier(&[crate::host::transition(record, srv, D3D12_RESOURCE_STATE_COMMON)]);
+        }
+        bound
+    }
+
+    fn execute_mesh_fallback(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        f: &crate::pipeline::host::MeshFallback,
+        args: u64,
+        count: Option<u64>,
+        stride: u32,
+        max: u32,
+    ) -> bool {
+        if max == 0 {
+            return true;
+        }
+        let Some(h) = crate::host::host() else {
+            return false;
+        };
+        let group_bytes = u64::from(f.layout.record_bytes());
+        let Some((record, bytes)) = h.mesh_records(list, 16 << 20) else {
+            return false;
+        };
+        let group_cap = (bytes / group_bytes) as u32;
+        use crate::host::{MESH_COMMAND_CAP, MESH_DRAW_BYTES, transition};
+        let records = max.min(MESH_COMMAND_CAP);
+        if records < max {
+            once!(max, records, "mesh indirect records clipped by command scratch capacity");
+        }
+        let Some((commands, base)) = list.argument_space(MESH_DRAW_BYTES + u64::from(records) * 16) else {
+            return false;
+        };
+        let Some(draw) = host_signature(0, 16) else {
+            return false;
+        };
+        let Some((upload, offset, to)) = list.scratch_buffer(MESH_DRAW_BYTES) else {
+            return false;
+        };
+        let l = &list.list;
+        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let copy = D3D12_RESOURCE_STATE_COPY_DEST;
+        let common = D3D12_RESOURCE_STATE_COMMON;
+        // SAFETY: both scratch allocations are retained by the list, and
+        // each use restores the entire argument chunk to COMMON.
+        unsafe {
+            to.cast::<[u32; 8]>().write_unaligned([
+                f.layout.max_primitives * 3,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]);
+            l.ResourceBarrier(&[transition(&commands, common, copy)]);
+            l.CopyBufferRegion(&commands, base, &upload, offset, MESH_DRAW_BYTES);
+            l.ResourceBarrier(&[transition(&commands, copy, uav)]);
+        }
+        if !crate::indirect::prepare_mesh(list, args, count, stride, records, &commands, base, group_cap) {
+            // SAFETY: a failed prepare did not change the argument state.
+            unsafe { l.ResourceBarrier(&[transition(&commands, uav, common)]) };
+            return false;
+        }
+        (self.host_pipeline, self.host_roots[1]) = (0, 0);
+        let ran = self.bind_as(list, &f.compute, true, false) && {
+            // The title may release the pipeline before submitting the list.
+            list.keep(&f.dispatch);
+            // SAFETY: prepared dispatch stream uses this CS root signature.
+            unsafe {
+                l.ResourceBarrier(&[transition(&record, common, uav)]);
+                l.SetComputeRootUnorderedAccessView(f.uav, record.GetGPUVirtualAddress());
+                l.ExecuteIndirect(
+                    &f.dispatch,
+                    records,
+                    &commands,
+                    base + MESH_DRAW_BYTES,
+                    None,
+                    0,
+                );
+            }
+            self.draw_mesh_records(list, p, f, &record, |l| unsafe {
+                l.ExecuteIndirect(&draw, 1, &commands, base, None, 0);
+            })
+        };
+        // SAFETY: prepare moved the held chunk to INDIRECT_ARGUMENT.
+        unsafe {
+            l.ResourceBarrier(&[transition(&commands, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, common)]);
+        }
+        ran
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -1231,21 +1417,37 @@ impl State {
         if !crate::capture::listed(crate::queue::presented() + 1) {
             return;
         }
-        let (Some(p), Some(host)) = (crate::pipeline::host_pipeline(self.pipeline as This), crate::host::host()) else {
+        let (Some(p), Some(host)) = (
+            crate::pipeline::host_pipeline(self.pipeline as This),
+            crate::host::host(),
+        ) else {
             return;
         };
         for stage in &p.stages {
-            for u in stage.translated().used.iter().filter(|u| u.kind == ResourceType::Uav) {
-                let (RootType::Table, Some(Root::Table(table))) = (u.root, self.compute.get(usize::from(u.slot))) else {
+            for u in stage
+                .translated()
+                .used
+                .iter()
+                .filter(|u| u.kind == ResourceType::Uav)
+            {
+                let (RootType::Table, Some(Root::Table(table))) =
+                    (u.root, self.compute.get(usize::from(u.slot)))
+                else {
                     continue;
                 };
-                let Some(View::Unordered(r, ..)) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                let Some(View::Unordered(r, ..)) =
+                    crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                else {
                     continue;
                 };
-                let Some(t) = crate::resource::host_resource(r as This) else { continue };
+                let Some(t) = crate::resource::host_resource(r as This) else {
+                    continue;
+                };
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
-                if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D && d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                    && d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                {
                     continue;
                 }
                 const COPY_SOURCE: u32 = 0x800;
@@ -1525,6 +1727,34 @@ impl State {
             },
             None => None,
         };
+        if kind == MESH {
+            let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_drop(self.pipeline as This);
+                why("no host mesh pipeline");
+                return false;
+            };
+            if let Some(fallback) = &p.mesh_fallback {
+                args.refresh(list, arguments, len);
+                if let Some((s, at)) = &counter {
+                    s.refresh(list, *at, 4);
+                }
+                let ran = self.prepare_for(list, false, true)
+                    && self.execute_mesh_fallback(
+                        list,
+                        p,
+                        fallback,
+                        args.gpu(arguments),
+                        counter.as_ref().map(|(s, at)| s.gpu(*at)),
+                        stride,
+                        max,
+                    );
+                if !ran {
+                    why("mesh fallback prepare or execution failed");
+                }
+                return ran;
+            }
+        }
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
             .then(|| host_signature(kind, stride))
             .flatten()

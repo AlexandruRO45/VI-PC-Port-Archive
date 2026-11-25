@@ -19,6 +19,8 @@ pub const VIEW_STRIDES: u8 = 255;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
+/// Raw mesh fallback records and the dispatch's base group.
+pub const MESH_RECORD_SPACE: u32 = 3;
 /// Heap indices are clamped below these (views, samplers): the host's heaps
 /// are at least this large, the slots past their own null (`emit`, "Heap
 /// indices").
@@ -101,6 +103,9 @@ pub(crate) struct Shader {
     pub memory_dirty: Option<V>,
     /// The view addresses' handle, once a descriptor's address is read.
     pub view_addresses: Option<V>,
+    mesh_record_srv: bool,
+    mesh_record_uav: bool,
+    mesh_base_cbv: bool,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -162,6 +167,9 @@ impl Shader {
             memory: None,
             memory_dirty: None,
             view_addresses: None,
+            mesh_record_srv: false,
+            mesh_record_uav: false,
+            mesh_base_cbv: false,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -399,6 +407,40 @@ impl Shader {
         h
     }
 
+    fn mesh_handle(&mut self, class: u8, kind: u32, properties: u32) -> V {
+        let zero = self.m.i32(0);
+        let space = self.m.i32(MESH_RECORD_SPACE);
+        let class = self.m.i8(class);
+        let binding = self.m.aggregate(self.t.bind, &[zero, zero, space, class]);
+        let uniform = self.m.bool(false);
+        let h = self.op(
+            self.entry,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[binding, zero, uniform],
+        );
+        self.annotate(self.entry, h, kind, properties)
+    }
+
+    pub fn mesh_record_srv_handle(&mut self) -> V {
+        self.mesh_record_srv = true;
+        self.flags |= flags::RAW_BUFFERS;
+        self.mesh_handle(0, 11, 0)
+    }
+
+    pub fn mesh_record_uav_handle(&mut self) -> V {
+        self.mesh_record_uav = true;
+        self.flags |= flags::RAW_BUFFERS;
+        self.mesh_handle(1, 11 | 0x1000, 0)
+    }
+
+    pub fn mesh_base_cbv_handle(&mut self) -> V {
+        self.mesh_base_cbv = true;
+        self.mesh_handle(2, 13, 16)
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -490,6 +532,9 @@ impl Shader {
             || self.memory.is_some()
             || self.memory_dirty.is_some()
             || self.view_addresses.is_some()
+            || self.mesh_record_srv
+            || self.mesh_record_uav
+            || self.mesh_base_cbv
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -540,11 +585,38 @@ impl Shader {
                     dxil_kind: 13,
                 });
             }
+            if self.mesh_base_cbv {
+                let arr = self.m.array(4, self.t.i32);
+                let ty = self.m.named_struct("MeshBase", vec![arr]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let ops = vec![
+                    Some(i32c(&mut self, cbv_list.len() as u32)),
+                    Some(self.m.md_value(u)),
+                    Some(empty),
+                    Some(i32c(&mut self, MESH_RECORD_SPACE)),
+                    Some(i32c(&mut self, 0)),
+                    Some(i32c(&mut self, 1)),
+                    Some(i32c(&mut self, 16)),
+                    None,
+                ];
+                cbv_list.push(Some(self.m.md_node(ops)));
+                bindings.push(Binding {
+                    kind: 2,
+                    space: MESH_RECORD_SPACE,
+                    register: 0,
+                    dxil_kind: 13,
+                });
+            }
             if !cbv_list.is_empty() {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() || self.memory.is_some() || self.view_addresses.is_some() {
+            if !self.root_srvs.is_empty()
+                || self.memory.is_some()
+                || self.view_addresses.is_some()
+                || self.mesh_record_srv
+            {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
@@ -557,6 +629,7 @@ impl Shader {
                     .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
                     .chain(self.memory.map(|_| (MEMORY_SPACE, 0)))
                     .chain(self.view_addresses.map(|_| (MEMORY_SPACE, 1)))
+                    .chain(self.mesh_record_srv.then_some((MESH_RECORD_SPACE, 0)))
                     .collect();
                 for (n, (space, slot)) in all.into_iter().enumerate() {
                     let ops = vec![
@@ -581,7 +654,7 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() {
+            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.mesh_record_uav {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -595,6 +668,7 @@ impl Shader {
                     .iter()
                     .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
                     .chain(self.memory_dirty.map(|_| (MEMORY_SPACE, 0)))
+                    .chain(self.mesh_record_uav.then_some((MESH_RECORD_SPACE, 0)))
                     .collect();
                 for (n, (space, slot)) in all.into_iter().enumerate() {
                     let ops = vec![

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use super::Shader;
 use super::hold_clock::{CLOCK, HoldClock};
-use super::host::{GraphicsState, HostPipeline};
+use super::host::{GraphicsState, HostPipeline, MeshPass1};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -36,6 +36,7 @@ pub(crate) struct Pending {
     now: AtomicBool,
     taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    mesh_pass1: Mutex<Option<MeshPass1>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     pub(crate) key: String,
@@ -64,6 +65,7 @@ impl Pending {
             now: AtomicBool::new(false),
             taken: AtomicBool::new(false),
             made: OnceLock::new(),
+            mesh_pass1: Mutex::new(None),
             used: AtomicBool::new(false),
         }
     }
@@ -72,8 +74,10 @@ impl Pending {
     fn make(&self, mode: CompileMode) -> Option<Lane> {
         let (started, cpu) = (Instant::now(), super::thread_cpu());
         let mut compile = Compile::new(mode);
+        compile.mesh_pass1 = self.mesh_pass1.lock().unwrap_or_else(|e| e.into_inner()).take();
         let made = HostPipeline::build(&self.shaders, self.graphics.as_deref(), &mut compile);
         if let Some(lane) = compile.deferred {
+            *self.mesh_pass1.lock().unwrap_or_else(|e| e.into_inner()) = compile.mesh_pass1.take();
             return Some(lane);
         }
         #[cfg(feature = "diagnostics")]
@@ -324,11 +328,13 @@ pub(super) enum CompileMode {
 pub(super) struct Compile {
     mode: CompileMode,
     deferred: Option<Lane>,
+    /// Pass 1, if pass 2 was deferred. Tied to a single pending pipeline.
+    pub(super) mesh_pass1: Option<MeshPass1>,
 }
 
 impl Compile {
     pub(super) fn new(mode: CompileMode) -> Self {
-        Self { mode, deferred: None }
+        Self { mode, deferred: None, mesh_pass1: None }
     }
 
     pub(super) fn cold<T>(
