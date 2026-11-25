@@ -1132,17 +1132,19 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
         d.format = family(d.format);
     }
     // The console makes any texture a target; the host refuses resources
-    // with a render target use their format cannot take -- the 16-bit
-    // packed ones on NVIDIA: B4G4R4A4 has none (#2725) -- and a texture
-    // whose creation fails that way gets no host texture at all, where
-    // without the use its shader reads work. A typeless format names no
-    // format itself (its views do): a resource of one takes any use. An
-    // unordered access use the device refuses is not a creation's business
-    // here: the creation refuses cleanly (`E_INVALIDARG`, no device
-    // removal) and its own-format views are the removal's to avoid, held
-    // back in `descriptor::host::fits` (`#2725`'s `CreateUnorderedAccessView`).
+    // with a render target or an unordered access use their format cannot
+    // take -- the 16-bit packed ones on NVIDIA: B4G4R4A4 has no render
+    // target, B5G5R5A1 no unordered access (#2725) -- where the creation
+    // fails (no host texture at all, and under the debug layer a device
+    // removal), where without the use its shader reads work. A typeless
+    // format names no format itself (its views do): a resource of one
+    // takes any use. The unordered access's own-format views are held
+    // back in `descriptor::host::fits` (`#2725`'s CreateUnorderedAccessView).
     if d.flags & DEPTH == 0 && !format_takes_render_target(d.format) {
         d.flags &= !RENDER_TARGET;
+    }
+    if d.flags & UNORDERED != 0 && !format_takes_unordered(d.format) {
+        d.flags &= !UNORDERED;
     }
     Some(d)
 }
@@ -1153,18 +1155,40 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
 /// names no format itself, its views do).
 #[cfg(windows)]
 fn format_takes_render_target(format: u32) -> bool {
+    format_takes(
+        format,
+        windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+    )
+}
+
+/// [`format_takes_render_target`], for the unordered access use.
+#[cfg(windows)]
+fn format_takes_unordered(format: u32) -> bool {
+    format_takes(
+        format,
+        windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+    )
+}
+
+/// Whether the host takes a resource of `format` with the use `bit` asks
+/// [`format_takes_render_target`] for: the same query, cached.
+#[cfg(windows)]
+fn format_takes(
+    format: u32,
+    bit: windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1,
+) -> bool {
+    let bit = bit.0 as u32;
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
-        D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     // Every family has more than one format, its typeless one first.
     if family(format) == format && family(format + 1) == format {
         return true;
     }
-    static KNOWN: std::sync::Mutex<Vec<(u32, bool)>> = std::sync::Mutex::new(Vec::new());
+    static KNOWN: std::sync::Mutex<Vec<(u32, u32, bool)>> = std::sync::Mutex::new(Vec::new());
     let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&(_, takes)) = known.iter().find(|&&(f, _)| f == format) {
+    if let Some(&(_, _, takes)) = known.iter().find(|&&(f, b, _)| f == format && b ==bit) {
         return takes;
     }
     let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
@@ -1179,8 +1203,8 @@ fn format_takes_render_target(format: u32) -> bool {
                 .is_ok()
         })
     };
-    let takes = !reported || support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0;
-    known.push((format, takes));
+    let takes = !reported || support.Support1.0 & bit as i32 != 0;
+    known.push((format, bit, takes));
     takes
 }
 
@@ -2406,17 +2430,18 @@ mod tests {
     }
 
     /// A description of a 16-bit packed target agrees with the device: the
-    /// render target use its format cannot take (B4G4R4A4's on NVIDIA) is
-    /// left away -- such a description created removed the device for it
-    /// (#2725) -- and the use it takes stays, the title's own. A typeless
-    /// format names no format itself: whatever uses its description has
-    /// stay.
+    /// render target and unordered access uses its format cannot take
+    /// (B4G4R4A4's render target, B5G5R5A1's unordered access on NVIDIA;
+    /// #2725) are left away -- a description of one created refused with
+    /// `E_INVALIDARG`, and under the debug layer removed the device -- and
+    /// the uses it takes stay, the title's own. A typeless format names no
+    /// format itself: whatever uses its description has stay.
     #[cfg(windows)]
     #[test]
     fn a_target_of_a_format_the_device_refuses_the_use_of_is_made_without_it() {
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
-            D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+            D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
         };
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         let Some(host) = crate::host::host() else {
@@ -2445,9 +2470,9 @@ mod tests {
                 "format {format}: the render target use stays when the device takes it"
             );
             assert_eq!(
-                d.flags & UNORDERED,
-                desc.flags & UNORDERED,
-                "format {format}: the unordered access use stays (its views are held back, not the resource's use)"
+                d.flags & UNORDERED != 0,
+                support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0,
+                "format {format}: the unordered access use stays when the device takes it"
             );
         }
         // Typeless: a resource of one takes every use; the sRGB promotion
@@ -2473,6 +2498,47 @@ mod tests {
         let d = host_desc(&srgb).expect("a texture description");
         assert_eq!(d.format, 27, "a sRGB target's resource is hosted typeless");
         assert_eq!(d.flags, 1 | 4, "a sRGB target stays a target and unordered storage");
+    }
+
+    /// A texture of a format whose unordered access the device refuses is
+    /// made without it (the 16-bit packed ones' on NVIDIA, #2725): a host
+    /// texture exists where the use kept one from being made at all (the
+    /// log's `no host texture`, `0x80070057`), and its flags are what the
+    /// description was made with. One the device takes the unordered
+    /// access of keeps it.
+    #[cfg(windows)]
+    #[test]
+    fn an_unordered_use_the_device_refuses_is_made_without_it() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let h = heap(1 << 20);
+        for (offset, format) in [(0, 86), (1 << 18, 115), (2 << 18, 28)] {
+            let placed = {
+                let desc = ResourceDesc {
+                    flags: 1 | 4,
+                    ..texture(4, 4, format, 1)
+                };
+                let mut out = null;
+                assert_eq!(
+                    create_placed(null, h, offset, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out),
+                    S_OK,
+                    "format {format}: a texture of it is made"
+                );
+                out
+            };
+            let host = host_copy(placed).expect("a host texture of it");
+            // SAFETY: a live resource.
+            let d = unsafe { host.texture.GetDesc() };
+            assert_eq!(
+                d.Flags.0 as u32 & UNORDERED != 0,
+                format_takes_unordered(format),
+                "format {format}: the use is the device's"
+            );
+            assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+        }
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
     }
 
     fn heap(size: u64) -> This {
