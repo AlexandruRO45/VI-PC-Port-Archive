@@ -5,7 +5,7 @@ lanes read only their own half run as two 32-lane waves. The others run in
 the console flow, in groups of one console wave or of several: masks read
 whole, lanes of the other half, divergent branches and loops, scalars a
 divergent loop leaves, whole-wave reductions and prefixes, and LDS shared
-within a wave. Still open: `ds_(b)permute`.
+within a wave. Nothing of this plan is open.
 
 ## The problem
 
@@ -47,15 +47,26 @@ of each host wave adds 32 to it when the wave starts and shares the result,
 and the wave's lanes take the next 32 console threads in lane order.
 
 **What stays inside a half** needs nothing: DPP16 and DPP8 (rows of 16,
-groups of 8), `ds_swizzle` (groups of 32 or 4), and `v_permlane16` /
-`v_permlanex16` (the two rows of a 32-lane half). Their lowering computes
-the source lane from the host lane's place in its row or group, so it is
-unchanged in the split form.
+groups of 8), `ds_swizzle` (groups of 32 or 4), `v_permlane16` /
+`v_permlanex16` (the two rows of a 32-lane half), and `ds_bpermute` /
+`ds_permute`. Their lowering computes the source lane from the host lane's
+place in its row, group or half, so it is unchanged in the split form.
+
+The permutes stay in their half on the console: "in wave64 mode the permute
+operates only across 32 lanes at a time of each half of a wave64. In other
+words, it executes as if were two independent wave32's" (AMD's RDNA ISA
+reference, 10.4.4; RDNA's list of changes says "DS_PERMUTE/DS_BPERMUTE are
+limited to 32-lane permutation"). Only the index's bits 6:2 count, a lane
+that does not run the instruction gives 0, and a `ds_permute` destination
+two lanes name takes the higher lane's value (12.13; the opcode table's
+`mod 64` is the general form, the section on permutes the wave64 one).
+Measurements on RDNA2 parts reported elsewhere agree. Before, the
+translation read across the whole wave64 where the host runs 64-lane waves.
 
 Step 4 (`split` in `Lower::new`) runs a program as two 32-lane waves when
 the host has no 64-lane waves and the program:
-- reads other lanes only through DPP, `ds_swizzle` and `v_permlane16` /
-  `v_permlanex16`;
+- reads other lanes only through DPP, `ds_swizzle`, `v_permlane16` /
+  `v_permlanex16` and `ds_(b)permute`;
 - reads no mask whole and tests no bit of a mask held as a number;
 - has no whole-wave sections (their reductions would cover a half);
 - uses no LDS (the console compiler may have left out barriers between
@@ -74,7 +85,7 @@ already did for every wave64 program without a declared wave size.
 | `v_mbcnt_lo` in the upper half | the lower half's ballot |
 | `v_readlane`, `v_readfirstlane` (uniform lane) | the value of lane `l & 31` from the half that owns `l` |
 | `v_writelane` to the other half | the value and lane |
-| `ds_bpermute`, `ds_permute` | open: check whether GFX10 wave64 crosses halves for these, then 32 words per half if it does |
+| `ds_bpermute`, `ds_permute` | nothing: they stay in their half (see above) |
 
 A mask read only lane by lane (a `v_cndmask` selector, a carry-in) needs
 just the lane's own half. Exchanging those anyway is correct but slow.
@@ -117,8 +128,7 @@ does (step 5, `lower::CONSOLE_FLOW`):
 `lower` tries the per-lane form first. A program that needs the console
 flow stops with `CONSOLE_FLOW`, and `emit` lowers it again from the
 console structure. Eligible: wave64 compute on a host without 64-lane
-waves and no `ds_(b)permute` (any group size, and whole-wave sections; see
-below).
+waves (any group size, whole-wave sections and permutes; see below).
 
 ### LDS within one console wave
 

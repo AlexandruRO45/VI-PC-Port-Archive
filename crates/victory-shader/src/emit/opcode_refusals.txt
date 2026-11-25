@@ -57,7 +57,6 @@ ds_and_rtn_b64
 ds_and_src2_b32
 ds_and_src2_b64
 ds_append
-ds_bpermute_b32
 ds_cmpst_b64
 ds_cmpst_f32
 ds_cmpst_f64
@@ -122,7 +121,6 @@ ds_or_rtn_b64
 ds_or_src2_b32
 ds_or_src2_b64
 ds_ordered_count
-ds_permute_b32
 ds_read_addtid_b32
 ds_read_i16
 ds_read_i8

@@ -1176,13 +1176,15 @@ impl<'a> Lower<'a> {
                         .map(|(_, inst)| inst)
                 })
             };
-            // Swizzles, DPP, `v_permlane16`/`v_permlanex16` and quad
-            // derivatives read lanes of the same 32 (rows of 16, groups of
-            // 8, 32 or 4, the two rows of a half): the rest may read the
-            // other half of a wave64.
+            // Swizzles, DPP, `v_permlane16`/`v_permlanex16`,
+            // `ds_(b)permute_b32` and quad derivatives read lanes of the same
+            // 32 (rows of 16, groups of 8, 32 or 4, the two rows of a half,
+            // a half: RDNA ISA 10.4.4 runs a wave64's permutes as two
+            // wave32s): the rest may read the other half of a wave64.
             let in_half = |i: &Inst| {
                 i.name().starts_with("ds_swizzle")
                     || i.name().starts_with("v_permlane")
+                    || i.name().contains("permute")
                     || implicit_derivatives(i.name())
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             };
@@ -1196,8 +1198,7 @@ impl<'a> Lower<'a> {
             let sccs = mask_sccs(x.st, p);
             let console_wave = if x.native.wave64 { 64 } else { 32 };
             let scc_ok = !x.per_lane_only
-                && (x.target.runs(console_wave)
-                    || !insts().any(|i| i.name().contains("permute")));
+                && (x.target.runs(console_wave) || x.native.wave64 && x.target.runs(32));
             let reads_scc = |i: &Inst| {
                 scc_ok
                     && !matches!(i.fields, Fields::Sopp { .. })
@@ -1205,8 +1206,7 @@ impl<'a> Lower<'a> {
             };
             let whole = |i: &Inst| {
                 let n = i.name();
-                n.contains("permute")
-                    || n.starts_with("v_mbcnt")
+                n.starts_with("v_mbcnt")
                     // Its derivatives are the quad's.
                     || n == "image_sample"
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
@@ -1265,10 +1265,7 @@ impl<'a> Lower<'a> {
             // its lanes (they run in step): in the console flow every thread
             // of a console wave runs every block it runs, so the halves can
             // meet between LDS accesses ([`Lower::lds_meet`]).
-            console_flow_ok = x.native.wave64
-                && !x.target.runs(64)
-                && x.target.runs(32)
-                && !insts().any(|i| i.name().contains("permute"));
+            console_flow_ok = x.native.wave64 && !x.target.runs(64) && x.target.runs(32);
             wants_console_flow =
                 ((console_lanes && !split) || (one_wave && s.lds_dwords > 0)) && console_flow_ok;
             // On a host that runs the console's wave size: lane reads and
@@ -4581,6 +4578,58 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// `ds_(b)permute_b32`: the host lane where this lane's half of the
+    /// console wave starts (0 where a host wave holds one half, as in
+    /// waves of 32), and the lane in that half the address `at` (in bytes,
+    /// plus the instruction's `offset`) names: its bits 6:2 (RDNA ISA
+    /// 10.4.4).
+    fn permute_lanes(&mut self, lane: V, at: V, offset: u32) -> (V, V) {
+        let c = self.cur;
+        let (by, two, k31, k32) = (
+            self.s.m.i32(offset),
+            self.s.m.i32(2),
+            self.s.m.i32(31),
+            self.s.m.i32(32),
+        );
+        let half = self.s.m.bin(c, Bin::And, lane, k32);
+        let at = self.s.m.bin(c, Bin::Add, at, by);
+        let at = self.s.m.bin(c, Bin::LShr, at, two);
+        (half, self.s.m.bin(c, Bin::And, at, k31))
+    }
+
+    /// The host wave's lanes that run here, as a ballot (low and high
+    /// word): a lane the host wave runs elsewhere has no value to read
+    /// (the console gives 0 for it).
+    fn running_lanes(&mut self) -> (V, V) {
+        let c = self.cur;
+        let t = self.s.m.bool(true);
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let all = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[t]);
+        self.s.flags |= flags::WAVE_OPS;
+        (self.s.m.extract(c, all, 0), self.s.m.extract(c, all, 1))
+    }
+
+    /// Whether host lane `src` is one of `lanes` ([`Self::running_lanes`]).
+    fn lane_runs(&mut self, (lo, hi): (V, V), src: V) -> V {
+        let c = self.cur;
+        let (k31, k32, one, z) = (
+            self.s.m.i32(31),
+            self.s.m.i32(32),
+            self.s.m.i32(1),
+            self.s.m.i32(0),
+        );
+        let high = self.s.m.bin(c, Bin::And, src, k32);
+        let high = self.s.m.cmp(c, pred::NE, high, z);
+        let word = self.s.m.select(c, high, hi, lo);
+        let bit = self.s.m.bin(c, Bin::And, src, k31);
+        let t = self.s.m.bin(c, Bin::LShr, word, bit);
+        let t = self.s.m.bin(c, Bin::And, t, one);
+        self.s.m.cmp(c, pred::NE, t, z)
+    }
+
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     fn quad_pick(&mut self, x: V, src: V) -> V {
@@ -4899,28 +4948,60 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if name == "ds_bpermute_b32" {
-            // Each lane reads the data of the lane it names (times 4): 0 if
-            // that one does not run this.
+            // Each lane reads the data of the lane it names (times 4) in its
+            // own half of 32 lanes: a wave64 runs its permutes as two
+            // independent wave32s, the index's bits 6:2 only (RDNA ISA
+            // 10.4.4). A lane that does not run it gives 0.
             self.cross_lane(false)?;
-            if self.split {
-                return Err("a lane permutation in a wave64 program split in halves");
-            }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permutation address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("permutation data")?, 1)?[0];
-            let (by, two, last) = (
-                self.s.m.i32(offset),
-                self.s.m.i32(2),
-                self.s.m.i32(self.wave() - 1),
-            );
-            let at = self.s.m.bin(c, Bin::Add, at, by);
-            let at = self.s.m.bin(c, Bin::LShr, at, two);
-            let src = self.s.m.bin(c, Bin::And, at, last);
+            let lane = self.lane_index();
+            let (half, index) = self.permute_lanes(lane, at, offset);
+            let src = self.s.m.bin(self.cur, Bin::Or, half, index);
             let z = self.s.m.i32(0);
             let x = match guard {
                 Some(g) => self.s.m.select(c, g, x, z),
                 None => x,
             };
             let r = self.read_lane(x, src);
+            let running = self.running_lanes();
+            let runs = self.lane_runs(running, src);
+            let r = self.s.m.select(c, runs, r, z);
+            let reg = dst_reg.ok_or("a permutation result")?;
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
+        if name == "ds_permute_b32" {
+            // Each lane sends its data to the lane it names (times 4) in its
+            // own half, as `ds_bpermute_b32` reads (RDNA ISA 10.4.4). A lane
+            // takes what the highest lane of its half that runs it sent, 0
+            // where none did (ISA 12.13, `DS_PERMUTE_B32`). Each lane looks
+            // at the 32 lanes of its half in turn.
+            self.cross_lane(false)?;
+            let at = self.vgprs(inst, addr.as_ref().ok_or("a permutation address")?, 1)?[0];
+            let x = self.vgprs(inst, data.first().ok_or("permutation data")?, 1)?[0];
+            let lane = self.lane_index();
+            let (half, to) = self.permute_lanes(lane, at, offset);
+            // A lane that does not run it sends nothing: no lane is 32.
+            let none = self.s.m.i32(32);
+            let to = match guard {
+                Some(g) => self.s.m.select(c, g, to, none),
+                None => to,
+            };
+            let k31 = self.s.m.i32(31);
+            let me = self.s.m.bin(c, Bin::And, lane, k31);
+            let running = self.running_lanes();
+            let mut r = self.s.m.i32(0);
+            for k in 0..32 {
+                let kk = self.s.m.i32(k);
+                let src = self.s.m.bin(c, Bin::Or, half, kk);
+                let sent_to = self.read_lane(to, src);
+                let sent = self.read_lane(x, src);
+                let mine = self.s.m.cmp(c, pred::EQ, sent_to, me);
+                let runs = self.lane_runs(running, src);
+                let take = self.s.m.bin(c, Bin::And, mine, runs);
+                r = self.s.m.select(c, take, sent, r);
+            }
             let reg = dst_reg.ok_or("a permutation result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());

@@ -962,3 +962,181 @@ fn permlanes_stay_in_their_half() {
     let cs = emit_for(&program(&row, 64), nvidia).expect("split in halves");
     assert_eq!(wave_size(&cs.dxil), Some(32));
 }
+
+// ---- `ds_bpermute_b32` / `ds_permute_b32`: each half on its own ----
+
+/// v4 = (t ^ 33) * 4: the address names lane l ^ 33 of the console wave,
+/// in the other half; only its bits 6:2 count (RDNA ISA 10.4.4), so the
+/// lane read is l ^ 1, in the lane's own half.
+const TO_THE_OTHER_HALF: [u32; 2] = [
+    0x3A08_00A1, // v_xor_b32 v4, 33, v0
+    0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+];
+
+const DS_BPERMUTE: [u32; 3] = [
+    0xDACC_0000,
+    0x0200_0004, // ds_bpermute_b32 v2, v4, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+const DS_PERMUTE: [u32; 3] = [
+    0xDAC8_0000,
+    0x0200_0004, // ds_permute_b32 v2, v4, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+/// v2 = 7, then the lanes whose t is even run the next `n` dwords.
+const fn even_lanes_run(n: u32) -> [u32; 5] {
+    [
+        0x7E04_0287,     // v_mov_b32 v2, 7
+        0x360A_0081,     // v_and_b32 v5, 1, v0
+        0x7D84_0A80,     // v_cmp_eq_u32 vcc, 0, v5
+        0xBE8A_246A,     // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0000 | n, // s_cbranch_execz +n
+    ]
+}
+
+const RESTORE_EXEC: u32 = 0x88FE_0A7E; // s_or_b64 exec, exec, s[10:11]
+
+/// `ds_bpermute_b32` reads within the lane's half: lane l, naming l ^ 33,
+/// reads l ^ 1. In a branch only even lanes take, the odd lanes they read
+/// do not run it and give 0, and the odd lanes keep their value. Split in
+/// halves on a host without 64-lane waves (no console flow); refused there
+/// before. Where the host runs 64-lane waves the translation read l ^ 33
+/// before.
+#[test]
+fn bpermute_reads_within_its_half() {
+    let mut body = TO_THE_OTHER_HALF.to_vec();
+    body.extend(DS_BPERMUTE);
+    for threads in [64, 128, 96, 32] {
+        flow_case("ds_bpermute of t ^ 33", &body, threads, |t| t ^ 1, true);
+    }
+    let mut branch = even_lanes_run(5).to_vec();
+    branch.extend(TO_THE_OTHER_HALF);
+    branch.extend(DS_BPERMUTE);
+    branch.push(RESTORE_EXEC);
+    for threads in [64, 128] {
+        flow_case(
+            "even lanes ds_bpermute t ^ 33",
+            &branch,
+            threads,
+            |t| if t & 1 == 0 { 0 } else { 7 },
+            true,
+        );
+    }
+}
+
+/// v4 = (((t & 31) >> 1) | 32) * 4: lanes 2d and 2d + 1 of each half send
+/// to lane d of their half (the address's bit 5 names the other half and
+/// does not count).
+const PAIRS_TO_THE_LOW_LANES: [u32; 4] = [
+    0x3608_009F, // v_and_b32 v4, 31, v0
+    0x2C08_0881, // v_lshrrev_b32 v4, 1, v4
+    0x3808_08A0, // v_or_b32 v4, 32, v4
+    0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+];
+
+/// Lane t's value after [`PAIRS_TO_THE_LOW_LANES`] and `ds_permute_b32` of
+/// t, in a group of `threads`, from the senders `sends` lets send: the
+/// highest sender of its half that names it, else 0.
+fn permuted(t: u32, threads: u32, sends: impl Fn(u32) -> bool) -> u32 {
+    let (base, d) = (t & !31, t & 31);
+    (0..32)
+        .map(|k| base + k)
+        .filter(|&s| s < threads && sends(s) && (s & 31) >> 1 == d)
+        .max()
+        .unwrap_or(0)
+}
+
+/// `ds_permute_b32` sends within the lane's half: lanes 2d and 2d + 1 both
+/// send to lane d, the higher one's value stays, and lanes 16 to 31 of each
+/// half get 0. In a branch only even lanes take, only they send and take.
+/// Not translated at all before, on any host.
+#[test]
+fn permute_sends_within_its_half() {
+    let mut body = PAIRS_TO_THE_LOW_LANES.to_vec();
+    body.extend(DS_PERMUTE);
+    for threads in [64, 128, 96, 48, 32] {
+        flow_case(
+            "ds_permute to (t & 31) >> 1",
+            &body,
+            threads,
+            |t| permuted(t, threads, |_| true),
+            true,
+        );
+    }
+    let mut branch = even_lanes_run(6).to_vec();
+    branch.extend(PAIRS_TO_THE_LOW_LANES);
+    branch.extend(DS_PERMUTE);
+    branch.push(RESTORE_EXEC);
+    for threads in [64, 128] {
+        flow_case(
+            "even lanes ds_permute to (t & 31) >> 1",
+            &branch,
+            threads,
+            |t| {
+                if t & 1 == 0 {
+                    permuted(t, threads, |s| s & 1 == 0)
+                } else {
+                    7
+                }
+            },
+            true,
+        );
+    }
+}
+
+/// Permutes with lane reads across the halves: the console flow, in groups
+/// of one console wave and of several.
+#[test]
+fn permutes_in_the_console_flow() {
+    let read_40 = [
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+    ];
+    let mut gather = read_40.to_vec();
+    gather.extend(TO_THE_OTHER_HALF);
+    gather.extend(DS_BPERMUTE);
+    gather.push(0x4A04_0409); // v_add_nc_u32 v2, s9, v2
+    waves_case(
+        "readlane 40 + ds_bpermute of t ^ 33",
+        &gather,
+        &[64, 128, 256, 112],
+        |t, _| (t ^ 1) + (t & !63) + 40,
+    );
+    let mut scatter = read_40.to_vec();
+    scatter.extend(PAIRS_TO_THE_LOW_LANES);
+    scatter.extend(DS_PERMUTE);
+    scatter.push(0x4A04_0409); // v_add_nc_u32 v2, s9, v2
+    waves_case(
+        "readlane 40 + ds_permute to (t & 31) >> 1",
+        &scatter,
+        &[64, 128, 256, 112],
+        |t, n| permuted(t, n, |_| true) + (t & !63) + 40,
+    );
+}
+
+/// The wave sizes programs with permutes declare: 32 where the host has
+/// no 64-lane waves (in halves), the console's 64 where it has them.
+#[test]
+fn permutes_translate_without_64_lane_waves() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let rdna = super::Target {
+        lanes_min: 32,
+        lanes_max: 64,
+    };
+    for ds in [DS_BPERMUTE, DS_PERMUTE] {
+        let mut body = TO_THE_OTHER_HALF.to_vec();
+        body.extend(ds);
+        for threads in [64, 128, 1024] {
+            let p = program(&body, threads);
+            let cs = emit_for(&p, nvidia).unwrap_or_else(|e| panic!("{threads}: {e}"));
+            assert_eq!(wave_size(&cs.dxil), Some(32));
+            let cs = emit_for(&p, rdna).unwrap_or_else(|e| panic!("{threads}: {e}"));
+            assert_eq!(wave_size(&cs.dxil), Some(64));
+        }
+    }
+}
