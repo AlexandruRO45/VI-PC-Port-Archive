@@ -180,6 +180,12 @@ impl Bools {
         vars.into_iter().map(|v| self.atoms[v as usize]).collect()
     }
 
+    /// The variable node for `atom`, if it has been created.
+    pub fn atom_bool(&self, atom: Atom) -> Option<Bool> {
+        let &v = self.ids.get(&atom)?;
+        self.unique.get(&(v, Bool::FALSE, Bool::TRUE)).copied()
+    }
+
     /// The variables `b` tests, in the order a depth-first walk meets them.
     /// Each node is visited once: scanning lists of every node and variable
     /// seen made this quadratic in the size of `b`.

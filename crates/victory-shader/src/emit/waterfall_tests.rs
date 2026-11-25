@@ -104,7 +104,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 /// hardware GPU and on WARP, returning the UAV's 32 dwords for each device
 /// that ran. At least one device must produce a readback.
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
-    let samplers = [D3D12_SAMPLER_DESC {
+    let clamp = D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -112,7 +112,15 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
         MaxAnisotropy: 1,
         MaxLOD: f32::MAX,
         ..Default::default()
-    }];
+    };
+    run_with_samplers(shader, views, &[clamp])
+}
+
+fn run_with_samplers(
+    shader: &HostShader,
+    views: &[View],
+    samplers: &[D3D12_SAMPLER_DESC],
+) -> Vec<(&'static str, Vec<u32>)> {
     let mut out = Vec::new();
     // One GPU test at a time, with the VALU tests: in parallel on the
     // hardware adapter and WARP the test process sometimes died of an
@@ -145,7 +153,7 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
                 &Dispatch {
                     roots: vec![(0, Root::Constants(ud))],
                     views,
-                    samplers: &samplers,
+                    samplers,
                     groups: [1, 1, 1],
                 },
             )
@@ -255,6 +263,53 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         let shader = build(&cmpx_waterfall(false, folded), false);
         for (label, red) in sampled(&shader) {
             assert_eq!(red, want, "{label}, folded {folded}");
+        }
+    }
+}
+
+#[test]
+fn lanes_sample_after_redundant_masked_image_descriptor_write() {
+    use crate::resource::tests::joined_with_masked_write;
+    let words = joined_with_masked_write(0x7D88_0090, 0x7E08_0218);
+    let shader = build(&words, false);
+    let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
+    for (label, red) in sampled(&shader) {
+        assert_eq!(red, want, "{label}");
+    }
+}
+
+#[test]
+fn lanes_sample_with_joined_sampler_after_redundant_masked_write() {
+    use crate::resource::tests::WATERFALL_JOINED_SAMPLER_WAVE32;
+    let shader = build(WATERFALL_JOINED_SAMPLER_WAVE32, false);
+    let tex = [[1.0f32, 0.0, 0.0, 1.0], [2.0f32, 0.0, 0.0, 1.0]];
+    // Entry 2 (dword 16) is the output UAV, matching `build`'s layout.
+    let views = [
+        View::Texture(2, 1, &tex),
+        View::Texture(2, 1, &tex),
+        View::RawUav(32),
+    ];
+    let sampler = |mode| D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: mode,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    };
+    let wrap = sampler(D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+    let clamp = sampler(D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+    for (swapped, pair, lo_want, hi_want) in [
+        (false, [wrap, clamp], 1.0f32, 2.0f32),
+        (true, [clamp, wrap], 2.0f32, 1.0f32),
+    ] {
+        let want: Vec<f32> = (0..32)
+            .map(|l| if l < 16 { lo_want } else { hi_want })
+            .collect();
+        for (label, words) in run_with_samplers(&shader, &views, &pair) {
+            let red: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
+            assert_eq!(red, want, "{label}, swapped {swapped}");
         }
     }
 }
