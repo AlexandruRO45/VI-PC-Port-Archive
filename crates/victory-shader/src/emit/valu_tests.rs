@@ -337,6 +337,10 @@ fn shift_add_and_align_take_sign_bit_modifiers() {
         (0x14E, 2, 0, [0, 1, 31], 1),                   // alignbit: neg(src1)
         (0x14F, 2, 0, [0, 0x00FF_FFFF, 3], 0x80),       // alignbyte: neg(src1)
         (0x14E, 0, 2, [0, 0x8000_0000, 31], 0),         // alignbit: abs(src1)
+        // abs and neg on one source: abs clears bit 31, then neg sets it
+        // (-|x|, as on a float); the other order would give 4 and 0x15
+        (0x347, 1, 1, [3, 1, 0], 0x8000_0004),          // add_lshl: -|src0|
+        (0x346, 4, 4, [5, 2, 0x8000_0001], 0x8000_0015), // lshl_add: -|src2|
     ];
     for &(op, neg, abs, [a, b, c], want) in cases {
         let mut w = vop3(op, 0, vgpr(1), vgpr(2), vgpr(3));
