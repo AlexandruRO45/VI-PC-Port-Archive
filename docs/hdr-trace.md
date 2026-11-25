@@ -5,9 +5,10 @@
 switches once at first use, and records nothing unless all of the following
 hold: `VICTORY_HDR_TRACE=1`, `VICTORY_CAPTURE_WORLD` is set, and
 `VICTORY_CAPTURE_LISTED_ONLY=1`. A TiledLighting draw also flushes the kept
-lines and the Present line on its own: the first frame where that draw
-executes, or the `VICTORY_HDR_TRACE_AFTER`-th one (default 1), so a frame
-offset a slow world never reaches is not needed. Recording is armed for the run (the title
+lines, the Present line and the presented PNG on its own: the first frame
+where that draw executes, or the `VICTORY_HDR_TRACE_AFTER`-th one (default 1),
+so a frame offset a slow world never reaches is not needed. Copies and lines
+are made only for that trigger frame (and for explicitly listed frames). Recording is armed for the run (the title
 records a frame's commands before presenting it, so filtering by the
 presented number misses them); the kept lines are emitted only at the
 selected world frame's Present and are discarded at every other Present.

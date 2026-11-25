@@ -62,9 +62,20 @@ pub(crate) fn listed_only() -> bool {
     *ONLY.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_LISTED_ONLY").is_some_and(|s| s == "1"))
 }
 
-/// Whether frame `n` is saved.
+/// Whether the world marker exists: a run's first frame with 500 draws.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn world_started() -> bool {
+    WORLD.get().is_some()
+}
+
+/// Whether frame `n` is saved: a listed frame, or the frame the HDR trace
+/// selected by its TiledLighting trigger (one frame, no offsets).
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (listed(n) || (!listed_only() && n.is_power_of_two()))
+    if folder().is_none() { return false; }
+    if listed(n) || (!listed_only() && n.is_power_of_two()) { return true; }
+    #[cfg(feature = "diagnostics")]
+    if crate::draw::hdr_trace::auto_frame(n) { return true; }
+    false
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.

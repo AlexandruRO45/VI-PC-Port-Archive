@@ -2040,6 +2040,14 @@ pub(crate) mod hdr_trace {
     static WITH_TILED: AtomicU32 = AtomicU32::new(0);
     static NOTES: AtomicU32 = AtomicU32::new(0);
 
+    /// Whether the Present now processing is the trigger frame, without
+    /// consuming it: `capture::wanted` asks before `flush` runs.
+    pub(crate) fn auto_frame(_n: u64) -> bool {
+        if !enabled() || !crate::capture::world_started() { return false; }
+        TILED.load(std::sync::atomic::Ordering::Relaxed) > 0
+            && WITH_TILED.load(std::sync::atomic::Ordering::Relaxed) + 1 == auto_after()
+    }
+
     fn auto_after() -> u32 {
         static AFTER: OnceLock<u32> = OnceLock::new();
         *AFTER.get_or_init(|| std::env::var("VICTORY_HDR_TRACE_AFTER").ok().and_then(|v| v.parse().ok()).unwrap_or(1))
@@ -2195,7 +2203,15 @@ pub(crate) mod hdr_trace {
         bindings: &[Binding], targets: &[Target]) -> Option<Event>
     {
         active_frame()?;
-        if program.tiled() { TILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        use std::sync::atomic::Ordering::Relaxed;
+        // The first TiledLighting draw of the frame decides whether this is
+        // the frame to keep; other frames record no copies or lines.
+        let first_tiled = program.tiled() && TILED.fetch_add(1, Relaxed) == 0;
+        let listed_now = crate::capture::listed(crate::queue::presented() + 1);
+        let candidate = listed_now
+            || (first_tiled && crate::capture::world_started()
+                && WITH_TILED.load(Relaxed) + 1 == auto_after());
+        if !candidate { return None; }
         let mut q = QUOTA.lock().unwrap_or_else(|e| e.into_inner());
         let seen = &mut q.seen[program as usize];
         if *seen != 0 { return None; }
@@ -2286,9 +2302,10 @@ pub(crate) mod hdr_trace {
     /// selected frame, and dropped either way.
     pub(crate) fn flush(frame: u64) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
-        let tiled = TILED.swap(0, Relaxed) > 0;
+        let tiled = TILED.swap(0, Relaxed) > 0 && crate::capture::world_started();
         let listed = frame_is_selected(frame);
-        let auto = tiled && WITH_TILED.fetch_add(1, Relaxed) + 1 == auto_after();
+        let with = if tiled { WITH_TILED.fetch_add(1, Relaxed) + 1 } else { WITH_TILED.load(Relaxed) };
+        let auto = tiled && with == auto_after();
         let selected = listed || auto;
         let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
         if selected {
