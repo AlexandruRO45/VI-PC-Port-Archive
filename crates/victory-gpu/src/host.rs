@@ -3603,6 +3603,7 @@ fn late_line(frames: f64) {
     fill_check::line();
     fill_ahead::line(frames);
     crate::readprobe::line(frames);
+    crate::lazyback::line(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -4890,6 +4891,11 @@ impl Host {
             }
         }
         BESIDE_STATS[0].fetch_add(again, Ordering::Relaxed);
+        if crate::lazyback::step() > 0 {
+            for (shadow, lo, hi, _) in &pieces {
+                crate::lazyback::fetched(shadow.title_start() + lo, shadow.title_start() + hi);
+            }
+        }
         if pieces.is_empty() {
             if inflight_fetch() {
                 // The next merge may be of a flight in the air now, with
@@ -5026,7 +5032,7 @@ impl Host {
                             // of them; the copy into it has run, and it is not
                             // given out again before this landing is done.
                             let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-                            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                            let merged = crate::lazyback::merging(|| shadow.card_merge_relay(*lo, gpu, after, &mut title));
                             shadow.walls_merged(gpu.len(), merged);
                             sum += merged;
                         }
@@ -5043,7 +5049,7 @@ impl Host {
                 // SAFETY: the mapping of the fetched bytes, `total` of them;
                 // the copy into it has run.
                 let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                let merged = crate::lazyback::merging(|| shadow.card_merge_relay(*lo, gpu, after, &mut title));
                 shadow.walls_merged(gpu.len(), merged);
                 written += merged;
             }
@@ -5189,7 +5195,7 @@ impl Host {
             // SAFETY: inside the mapping of the slots (checked above); the
             // copy into it ran in the plan's flight, which the card has run.
             let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+            written += crate::lazyback::merging(|| shadow.card_merge_relay(*lo, gpu, *after, &mut title));
             bytes += (hi - lo) as u64;
         }
         for plan in plans {
@@ -7742,6 +7748,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    crate::lazyback::touched(if title_dst { dst as usize } else { src as usize }, len);
     // A title destination that is not all mapped is left alone. Asking
     // Windows first (`VirtualQuery`) walks the page tables to the end of
     // the destination's region: in the title's big blocks that is
@@ -7843,6 +7850,7 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    crate::lazyback::touched(src as usize, dst.len());
     // In place first, if asked for (`crate::plaincopy`): the destination is
     // memory of ours, as in `copy_mapped`.
     crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()) || read(src, dst.as_mut_ptr(), dst.len())
@@ -7891,6 +7899,7 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    crate::lazyback::touched(dst as usize, len);
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);

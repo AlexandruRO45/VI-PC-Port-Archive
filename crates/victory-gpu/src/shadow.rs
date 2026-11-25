@@ -3840,6 +3840,11 @@ impl Shadow {
         written
     }
 
+    /// Where the title buffer this copy is of starts in title memory.
+    pub(crate) fn title_start(&self) -> usize {
+        self.start as usize
+    }
+
     /// [`relay`], for a copy in the card's memory: `gpu` is what the
     /// card's side held at offset `at` on when a fetch sent after send
     /// `fetched_after` (`crate::host`'s order of the queue) ran, in a piece
