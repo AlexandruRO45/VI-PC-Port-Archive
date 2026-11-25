@@ -712,6 +712,16 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+/// A write the guards do not see went into title memory `[at, at + len)`
+/// with no [`Writing`] open for it, a view mapped while another write was
+/// under way: what it shows is marked changed, without keeping bytes (they
+/// are the write's, not what was there before it).
+pub fn title_memory_written(at: usize, len: usize) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut g = guards();
+    changed(&mut g, first, last, false);
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
@@ -1211,6 +1221,27 @@ pub(crate) mod tests {
         // SAFETY: a page of our pool, guarded: the handler opens it.
         unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(1) };
         assert!(copy.changed(p / PAGE + 1) && texture.changed(p / PAGE + 1), "a title write marks both");
+    }
+
+    /// A write reported after it happened marks the page changed but saves
+    /// nothing: the bytes there are the write's, not what it replaced.
+    #[test]
+    fn a_write_reported_after_the_fact_saves_nothing() {
+        let p = pool(1);
+        let t = track(p, PAGE, true).expect("tracked");
+        t.take(p, p + PAGE);
+        t.arm(p, p + PAGE);
+        // Armed and kept as it was before a write.
+        drop(writing(p, PAGE));
+        // SAFETY: a page of our pool, opened by the write above.
+        unsafe { (p as *mut u8).add(8).write_volatile(0x22) };
+        // Told after the write went through.
+        title_memory_written(p, PAGE);
+        assert!(t.changed(p / PAGE), "changed, so the copy refreshes");
+        let saved = t.saved(p / PAGE).expect("the bytes from before the write");
+        assert_eq!(saved[8], 0, "not the bytes the write left");
+        drop(t);
+        free(p);
     }
 
     /// A write or mapping that runs past the end of the address space (a
