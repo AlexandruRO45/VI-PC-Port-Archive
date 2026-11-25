@@ -54,6 +54,9 @@ pub(crate) struct Staging {
     /// of 1,120 textures in one frame of run 18.)
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
+    /// The memory was remapped and has not been read since while partly
+    /// mapped: that read does not wait its turn (see `refresh_timed`).
+    remapped: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
 }
@@ -144,6 +147,7 @@ pub(crate) fn remapped(at: usize, len: usize) {
         let (start, bytes) = staging.memory();
         if start.saturating_add(bytes) > at {
             staging.dirty.store(true, Relaxed);
+            staging.remapped.store(true, Relaxed);
         }
     }
 }
@@ -818,8 +822,10 @@ impl Staging {
             // shortcut: read again at most every 30 frames (reading around
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
+            // A remap is told of, so the read after one does not wait.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            let remapped = self.remapped.swap(false, std::sync::atomic::Ordering::Relaxed);
+            if !remapped && last.partial.is_some_and(|at| frame < at + 30) {
                 return 0;
             }
             last.partial = Some(frame);
@@ -1224,6 +1230,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
+        remapped: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
     });
     map.insert(resource as usize, s.clone());
@@ -1272,6 +1279,48 @@ mod remap_tests {
             assert!(staging.dirty.load(Relaxed), "a remap under the texture did not mark it");
         }
         // SAFETY: the allocation above, released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// A texture with only some of its pages mapped is read at most every 30
+    /// frames. A remap under it must not wait that out: the list uploading it
+    /// would copy the old texels (#574).
+    #[test]
+    fn a_remap_under_a_partly_mapped_texture_is_read_at_once() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE_RUN: usize = 0x1_0000;
+        // A linear 256x256 RGBA8 texture is four 64 KiB runs; only the first
+        // is committed.
+        // SAFETY: a private reservation of our own, released at the end.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE_RUN, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        // SAFETY: the first run of the reservation above.
+        assert!(!unsafe { VirtualAlloc(base, PAGE_RUN, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        let first_byte = base.cast::<u8>();
+        let description = [3, 0, 0, 0, 256, 0, 256, 0x1_0001, 28, 1, 0, 1, 0, 0];
+        let staged = crate::resource::texture_at(base as u64, &description).and_then(|resource| {
+            let host_texture = crate::resource::host_resource(resource)?;
+            super::staging(resource, host_texture)
+        });
+        // `None` means there is no GPU to make the host texture on: nothing
+        // to check then.
+        if let Some(staging) = staged {
+            // SAFETY: the staging buffer stays mapped while `staging` lives.
+            let uploaded_byte = || unsafe { staging.data.cast::<u8>().read_volatile() };
+
+            // SAFETY: committed memory.
+            unsafe { first_byte.write(0x11) };
+            staging.refresh();
+            assert_eq!(uploaded_byte(), 0x11, "the first read");
+
+            // The same frame: other memory is shown at these addresses.
+            // SAFETY: as above.
+            unsafe { first_byte.write(0x22) };
+            super::remapped(base as usize, PAGE_RUN);
+            staging.refresh();
+            assert_eq!(uploaded_byte(), 0x22, "the read after the remap waited");
+        }
+        // SAFETY: the reservation above, released once.
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 }
