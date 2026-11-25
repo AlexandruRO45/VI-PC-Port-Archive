@@ -43,8 +43,8 @@
 //! bytes. Where copies of the same title memory still differ (a buffer in
 //! place directly in the arena inside a resident, a resident made before a
 //! bigger one), what the card writes to one is merged into the arena and
-//! its pages go up to the others before the next submission
-//! ([`prepare`]).
+//! those bytes go up to the others before the next submission
+//! ([`prepare`], [`cross_mark`]).
 //!
 //! shortcut: as with copies in the card's memory, shaders are assumed to
 //! write only the ranges declared written; a write outside them stays in
@@ -254,8 +254,9 @@ static BYTES: AtomicU64 = AtomicU64::new(0);
 /// Since the last line: bytes that went up from arenas and their ranges;
 /// bytes the merge compared and its dispatches; bytes that went up again
 /// because another copy of the same memory was written; submissions that
-/// had work for residents.
-static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// had work for residents; of the bytes that went up again, those written
+/// in place (buffers and windows in arenas, not residents).
+static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// Since the start: windows in place handed a resident for being hot
 /// (`shadow::hot_window`); asks for a new resident that made none (not in
@@ -806,32 +807,44 @@ pub(crate) fn prepare(device: &ID3D12Device, completed: u64, declared: &[(Arc<Re
         out.merge = Some(close(&list, "the merge of residents"));
     }
     // What this submission writes reaches the arena by its end (in place,
-    // or merged); every other resident over it takes those pages again
+    // or merged); every other resident over it takes those bytes again
     // before the next submission (this one's upload is taken already).
     let mut written: Vec<(Option<&Resident>, u64, u64)> =
         merges.iter().flat_map(|m| m.ranges.iter().map(|&(a, b)| (Some(m.resident), m.resident.start + a, m.resident.start + b))).collect();
     written.extend(joined(in_place.to_vec()).into_iter().map(|(from, to)| (None, from, to)));
-    STATS[4].fetch_add(cross_mark(&live, &written), Ordering::Relaxed);
+    let [by_place, by_merge] = cross_mark(&live, &written);
+    STATS[4].fetch_add(by_place + by_merge, Ordering::Relaxed);
+    STATS[6].fetch_add(by_place, Ordering::Relaxed);
     if out.upload.is_some() || out.merge.is_some() {
         STATS[5].fetch_add(1, Ordering::Relaxed);
     }
     out
 }
 
+/// The unit in which what another copy wrote goes up to a resident
+/// ([`cross_mark`]): the shaders' declared ranges, widened to it.
+const MARK: u64 = 256;
+
 /// Title ranges `written` (each with the resident whose merge writes it,
 /// or none: written in place) go up again to every other resident of
-/// `live` that holds some of them, by whole pages. Returns the bytes.
-fn cross_mark(live: &[Arc<Resident>], written: &[(Option<&Resident>, u64, u64)]) -> u64 {
-    let mut marked = 0;
+/// `live` that holds some of them, on [`MARK`] bytes. The title wrote none
+/// of it (what it writes goes up by whole pages, [`Resident::refresh`]):
+/// only the bytes the other copy's shaders may have written differ, so
+/// whole pages would send up again what the resident holds already (run
+/// inplace4-s2: 196 MB a frame marked, of 202 MB that went up). Returns
+/// the bytes, marked after writes in place and after merges of other
+/// residents.
+fn cross_mark(live: &[Arc<Resident>], written: &[(Option<&Resident>, u64, u64)]) -> [u64; 2] {
+    let mut marked = [0; 2];
     for &(writer, from, to) in written {
         for other in live {
             if writer.is_some_and(|w| std::ptr::eq(w, &**other)) || !other.overlaps(from, to) {
                 continue;
             }
-            let a = (from.max(other.start) - other.start) & !(PAGE - 1);
-            let b = (to.min(other.start + other.len) - other.start).next_multiple_of(PAGE);
+            let a = (from.max(other.start) - other.start) & !(MARK - 1);
+            let b = (to.min(other.start + other.len) - other.start).next_multiple_of(MARK).min(other.len);
             other.mark(a, b);
-            marked += b - a;
+            marked[usize::from(writer.is_some())] += b - a;
         }
     }
     marked
@@ -882,7 +895,8 @@ pub(crate) fn line(frames: f64) {
         "residents (VICTORY_INPLACE=4): {alive} alive, {} MB in the card's memory and {} MB of twins (budget {} MB); per frame: \
          {:.1} MB uploaded from arenas in {:.0} ranges, {:.1} MB compared in {:.0} merge passes, {:.2} MB merged into arenas \
          ({:.0} partial dwords), {:.1} MB marked to go up again after writes through other copies, {:.1} submissions with work for residents; \
-         since the start {} hot windows in place handed residents and {} asks for a new resident turned down (not in an arena, or over a budget)",
+         since the start {} hot windows in place handed residents and {} asks for a new resident turned down (not in an arena, or over a budget); \
+         of the bytes marked per frame, {:.1} MB after writes in place and {:.1} MB after merges of other residents over the same memory",
         bytes >> 20,
         bytes >> 20,
         most() >> 20,
@@ -896,6 +910,8 @@ pub(crate) fn line(frames: f64) {
         s[5],
         HOT[0].load(Ordering::Relaxed),
         HOT[1].load(Ordering::Relaxed),
+        mb(s[6]),
+        mb((s[4] - s[6]).max(0.0)),
     );
 }
 
@@ -1249,12 +1265,16 @@ mod tests {
         let _ = (outer.take(), other.take());
         let live = [outer.clone(), other.clone()];
         let marked = cross_mark(&live, &[(Some(&*outer), start + k + 8, start + k + 16)]);
-        assert_eq!(marked, k);
-        assert_eq!(other.take(), [(k, 2 * k)], "the page goes up to the other copy");
+        assert_eq!(marked, [0, MARK]);
+        assert_eq!(other.take(), [(k, k + MARK)], "the bytes written go up to the other copy, not their page");
         assert_eq!(outer.take(), [], "not to the one that wrote it");
-        // Written in place (no resident): up to both.
-        assert_eq!(cross_mark(&live, &[(None, start + 3 * k, start + 3 * k + 1)]), 2 * k);
-        assert_eq!(outer.take(), [(3 * k, n)]);
+        // Written in place (no resident): up to both; a range across the
+        // unit's line takes both units.
+        assert_eq!(cross_mark(&live, &[(None, start + 3 * k + MARK - 4, start + 3 * k + MARK + 4)]), [4 * MARK, 0]);
+        assert_eq!(outer.take(), [(3 * k, 3 * k + 2 * MARK)]);
+        // At the resident's end: not past it.
+        assert_eq!(cross_mark(&live, &[(None, start + n - 8, start + n + 8)]), [2 * MARK, 0]);
+        assert_eq!(other.take(), [(3 * k, 3 * k + 2 * MARK), (n - MARK, n)]);
         forget(start, start + 1, false);
         assert!(holder(start, start + k).is_none(), "forgotten when let go");
         drop((outer, inner, other, live));
@@ -1293,8 +1313,8 @@ mod tests {
         // Written through the new one: the page goes up to a replaced one.
         let live = [all.clone(), inner.clone()];
         let _ = (all.take(), inner.take());
-        assert_eq!(cross_mark(&live, &[(Some(&*all), start + k + 4, start + k + 8)]), k);
-        assert_eq!(inner.take(), [(0, k)]);
+        assert_eq!(cross_mark(&live, &[(Some(&*all), start + k + 4, start + k + 8)]), [0, MARK]);
+        assert_eq!(inner.take(), [(0, MARK)]);
         forget(start, start + 8 * k, false);
         drop((inner, right, outer, all, live, replaced));
     }
