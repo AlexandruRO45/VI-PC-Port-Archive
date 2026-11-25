@@ -9,8 +9,8 @@ pub(super) const READ_LANE: u32 = 0x7ff2;
 // partner, and do not let the approximate single-lane retry erase it.
 pub(super) const DPP8_EXCHANGE: u32 = 0x7fe7;
 
-/// Prove a full-EXEC, single 32-thread group (also valid as a partial
-/// wave64), or a 64-thread group with only within-octet exchanges.
+/// Prove full-EXEC straight-line within-octet exchanges in complete
+/// 32-thread blocks, including groups containing multiple waves.
 /// No branch, EXEC modification, early return, LDS or unknown operands.
 /// Static descriptor loads and a single terminal store can be admitted;
 /// the main emitter still resolves their resource and address metadata.
@@ -20,7 +20,7 @@ pub(super) const DPP8_EXCHANGE: u32 = 0x7fe7;
 /// only allowed at 32 threads where wave32/wave64 agree for lanes 0..31.
 pub(super) fn straight_exchange(insns: &mut [Insn], group: [u32; 3]) -> bool {
     let Some(lanes) = group.into_iter().try_fold(1u32, u32::checked_mul) else { return false; };
-    if !matches!(lanes, 32 | 64) || insns.len() > 4096
+    if !(32..=1024).contains(&lanes) || lanes % 32 != 0 || group[2] > 64 || insns.len() > 4096
         || insns.last().is_none_or(|i| i.mnemonic != "s_endpgm")
     { return false; }
     let mut found = false;
@@ -913,11 +913,20 @@ pub(super) fn portable_single_wave(insns: &[Insn]) -> bool {
 }
 
 /// The native compute local IDs are x-fast, then y, then z. A group-shared
-/// exchange indexes the whole logical wave, not the x coordinate alone.
+/// exchange indexes the whole workgroup, not the x coordinate alone.
 pub(super) fn portable_lane_id(group: [u32; 3]) -> String {
     let [x, y, z] = group;
     if y == 1 && z == 1 { "gtid.x".into() }
     else { format!("(gtid.x + {x}u * (gtid.y + {y}u * gtid.z))") }
+}
+
+/// Reserve enough shared slots for every invocation. The larger allocation
+/// is used only by the proven straight-line DPP8 path; a group-wide barrier
+/// must not be introduced into independently diverging guest waves.
+pub(super) fn portable_declarations(group: [u32; 3]) -> String {
+    let lanes = group.into_iter().product::<u32>();
+    if lanes <= 64 { PORTABLE_DECLARATIONS.to_owned() }
+    else { PORTABLE_DECLARATIONS.replace("tb_reduction_lanes[64]", &format!("tb_reduction_lanes[{lanes}]")) }
 }
 
 // A second barrier prevents a fast host subgroup from overwriting a slot

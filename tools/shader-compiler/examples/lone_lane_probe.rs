@@ -17,12 +17,13 @@ fn main() {
     let rhs = u32::from_str_radix(&args[6],16).unwrap();
     let fi = args.get(7).map(|s| s.parse::<u32>().unwrap()).unwrap_or(0);
     assert!(fi <= 1);
-    let (mut ex, _, _) = fixture::shader(width);
+    let (mut ex, _, _) = fixture::shader(if width == 32 { 32 } else { 64 });
     let group: Vec<u32> = args.iter().skip(8).map(|s| s.parse().expect("group dimension")).collect();
     let group: [u32; 3] = if group.is_empty() { [width, 1, 1] }
         else { group.try_into().expect("three group dimensions") };
     assert_eq!(group.into_iter().try_fold(1u32, u32::checked_mul), Some(width));
     assert!(group.into_iter().all(u32::is_power_of_two));
+    assert!((32..=1024).contains(&width) && width % 32 == 0 && group[2] <= 64);
     ex.psv_threads = Some(group);
     // s_load_dwordx4 s[16:19],s[4:5],0; XOR lane with bias;
     // materialize independent second operand; DPP8 v4,v2,v1.

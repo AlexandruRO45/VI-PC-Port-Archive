@@ -61,6 +61,9 @@ CHECKS = {
     **{f"dpp8-exchange-{layout}": Check("check_dpp8_exchange", emitter="lone_lane_probe", dxc=True,
                                        extra=("--layout", layout))
        for layout in ("2d", "3d")},
+    **{f"dpp8-multiwave-{layout}": Check("check_dpp8_exchange", emitter="lone_lane_probe", dxc=True,
+                                        extra=("--layout", layout, "--multiwave"))
+       for layout in ("linear", "2d", "3d")},
     "pixel-heap-offsets": Check("check_pixel_heap_offsets", emitter="pixel_heap_offsets", dxc=True),
     "pixel-link": Check("check_portable_pixel_link", emitter="xshader", dxc=True),
     "pixel-link-slot86": Check("check_slot86_portable_link", emitter="xshader", dxc=True),
