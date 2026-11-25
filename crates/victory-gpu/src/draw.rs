@@ -2265,7 +2265,7 @@ impl State {
     /// not decoded here).
     ///
     /// Where the slots are, for the title's character shaders
-    /// (`PS_DeferredPedTexturedNC`, from their native code): in the small
+    /// (a deferred character pixel shader, from its native code): in the small
     /// buffers and constants of the draw's own table (every word of those
     /// that names a texture view gets a line); in the material record, at
     /// the byte offset the draw's constants (table 1, dword 56) hold at

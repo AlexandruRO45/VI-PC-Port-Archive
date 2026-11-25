@@ -476,7 +476,7 @@ fn local_waves_select_their_console_bits_from_a_constant_mask() {
 /// A 32-lane console wave. A register holds a lane mask on one path (the lanes below s0)
 /// and a number on the other, and is read as a number after the join, as the trace programs
 /// keep their lanes' masks and their node numbers on one stack
-/// (`deferred_tiled:CS_LaserLightShadowRaytracing`, s46 at 0x104, 0x75c and 0x188). The
+/// (a tiled laser-light shadow program, s46 at 0x104, 0x75c and 0x188). The
 /// mask arrives as the ballot of its lanes.
 #[test]
 fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {

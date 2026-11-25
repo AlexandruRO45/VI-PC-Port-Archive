@@ -540,7 +540,7 @@ fn a_descriptor_only_read_as_data_gives_its_views_size() {
 }
 
 /// Entry 0's buffer descriptor read only for its record count (dword 2), as
-/// `ShallowWaterSim:CS_MinTimestepReduce` (ceb5eb68cd99cb07) tests it before anything
+/// the shallow-water simulation's timestep reduction (ceb5eb68cd99cb07) tests it before anything
 /// reads the buffer: each lane stores the count, none if it is 0.
 const RECORDS_ONLY_WAVE32: &[u32] = &[
     0xBE84_0300, // s_mov_b32 s4, s0

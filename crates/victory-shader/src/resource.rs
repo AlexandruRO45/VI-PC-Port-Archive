@@ -2634,7 +2634,7 @@ pub(crate) mod tests {
     }
 
     /// Two paths add an index to one table in the code and meet before one load
-    /// (hair `CS_InterpolateStrands`): the join is the computed term, counted
+    /// (a hair strand interpolation program): the join is the computed term, counted
     /// from the `s_getpc_b64`.
     #[test]
     fn two_paths_into_one_code_table_load() {

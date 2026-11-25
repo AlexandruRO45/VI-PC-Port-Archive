@@ -998,7 +998,7 @@ fn decided(
 /// leaves such a loop with its last running lane; a host lane outside EXEC
 /// decides by its own bit and goes round until the lowering's limit, and past
 /// it runs what follows the loop with no guard (c4183d3c,
-/// CS_ProjDecalResolve_Vectorized: `s_andn2_b64 vcc, exec, vcc`, `s_cbranch_vccz`
+/// A projected-decal resolve program (c4183d3c): `s_andn2_b64 vcc, exec, vcc`, `s_cbranch_vccz`
 /// back). A branch on a scalar counts as a way out.
 fn spins_with_empty_exec(
     p: &Program,
@@ -2217,7 +2217,7 @@ mod tests {
     }
 
     /// The wave sum the console compiler puts behind a bounds test
-    /// (b22a16a178976e1b, CS_TransposeVecMatMulAlignedOperation): EXEC opened
+    /// (b22a16a178976e1b, a matrix transpose-multiply program): EXEC opened
     /// to the whole wave, a masked input summed, and EXEC put back from the
     /// mask saved while it was clear. Only registers change in that window, so
     /// the early-out can go. A store inside it, or a window still open where
@@ -2413,7 +2413,7 @@ mod tests {
     }
 
     /// A prefix sum over the wave narrows its whole-wave window with constants
-    /// (bad01f53, CS_MaterialTilesInitial: rows 1 and 3, then every lane
+    /// (bad01f53, a material tile setup program: rows 1 and 3, then every lane
     /// again). That still writes registers only, so the early-out can go. A
     /// mask from a register or from SCC there keeps it.
     #[test]
@@ -2452,7 +2452,7 @@ mod tests {
     }
 
     /// A loop that goes on "while no running lane wants out" behind an
-    /// early-out (c4183d3c, CS_ProjDecalResolve_Vectorized). EXEC stays clear
+    /// early-out (c4183d3c, a projected-decal resolve program). EXEC stays clear
     /// in it, but a host lane decides `s_cbranch_vccz` by its own bit: outside
     /// EXEC it never leaves, counts to the lowering's limit and runs the store
     /// after the loop. The early-out stays; with a way out on a scalar the

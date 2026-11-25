@@ -1075,7 +1075,7 @@ mod tests {
     }
 
     /// `WaveActiveSum` of 16-bit floats, as compiled in
-    /// `compute_graph_ops:CS_TransposeVecMatMulAlignedOperation` (0x19c on): the tree the
+    /// A matrix transpose-multiply program (0x19c on): the tree the
     /// lowering reproduces. A tree in another order is not followed.
     #[test]
     fn a_sum_of_halves_over_the_wave_is_followed_in_the_order_of_its_tree() {
