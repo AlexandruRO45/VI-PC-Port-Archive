@@ -1600,29 +1600,6 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_readings_keep_held_keys_in_press_order() {
-        let (hub, host) = fake();
-        let poll = |down: &[u8], expected: &[u8]| {
-            host.lock().unwrap().keys = down.iter().copied().map(key).collect();
-            hub.poll();
-            let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
-            let mut got = [KeyState::default(); 4];
-            let n = key_state(r, 4, got.as_mut_ptr()) as usize;
-            let actual: Vec<_> = got[..n].iter().map(|k| k.virtual_key).collect();
-            let sequence = sequence_number(r, KEYBOARD_KIND);
-            release(r);
-            assert_eq!(actual, expected);
-            sequence
-        };
-        poll(b"W", b"W");
-        let wa = poll(b"AW", b"WA");
-        assert_eq!(poll(b"WA", b"WA"), wa);
-        poll(b"ADW", b"WAD");
-        poll(b"AD", b"AD");
-        poll(b"ADW", b"ADW");
-    }
-
-    #[test]
     fn keys_feed_the_keyboard_and_the_stand_in_pad() {
         let (hub, host) = fake();
         let log = Log::default();
@@ -1656,6 +1633,53 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn keyboard_readings_keep_held_keys_in_press_order() {
+        let (hub, host) = fake();
+        let poll = |down: &[u8]| {
+            host.lock().unwrap().keys = down.iter().copied().map(key).collect();
+            hub.poll();
+            current(hub, KEYBOARD_KIND, KEYBOARD).unwrap()
+        };
+        let read_keys = |reading, capacity| {
+            let state =
+                slot::<extern "system" fn(*const Reading, u32, *mut KeyState) -> u32, _>(
+                    reading, 0x78,
+                );
+            let mut keys = [KeyState::default(); 3];
+            let count = state(reading, capacity, keys.as_mut_ptr()) as usize;
+            keys[..count]
+                .iter()
+                .map(|key| key.virtual_key)
+                .collect::<Vec<_>>()
+        };
+        let sequence = |reading| {
+            let get = slot::<extern "system" fn(*const Reading, u32) -> u64, _>(reading, 0x20);
+            get(reading, KEYBOARD_KIND)
+        };
+
+        let w = poll(b"W");
+        let wa = poll(b"AW");
+        let reordered = poll(b"WA");
+        let wad = poll(b"ADW");
+        let ad = poll(b"AD");
+        let adw = poll(b"ADW");
+
+        assert_ne!(sequence(w), sequence(wa));
+        assert_eq!(sequence(reordered), sequence(wa));
+        // Retained readings keep their original key state even after later polls.
+        assert_eq!(read_keys(w, 3), b"W");
+        assert_eq!(read_keys(wa, 3), b"WA");
+        assert_eq!(read_keys(wad, 3), b"WAD");
+        assert_eq!(read_keys(wad, 2), b"WA");
+        assert_eq!(read_keys(ad, 3), b"AD");
+        assert_eq!(read_keys(adw, 3), b"ADW");
+
+        for reading in [w, wa, reordered, wad, ad, adw] {
+            release(reading);
+        }
     }
 
     #[test]
