@@ -28,6 +28,11 @@ const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
         | src0 as u32
 }
 
+/// SOP1 `op sdst, src0`.
+const fn sop1(op: u8, sdst: u8, src0: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | src0 as u32
+}
+
 /// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], 0` (soffset = null).
 const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
     [
@@ -978,6 +983,48 @@ fn v_cvt_f16_u16_and_i16_widen_the_integer_first() {
             );
         });
     }
+}
+
+#[test]
+fn s_logic_not_and_ashr_b32_match_rdna2() {
+    // s_<op> s6, s0, s1 (SOP2); v_mov_b32 v0, s6.
+    type Pick = fn(u32, u32) -> u32;
+    let ops: [(&str, u8, Pick); 8] = [
+        ("s_and_b32", 0x0e, |a, b| a & b),
+        ("s_xor_b32", 0x12, |a, b| a ^ b),
+        ("s_andn2_b32", 0x14, |a, b| a & !b),
+        ("s_orn2_b32", 0x16, |a, b| a | !b),
+        ("s_nand_b32", 0x18, |a, b| !(a & b)),
+        ("s_nor_b32", 0x1a, |a, b| !(a | b)),
+        ("s_xnor_b32", 0x1c, |a, b| !(a ^ b)),
+        // The shift amount is the low five bits of the second operand.
+        ("s_ashr_i32", 0x22, |a, b| ((a as i32) >> (b & 31)) as u32),
+    ];
+    let values = [0u32, 1, 31, 32, 0xF0F0_F0F0, 0x8000_0001, 0xFFFF_FFFF];
+    let mut cases = Vec::new();
+    for a in values {
+        for b in values {
+            cases.push([a, b, 0, 0]);
+        }
+    }
+    for (name, op, pick) in ops {
+        let shader = build_valu_cs(&[sop2(op, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let want = pick(inp[0], inp[1]);
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1],
+            );
+        });
+    }
+
+    // s_not_b32 s6, s0 (SOP1 0x07).
+    let not = build_valu_cs(&[sop1(0x07, 6, 0), vop1(0x001, 0, sgpr(6))]);
+    let cases: Vec<[u32; 4]> = values.iter().map(|&v| [v, 0, 0, 0]).collect();
+    run_cases(&not, &cases, |backend, _, inp, got| {
+        assert_eq!(got, !inp[0], "{backend}: s_not_b32({:#010x})", inp[0]);
+    });
 }
 
 #[test]
