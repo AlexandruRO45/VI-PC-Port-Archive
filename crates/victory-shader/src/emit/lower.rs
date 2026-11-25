@@ -88,6 +88,11 @@ enum Stop {
     Fail(ShaderError),
 }
 
+fn full_wave32_groups(native: &NativeProgram) -> bool {
+    !native.wave64
+        && matches!(&native.io, StageIo::Cs(cs) if cs.threads.iter().product::<u32>().is_multiple_of(32))
+}
+
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let result = lower_mode(parts, false);
     if let Err(ShaderError::Unsupported { what, .. }) = &result
@@ -100,9 +105,7 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
                 | "v_permlanex16_b32"
                 | VIEW_BASE
         )
-        && let StageIo::Cs(cs) = &parts.native.io
-        && !parts.native.wave64
-        && cs.threads.iter().product::<u32>().is_multiple_of(32)
+        && full_wave32_groups(parts.native)
     {
         let st = crate::structure::wave32(parts.p)?;
         return lower_mode(
@@ -4241,12 +4244,11 @@ impl<'a> Lower<'a> {
                         if self.whole_wave && rel == 0 {
                             self.descriptor_bases.insert(v, (site, first, c));
                         }
-                        let why =
-                            if rel == 0 && !self.x.p.wave64 && self.x.native.stage == HwStage::Cs {
-                                VIEW_BASE
-                            } else {
-                                OTHER
-                            };
+                        let why = if rel == 0 && full_wave32_groups(self.x.native) {
+                            VIEW_BASE
+                        } else {
+                            OTHER
+                        };
                         self.vals.insert(v, Val::Missing(why));
                     }
                 }
