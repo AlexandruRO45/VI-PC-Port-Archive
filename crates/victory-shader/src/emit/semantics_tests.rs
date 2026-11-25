@@ -2585,6 +2585,12 @@ fn scalar_probes() -> Vec<Probe> {
         sop2_probe(0x35, ab.clone(), |a, b| {
             (((u64::from(a) * u64::from(b)) >> 32) as u32, None)
         }),
+        sop2_probe(0x36, ab.clone(), |a, b| {
+            (
+                ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32,
+                None,
+            )
+        }),
         // SCC: whether the first operand was chosen (RDNA2 ISA S_MIN/S_MAX).
         sop2_probe(0x07, ab.clone(), |a, b| (a.min(b), Some(a < b)))
             .shows(SCC_MIN_MAX, |i| (i[0] < i[1]) != (i[0].min(i[1]) != 0)),
