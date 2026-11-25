@@ -955,6 +955,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
+        if crate::compute::under_wine() {
+            eprintln!("Wine's shader compiler has no shader model 5.1 resource arrays. Skipping.");
+            return;
+        }
         let (root, pso) = pipeline(SOURCE, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 3);
         let (out, at) = host.shared_buffer(256).unwrap();
         // SAFETY: a live buffer.
@@ -1080,6 +1084,10 @@ void main() {
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
+        if crate::compute::under_wine() {
+            eprintln!("Wine's shader compiler has no shader model 5.1 resource arrays. Skipping.");
+            return;
+        }
         let write = pipeline(WRITE, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 5);
         let ((write_root, writer), (read_root, reader)) = (
             write,
