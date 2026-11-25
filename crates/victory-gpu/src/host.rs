@@ -1275,7 +1275,11 @@ pub(crate) fn parse_env_flag(value: Option<&std::ffi::OsStr>) -> bool {
 }
 
 /// Whether the opt-in boolean environment variable `name` is enabled.
-pub(crate) fn env_flag(name: &str) -> bool {
+///
+/// Re-exported crate-wide so the rest of the tree ([`crate::env_flag`]) asks
+/// the same question `0`, `false`, `no` and `off` the same way, instead of
+/// `var_os(..).is_some()` answering only "was it set at all".
+pub fn env_flag(name: &str) -> bool {
     parse_env_flag(std::env::var_os(name).as_deref())
 }
 
