@@ -41,6 +41,9 @@ struct Reused {
     event: HANDLE,
     /// The fence value of the last dispatch.
     value: u64,
+    /// A recording has begun and its fence has not been waited for: the
+    /// allocator is in use and the list is open, so neither may be reset.
+    recording: std::cell::Cell<bool>,
 }
 
 #[cfg(test)]
@@ -68,6 +71,7 @@ impl Reused {
                 fence: dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?,
                 event: CreateEventW(None, false, false, None).map_err(err)?,
                 value: 0,
+                recording: std::cell::Cell::new(false),
             })
         }
     }
@@ -1502,6 +1506,12 @@ impl Host {
         let _guard = self.lock_warp();
         let dev = &self.device;
         let mut reused = self.reused.lock().unwrap_or_else(|e| e.into_inner());
+        // A dispatch that failed between `Reset` and its fence left the list
+        // recording and the allocator in use: make new ones rather than fail
+        // every later dispatch with a second, misleading error.
+        if reused.as_ref().is_some_and(|r| r.recording.get()) {
+            *reused = None;
+        }
         if reused.is_none() {
             *reused = Some(Reused::new(dev)?);
         }
@@ -1512,6 +1522,10 @@ impl Host {
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
         unsafe {
+            // Free the memory of the previous recording; its fence was waited
+            // for, and a dispatch that did not wait is dropped above.
+            r.alloc.Reset().map_err(err)?;
+            r.recording.set(true);
             list.Reset(&r.alloc, pso).map_err(err)?;
             let make = |heap: D3D12_HEAP_TYPE, desc: &D3D12_RESOURCE_DESC, state| {
                 let mut r: Option<ID3D12Resource> = None;
@@ -2081,6 +2095,7 @@ impl Host {
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             queue.Signal(fence, value).map_err(err)?;
             wait(r.event, fence, dev, value)?;
+            r.recording.set(false);
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {
                 let mut p = std::ptr::null_mut();
