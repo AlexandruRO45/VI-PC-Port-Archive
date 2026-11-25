@@ -1468,9 +1468,9 @@ impl State {
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
         // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
+        // at best), with a sixteenth of all of them in turn, because a view
+        // of a released resource goes stale without a write, and a slot
+        // written before its memory had a host copy is only made then.
         let (slots, mut kept) = host.buffers.begin_pass();
         let ranges = &mut kept.by_slot;
         // Whether the device was there before the pass: a view that removes
@@ -1562,7 +1562,9 @@ impl State {
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
-        // The first pass and every growth of the set by half.
+        // The first pass and every growth of the set by half. (After a
+        // heap's first pass, `slots` is a pass's share: those written since
+        // and a sixteenth of all.)
         let seen = LOGGED.load(Ordering::Relaxed);
         if u64::from(views) > seen + seen / 2 {
             LOGGED.store(u64::from(views), Ordering::Relaxed);

@@ -17,6 +17,8 @@ use crate::host::host;
 
 pub(crate) struct BufferRanges<T> {
     passes: u64,
+    /// Where the next pass's share of all slots starts (a title slot).
+    cursor: u32,
     pub(crate) by_slot: std::collections::HashMap<u32, (T, u64, u64)>,
 }
 
@@ -35,6 +37,7 @@ impl<T> BufferViews<T> {
             changed: Mutex::default(),
             ranges: Mutex::new(BufferRanges {
                 passes: 0,
+                cursor: 0,
                 by_slot: Default::default(),
             }),
         }
@@ -55,19 +58,36 @@ impl<T> BufferViews<T> {
 
     pub(crate) fn begin_pass(&self) -> (Vec<u32>, std::sync::MutexGuard<'_, BufferRanges<T>>) {
         let mut kept = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
+        // Its own statement: `written` locks `slots`, then `changed`.
         let changed = std::mem::take(&mut *self.changed.lock().unwrap_or_else(|e| e.into_inner()));
-        // A view may go stale without a write. Revisit all slots in a
-        // fresh heap and every 16 passes thereafter.
-        let slots = if kept.passes.is_multiple_of(16) {
+        // A view may go stale without a write. All slots are revisited in a
+        // fresh heap; after that, each pass revisits the next sixteenth of
+        // them in turn (each slot about every 16 passes; a little later
+        // while slots are added ahead of the turn), with the slots written
+        // since. It was all of them every 16th pass: 70,000 slots, some
+        // 73 ms of one frame in 16 on the thread recording the title's list,
+        // where the others took under 2 ms. The entries the pass keeps stay:
+        // it drops each slot's own before making it again.
+        let all = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let slots = if kept.passes == 0 {
             kept.by_slot.clear();
-            self.slots
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .copied()
-                .collect()
+            all.iter().copied().collect()
         } else {
-            changed.into_iter().collect()
+            let cursor = kept.cursor;
+            let mut slots: Vec<u32> = all
+                .range(cursor..)
+                .chain(all.range(..cursor))
+                .take(all.len().div_ceil(16))
+                .copied()
+                .collect();
+            drop(all);
+            if let Some(&last) = slots.last() {
+                kept.cursor = last.wrapping_add(1);
+            }
+            slots.extend(changed);
+            slots.sort_unstable();
+            slots.dedup();
+            slots
         };
         kept.passes = kept.passes.wrapping_add(1);
         (slots, kept)
@@ -2591,14 +2611,20 @@ mod tests {
         let weak = Arc::downgrade(&shadow);
         pass.by_slot.insert(7, (shadow, 16, 48));
         drop(pass);
-        for _ in 1..16 {
+        // After the first pass, the slots written since and a sixteenth of
+        // all in turn: each slot again within 16 passes. The pass's entries
+        // stay until a pass revisits their slot (it drops each before making
+        // it again).
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 1..=16 {
             views.written(3, true);
-            assert_eq!(views.begin_pass().0, [3]);
-            assert!(weak.upgrade().is_some());
+            let (slots, _pass) = views.begin_pass();
+            assert!(slots.contains(&3));
+            seen.extend(slots);
         }
-        let (slots, mut pass) = views.begin_pass();
-        assert_eq!(slots, [3, 7]);
-        assert!(weak.upgrade().is_none());
+        assert_eq!(seen, std::collections::BTreeSet::from([3, 7]));
+        assert!(weak.upgrade().is_some());
+        let (_, mut pass) = views.begin_pass();
 
         let shadow = Arc::new(());
         let weak = Arc::downgrade(&shadow);
