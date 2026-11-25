@@ -62,7 +62,10 @@ fn program() -> HostShader {
     let mut w = vec![s_mov_b32(5, 0x80)]; // s[4:5]: the table at s4
     w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
     w.push(v_mov_b32(1, ZERO));
-    w.extend(global(10, 2, 1, 0, 0, 3)); // global_load_ushort across dwords
+    w.extend(global(12, 2, 1, 0, 0, 0)); // global_load_dword v2, v1, s[0:1]
+    // global_load_ushort v10, v1, s[0:1] offset:3: the halfword straddles
+    // the first and second dwords of the copy.
+    w.extend(global(10, 10, 1, 0, 0, 3));
     w.extend(s_load(1, 12, 0, 8)); // s[12:13] = the pointer at +8
     w.push(S_WAITCNT_ALL);
     w.extend(s_load(0, 14, 12, 0)); // s14 = what it points at
@@ -104,11 +107,12 @@ fn program() -> HostShader {
     w.extend(global(12, 9, 1, 0, 6, 0x24)); // global_load_dword v9, v1, s[6:7]
     w.push(S_WAITCNT_ALL);
     w.extend(buffer_store_dword(9, 8, 20));
+    w.extend(buffer_store_dword(10, 8, 24));
     w.push(S_ENDPGM);
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
-        vgprs: 10,
+        vgprs: 11,
         layout: vec![
             RootParam {
                 root: RootType::Constants,
@@ -167,7 +171,7 @@ fn program() -> HostShader {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let memory = res.scalar.iter().filter(|s| s.1.param == resource::MEMORY).count();
-    assert_eq!(memory, 11, "every access through the pointer is title memory");
+    assert_eq!(memory, 12, "every access through the pointer is title memory");
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
         native: &native,
@@ -276,7 +280,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                             (3, Root::View { srv: true, data: view_addresses.clone() }),
                         ],
                         views: &[
-                            View::RawUav(6),
+                            View::RawUav(7),
                             View::Memory(&memory),
                             View::Pair,
                             View::NullPair,
@@ -289,15 +293,8 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(
                 out[0],
-                [
-                    0xAB11,
-                    0x2222_2222,
-                    0x2222_2222,
-                    0,
-                    0,
-                    0x3333_3333,
-                ],
-                "{label}: reads"
+                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333, 0xAB11],
+                "{label}: reads (the dword at 0, and the halfword at 3 across two dwords)"
             );
             assert_eq!(out[1][0x40 / 4], value, "{label}: the store");
             assert_eq!(out[1][(0x200 + 0x20) / 4], value, "{label}: the root UAV store");

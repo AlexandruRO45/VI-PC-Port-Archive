@@ -803,6 +803,10 @@ impl<'a> Lower<'a> {
                     let sh = self.s.m.bin(c, Bin::Shl, byte, three);
                     let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
                     if width == 16 && (a.param == MEMORY || a.dynamic.is_some() || a.offset & 3 == 3) {
+                        // assumption: the console runs SH_MEM_CONFIG.alignment_mode
+                        // UNALIGNED (RDNA 2 guide, 8.1.7), so a halfword at an odd
+                        // address reads bytes 3 and 4. In DWORD mode it would read
+                        // bytes 2 and 3. Nothing public settles which mode applies.
                         // A 16-bit load at byte offset 3 mod 4 takes its high
                         // byte from the next dword; guard dynamic offsets so
                         // non-straddling loads never read past a buffer's end.
