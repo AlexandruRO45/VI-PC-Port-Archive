@@ -65,6 +65,14 @@ fn program(whole: bool) -> Vec<u32> {
 }
 
 fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    let native = native(words);
+    let lowered = lowered(&native)?;
+    host_shader(lowered)
+}
+
+/// The program `words` as a wave32 compute program of 32 threads, with
+/// the resources of [`program`]'s table at s0.
+fn native(words: &[u32]) -> NativeProgram {
     let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
         root: RootType::Table,
@@ -75,7 +83,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         user_data: 0,
         slot: 0,
     };
-    let native = NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 32,
@@ -97,8 +105,10 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
             threads: [32, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
-    let lowered = lowered(&native)?;
+    }
+}
+
+fn host_shader(lowered: lower::Lowered) -> Result<HostShader, crate::ShaderError> {
     Ok(HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -356,6 +366,43 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         assert_eq!(out[0], want, "{label}");
+    }
+}
+
+/// A loop that does not end (its counter wraps after 2^32 passes) is left
+/// at the loop limit; with loop cuts on (`emit`, "Loop cuts") the lanes
+/// that leave there add one to the counter `u2` in the memory space, and
+/// nothing else changes. Off, the program has no atomic at all.
+#[test]
+fn a_loop_left_at_the_limit_counts_its_lanes_only_when_asked() {
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0x8007_8107, // header: s_add_u32 s7, s7, 1
+        0xBF07_8007, // s_cmp_lg_u32 s7, 0
+        0xBF85_FFFD, // s_cbranch_scc1 header
+        0x7E06_0207, // v_mov_b32 v3, s7
+        0xE070_1000,
+        0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let native = native(&words);
+    let off = lowered(&native).expect("lower");
+    assert_eq!(off.atomics, 0, "no counter without loop cuts");
+    super::TEST_LOOP_CUTS.with(|c| c.set(true));
+    let on = lowered(&native);
+    super::TEST_LOOP_CUTS.with(|c| c.set(false));
+    let on = on.expect("lower with loop cuts");
+    assert_eq!(on.atomics, 1, "one add, guarded by the cut on the back edge");
+    let shader = host_shader(on).expect("host shader");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
     }
 }
 
