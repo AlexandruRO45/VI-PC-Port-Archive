@@ -1831,11 +1831,12 @@ pub(crate) mod tests {
         let handle = 0xdead_beef_0001usize;
         title_memory_section(handle, 64 * K64 as u64, true);
         assert!(section_committed(handle));
-        title_memory_section_gone(handle);
+        section_gone(handle);
         assert!(!section_committed(handle));
     }
 
     #[test]
+    #[ignore = "#772 refuses heaps opened by a section's handle (commit kept until restart on NVIDIA); run with VICTORY_ALLOW_SECTION_HEAPS=1"]
     fn warp_committed_section_places_read_only_and_writable_and_promotes() {
         let Some(device) = warp() else { return };
         const SIZE: usize = 4 * K64;
@@ -1847,7 +1848,7 @@ pub(crate) mod tests {
             assert!(!reserved.is_null());
             title_memory_section(reserved as usize, SIZE as u64, false);
             assert!(matches!(place_section(&device, reserved as usize, 0, 0, K64 as u64, false), Err(None)));
-            title_memory_section_gone(reserved as usize);
+            section_gone(reserved as usize);
             windows_sys::Win32::Foundation::CloseHandle(reserved);
 
             let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, SIZE as u32, std::ptr::null());
@@ -1881,7 +1882,7 @@ pub(crate) mod tests {
                 rw.buffer.GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                 D3D12_RESOURCE_FLAGS(0)
             );
-            assert_eq!(ro.heap, rw.heap, "section heap is opened once and cached");
+            assert_eq!(ro.heap.raw(), rw.heap.raw(), "section heap is opened once and cached");
             hole.cast::<[u32; 3]>().write([17, 25, 0]);
             rig.shade(rw.gpu).unwrap();
             assert_eq!(hole.cast::<[u32; 3]>().read()[2], 42);
@@ -1917,7 +1918,7 @@ pub(crate) mod tests {
 
             drop((promoted, rw, ro, rig));
             views_gone(hole as usize, 2 * K64);
-            title_memory_section_gone(handle as usize);
+            section_gone(handle as usize);
             assert!(!section_committed(handle as usize));
             assert!(!heaps().contains_key(&(handle as usize)));
             mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER);

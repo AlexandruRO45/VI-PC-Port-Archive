@@ -73,6 +73,13 @@ pub(crate) struct Heap {
     _view: Option<Arc<SectionView>>,
 }
 
+impl Heap {
+    #[cfg(test)]
+    pub(crate) fn raw(&self) -> &ID3D12Heap {
+        &self._heap
+    }
+}
+
 impl std::convert::From<ID3D12Heap> for Heap {
     fn from(heap: ID3D12Heap) -> Heap {
         Heap { _heap: heap, _view: None }
