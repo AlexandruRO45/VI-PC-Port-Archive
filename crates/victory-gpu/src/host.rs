@@ -1881,9 +1881,11 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// A submission's refreshes not done yet, merged per buffer copy into
+/// disjoint ranges: what a range overlaps, or lies within a page of,
+/// coalesces, and distant ranges of one copy are copied apart instead of
+/// copying the span between them. Done before a step that writes title
+/// memory or gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -1891,38 +1893,38 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 ///
 /// A copy's range brought up to date is not copied again in the submission
-/// until a step writes title memory: every list of a world submission using
-/// title memory asks for every copy whole. What the title's threads write
+/// until a step writes title memory. What the title's threads write
 /// meanwhile is for later submissions (on the console it would race the
 /// GPU).
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// Where each copy's refresh is in `refreshes`, by copy.
-    pending: std::collections::HashMap<usize, usize>,
-    /// The range of each copy brought up to date since the last title
-    /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// The disjoint ranges each copy is to be brought up to date in, by
+    /// copy (held, so that its address names no other).
+    pending:
+        std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
+    /// The ranges of each copy brought up to date since the last title
+    /// write, by copy.
+    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let end = address + len;
+        if self
+            .current
+            .get(&key)
+            .is_some_and(|(_, ranges)| covered(ranges, address, end))
+        {
             return;
         }
-        match self.pending.get(&key) {
-            Some(&i) => {
-                let (_, from, to) = &mut self.refreshes[i];
-                (*from, *to) = ((*from).min(address), (*to).max(end));
-            }
-            None => {
-                self.pending.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
-            }
-        }
+        let (_, ranges) = self
+            .pending
+            .entry(key)
+            .or_insert_with(|| (shadow.clone(), vec![]));
+        push_range(ranges, address, end);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -1943,29 +1945,56 @@ impl Batch {
     fn flush(&mut self) -> usize {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
-        self.pending.clear();
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-            total += copied;
-            // Kept: the union with what was current if they touch, else
-            // the larger.
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (from, to);
+        for (key, (shadow, ranges)) in self.pending.drain() {
+            for (from, to) in ranges {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                total += copied;
+                let (_, current) = self
+                    .current
+                    .entry(key)
+                    .or_insert_with(|| (shadow.clone(), vec![]));
+                push_range(current, from, to);
             }
         }
         total
     }
+}
+
+/// Refreshes whose gap is at most a page: coalesced, one kernel copy is
+/// cheaper than two.
+const COALESCE: usize = crate::watch::PAGE;
+
+/// Adds `[address, end)` to `ranges`, kept disjoint: what the range
+/// overlaps, or lies within [`COALESCE`] of, merges into it — and ranges
+/// it now bridges merge together.
+fn push_range(ranges: &mut Vec<(usize, usize)>, address: usize, end: usize) {
+    let (mut from, mut to) = (address, end);
+    let mut i = 0;
+    while i < ranges.len() {
+        let (a, e) = ranges[i];
+        let near = |x: usize, y: usize| x <= y.saturating_add(COALESCE);
+        if near(a, to) && near(from, e) {
+            ranges.remove(i);
+            from = from.min(a);
+            to = to.max(e);
+        } else {
+            i += 1;
+        }
+    }
+    ranges.push((from, to));
+    ranges.sort_unstable();
+}
+
+/// Whether `[address, end)` lies inside one of `ranges`.
+fn covered(ranges: &[(usize, usize)], address: usize, end: usize) -> bool {
+    ranges.iter().any(|&(a, e)| a <= address && end <= e)
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -2908,7 +2937,7 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::*;
     use std::sync::Arc;
 
     #[test]
@@ -2938,6 +2967,61 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    /// Ranges of one copy stay disjoint: what a range overlaps, or lies
+    /// within a page of, coalesces; distant ranges do not copy the span
+    /// between them.
+    #[test]
+    fn ranges_of_a_copy_stay_disjoint() {
+        let mut rs = vec![];
+        push_range(&mut rs, 0x1_0000, 0x1_1000);
+        push_range(&mut rs, 0x40_0000, 0x40_1000);
+        assert_eq!(rs, [(0x1_0000, 0x1_1000), (0x40_0000, 0x40_1000)]);
+        assert!(covered(&rs, 0x1_0000, 0x1_1000));
+        assert!(!covered(&rs, 0x1_0000, 0x2_0000));
+        // A page's gap coalesces ...
+        push_range(&mut rs, 0x1_1000 + crate::watch::PAGE, 0x1_2000 + crate::watch::PAGE);
+        assert_eq!(
+            rs,
+            [
+                (0x1_0000, 0x1_2000 + crate::watch::PAGE),
+                (0x40_0000, 0x40_1000),
+            ]
+        );
+        // ... a page and one byte more stays apart.
+        push_range(
+            &mut rs,
+            0x1_2000 + 2 * crate::watch::PAGE + 1,
+            0x1_2900 + 2 * crate::watch::PAGE + 1,
+        );
+        assert_eq!(rs.len(), 3);
+        // A range bridging all of them coalesces them into one.
+        push_range(&mut rs, 0x1_3000 + crate::watch::PAGE, 0x50_0000);
+        assert_eq!(rs, [(0x1_0000, 0x50_0000)]);
+        assert!(covered(&rs, 0x2_0000, 0x4f_0000));
+    }
+
+    /// A submission asking for distant parts of one copy refreshes them
+    /// apart, not the span between them.
+    #[test]
+    fn distant_refreshes_of_a_copy_are_copied_apart() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(8);
+        let len = 8 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, PAGE / 2);
+        batch.add(&copy, p + 6 * PAGE, PAGE / 2);
+        let ranges = &batch.pending.values().next().unwrap().1;
+        assert_eq!(ranges, &[(p, p + PAGE / 2), (p + 6 * PAGE, p + 6 * PAGE + PAGE / 2)]);
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
     }
 
     /// A host copy of tracked title memory: a submission whose lists all ask
