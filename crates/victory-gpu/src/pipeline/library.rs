@@ -103,7 +103,8 @@ impl MappedBlob {
         }
         // SAFETY: a live read-only file handle. Zero maps the current file size.
         let mapping = unsafe {
-            CreateFileMappingW(file.as_raw_handle(), std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null())
+            let (handle, none) = (file.as_raw_handle(), std::ptr::null());
+            CreateFileMappingW(handle, none, PAGE_READONLY, 0, 0, std::ptr::null())
         };
         if mapping.is_null() {
             return Err(io::Error::last_os_error());
@@ -361,8 +362,18 @@ pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    // Hold this through publication so a worker and shutdown save in order.
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    // Held through publication, so that saves publish in order. A periodic
+    // save gives way to one under way (the workers call this after every
+    // pipeline and would wait for its writes); the shutdown save waits.
+    let mut last = if now {
+        LAST.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match LAST.try_lock() {
+            Ok(last) => last,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        }
+    };
     if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
         return;
     }
@@ -421,6 +432,7 @@ pub(crate) fn save(now: bool) {
 }
 
 /// Complete blobs in generation order, with the original filename first.
+/// Names compare as the file system does, without case.
 fn generations(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -432,9 +444,12 @@ fn generations(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
+        let name = name.to_ascii_lowercase();
         let generation = if name == LIBRARY_FILE {
             0
-        } else if let Some(suffix) = name.strip_prefix(LIBRARY_FILE).and_then(|suffix| suffix.strip_prefix('.')) {
+        } else if let Some(suffix) =
+            name.strip_prefix(LIBRARY_FILE).and_then(|s| s.strip_prefix('.'))
+        {
             let Ok(generation) = suffix.parse::<u64>() else { continue };
             if generation == 0 || suffix != generation.to_string() {
                 continue;
@@ -456,20 +471,81 @@ fn remove_older(files: &[(u64, PathBuf)], generation: u64) {
     }
 }
 
-/// Opens the newest published blob and reclaims older files when possible.
+/// Opens the newest blob that opens, newest by when it was written (so a
+/// build that writes only the original filename, as earlier ones did, is
+/// not outvoted by an older numbered file), then by generation. A file that
+/// does not open (empty, gone, or held by another process for the moment)
+/// leaves the next older one to try. The others are removed where they can
+/// be, and so are staging files of runs that ended in a save.
 fn load_blob(dir: &Path) -> io::Result<Option<MappedBlob>> {
-    loop {
-        let files = generations(dir)?;
-        let Some((generation, path)) = files.last() else { return Ok(None) };
-        if let Some(blob) = MappedBlob::open(path)? {
-            remove_older(&files, *generation);
-            return Ok(Some(blob));
-        }
-        // A concurrent save may have retired this path since the scan.
-        if path.try_exists()? {
-            return Ok(None);
+    remove_stale_staging(dir);
+    let mut files = generations(dir)?;
+    let written = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    files.sort_by_cached_key(|(generation, path)| (written(path), *generation));
+    for (i, (_, path)) in files.iter().enumerate().rev() {
+        match MappedBlob::open(path) {
+            Ok(Some(blob)) => {
+                for (k, (_, other)) in files.iter().enumerate() {
+                    if k != i {
+                        let _ = std::fs::remove_file(other);
+                    }
+                }
+                return Ok(Some(blob));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let path = path.display();
+                tracing::info!(error = %e, %path, "a host pipeline library file does not open");
+            }
         }
     }
+    Ok(None)
+}
+
+/// The staging files `save_blob` writes are named for the process.
+const STAGING: &str = ".tmp-";
+
+/// Removes staging files of processes that are not running any more (a
+/// save cut short by the end of the process): each is as big as the
+/// library. A running process's are left alone, ours included.
+fn remove_stale_staging(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let prefix = format!("{LIBRARY_FILE}{STAGING}");
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        let Some(rest) = name.strip_prefix(&prefix) else { continue };
+        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        if !running(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Whether process `pid` is running (ours is).
+fn running(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == std::process::id() {
+        return true;
+    }
+    // SAFETY: a plain query; the handle is closed below.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        // Gone, or not ours to ask: only the first is safe to clean up
+        // after, and an access error says the process is there.
+        return io::Error::last_os_error().raw_os_error() == Some(5);
+    }
+    let mut code = 0;
+    // SAFETY: a live process handle and a valid out pointer.
+    let asked = unsafe { GetExitCodeProcess(process, &mut code) } != 0;
+    let alive = asked && code == STILL_ACTIVE as u32;
+    // SAFETY: the handle opened above.
+    unsafe { CloseHandle(process) };
+    alive
 }
 
 /// Publishes a new generation so a save never replaces a mapped file.
@@ -477,29 +553,40 @@ fn save_blob(dir: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
+    const TRIES: usize = 128;
     let dir = dir.canonicalize()?;
-    let (tmp, mut file) = loop {
+    let mut staged = None;
+    for _ in 0..TRIES {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let tmp = dir.join(format!("{LIBRARY_FILE}.tmp-{}-{n}", std::process::id()));
+        let tmp = dir.join(format!("{LIBRARY_FILE}{STAGING}{}-{n}", std::process::id()));
         match OpenOptions::new().write(true).create_new(true).open(&tmp) {
-            Ok(file) => break (tmp, file),
+            Ok(file) => {
+                staged = Some((tmp, file));
+                break;
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
-    };
+    }
+    let (tmp, mut file) = staged.ok_or_else(|| io::Error::other("no free staging name"))?;
     let ready = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
     let res = ready.and_then(|()| {
         let source: Vec<_> = tmp.as_os_str().encode_wide().chain([0]).collect();
-        loop {
+        for _ in 0..TRIES {
             let files = generations(&dir)?;
-            let generation = files.last().map_or(0, |(n, _)| *n).checked_add(1)
+            let newest = files.last().map_or(0, |(n, _)| *n);
+            let generation = newest
+                .checked_add(1)
                 .ok_or_else(|| io::Error::other("pipeline library generation exhausted"))?;
             let target = dir.join(format!("{LIBRARY_FILE}.{generation}"));
             let destination: Vec<_> = target.as_os_str().encode_wide().chain([0]).collect();
             // SAFETY: both paths are live, NUL-terminated strings. The move
             // stays in this directory and cannot replace an existing file.
-            if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH) } != 0 {
+            let moved = unsafe {
+                MoveFileExW(source.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH)
+            };
+            if moved != 0 {
                 remove_older(&files, generation);
                 return Ok(());
             }
@@ -508,6 +595,7 @@ fn save_blob(dir: &Path, bytes: &[u8]) -> io::Result<()> {
                 return Err(e);
             }
         }
+        Err(io::Error::other("no free pipeline library generation"))
     });
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -635,13 +723,45 @@ mod tests {
         assert_eq!(old.bytes(), b"old bytes");
 
         save_blob(dir.path(), b"newest bytes").unwrap();
-        std::fs::write(dir.path().join("host-pipelines.bin.tmp-interrupted"), b"partial").unwrap();
+        // Staging files of a save cut short: one named for a process ID no
+        // process has, one of ours.
+        let gone = (1_000_000u32..).step_by(4).find(|&p| !running(p)).unwrap();
+        let stale = dir.path().join(format!("{LIBRARY_FILE}{STAGING}{gone}-0"));
+        let ours = dir.path().join(format!("{LIBRARY_FILE}{STAGING}{}-999", std::process::id()));
+        std::fs::write(&stale, b"partial").unwrap();
+        std::fs::write(&ours, b"partial").unwrap();
         drop(old);
         drop(loaded);
         let newest = load_blob(dir.path()).unwrap().unwrap();
         assert_eq!(newest.bytes(), b"newest bytes");
         assert_eq!(generations(dir.path()).unwrap().len(), 1);
         assert!(!path.exists());
+        assert!(!stale.exists(), "a dead process's staging file is removed");
+        assert!(ours.exists(), "a running process's staging file is left");
+    }
+
+    /// The newest file that opens is taken: an empty newest generation
+    /// leaves the one before; an original filename written after the
+    /// numbered ones (by a build that writes only that name) wins.
+    #[test]
+    fn mapped_blob_takes_the_newest_file_that_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        save_blob(dir.path(), b"first").unwrap();
+        // Mapped, the first generation outlives the second's save.
+        let held = load_blob(dir.path()).unwrap().unwrap();
+        save_blob(dir.path(), b"second").unwrap();
+        drop(held);
+        assert_eq!(generations(dir.path()).unwrap().len(), 2);
+        let newest = generations(dir.path()).unwrap().last().unwrap().1.clone();
+        std::fs::write(&newest, b"").unwrap();
+        let blob = load_blob(dir.path()).unwrap().unwrap();
+        assert_eq!(blob.bytes(), b"first", "the generation before an empty one");
+        drop(blob);
+        // Written later than any numbered one, under the original name.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.path().join(LIBRARY_FILE), b"from another build").unwrap();
+        let blob = load_blob(dir.path()).unwrap().unwrap();
+        assert_eq!(blob.bytes(), b"from another build");
     }
 
     #[test]
