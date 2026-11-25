@@ -189,11 +189,9 @@ pub fn run(
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+        for entry in crate::scan_files(root) {
+            let entry = entry?;
+            if entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
             let Ok(data) = std::fs::read(entry.path()) else {

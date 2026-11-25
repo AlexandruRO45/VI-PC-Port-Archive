@@ -32,12 +32,10 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
     let mut missing: BTreeMap<(String, String), BTreeSet<PathBuf>> = BTreeMap::new();
 
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
+        for entry in crate::scan_files(root) {
+            let entry = entry?;
             let path = entry.path();
-            if !entry.file_type().is_file() || !looks_like_pe(path) {
+            if !looks_like_pe(path) {
                 continue;
             }
             let info = match std::fs::read(path)

@@ -75,13 +75,8 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let mut t = Totals::default();
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
+        for entry in crate::scan_files(root) {
+            let entry = entry?;
             let path = entry.path();
             if entry.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE {
                 eprintln!("skipping large file {}", path.display());

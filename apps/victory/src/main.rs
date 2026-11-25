@@ -9,7 +9,7 @@ mod run;
 mod shader;
 mod translate;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -219,4 +219,33 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+/// Files under one scan root. Report errors opening the root, while retaining
+/// best-effort traversal of its descendants.
+fn scan_files(root: &Path) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter(|entry| match entry {
+            Ok(entry) => entry.file_type().is_file(),
+            Err(error) => error.depth() == 0,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_files_accepts_a_file_root_and_reports_a_missing_root() {
+        let file = std::env::current_exe().unwrap();
+        let mut entries = scan_files(&file);
+        assert_eq!(entries.next().unwrap().unwrap().path(), file);
+        assert!(entries.next().is_none());
+
+        // A regular file cannot contain a child, even in a shared temp directory.
+        let missing = file.join("missing-scan-root");
+        let error = scan_files(&missing).next().unwrap().unwrap_err();
+        assert_eq!(error.path(), Some(missing.as_path()));
+    }
 }
