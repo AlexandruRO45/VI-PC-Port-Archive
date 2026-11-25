@@ -123,18 +123,19 @@ fn needs_portable_heap(can_create: impl FnOnce(u32) -> bool) -> bool {
 /// each a device removal shortly after; #59).
 const DYNAMIC: u32 = 1 << 18;
 
-/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// The dynamic slots a heap of [`HEAP_VIEWS`] keeps at least, when the title's
+/// slots would take nearly all of it.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
 /// The mirrored slots, dynamic slots and total slots of a view heap.
 /// The shader's last three slots stay reserved for the null UAV, SRV and general view.
 fn view_layout(count: u32, portable: bool) -> (u32, u32, u32) {
-    let (total, dynamic) = if portable { (PORTABLE_VIEWS, MIN_DYNAMIC) } else { (HEAP_VIEWS, DYNAMIC) };
+    // A capped heap (NVIDIA) keeps all of DYNAMIC: fewer ran out in the opening
+    // cutscene there, and the title's highest slot seen (about 720,000) fits below it.
+    let (total, kept) = if portable { (PORTABLE_VIEWS, DYNAMIC) } else { (HEAP_VIEWS, MIN_DYNAMIC) };
     let available = total - 3;
-    // Keep title slots first, leaving at least the smaller dynamic range.
-    let count = count.min(available - MIN_DYNAMIC);
-    (count, dynamic.min(available - count), total)
+    let count = count.min(available - kept);
+    (count, DYNAMIC.min(available - count), total)
 }
 
 impl HostHeap {
@@ -2222,8 +2223,8 @@ mod tests {
     fn the_probe_selects_the_heap_layout_before_translation() {
         for (capacity, limit, dynamic) in [
             (HEAP_VIEWS, HEAP_VIEWS, DYNAMIC),
-            (HEAP_VIEWS - 1, PORTABLE_VIEWS, MIN_DYNAMIC),
-            (PORTABLE_VIEWS, PORTABLE_VIEWS, MIN_DYNAMIC),
+            (HEAP_VIEWS - 1, PORTABLE_VIEWS, DYNAMIC),
+            (PORTABLE_VIEWS, PORTABLE_VIEWS, DYNAMIC),
         ] {
             let portable = needs_portable_heap(|count| {
                 assert_eq!(count, HEAP_VIEWS);
@@ -2245,11 +2246,11 @@ mod tests {
         // All title slots still fit if the dynamic range gives up its last three.
         let requested = HEAP_VIEWS - DYNAMIC;
         assert_eq!(view_layout(requested, false), (requested, DYNAMIC - 3, HEAP_VIEWS));
-        for (portable, total, dynamic) in [(false, HEAP_VIEWS, DYNAMIC), (true, PORTABLE_VIEWS, MIN_DYNAMIC)] {
+        for (portable, total, kept) in [(false, HEAP_VIEWS, MIN_DYNAMIC), (true, PORTABLE_VIEWS, DYNAMIC)] {
             let available = total - 3;
-            let fits = available - dynamic;
-            assert_eq!(view_layout(fits, portable), (fits, dynamic, total));
-            assert_eq!(view_layout(u32::MAX, portable), (available - MIN_DYNAMIC, MIN_DYNAMIC, total));
+            let fits = available - DYNAMIC;
+            assert_eq!(view_layout(fits, portable), (fits, DYNAMIC, total));
+            assert_eq!(view_layout(u32::MAX, portable), (available - kept, kept, total));
         }
     }
 
