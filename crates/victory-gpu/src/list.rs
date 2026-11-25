@@ -512,6 +512,30 @@ fn uav_barrier_for(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resourc
     }
 }
 
+/// A transition barrier for `texture` from `before` to `wanted`, with both
+/// states masked to what `texture`'s flags allow, or `None` when the legal
+/// states are equal.
+#[cfg(windows)]
+fn transition_barrier_for(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    before: u32,
+    wanted: u32,
+) -> Option<Barrier> {
+    use windows::core::Interface;
+    let before = crate::host::legal_state(texture, before);
+    let after = crate::host::legal_state(texture, wanted);
+    if before == after {
+        return None;
+    }
+    Some(Barrier {
+        kind: 0,
+        flags: 0,
+        first: texture.as_raw().cast_const().cast(),
+        second: 0xffff_ffff | (u64::from(before) << 32),
+        last: u64::from(after),
+    })
+}
+
 /// The barrier on host resources, or `None` if it names a resource the host
 /// GPU does not have (buffers so far).
 #[cfg(windows)]
@@ -529,18 +553,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
             let (texture, before) = list.transition(b.first, wanted)?;
-            let before = crate::host::legal_state(texture, before);
-            let after = crate::host::legal_state(texture, wanted);
-            if before == after {
-                return None;
-            }
-            Some(Barrier {
-                kind: 0,
-                flags: 0,
-                first: texture.as_raw().cast_const().cast(),
-                second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(after),
-            })
+            transition_barrier_for(texture, before, wanted)
         }
         1 => Some(Barrier {
             first: if b.first.is_null() {
@@ -2267,6 +2280,72 @@ mod tests {
                 std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(b_uav),
             ];
             list.list.ResourceBarrier(&barriers);
+            list.list.Close().expect("command list must close cleanly");
+        }
+    }
+
+    /// A transition whose `before` and `wanted` states become equal after
+    /// `legal_state` emits no barrier (`None`), while a real legal transition
+    /// records and closes cleanly on a live D3D12 command list.
+    #[cfg(windows)]
+    #[test]
+    fn transition_barrier_skips_noop_after_legal_state() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let mut depth: Option<ID3D12Resource> = None;
+        // SAFETY: valid D3D12 texture creation on the live host device.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    None,
+                    &mut depth,
+                )
+                .unwrap();
+        }
+        let depth = depth.unwrap();
+        const RENDER_TARGET: u32 = 0x4;
+        const UNORDERED_ACCESS: u32 = 0x8;
+        const DEPTH_WRITE: u32 = 0x10;
+        const COPY_SOURCE: u32 = 0x800;
+        // Depth texture forbids UAV and RT, so both sanitize to COMMON (0): no-op.
+        assert!(transition_barrier_for(&depth, UNORDERED_ACCESS, 0).is_none());
+        assert!(transition_barrier_for(&depth, UNORDERED_ACCESS, RENDER_TARGET).is_none());
+        // Stripping illegal UAV from `before` leaves DEPTH_WRITE == DEPTH_WRITE: no-op.
+        assert!(transition_barrier_for(&depth, UNORDERED_ACCESS | DEPTH_WRITE, DEPTH_WRITE).is_none());
+        // Stripping illegal UAV from `before` leaves DEPTH_WRITE -> COPY_SOURCE.
+        let b = transition_barrier_for(&depth, UNORDERED_ACCESS | DEPTH_WRITE, COPY_SOURCE)
+            .expect("legal state change must emit a barrier");
+        assert_eq!(b.kind, 0);
+        assert_eq!((b.second >> 32) as u32, DEPTH_WRITE);
+        assert_eq!(b.last as u32, COPY_SOURCE);
+        let list = host.new_list().expect("host command list");
+        // SAFETY: identical layout to D3D12_RESOURCE_BARRIER; live resource.
+        unsafe {
+            let barrier = std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(b);
+            list.list.ResourceBarrier(&[barrier]);
             list.list.Close().expect("command list must close cleanly");
         }
     }
