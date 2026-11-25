@@ -1841,13 +1841,15 @@ mod tests {
     }
 
     #[test]
-    fn wave64_one_wave_lds_is_refused_on_wave32_host() {
-        // ds_write_b32 v0, v1; s_endpgm (no barrier, one-wave LDS sharing)
-        let words = [0xD834_0000u32, 0x0000_0100, 0xBF81_0000];
+    fn wave64_one_wave_lds_waits_between_its_phases_on_wave32_host() {
+        // ds_write_b32 v0, v1; ds_read_b32 v2, v0; s_endpgm: one wave of 64
+        // threads, no barrier (the console runs it in step). On a 32-lane
+        // host its halves meet at a barrier between the write and the read.
+        let words = [0xD834_0000u32, 0x0000_0100, 0xD8D8_0000, 0x0200_0000, 0xBF81_0000];
         let native = super::NativeProgram {
             stage: super::HwStage::Cs,
             wave64: true,
-            vgprs: 2,
+            vgprs: 3,
             layout: vec![],
             used: vec![],
             io: crate::native::StageIo::Cs(crate::native::ComputeIo {
@@ -1867,11 +1869,11 @@ mod tests {
             host_wave32: true,
             ..Default::default()
         };
-        let err = super::emit_with(&c, &native, &p, &st, &io, &res, opts)
-            .expect_err("one-wave LDS sharing must be refused on a 32-lane host");
-        assert!(
-            err.to_string().contains("sharing LDS within one wave"),
-            "unexpected refusal reason: {err}"
-        );
+        let shader = super::emit_with(&c, &native, &p, &st, &io, &res, opts)
+            .expect("one-wave LDS phases translate on a 32-lane host");
+        if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
     }
 }

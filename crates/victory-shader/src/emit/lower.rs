@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod lds;
 
 type Why = &'static str;
 
@@ -281,6 +282,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Loop latches' barriers still ahead (`lds::Plan::drains`).
+    drains: HashMap<usize, usize>,
     /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
@@ -726,6 +729,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            drains: HashMap::new(),
             round16: round16(p),
             mode16: Some(0),
         }
@@ -1299,17 +1303,6 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
-        if let Some(threads) = self.s.threads
-            && self.x.native.wave64
-            && self.x.host_wave32
-            && threads.iter().product::<u32>() <= 64
-            && self.s.lds_dwords > 0
-        {
-            return Err(unsupported(
-                0,
-                "wave64 compute shader sharing LDS within one wave on a 32-lane host",
-            ));
-        }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -1336,6 +1329,25 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.find_sections();
+        // One console wave run as two host waves: its halves meet at a
+        // barrier between LDS phases (`lds_barriers`).
+        let mut meet = HashSet::new();
+        if let Some(threads) = self.s.threads
+            && self.x.native.wave64
+            && self.x.host_wave32
+            && threads.iter().product::<u32>() <= 64
+            && self.s.lds_dwords > 0
+        {
+            let sections = &self.sections;
+            let inside = |b: usize, i: usize| {
+                sections
+                    .get(&b)
+                    .is_some_and(|s| s.iter().any(|(&start, sec)| start < i && i < sec.end))
+            };
+            let plan = lds::barriers(p, &self.x.st.exits, inside).map_err(|w| unsupported(0, w))?;
+            meet.extend(plan.at);
+            self.drains = plan.drains;
+        }
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
@@ -1371,6 +1383,9 @@ impl<'a> Lower<'a> {
             let mut i = 0;
             self.mode16 = self.round16[b];
             while i < p.blocks[b].insts.len() {
+                if meet.contains(&(b, i)) {
+                    self.lds_barrier();
+                }
                 if let Some(&lanes) = self.x.st.discards.get(&(b, i)) {
                     // A pixel's discard: the lanes stay on as helpers.
                     let at = self.cur;
@@ -1391,6 +1406,9 @@ impl<'a> Lower<'a> {
                     continue;
                 }
                 i += 1;
+            }
+            if meet.contains(&(b, p.blocks[b].insts.len())) {
+                self.lds_barrier();
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
@@ -10197,7 +10215,7 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
+                let abort = self.lds_abort(b);
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
@@ -10969,6 +10987,7 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
 
     /// A program's constant table starts after its instructions, unless a
     /// load at a fixed offset reads below that.
