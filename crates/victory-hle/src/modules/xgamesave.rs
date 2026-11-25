@@ -1212,6 +1212,57 @@ mod tests {
         assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
     }
 
+    /// A Windows reader denying sharing must delay migration of the whole
+    /// legacy save, not commit a partial version that hides the locked blob.
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_legacy_blob_delays_migration_until_it_can_be_read() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
+        let old = root.join("Player");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("readable%20blob"), b"first payload").unwrap();
+        std::fs::write(old.join("locked%20blob"), b"second payload").unwrap();
+        std::fs::write(old.join(".display"), b"Chapter 1").unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(old.join("locked%20blob"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(old.join("locked%20blob")).unwrap_err().raw_os_error(),
+            Some(32),
+            "the fixture must deny a second read with ERROR_SHARING_VIOLATION"
+        );
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        let c = p.container("Player");
+        assert!(old.is_dir(), "the unreadable source must be retained");
+        assert!(
+            !c.dir.join("v1").exists(),
+            "migration must not commit a version missing the locked blob"
+        );
+        drop(locked);
+        assert_eq!(std::fs::read(old.join("readable%20blob")).unwrap(), b"first payload");
+        assert_eq!(std::fs::read(old.join("locked%20blob")).unwrap(), b"second payload");
+        assert_eq!(std::fs::read(old.join(".display")).unwrap(), b"Chapter 1");
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(!old.exists(), "a complete migration may remove its source");
+        let c = p.container("Player");
+        assert_eq!(
+            read(&c, None).unwrap(),
+            [
+                ("locked blob".into(), b"second payload".to_vec()),
+                ("readable blob".into(), b"first payload".to_vec()),
+            ]
+        );
+        let v = current_named(&c.dir, "Player").unwrap().unwrap();
+        assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
+    }
+
     /// An empty configuration id names none. As a folder name it would be
     /// the folder every configuration lives in, whose folders then look
     /// like containers of the old layout and are converted away.
