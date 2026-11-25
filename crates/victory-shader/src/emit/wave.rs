@@ -1055,7 +1055,7 @@ mod tests {
         // v_mov_b32 v2, v1 dpp16 quad-perm sel 0xE4 (identity);
         // s_mov_b32 exec, s0.
         for (wave64, saveexec, mov_exec) in [(true, 0x25, 0x04), (false, 0x3D, 0x03)] {
-            let mut section = |narrow: bool| {
+            let section = |narrow: bool| {
                 let mut w = vec![sop1(0, saveexec, 193), vop1(1, 0x01, 135)];
                 if narrow {
                     w.push(sop1(EXEC, mov_exec, 194));
