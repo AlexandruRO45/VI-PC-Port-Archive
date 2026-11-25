@@ -172,6 +172,19 @@ fn mirror(handle: u64) {
     }
 }
 
+/// The title's own descriptor words at `handle`, for traces: a null host
+/// slot with nonzero title words means the title wrote the descriptor
+/// without a D3D12 call (plain stores), which mirroring never sees.
+#[cfg(windows)]
+pub(crate) fn peek(this: usize, index: u32) -> Option<[u32; 8]> {
+    let h = heap(this as This);
+    let at = h.start + u64::from(index) * u64::from(increment(h.desc.kind)?);
+    // SAFETY: a live registered heap; `index` is inside its descriptor count
+    // for every caller that got it from `Heap::index`.
+    let words = unsafe { std::slice::from_raw_parts(at as *const u32, 8) };
+    Some(words.try_into().ok()?)
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]

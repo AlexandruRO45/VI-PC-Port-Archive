@@ -1051,6 +1051,8 @@ impl State {
         if std::env::var_os("VICTORY_COMPUTE_TRACE").is_some() {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if crate::queue::presented() >= trace_after()
+                && !p.name.contains("Bake")
+                && !p.name.contains("LUT")
                 && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2000
             {
                 tracing::info!(
@@ -1192,6 +1194,12 @@ impl State {
                 let index = if u.root == RootType::Table { v / 32 } else { v };
                 if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
                     let _ = write!(text, " [heap {index}: {slot}]");
+                    #[cfg(feature = "diagnostics")]
+                    if slot == "null" {
+                        if let Some(w) = crate::descriptor::peek(self.heaps[0], index) {
+                            let _ = write!(text, " title {w:08x?}");
+                        }
+                    }
                 }
             }
             for &(slot, _) in stage
