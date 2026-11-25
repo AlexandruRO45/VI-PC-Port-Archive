@@ -234,37 +234,34 @@ mod tests {
         draws_the_square(&[[0.5, 0.5], [-0.5, -0.5], [-0.5, 0.5]]);
     }
 
+    /// A zero w at the second corner leaves the diagonal comparisons
+    /// unordered. The old completion puts the fourth above the first
+    /// and third, and its attribute contributes to the upper half.
+    #[test]
+    fn rectangles_with_zero_w_complete_from_the_second_corner() {
+        let vertices = [
+            [-0.5, 0.0, 0.5, 1.0, 0.0, 0.0],
+            [0.0, -0.5, 0.5, 0.0, 1.0, 1.0],
+            [0.5, 0.0, 0.5, 1.0, 0.0, 0.0],
+        ];
+        draw_rectangle(vertices.as_flattened(), |warp, texels| {
+            // At y = 3/32 the fourth corner has screen-space weight 3/8.
+            // Its w is 2, giving it a perspective-correct weight of 3/13.
+            let t = texels[14 * 32 + 16];
+            let want = [-3.0 / 13.0, -3.0 / 13.0, 1.0, 1.0];
+            assert!(
+                t.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4),
+                "warp {warp} pixel (16, 14): {t:?}, want {want:?}"
+            );
+        });
+    }
+
     /// Draws one rectangle of the given corners (clip x, y; the attribute
     /// is the same x, y) into 32x32 and checks every pixel: the square
     /// `|x|, |y| < 0.5` holds its coordinates, the rest nothing.
     fn draws_the_square(corners: &[[f32; 2]; 3]) {
-        let (vs, ps) = (shader(false), shader(true));
-        let gs = super::rectangle_gs(&vs).unwrap();
-        if let Ok(mut v) =
-            super::super::validator::Validator::load(super::super::validator::Validator::default_path().as_deref())
-        {
-            for c in [&vs, &gs, &ps] {
-                v.validate(&mut c.clone()).unwrap();
-            }
-        }
-        let vertices: Vec<f32> = corners
-            .iter()
-            .flat_map(|&[x, y]| [x, y, 0.5, 1.0, x, y])
-            .collect();
-        for warp in [false, true] {
-            let Ok(host) = Host::new(warp) else { continue };
-            let root = host.root_signature_for(&[]).unwrap();
-            let pso = host.pipeline_gs(&root, &vs, &gs, &ps).unwrap();
-            let draw = Draw {
-                roots: Vec::new(),
-                textures: &[],
-                samplers: &[],
-                vertices: &vertices,
-                stride: 24,
-                size: (32, 32),
-                mesh_groups: 0,
-            };
-            let texels = host.draw(&root, &pso, &draw).unwrap();
+        let vertices = corners.map(|[x, y]| [x, y, 0.5, 1.0, x, y]);
+        draw_rectangle(vertices.as_flattened(), |warp, texels| {
             for (i, t) in texels.iter().enumerate() {
                 let (x, y) = ((i % 32) as f32, (i / 32) as f32);
                 let (u, v) = ((x + 0.5) / 16.0 - 1.0, 1.0 - (y + 0.5) / 16.0);
@@ -273,6 +270,40 @@ mod tests {
                 let near = t.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4);
                 assert!(near, "warp {warp} pixel ({x}, {y}): {t:?}, want {want:?}");
             }
+        });
+    }
+
+    fn draw_rectangle(vertices: &[f32], check: impl Fn(bool, &[[f32; 4]])) {
+        let (vs, ps) = (shader(false), shader(true));
+        let gs = super::rectangle_gs(&vs).unwrap();
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            for c in [&vs, &gs, &ps] {
+                v.validate(&mut c.clone()).unwrap();
+            }
+        }
+        let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        let adapters: &[bool] = if warp_only { &[true] } else { &[false, true] };
+        for &warp in adapters {
+            let host = match Host::new(warp) {
+                Ok(host) => host,
+                Err(error) if warp_only => panic!("WARP adapter: {error}"),
+                Err(_) => continue,
+            };
+            let root = host.root_signature_for(&[]).unwrap();
+            let pso = host.pipeline_gs(&root, &vs, &gs, &ps).unwrap();
+            let draw = Draw {
+                roots: Vec::new(),
+                textures: &[],
+                samplers: &[],
+                vertices,
+                stride: 24,
+                size: (32, 32),
+                mesh_groups: 0,
+            };
+            let texels = host.draw(&root, &pso, &draw).unwrap();
+            check(warp, &texels);
         }
     }
 }
