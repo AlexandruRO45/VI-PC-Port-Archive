@@ -10292,6 +10292,19 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        #[cfg(feature = "diagnostics")]
+        let tag = {
+            static SELECTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+            let hashes = SELECTED.get_or_init(|| std::env::var("VICTORY_TAG_PIXEL")
+                .unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect());
+            if !mesh && !hashes.is_empty() {
+                super::per_program::current().and_then(|hash| {
+                    hashes.iter().position(|name| name == &hash)
+                        .filter(|&index| index < 216)
+                        .map(|index| (index, hashes.len() > 63))
+                })
+            } else { None }
+        };
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -10309,6 +10322,17 @@ impl<'a> Lower<'a> {
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
+            #[cfg(feature = "diagnostics")]
+            let tag_channel = tag.filter(|_| el.kind == 16 && el.index == 0 && el.comp == 9 && col + el.col < 3)
+                .map(|(idx, wide)| {
+                    let channel = u32::from(col + el.col);
+                    let byte = if wide {
+                        20 + 40 * ((idx / 6usize.pow(channel)) % 6)
+                    } else {
+                        32 + 64 * (((idx + 1) >> (2 * channel)) & 3)
+                    };
+                    byte as f32 / 255.0
+                });
             let (suffix, x) = match el.comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
@@ -10320,6 +10344,8 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            #[cfg(feature = "diagnostics")]
+            let x = tag_channel.map_or(x, |level| self.s.m.f32(level.to_bits()));
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),

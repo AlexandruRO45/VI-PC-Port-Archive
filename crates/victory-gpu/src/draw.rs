@@ -1784,15 +1784,57 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
+            let mut material_inputs = [None, None];
             for u in &t.host.user_data {
                 let v = match u.root {
                     RootType::Other(kind) => self.host_word(compute, kind, u.slot, u.dword, None),
                     _ => self.user_value(compute, u.slot, u.root, u.dword),
                 };
+                match u.index {
+                    8 => material_inputs[0] = Some(v),
+                    14 => material_inputs[1] = Some(v),
+                    _ => {}
+                }
                 let _ = write!(text, " u{}={v:#x}", u.index);
                 let index = if u.root == RootType::Table { v / 32 } else { v };
                 if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
                     let _ = write!(text, " [heap {index}: {slot}]");
+                }
+            }
+            // This program reads nine texture indices from a byte-addressed
+            // material record. Capture title bytes and host slots at the same draw.
+            if stage.shader.hash == "6695d7f5e3f6d351"
+                && let [Some(table), Some(offset)] = material_inputs
+                && let Some(host) = views
+            {
+                let heap = crate::descriptor::heap(self.heaps[0] as This);
+                let record = table.checked_add(2752)
+                    .and_then(|bytes| heap.handle(bytes / 32))
+                    .and_then(crate::descriptor::view)
+                    .as_ref()
+                    .and_then(crate::descriptor::host::buffer_range);
+                let mut bytes = [0u8; 36];
+                if let Some((base, len)) = record
+                    && u64::from(offset) + 36 <= len
+                    && let Some(address) = base.checked_add(u64::from(offset))
+                    && crate::host::read_into(address as *const u8, &mut bytes)
+                {
+                    host.observe_material_slots([
+                        u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+                        u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+                    ]);
+                    for (word, b) in bytes.chunks_exact(4).enumerate() {
+                        let index = u32::from_le_bytes(b.try_into().unwrap());
+                        let slot = host.describe_slot(index);
+                        let title = heap.handle(index).and_then(crate::descriptor::view);
+                        let schedule = host.texture_slot_schedule(index);
+                        if word == 0 && slot.as_deref() == Some("null")
+                            && matches!(&title, Some(View::Placed(false, res, _)) if res[0] != 1)
+                        {
+                            host.request_missing_color(index);
+                        }
+                        let _ = write!(text, " material[{word}]={index} title={title:?} schedule={schedule:?} host={slot:?}");
+                    }
                 }
             }
             for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs) {

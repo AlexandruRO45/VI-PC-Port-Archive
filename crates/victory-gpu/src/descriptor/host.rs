@@ -307,6 +307,10 @@ struct Waiting {
 pub(crate) struct TextureQueue {
     slots: std::collections::BTreeMap<u32, Waiting>,
     writes: u64,
+    #[cfg(feature = "diagnostics")]
+    material_probe: Option<[u32; 2]>,
+    #[cfg(feature = "diagnostics")]
+    observed_color: (u64, Vec<u32>),
 }
 
 impl TextureQueue {
@@ -338,6 +342,42 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        static MIX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mix = *MIX.get_or_init(|| std::env::var_os("VICTORY_MIX_TEXTURE_RETRIES").is_some_and(|v| v == "1"));
+        #[cfg(feature = "diagnostics")]
+        {
+            static FIRST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *FIRST.get_or_init(|| std::env::var_os("VICTORY_PROBE_FIRST_MATERIAL").is_some_and(|v| v == "1"))
+                && let Some(slots) = self.material_probe
+            {
+                let mut priority = slots.to_vec();
+                priority.extend_from_slice(&self.observed_color.1);
+                return self.probed_due(frame, max, mix, &priority);
+            }
+        }
+        self.ordered_due(frame, max, mix)
+    }
+
+    /// Diagnostic intervention: only move current, eligible writes. Preserve
+    /// the normal order and cap for every other slot in the returned pass.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn probed_due(&self, frame: u64, max: usize, mix: bool, slots: &[u32]) -> Vec<(u32, u64)> {
+        let mut first = Vec::new();
+        for &index in slots {
+            if first.len() >= max { break; }
+            if let Some(w) = self.slots.get(&index)
+                && w.due <= frame && !first.contains(&(index, w.write))
+            {
+                first.push((index, w.write));
+            }
+        }
+        let mut order = self.ordered_due(frame, max, mix);
+        order.retain(|entry| !first.contains(entry));
+        first.extend(order.into_iter().take(max - first.len()));
+        first
+    }
+
+    fn ordered_due(&self, frame: u64, max: usize, mix: bool) -> Vec<(u32, u64)> {
         if max == 0 {
             return Vec::new();
         }
@@ -348,9 +388,12 @@ impl TextureQueue {
             class.push((index, w.write));
         }
         let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
-        if again.len() > max {
-            again.select_nth_unstable_by(max, newest_first);
-            again.truncate(max);
+        // The upload byte or time limit may end a pass long before it consumes
+        // max entries. Interleave the classes in the prefix the pass can reach.
+        let retry_limit = if mix { max.div_ceil(2).max(max.saturating_sub(fresh.len())) } else { max };
+        if again.len() > retry_limit {
+            again.select_nth_unstable_by(retry_limit, newest_first);
+            again.truncate(retry_limit);
         }
         again.sort_unstable_by(newest_first);
         let mut order = again;
@@ -375,13 +418,18 @@ impl TextureQueue {
             fresh[..newer].sort_unstable_by(newest_first);
             fresh[oldest_start..].sort_unstable_by(newest_first);
         }
-        order.reserve(count);
+        let retry_prefix = if mix { std::mem::take(&mut order) } else { Vec::new() };
+        let mut retries = retry_prefix.into_iter();
+        order.reserve(count + retries.len());
         for (i, &entry) in fresh[..newer].iter().enumerate() {
+            if let Some(retry) = retries.next() { order.push(retry); }
             order.push(entry);
             if i < older {
+                if let Some(retry) = retries.next() { order.push(retry); }
                 order.push(fresh[fresh.len() - 1 - i]);
             }
         }
+        order.extend(retries);
         order
     }
 
@@ -1064,6 +1112,14 @@ impl HostHeap {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             for &slot in &stale {
+                #[cfg(feature = "diagnostics")]
+                if textures.material_probe.is_some_and(|slots| slots.contains(&slot)) {
+                    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    if *TRACE.get_or_init(|| std::env::var_os("VICTORY_TRACE_FACE_ALIAS").is_some()) {
+                        tracing::info!(frame = crate::frame::current(), retired = slot, replacing = index,
+                            replacement = ?view, "material probe: overlapping texture retired");
+                    }
+                }
                 textures.remove(slot);
             }
         }
@@ -1359,6 +1415,37 @@ impl HostHeap {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         let shown = kept.get(index as usize)?.as_ref()?;
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn observe_material_slots(&self, slots: [u32; 2]) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).material_probe = Some(slots);
+    }
+
+    /// Probe one material input whose valid title view has no host descriptor.
+    /// Keep the normal producer's backoff and generation for existing requests.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn request_missing_color(&self, index: u32) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_PROBE_MATERIAL_ZERO").is_some_and(|v| v == "1")) {
+            return;
+        }
+        let frame = crate::frame::current();
+        let mut q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        if q.observed_color.0 != frame {
+            q.observed_color.0 = frame;
+            q.observed_color.1.clear();
+        }
+        if q.observed_color.1.len() < 64 && !q.observed_color.1.contains(&index) {
+            q.observed_color.1.push(index);
+            q.written(index, frame, frame, true);
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn texture_slot_schedule(&self, index: u32) -> Option<(u64, u64, u8, u64)> {
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.slots.get(&index).map(|w| (w.written, w.due, w.looks, w.mapped))
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -2329,6 +2416,30 @@ mod tests {
     /// slot whose memory is not there is looked at again after
     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
     /// slot written again meanwhile is dropped.
+    #[test]
+    fn probed_slots_must_be_due_and_do_not_displace_extra_writes() {
+        let mut q = TextureQueue::default();
+        for i in 0..20 { q.written(i, 1, 1, false); }
+        q.written(9, 1, 7, false);
+        let pass = q.probed_due(2, 3, false, &[9, 6, 6, 999]);
+        assert_eq!(pass.iter().map(|x| x.0).collect::<Vec<_>>(), vec![6, 19, 0]);
+        assert!(q.probed_due(7, 0, true, &[9]).is_empty());
+    }
+
+    #[test]
+    fn mixed_pass_reaches_new_slots_before_exhausting_the_retry_backlog() {
+        let mut q = TextureQueue::default();
+        for i in 0..10 {
+            q.written(i, 0, 0, false);
+            if i < 7 { q.partly(i, q.writes, 1, 1024); }
+        }
+        let all = q.ordered_due(2, usize::MAX, true);
+        assert_eq!(all.iter().map(|v| v.0).collect::<Vec<_>>(), [6, 9, 5, 7, 4, 8, 3, 2, 1, 0]);
+        for limit in 0..=12 {
+            assert_eq!(q.ordered_due(2, limit, true), all[..limit.min(all.len())]);
+        }
+    }
+
     #[test]
     fn limited_texture_queue_matches_unlimited_order() {
         let mut queue = TextureQueue::default();
