@@ -2088,7 +2088,6 @@ mod tests {
         assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
     }
 
-    /// The world's 16-byte view of 0 elements removed the device.
     /// A slot rewritten while a submission runs keeps the copy its view
     /// had of title memory until that work has run (its marked writes are
     /// read after it).
@@ -2110,6 +2109,7 @@ mod tests {
         crate::shadow::unregister(at, at as u64);
     }
 
+    /// The world's 16-byte view of 0 elements removed the device.
     #[test]
     fn empty_and_overlong_buffer_views_are_refused() {
         assert!(within(64, 0, 4, 16));
