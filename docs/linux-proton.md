@@ -7,7 +7,8 @@ expect. Nothing here is supported by upstream VIctory.
 
 Measured on Arch/CachyOS, Ryzen 7 3700X, 32 GB, RTX 3070 (8 GB, 32-lane
 waves), Proton Experimental with its bundled vkd3d-proton, title build
-`b99f876b74d4a77f` (Xbox Series profile).
+`b99f876b74d4a77f` (Xbox Series profile). A Wine/RADV host reaches 1.1–1.6 fps
+with a patched wineserver; see [Other configurations](#other-configurations).
 
 No game files are in this repository. Everything is built from the user's own
 dump, as [the asset policy](asset-policy.md) requires.
@@ -41,7 +42,9 @@ cargo xwin build --profile diag --features diagnostics \
 ```
 
 `cargo-xwin` downloads the Windows SDK and CRT on the first build. Set
-`XWIN_CACHE_DIR` to keep that cache somewhere specific.
+`XWIN_CACHE_DIR` to keep that cache somewhere specific. Do not set
+`CFLAGS=/FIstring.h` (a common `cargo-xwin` workaround): it breaks blake3's
+assembly.
 
 Put the compiler beside the executable:
 
@@ -114,6 +117,9 @@ VICTORY_LATE_WAIT=3 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1
 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024
 ```
 
+On RADV, `VICTORY_RELAY=2` has caused a GPU page fault and device loss; leave
+it off there.
+
 Evidence capture (the directory **must exist**, or every save logs
 `Path not found`):
 
@@ -160,6 +166,14 @@ startup.
 The first run is cold: 500–1,300 pipelines are built (the fork loads about
 960 from its library and builds the rest). Later runs reuse them.
 
+## Diagnosing
+
+- `VKD3D_DEBUG=warn` — why vkd3d-proton refuses a pipeline.
+- `WINEDEBUG=+server` — which wineserver requests dominate; pipe it into a
+  counter.
+- `victory translate --list --validate` — offline translation report over the
+  dump. Set `VICTORY_DXIL` to the prefix's `dxil.dll`.
+
 ## Speed
 
 Where the time went on the measured host, from `VICTORY_LOG=info` frame lines:
@@ -186,6 +200,25 @@ frame. The copy path is still the next target. `VICTORY_JOIN_COPIES=1` joins
 adjacent title copies; `VICTORY_CARD_BUFFERS_MIN_MB` and
 `VICTORY_CARD_BUFFERS_MB` move large copies to the card; `VICTORY_INPLACE`
 avoids copies by using title memory in place (first stage only).
+
+## Other configurations
+
+A second host (Arch, RX 7900 XTX) runs the same world at **1.1–1.6 fps**
+under plain Wine 11.20 rather than Proton, with vkd3d-proton 3.2.0, DXVK
+3.1.1 and DXC 1.9.2609 copied into the prefix's `system32`. Proton made no
+difference there; Wine 11 already uses ntsync.
+
+Most of that host's gain comes from outside this repository. Stock wineserver
+keeps a process's mapped views in a linked list and walks it on every map,
+unmap and overlap check; the title holds tens of thousands of views, so
+wineserver sat at ~70% CPU and each frame waited ~1.2 s before its first GPU
+work. An rb-tree index for views (`server/mapping.c`, `process.c`) drops
+wineserver to ~5% and frames to 0.6–0.9 s. Build the patched server and start
+it before Wine: `WINESERVER=` is ignored while a system wineserver is running.
+The patch and the full recipe are in
+[yayameowmeow's notes](https://github.com/yayameowmeow/victory-fork/blob/linux-wine/docs/linux-wine.md).
+
+That host also needed the Wine-side changes in the table below.
 
 ## Expected warnings
 
@@ -245,6 +278,9 @@ wrapper at the repository root.
 | Watchdog hooks (upstream #454) | [#364](https://github.com/fxceless/victory-fork/pull/364) |
 | 512 MiB pipeline-worker stacks | [#28](https://github.com/fxceless/victory-fork/pull/28) |
 | Copy and pipeline-library work | [#363](https://github.com/fxceless/victory-fork/pull/363) |
+| No blending on integer render targets | [#51](https://github.com/fxceless/victory-fork/pull/51) |
+| Wine writes without a wineserver request | [#256](https://github.com/fxceless/victory-fork/pull/256) |
+| One view per physical-page section | [#231](https://github.com/fxceless/victory-fork/pull/231) |
 | This page and wrapper (supervisor optional) | [#365](https://github.com/fxceless/victory-fork/pull/365) |
 
 ## References
