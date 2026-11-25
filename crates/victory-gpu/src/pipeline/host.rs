@@ -819,10 +819,10 @@ mod tests {
     #[test]
     fn a_host_pipeline_refused_by_the_library_is_not_listed_as_prebuilt() {
         use super::super::{Prebuild, library, prebuilt, save_pipeline_cache, use_pipeline_cache};
-        use victory_shader::{HwStage, emit::HostShader};
+        use victory_shader::native::{ComputeIo, NativeProgram, StageIo};
+        use victory_shader::{Container, HwStage, emit, io, range, resource};
         use windows::Win32::Foundation::E_INVALIDARG;
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::core::{HSTRING, PCWSTR, s};
+        use windows::core::{HSTRING, PCWSTR};
 
         // The device's pipeline cache has process-wide state.
         const CHILD: &str = "VICTORY_TEST_PIPELINE_STORE_REFUSAL";
@@ -840,14 +840,20 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
             );
-            assert!(output.status.success(), "{stdout}{stderr}");
+            assert!(
+                output.status.success(),
+                "pipeline cache child exited with {}\n{stdout}{stderr}",
+                output.status
+            );
             eprint!("{stderr}");
             return;
         }
 
+        eprintln!("opening the D3D12 device");
         let Some(host) = host() else {
             return;
         };
+        eprintln!("creating the directly indexed root signature");
         let Ok((root, root_bytes)) = root_signature(&host.device, &[], &[], true) else {
             eprintln!("no directly indexed root signature; skipped");
             return;
@@ -855,33 +861,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         use_pipeline_cache(dir.path().to_owned());
 
-        let compile = |threads| {
-            let source = format!("[numthreads({threads}, 1, 1)] void main() {{}}");
-            let mut blob: Option<ID3DBlob> = None;
-            // SAFETY: the source and output slot are live; copy the blob before releasing it.
-            unsafe {
-                D3DCompile(
-                    source.as_ptr().cast(),
-                    source.len(),
-                    None,
-                    None,
-                    None,
-                    s!("main"),
-                    s!("cs_5_1"),
-                    0,
-                    0,
-                    &mut blob,
-                    None,
-                )
-                .unwrap();
-                let blob = blob.unwrap();
-                std::slice::from_raw_parts(blob.GetBufferPointer().cast(), blob.GetBufferSize())
-                    .to_vec()
-            }
+        // Use the same SM 6.6 DXIL path as real prebuilds. The two shaders
+        // differ in group size, so the incoming description cannot load
+        // the pipeline stored under its name.
+        let container = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
         };
-        let original = compile(1);
-        let incoming = compile(2);
-        assert_ne!(original, incoming);
+        let shader = |threads| {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 1,
+                layout: Vec::new(),
+                used: Vec::new(),
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [threads, 1, 1],
+                }),
+                code: 0xbf81_0000u32.to_le_bytes().to_vec(), // s_endpgm
+            };
+            let (program, flow) = range::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let flow = flow.unwrap();
+            let resources =
+                resource::track(&program, &native.layout, native.stage, Some(&flow)).unwrap();
+            let io = io::raise(&program, &native).unwrap();
+            emit::emit(&container, &native, &program, &flow, &io, &resources).unwrap()
+        };
+        eprintln!("emitting the synthetic compute shaders");
+        let original = shader(1);
+        let incoming = shader(2);
+        assert_ne!(original.dxil, incoming.dxil);
         let desc = |code: &[u8]| D3D12_COMPUTE_PIPELINE_STATE_DESC {
             // SAFETY: the descriptor borrows the live root and bytecode.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -891,8 +902,9 @@ mod tests {
             },
             ..Default::default()
         };
-        let (original_desc, incoming_desc) = (desc(&original), desc(&incoming));
-        let name = library::name("compute", &root_bytes, &[&incoming], "");
+        let (original_desc, incoming_desc) = (desc(&original.dxil), desc(&incoming.dxil));
+        let name = library::name("compute", &root_bytes, &[&incoming.dxil], "");
+        eprintln!("storing the seed PSO");
         let mut cache = None;
         library::pipeline(
             &name,
@@ -909,6 +921,7 @@ mod tests {
             eprintln!("no D3D12 pipeline library; skipped");
             return;
         };
+        eprintln!("checking the mismatched load and refused store");
         let wide = HSTRING::from(&name);
         let name = PCWSTR(wide.as_ptr());
         // SAFETY: both descriptions borrow the live root and bytecode.
@@ -931,24 +944,8 @@ mod tests {
             );
         }
 
-        let prebuild = |container: &[u8], dxil| {
+        let prebuild = |container: &[u8], host| {
             let item = Prebuild::compute(container);
-            let host = HostShader {
-                stage: HwStage::Cs,
-                dxil,
-                user_data: Vec::new(),
-                samplers: Vec::new(),
-                static_samplers: Vec::new(),
-                root_cbvs: Vec::new(),
-                root_srvs: Vec::new(),
-                root_uavs: Vec::new(),
-                memory: false,
-                memory_writes: false,
-                view_addresses: false,
-                heap: false,
-                heap_writes: false,
-                view_marks: false,
-            };
             assert!(
                 item.shaders[0]
                     .translated
@@ -961,6 +958,7 @@ mod tests {
             item.make().expect("host PSO creation succeeds");
             item.key()
         };
+        eprintln!("running and saving the two prebuilds");
         let refused = prebuild(b"refused synthetic PSO", incoming);
         let stored = prebuild(b"stored synthetic PSO", original);
         save_pipeline_cache();
