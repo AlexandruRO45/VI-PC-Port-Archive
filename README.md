@@ -4,7 +4,7 @@ A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
 compatibility layer that runs an Xbox Series title natively on Windows from
 files the user supplies. This fork follows upstream
 `main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+correctly and playably on the development PC described below.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's
@@ -21,11 +21,22 @@ developer or publisher.
   (GPL-2.0-only) was used as a reference for how the same title behaves under
   another layer. Fixes inspired by it were written anew in VIctory's code.
 
+## Development PC
+
+| Component | Configuration |
+|-----------|---------------|
+| Processor | AMD Ryzen 9 9950X3D (16 cores, 32 threads) |
+| Graphics card | NVIDIA GeForce RTX 4090 (24 GB GDDR6X) |
+| Graphics driver | NVIDIA 621.40 |
+| Memory | 48 GB DDR5 (2 × 24 GB, configured at 8000 MT/s) |
+| Operating system | Windows 11 Pro 26H2, 64-bit (build 26300.10075) |
+
 ## Status of this fork (2026-11-25)
 
 **Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
-Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
-32 GB RAM. The Series X profile is used throughout.
+The results in this section come from Series X profile runs on the original
+test machine with Windows 11, an Intel Core i7-14700KF, an NVIDIA GeForce
+RTX 4070 with 12 GB of VRAM and 32 GB of system RAM.
 
 | Stage | State in this fork |
 |-------|--------------------|
