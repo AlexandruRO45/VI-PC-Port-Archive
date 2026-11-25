@@ -925,10 +925,9 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const KERNEL_PAGE: usize = 4096;
-    let Some(end_incl) = at.checked_add(len - 1) else {
+    let Some((first, last)) = page_span(at, len, KERNEL_PAGE) else {
         return (0, 1);
     };
-    let (first, last) = (at / KERNEL_PAGE, end_incl / KERNEL_PAGE);
     let of = last - first + 1;
     let mut there = 0;
     // SAFETY: plain data.
@@ -961,6 +960,22 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
         page += n;
     }
     (there, of)
+}
+
+/// The pages `[at, at + len)` covers: the first and last page numbers, both
+/// inclusive.
+///
+/// `None` when the range is empty or its end does not fit in an address. That
+/// second case is why this is a function of its own: a saturated end (the
+/// shape this replaced) makes the caller walk from wherever the range starts
+/// to the top of the address space, which on this address width is 2^52 page
+/// queries for one call. `page_span(0x1000, usize::MAX)` is the input that
+/// tells the two apart, and `readable`'s output for that input is the same
+/// either way -- so a test that only reads `readable`'s answer cannot see the
+/// difference. This one is asserted directly.
+fn page_span(at: usize, len: usize, page: usize) -> Option<(usize, usize)> {
+    let end_incl = at.checked_add(len.checked_sub(1)?)?;
+    Some((at / page, end_incl / page))
 }
 
 fn is_readable_commit(
@@ -1252,6 +1267,36 @@ mod title_memory_tests {
     }
 
     #[test]
+    /// The overflow half of `readable`, asserted where it happens rather than
+    /// through its answer: for a range that runs off the end of the address
+    /// space, saturating and refusing produce the same `(0, 1)`, so the
+    /// existing assertions pass against the defect.
+    #[test]
+    fn a_range_that_runs_past_the_address_space_covers_no_pages() {
+        const PAGE: usize = 4096;
+        assert_eq!(
+            super::page_span(0x1000, usize::MAX, PAGE),
+            None,
+            "a range from low memory to the top must be refused, not walked"
+        );
+        assert_eq!(super::page_span(usize::MAX - 8, 64, PAGE), None);
+        assert_eq!(super::page_span(0, 0, PAGE), None, "an empty range covers no pages");
+        // Neighbours that must keep working.
+        assert_eq!(super::page_span(0, 4096, PAGE), Some((0, 0)));
+        assert_eq!(
+            super::page_span(PAGE - 1, 2, PAGE),
+            Some((0, 1)),
+            "one byte on each side of a page boundary"
+        );
+        assert_eq!(
+            super::page_span(usize::MAX - PAGE + 1, PAGE, PAGE),
+            Some((usize::MAX / PAGE, usize::MAX / PAGE)),
+            // `usize::MAX - 4095` and `usize::MAX` are the same page; the
+            // range fits precisely because it stops before the wrap.
+            "a range that fits, ending exactly at the top"
+        );
+    }
+
     fn readable_and_query_reject_overflow_noaccess_and_guard_pages() {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE,
