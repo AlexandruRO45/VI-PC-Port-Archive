@@ -800,7 +800,34 @@ struct Resource {
     /// Textures also live on the host GPU (decision 0007); buffers do not
     /// yet.
     #[cfg(windows)]
-    host: Option<std::sync::Arc<HostTexture>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>,
+    #[cfg(windows)]
+    initial: HostInitial,
+    #[cfg(windows)]
+    key: Option<MemoryKey>,
+}
+
+#[cfg(windows)]
+struct HostInitial {
+    state: u32,
+    clear: Option<[u32; 5]>,
+}
+
+#[cfg(windows)]
+impl Resource {
+    /// Resource creation itself does not allocate a D3D12 texture. All
+    /// callers that create a host descriptor or record GPU work come here.
+    fn materialize(&self) -> Option<&std::sync::Arc<HostTexture>> {
+        let desc = host_desc(&self.desc)?;
+        self.host.get_or_init(|| {
+            let clear = self.initial.clear.as_ref().map_or(std::ptr::null(), |v| std::ptr::from_ref(v).cast());
+            shared_texture(self.data() as u64, &self.desc, &desc, self.initial.state, clear)
+        }).as_ref()
+    }
+
+    fn materialized(&self) -> Option<&std::sync::Arc<HostTexture>> {
+        self.host.get().and_then(Option::as_ref)
+    }
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1010,7 +1037,7 @@ pub(crate) mod life {
 #[cfg(all(test, windows))]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
+    let host = resource(this).materialize()?;
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -1025,7 +1052,7 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    resource(this).materialize().map(|h| &h.texture)
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -1034,7 +1061,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    resource(this).materialize().cloned()
 }
 
 /// The host description of a title texture: the same, without the
@@ -1158,21 +1185,36 @@ static MEMORY: std::sync::Mutex<
 fn shared_texture(
     address: u64,
     desc: &ResourceDesc,
+    d: &ResourceDesc,
     state: u32,
     clear: *const c_void,
 ) -> Option<std::sync::Arc<HostTexture>> {
-    let d = host_desc(desc)?;
     let key = memory_key(address, desc);
+    // A read-only placed view can be the first host use of memory already
+    // described by a UAV/RT object. Start with that object's capabilities
+    // and initial state, just as eager creation did at its declaration.
+    let candidate = key.and_then(|key| {
+        if d.flags & USES != 0 { return None; }
+        let index = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+        index.get(&address)?.iter().find_map(|&ptr| {
+            let r = resource(ptr as This);
+            let own = host_desc(&r.desc)?;
+            let compatible = family(own.format) == family(d.format)
+                || castable(own.format).into_iter().any(|f| family(f) == family(d.format));
+            (own.flags & USES != 0 && compatible && r.key == Some(key))
+                .then_some((own, r.initial.state, r.initial.clear))
+        })
+    });
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
     let live = key.and_then(|k| map.get(&k)?.upgrade());
     if let Some(t) = &live
-        && takes(t, &d)
+        && takes(t, d)
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(host) = crate::host::host() {
             // SAFETY: a plain query on a host description (same layout).
-            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[std::ptr::from_ref(&d).cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>().read_unaligned()]) };
+            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[std::ptr::from_ref(d).cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>().read_unaligned()]) };
             SAVED.fetch_add(info.SizeInBytes, std::sync::atomic::Ordering::Relaxed);
         }
         return live;
@@ -1180,7 +1222,11 @@ fn shared_texture(
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
-    let t = std::sync::Arc::new(make_texture(&d, state, clear)?);
+    let preferred = candidate.and_then(|(own, state, clear)| {
+        let clear = clear.as_ref().map_or(std::ptr::null(), |v| std::ptr::from_ref(v).cast());
+        make_texture(&own, state, clear).filter(|t| takes(t, d))
+    });
+    let t = std::sync::Arc::new(preferred.or_else(|| make_texture(d, state, clear))?);
     if let Some(k) = key {
         if live.is_some() {
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1212,7 +1258,7 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
 #[cfg(windows)]
 fn current(this: This) -> bool {
     let r = resource(this);
-    let (Some(h), Some(k)) = (&r.host, memory_key(r.data() as u64, &r.desc)) else {
+    let (Some(h), Some(k)) = (r.materialized(), memory_key(r.data() as u64, &r.desc)) else {
         return true;
     };
     let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -1377,25 +1423,38 @@ fn hand_out_resource(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = (state, clear);
-    #[allow(unused_mut)] // the host texture is set on Windows only
-    let mut resource = Box::new(Resource {
+    #[cfg(windows)]
+    let initial = HostInitial {
+        state,
+        // SAFETY: the caller's optional clear value lives through this call
+        // only. Keep the five words, not the caller's pointer.
+        clear: (!clear.is_null() && desc.dimension != BUFFER)
+            .then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
+    };
+    let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
         heap,
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: None,
+        host: std::sync::OnceLock::new(),
+        #[cfg(windows)]
+        initial,
+        #[cfg(windows)]
+        key: None,
     });
     #[cfg(windows)]
-    {
-        resource.host = shared_texture(resource.data() as u64, &desc, state, clear);
-    }
+    let resource = {
+        let mut resource = resource;
+        resource.key = memory_key(resource.data() as u64, &desc);
+        resource
+    };
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
-    } else if resource.host.is_some() {
+    } else {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(resource.data() as u64).or_default().push(at);
@@ -1440,7 +1499,7 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
             let a = resource(r);
             a.desc.flags & WRITTEN != 0
                 && bytes(&a.desc) == Some(want)
-                && matches!((&a.host, &b.host), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(x, y))
+                && matches!((a.materialized(), b.materialized()), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(x, y))
         })
 }
 
@@ -1449,8 +1508,7 @@ impl Drop for Resource {
     fn drop(&mut self) {
         #[cfg(feature = "diagnostics")]
         if self
-            .host
-            .as_ref()
+            .materialized()
             .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
         {
             // Before lists held their textures, this freed a texture that
@@ -1466,7 +1524,7 @@ impl Drop for Resource {
             }
         }
         #[cfg(feature = "diagnostics")]
-        if let Some(h) = &self.host {
+        if let Some(h) = self.materialized() {
             use windows::core::Interface;
             life::note(h.texture.as_raw() as usize, life::RELEASED, 0, life::holders(&h.texture));
         }
@@ -1488,7 +1546,7 @@ impl Drop for Resource {
                 self.data() as u64,
             );
         }
-        if let Some(copy) = self.host.take() {
+        if let Some(Some(copy)) = self.host.take() {
             crate::host::retire(copy);
         }
     }
@@ -1694,7 +1752,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    resource(out).materialize().is_some().then_some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1932,6 +1990,32 @@ mod tests {
     /// Title textures of one memory share a key in any format of the same
     /// element; another address, shape, element size or a depth texture is
     /// another memory. The library's own layout pick resolves as spelled.
+    #[cfg(windows)]
+    #[test]
+    fn unused_default_textures_do_not_materialize() {
+        let host = crate::host::host().expect("D3D12 host");
+        let desc = texture(1024, 1024, 28, 1);
+        let backing = Memory::zeroed(16 << 20, 1 << 16).unwrap();
+        let mut resources = Vec::new();
+        for i in 0..4 {
+            let mut out = std::ptr::null();
+            assert_eq!(create_at_address(std::ptr::null(), backing.address() + (i << 22),
+                &desc, 0, std::ptr::null(), &RESOURCE_IIDS[0], &mut out), S_OK);
+            resources.push(out);
+        }
+        let materialized = || resources.iter().filter(|&&r| resource(r).host.get().is_some()).count();
+        assert_eq!(materialized(), 0);
+        let first = host_copy(resources[0]).expect("first host use");
+        let second = host_copy(resources[0]).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(materialized(), 1);
+        // SAFETY: a live texture and its own D3D12 device.
+        let bytes = unsafe { host.device.GetResourceAllocationInfo(0, &[first.texture.GetDesc()]) }.SizeInBytes;
+        assert!(bytes >= 4 << 20 && bytes < u64::MAX / 4);
+        eprintln!("DEFAULT fixture: 4 title textures, 1 materialized; nominal {} -> {bytes} bytes", 4 * bytes);
+        for r in resources { resource_release(r); }
+    }
+
     #[test]
     fn one_memory_one_key_in_any_format_of_its_element() {
         let a = ResourceDesc { flags: 4, ..texture(192, 108, 42, 1) };
