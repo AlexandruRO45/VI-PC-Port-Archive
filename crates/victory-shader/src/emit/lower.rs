@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod trunc;
 
 type Why = &'static str;
 
@@ -523,6 +524,23 @@ fn smem_dwords(name: &str) -> Option<u32> {
     }
 }
 
+/// Where a program's constant table starts in its code: where its
+/// instructions end, unless a load at a fixed offset reads below that (then
+/// at `lowest`, the lowest offset any load or descriptor names). The
+/// program's constants follow its instructions, and a load at a computed
+/// offset reads them, not instruction bytes.
+fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Address], lowest: u32) -> u32 {
+    let code_end = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .max()
+        .unwrap_or(0) as u32;
+    let fixed_below = addresses.iter().any(|a| a.dynamic.is_none() && a.offset < code_end);
+    if fixed_below { lowest } else { lowest.max(code_end & !3) }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -719,22 +737,22 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<&crate::resource::Address> = self
                     .x
                     .res
                     .scalar
                     .iter()
-                    .map(|s| s.1)
+                    .map(|s| &s.1)
                     .chain(self.x.res.descriptors.iter().flat_map(|d| {
                         d.source.leaves().into_iter().filter_map(|l| match l {
-                            Source::Built { address, .. } => Some(*address),
+                            Source::Built { address, .. } => Some(address),
                             _ => None,
                         })
                     }))
                     .filter(|a| a.param == CODE)
-                    .map(|a| a.offset & !3)
-                    .min()
-                    .ok_or("a code table")?;
+                    .collect();
+                let lowest = addresses.iter().map(|a| a.offset & !3).min().ok_or("a code table")?;
+                let first = code_table_start(self.x.p, &addresses, lowest);
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -1433,11 +1451,16 @@ impl<'a> Lower<'a> {
                     None if self.s.pixel && self.x.io.initialized_sgprs == Some(n + 2) => {
                         Val::I32(self.s.m.i32(0))
                     }
-                    // The ordered section's collision id, and (`operand`) the
-                    // id of the last wave that left it: 0, so no wave waits;
-                    // the host's rasterizer-ordered views order the accesses.
+                    // The ordered section's collision id (overlap bit 31 clear,
+                    // wave id 1 in bits 16..25, collision id 0 in bits 0..9)
+                    // and (`operand`) the exiting wave id (0): wave id !=
+                    // collision id so `wave_id + ~collision_id` is 0 rather
+                    // than 0xffff_ffff and the wrap-around wait test
+                    // (`s_cmp_lt_u32 s5, s0`) exits immediately even if an
+                    // inactive lane falls through `s_cbranch_vccnz`; the host's
+                    // rasterizer-ordered views order the accesses instead.
                     None if self.pops && self.x.io.initialized_sgprs == Some(n + 1) => {
-                        Val::I32(self.s.m.i32(0))
+                        Val::I32(self.s.m.i32(1 << 16))
                     }
                     None => Val::Missing("a hardware SGPR input"),
                 },
@@ -3259,17 +3282,31 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as aligned to what they access
-        // and in bounds (out-of-bounds console accesses read 0 and drop
-        // writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        // shortcut: LDS addresses are taken as aligned to what they access.
+        // The address is `addr + offset` in 32 bits (it wraps: LLVM folds a
+        // base below 0 and an offset on GFX7 and later). Each dword comes
+        // with whether it lies inside the program's LDS:
+        // out-of-bounds console accesses read 0 and drop writes, and the
+        // host index is clamped so it never leaves the group-shared array.
+        let dword = |l: &mut Self, bytes: u32| -> (V, V) {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let n = l.s.m.i32(l.s.lds_dwords);
+            let inside = l.s.m.cmp(c, pred::IULT, index, n);
+            let zero = l.s.m.i32(0);
+            let index = l.s.m.select(c, inside, index, zero);
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            (l.s.m.element(c, lds, index), inside)
+        };
+        // A lane accesses when its guard holds and the dword is inside.
+        let on = |l: &mut Self, inside: V| -> V {
+            match guard {
+                Some(g) => l.s.m.bin(l.cur, Bin::And, g, inside),
+                None => inside,
+            }
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -3303,8 +3340,10 @@ impl<'a> Lower<'a> {
                     _ => return Err("an LDS read of bytes or halves"),
                 };
                 let reg = dst_reg.ok_or("an LDS read result")?;
-                let p = dword(self, offset);
+                let (p, inside) = dword(self, offset);
                 let x = self.s.m.load(c, p);
+                let zero = self.s.m.i32(0);
+                let x = self.s.m.select(c, inside, x, zero);
                 let sh = self.lds_shift(a, offset);
                 let x = self.s.m.bin(c, Bin::LShr, x, sh);
                 let left = self.s.m.i32(32 - bits);
@@ -3339,8 +3378,10 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
+                    let (p, inside) = dword(self, off + 4 * k);
                     let x = self.s.m.load(self.cur, p);
+                    let zero = self.s.m.i32(0);
+                    let x = self.s.m.select(self.cur, inside, x, zero);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -3377,8 +3418,9 @@ impl<'a> Lower<'a> {
                 let part = self.s.m.bin(c, Bin::Shl, mask, sh);
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, part, ones);
-                let p = dword(self, offset);
-                let at = self.begin_guarded(guard);
+                let (p, inside) = dword(self, offset);
+                let g = on(self, inside);
+                let at = self.begin_guarded(Some(g));
                 use super::bitcode::Rmw;
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, set);
@@ -3392,12 +3434,13 @@ impl<'a> Lower<'a> {
                     stores.push((off + 4 * k as u32, x));
                 }
             }
-            let at = self.begin_guarded(guard);
             for (off, x) in stores {
-                let p = dword(self, off);
+                let (p, inside) = dword(self, off);
+                let g = on(self, inside);
+                let at = self.begin_guarded(Some(g));
                 self.s.m.store(self.cur, p, x);
+                self.end_guarded(at, &[]);
             }
-            self.end_guarded(at, &[]);
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -3430,8 +3473,16 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
-        let at = self.begin_guarded(guard);
+        let (p, inside) = dword(self, offset);
+        // Lanes the guard leaves out keep the old register; lanes outside
+        // the LDS read 0.
+        let zero = self.s.m.i32(0);
+        let outside = match guard {
+            Some(g) => self.s.m.select(self.cur, g, zero, outside),
+            None => zero,
+        };
+        let g = on(self, inside);
+        let at = self.begin_guarded(Some(g));
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
@@ -4622,50 +4673,74 @@ impl<'a> Lower<'a> {
             (false, Some(a)) => Some(self.s.m.bin(c, Bin::And, e.miss, a)),
             (false, None) => Some(e.miss),
         };
-        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
         // A miss marks its page's entry, or with no block its region's
         // level-1 index (bits 0-4095, block 0's entries, which no copy has).
-        let zero = k(self, 0);
-        let empty = self.s.m.cmp(c, pred::EQ, e.block, zero);
-        let missed = self.s.m.select(c, empty, e.l1, e.entry);
+        let missed = self.memory_mark_index(e.entry, e.block, e.l1);
         let first = self.s.m.select(c, e.miss, missed, e.entry);
-        let mut bits = vec![first];
-        if write {
-            // A write marks the pages of its first and last byte (one block).
-            let (last, k16) = (k(self, bytes - 1), k(self, 16));
-            let end = self.s.m.bin(c, Bin::Add, lo, last);
-            let a = self.s.m.bin(c, Bin::LShr, lo, k16);
-            let b = self.s.m.bin(c, Bin::LShr, end, k16);
-            let pages = self.s.m.bin(c, Bin::Sub, b, a);
-            let next = self.s.m.bin(c, Bin::Add, e.entry, pages);
-            bits.push(self.s.m.select(c, e.miss, first, next));
-        }
         let bitmap = self.s.memory_dirty_handle();
         let at = self.begin_guarded(marks);
-        let c = self.cur;
-        let (k5, k31, k2, one) = (k(self, 5), k(self, 31), k(self, 2), k(self, 1));
-        let iu = self.s.m.undef(self.s.t.i32);
-        for n in bits {
-            // Byte offset of the bitmap dword; operation 2 is OR.
-            let word = self.s.m.bin(c, Bin::LShr, n, k5);
-            let word = self.s.m.bin(c, Bin::Shl, word, k2);
-            let bit = self.s.m.bin(c, Bin::And, n, k31);
-            let bit = self.s.m.bin(c, Bin::Shl, one, bit);
-            self.s.op(
-                c,
-                "atomicBinOp.i32",
-                Attr::NoUnwind,
-                self.s.t.i32,
-                78,
-                &[bitmap, k2, word, iu, iu, bit],
-            );
-        }
+        self.mark_memory_bit(bitmap, first);
         self.end_guarded(at, &[]);
+        if write && bytes > 1 {
+            // A multi-byte write crossing a 64 KiB boundary can enter another
+            // 256 MiB region or cross 4 GiB, so look up its last byte in the
+            // page table rather than offsetting `e.entry`.
+            let c = self.cur;
+            let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+            let (last, k16, mask) = (k(self, bytes - 1), k(self, 16), k(self, 0xFFFF));
+            let (end_lo, end_hi) = self.add64(lo, hi, last, false);
+            let end_hi = self.s.m.bin(c, Bin::And, end_hi, mask);
+            let a = self.s.m.bin(c, Bin::LShr, lo, k16);
+            let b = self.s.m.bin(c, Bin::LShr, end_lo, k16);
+            let crossed = self.s.m.cmp(c, pred::NE, a, b);
+            let t = self.s.m.bool(true);
+            let not_miss = self.s.m.bin(c, Bin::Xor, e.miss, t);
+            let mut cross = self.s.m.bin(c, Bin::And, not_miss, crossed);
+            if let Some(a) = active {
+                cross = self.s.m.bin(c, Bin::And, cross, a);
+            }
+            let at = self.begin_guarded(Some(cross));
+            let (entry2, block2, l1_2) = self.memory_page(end_lo, end_hi);
+            let second = self.memory_mark_index(entry2, block2, l1_2);
+            self.mark_memory_bit(bitmap, second);
+            self.end_guarded(at, &[]);
+        }
         (e.handle, e.offset)
     }
 
-    /// [`Self::memory`]'s lookup in the page table.
-    fn memory_entry(&mut self, lo: V, hi: V, write: bool) -> MemoryEntry {
+    /// Bitmap bit for a page-table lookup: `l1` in block 0 when the 256 MiB
+    /// region has no block, otherwise `entry`.
+    fn memory_mark_index(&mut self, entry: V, block: V, l1: V) -> V {
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let empty = self.s.m.cmp(c, pred::EQ, block, zero);
+        self.s.m.select(c, empty, l1, entry)
+    }
+
+    /// Sets bit `n` in the title-memory dirty bitmap `bitmap`.
+    fn mark_memory_bit(&mut self, bitmap: V, n: V) {
+        let c = self.cur;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (k5, k31, k2, one) = (k(self, 5), k(self, 31), k(self, 2), k(self, 1));
+        let iu = self.s.m.undef(self.s.t.i32);
+        // Byte offset of the bitmap dword; operation 2 is OR.
+        let word = self.s.m.bin(c, Bin::LShr, n, k5);
+        let word = self.s.m.bin(c, Bin::Shl, word, k2);
+        let bit = self.s.m.bin(c, Bin::And, n, k31);
+        let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+        self.s.op(
+            c,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            self.s.t.i32,
+            78,
+            &[bitmap, k2, word, iu, iu, bit],
+        );
+    }
+
+    /// The level-2 page-table index, block, and level-1 index of title
+    /// address `(hi:lo)` (`block == 0` when the 256 MiB region has no block).
+    fn memory_page(&mut self, lo: V, hi: V) -> (V, V, V) {
         let c = self.cur;
         let map = self.s.memory_handle();
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
@@ -4682,16 +4757,24 @@ impl<'a> Lower<'a> {
         let block = self.raw_dword(map, at);
         let block = self.s.m.select(c, inside, block, zero);
         // Level 2: block b holds 4096 entries of two dwords after level 1.
-        let (k16, k12, mask, k3, first) =
-            (k(self, 16), k(self, 12), k(self, 0xFFF), k(self, 3), k(self, 4096 * 4));
+        let (k16, k12, mask) = (k(self, 16), k(self, 12), k(self, 0xFFF));
         let page = self.s.m.bin(c, Bin::LShr, lo, k16);
         let page = self.s.m.bin(c, Bin::And, page, mask);
         let entry = self.s.m.bin(c, Bin::Shl, block, k12);
         let entry = self.s.m.bin(c, Bin::Or, entry, page);
+        (entry, block, l1)
+    }
+
+    /// [`Self::memory`]'s lookup in the page table.
+    fn memory_entry(&mut self, lo: V, hi: V, write: bool) -> MemoryEntry {
+        let (entry, block, l1) = self.memory_page(lo, hi);
+        let c = self.cur;
+        let map = self.s.memory_handle();
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (k3, first, four) = (k(self, 3), k(self, 4096 * 4), k(self, 4));
         let at = self.s.m.bin(c, Bin::Shl, entry, k3);
         let at = self.s.m.bin(c, Bin::Add, at, first);
         let view = self.raw_dword(map, at);
-        let four = k(self, 4);
         let at = self.s.m.bin(c, Bin::Add, at, four);
         let start = self.raw_dword(map, at);
         // Block 0's first entry names the null pair: no copy holds the page.
@@ -6296,8 +6379,22 @@ impl<'a> Lower<'a> {
                 }
                 int(self, r)
             }
-            "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
-            | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
+            "v_cvt_f32_u32" => {
+                // WARP can misround a full-width uitofp. Each 16-bit
+                // half and the scaled high half are exact in f32, so the
+                // sum rounds just once, whether the host fuses FMad or not.
+                let a = s(self, 0)?;
+                let (shift, mask) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                let hi = self.s.m.bin(c, Bin::LShr, a, shift);
+                let lo = self.s.m.bin(c, Bin::And, a, mask);
+                let hi = self.s.m.cast(c, Cast::SiToFp, hi, self.s.t.f32);
+                let lo = self.s.m.cast(c, Cast::SiToFp, lo, self.s.t.f32);
+                let scale = self.s.m.f32(65_536.0f32.to_bits());
+                let r = self.fmad(hi, scale, lo);
+                float(self, r)
+            }
+            "v_cvt_f32_i32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2"
+            | "v_cvt_f32_ubyte3" => {
                 let mut a = s(self, 0)?;
                 if let Some(n) = name.strip_prefix("v_cvt_f32_ubyte") {
                     let sh = self.s.m.i32(8 * u32::from(n.as_bytes()[0] - b'0'));
@@ -6407,16 +6504,6 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, lo, hi);
                 int(self, r)
             }
-            "v_cvt_f16_f32" if v.opsel == 0 => {
-                // Rounded as MODE says (nearest even by default) into the low half.
-                let a = f(self, 0)?;
-                let r = self.narrow16(a);
-                let Some(Operand::Vector { reg, .. }) = v.dst else {
-                    return Err("a 16-bit result outside a VGPR");
-                };
-                let r = self.low_half(inst, reg, r);
-                int(self, r)
-            }
             "v_pack_b32_f16" => {
                 // Two f16 sources (op_sel: their high halves; abs and neg on
                 // the sign bit) into the low and high half.
@@ -6441,13 +6528,6 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
                 let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
                 int(self, r)
-            }
-            "v_cvt_f32_f16" if v.opsel == 0 => {
-                let a = s(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[a]);
-                float(self, r)
             }
             "v_cndmask_b32" => {
                 let cond = match v.src.get(2) {
@@ -6708,89 +6788,6 @@ impl<'a> Lower<'a> {
                 Ok((x, self.s.m.i32(0)))
             }
         }
-    }
-
-    /// Truncate binary64 by clearing the fraction below the units bit.
-    fn trunc_f64(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
-        let Fields::Valu(v) = &inst.fields else {
-            unreachable!()
-        };
-        if v.clamp || v.omod != 0 || v.sdwa.is_some() || v.dpp.is_some() {
-            return Err("binary64 truncation modifiers");
-        }
-        let Some(Operand::Vector { reg, .. }) = v.dst else {
-            return Err("a binary64 destination pair");
-        };
-        let next = reg.checked_add(1).ok_or("a missing destination high word")?;
-        let source = *v.src.first().ok_or("a missing binary64 source")?;
-        let pair = |l: &mut Self, high: Reg| -> Result<(V, V), Why> {
-            let high = inst.read(high).ok_or("an unread high word")?;
-            Ok((l.operand(inst, &source)?, l.i32_of(high)?))
-        };
-        let (lo, mut hi) = match source {
-            Operand::Vector { reg, .. } => {
-                pair(self, Reg::V(reg.checked_add(1).ok_or("a missing high word")?))?
-            }
-            Operand::Scalar { code, .. } if code != NULL => {
-                pair(self, Reg::S(code.checked_add(1).ok_or("a missing high word")?))?
-            }
-            Operand::Literal(high) => (self.s.m.i32(0), self.s.m.i32(high)),
-            Operand::Const(code @ 240..=248) => {
-                let value = crate::resource::inline(code).ok_or("an unknown inline float")?;
-                let bits = f64::from(f32::from_bits(value)).to_bits();
-                (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
-            }
-            _ => {
-                let high = if matches!(source, Operand::Const(193..=208)) { u32::MAX } else { 0 };
-                (self.operand(inst, &source)?, self.s.m.i32(high))
-            }
-        };
-        let c = self.cur;
-        let sign = self.s.m.i32(0x8000_0000);
-        if v.abs & 1 != 0 {
-            let mask = self.s.m.i32(0x7fff_ffff);
-            hi = self.s.m.bin(c, Bin::And, hi, mask);
-        }
-        if v.neg & 1 != 0 {
-            hi = self.s.m.bin(c, Bin::Xor, hi, sign);
-        }
-
-        let k20 = self.s.m.i32(20);
-        let exp_mask = self.s.m.i32(0x7ff);
-        let exp = self.s.m.bin(c, Bin::LShr, hi, k20);
-        let exp = self.s.m.bin(c, Bin::And, exp, exp_mask);
-        let bias = self.s.m.i32(1023);
-        let low_dword_boundary = self.s.m.i32(1023 + 20);
-        let already_integral = self.s.m.i32(1023 + 52);
-        let zero = self.s.m.i32(0);
-        let ones = self.s.m.i32(u32::MAX);
-        let k31 = self.s.m.i32(31);
-        let keep_mask = |l: &mut Self, boundary| {
-            let bits = l.s.m.bin(c, Bin::Sub, boundary, exp);
-            let shift = l.s.m.bin(c, Bin::And, bits, k31);
-            l.s.m.bin(c, Bin::Shl, ones, shift)
-        };
-
-        // Once all fractional bits are in the low dword, its mask applies
-        // until there are none left. A shift of 32 clears the whole word.
-        let low_mask = keep_mask(self, already_integral);
-        let low_rounded = self.s.m.bin(c, Bin::And, lo, low_mask);
-        let low_kept = self.s.m.cmp(c, pred::IUGT, exp, low_dword_boundary);
-        let low_rounded = self.s.m.select(c, low_kept, low_rounded, zero);
-        let no_fraction = self.s.m.cmp(c, pred::IUGE, exp, already_integral);
-        let low_result = self.s.m.select(c, no_fraction, lo, low_rounded);
-
-        let high_mask = keep_mask(self, low_dword_boundary);
-        let high_rounded = self.s.m.bin(c, Bin::And, hi, high_mask);
-        let high_needs_rounding = self.s.m.cmp(c, pred::IULT, exp, low_dword_boundary);
-        let high_rounded = self.s.m.select(c, high_needs_rounding, high_rounded, hi);
-        let signed_zero = self.s.m.bin(c, Bin::And, hi, sign);
-        let below_one = self.s.m.cmp(c, pred::IULT, exp, bias);
-        let high_result = self.s.m.select(c, below_one, signed_zero, high_rounded);
-
-        self.write(inst, Reg::V(reg), low_result, guard);
-        self.write(inst, Reg::V(next), high_result, guard);
-        Ok(())
     }
 
     /// The low and high dwords of an i64.
@@ -8307,20 +8304,6 @@ impl<'a> Lower<'a> {
             }
         }
         false
-    }
-
-    /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
-    /// results keep the register's high half (GFX10).
-    fn low_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
-        let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) => o,
-            _ => self.s.m.i32(0),
-        };
-        let (high, low) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF));
-        let old = self.s.m.bin(c, Bin::And, old, high);
-        let x = self.s.m.bin(c, Bin::And, x, low);
-        self.s.m.bin(c, Bin::Or, old, x)
     }
 
     /// VOP3 f16 output modifiers: omod, then clamp, applied in f32 so the
@@ -10386,9 +10369,14 @@ impl<'a> Lower<'a> {
                         regs.insert(r);
                         tainted.insert(w);
                     }
-                } else if guard.is_none() {
-                    for w in &inst.writes {
-                        regs.remove(&w.0);
+                } else {
+                    // Only VGPR writes keep their old value under a lane guard;
+                    // SGPR and SCC writes (e.g. `v_readfirstlane_b32`, `v_cmp_*`)
+                    // always overwrite the register unconditionally.
+                    for &(r, _) in &inst.writes {
+                        if guard.is_none() || !matches!(r, Reg::V(_)) {
+                            regs.remove(&r);
+                        }
                     }
                 }
             }
@@ -10488,25 +10476,41 @@ impl<'a> Lower<'a> {
         r
     }
 
-    /// The instruction writing `v`.
-    fn def_inst(&self, v: Value) -> Option<&'a Inst> {
+    /// The block, instruction index, and instruction writing `v`.
+    fn def_site(&self, v: Value) -> Option<(usize, usize, &'a Inst)> {
         let b = *self.def_block.get(&v)?;
-        let p = self.x.p;
-        p.blocks[b]
+        let (i, inst) = self.x.p.blocks[b]
             .insts
             .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == v))
+            .enumerate()
+            .find(|(_, inst)| inst.writes.iter().any(|w| w.1 == v))?;
+        Some((b, i, inst))
     }
 
-    /// The constant `v` holds, `env` giving phi values: moves of constants.
+    /// The instruction writing `v`.
+    fn def_inst(&self, v: Value) -> Option<&'a Inst> {
+        self.def_site(v).map(|(_, _, inst)| inst)
+    }
+
+    /// The constant `v` holds, `env` giving phi values: unguarded moves of
+    /// unmodified constants.
     fn konst(&self, env: &HashMap<Value, u32>, v: Value) -> Option<u32> {
         if let Some(&k) = env.get(&v) {
             return Some(k);
         }
-        let inst = self.def_inst(v)?;
+        let (b, i, inst) = self.def_site(v)?;
+        if self.x.st.guards[b][i].is_some() {
+            return None;
+        }
         let op = match &inst.fields {
             Fields::Valu(w)
-                if inst.name() == "v_mov_b32" && w.sdwa.is_none() && w.dpp.is_none() =>
+                if inst.name() == "v_mov_b32"
+                    && w.sdwa.is_none()
+                    && w.dpp.is_none()
+                    && w.abs == 0
+                    && w.neg == 0
+                    && !w.clamp
+                    && w.omod == 0 =>
             {
                 w.src.first()?
             }
@@ -10580,26 +10584,58 @@ impl<'a> Lower<'a> {
     /// so keeping only the last few stays sound.
     fn live_edges(&self) -> HashSet<(Value, usize)> {
         const MAX_KNOWN: usize = 4;
+        /// What is known of the lanes along a path: the last few branch
+        /// conditions taken, in order (a value, not a heap allocation:
+        /// shaders with control flow push thousands of them).
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        struct Known {
+            conditions: [(Bool, bool); MAX_KNOWN],
+            len: usize,
+        }
+        impl Known {
+            fn get(&self) -> &[(Bool, bool)] {
+                &self.conditions[..self.len]
+            }
+            /// With `c` after the others, the oldest dropped past the limit.
+            fn and(mut self, c: (Bool, bool)) -> Known {
+                if self.len == MAX_KNOWN {
+                    self.conditions.copy_within(1.., 0);
+                    self.len -= 1;
+                }
+                self.conditions[self.len] = c;
+                self.len += 1;
+                self
+            }
+        }
+        let none = Known {
+            conditions: [(Bool::FALSE, false); MAX_KNOWN],
+            len: 0,
+        };
         let (p, st) = (self.x.p, &self.x.st);
-        let mut work: Vec<(Value, Vec<(Bool, bool)>)> =
-            self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
+        let mut work: Vec<(Value, Known)> = self.read_phis.iter().map(|&v| (v, none)).collect();
         let mut live = HashSet::new();
-        let mut seen = HashMap::<Value, Vec<Vec<(Bool, bool)>>>::new();
+        let mut seen = HashMap::<Value, Vec<Known>>::new();
+        // Whether some lane meets each set of conditions: paths into a join
+        // ask again for the same sets.
+        let mut meets = HashMap::<Known, bool>::new();
         while let Some((v, known)) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
             let done = seen.entry(v).or_default();
             // Known of fewer lanes than before: nothing new is live.
-            if done.iter().any(|d| d.iter().all(|c| known.contains(c))) {
+            if done
+                .iter()
+                .any(|d| d.get().iter().all(|c| known.get().contains(c)))
+            {
                 continue;
             }
-            done.push(known.clone());
+            done.push(known);
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 if self.tail[q].is_none() {
                     continue;
                 }
-                let mut k = Vec::new();
+                let mut k = none;
                 // Forward edges out of a block that is no loop's latch (a
                 // loop's exit is also taken at its iteration limit).
                 if let LaneExit::Branch {
@@ -10611,14 +10647,12 @@ impl<'a> Lower<'a> {
                     && self.rpo[taken] > self.rpo[q]
                     && self.rpo[not_taken] > self.rpo[q]
                 {
-                    k.clone_from(&known);
-                    k.push((when, taken == b));
-                    k.drain(..k.len().saturating_sub(MAX_KNOWN));
-                    if !st.bools.meet(&k) {
+                    k = known.and((when, taken == b));
+                    if !*meets.entry(k).or_insert_with(|| st.bools.meet(k.get())) {
                         continue;
                     }
                 } else if self.rpo[q] < self.rpo[b] {
-                    k.clone_from(&known);
+                    k = known;
                 }
                 live.insert((v, n));
                 let arg = p.blocks[b].phis[i].args[n];
@@ -10888,13 +10922,38 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower, packed_half};
+    use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// A program's constant table starts after its instructions, unless a
+    /// load at a fixed offset reads below that.
+    #[test]
+    fn the_code_table_starts_after_the_instructions() {
+        // s_nop 0, s_endpgm, then 1,000 dwords of constants.
+        let mut words = vec![0xBF80_0000, S_ENDPGM];
+        words.extend(0..1000u32);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let at = |offset: u32, dynamic: bool| resource::Address {
+            param: resource::CODE,
+            offset,
+            dynamic: dynamic.then_some(ir::Value(0)),
+        };
+        let (computed, fixed_after, fixed_inside) = (at(0, true), at(12, false), at(4, false));
+        // A load at a computed offset from the code's start: the table is
+        // the constants only, not the whole program.
+        assert_eq!(code_table_start(&p, &[&computed], 0), 8);
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_after], 0), 8);
+        // A load at a fixed offset inside the instructions keeps the start.
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_inside], 0), 0);
+        // Loads past the instructions only: from the lowest of them.
+        assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
+    }
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
@@ -10995,7 +11054,7 @@ mod tests {
     /// Lowers a one-thread compute program that copies four root constants
     /// (s0..s3) into v1..v4, runs `body`, and stores v0 to a raw buffer from a
     /// descriptor table, so the vector instructions in `body` have an effect.
-    fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
+    fn lower_valu(body: &[u32]) -> Result<Lowered, crate::ShaderError> {
         let mut words = vec![
             0xBE85_0380, // s_mov_b32 s5, 0
             0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
@@ -11028,7 +11087,37 @@ mod tests {
             vec![constants, root(RootType::Table, 4, 1)],
             vec![buffer],
         )
-        .map(|_| ())
+    }
+
+    fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
+        lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn vop3_conversion_modifiers_affect_the_lowering() {
+        for (op, first, second, modifier) in [
+            (0x0Au32, 1 << 15, 0, "clamp"),
+            (0x0B, 1 << 8, 0, "abs"),
+            (0x0B, 0, 1 << 29, "neg"),
+        ] {
+            let vop1 = lower_valu(&[0x7E00_0000 | op << 9 | 0x101])
+                .unwrap()
+                .dxil;
+            let vop3 = |first: u32, second: u32| {
+                lower_valu(&[
+                    0xD400_0000 | (0x180 + op) << 16 | first,
+                    0x101 | second,
+                ])
+                .unwrap()
+                .dxil
+            };
+            assert_eq!(vop1, vop3(0, 0), "VOP1/VOP3 control for op {op:#x}");
+            assert_ne!(
+                vop1,
+                vop3(first, second),
+                "VOP3 {modifier} was dropped for op {op:#x}"
+            );
+        }
     }
 
     #[test]
@@ -11749,6 +11838,74 @@ mod tests {
     }
 
     #[test]
+    fn guarded_or_modified_v_mov_b32_is_not_folded_as_constant() {
+        let group_ids_xy = 3 << 7;
+        let refusal = |code: &[u32]| match lowers(code, group_ids_xy) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        let direct = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        assert!(refusal(&direct).is_some());
+
+        // Guarded `v_mov_b32 v1, 0`: inactive lanes (v0 != 0) preserve v1 = -1,
+        // so they pass the compare after the join and read s6 (`s_memtime`).
+        let mut guarded = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_02C1, // v_mov_b32 v1, -1
+            0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+            0x7E02_0280, // v_mov_b32 v1, 0 (guarded)
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> join
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7E02_02C1, // v_mov_b32 v1, -1
+            0x7D84_02C1, // join: v_cmp_eq_u32 vcc_lo, -1, v1
+            0xBF86_0003, // s_cbranch_vccz -> end
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&guarded), refusal(&direct));
+        // Without the EXEC guard, `v_mov_b32 v1, 0` writes every lane and s6 is dead.
+        guarded[3] = 0xBF80_0000; // s_nop 0
+        guarded[5] = 0xBF80_0000; // s_nop 0
+        lowers(&guarded, group_ids_xy).expect("unguarded v_mov_b32 still folds");
+
+        // VOP3 `v_mov_b32_e64 v1, -(1.0)`: neg modifier flips 1.0f to -1.0f,
+        // matching the compare after the join so s6 is live.
+        let mut negated = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xD581_0001,
+            0x2000_00F2, // v_mov_b32_e64 v1, -(1.0)
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> join
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7E02_02F3, // v_mov_b32 v1, -1.0
+            0x7D84_02F3, // join: v_cmp_eq_u32 vcc_lo, -1.0, v1
+            0xBF86_0003, // s_cbranch_vccz -> end
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&negated), refusal(&direct));
+        // Clearing the neg bit yields unmodified 1.0f (!= -1.0f), so s6 is dead.
+        negated[3] = 0x0000_00F2; // v_mov_b32_e64 v1, 1.0
+        lowers(&negated, group_ids_xy).expect("unmodified v_mov_b32_e64 still folds");
+    }
+
+    #[test]
     fn a_missing_value_on_a_path_no_lane_takes_is_dead() {
         let refusal = |code: &[u32]| match lowers(code, 1 << 7) {
             Ok(()) => None,
@@ -11795,6 +11952,43 @@ mod tests {
             S_ENDPGM,
         ];
         assert_eq!(refusal(&kept), None);
+    }
+
+    #[test]
+    fn a_guarded_scalar_write_kills_a_stale_sgpr() {
+        // s6 holds a missing value (timestamp) where s0 == 0 and 5 where
+        // s0 != 0; the flag in v1 skips the first read on the s0 == 0 path.
+        // After that, inside a guarded region (EXEC narrowed without a
+        // branch), `v_readfirstlane_b32` overwrites s6 unconditionally before
+        // s6 is read again.
+        let mut words = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0002, // s_cbranch_scc1 -> join
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7E02_02C1, // v_mov_b32 v1, -1
+            0x7D84_02C1, // join: v_cmp_eq_u32 vcc_lo, -1, v1
+            0xBF86_0003, // s_cbranch_vccz -> after
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 -> after
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0x7DA4_0080, // after: v_cmpx_eq_u32 exec_lo, 0, v0 (narrows EXEC)
+            0x7E0C_0500, // v_readfirstlane_b32 s6, v0 (guarded, writes SGPR)
+            0x7DA4_0006, // v_cmpx_eq_u32 exec_lo, s6, v0 (reads new s6)
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            S_ENDPGM,
+        ];
+        let group_ids_xy = 3 << 7;
+        lowers(&words, group_ids_xy).expect("guarded v_readfirstlane overwrites stale s6");
+        // Without the overwrite, the guarded compare reads the stale s6.
+        let mut no_kill = words;
+        no_kill[13] = 0xBF80_0000; // s_nop 0
+        assert!(lowers(&no_kill, group_ids_xy).is_err());
+        // With the flag set on both paths, the earlier read sees the stale s6.
+        words[2] = 0x7E02_02C1; // v_mov_b32 v1, -1
+        assert!(lowers(&words, group_ids_xy).is_err());
     }
 
     #[test]
