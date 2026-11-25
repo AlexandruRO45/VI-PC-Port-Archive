@@ -348,7 +348,11 @@ fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     let dir = container_dir(root, name);
     let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
     if !done {
-        let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
+        let display = match std::fs::read_to_string(old.join(".display")) {
+            Ok(display) => display,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return None,
+        };
         let mut blobs = Vec::new();
         for entry in std::fs::read_dir(old).ok()? {
             let entry = entry.ok()?;
@@ -1226,11 +1230,8 @@ mod tests {
         assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
     }
 
-    /// A Windows reader denying sharing must delay migration of the whole
-    /// legacy save, not commit a partial version that hides the locked blob.
     #[cfg(windows)]
-    #[test]
-    fn a_locked_legacy_blob_delays_migration_until_it_can_be_read() {
+    fn assert_locked_legacy_entry_delays_migration(entry: &str) {
         use std::os::windows::fs::OpenOptionsExt;
 
         let saves = tempfile::tempdir().unwrap();
@@ -1243,12 +1244,12 @@ mod tests {
         let locked = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(0)
-            .open(old.join("locked%20blob"))
+            .open(old.join(entry))
             .unwrap();
         assert_eq!(
-            std::fs::read(old.join("locked%20blob")).unwrap_err().raw_os_error(),
+            std::fs::read(old.join(entry)).unwrap_err().raw_os_error(),
             Some(32),
-            "the fixture must deny a second read with ERROR_SHARING_VIOLATION"
+            "the fixture must deny a second read with ERROR_SHARING_VIOLATION: {entry}"
         );
 
         let p = Provider::open(saves.path(), Some("scid")).unwrap();
@@ -1256,7 +1257,7 @@ mod tests {
         assert!(old.is_dir(), "the unreadable source must be retained");
         assert!(
             !c.dir.join("v1").exists(),
-            "migration must not commit a version missing the locked blob"
+            "migration must not commit a version missing the locked entry: {entry}"
         );
         drop(locked);
         assert_eq!(std::fs::read(old.join("readable%20blob")).unwrap(), b"first payload");
@@ -1275,6 +1276,39 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
+    }
+
+    /// A Windows reader denying sharing must delay migration of the whole
+    /// legacy save, not commit a partial version that hides the locked blob.
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_legacy_blob_delays_migration_until_it_can_be_read() {
+        assert_locked_legacy_entry_delays_migration("locked%20blob");
+    }
+
+    /// Display metadata has the same retry guarantee as the blobs it names.
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_legacy_display_delays_migration_until_it_can_be_read() {
+        assert_locked_legacy_entry_delays_migration(".display");
+    }
+
+    /// Old containers need not have display metadata; absence means empty,
+    /// whereas an existing but unreadable file must delay migration.
+    #[test]
+    fn missing_legacy_display_metadata_can_still_migrate() {
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
+        let old = root.join("Player");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("blob"), b"kept payload").unwrap();
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(!old.exists());
+        let c = p.container("Player");
+        assert_eq!(read(&c, None).unwrap(), [("blob".into(), b"kept payload".to_vec())]);
+        let v = current_named(&c.dir, "Player").unwrap().unwrap();
+        assert_eq!(v.display, "");
     }
 
     /// An empty configuration id names none. As a folder name it would be
