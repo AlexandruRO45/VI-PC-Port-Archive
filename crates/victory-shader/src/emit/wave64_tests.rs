@@ -450,3 +450,68 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// A 64-lane console wave on a 32-lane host: inside a per-lane branch,
+/// reading a wave-uniform LDS address (`ds_read_b32`, even into a VGPR that
+/// previously held a per-lane value) and feeding the result to
+/// `v_readfirstlane_b32` needs no cross-half exchange because every active
+/// lane holds the same value. A divergent LDS read in the same branch must
+/// still be refused.
+#[test]
+fn a_first_lane_read_of_a_uniform_lds_load_inside_a_lane_branch() {
+    let make_program = |addr_inst: u32| {
+        let words = [
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0 (forces two-host-wave exchange)
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0200, // v_mov_b32 v3, s0
+            0xD834_0000,
+            0x0000_0302, // ds_write_b32 v2, v3
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBF8A_0000, // s_barrier
+            0x7D88_0001, // v_cmp_gt_u32 vcc, s1, v0  (lanes < s1)
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_000A, // s_cbranch_execz +10 -> restore exec
+            0x7E0A_0300, // v_mov_b32 v5, v0 (divergent old value in dst > addr)
+            addr_inst,   // v4 = 0 (uniform) or v0 << 2 (divergent)
+            0xD8D8_0000,
+            0x0500_0004, // ds_read_b32 v5, v4
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A0A_0A00, // v_add_nc_u32 v5, s0, v5
+            0x7E0E_0505, // v_readfirstlane_b32 s7, v5
+            0x7E00_0207, // v_mov_b32 v0, s7
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+            0xBEFE_040C,          // s_mov_b64 exec, s[12:13]
+        ];
+        let mut n = native(&words);
+        if let StageIo::Cs(cs) = &mut n.io {
+            cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+        }
+        n
+    };
+
+    // Divergent LDS address (v_lshlrev_b32 v4, 2, v0): must stay refused.
+    let divergent = make_program(0x3408_0082);
+    let p_div = ir::build(&divergent.code, divergent.wave64, divergent.vgprs).expect("ir::build");
+    let err = lowered(&divergent, &p_div, &HashSet::new()).unwrap_err();
+    assert!(
+        matches!(err, ShaderError::Unsupported { what, .. } if what == "a first-lane read where not every lane runs"),
+        "{err:?}"
+    );
+
+    // Uniform LDS address (v_mov_b32 v4, 0): lowers, validates, and runs on 32-lane hardware.
+    let uniform = make_program(0x7E08_0280);
+    let p_uni = ir::build(&uniform.code, uniform.wave64, uniform.vgprs).expect("ir::build");
+    let shader = lowered(&uniform, &p_uni, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (val, below) in [(17u32, 64u32), (42, 40), (99, 10), (123, 1)] {
+        let Some(got) = on_the_card(&shader, [val, below]) else { return };
+        assert_eq!(got, val * 2, "val = {val}, below = {below}");
+    }
+    eprintln!("ran on the hardware device: first-lane read of a uniform LDS load inside a lane branch");
+}
