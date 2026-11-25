@@ -31,3 +31,21 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+
+  # The crates with code that runs anywhere, tested on Linux too: quicker
+  # than the Windows job, and it keeps them free of Windows-only paths.
+  # victory-gpu's tests run one at a time: they share global queues (#116).
+  portable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: >-
+          cargo test --locked
+          -p victory-core -p victory-formats -p victory-pipeline
+          -p victory-game -p victory-shader
+      - name: Tests, victory-gpu
+        run: cargo test --locked -p victory-gpu -- --test-threads=1
