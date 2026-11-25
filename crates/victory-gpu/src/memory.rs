@@ -331,7 +331,7 @@ impl Shared {
                         ONCE.call_once(|| tracing::warn!("no descriptor slots for a title memory copy's views: it reads as missing"));
                         continue;
                     };
-                    heap.raw_pair_at(slot, Some(&c.buffer), c.range().1.next_multiple_of(4));
+                    heap.raw_pair_at(slot, Some(c.host_resource()), c.range().1.next_multiple_of(4));
                     self.pairs.insert(key, slot);
                     slot
                 }
@@ -467,6 +467,22 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // shortcut: root UAV writes of such a list still go back (their
         // bytes, `Shadow::gpu_writes`).
         let withheld = if pages + regions > 0 { writes.len() as u64 } else { 0 };
+        if withheld == 0 && !writes.is_empty() {
+            let ranges: Vec<_> = writes
+                .iter()
+                .filter_map(|&(k, at)| {
+                    let copy = &copies[k];
+                    copy.vram_resource()?;
+                    let (offset, len) = copy.page_range(at as usize)?;
+                    Some((copy.clone(), offset, len))
+                })
+                .collect();
+            if !ranges.is_empty()
+                && let Some(host) = crate::host::host()
+            {
+                host.readback_vram_in_execute(&ranges);
+            }
+        }
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
             let n = copies[k].copy_back_page(at as usize);

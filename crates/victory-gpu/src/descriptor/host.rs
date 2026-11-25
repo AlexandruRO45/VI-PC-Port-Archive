@@ -969,9 +969,10 @@ fn buffer_srv(
         }
         return None;
     };
+    let resource = shadow.host_resource();
     buffer.FirstElement = shadow.offset(start) / element;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
+    if !in_buffer(resource, first, count, element) {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(start = format_args!("{start:#x}"), first, count, element, "refused buffer view: empty or past its copy");
@@ -983,9 +984,9 @@ fn buffer_srv(
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
-            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
+            .CreateShaderResourceView(resource, Some(&desc), at)
     };
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((resource.clone(), own.then_some(shadow))))
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in
@@ -1026,8 +1027,9 @@ fn buffer_uav(
     }
     let start = address + buffer.FirstElement * element;
     let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let resource = shadow.host_resource();
     // SAFETY: a live buffer.
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+    let flags = unsafe { resource.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
@@ -1035,7 +1037,7 @@ fn buffer_uav(
     buffer.FirstElement = shadow.offset(start) / element;
     buffer.CounterOffsetInBytes = 0;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
+    if !in_buffer(resource, first, count, element) {
         once!(first, count, element, "unordered buffer view empty or past its host copy");
         return None;
     }
@@ -1043,10 +1045,10 @@ fn buffer_uav(
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
-            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
+            .CreateUnorderedAccessView(resource, None::<&ID3D12Resource>, Some(&desc), at)
     };
     MARK.with(|m| m.set(shadow.mark_entry(start)));
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((resource.clone(), own.then_some(shadow))))
 }
 
 thread_local! {

@@ -105,6 +105,39 @@ impl DirtyRanges {
         std::mem::take(&mut self.ranges)
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// Returns the sub-intervals of `[offset, offset + len)` not covered by `self`.
+    pub(crate) fn subtract(&self, offset: u64, len: u64) -> Vec<(u64, u64)> {
+        let Some(end) = offset.checked_add(len) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut cur = offset;
+        for &(a, alen) in &self.ranges {
+            let b = a + alen;
+            if b <= cur {
+                continue;
+            }
+            if a >= end {
+                break;
+            }
+            if a > cur {
+                out.push((cur, a - cur));
+            }
+            cur = cur.max(b);
+            if cur >= end {
+                break;
+            }
+        }
+        if cur < end {
+            out.push((cur, end - cur));
+        }
+        out
+    }
+
     #[cfg(test)]
     pub(crate) fn as_slice(&self) -> &[(u64, u64)] {
         &self.ranges
@@ -224,6 +257,30 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         (from < to).then(|| ((from - start) as u64, (to - from) as u64))
+    }
+
+    /// Sub-ranges of `[offset, offset + len)` not currently pending CPU->VRAM sync.
+    pub(crate) fn subtract_vram_dirty(&self, offset: u64, len: u64) -> Vec<(u64, u64)> {
+        if !self.vram_has_dirty.load(Ordering::Acquire) {
+            return (len > 0).then_some((offset, len)).into_iter().collect();
+        }
+        let dirty = self.vram_dirty.lock().unwrap_or_else(|e| e.into_inner());
+        dirty.subtract(offset, len)
+    }
+
+    /// Buffer-relative `(offset, len)` if a snapshot segment covers
+    /// `[address, address + len)` (non-empty) and will be compared on `copy_back`.
+    pub(crate) fn snapshot_range(&self, address: usize, len: usize) -> Option<(u64, u64)> {
+        let (from, to) = self.inside(address, len);
+        if from >= to {
+            return None;
+        }
+        let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        before
+            .0
+            .iter()
+            .any(|(at, bytes)| *at <= from && to <= at + bytes.len())
+            .then_some((from as u64, (to - from) as u64))
     }
 
     /// Bytes from a title address to the buffer's end.
@@ -628,12 +685,19 @@ impl Shadow {
             Some(before) => {
                 let before = &before[from - page..to - page];
                 let mut changed = false;
+                let mut host_updated = false;
                 for ((t, h), b) in title.iter_mut().zip(host.iter_mut()).zip(before) {
                     if *h != *b && *t != *h {
                         *t = *h;
                         changed = true;
                     }
-                    *h = *t;
+                    if *h != *t {
+                        *h = *t;
+                        host_updated = true;
+                    }
+                }
+                if host_updated {
+                    self.mark_vram_dirty((from - start) as u64, n as u64);
                 }
                 changed.then_some(title.as_ptr())
             }
@@ -899,52 +963,76 @@ pub(crate) fn view_writes() -> Option<u64> {
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
-    let Some(b) = bitmap() else {
-        return;
-    };
-    #[cfg(feature = "diagnostics")]
-    let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
-    let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
-    // SAFETY: the mapped bitmap; the GPU is done with it (one submission
-    // runs at a time).
-    let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
-    // Marks of offsets past the bitmap land in its last bit, no copy's.
-    bits[words - 1] = 0;
-    let mut marked = Vec::new();
-    let used = (marks().end as usize).div_ceil(32).min(words);
-    for (w, word) in bits[..used].iter_mut().enumerate() {
-        let mut x = std::mem::take(word);
-        while x != 0 {
-            marked.push((w * 32) as u32 + x.trailing_zeros());
-            x &= x - 1;
+    copy_back_marks_with_vram(withheld, &[]);
+}
+
+/// Like [`copy_back_marks`], also coalescing `extra_vram_ranges` (unmarked
+/// snapshot ranges needing VRAM readback) into the same readback pass before
+/// any copy-back reads the host buffer.
+pub(crate) fn copy_back_marks_with_vram(
+    withheld: &[(Arc<Shadow>, usize, usize)],
+    extra_vram_ranges: &[(Arc<Shadow>, u64, u64)],
+) {
+    let mut active: Vec<(Arc<Shadow>, usize)> = Vec::new();
+    if let Some(b) = bitmap() {
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
+        let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
+        // SAFETY: the mapped bitmap; the GPU is done with it (one submission
+        // runs at a time).
+        let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
+        // Marks of offsets past the bitmap land in its last bit, no copy's.
+        bits[words - 1] = 0;
+        let mut marked = Vec::new();
+        let used = (marks().end as usize).div_ceil(32).min(words);
+        for (w, word) in bits[..used].iter_mut().enumerate() {
+            let mut x = std::mem::take(word);
+            while x != 0 {
+                marked.push((w * 32) as u32 + x.trailing_zeros());
+                x &= x - 1;
+            }
         }
-    }
-    if marked.is_empty() {
-        return;
-    }
-    let pages: Vec<(Arc<Shadow>, usize)> = {
-        let m = marks();
-        marked
-            .iter()
-            .filter_map(|&n| {
-                let (&base, copy) = m.owners.range(..=n).next_back()?;
-                let copy = copy.upgrade()?;
-                let k = n - base;
-                (k < pages(copy.start, copy.len)).then(|| {
-                    let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
-                    (copy, page)
+        if !marked.is_empty() {
+            let m = marks();
+            active = marked
+                .iter()
+                .filter_map(|&n| {
+                    let (&base, copy) = m.owners.range(..=n).next_back()?;
+                    let copy = copy.upgrade()?;
+                    let k = n - base;
+                    (k < pages(copy.start, copy.len)).then(|| {
+                        let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
+                        (copy, page)
+                    })
                 })
-            })
-            .collect()
-    };
-    for (copy, page) in pages {
-        if withheld
-            .iter()
-            .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
-        {
-            continue;
+                .filter(|(copy, page)| {
+                    !withheld
+                        .iter()
+                        .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < *page + PAGE && *page < a + n)
+                })
+                .collect();
         }
+    }
+
+    let mut vram_ranges: Vec<(Arc<Shadow>, u64, u64)> = extra_vram_ranges.to_vec();
+    for (copy, page) in &active {
+        if copy.vram_resource().is_some()
+            && let Some((offset, len)) = copy.page_range(*page)
+        {
+            vram_ranges.push((copy.clone(), offset, len));
+        }
+    }
+    if !vram_ranges.is_empty()
+        && let Some(host) = host()
+    {
+        host.readback_vram_in_execute(&vram_ranges);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    let _timed = (!active.is_empty()).then(|| crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs));
+    for (copy, page) in active {
         let written = copy.copy_back_marked(page);
         #[cfg(feature = "diagnostics")]
         {

@@ -882,7 +882,7 @@ impl State {
         let index = self.root_run.1;
         self.root_run.1 += 1;
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
-        host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
+        host.raw_view_at(index, Some(shadow.host_resource()), 0, shadow.range().1 & !3, uav);
         if uav {
             host.set_mark(index, shadow.mark_entry(shadow.range().0));
         }
@@ -1699,8 +1699,10 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        let args_res = args.host_resource();
+        let counter_res = counter.as_ref().map(|(s, _)| s.host_resource());
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        if !crate::indirect::bound(list, args_res, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -1721,7 +1723,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, args_res);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1749,9 +1751,9 @@ impl State {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &args.buffer,
+                args_res,
                 args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
+                counter_res,
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
@@ -1760,11 +1762,11 @@ impl State {
         // A listed frame: what the records held (after the clamp).
         #[cfg(feature = "diagnostics")]
         if crate::capture::dump_on() {
-            let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            let count = counter_res.zip(counter.as_ref()).map(|(r, (s, at))| (r, s.offset(*at)));
             let name = crate::pipeline::shaders_of(pipeline);
-            crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
+            crate::capture::read_indirect(list, (args_res, args.offset(arguments)), count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, args_res);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
