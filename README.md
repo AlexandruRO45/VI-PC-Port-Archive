@@ -13,6 +13,22 @@ This repository contains the compatibility code. Game files and assets come
 from your own copy. The project is independent of the game's developer and
 publisher.
 
+## Compatibility fixes (2026-11-25)
+
+- Save recovery limits cleanup to the staging names it owns. See
+  [VIctory #2716](https://github.com/Marvisak/VIctory/pull/2716).
+- Shader fixes improve normalized buffer conversion and declare the required
+  feature for writeable views in vertex, geometry, and mesh shaders. The
+  compute test harness clears its output buffers and textures before dispatch.
+- Texture copies between aliases of the same host subresource avoid invalid
+  Direct3D 12 commands. Capture logs include alpha ranges and traced barriers.
+- The loader releases the source executable buffer as soon as its prepared
+  image is available.
+
+These changes use the [VIctory main snapshot](https://github.com/Marvisak/VIctory/commit/13f91caee25f2fdf2c062be5f7a27f058e51cbca)
+and the [fxceless texture-copy fix](https://github.com/fxceless/victory-fork/commit/a25370661ed1343e2f2d5e79669ec8db4e60dc68)
+as references. The run measurements below identify their own revisions.
+
 ## Development PC
 
 | Component | Configuration |

@@ -86,6 +86,7 @@ pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -484,6 +485,11 @@ impl Shader {
                 e.usage = mask;
             }
         }
+        let compute = self.threads.is_some() && self.mesh.is_none() && self.geometry.is_none();
+        // DXIL requires this flag for declared UAVs outside pixel and compute shaders.
+        if !self.root_uavs.is_empty() && !self.pixel && !compute {
+            self.flags |= flags::UAVS_EVERY_STAGE;
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -798,6 +804,9 @@ impl Shader {
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
         }
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
@@ -903,5 +912,44 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::bitcode::Term;
+    use super::*;
+
+    #[test]
+    fn declared_uavs_outside_pixel_and_compute_set_the_feature_flag() {
+        for (pixel, threads, declared) in [
+            (false, None, true),
+            (true, None, true),
+            (false, Some([1, 1, 1]), true),
+            (false, None, false),
+        ] {
+            let mut shader = Shader::new(pixel);
+            shader.threads = threads;
+            if declared {
+                let handle = shader.root_uav_handle(1);
+                let (or, zero, one) = (shader.m.i32(2), shader.m.i32(0), shader.m.i32(1));
+                let integer = shader.t.i32;
+                let unused = shader.m.undef(integer);
+                shader.op(
+                    shader.entry,
+                    "atomicBinOp.i32",
+                    Attr::NoUnwind,
+                    integer,
+                    78,
+                    &[handle, or, zero, unused, unused, one],
+                );
+            }
+            shader.m.terminate(shader.entry, Term::Ret);
+            let dxil = shader.finish();
+            let feature_offset = u32::from_le_bytes(dxil[32..36].try_into().unwrap()) as usize;
+            assert_eq!(&dxil[feature_offset..feature_offset + 4], b"SFI0");
+            let features = dxil[feature_offset + 8];
+            assert_eq!(features & 4 != 0, declared && !pixel && threads.is_none());
+        }
     }
 }
