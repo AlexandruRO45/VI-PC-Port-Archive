@@ -128,6 +128,19 @@ impl Drop for State {
     }
 }
 
+/// `VICTORY_TRACE_AFTER`: the presented frame the env-gated dispatch traces
+/// start at, so loading bakes do not spend the trace budget before the world.
+#[cfg(feature = "diagnostics")]
+fn trace_after() -> u64 {
+    static AFTER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *AFTER.get_or_init(|| {
+        std::env::var("VICTORY_TRACE_AFTER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
@@ -1037,7 +1050,9 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if std::env::var_os("VICTORY_COMPUTE_TRACE").is_some() {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+            if crate::queue::presented() >= trace_after()
+                && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2000
+            {
                 tracing::info!(
                     "{}",
                     self.op_text(format!("compute {x}x{y}x{z}"), true, true)
@@ -1228,7 +1243,9 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if std::env::var_os("VICTORY_MESH_TRACE").is_some() {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
+            if crate::queue::presented() >= trace_after()
+                && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2000
+            {
                 tracing::info!("{}", self.op_text(format!("mesh {x}"), false, true));
             }
         }
