@@ -172,6 +172,11 @@ pub(super) fn meetings(
         if all[b] {
             continue;
         }
+        // A divergent `s_barrier` inside `!all` cannot safely run across two 32-lane host waves
+        // (under group sync it deadlocks when only one half enters; under fence-only it drops sync).
+        if block.insts.iter().any(|inst| inst.name() == "s_barrier") {
+            return None;
+        }
         let r = find(&mut region, b);
         for inst in &block.insts {
             if !matches!(inst.fields, Fields::Ds { .. }) {
@@ -963,7 +968,7 @@ impl<'a> AddrCtx<'a> {
         }
 
         let inst = &self.p.blocks[def_b].insts[def_i];
-        let folded = self.eval_inst(inst, def_b, visiting);
+        let folded = self.eval_inst(inst, def_b, v, visiting);
         visiting.remove(&v);
         if folded.is_some() {
             return folded;
@@ -985,7 +990,7 @@ impl<'a> AddrCtx<'a> {
                 v,
                 &mut seen,
             ) {
-                let tz = uniform_result_tz(inst);
+                let tz = uniform_result_tz(inst, v);
                 return Some(SymVal::Linear(uniform_unit(v, tz)));
             }
         }
@@ -1026,11 +1031,15 @@ impl<'a> AddrCtx<'a> {
         &self,
         inst: &Inst,
         def_b: usize,
+        v: Value,
         visiting: &mut HashSet<Value>,
     ) -> Option<SymVal> {
         let name = inst.name();
         match &inst.fields {
             Fields::Sop { dst, src, imm } => {
+                if !is_primary_sop_dst(inst, dst.as_ref(), v) {
+                    return None;
+                }
                 let mut sop = |k: usize| {
                     src.get(k)
                         .and_then(|op| self.eval_operand(inst, op, def_b, visiting))
@@ -1060,12 +1069,12 @@ impl<'a> AddrCtx<'a> {
                     _ => None,
                 }
             }
-            Fields::Valu(v) => {
-                if has_valu_modifiers(v) {
+            Fields::Valu(valu) => {
+                if !is_primary_valu_dst(inst, valu.dst.as_ref(), v) || has_valu_modifiers(valu) {
                     return None;
                 }
                 let mut src = |k: usize| {
-                    v.src
+                    valu.src
                         .get(k)
                         .and_then(|op| self.eval_operand(inst, op, def_b, visiting))
                 };
@@ -1117,6 +1126,21 @@ impl<'a> AddrCtx<'a> {
             _ => None,
         }
     }
+}
+
+fn is_primary_sop_dst(inst: &Inst, dst: Option<&Operand>, v: Value) -> bool {
+    matches!(
+        dst,
+        Some(Operand::Scalar { code, dwords: 1 })
+            if !(106..PARKED).contains(code) && inst.write(Reg::S(*code)) == Some(v)
+    )
+}
+
+fn is_primary_valu_dst(inst: &Inst, dst: Option<&Operand>, v: Value) -> bool {
+    matches!(
+        dst,
+        Some(Operand::Vector { reg, dwords: 1 }) if inst.write(Reg::V(*reg)) == Some(v)
+    )
 }
 
 fn has_valu_modifiers(v: &crate::gfx10::Valu) -> bool {
@@ -1669,6 +1693,9 @@ fn is_group_uniform_val(
                 && check_op(soffset, seen)
         }
         Fields::Valu(valu) => {
+            if !is_primary_valu_dst(inst, valu.dst.as_ref(), v) {
+                return false;
+            }
             let safe_valu = matches!(
                 name,
                 "v_mov_b32"
@@ -1732,7 +1759,7 @@ fn is_group_uniform_val(
     }
 }
 
-fn uniform_result_tz(inst: &Inst) -> u32 {
+fn uniform_result_tz(inst: &Inst, v: Value) -> u32 {
     let const_op = |op: &Operand| match *op {
         Operand::Const(c) => inline(c),
         Operand::Literal(x) => Some(x),
@@ -1740,17 +1767,34 @@ fn uniform_result_tz(inst: &Inst) -> u32 {
         _ => None,
     };
     match (inst.name(), &inst.fields) {
-        ("s_and_b32" | "v_and_b32", Fields::Sop { src, .. }) => {
-            src.iter().filter_map(const_op).map(u32::trailing_zeros).max().unwrap_or(0)
+        ("s_and_b32" | "v_and_b32", Fields::Sop { dst, src, .. })
+            if is_primary_sop_dst(inst, dst.as_ref(), v) =>
+        {
+            src.iter()
+                .filter_map(const_op)
+                .map(u32::trailing_zeros)
+                .max()
+                .unwrap_or(0)
         }
-        ("s_and_b32" | "v_and_b32", Fields::Valu(v)) => {
-            v.src.iter().filter_map(const_op).map(u32::trailing_zeros).max().unwrap_or(0)
+        ("s_and_b32" | "v_and_b32", Fields::Valu(valu))
+            if is_primary_valu_dst(inst, valu.dst.as_ref(), v) =>
+        {
+            valu.src
+                .iter()
+                .filter_map(const_op)
+                .map(u32::trailing_zeros)
+                .max()
+                .unwrap_or(0)
         }
-        ("s_lshl_b32", Fields::Sop { src, .. }) => {
+        ("s_lshl_b32", Fields::Sop { dst, src, .. })
+            if is_primary_sop_dst(inst, dst.as_ref(), v) =>
+        {
             src.get(1).and_then(const_op).map_or(0, |s| s & 31)
         }
-        ("v_lshlrev_b32", Fields::Valu(v)) => {
-            v.src.first().and_then(const_op).map_or(0, |s| s & 31)
+        ("v_lshlrev_b32", Fields::Valu(valu))
+            if is_primary_valu_dst(inst, valu.dst.as_ref(), v) =>
+        {
+            valu.src.first().and_then(const_op).map_or(0, |s| s & 31)
         }
         _ => 0,
     }
@@ -2504,5 +2548,123 @@ mod tests {
             unreachable!();
         };
         assert!(super::meetings(&sp, &sst, &sio, &sres, scs, &sall).is_none());
+    }
+
+    #[test]
+    fn vop3b_carry_is_not_confused_with_valu_dst() {
+        // VOP3B encoders: v_add_co_u32 (op 0x30f), v_sub_co_u32 (op 0x310)
+        let v_add_co = |vdst: u8, sdst: u8, src0: u32, src1: u32| -> [u32; 2] {
+            [
+                (0x35u32 << 26) | (0x30fu32 << 16) | (u32::from(sdst) << 8) | u32::from(vdst),
+                (src1 << 9) | src0,
+            ]
+        };
+        let v_sub_co = |vdst: u8, sdst: u8, src0: u32, src1: u32| -> [u32; 2] {
+            [
+                (0x35u32 << 26) | (0x310u32 << 16) | (u32::from(sdst) << 8) | u32::from(vdst),
+                (src1 << 9) | src0,
+            ]
+        };
+        // v_lshlrev_b32 vdst, shift(const), s_src -> VOP3 op 0x11a (since src1 is SGPR)
+        let v_lshlrev_ks = |vdst: u8, shift: u8, sgpr: u8| -> [u32; 2] {
+            [
+                (0x35u32 << 26) | (0x11au32 << 16) | u32::from(vdst),
+                (u32::from(sgpr) << 9) | u32::from(128 + shift),
+            ]
+        };
+        let assert_has_op = |body: &[u32], threads: [u32; 3], op: &str| {
+            let native = make_cs(body, threads, 1, 16);
+            let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+            assert!(
+                p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == op),
+                "expected decoded {op}"
+            );
+        };
+
+        // 1. Refinement B bypass attempt: v_add_co_u32 v5, s[2:3], 0, v0; v2 = s2 << 2.
+        // At runtime s2 == 0 so all 64 lanes share LDS[0]; carry s2 must NOT be folded as v0.
+        let mut ref_b_carry = Vec::new();
+        ref_b_carry.extend(v_add_co(5, 2, 128, 256)); // v5, s[2:3] = 0 + v0
+        ref_b_carry.extend(v_lshlrev_ks(2, 2, 2)); // v2 = s2 << 2
+        ref_b_carry.push(v_mov_k(3, 7));
+        ref_b_carry.extend(ds_write_b32(2, 3, 0));
+        ref_b_carry.extend(ds_read_b32(4, 2, 0));
+        ref_b_carry.extend(store_uav(4));
+        let ref_b_body = if_v0_lt_s0(&ref_b_carry);
+        assert_has_op(&ref_b_body, [64, 1, 1], "v_add_co_u32");
+        assert!(run_meetings(&ref_b_body, [64, 1, 1], 1).is_none());
+        assert_eq!(lowered_wave(&ref_b_body, [64, 1, 1], 1), 64);
+
+        // 2. Refinement A bypass attempt: v_add_co_u32 v5, s[2:3], s1, 4; write v5+0, read s2+4.
+        // When s1 == 0, v5 == 4 and s2 == 0, so both access byte 4! Must refuse.
+        let mut ref_a_carry = Vec::new();
+        ref_a_carry.extend(v_add_co(5, 2, 1, 132)); // v5, s[2:3] = s1 + 4
+        ref_a_carry.push(v_mov_k(3, 7));
+        ref_a_carry.extend(ds_write_b32(5, 3, 0));
+        ref_a_carry.push(v_mov_s(2, 2)); // v2 = carry s2
+        ref_a_carry.extend(ds_read_b32(4, 2, 4));
+        ref_a_carry.extend(store_uav(4));
+        let ref_a_body = if_v0_lt_s0(&ref_a_carry);
+        assert_has_op(&ref_a_body, [64, 1, 1], "v_add_co_u32");
+        assert!(run_meetings(&ref_a_body, [64, 1, 1], 1).is_none());
+        assert_eq!(lowered_wave(&ref_a_body, [64, 1, 1], 1), 64);
+
+        // 3. Per-wave carry ballot high dword on non-64-multiple group [96, 1, 1]:
+        // v_sub_co_u32 v5, s[2:3], s1, s2 in `all` block -> s3 differs between wave 0 and wave 1
+        // and must NOT be classified as group-uniform.
+        let mut sub_co_body = Vec::new();
+        sub_co_body.extend(v_sub_co(5, 2, 1, 2)); // v5, s[2:3] = s1 - s2
+        let mut sub_inner = vec![v_mov_s(2, 3), v_mov_k(3, 7)]; // v2 = carry high dword s3
+        sub_inner.extend(ds_write_b32(2, 3, 0));
+        sub_inner.extend(ds_read_b32(4, 2, 4));
+        sub_inner.extend(store_uav(4));
+        sub_co_body.extend(if_v0_lt_s0(&sub_inner));
+        assert_has_op(&sub_co_body, [96, 1, 1], "v_sub_co_u32");
+        assert!(run_meetings(&sub_co_body, [96, 1, 1], 1).is_none());
+        assert_eq!(lowered_wave(&sub_co_body, [96, 1, 1], 1), 64);
+
+        // 4. Positive control: primary dst v5 of v_add_co_u32 (0 + v0) IS lane-private tid * 4.
+        let mut ref_b_ok = Vec::new();
+        ref_b_ok.extend(v_add_co(5, 2, 128, 256)); // v5, s[2:3] = 0 + v0
+        ref_b_ok.push(v_lshlrev_k(2, 2, 5)); // v2 = v5 << 2 == tid * 4
+        ref_b_ok.push(v_mov_k(3, 7));
+        ref_b_ok.extend(ds_write_b32(2, 3, 0));
+        ref_b_ok.extend(ds_read_b32(4, 2, 0));
+        ref_b_ok.extend(store_uav(4));
+        let ref_b_ok_body = if_v0_lt_s0(&ref_b_ok);
+        assert_has_op(&ref_b_ok_body, [64, 1, 1], "v_add_co_u32");
+        assert!(run_meetings(&ref_b_ok_body, [64, 1, 1], 1).is_some());
+        assert_eq!(lowered_wave(&ref_b_ok_body, [64, 1, 1], 1), 32);
+    }
+
+    #[test]
+    fn s_barrier_inside_divergent_region_refuses_wave32() {
+        const S_BARRIER: u32 = 0xBF8A_0000;
+
+        // Refinement A accesses separated by `s_barrier` inside `!all` -> MUST refuse (`64`).
+        let mut ref_a = vec![v_mov_k(2, 0), v_mov_k(3, 7)];
+        ref_a.extend(ds_write_b32(2, 3, 0));
+        ref_a.push(S_BARRIER);
+        ref_a.extend(ds_read_b32(4, 2, 4));
+        ref_a.extend(store_uav(4));
+        let body_a = if_v0_lt_s0(&ref_a);
+        let native_a = make_cs(&body_a, [64, 1, 1], 1, 16);
+        let pa = ir::build(&native_a.code, native_a.wave64, native_a.vgprs).expect("ir::build");
+        assert!(
+            pa.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier"),
+            "expected decoded s_barrier"
+        );
+        assert!(run_meetings(&body_a, [64, 1, 1], 1).is_none());
+        assert_eq!(lowered_wave(&body_a, [64, 1, 1], 1), 64);
+
+        // Refinement B lane-private accesses with `s_barrier` inside `!all` -> MUST refuse (`64`).
+        let mut ref_b = vec![v_lshlrev_k(2, 2, 0), v_mov_k(3, 7)];
+        ref_b.extend(ds_write_b32(2, 3, 0));
+        ref_b.push(S_BARRIER);
+        ref_b.extend(ds_read_b32(4, 2, 0));
+        ref_b.extend(store_uav(4));
+        let body_b = if_v0_lt_s0(&ref_b);
+        assert!(run_meetings(&body_b, [64, 1, 1], 1).is_none());
+        assert_eq!(lowered_wave(&body_b, [64, 1, 1], 1), 64);
     }
 }
