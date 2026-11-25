@@ -46,6 +46,7 @@ The game also imports Windows core API sets for services such as files, timing a
 | `indirect-dispatch` | `ExecuteIndirect` on its Series X\|S slot matches a direct dispatch |
 | `texture-readback` | `CopyMemoryToMemoryX` reads a guest texture into title memory |
 | `ray-tracing-builder` | `XboxBvhBuilder` builds a structure with a size report, copies it and builds it again in a batch (needs ray tracing) |
+| `thread-dimensions` | Slot 80 `USE_THREAD_DIMENSIONS` (`0x20`) converts thread counts using the bound PSO's `[numthreads]` and fails closed without one |
 | `xbox-shader` | A console shader's pipeline and dispatch ([shader cache](#shader-cache)) |
 
 ```sh

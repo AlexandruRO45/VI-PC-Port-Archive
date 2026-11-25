@@ -19,7 +19,7 @@ La branche `main` est protégée. **Personne ne peut y pousser directement.** Po
 Une pull request n'est fusionnée qu'après la relecture et l'accord du mainteneur, et quand les deux checks de la CI passent :
 
 - `lint` (Linux, ~1 min) : ruff et cohérence des README dans les 9 langues ;
-- `pytest` (Windows) : build du runtime C++ et du Rust, puis toute la suite. Elle vérifie aussi que le nombre de tests annoncé dans les README est exact.
+- `pytest` (Windows) : build du runtime C++ et du Rust, puis toute la suite. Elle vérifie aussi le nombre de tests annoncé dans les README : la centaine inférieure suivie de « + » (806 tests → « 800+ »). Ne le changez que si votre PR franchit une centaine.
 
 ### Bonnes pratiques
 
