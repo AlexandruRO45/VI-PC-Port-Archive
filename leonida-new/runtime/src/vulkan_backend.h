@@ -2091,6 +2091,22 @@ public:
             return UINT64_MAX;
         }
         if (result != VK_SUCCESS) return 0;
+        if (value == UINT64_MAX) {
+            // A lost device can show itself here first: measured on NVIDIA 621.24 and reported on 617.14, the counter
+            // query succeeds with UINT64_MAX (and vkWaitSemaphores with a zero timeout succeeds too) before any call
+            // has returned VK_ERROR_DEVICE_LOST. vkDeviceWaitIdle is what then says so, and it is also what a driver
+            // needs to have returned before vkGetDeviceFaultInfoEXT answers (LEONIDA_DEVICE_FAULT=1). When
+            // vkDeviceWaitIdle succeeds, nothing is recorded and the value is returned as the driver gave it.
+            VkResult idle = VK_SUCCESS;
+            {
+                std::lock_guard lock(context_.submit_mutex());
+                idle = context_.observe_result(context_.vk.vkDeviceWaitIdle(context_.device()),
+                                               "vkDeviceWaitIdle (a fence counter of UINT64_MAX)");
+            }
+            if (idle == VK_ERROR_DEVICE_LOST)
+                context_.mark_device_lost(
+                    "a fence's counter read UINT64_MAX and vkDeviceWaitIdle then returned VK_ERROR_DEVICE_LOST");
+        }
         return value;
     }
 
