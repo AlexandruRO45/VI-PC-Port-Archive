@@ -801,9 +801,14 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         for block in aliased {
             g.aliased.remove(&block);
         }
-        if changed {
-            bump_region_epochs(at, end);
-        }
+        // Whether or not a block of it was guarded or noted a hole: a walk
+        // that found a block unmapped (`check_each` in `guard`) left it
+        // unnoted, and memory mapped there since is written without a
+        // fault. A range holding it must not stay known clean (with
+        // `VICTORY_EPOCH_CHECK=1`, 20 spans of 524,000 called clean were
+        // not at 64 MiB regions, 148 of 2.1 million at 64 KiB ones).
+        let _ = changed;
+        bump_region_epochs(at, end);
     }
     crate::shadow::remapped(at as u64, end as u64);
     crate::resource::evict_placed_textures(at as u64, end as u64);

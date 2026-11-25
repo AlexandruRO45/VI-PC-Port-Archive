@@ -718,17 +718,74 @@ impl Shadow {
         let lazy = lazy && !forced && always != 2;
         if mode == WATCHED_GUARDED {
             let ge = crate::watch::region_epoch(from, to);
-            {
+            let clean = {
                 let spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
-                if spans.get(&(from, to)) == Some(&ge) {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        use crate::copystat::{C, add};
-                        add(C::Checked, (to - from) as u64);
-                        add(C::Unchanged, (to - from) as u64);
-                    }
-                    return 0;
+                spans.get(&(from, to)) == Some(&ge)
+            };
+            if clean {
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from) as u64);
                 }
+                // Diagnostics (`VICTORY_EPOCH_CHECK=1`): the walk all the
+                // same. What it copies the epochs would have left stale.
+                static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *CHECK.get_or_init(|| std::env::var_os("VICTORY_EPOCH_CHECK").is_some_and(|v| v == "1"))
+                    && let Some((now, written)) = crate::watch::writes_guarded(from, to)
+                {
+                    // Blocks this walk found written (it guarded them again),
+                    // and whole pages written after this copy took them: with
+                    // sound epochs neither exists while the epoch stands.
+                    // (What `copy_stale` copies is no measure: it takes a
+                    // page only partly in the range every time.)
+                    let newly = written.iter().filter(|&&(_, w)| w == now).count();
+                    let behind = {
+                        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                        let base = start / PAGE;
+                        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                        written
+                            .iter()
+                            .filter(|&&(p, w)| {
+                                let whole = (p * PAGE).max(start) >= from && ((p + 1) * PAGE).min(end) <= to;
+                                let at = copied.get(p.wrapping_sub(base)).copied().unwrap_or(0);
+                                whole && at != 0 && w > at
+                            })
+                            .count()
+                    };
+                    let stood = crate::watch::region_epoch(from, to) == ge;
+                    self.copy_stale(from, to, now, &written);
+                    static CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    static STALE: [std::sync::atomic::AtomicU64; 2] =
+                        [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+                    let checked = CHECKED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if newly > 0 || behind > 0 {
+                        // With the epoch moved meanwhile it is a write that
+                        // came between the look and the walk: no fault.
+                        let stale = STALE[usize::from(stood)].fetch_add(1, Ordering::Relaxed) + 1;
+                        if stood && (stale <= 40 || stale.is_power_of_two()) {
+                            tracing::warn!(
+                                stale,
+                                checked,
+                                from = format_args!("{from:#x}"),
+                                len = to - from,
+                                newly,
+                                behind,
+                                "a span the region epochs called clean was not"
+                            );
+                        }
+                    }
+                    if checked.is_power_of_two() && checked >= 1 << 14 {
+                        tracing::info!(
+                            checked,
+                            written_meanwhile = STALE[0].load(Ordering::Relaxed),
+                            stale = STALE[1].load(Ordering::Relaxed),
+                            "clean spans checked by the walk"
+                        );
+                    }
+                }
+                return 0;
             }
             if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
                 let copied = self.copy_stale(from, to, now, &written);
