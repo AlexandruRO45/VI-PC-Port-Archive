@@ -1,13 +1,13 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
-//! translator never serves an old translation. Entries go through
+//! cache folder, keyed by the container's content and by the translator
+//! that translated it (its sources, this file's encoding and the settings,
+//! `build`), so a rebuilt translator never serves an old translation. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
-//! must be added to `encode` and `decode` too (entries of older builds
-//! are ignored anyway).
+//! must be added to `encode` and `decode` too (entries encoded the old
+//! way are ignored anyway: this file is part of the key).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -49,13 +49,14 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// What identifies the translations of this build: the translator's
+/// sources ([`victory_shader::SOURCE_HASH`]), this file, which holds the
+/// entry's encoding ([`ENCODING`]), and the settings translation runs with.
+/// Not the whole executable: a build that changes only other code keeps
+/// the translations cached before it.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -63,45 +64,46 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                // Which group barriers wait is part of the translation too.
-                bytes.push(victory_shader::emit::group_sync());
-                // So are the switches that pick the form of a wave64 program:
-                // without them here a run with `VICTORY_WAVE_WIDE=0` was
-                // served the translations an earlier run of the same
-                // executable had cached with the switch unset.
-                for name in [
-                    "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_DEEP_SKIPS",
-                    "VICTORY_WAVE_OWN_BITS",
-                    "VICTORY_F16_NEAREST",
-                    "VICTORY_WAVE_LOCAL",
-                    "VICTORY_STRICT_JOINS",
-                    "VICTORY_MESH_OUTPUT_STRICT",
-                ] {
-                    bytes.extend_from_slice(name.as_bytes());
-                    bytes.push(b'=');
-                    if let Some(value) = std::env::var_os(name) {
-                        bytes.extend_from_slice(value.as_encoded_bytes());
-                    }
-                    bytes.push(0);
-                }
-                // And which clean-up passes ran over the translated code.
-                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
-            }
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
-            }
-        }
+        key(victory_shader::SOURCE_HASH, ENCODING, limit, &settings())
     })
+}
+
+/// The translation settings besides the loop limit: which group barriers
+/// wait, the switches that pick the form of a wave64 program (without
+/// them a run with `VICTORY_WAVE_WIDE=0` was served what an earlier run had
+/// cached with the switch unset), and the clean-up passes that ran.
+fn settings() -> Vec<u8> {
+    let mut bytes = vec![victory_shader::emit::group_sync()];
+    for name in [
+        "VICTORY_WAVE_WIDE",
+        "VICTORY_WAVE_DEEP_SKIPS",
+        "VICTORY_WAVE_OWN_BITS",
+        "VICTORY_F16_NEAREST",
+        "VICTORY_WAVE_LOCAL",
+        "VICTORY_STRICT_JOINS",
+        "VICTORY_MESH_OUTPUT_STRICT",
+    ] {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(b'=');
+        if let Some(value) = std::env::var_os(name) {
+            bytes.extend_from_slice(value.as_encoded_bytes());
+        }
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+    bytes
+}
+
+/// This file as built: a change to how entries are encoded changes the key.
+const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
+
+fn key(translator: &str, encoding: &[u8], limit: u32, settings: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(translator.as_bytes());
+    h.update(blake3::hash(encoding).as_bytes());
+    h.update(&limit.to_le_bytes());
+    h.update(settings);
+    *h.finalize().as_bytes()
 }
 
 /// Translates a console shader container and reports whether the cache supplied it.
@@ -536,6 +538,31 @@ mod tests {
             assert_eq!(result, Ok(expected));
         }
         assert_eq!(runs.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn the_key_covers_translator_encoding_and_settings() {
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, b"s");
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, b"s"));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, b"s"));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, b"s"));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, b"s"));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, b"t"));
+        assert_eq!(
+            *build(),
+            key(
+                victory_shader::SOURCE_HASH,
+                ENCODING,
+                victory_shader::emit::loop_limit(),
+                &settings()
+            )
+        );
+        // The encoding part is this file as built.
+        assert!(
+            std::str::from_utf8(ENCODING)
+                .unwrap()
+                .contains("fn encode(s: &HostShader) -> Vec<u8>")
+        );
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
