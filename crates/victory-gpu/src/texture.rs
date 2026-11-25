@@ -164,6 +164,8 @@ pub(crate) struct Through {
 pub(crate) struct AliasCopy {
     /// The source's host copy (its address names it in the write marks).
     pub(crate) source: Arc<crate::resource::HostTexture>,
+    /// The placed view's host copy (names the pair with `source`).
+    pub(crate) placed: Arc<crate::resource::HostTexture>,
     pub(crate) to: ID3D12Resource,
     pub(crate) through: Arc<Through>,
 }
@@ -351,6 +353,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         && !list.touches(source)
         && !list.touches(placed)
         && let Some(copy) = crate::resource::host_copy(source)
+        && let Some(placed_copy) = crate::resource::host_copy(placed)
     {
         let _ = list.transition(source, COPY_SOURCE);
         card_writes(list, placed, to, None);
@@ -358,6 +361,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         list.keep(&through.buffer);
         list.alias_at_submission(AliasCopy {
             source: copy,
+            placed: placed_copy,
             to: to.clone(),
             through: through.clone(),
         });

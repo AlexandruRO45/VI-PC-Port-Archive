@@ -898,13 +898,24 @@ const GATHER_SETS: usize = 8;
 /// The write marks of [`crate::texture::alias_once`], kept at submission:
 /// the submissions' numbers, the last one that wrote each host copy (by
 /// the copy's address), and the last one that made each alias copy (by
-/// source copy, source texture, placed texture).
+/// source copy and placed copy).
+///
+/// The marks are keyed by the host copies' addresses, and each holds a weak
+/// reference to its copies: while a mark lives, the allocation behind its
+/// address cannot be freed and handed to another copy, so a new pair can
+/// never inherit an old pair's mark. Marks of copies that are gone are swept
+/// once there are many.
 #[derive(Default)]
 struct AliasWrites {
     seq: u64,
-    written: std::collections::HashMap<usize, u64>,
-    copied: std::collections::HashMap<(usize, usize, usize), u64>,
+    written: std::collections::HashMap<usize, (u64, AliasWeak)>,
+    copied: std::collections::HashMap<(usize, usize), (u64, AliasWeak, AliasWeak)>,
 }
+
+type AliasWeak = std::sync::Weak<crate::resource::HostTexture>;
+
+/// Marks past which [`AliasWrites`] sweeps the ones whose copies are gone.
+const ALIAS_MARKS_SWEEP: usize = 4096;
 
 static ALIAS_WRITES: Mutex<Option<AliasWrites>> = Mutex::new(None);
 
@@ -6409,17 +6420,24 @@ impl HostList {
                 let seq = marks.seq;
                 for a in wanted.iter() {
                     let source = std::sync::Arc::as_ptr(&a.source) as usize;
-                    let key = (source, a.source.texture.as_raw() as usize, a.to.as_raw() as usize);
-                    let last_write = marks.written.get(&source).copied().unwrap_or(0);
-                    let fresh = marks.copied.get(&key).is_some_and(|&at| last_write < at);
+                    let key = (source, std::sync::Arc::as_ptr(&a.placed) as usize);
+                    let last_write = marks.written.get(&source).map_or(0, |w| w.0);
+                    let fresh = marks.copied.get(&key).is_some_and(|c| last_write < c.0);
                     ALIAS_COUNTS[usize::from(fresh)].fetch_add(1, Ordering::Relaxed);
                     if !fresh {
-                        marks.copied.insert(key, seq);
+                        let weak = (std::sync::Arc::downgrade(&a.source), std::sync::Arc::downgrade(&a.placed));
+                        marks.copied.insert(key, (seq, weak.0, weak.1));
                         run.push((a.source.texture.clone(), a.to.clone(), a.through.clone()));
                     }
                 }
                 for &key in written.iter() {
-                    marks.written.insert(key, seq);
+                    if let Some((_, _, copy)) = states.get(&key) {
+                        marks.written.insert(key, (seq, std::sync::Arc::downgrade(copy)));
+                    }
+                }
+                if marks.copied.len() + marks.written.len() > ALIAS_MARKS_SWEEP {
+                    marks.copied.retain(|_, c| c.1.strong_count() > 0 && c.2.strong_count() > 0);
+                    marks.written.retain(|_, w| w.1.strong_count() > 0);
                 }
             }
             run
