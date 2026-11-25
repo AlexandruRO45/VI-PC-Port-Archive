@@ -61,6 +61,14 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                let host = crate::host::host();
+                bytes.push(host.map_or(0, |h| 1 + u8::from(h.warp)));
+                let lanes = host.and_then(|h| h.wave_lanes.as_ref());
+                bytes.push(u8::from(lanes.is_some()));
+                if let Some(lanes) = lanes {
+                    bytes.extend_from_slice(&lanes.start().to_le_bytes());
+                    bytes.extend_from_slice(&lanes.end().to_le_bytes());
+                }
                 // So is the view heap's null slot (it differs by host GPU):
                 // a translation cached without the clamp must not be served.
                 crate::descriptor::host::probe_view_limit();
@@ -76,6 +84,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_SPLIT_PREFILTER",
                     "VICTORY_FIRSTLANE_OWN",
                     "VICTORY_WAVE_WIDE",
+                    "VICTORY_WAVE_LOCAL",
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",

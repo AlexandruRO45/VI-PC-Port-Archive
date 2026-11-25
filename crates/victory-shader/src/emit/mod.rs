@@ -221,7 +221,7 @@ pub enum DispatchContract {
     None,
     /// Direct dispatch with one X group and an immutable table CBV.
     Visibility,
-    /// Experimental full-tile-only prefilter: partial tiles produce no writes.
+    /// Experimental prefilter: unaligned dimensions suppress the whole dispatch.
     /// Requires a direct dispatch with Z = 1 and an immutable 80-byte CBV.
     Prefilter,
 }

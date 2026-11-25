@@ -52,8 +52,9 @@ impl Witness {
     }
 }
 
-// Experimental opt-in: only full 16x16 tiles execute; partial dimensions
-// deliberately produce no writes. Default translation retains Wave64.
+// Experimental opt-in: if either dimension is not a multiple of 16, the
+// entire dispatch produces no writes, including otherwise complete tiles.
+// Default translation retains Wave64.
 fn enabled() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_PREFILTER.get() {
