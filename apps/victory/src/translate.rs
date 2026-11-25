@@ -520,7 +520,18 @@ fn check(
             &shader.dxil,
         );
     }
-    if let Some((h, stub_ps)) = &checks.host {
+    // A mesh program over D3D12's 32 KiB of outputs is emitted only to be
+    // linked with the pixel program that reads it, as the runtime does:
+    // alone it is not valid DXIL, so no pipeline is made of it here.
+    let over_budget = shader.stage == HwStage::Ms
+        && emit::mesh_output_bytes(&shader.dxil).is_some_and(|b| b > emit::MESH_OUTPUT_LIMIT);
+    if over_budget && checks.host.is_some() {
+        t.fail(
+            "pipeline: mesh outputs over 32 KiB alone (made only linked with its pixel program)"
+                .to_owned(),
+            &label,
+        );
+    } else if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),

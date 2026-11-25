@@ -395,6 +395,12 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 /// [`translate`] for a host that runs the wave sizes of `target`.
+///
+/// A mesh program whose outputs exceed D3D12's 32 KiB
+/// ([`MESH_OUTPUT_LIMIT`], measured with [`mesh_output_bytes`]) is still
+/// emitted, so that a pipeline can link it with its pixel program
+/// ([`translate_linked`]), but alone it is not valid DXIL: callers that
+/// make a pipeline of it alone must check the size first.
 pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, ShaderError> {
     let prep = prepare(container)?;
     let with = |addresses: bool| {

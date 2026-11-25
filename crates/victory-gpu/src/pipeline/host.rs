@@ -444,7 +444,14 @@ impl HostPipeline {
         }) {
             Some(ms) => match super::translate_linked(ms, find("pixel").map(Arc::as_ref)) {
                 Some(pair) => Some(pair),
-                None => return refuse("mesh outputs beyond 32 KiB after linking", shaders),
+                // `translate_linked` logged why: still over 32 KiB, or the
+                // linked translation itself failed.
+                None => {
+                    return refuse(
+                        "mesh outputs over 32 KiB and no valid linked translation",
+                        shaders,
+                    );
+                }
             },
             None => None,
         };

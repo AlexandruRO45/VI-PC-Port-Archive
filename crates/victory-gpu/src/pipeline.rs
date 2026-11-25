@@ -443,7 +443,7 @@ pub(crate) fn translate_linked(
                 mesh = %ms.hash,
                 pixel = ps.map_or("none", |p| p.hash.as_str()),
                 error = %e,
-                "linked mesh/pixel translation failed; using standalone translation"
+                "linked mesh/pixel translation failed; the pipeline is refused"
             );
             None
         }
