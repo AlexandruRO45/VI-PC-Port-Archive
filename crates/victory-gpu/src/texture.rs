@@ -1800,12 +1800,14 @@ mod title_memory_tests {
             last: std::sync::Mutex::default(),
             dirty: std::sync::atomic::AtomicBool::new(false),
             uploaded: std::sync::atomic::AtomicBool::new(false),
+            motion_copy: std::sync::atomic::AtomicBool::new(false),
             used: std::sync::atomic::AtomicU64::new(0),
             on_demand: true,
             has_detiled: std::sync::atomic::AtomicBool::new(false),
             detiled: std::sync::atomic::AtomicU32::new(0),
             judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
             waiting: std::sync::atomic::AtomicU64::new(0),
+            pooled: 0,
         };
 
         // Fresh Staging has not detiled yet -> must not report `Some(0)` to Tiled::uploaded.
@@ -1814,7 +1816,7 @@ mod title_memory_tests {
         // 1) Failed `refresh_unlocked` on partly-mapped memory keeps `detiled_levels() == None`
         //    and sets `dirty = true` so the next draw retries.
         let mut last = staging.last.lock().unwrap();
-        assert_eq!(staging.refresh_unlocked(&mut last, total), 0);
+        assert_eq!(staging.refresh_unlocked(&mut last, total, 0), 0);
         drop(last);
         assert_eq!(staging.detiled_levels(), None);
         assert!(staging.dirty.load(Relaxed));
