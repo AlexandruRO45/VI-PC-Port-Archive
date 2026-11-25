@@ -958,7 +958,10 @@ void main() {
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
                 let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                // DXVK can return llvmpipe without setting the software flag.
+                let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                    || String::from_utf16_lossy(&desc.Description).starts_with("llvmpipe");
+                if !software {
                     return None;
                 }
                 let mut device: Option<ID3D12Device> = None;
