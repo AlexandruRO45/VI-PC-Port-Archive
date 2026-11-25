@@ -4580,7 +4580,9 @@ impl<'a> Lower<'a> {
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format`. MTBUF uses identity
     /// channel selection, which yields zero for missing components (RDNA 2
-    /// ISA §8.1.4).
+    /// ISA §8.1.4): the descriptor's `dst_sel` does not apply, and channels
+    /// past the format read 0, the 4th included (measured on gfx1036 for
+    /// issue #1060).
     // shortcut: elements of 4 bytes or more are taken as dword-aligned.
     // Norm formats divide, which the AMD driver does 1 ULP off the hardware's
     // correctly rounded conversion for some values; correct it with an
