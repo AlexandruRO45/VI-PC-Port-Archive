@@ -1890,35 +1890,30 @@ mod tests {
     /// An unordered-access flag on a texture whose format no unordered
     /// view can take — itself or, where creation carries a cast list, a
     /// castable one — is refused by the host (NVIDIA removes the device at
-    /// `GetResourceAllocationInfo` for B5G5R5A1), so it is dropped.
+    /// `GetResourceAllocationInfo` for B5G5R5A1), so it is dropped. A
+    /// format the host's probe does take keeps it.
     #[test]
     fn unordered_needs_a_format_unordered_views_take() {
-        // 86 B5G5R5A1_UNORM and 85 B5G6R5_UNORM: UAV-capable on no host.
-        for format in [86, 85] {
-            let d = ResourceDesc {
-                flags: UNORDERED,
-                ..texture(64, 64, format, 1)
-            };
-            assert_eq!(host_desc(&d).unwrap().flags & UNORDERED, 0, "format {format}");
-        }
-        // With a host: a UAV-capable format keeps the flag (28
-        // R8G8B8A8_UNORM is store-capable on every feature level), and a
-        // typeless one (27) keeps it only where the cast list can reach
-        // that format — else the flag is as illegal as on 86.
         let Some(host) = crate::host::host() else {
             return;
         };
-        let d = ResourceDesc {
-            flags: UNORDERED,
-            ..texture(64, 64, 28, 1)
-        };
-        assert_eq!(host_desc(&d).unwrap().flags & UNORDERED, UNORDERED);
-        let d = ResourceDesc { format: 27, ..d };
+        use crate::descriptor::host::typed_store;
         use windows::Win32::Graphics::Direct3D12::ID3D12Device10;
         use windows::core::Interface;
         let enhanced = host.device.cast::<ID3D12Device10>().is_ok();
-        let kept = host_desc(&d).unwrap().flags & UNORDERED != 0;
-        assert_eq!(kept, enhanced, "a typeless UAV flag needs the cast list");
+        // 86 B5G5R5A1_UNORM (the NVIDIA device-removal case), 85 B5G6R5,
+        // 27 R8G8B8A8_TYPELESS (UAV only through the cast list) and 28
+        // R8G8B8A8_UNORM (store-capable wherever feature level 11.0 is).
+        for format in [86, 85, 27, 28] {
+            let desc = ResourceDesc {
+                flags: UNORDERED,
+                ..texture(64, 64, format, 1)
+            };
+            let d = host_desc(&desc).unwrap();
+            let legal = typed_store(d.format)
+                || enhanced && castable(d.format).into_iter().any(typed_store);
+            assert_eq!(d.flags & UNORDERED != 0, legal, "format {format}");
+        }
     }
 
     type Release = extern "system" fn(This) -> u32;
