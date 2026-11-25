@@ -1018,10 +1018,14 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
         d.format = family(d.format);
     }
     // Hosts differ in which formats take unordered access (NVIDIA has none
-    // for B5G5R5A1_UNORM, AMD has): a texture in a format the host cannot
-    // write from shaders drops that use, which the host would refuse (and
-    // a size query with it removes the device).
-    if d.flags & UNORDERED != 0 && !host_unordered_format(d.format) {
+    // for B5G5R5A1_UNORM, AMD has). D3D12 still takes the use when a format
+    // the texture can be cast to has it (B5G5R5A1's 16-bit aliases such as
+    // R16_UINT), and `make_texture` makes it with those formats: the use
+    // goes only when neither the format nor one it casts to takes it.
+    if d.flags & UNORDERED != 0
+        && !host_unordered_format(d.format)
+        && !castable(d.format).into_iter().any(host_unordered_format)
+    {
         d.flags &= !UNORDERED;
     }
     Some(d)
@@ -1287,6 +1291,13 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     }
     if texture.is_none() {
         castable_formats.clear();
+        // Without castable formats a use only an alias format takes is not
+        // legal: unordered access in a format the host cannot write.
+        let mut plain = *d;
+        if plain.flags & UNORDERED != 0 && !host_unordered_format(plain.format) {
+            plain.flags &= !UNORDERED;
+        }
+        let d = &plain;
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
         let made = unsafe {
@@ -2136,50 +2147,31 @@ mod tests {
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
     /// A texture whose format the host GPU cannot write from shaders keeps
-    /// its other uses and drops unordered access, so the host takes it:
-    /// NVIDIA has no unordered access for B5G5R5A1_UNORM (86), AMD has.
+    /// unordered access when a format it casts to takes it (B5G5R5A1_UNORM's
+    /// 16-bit aliases on NVIDIA) and drops it only when none does, and the
+    /// host makes it either way: with the castable formats, or without them
+    /// and without that use.
     #[cfg(windows)]
     #[test]
-    fn unordered_access_only_in_formats_the_host_writes() {
-        use windows::Win32::Graphics::Direct3D12::*;
-        let Some(host) = crate::host::host() else {
+    fn unordered_access_only_where_the_format_or_an_alias_takes_it() {
+        if crate::host::host().is_none() {
             return; // no host GPU here
-        };
+        }
         const RENDER_TARGET: u32 = 1;
-        for format in [86, 28, 87, 2, 10] {
+        for format in [86, 28, 87, 2, 10, 85] {
             let title = ResourceDesc {
                 flags: RENDER_TARGET | UNORDERED,
                 ..texture(64, 64, format, 1)
             };
             let d = host_desc(&title).expect("a texture");
             assert_eq!(d.flags & RENDER_TARGET, RENDER_TARGET, "format {format}");
-            assert_eq!(
-                d.flags & UNORDERED != 0,
-                host_unordered_format(d.format),
-                "format {format}"
+            let takes = host_unordered_format(d.format)
+                || castable(d.format).into_iter().any(host_unordered_format);
+            assert_eq!(d.flags & UNORDERED != 0, takes, "format {format}");
+            assert!(
+                make_texture(&d, 0, std::ptr::null()).is_some(),
+                "format {format}: no host texture"
             );
-            // SAFETY: a plain query on a host description (same layout).
-            let desc = unsafe {
-                std::ptr::from_ref(&d)
-                    .cast::<D3D12_RESOURCE_DESC>()
-                    .read_unaligned()
-            };
-            let mut made: Option<ID3D12Resource> = None;
-            // SAFETY: plain object creation from a host description.
-            let result = unsafe {
-                host.device.CreateCommittedResource(
-                    &D3D12_HEAP_PROPERTIES {
-                        Type: D3D12_HEAP_TYPE_DEFAULT,
-                        ..Default::default()
-                    },
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    None,
-                    &mut made,
-                )
-            };
-            assert!(result.is_ok(), "format {format}: {result:?}");
         }
         // Typeless formats keep unordered access (their views decide).
         assert!(host_unordered_format(27));
