@@ -183,8 +183,12 @@ pub(crate) extern "system" fn statistics(
 mod tests {
     use super::*;
 
+    // These tests share the production clock and tick reservations.
+    static FRAME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
+        let _test = FRAME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
@@ -236,6 +240,7 @@ mod tests {
     /// none. The old code marked the tick after the sleep, so both got it.
     #[test]
     fn waits_begun_together_take_different_ticks() {
+        let _test = FRAME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         const VBLANK: u32 = 1;
         let long = Duration::from_secs(1);
         let (first, _) = next_tick(VBLANK, long);
@@ -243,5 +248,10 @@ mod tests {
         assert!(second > first, "{second} after {first}");
         next_tick(VBLANK, Duration::ZERO);
         assert_eq!(last(VBLANK).load(Ordering::Relaxed), second);
+
+        let latest = LAST.iter().map(|tick| tick.load(Ordering::Relaxed)).max().unwrap();
+        let null = std::ptr::null();
+        assert_eq!(set_interval(null, null, 16_667, 1, 0), S_OK);
+        assert_eq!(clock().as_ref().unwrap().first, latest);
     }
 }
