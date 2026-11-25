@@ -90,7 +90,7 @@ impl Factory {
             let mut cfg: Option<ID3D12SDKConfiguration1> = None;
             D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut cfg).map_err(|e| {
                 format!(
-                    "ID3D12SDKConfiguration1 unavailable ({e}); Windows 10 21H2/22H2 needs KB5029331+ (d3d12.dll 10.0.19041.3393+)"
+                    "ID3D12SDKConfiguration1 unavailable ({e}); Windows 10 needs a serviced runtime that provides ID3D12SDKConfiguration1"
                 )
             })?;
             let cfg = cfg.ok_or("D3D12GetInterface returned no ID3D12SDKConfiguration1")?;
