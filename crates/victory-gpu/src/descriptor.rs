@@ -185,6 +185,26 @@ pub(crate) fn peek(this: usize, index: u32) -> Option<[u32; 8]> {
     Some(words.try_into().ok()?)
 }
 
+/// Sweeps a window of each shader-visible view heap for descriptors the
+/// title wrote with plain CPU stores; called once per presented frame.
+#[cfg(windows)]
+pub(crate) fn scan_hosts(budget: u32) {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+        // the `SHADER_HEAPS` lock we hold here.
+        let h = unsafe { &*(at as *const Heap) };
+        if h.samplers() {
+            continue;
+        }
+        let Some(host) = h.host.get().and_then(|o| o.as_ref()) else {
+            continue;
+        };
+        let step = increment(h.desc.kind).unwrap_or(32);
+        host.scan(h.start, step, h.desc.count, budget);
+    }
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]

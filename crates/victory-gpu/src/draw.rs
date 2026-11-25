@@ -1051,8 +1051,10 @@ impl State {
         if std::env::var_os("VICTORY_COMPUTE_TRACE").is_some() {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if crate::queue::presented() >= trace_after()
-                && !p.name.contains("Bake")
-                && !p.name.contains("LUT")
+                && !p
+                    .stages
+                    .iter()
+                    .any(|s| s.shader.name().contains("Bake") || s.shader.name().contains("LUT"))
                 && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2000
             {
                 tracing::info!(

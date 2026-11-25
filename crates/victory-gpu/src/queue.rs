@@ -374,6 +374,19 @@ fn show(shown: Option<object::Ref>, over: Option<object::Ref>) {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     crate::shadow::sweep(frame);
+    #[cfg(windows)]
+    {
+        static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let budget = *BUDGET.get_or_init(|| {
+            std::env::var("VICTORY_SCAN_BUDGET")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32768)
+        });
+        if budget > 0 {
+            crate::descriptor::scan_hosts(budget);
+        }
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

@@ -30,6 +30,9 @@ pub(crate) struct HostHeap {
     remap_first: u32,
     remap_used: std::sync::atomic::AtomicU32,
     remap_map: Mutex<HashMap<u32, u32>>,
+    /// Where the next plain-store sweep starts: the title writes descriptors
+    /// with CPU stores as well as D3D12 calls, and only the calls mirror.
+    scan_at: std::sync::atomic::AtomicU32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
@@ -807,6 +810,7 @@ impl HostHeap {
             remap_first,
             remap_used: std::sync::atomic::AtomicU32::new(0),
             remap_map: Mutex::default(),
+            scan_at: std::sync::atomic::AtomicU32::new(0),
             bindless: Mutex::default(),
             recording: std::sync::atomic::AtomicBool::new(false),
             record_hint: std::sync::atomic::AtomicBool::new(false),
@@ -1210,6 +1214,23 @@ impl HostHeap {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
         }
+    }
+
+    /// Mirrors a window of title slots the title may have written with plain
+    /// CPU stores (no D3D12 call, so nothing else mirrors them). Amortized:
+    /// `budget` slots per call, wrapping over the title's whole heap, so a
+    /// full sweep takes total/budget frames. `mirror` skips unchanged slots.
+    pub(crate) fn scan(&self, start: u64, step: u32, total: u32, budget: u32) {
+        let mut at = self.scan_at.load(Ordering::Relaxed);
+        if at >= total {
+            at = 0;
+        }
+        let end = total.min(at + budget);
+        for i in at..end {
+            self.mirror(i, start + u64::from(i) * u64::from(step), true);
+        }
+        self.scan_at
+            .store(if end == total { 0 } else { end }, Ordering::Relaxed);
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
