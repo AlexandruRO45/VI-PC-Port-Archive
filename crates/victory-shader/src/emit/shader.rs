@@ -22,7 +22,9 @@ pub const MEMORY_SPACE: u32 = 2;
 /// Heap indices are clamped below these (views, samplers): the host's heaps
 /// are at least this large, the slots past their own null (`emit`, "Heap
 /// indices").
-pub const HEAP_VIEWS: u32 = 1 << 21;
+// This GTX compatibility branch uses the portable D3D12 view-heap limit.
+// Keep the shader clamp and reserved null views inside the actual host heap.
+pub const HEAP_VIEWS: u32 = 1_000_000;
 pub const HEAP_SAMPLERS: u32 = 2048;
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
@@ -86,6 +88,8 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    pub mesh_compute: bool,
+    pub(super) mesh_uav: Option<V>,
     /// A geometry shader taking triangles and emitting triangle strips of
     /// at most this many vertices (`rect`).
     pub gs: Option<u32>,
@@ -127,6 +131,9 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    pub(super) collective_shared_bytes: u32,
+    pub(super) guest_collective_scratch: Option<(u32, V)>,
+    pub(super) native_election_scratch: Option<V>,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -168,6 +175,8 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            mesh_compute: false,
+            mesh_uav: None,
             gs: None,
             user_data: 0,
             samplers: 0,
@@ -187,6 +196,9 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            collective_shared_bytes: 0,
+            guest_collective_scratch: None,
+            native_election_scratch: None,
             lds: None,
             main,
             entry,
@@ -542,6 +554,12 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        if self.mesh_compute {
+            self.mesh = None;
+            self.inputs.clear();
+            self.outputs.clear();
+            self.prims.clear();
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;
@@ -560,6 +578,7 @@ impl Shader {
             || self.view_addresses.is_some()
             || self.view_marks.is_some()
             || self.view_writes.is_some()
+            || self.mesh_uav.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -656,7 +675,7 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some() {
+            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some() || self.mesh_uav.is_some() {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -671,6 +690,7 @@ impl Shader {
                     .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
                     .chain(self.memory_dirty.map(|_| (MEMORY_SPACE, 0)))
                     .chain(self.view_writes.map(|_| (MEMORY_SPACE, VIEW_WRITES)))
+                    .chain(self.mesh_uav.map(|_| (super::mesh_compute::SPACE, 0)))
                     .collect();
                 for (n, (space, slot)) in all.into_iter().enumerate() {
                     let ops = vec![

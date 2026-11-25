@@ -193,6 +193,10 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+pub mod mesh_compute;
+mod wave64;
+#[cfg(all(test, windows))]
+mod native_compute_tests;
 mod rect;
 pub use rect::rectangle_gs;
 #[cfg(all(test, windows))]
@@ -415,6 +419,16 @@ pub fn emit_with(
     res: &resource::Resources,
     options: Options,
 ) -> Result<HostShader, ShaderError> {
+    emit_mode(c, native, p, st, io, res, options, false, false)
+}
+
+// Same analysis inputs as emit_with, plus the two private lowering modes.
+#[allow(clippy::too_many_arguments)]
+fn emit_mode(
+    c: &Container, native: &NativeProgram, p: &ir::Program,
+    st: &structure::Structured, io: &io::Io, res: &resource::Resources,
+    options: Options, mesh_compute: bool, wave64_dag: bool,
+) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -481,6 +495,8 @@ pub fn emit_with(
         prims: prims.clone(),
         mesh_stride,
         view_marks: options.view_marks,
+        mesh_compute,
+        wave64_dag,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
@@ -494,7 +510,7 @@ pub fn emit_with(
         l => l?,
     };
     Ok(HostShader {
-        stage: native.stage,
+        stage: if mesh_compute { HwStage::Cs } else { native.stage },
         dxil: l.dxil,
         user_data: l.user_data,
         static_samplers: l

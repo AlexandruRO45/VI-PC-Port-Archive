@@ -82,10 +82,6 @@ pub(crate) fn near_heaps(va: u64) -> String {
     text
 }
 
-/// The host's limit for shader-visible view heaps on resource binding
-/// tiers 1 and 2; tier 3 hardware may take more.
-const PORTABLE_VIEWS: u32 = 1_000_000;
-
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
@@ -96,6 +92,13 @@ const DYNAMIC: u32 = 1 << 18;
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
+
+fn portable_layout(count: u32) -> (u32, u32) {
+    // The last three slots are the null UAV, null SRV and clamped sentinel.
+    let usable = victory_shader::emit::NULL_BUFFER_VIEW - 1;
+    let extra = if count <= usable - DYNAMIC { DYNAMIC } else { MIN_DYNAMIC };
+    (count.min(usable - extra), extra)
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -135,10 +138,8 @@ impl HostHeap {
                 Some((buffer, data as usize))
             })
             .flatten();
-        // The larger dynamic range only where the host takes it on top of
-        // every title slot; else the smaller one, and the cap after that.
-        // Translated shaders clamp their indices below `HEAP_VIEWS` or
-        // `HEAP_SAMPLERS`: slots up to there exist and stay null.
+        // The actual heap and translator must agree on the clamp and null
+        // indices, including on hardware that rejects a two-million heap.
         let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
         let (heap, count, extra) = if sampler {
             match make(count.max(samplers)) {
@@ -148,19 +149,15 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
-            (heap, count, DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
+            let (kept, extra) = portable_layout(count);
+            if kept < count {
+                // As in upstream's capped path, titles reaching omitted
+                // descriptors still need remapping; this is not solved here.
+                tracing::warn!(count, kept, "host view heap capped; omitted title slots require remapping");
+            }
+            match make(views) {
+                Ok(heap) => (heap, kept, extra),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
@@ -1484,6 +1481,7 @@ mod tests {
         // SAFETY: plain queries of live heaps.
         unsafe {
             assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            assert!(heap.count + heap.dynamic < victory_shader::emit::NULL_BUFFER_VIEW);
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }
@@ -1535,6 +1533,17 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn portable_layout_reserves_null_views_without_overflow() {
+        for requested in [0, 4, 737853, 737854, 934461, 1_000_000, 1 << 21, u32::MAX] {
+            let (count, extra) = portable_layout(requested);
+            assert!(count <= requested);
+            assert!(matches!(extra, DYNAMIC | MIN_DYNAMIC));
+            assert!(count + extra < victory_shader::emit::NULL_BUFFER_VIEW);
+        }
+        assert_eq!(portable_layout(4), (4, DYNAMIC));
     }
 
     #[test]

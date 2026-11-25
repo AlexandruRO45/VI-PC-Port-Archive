@@ -178,7 +178,7 @@ fn program() -> HostShader {
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
-        mesh_stride: 0,
+        mesh_stride: 0, mesh_compute: false, wave64_dag: false,
         view_marks: false,
     })
     .expect("lower");
@@ -404,7 +404,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
-        mesh_stride: 0,
+        mesh_stride: 0, mesh_compute: false, wave64_dag: false,
         view_marks: false,
     })
     .expect("lower");
@@ -546,7 +546,7 @@ fn writes_through_views_mark_their_pages() {
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
-        mesh_stride: 0,
+        mesh_stride: 0, mesh_compute: false, wave64_dag: false,
         view_marks: true,
     })
     .expect("lower");
