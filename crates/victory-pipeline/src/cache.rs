@@ -182,7 +182,8 @@ mod tests {
                 let output = input.to_ascii_uppercase();
                 let key = CacheKey::new(self, input);
                 let path = self.cache.path_for(&key);
-                std::fs::create_dir_all(path.parent().unwrap())?;
+                let dir = path.parent().unwrap();
+                std::fs::create_dir_all(dir)?;
                 std::fs::write(&path, &output)?;
                 // FILE_SHARE_READ permits readers but prevents replacement while held.
                 *self.held.lock().unwrap() = Some(
@@ -191,8 +192,9 @@ mod tests {
                         .share_mode(1)
                         .open(&path)?,
                 );
-                let probe = tempfile_in(path.parent().unwrap());
-                std::fs::write(&probe, &output)?;
+                let (probe, mut probe_file) = tempfile_in(dir)?;
+                probe_file.write_all(&output)?;
+                drop(probe_file);
                 assert!(
                     std::fs::rename(&probe, &path).is_err(),
                     "the open reader must prevent replacing the published entry"
