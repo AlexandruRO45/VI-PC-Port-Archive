@@ -65,3 +65,5 @@ pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
     with_kernel_write, writing as kernel_will_write,
 };
+#[cfg(all(windows, feature = "test-support"))]
+pub use watch::title_memory_guard;
