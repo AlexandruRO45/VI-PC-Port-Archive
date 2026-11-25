@@ -1977,6 +1977,7 @@ impl HostHeap {
         text
     }
 
+    #[allow(dead_code)] // used by diagnostics builds of the debugger
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
         let key = *self
             .made
@@ -2130,13 +2131,13 @@ fn view_count(view: &View) -> u32 {
         let desc = srv_desc(w);
         // SAFETY: a buffer view's union member.
         (desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
-            .then(|| unsafe { desc.Anonymous.Buffer }.NumElements)
+            .then_some(unsafe { desc.Anonymous.Buffer }.NumElements)
     };
     let uav = |w: &[u32; 10]| {
         let desc = uav_desc(w);
         // SAFETY: a buffer view's union member.
         (desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
-            .then(|| unsafe { desc.Anonymous.Buffer }.NumElements)
+            .then_some(unsafe { desc.Anonymous.Buffer }.NumElements)
     };
     match view {
         View::Shader(_, Some(desc)) => srv(desc),

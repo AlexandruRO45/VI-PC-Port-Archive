@@ -180,7 +180,7 @@ impl CardState {
             return None;
         }
         let (min_bytes, max_bytes) = limits();
-        if size < min_bytes || size >= (1 << 30) || size % PAGE as u64 != 0 {
+        if size < min_bytes || size >= (1 << 30) || !size.is_multiple_of(PAGE as u64) {
             return None;
         }
         if !host.card_ready() {

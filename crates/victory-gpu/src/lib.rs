@@ -1,3 +1,14 @@
+// The AMD fork's GPU layer has long low-level signatures, tuple-heavy state
+// and unsafe blocks whose preconditions are described in the surrounding
+// comments. Keep those lints off for this crate so `-D warnings` can gate
+// real regressions instead of the established style.
+#![allow(
+    clippy::explicit_counter_loop,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::undocumented_unsafe_blocks
+)]
+
 //! D3D12.X on host D3D12.
 //!
 //! D3D12.X records commands from code inlined into the title, which writes

@@ -63,6 +63,7 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     /// It animates or draws hair strands ([`hair_strands`]).
     #[cfg(windows)]
+    #[allow(dead_code)] // kept for hair-strand diagnostics
     hair: bool,
     /// Its result gets the least indirect light ([`crate::ambient`]).
     #[cfg(windows)]
