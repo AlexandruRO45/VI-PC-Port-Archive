@@ -4262,62 +4262,103 @@ impl<'a> Lower<'a> {
                 .filter(|&(s, a)| *s != site && address.is_some_and(|b| same(a, b)))
                 .find_map(|&(s, _)| use_of(s))
         });
-        let Some((at, first)) = use_at else {
-            return self.view_addresses(inst, site, code, count);
-        };
-        let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
-                };
-                ((kind | u, 0x409), Some(kind))
-            }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
+        let (src, used, ((props, image), uav), first) = if let Some((at, first)) = use_at {
+            let src = Source::Loaded { load: site, first };
+            let used = self.used_kind(&src);
+            let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+            let un = ui.name();
+            let uav = un.contains("store")
+                || un.contains("atomic")
+                || used.is_some_and(|u| u.kind == ResourceType::Uav);
+            let u = if uav { 0x1000u32 } else { 0 };
+            let kind = match &ui.fields {
+                Fields::Image { dim, .. } => {
+                    let kind = match dim {
+                        0 => 1u32,
+                        1 => 2,
+                        2 => 4,
+                        4 => 6,
+                        5 => 7,
+                        _ => return Err("an image dimension (cube or MSAA)"),
+                    };
+                    ((kind | u, 0x409), Some(kind))
                 }
-                (props, None)
-            }
-            // A buffer the code reads with scalar loads (`buf[buf.Length - 1]`
-            // at a uniform index): structured by the used-resource entry's
-            // stride, so its record count is in elements, else raw (bytes).
-            Fields::Smem { .. } => {
-                let used = used.ok_or("a scalar-loaded buffer of unknown kind read as data")?;
-                if used.kind == ResourceType::Cbv {
-                    return Err("a constant buffer's descriptor read as data");
+                Fields::Buffer { idxen, format, .. } => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    let props = if un.starts_with("buffer_load_format")
+                        || un.starts_with("buffer_store_format")
+                    {
+                        (10 | u, 0x409)
+                    } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
+                    {
+                        (12 | u, stride)
+                    } else {
+                        (11 | u, 0)
+                    };
+                    if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                        return Err("a constant buffer's descriptor read as data");
+                    }
+                    (props, None)
                 }
-                let props = match used.stride {
+                // A buffer the code reads with scalar loads (`buf[buf.Length - 1]`
+                // at a uniform index): structured by the used-resource entry's
+                // stride, so its record count is in elements, else raw (bytes).
+                Fields::Smem { .. } => {
+                    let used = used.ok_or("a scalar-loaded buffer of unknown kind read as data")?;
+                    if used.kind == ResourceType::Cbv {
+                        return Err("a constant buffer's descriptor read as data");
+                    }
+                    let props = match used.stride {
+                        0 | 1 => (11 | u, 0),
+                        s if s.is_multiple_of(4) => (12 | u, s),
+                        _ => return Err("a scalar-loaded buffer of odd stride read as data"),
+                    };
+                    (props, None)
+                }
+                _ => return Err("a scalar memory read as data"),
+            };
+            (src, used, (kind, uav), first)
+        } else if descriptor_dimensions_enabled()
+            && let Some(a) = address
+            && matches!(
+                self.x.native.layout.get(a.param).map(|p| p.root),
+                Some(RootType::Table | RootType::ResourceHeap)
+            )
+        {
+            let src = Source::Loaded { load: site, first: 0 };
+            let used = self.used_kind(&src);
+            let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+            let u = if uav { 0x1000u32 } else { 0 };
+            if count == 8 || used.is_some_and(|u| u.dwords == 8) {
+                (src, used, (((2u32 | u, 0x409u32), Some(2u32)), uav), 0u8)
+            } else if let Some(used_entry) = used.filter(|u| u.kind != ResourceType::Cbv) {
+                // Only switch from view_addresses when a dword at word >= 2
+                // (record count / properties) is actually consumed.
+                let reads_upper = (0..count).any(|k| {
+                    (a.offset / 4 + k) % 8 >= 2
+                        && inst.write(Reg::S(code + k as u8)).is_some_and(|v| {
+                            self.x.p.blocks.iter().any(|b| {
+                                b.phis.iter().any(|phi| phi.args.contains(&v))
+                                    || b.insts.iter().any(|i| i.reads.iter().any(|r| r.1 == v))
+                            })
+                        })
+                });
+                if !reads_upper {
+                    return self.view_addresses(inst, site, code, count);
+                }
+                let props = match used_entry.stride {
                     0 | 1 => (11 | u, 0),
                     s if s.is_multiple_of(4) => (12 | u, s),
                     _ => return Err("a scalar-loaded buffer of odd stride read as data"),
                 };
-                (props, None)
+                (src, used, ((props, None), uav), 0u8)
+            } else {
+                return self.view_addresses(inst, site, code, count);
             }
-            _ => return Err("a scalar memory read as data"),
+        } else {
+            return self.view_addresses(inst, site, code, count);
         };
+        let _ = used;
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -11290,6 +11331,63 @@ mod tests {
         ];
         lowers(&words, 0).expect("SCC from lane mask SOP should lower");
     }
+
+    #[test]
+    fn a_descriptor_read_only_for_dimensions_lowers() {
+        // Structured SRV loaded without buffer accesses, checking dword 2 == 0
+        // (`CS_MinTimestepReduce`), and an 8-dword heap image descriptor loaded
+        // solely for GetDimensions (`PS_PuddleDetect`).
+        let srv_check = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBF06_800A, // s_cmp_eq_u32 s10, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE82_0380, // s_mov_b32 s2, 0
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 16,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(&srv_check, layout, used).expect("buffer SRV size check should lower");
+
+        let heap_tex_dims = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x9382_FF0B,
+            0x0004_000C, // s_bfe_u32 s2, s11, 0x0004000c
+            0xBF06_8002, // s_cmp_eq_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let heap_layout = vec![root(RootType::ResourceHeap, 0, 0)];
+        lower_with(&heap_tex_dims, heap_layout, vec![])
+            .expect("heap image GetDimensions without sample should lower");
+    }
+}
+
+/// Whether descriptor loads with no access instruction query DXIL
+/// `getDimensions` for buffer size or image dimensions
+/// (`VICTORY_DESCRIPTOR_DIMENSIONS`, on unless 0).
+fn descriptor_dimensions_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_DESCRIPTOR_DIMENSIONS").map_or(true, |v| v != "0")
+    })
 }
 
 /// Whether SCC written by a scalar mask instruction lowers as `WaveActiveAnyTrue`
