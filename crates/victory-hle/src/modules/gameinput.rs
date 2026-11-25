@@ -1,9 +1,10 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3), and a PlayStation pad (DualSense or DualShock 4) read straight from HID takes the first
-//! slot XInput leaves empty; while none is connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
-//! too. A poll thread turns host state into readings (a new one per change)
-//! and runs device callbacks on connect and disconnect.
+//! (host slots 0-3), and a HID pad (`hid`) takes the first slot XInput leaves
+//! empty. The keyboard drives a stand-in gamepad (`FALLBACK_BUTTONS`): alone
+//! while no pad is connected, added to the first pad's reading when one is.
+//! The keyboard is a device of its own too. A poll thread turns host state
+//! into readings (a new one per change) and runs device callbacks on connect
+//! and disconnect.
 #![allow(non_snake_case)]
 // Title code calls these through the objects, passing pointers the real API
 // would trust.
@@ -87,6 +88,21 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'F', LEFT_STICK),
     (b'H', RIGHT_STICK),
 ];
+
+/// A pad's reading with the keyboard stand-in's keys added: buttons together,
+/// each stick and trigger from whichever of the two is pushed further.
+fn with_keys(pad: PadState, keys: PadState) -> PadState {
+    let far = |a: f32, b: f32| if b.abs() > a.abs() { b } else { a };
+    PadState {
+        buttons: pad.buttons | keys.buttons,
+        left_trigger: pad.left_trigger.max(keys.left_trigger),
+        right_trigger: pad.right_trigger.max(keys.right_trigger),
+        left_x: far(pad.left_x, keys.left_x),
+        left_y: far(pad.left_y, keys.left_y),
+        right_x: far(pad.right_x, keys.right_x),
+        right_y: far(pad.right_y, keys.right_y),
+    }
+}
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
@@ -484,10 +500,21 @@ impl State {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         let any_pad = pads.iter().any(Option::is_some);
+        // The keyboard keeps working with a pad connected: its keys are added
+        // to the first pad's reading.
+        let keyed = fallback(&keys);
+        let mut first = true;
         for (slot, pad) in pads.into_iter().enumerate() {
+            let pad = pad.map(|pad| {
+                if std::mem::take(&mut first) {
+                    with_keys(pad, keyed)
+                } else {
+                    pad
+                }
+            });
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then_some(Value::Pad(keyed));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1610,6 +1637,49 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn the_keyboard_still_works_with_a_pad_connected() {
+        let (hub, host) = fake();
+        {
+            let mut host = host.lock().unwrap();
+            // Pad 0 holds B and pushes its left stick a little right; the keys
+            // hold Enter (A), D (left stick right, further) and C.
+            host.pads[0] = Some(PadState {
+                buttons: B,
+                left_x: 0.25,
+                ..Default::default()
+            });
+            host.pads[1] = Some(PadState::default());
+            host.keys = vec![key(0x0D), key(b'D'), key(b'C')];
+        }
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(
+            pad(r),
+            PadState {
+                buttons: A | B,
+                left_x: 1.0,
+                right_trigger: 1.0,
+                ..Default::default()
+            }
+        );
+        release(r);
+        // Only the first pad takes the keys, and no stand-in appears beside it.
+        let second = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(pad(second), PadState::default());
+        release(second);
+        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
+        // A pad that pushes further than the keys keeps its own value.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            left_x: -1.0,
+            ..Default::default()
+        });
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r).left_x, -1.0);
+        release(r);
     }
 
     #[test]

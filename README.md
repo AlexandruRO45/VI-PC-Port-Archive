@@ -43,8 +43,8 @@ through XInput. Other pads are read directly from HID, one at a time, in the
 first slot XInput leaves empty, with no DS4Windows or Steam Input: DualSense and
 DualShock 4 (USB or Bluetooth, with rumble), Switch Pro, and any other HID
 gamepad by a guessed button layout (`VICTORY_HID_GENERIC=1` forces that path).
-Only the PlayStation pads are tested; the rest are not. With no pad connected the keyboard acts as one while the game window
-has focus.
+Only the PlayStation pads are tested; the rest are not. The keyboard acts as a pad while the game window has focus, alone when no
+pad is connected and added to the first pad when one is.
 
 ## Faster settings (optional, off by default)
 
