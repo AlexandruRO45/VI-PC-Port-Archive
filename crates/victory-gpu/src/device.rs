@@ -346,16 +346,10 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
-/// pipeline would hand the title whatever its stack held as an object.
+/// Device methods at slots 0x1c8 and 0x218 (`SLOT`) return `E_NOTIMPL`
+/// and write a null result when given an output pointer. The first four
+/// calls per slot and later power-of-two counts log readable words from
+/// the description and from the address in its first word.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
@@ -393,7 +387,7 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            "pipeline creation method returned E_NOTIMPL"
         );
     }
     E_NOTIMPL
