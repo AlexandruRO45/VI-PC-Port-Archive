@@ -238,6 +238,8 @@ struct Lower<'a> {
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
+    /// SCC values written by mask/EXEC `sop`s: `(lo_mask, hi_mask)` for lazy evaluation.
+    scc_masks: HashMap<Value, (Value, Option<Value>)>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -629,6 +631,7 @@ impl<'a> Lower<'a> {
             },
             mask_ok: false,
             ballots: HashMap::new(),
+            scc_masks: HashMap::new(),
             balloting: HashSet::new(),
             def_block: p
                 .blocks
@@ -1554,6 +1557,13 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
+            Some(&Val::Missing(_)) | None
+                if self.mask_ok
+                    && self.mask_data == MaskData::Console
+                    && self.scc_masks.contains_key(&v) =>
+            {
+                return self.scc_mask_bit(v).map(Val::Bit);
+            }
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
             None => {}
@@ -1762,6 +1772,25 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Evaluates SCC written by a mask/EXEC `sop` lazily as `(lo | hi) != 0`.
+    fn scc_mask_bit(&mut self, v: Value) -> Result<V, Why> {
+        let (lo_v, hi_v) = self.scc_masks[&v];
+        let at = self
+            .def_block
+            .get(&v)
+            .and_then(|&b| self.tail[b])
+            .unwrap_or(self.cur);
+        let mut bits = self.mask_dword(lo_v)?;
+        if let Some(h) = hi_v.filter(|h| self.x.st.highs.contains_key(h)) {
+            let hi = self.mask_dword(h)?;
+            bits = self.s.m.bin(at, Bin::Or, bits, hi);
+        }
+        let zero = self.s.m.i32(0);
+        let nz = self.s.m.cmp(at, pred::NE, bits, zero);
+        self.vals.insert(v, Val::Bit(nz));
+        Ok(nz)
     }
 
     /// Both dwords of a mask holding lanes that do not reach the block
@@ -3316,6 +3345,21 @@ impl<'a> Lower<'a> {
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+            let mask_v = inst
+                .write(Reg::S(EXEC))
+                .or(lo)
+                .filter(|v| self.x.st.masks.contains_key(v));
+            if self.mask_data == MaskData::Console
+                && let Some(scc_v) = scc
+                && let Some(m_v) = mask_v
+            {
+                let hi_v = if inst.write(Reg::S(EXEC)).is_some() {
+                    inst.write(Reg::S(EXEC + 1))
+                } else {
+                    dst_code.and_then(|c| inst.write(Reg::S(c + 1)))
+                };
+                self.scc_masks.insert(scc_v, (m_v, hi_v));
+            }
             return Err(LANE_MASK);
         }
         if matches!(
@@ -9856,6 +9900,23 @@ impl<'a> Lower<'a> {
                 let read = live.contains(&(phi.value, n));
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
+                    _ if read
+                        && !bit
+                        && self.mask_data == MaskData::Console
+                        && (self.x.st.masks.contains_key(&arg)
+                            || self.x.st.highs.contains_key(&arg)) =>
+                    {
+                        self.mask_dword(arg)
+                            .map_err(|why| Stop::Retry(phi.value, why))?
+                    }
+                    _ if read
+                        && bit
+                        && self.mask_data == MaskData::Console
+                        && self.scc_masks.contains_key(&arg) =>
+                    {
+                        self.scc_mask_bit(arg)
+                            .map_err(|why| Stop::Retry(phi.value, why))?
+                    }
                     // No lane from this edge reads it, or no lane comes
                     // along it at all: any value will do.
                     _ if read
@@ -10724,5 +10785,34 @@ mod tests {
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
         }
+    }
+
+    #[test]
+    fn data_phi_joining_tracked_lane_mask_lowers_in_compute() {
+        // Compute shader: conditional branch where one arm computes a tracked
+        // lane mask in s2 (`v_cmp_ne_u32` + `s_and_b32 s2, exec_lo, vcc_lo`)
+        // and the other sets `s2 = 0`, joining them as a data phi and storing s2.
+        lowers_valu(&[
+            0x7D9A_0501, // v_cmp_ne_u32_e32 vcc_lo, v1, v2
+            0xBF00_8000, // s_cmp_eq_u32 s0, 0
+            0xBF84_0002, // s_cbranch_scc0 +2
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0xBF82_0001, // s_branch +1
+            0x8702_6A7E, // s_and_b32 s2, exec_lo, vcc_lo
+            0x7E00_0202, // v_mov_b32 v0, s2
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn saveexec_scc_read_by_cselect_lowers_in_compute() {
+        // Compute shader: `s_and_saveexec_b32` writes EXEC and SCC; `s_cselect_b32`
+        // consumes SCC as a scalar condition.
+        lowers_valu(&[
+            0xBE82_3C00, // s_and_saveexec_b32 s2, s0
+            0x8283_8281, // s_cselect_b32 s3, 1, 2
+            0x7E00_0203, // v_mov_b32 v0, s3
+        ])
+        .unwrap();
     }
 }
