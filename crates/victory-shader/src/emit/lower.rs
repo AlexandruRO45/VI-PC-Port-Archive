@@ -2072,6 +2072,107 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// `v_log_f32`: DXIL's own logarithm everywhere except in a band around one.
+    ///
+    /// Direct3D bounds `log` only absolutely near unity - 2^-21 on [0.5, 2] (SM4 `log`, and the same
+    /// rule in the D3D functional specification) - which says nothing when the true answer is tiny: a
+    /// host was measured more than 80% off within a few ulps of 1.0 while still meeting that bound.
+    /// RDNA2 asks for 1 ULP across its whole range and exact +0 at the input 1.0 (ISA, printed page
+    /// 141). So inside |x - 1| <= 2^-6 the logarithm comes from its series in t = x - 1 instead:
+    ///
+    /// * `t` needs no rounding anywhere in [1/2, 2] (Sterbenz), and neither does `t - T1` below.
+    /// * `T1` keeps twelve leading significand digits of `t`, so with a constant `C1` whose own
+    ///   significand is at most twelve digits long the product needs at most twenty-four binary digits:
+    ///   `C1 * T1` cannot round, and a back end that contracts that one multiply into the add after it
+    ///   gets the same bits either way. That exactness reaches no further. Contracting the muls and adds
+    ///   inside the series and the small corrections changes the rounding there, and on a few operands
+    ///   it changes the result bits: modelling the unfused and fully fused schedules over all 393,217
+    ///   operands of the band found 32 operands where the two schedules disagree - at `0x3f7c2956`,
+    ///   `0xbcb28d76` unfused against `0xbcb28d75` fused. Hosts do disagree about contracting, since
+    ///   NVIDIA's driver fuses what WARP keeps apart, so what matters is the error rather than any
+    ///   invariance: both schedules peak at 0.512 ULP across the band, and an independently derived
+    ///   conservative bound on the scheme comes in under 0.61 ULP, inside the 1 ULP the ISA asks for.
+    /// * The terms that are left - `C1*T0`, `(log2(e)-C1)*t` and the series tail from t^2 to t^5 - each
+    ///   stay far smaller than that exact product, so their roundings cost only a small part of the
+    ///   accepted error and just one addition loses half an ulp. Nothing in this path goes near
+    ///   denormal scale (the smallest intermediate is around 2^-47), so no host's flush mode can reach
+    ///   it either - which matters where hosts disagree about denormals (#1554).
+    /// * A half-width of 2^-6 is the interval this scheme was picked for and checked across, operand by
+    ///   operand: it keeps the small terms far below the exact product and the omitted tail well inside
+    ///   the bound. It is not claimed to be the widest interval for which that holds, and nothing here
+    ///   makes the host `Log` meet the guest's 1 ULP outside this interval.
+    fn log_f32(&mut self, x: V) -> V {
+        let c = self.cur;
+
+        // t = x - 1, then its high part (sign and exponent untouched, low twelve fraction bits cleared)
+        // and the exact remainder.
+        let one = self.s.m.f32(0x3F80_0000);
+        let t = self.s.m.bin(c, Bin::Sub, x, one);
+        let keep_high = self.s.m.i32(0xFFFF_F000);
+        let t_bits = self.as_int(t);
+        let high_bits = self.s.m.bin(c, Bin::And, t_bits, keep_high);
+        let t1 = self.as_float(high_bits);
+        let t0 = self.s.m.bin(c, Bin::Sub, t, t1);
+
+        // C1 is the nearest binary32 to log2(e) whose own significand is at most twelve digits long,
+        // 1.442871093750; D is the correctly rounded remainder of the split, and log2(e) - C1 is about
+        // -1.760528610366 * 10^-4 (a plain difference, not a round power of two like 2^-13). b_5 down to
+        // b_2 are the series coefficients of log2(1+t), each the nearest binary32 to its exact value:
+        // none of them is chosen by eye or copied from an estimate.
+        let c1 = self.s.m.f32(0x3FB8_B000);
+        let d = self.s.m.f32(0xB938_9AD4);
+
+        // Horner over t for b_5..b_2, then times t^2: the whole tail is tiny next to C1*T1. The muls
+        // and adds are emitted separate on purpose, which is a choice about rounding rather than a
+        // guarantee: a back end that fuses some of them rounds differently inside the tail, and over
+        // the band that is enough to change the result bits on 32 of the 393,217 operands. Every
+        // arrangement stays inside the 1 ULP the guest asks for, so no host-specific arrangement is
+        // needed here, and the exactness proved above covers only the C1*T1 product.
+        let mut series = self.s.m.f32(0x3E93_BB63); // b_5: +log2(e)/5
+        series = {
+            let coefficient = self.s.m.f32(0xBEB8_AA3B); // b_4: -log2(e)/4
+            let step = self.s.m.bin(c, Bin::Mul, series, t);
+            self.s.m.bin(c, Bin::Add, step, coefficient)
+        };
+        series = {
+            let coefficient = self.s.m.f32(0x3EF6_384F); // b_3: +log2(e)/3
+            let step = self.s.m.bin(c, Bin::Mul, series, t);
+            self.s.m.bin(c, Bin::Add, step, coefficient)
+        };
+        series = {
+            let step = self.s.m.bin(c, Bin::Mul, series, t);
+            let coefficient = self.s.m.f32(0xBF38_AA3B); // b_2: -log2(e)/2
+            self.s.m.bin(c, Bin::Add, step, coefficient)
+        };
+        let square = self.s.m.bin(c, Bin::Mul, t, t);
+        let tail = self.s.m.bin(c, Bin::Mul, square, series);
+
+        // What the coarse split of the linear term leaves over: C1*T0 and (log2(e)-C1)*t. Summing them in
+        // any order costs far less than one ulp of the result, because each is small next to it.
+        let carried = self.s.m.bin(c, Bin::Mul, c1, t0);
+        let coefficient_gap = self.s.m.bin(c, Bin::Mul, d, t);
+        let corrections = {
+            let sum = self.s.m.bin(c, Bin::Add, tail, coefficient_gap);
+            self.s.m.bin(c, Bin::Add, sum, carried)
+        };
+
+        // One rounding at full magnitude: the unrounded product plus everything small below it. At x == 1
+        // both halves are exact zeros whose signs add to +0 under ties-to-even, which is what the ISA
+        // entry asks for there.
+        let kept = self.s.m.bin(c, Bin::Mul, c1, t1);
+        let near_one = self.s.m.bin(c, Bin::Add, kept, corrections);
+
+        // The band test runs on |t|. A NaN or an infinity fails it and keeps DXIL's own answer, so the
+        // special values - signed zeros, infinities, negatives, denormals - behave exactly as before.
+        let clear_sign = self.s.m.i32(0x7FFF_FFFF);
+        let magnitude_bits = self.s.m.bin(c, Bin::And, t_bits, clear_sign);
+        let magnitude = self.as_float(magnitude_bits);
+        let band = self.s.m.f32(0x3C80_0000); // 2^-6: chosen and verified half-width, not a proven widest
+        let inside_band = self.s.m.cmp(c, pred::OLE, magnitude, band);
+        let host_log = self.unary(23, x); // DXIL's own answer: kept outside the band exactly as before
+        self.s.m.select(c, inside_band, near_one, host_log)
+    }
+
     /// A 32-bit denormal as the console's float mode reads it: a zero of its
     /// sign, decided on the bits (the host's own denormal mode varies).
     fn ftz(&mut self, f: V) -> V {
@@ -5738,6 +5839,9 @@ impl<'a> Lower<'a> {
                 let r = match op {
                     12 | 13 => self.trig_turns(a, op == 12),
                     22 => self.fract(a, 1.0, f32::from_bits(0x3F7F_FFFF)),
+                    // RDNA2 holds `v_log_f32` to 1 ULP and to exact +0 at the input 1.0; DXIL's bound
+                    // near unity is absolute only, so that one instruction gets its own lowering.
+                    _ if name == "v_log_f32" => self.log_f32(a),
                     _ => self.unary(op, a),
                 };
                 float(self, r)
