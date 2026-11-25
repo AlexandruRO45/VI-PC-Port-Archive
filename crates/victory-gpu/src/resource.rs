@@ -1131,9 +1131,62 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // The console makes any texture a target or unordered storage; the host
+    // refuses resources with uses their format cannot take (the 16-bit
+    // packed ones: B4G4R4A4 has no render target support on NVIDIA and
+    // neither has UAV there, B5G5R5A1 no UAV either), and such a creation
+    // -- even a plain query of it -- removed the device for it (#2725). A
+    // use the host format cannot take is left away: the texture is made
+    // without it (its shader reads work), views of it are null and writes
+    // to it are dropped (`descriptor::host::fits`, `Host::rtv`, `Host::dsv`).
+    if d.flags & DEPTH == 0 {
+        let (rt, uav) = format_uses(d.format);
+        if !rt {
+            d.flags &= !RENDER_TARGET;
+        }
+        if !uav {
+            d.flags &= !UNORDERED;
+        }
+    }
     Some(d)
 }
 
+/// Whether the host takes texture `format` with the render target and the
+/// unordered access use, as `CheckFeatureSupport` reports it (which the
+/// query left unknown: reported so, as the console makes such textures).
+#[cfg(windows)]
+fn format_uses(format: u32) -> (bool, bool) {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+        D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static KNOWN: std::sync::Mutex<Vec<(u32, [bool; 2])>> = std::sync::Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, uses)) = known.iter().find(|&&(f, _)| f == format) {
+        return (uses[0], uses[1]);
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: a plain query into a struct of its size.
+    let reported = unsafe {
+        crate::host::host().is_some_and(|h| {
+            h.device
+                .CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut support).cast(), size_of_val(&support) as u32)
+                .is_ok()
+        })
+    };
+    let uses = [
+        !reported || support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0,
+        !reported || support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0,
+    ];
+    known.push((format, uses));
+    (uses[0], uses[1])
+}
+
+const RENDER_TARGET: u32 = 1;
 const DEPTH: u32 = 2;
 #[cfg(windows)]
 const UNORDERED: u32 = 4;
@@ -2351,6 +2404,52 @@ mod tests {
             mip_levels: mips,
             layout: 0,
             ..buffer(0)
+        }
+    }
+
+    /// A description of a 16-bit packed target agrees with the device: the
+    /// uses its format cannot take (B4G4R4A4's render target on NVIDIA, its
+    /// and B5G5R5A1's unordered access) are left away -- such a description
+    /// created removed the device for it (#2725) -- and those it takes stay,
+    /// the title's own.
+    #[cfg(windows)]
+    #[test]
+    fn a_target_of_a_format_the_device_refuses_the_uses_of_is_made_without_them() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+            D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        for format in [86, 115, 87] {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT(format as i32),
+                ..Default::default()
+            };
+            // SAFETY: a plain query into a struct of its size.
+            unsafe {
+                host.device
+                    .CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut support).cast(), size_of_val(&support) as u32)
+            }
+            .unwrap();
+            let desc = ResourceDesc {
+                flags: 1 | 4, // render target and unordered access
+                ..texture(4, 4, format, 1)
+            };
+            // SAFETY: a texture description; no device is touched.
+            let d = host_desc(&desc).expect("a texture description");
+            assert_eq!(
+                d.flags & RENDER_TARGET != 0,
+                support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0,
+                "format {format}: the render target use stays when the device takes it"
+            );
+            assert_eq!(
+                d.flags & UNORDERED != 0,
+                support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0,
+                "format {format}: the unordered access use stays when the device takes it"
+            );
         }
     }
 
