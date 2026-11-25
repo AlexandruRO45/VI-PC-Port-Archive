@@ -6821,6 +6821,8 @@ impl Meter {
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
                 let [same, parts, tails] =
                     [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURES_PARTLY[i].load(Ordering::Relaxed));
+                let [unchanged, reuploaded] =
+                    crate::draw::HEAP_TEXTURES_RECHECKED.each_ref().map(|n| n.load(Ordering::Relaxed));
                 tracing::info!(
                     "textures picked by index, the queue: {queued} slots, {due} of them due (the oldest written {oldest} frames ago), \
                      {away} waiting for their memory, {partly} uploaded in part; since the start: {} slots found uploaded already by \
@@ -6828,7 +6830,8 @@ impl Meter {
                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
                      {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
-                     {} made slots found unmapped and made null",
+                     {} made slots found unmapped and made null; {unchanged} content checks unchanged, \
+                     {reuploaded} textures uploaded again after a change",
                     crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[1].load(Ordering::Relaxed),
