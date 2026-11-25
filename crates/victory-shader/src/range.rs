@@ -397,6 +397,25 @@ mod tests {
     }
 
     #[test]
+    fn shift_bounds_accept_only_unambiguous_constant_counts() {
+        for count in 0..32 {
+            assert_eq!(constant_shift(&Operand::Literal(count)), Some(count));
+        }
+        for code in 128..=159 {
+            assert_eq!(
+                constant_shift(&Operand::Const(code)),
+                Some(u32::from(code - 128))
+            );
+        }
+        for count in [32, 63, u32::MAX] {
+            assert_eq!(constant_shift(&Operand::Literal(count)), None);
+        }
+        for code in [127, 160, 192, 193, 208] {
+            assert_eq!(constant_shift(&Operand::Const(code)), None);
+        }
+    }
+
+    #[test]
     fn constant_right_shifts_bound_relative_register_reads() {
         for (shift, expected) in [
             (30, vec![8, 9, 10, 11, 4]),
