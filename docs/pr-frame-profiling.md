@@ -30,7 +30,7 @@ exist separately and change the submission path.
   existing run destinations rather than overwriting captures.
 - Add a benchmark wrapper with executable/Git/environment/hardware metadata,
   process sampling, optional device-wide NVIDIA sampling, and bounded process lifetime.
-- Add a summarizer with explicit tail-mean lows and nearest-rank percentiles; reject
+- Add a summarizer with median frame time, explicit tail-mean lows and nearest-rank percentiles; reject
   loss, gaps and partial required fields. Document observer effects and warm-up.
 
 ## Performance impact
@@ -104,4 +104,4 @@ Optional telemetry may perturb scheduling or fill its queue under slow storage.
 S_OK-only counting changes reported cadence when the swap chain is occluded; it does
 not change submitted rendering. Existing consumers parsing the old English fence
 label need updating. No synchronization, draw omission or cache-default change is
-included. This description is a local draft; no PR has been submitted.
+included. Upstream discussion: https://github.com/Zettrox/ztrx/pull/82.

@@ -16,6 +16,25 @@ try {
     if ($summary.intervals -ne 1000 -or [Math]::Abs($summary.mean_frame_ms - 10.18) -gt 0.00001 -or
         $summary.median_frame_ms -ne 10 -or $summary.low_0_1_percent_fps -ne 10 -or [Math]::Abs($summary.low_1_percent_fps - (1000.0 / 28)) -gt 0.00001 -or
         $summary.p99_frame_ms -ne 10 -or $summary.p99_9_frame_ms -ne 20) { throw 'Incorrect percentile or tail-mean calculation.' }
+    # Distinct middle values catch even/odd indexing; crossing intervals stay out.
+    $selectedRows = [Collections.Generic.List[object]]::new()
+    $selectedElapsed = 0L
+    foreach ($ms in @(0, 10, 20, 30, 90)) {
+        $interval = [long]$ms * 1000000L
+        $selectedElapsed += $interval
+        $selectedRows.Add([pscustomobject]@{ schema_version = 1; kind = 'present'; sequence = $selectedRows.Count + 1; elapsed_ns = $selectedElapsed; interval_ns = $interval; lost_records = 0 })
+    }
+    $selectedRows | Export-Csv -LiteralPath $csv -NoTypeInformation
+    foreach ($case in @(
+        @{ Start = 0.01; End = 0.06; Count = 2; Median = 25 },
+        @{ Start = 0.01; End = 0.15; Count = 3; Median = 30 },
+        @{ Start = 0.025; End = 0.15; Count = 2; Median = 60 }
+    )) {
+        $summary = (& "$PSScriptRoot/summarize-profile.ps1" -InputCsv $csv -StartSeconds $case.Start -EndSeconds $case.End) | ConvertFrom-Json
+        if ($summary.intervals -ne $case.Count -or $summary.median_frame_ms -ne $case.Median) {
+            throw 'Incorrect selected-window median or interval boundary.'
+        }
+    }
     $rows[20].lost_records = 1
     $rows | Export-Csv -LiteralPath $csv -NoTypeInformation
     $rejected = $false
@@ -33,7 +52,7 @@ try {
     $rejected = $false
     try { & "$PSScriptRoot/summarize-profile.ps1" -InputCsv $csv | Out-Null } catch { $rejected = $true }
     if (-not $rejected) { throw 'A partial final row must invalidate the summary.' }
-    Write-Output 'Profile summary: synthetic cadence, percentiles, loss, gaps and partial rows passed.'
+    Write-Output 'Profile summary: synthetic cadence, medians, windows, percentiles, loss, gaps and partial rows passed.'
 } finally {
     # Only remove the two explicitly created paths, without recursive deletion.
     if (Test-Path -LiteralPath $csv) { Remove-Item -LiteralPath $csv }

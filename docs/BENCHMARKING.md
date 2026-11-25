@@ -65,7 +65,8 @@ Forced termination can lose queued tail records or leave a partial final line;
 only complete records describe the observed prefix, not the entire requested run.
 The files are not an atomic pair on disk failure. This exporter is not an asset cache.
 
-The summarizer uses reciprocal mean interval for FPS, nearest-rank frame-time
+The summarizer reports median interval in milliseconds (the mean of the two middle
+intervals for an even sample), reciprocal mean interval for FPS, nearest-rank frame-time
 percentiles, and reciprocal mean of the slowest ceil(N*1%) / ceil(N*0.1%) intervals
 for lows. It excludes intervals crossing the selection boundary and refuses reported
 loss/gaps. Small samples, especially fewer than 1,000 intervals, poorly estimate 0.1%
