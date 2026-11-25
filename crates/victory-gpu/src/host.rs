@@ -4013,8 +4013,10 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
+        // Only per-list timing needs the boundaries. Ordinary submissions
+        // execute the entire list slice and need no boundary allocation.
+        #[cfg(feature = "diagnostics")]
+        let mut firsts = timing().then(|| Vec::with_capacity(runs.len()));
         let mut batch = Batch::default();
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
@@ -4055,7 +4057,10 @@ impl Host {
         }
         for list in runs {
             list.run_deferred(&mut batch);
-            firsts.push(lists.len());
+            #[cfg(feature = "diagnostics")]
+            if let Some(firsts) = &mut firsts {
+                firsts.push(lists.len());
+            }
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
@@ -4114,18 +4119,17 @@ impl Host {
             return Some((submitted, sent));
         }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        let groups = [&lists[..]];
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let timed_groups = firsts.map(|firsts| {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
                 .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+                .collect::<Vec<_>>()
+        });
+        #[cfg(feature = "diagnostics")]
+        let groups = timed_groups.as_deref().unwrap_or(&groups);
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -4174,7 +4178,6 @@ impl Host {
             }
             let _ = (i, started);
         }
-        let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
