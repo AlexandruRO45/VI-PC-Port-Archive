@@ -78,6 +78,8 @@ pub(crate) static SAVED: AtomicU64 = AtomicU64::new(0);
 /// Stores the host refused: each one is a pipeline every later run compiles
 /// again.
 pub(crate) static STORE_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// [`STORE_REFUSED`] by class of pipeline: compute, mesh, graphics.
+static STORE_REFUSED_BY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Whether the library's file is mapped ([`Blob`]) and saved through a
 /// mapping. On by default; `VICTORY_LIBRARY_MAP=0` uses buffers, as before.
@@ -578,6 +580,7 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
+    class: &'static str,
     load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
@@ -671,11 +674,21 @@ pub(crate) fn pipeline(
                 // library file stays small while thousands are made. Said once,
                 // with the count on the save line beside it.
                 STORE_REFUSED.fetch_add(1, Ordering::Relaxed);
-                static SAID: AtomicBool = AtomicBool::new(false);
-                if !SAID.swap(true, Ordering::Relaxed) {
+                // Which class they are in decides where to look: mesh state,
+                // pixel state, or the compute path's root signature. One line
+                // per class, with the description's own words.
+                let at = match class {
+                    "mesh" => 1,
+                    "graphics" => 2,
+                    _ => 0,
+                };
+                STORE_REFUSED_BY[at].fetch_add(1, Ordering::Relaxed);
+                static SAID: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
+                if !SAID[at].swap(true, Ordering::Relaxed) {
                     tracing::warn!(
                         error = %why,
                         pipeline = %name,
+                        class,
                         "host pipeline: the library refused to store it"
                     );
                 }
@@ -783,6 +796,9 @@ pub(crate) fn save(now: bool) {
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             store_refused = STORE_REFUSED.load(Ordering::Relaxed),
+            store_refused_compute = STORE_REFUSED_BY[0].load(Ordering::Relaxed),
+            store_refused_mesh = STORE_REFUSED_BY[1].load(Ordering::Relaxed),
+            store_refused_graphics = STORE_REFUSED_BY[2].load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             recycled = RECYCLED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),

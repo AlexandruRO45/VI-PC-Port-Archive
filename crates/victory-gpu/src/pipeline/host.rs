@@ -798,6 +798,7 @@ impl HostPipeline {
             }
             let made = super::library::pipeline(
                 &name,
+                "compute",
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                 // SAFETY: as above.
@@ -950,6 +951,7 @@ impl HostPipeline {
         let make = |desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, name: &str| {
             super::library::pipeline(
                 name,
+                "graphics",
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadGraphicsPipeline(name, desc) },
                 // SAFETY: as above.
@@ -1113,6 +1115,7 @@ fn mesh_pipeline(
     let device = device.cast::<ID3D12Device2>()?;
     super::library::pipeline(
         name,
+        "mesh",
         // SAFETY: the stream holds whole subobjects pointing at live data.
         |library, name| unsafe { library.LoadPipeline(name, &desc) },
         // SAFETY: as above.
