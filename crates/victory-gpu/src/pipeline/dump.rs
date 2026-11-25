@@ -50,9 +50,9 @@ fn file() -> Option<&'static std::path::PathBuf> {
     .as_ref()
 }
 
-/// Writes `shaders` and `state` to the dump, once per distinct pipeline.
-pub(crate) fn record(shaders: &[(String, String)], state: Option<&GraphicsState>) {
-    let Some(path) = file() else { return };
+/// The line `record` writes for `shaders` and `state`: the one `victory
+/// precompile` rebuilds, and the one a preload manifest holds.
+pub(crate) fn line_of(shaders: &[(String, String)], state: Option<&GraphicsState>) -> String {
     let layout = if shaders.len() == 1 && shaders[0].0 == "compute" {
         "compute"
     } else if shaders.iter().any(|(stage, _)| stage == "mesh") {
@@ -66,7 +66,13 @@ pub(crate) fn record(shaders: &[(String, String)], state: Option<&GraphicsState>
         .collect::<Vec<_>>()
         .join(",");
     let fields = state.map(GraphicsState::fields).unwrap_or_else(|| "-".into());
-    let line = format!("kind={layout} stages={stages} state={fields}");
+    format!("kind={layout} stages={stages} state={fields}")
+}
+
+/// Writes `shaders` and `state` to the dump, once per distinct pipeline.
+pub(crate) fn record(shaders: &[(String, String)], state: Option<&GraphicsState>) {
+    let Some(path) = file() else { return };
+    let line = line_of(shaders, state);
     // Under the lock, and in one write: a second process on the same dump (the
     // title relaunches itself, and the audio capture child has the environment
     // too) appends to the same file with its own set, so a write that is not one

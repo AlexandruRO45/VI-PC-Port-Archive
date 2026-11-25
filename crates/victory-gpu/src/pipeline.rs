@@ -810,6 +810,7 @@ mod dump;
 #[cfg(windows)]
 mod library;
 mod poison;
+mod preload;
 
 /// The key a poison list is written for (this executable's own hash), for the
 /// prober that writes one.

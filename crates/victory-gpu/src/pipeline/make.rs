@@ -49,22 +49,27 @@ impl Pending {
         // `VICTORY_PIPELINE_DUMP`: the pipeline as a line `victory precompile`
         // rebuilds, written before the make so a run that faults here still
         // leaves the description that faulted.
-        super::dump::record(
-            &shaders.iter().map(|s| (s.stage.to_owned(), s.hash.clone())).collect::<Vec<_>>(),
-            graphics.as_deref(),
-        );
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let key = key.finalize().to_hex()[..32].to_owned();
+        super::dump::record(
+            &shaders.iter().map(|s| (s.stage.to_owned(), s.hash.clone())).collect::<Vec<_>>(),
+            graphics.as_deref(),
+        );
+        // `VICTORY_PRELOAD`: the same line, and its stages' containers, kept
+        // for the keys the early list holds, so a later run loads them at
+        // startup instead of inside the frame that first asks for them.
+        super::preload::record(&shaders, graphics.as_deref(), &key);
         Pending {
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            key,
             used: AtomicBool::new(false),
             #[cfg(feature = "diagnostics")]
             queued_at: AtomicU64::new(0),

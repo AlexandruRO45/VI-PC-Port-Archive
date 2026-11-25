@@ -581,6 +581,14 @@ pub(crate) fn pipeline(
     load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    // The startup preload runs here, on the first pipeline the title asks for
+    // (during loading, before any frame): it loads what the library holds, and
+    // `while_preloading` keeps it from compiling anything.
+    if preload_now()
+        && let Some(dir) = DIR.get()
+    {
+        super::preload::run(dir);
+    }
     let wide = HSTRING::from(name);
     // With `VICTORY_SERIAL_PIPELINES=1` the load, the create and the store of
     // one pipeline hold the compiler's lock between them, so no other path can
@@ -616,6 +624,9 @@ pub(crate) fn pipeline(
     // Said before the call, not after: the vendor compiler can fault on this
     // path, and a fault leaves nothing behind to say which pipeline was being
     // made or why the library missed it. This line is the only account of it.
+    if PRELOADING.with(|p| p.get()) {
+        return Err(refused);
+    }
     tracing::info!(
         pipeline = %name,
         refused = %refused,
@@ -1002,6 +1013,28 @@ mod tests {
     }
 }
 
+
+thread_local! {
+    /// Whether this thread is in the startup preload, which loads what the
+    /// library holds and compiles nothing.
+    static PRELOADING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with creates refused ([`pipeline`] returns the load's refusal
+/// rather than compiling): what a preload is.
+pub(crate) fn while_preloading<T>(f: impl FnOnce() -> T) -> T {
+    PRELOADING.with(|p| p.set(true));
+    let done = f();
+    PRELOADING.with(|p| p.set(false));
+    done
+}
+
+/// Whether this call is the one that runs the startup preload: once per
+/// process, and only with `VICTORY_PRELOAD=1`.
+fn preload_now() -> bool {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    super::preload::enabled() && !DONE.swap(true, Ordering::Relaxed)
+}
 
 /// Whether a pipeline the library did not hold is refused instead of made
 /// (`VICTORY_NO_PIPELINE_FALLBACK=1`, diagnostics builds only). The fallback
