@@ -53,9 +53,13 @@ WAVE_SEED=42 WAVE_COUNT=1 cargo test -p victory-shader --locked --test equivalen
 ```
 
 Seeds are unsigned decimal integers. Each seed reconstructs the entire program
-and its inputs from SplitMix64. The default run starts at zero and executes up to
-10,000 consecutive seeds or 30 minutes, checking the deadline between bounded
-cases. It prints the first seed, counts and elapsed search time. The final
+and its inputs from SplitMix64. The regular test suite runs seeds 10,000 through
+10,127 and requires every case to complete and agree at both stages. Failures
+report the seed and outcome.
+
+The opt-in campaign starts at zero by default and executes up to 10,000
+consecutive seeds or 30 minutes, checking the deadline between bounded cases.
+It prints the first seed, counts and elapsed search time. The final
 outcomes distinguish agreement, compiler refusal, checker-unsupported behavior,
 invalid evaluation, compiler errors, exhaustion, panic and semantic difference.
 The separate SSA count includes programs whose SSA comparison passed before a

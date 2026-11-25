@@ -76,6 +76,19 @@ fn generate(seed: u64) -> (Vec<Region>, Inputs) {
     )
 }
 
+#[test]
+fn fixed_generated_corpus_agrees() {
+    // This range was independently validated on Windows during PR review.
+    for seed in 10_000..10_128 {
+        let (body, inputs) = generate(seed);
+        assert_eq!(
+            evaluate(&body, &inputs, unchanged).outcome,
+            Outcome::Agree,
+            "generated Wave32 program at seed {seed}"
+        );
+    }
+}
+
 // Each candidate is assembled afresh: labels and restores survive deletion.
 // Walk subregions too, retaining nonempty bodies and positive trip counts.
 fn smaller(body: &[Region]) -> Vec<Vec<Region>> {
