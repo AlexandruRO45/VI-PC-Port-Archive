@@ -28,7 +28,9 @@ pub(crate) struct HostHeap {
     made: Mutex<Vec<u64>>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
-    /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
+    /// ([`HostHeap::mirror_copied`]). Zero marks an unchecked empty slot.
+    /// `COPIED_INVALIDATED` marks a slot changed since the pass last saw it.
+    /// Made on first use. When taking both locks, take `made` first.
     copied: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
@@ -1454,20 +1456,34 @@ impl HostHeap {
             return false;
         }
         self.unmake(&mut made, index);
-        drop(made);
-        self.forget_copied(index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
     }
 
-    /// Clears the cached raw-copy fingerprint for `index` so a subsequent
-    /// raw-byte copy back to an earlier record is not mistakenly skipped.
-    /// Must never be called while holding `self.made`.
-    fn forget_copied(&self, index: u32) {
+    /// Updates the cached fingerprint with `made` still held so the
+    /// fingerprint and descriptor are published in the same order.
+    fn set_copied(&self, index: u32, print: u64) {
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = copied.get_mut(index as usize) {
-            *slot = 0;
+            *slot = print;
         }
+    }
+
+    fn copied_records(&self) -> std::sync::MutexGuard<'_, Vec<u64>> {
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        if !copied.is_empty() {
+            return copied;
+        }
+        drop(copied);
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        if copied.is_empty() {
+            // API writes may have populated slots before the first scan.
+            copied.extend(made.iter().map(|&key| {
+                if key == 0 { 0 } else { COPIED_INVALIDATED }
+            }));
+        }
+        copied
     }
 
     /// Makes host slot `index` null again, as it is before its view is
@@ -1484,6 +1500,7 @@ impl HostHeap {
             None => null_view(self.cpu(index)),
         }
         self.keep(index, None);
+        self.set_copied(index, 0);
     }
 
     /// Title slot `index` is a table's ([`HostHeap::tabled`]). `read`: a
@@ -1872,7 +1889,7 @@ impl HostHeap {
     /// kernel, which fails on a page the title unmapped meanwhile where a
     /// read in place would fault: the title unmaps heap pages too).
     pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
-        if index >= self.count {
+        if index >= self.count || record.len() < 12 {
             return false;
         }
         // A slot draws read through a table lately is left to its draws,
@@ -1889,50 +1906,12 @@ impl HostHeap {
             COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
-        let n = record.len();
-        // Never 0, which is "never looked at". (A multiply-and-fold over
-        // the record's words: BLAKE3 here was most of the 35 to 42 ms a
-        // frame this pass took over some 250,000 to 300,000 records, run
-        // 200.)
         let print = record_print(record) | 1;
-        let all_zero = record[..n].iter().all(|&b| b == 0);
-        let check_made_for_zero = {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if copied.is_empty() {
-                copied.resize(self.count as usize, 0);
-            }
-            let Some(last) = copied.get_mut(index as usize) else {
-                return false;
-            };
-            if *last == print {
-                return false;
-            }
-            if *last == 0 && all_zero {
-                // Slot was never raw-copied, but may hold a descriptor written
-                // via API (`Create*View`/`CopyDescriptors`); check `made` outside
-                // the `copied` lock before skipping.
-                true
-            } else {
-                *last = print;
-                false
-            }
-        };
-        if check_made_for_zero {
-            let is_made = self
-                .made
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(index as usize)
-                .is_some_and(|&key| key != 0);
-            if !is_made {
-                return false;
-            }
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(last) = copied.get_mut(index as usize) {
-                *last = print;
-            }
+        let last = self.copied_records()[index as usize];
+        if last == print || (last == 0 && record.iter().all(|&b| b == 0)) {
+            return false;
         }
-        self.mirror_inner(index, handle, false, false);
+        self.mirror_snapshot(index, handle, record, print);
         true
     }
 
@@ -1958,14 +1937,14 @@ impl HostHeap {
         from: usize,
         page: &[u8],
     ) -> (u64, u64) {
+        if step < 12 {
+            return (0, 0);
+        }
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
-        let mut due: Vec<(u32, u64)> = Vec::new();
+        let mut due = Vec::new();
         {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if copied.is_empty() {
-                copied.resize(self.count as usize, 0);
-            }
+            let copied = self.copied_records();
             for index in slots {
                 let handle = start + index * step;
                 // A record that straddles the range's ends is left to the
@@ -1978,14 +1957,11 @@ impl HostHeap {
                 };
                 looked += 1;
                 // None past the host heap's slots, as `mirror_copied`.
-                let Some(last) = copied.get_mut(index as usize) else {
+                let Some(&last) = copied.get(index as usize) else {
                     continue;
                 };
-                // Never 0, which is "never looked at".
                 let print = record_print(record) | 1;
-                // The record last seen, or a slot never looked at that
-                // holds nothing: as it was.
-                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                if last == print || (last == 0 && record.iter().all(|&b| b == 0)) {
                     continue;
                 }
                 // A table's slot lately: left to its draws, and looked at
@@ -1994,14 +1970,19 @@ impl HostHeap {
                     COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
-                *last = print;
-                due.push((index as u32, handle));
+                due.push((index as u32, handle, record, print));
             }
         }
-        for &(index, handle) in &due {
-            self.mirror(index, handle, false);
+        for &(index, handle, record, print) in &due {
+            self.mirror_snapshot(index, handle, record, print);
         }
         (looked, due.len() as u64)
+    }
+
+    fn mirror_snapshot(&self, index: u32, handle: u64, record: &[u8], print: u64) {
+        // Decode the same snapshot used to compute the fingerprint.
+        let word = |at| u32::from_le_bytes(record[at..at + 4].try_into().unwrap());
+        self.mirror_record(index, handle, false, [word(0), word(4), word(8)], Some(print));
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -2009,19 +1990,6 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
-        self.mirror_inner(index, handle, for_draw, true)
-    }
-
-    /// Shared implementation of [`HostHeap::mirror`] and
-    /// [`HostHeap::mirror_copied`]. When `invalidate_copied` is true and
-    /// `made[index]` changes, clears `self.copied[index]` after dropping `made`.
-    fn mirror_inner(
-        &self,
-        index: u32,
-        handle: u64,
-        for_draw: bool,
-        invalidate_copied: bool,
-    ) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -2037,13 +2005,23 @@ impl HostHeap {
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let record = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        self.mirror_record(index, handle, for_draw, record, None)
+    }
+
+    fn mirror_record(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        [tag, i, generation]: [u32; 3],
+        print: Option<u64>,
+    ) -> Option<View> {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut stale_unmade: Vec<u32> = Vec::new();
         let mut self_changed = false;
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let result = {
-            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
             match view {
                 None => {
@@ -2054,7 +2032,7 @@ impl HostHeap {
                         self.make_null(index);
                         let _ = self.note_buffer(index, None, false);
                         self_changed = true;
-                    } else if for_draw {
+                    } else if for_draw || (print.is_some() && [tag, i, generation] == [0; 3]) {
                         // Left for later and stale since: out of the sets and the stride table.
                         let _ = self.note_buffer(index, None, false);
                     }
@@ -2067,9 +2045,6 @@ impl HostHeap {
                         // let go of the host copies they held.
                         for stale in self.note_buffer(index, Some(&view), for_draw) {
                             if stale != index {
-                                if made.get(stale as usize).is_some_and(|&k| k != 0) {
-                                    stale_unmade.push(stale);
-                                }
                                 self.unmake(&mut made, stale);
                             }
                         }
@@ -2116,11 +2091,10 @@ impl HostHeap {
                 }
             }
         };
-        if invalidate_copied && self_changed {
-            self.forget_copied(index);
-        }
-        for stale in stale_unmade {
-            self.forget_copied(stale);
+        if let Some(print) = print {
+            self.set_copied(index, print);
+        } else if self_changed {
+            self.set_copied(index, COPIED_INVALIDATED);
         }
         result
     }
@@ -2365,6 +2339,9 @@ fn sync_tables() -> bool {
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Recorded fingerprints are odd, leaving this value free for invalidation.
+const COPIED_INVALIDATED: u64 = 2;
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same
@@ -2839,12 +2816,11 @@ fn twin_uav(
 /// a constant view, so nothing it can read is lost.
 fn constant_view_size(size: u32) -> u32 {
     const MOST: u32 = 4096 * 16;
-    let sized = size.max(1).next_multiple_of(256);
-    if sized > MOST {
+    if size > MOST {
         once!(size, "a constant buffer view over 64 KiB, made 64 KiB (the host takes no more)");
         return MOST;
     }
-    sized
+    size.max(1).next_multiple_of(256)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -3262,10 +3238,46 @@ mod tests {
     /// most the host takes (a larger size removes the device on NVIDIA).
     #[test]
     fn constant_views_are_at_most_64_kib() {
+        assert_eq!(constant_view_size(0), 256);
         assert_eq!(constant_view_size(16), 256);
         assert_eq!(constant_view_size(256), 256);
         assert_eq!(constant_view_size(65_536), 65_536);
         assert_eq!(constant_view_size(1_306_368), 65_536);
+        assert_eq!(constant_view_size(u32::MAX), 65_536);
+    }
+
+    #[test]
+    fn copied_page_uses_snapshot_and_invalidates_after_api_writes() {
+        let Some(heap) = HostHeap::new(true, 8) else { return };
+        let clamp = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+        let mut wrap = clamp;
+        wrap[1] = 1;
+        let mut a = [0u32; 4];
+        let mut b = [0u32; 4];
+        super::super::create_sampler(std::ptr::null(), &clamp, a.as_mut_ptr() as u64);
+        super::super::create_sampler(std::ptr::null(), &wrap, b.as_mut_ptr() as u64);
+        let key = |record: [u32; 4]| u64::from(record[2]) << 32 | u64::from(record[1]);
+        assert_ne!(key(a), key(b));
+        let mut live = b;
+        let handle = live.as_mut_ptr() as u64;
+        let scan = |record: [u32; 4]| {
+            let bytes = record.map(u32::to_le_bytes);
+            heap.mirror_copied_page(1..2, (handle - 16, 16), handle as usize, bytes.as_flattened())
+        };
+
+        heap.mirror(1, handle, false);
+        assert_eq!(heap.made_key(1), key(b));
+        assert_eq!(scan([0; 4]), (1, 1), "clear an API slot on its first scan");
+        assert_eq!(heap.made_key(1), 0);
+
+        assert_eq!(scan(a), (1, 1));
+        assert_eq!(heap.made_key(1), key(a), "publish the snapshot while the live record differs");
+        assert_eq!(scan(a), (1, 0), "the published fingerprint remains cached");
+
+        heap.mirror(1, handle, false);
+        assert_eq!(heap.made_key(1), key(b));
+        assert_eq!(scan(a), (1, 1), "an API write invalidates the old fingerprint");
+        assert_eq!(heap.made_key(1), key(a));
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's

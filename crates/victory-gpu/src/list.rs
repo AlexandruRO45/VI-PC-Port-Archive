@@ -767,9 +767,13 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                     return Some(None);
                 }
                 let copy = crate::resource::host_copy(r)?;
+                let reserved = copy.tiled.is_some();
+                if reserved {
+                    list.keep(&copy.texture);
+                }
                 Some(Some((
                     copy.texture.as_raw().cast_const().cast(),
-                    copy.tiled.is_some(),
+                    reserved,
                 )))
             };
             let first = resolve(b.first)?;
