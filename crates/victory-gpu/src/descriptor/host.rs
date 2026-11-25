@@ -1115,6 +1115,15 @@ fn buffer_uav(
         once!(len, "unordered buffer view of elements without a size");
         return None;
     }
+    // A typed view, as of textures (`fits`): one in a format the host stores
+    // no typed unordered views of removes the device.
+    if buffer.StructureByteStride == 0
+        && buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 == 0
+        && !typed_store(desc.Format.0 as u32)
+    {
+        once!(format = desc.Format.0, "an unordered buffer view in a format the host cannot store");
+        return None;
+    }
     let start = address + buffer.FirstElement * element;
     let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
     // SAFETY: a live buffer.
@@ -1158,9 +1167,10 @@ fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, O
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
-/// resource's permission, of typed depth, and in a format neither of the
+/// resource's permission, of typed depth, in a format neither of the
 /// resource's family nor among the formats it was made castable to
-/// (`castable`, `resource::castable`). A view of a typed texture in another
+/// (`castable`, `resource::castable`), and unordered views in a format it
+/// stores no typed unordered views of. A view of a typed texture in another
 /// format of its family takes the texture's format unless it is castable.
 /// shortcut: such a view (sRGB of UNORM, say, on a texture the host made
 /// without castable formats) reads without its conversion.
@@ -1195,6 +1205,10 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
+        if !typeless && unordered && !typed_store(own) {
+            once!(own, "an unordered view of a texture in a format the host cannot store");
+            return false;
+        }
         return !typeless;
     }
     let cast = castable.contains(&view);
@@ -1202,7 +1216,13 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         once!(view, own, "view format of another family");
         return false;
     }
-    if cast && family(view) != family(own) && unordered && !typed_store(view) {
+    // The format of the host view: the view's if the texture is typeless or
+    // castable to it, else the texture's own. A texture made with castable
+    // formats takes unordered access although its own format has none
+    // (B5G5R5A1_UNORM on the GTX 1070 Ti, the title 2026-11-25), and an
+    // unordered view in that format removes the device.
+    let made = if typeless || cast { view } else { own };
+    if unordered && !typed_store(made) {
         once!(view, own, "an unordered view in a format the host cannot store");
         return false;
     }
@@ -1734,6 +1754,69 @@ mod tests {
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
         null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// The title's device removal on the GTX 1070 Ti (2026-11-25): a texture in a
+    /// format the host stores no typed unordered views of (B5G5R5A1_UNORM on
+    /// the GTX 1070 Ti), made with castable formats, takes unordered access
+    /// (a plain one is refused). Unordered views in its own format, named or
+    /// by default, are refused (a null view in their slot); ones in a
+    /// castable format the host stores, and shader views, are made.
+    #[test]
+    fn unordered_views_in_a_format_the_host_cannot_store_are_refused() {
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let b5g5r5a1 = DXGI_FORMAT_B5G5R5A1_UNORM.0 as u32;
+        if typed_store(b5g5r5a1) {
+            eprintln!("the host stores typed unordered views of B5G5R5A1_UNORM; skipped");
+            return;
+        }
+        let Ok(device) = host.device.cast::<ID3D12Device10>() else {
+            return; // no castable formats
+        };
+        let castable = crate::resource::castable(b5g5r5a1);
+        let formats: Vec<DXGI_FORMAT> = castable.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
+        let desc = D3D12_RESOURCE_DESC1 {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_B5G5R5A1_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: a host description and our out pointer; the list lives
+        // through the call.
+        unsafe {
+            device.CreateCommittedResource3(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_BARRIER_LAYOUT_COMMON,
+                None,
+                None::<&ID3D12ProtectedResourceSession>,
+                Some(&formats),
+                &mut texture,
+            )
+        }
+        .expect("a texture made with castable formats");
+        let texture = texture.expect("a texture");
+        let mut own = DXGI_FORMAT_B5G5R5A1_UNORM;
+        assert!(!fits(&texture, &castable, Some(&mut own), true), "its own format");
+        assert!(!fits(&texture, &castable, None, true), "no description: its own format");
+        let mut r16 = DXGI_FORMAT_R16_UINT;
+        assert!(fits(&texture, &castable, Some(&mut r16), true), "a castable format the host stores");
+        assert_eq!(r16, DXGI_FORMAT_R16_UINT);
+        let mut read = DXGI_FORMAT_B5G5R5A1_UNORM;
+        assert!(fits(&texture, &castable, Some(&mut read), false), "a shader view");
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
