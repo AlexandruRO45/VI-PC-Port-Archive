@@ -10740,8 +10740,9 @@ mod tests {
     #[test]
     fn s_buffer_load_with_unaligned_soffset_and_offset_lowers() {
         // Hardware rule: independent truncation, not sum-then-shift.
-        assert_eq!((3u32 & !3) + (3u32 & !3), 0);
-        assert_eq!((3u32 + 3) >> 2, 1);
+        let trunc = |x: u32| x & !3;
+        assert_eq!(trunc(3).wrapping_add(trunc(3)), 0);
+        assert_eq!(3u32.wrapping_add(3) >> 2, 1);
         let words = [
             0xBE85_0380u32, // s_mov_b32 s5, 0
             0xF408_0202,    // s_load_dwordx4 s[8:11], s[4:5], 0 (CBV)
