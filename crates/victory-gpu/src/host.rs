@@ -3602,6 +3602,7 @@ fn late_line(frames: f64) {
     #[cfg(feature = "diagnostics")]
     fill_check::line();
     fill_ahead::line(frames);
+    crate::readprobe::line(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -7855,7 +7856,9 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let mut once = || unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 };
+    // A page the copy-back probe marked fails the read: unmarked, again.
+    once() || (crate::readprobe::unmark(src as usize, len) && once())
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -7905,6 +7908,10 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
     if len == 0 || write(dst as usize, len) {
+        return;
+    }
+    // A page the copy-back probe marked fails the write: unmarked, again.
+    if crate::readprobe::unmark(dst as usize, len) && write(dst as usize, len) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {

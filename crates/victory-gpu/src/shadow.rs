@@ -3921,11 +3921,13 @@ impl Shadow {
         }
         crate::host::shaders_write(start + at, &title[..]);
         if self.put_back_own(start + at, &title[..]) {
+            crate::readprobe::mark(start + at, n);
             return n;
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::readprobe::mark(start + at, n);
         n
     }
 }

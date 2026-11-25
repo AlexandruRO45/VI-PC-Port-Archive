@@ -76,6 +76,8 @@ pub mod signature;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod readprobe;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
