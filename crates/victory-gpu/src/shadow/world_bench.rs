@@ -11,6 +11,17 @@
 //! memory"): bytes the GPU wrote reach title memory, and bytes the title
 //! wrote while the GPU ran stay as the title left them.
 //!
+//! Two modes, as `Host::execute` runs them: `world_frame_copies` snapshots
+//! each declared range before the submission (memory that is not tracked),
+//! `world_frame_copies_marked` arms the ranges and copies back the pages
+//! the shaders marked (`Shadow::writing` with `marked`, then
+//! [`copy_back_marks`]). Both check the same things, with one exception
+//! the marked mode prints instead of asserting: a GPU write on a page that
+//! no declared range covers whole, which the title has written since its
+//! copy last took it. Such a page is never taken (`Shadow::update` takes
+//! whole pages only), so `Shadow::copy_back_marked` cannot tell the
+//! shaders' bytes from stale ones and keeps the title's.
+//!
 //! `cargo test --release -p victory-gpu world_frame_copies -- --ignored --nocapture`
 
 use std::collections::BTreeMap;
@@ -71,6 +82,9 @@ struct Frame {
     snapshots: Duration,
     copy_back: Duration,
     written: usize,
+    /// GPU writes on pages no declared range covered whole that did not
+    /// reach title memory (marked mode).
+    edge_lost: usize,
 }
 
 fn time<T>(total: &mut Duration, f: impl FnOnce() -> T) -> T {
@@ -93,6 +107,28 @@ fn get(at: usize) -> u64 {
 #[test]
 #[ignore = "benchmark: needs a host D3D12 device and ~600 MB; run in release with --ignored --nocapture"]
 fn world_frame_copies() {
+    replay(false);
+}
+
+#[test]
+#[ignore = "benchmark: needs a host D3D12 device and ~600 MB; run in release with --ignored --nocapture"]
+fn world_frame_copies_marked() {
+    replay(true);
+}
+
+/// Sets the written-pages bit of title address `at`, as a shader writing
+/// through a view of `shadow` does.
+fn mark(shadow: &Shadow, at: usize) {
+    let (bit, _) = shadow
+        .mark_entry(at as u64)
+        .expect("a tracked copy marks its views' writes");
+    let words = bitmap().expect("the written-pages bitmap").data as *mut u32;
+    // SAFETY: a dword of the mapped bitmap (`mark_entry` gives bits of it);
+    // nothing else runs on the GPU in this test.
+    unsafe { *words.add(bit as usize / 32) |= 1 << (bit % 32) };
+}
+
+fn replay(marked: bool) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
@@ -117,6 +153,7 @@ fn world_frame_copies() {
     }
     register(0x5eed_0174, base as u64, HEAP as u64);
     let shadow = find(base as u64, 1).expect("a host copy of the heap");
+    assert!(!marked || shadow.marked(), "the heap's copy is not tracked");
     shadow.update(base, HEAP);
 
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -134,12 +171,16 @@ fn world_frame_copies() {
             }
             let declared: Vec<(usize, usize)> =
                 (0..DECLARED).map(|_| views[rng.below(VIEWS)]).collect();
-            // Each range's draws read some of the heap first.
+            // Each range's draws read some of the heap first; the range
+            // itself is refreshed before it is declared, as `gpu_writes`
+            // asks (the shaders start from the title's data).
             for &(address, len) in &declared {
                 let (read, n) = rng.range(base, 1 << 20, 128 << 20);
-                f.asked += n;
-                f.refreshed += time(&mut f.refresh, || shadow.update(read, n));
-                time(&mut f.snapshots, || shadow.writing(address, len));
+                f.asked += n + len;
+                f.refreshed += time(&mut f.refresh, || {
+                    shadow.update(read, n) + shadow.update(address, len)
+                });
+                time(&mut f.snapshots, || shadow.writing(address, len, marked));
             }
             // The GPU writes into the declared ranges, while the title
             // writes the eight bytes after each place (same pages).
@@ -154,9 +195,17 @@ fn world_frame_copies() {
                 stamp += 1;
                 gpu.insert(at, stamp);
                 put(shadow.data as usize + (at - base), stamp);
+                if marked {
+                    mark(&shadow, at);
+                }
                 stamp += 1;
                 title.insert(at + 8, stamp);
                 put(at + 8, stamp);
+            }
+            // After the submission: the marked pages, then the declared
+            // ranges (which disarm the copy).
+            if marked {
+                time(&mut f.copy_back, || copy_back_marks(&[]));
             }
             let mut once = declared.clone();
             once.sort_unstable();
@@ -165,6 +214,14 @@ fn world_frame_copies() {
                 f.written += time(&mut f.copy_back, || shadow.copy_back(address, len));
             }
             for (&at, &value) in &gpu {
+                let page = at & !(crate::watch::PAGE - 1);
+                let whole = declared
+                    .iter()
+                    .any(|&(a, l)| a <= page && page + crate::watch::PAGE <= a + l);
+                if marked && !whole && get(at) != value {
+                    f.edge_lost += 1;
+                    continue;
+                }
                 assert_eq!(
                     get(at),
                     value,
@@ -189,7 +246,18 @@ fn world_frame_copies() {
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
     let mb = |n: usize| n as f64 / f64::from(1 << 20);
     println!(
-        "frame | refresh ms (MB copied of GB asked) | snapshots ms | copy-back ms (KB written) | total ms"
+        "mode: {}",
+        if marked { "marked pages" } else { "snapshots" }
+    );
+    println!(
+        "frame | refresh ms (MB copied of GB asked) | {} ms | copy-back ms ({}) | total ms",
+        if marked { "arming" } else { "snapshots" },
+        // `copy_back_marks` does not say what it wrote.
+        if marked {
+            "KB written by declared ranges"
+        } else {
+            "KB written"
+        }
     );
     for (i, f) in frames.iter().enumerate().skip(1) {
         println!(
@@ -209,4 +277,13 @@ fn world_frame_copies() {
         .collect();
     totals.sort_by(f64::total_cmp);
     println!("median total: {:.1} ms per frame", totals[totals.len() / 2]);
+    if marked {
+        let (lost, writes) = (
+            frames.iter().map(|f| f.edge_lost).sum::<usize>(),
+            FRAMES * SUBMISSIONS * GPU_WRITES,
+        );
+        println!(
+            "GPU writes kept out of title memory on pages no declared range covers whole: {lost} (of up to {writes})"
+        );
+    }
 }
