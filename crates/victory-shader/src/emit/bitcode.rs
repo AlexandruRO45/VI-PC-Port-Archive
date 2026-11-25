@@ -1321,15 +1321,37 @@ mod tests {
         })
     }
 
-    /// Liveness as `write` computed it before the worklist: whole passes over
-    /// the instructions until one changes nothing.
+    /// Liveness by whole passes until one changes nothing, to check the
+    /// worklist against: the blocks reached from the entry by the edges
+    /// branches on constants leave, what is rooted in them and their branch
+    /// conditions, and what those read (a phi: only along an edge that is
+    /// still there).
     fn live_by_passes(m: &Module) -> Vec<bool> {
+        let mut reached = vec![false; m.blocks.len()];
+        reached[0] = true;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let now: Vec<usize> = (0..m.blocks.len()).filter(|&b| reached[b]).collect();
+            for b in now {
+                for &s in successors(m.term(b)).iter() {
+                    if !reached[s] {
+                        reached[s] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
         let mut live = vec![false; m.insts.len()];
-        for b in &m.blocks {
-            for &i in b.body.iter().filter(|&&i| m.rooted(i)) {
+        let mut owner = vec![usize::MAX; m.insts.len()];
+        for (b, blk) in m.blocks.iter().enumerate().filter(|&(b, _)| reached[b]) {
+            for &i in &blk.phis {
+                owner[i as usize] = b;
+            }
+            for &i in blk.body.iter().filter(|&&i| m.rooted(i)) {
                 live[i as usize] = true;
             }
-            if let Some(Term::CondBr(V::Inst(c), ..)) = b.term {
+            if let Some(Term::CondBr(V::Inst(c), ..)) = m.term(b) {
                 live[c as usize] = true;
             }
         }
@@ -1337,15 +1359,26 @@ mod tests {
         while changed {
             changed = false;
             for (i, inst) in m.insts.iter().enumerate() {
-                if live[i] {
-                    for_each_operand(&inst.op, |v| {
-                        if let V::Inst(j) = v
-                            && !live[j as usize]
-                        {
-                            live[j as usize] = true;
-                            changed = true;
+                if !live[i] {
+                    continue;
+                }
+                let mut read = |v: V| {
+                    if let V::Inst(j) = v
+                        && !live[j as usize]
+                    {
+                        live[j as usize] = true;
+                        changed = true;
+                    }
+                };
+                match &inst.op {
+                    Op::Phi(inc) => {
+                        for &(v, pred) in inc {
+                            if reached[pred] && successors(m.term(pred)).contains(&owner[i]) {
+                                read(v);
+                            }
                         }
-                    });
+                    }
+                    op => for_each_operand(op, read),
                 }
             }
         }
@@ -1683,6 +1716,7 @@ mod tests {
             _ => unreachable!(),
         };
         assert!(!at(h) && !at(wide) && !at(p) && !at(loaded));
+        assert_eq!(plan.live, live_by_passes(&m));
         assert_eq!(m.uses(), Uses::default());
         let ((globals, g_n), _) = m.kept(&plan);
         let V::Global(g) = dead_tbl else { unreachable!() };
@@ -1731,6 +1765,7 @@ mod tests {
         };
         assert!(!at(dead_sum) && !at(dead_h) && !at(dead_h32));
         assert!(at(p_val) && at(p_h) && at(out));
+        assert_eq!(plan.live, live_by_passes(&m));
         assert_eq!(m.uses(), Uses::default());
         let _ = m.write();
     }
@@ -1782,6 +1817,7 @@ mod tests {
             assert!(at(p_val) && at(p_h) && at(out), "folded={folded}");
             assert!(!plan.edge(&m, entry, join), "the removed direct edge, folded={folded}");
             assert!(plan.edge(&m, mid, join), "the taken edge, folded={folded}");
+            assert_eq!(plan.live, live_by_passes(&m), "folded={folded}");
             assert_eq!(m.uses(), Uses::default(), "folded={folded}");
             let _ = m.write();
         }
@@ -1808,6 +1844,7 @@ mod tests {
         assert!(!plan.live[i as usize]);
         assert_eq!(plan.fold[mid], Some((entry, live)));
         assert!(!plan.layout.contains(&mid));
+        assert_eq!(plan.live, live_by_passes(&m));
         let _ = m.write();
     }
 
