@@ -612,11 +612,11 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     let ends_loop = loop_end != 0
         && (frame.start == loop_end
             || (frame.start < loop_end && frame.next.is_none_or(|n| loop_end < n)));
-    if loops > 0 && ends_loop {
+    let looped = loops > 0 && ends_loop;
+    if looped {
         let keep = (context.field(1, 12, 2) as usize + 1) * xma::SUBFRAME_SAMPLES * channels;
         pcm.truncate(keep);
         next = context.field(3, 0, 26) as usize;
-        voice.skip = context.field(1, 17, 3) as usize * xma::SUBFRAME_SAMPLES;
         if loops != 255 {
             context.set_field(0, 12, 8, loops - 1);
         }
@@ -624,6 +624,11 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     let skip = (voice.skip * channels).min(pcm.len());
     voice.skip -= skip / channels;
     voice.pcm.extend(&pcm[skip..]);
+    if looped {
+        // Of the frame the loop starts in, decoded next: not of this one,
+        // which ends the loop and is only cut short.
+        voice.skip = context.field(1, 17, 3) as usize * xma::SUBFRAME_SAMPLES;
+    }
     if next == 0 {
         context.set_field(0, 20 + current, 1, 0);
     }
