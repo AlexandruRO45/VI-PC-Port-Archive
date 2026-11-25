@@ -13,12 +13,14 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     let folder = launcher.parent().context("Launcher folder is missing")?;
     let runtime = folder.join("victory.exe");
     let mut args = std::env::args_os().skip(1).peekable();
-    let (mut warp, mut rt) = (false, false);
+    let (mut warp, mut rt, mut capture_world) = (false, false, false);
     while let Some(option) = args.peek() {
         if option == "--warp" {
             warp = true;
         } else if option == "--rt" {
             rt = true;
+        } else if option == "--capture-world" && !warm {
+            capture_world = true;
         } else {
             break;
         }
@@ -34,7 +36,8 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
         }
     };
     if args.next().is_some() {
-        bail!("Usage\n{} [--rt] [--warp] [game executable]", launcher.display());
+        let capture_option = if warm { "" } else { " [--capture-world]" };
+        bail!("Usage\n{} [--rt] [--warp]{capture_option} [game executable]", launcher.display());
     }
     if !game.is_file() || !runtime.is_file() {
         bail!(
@@ -80,6 +83,17 @@ pub(super) fn run(warm: bool) -> anyhow::Result<()> {
     fs::write(logs.join(latest), path.display().to_string())?;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut child = Command::new(&runtime);
+    if capture_world {
+        let capture = logs.join(format!("captures-{started}-{}", std::process::id()));
+        fs::create_dir(&capture)?;
+        child
+            .env("VICTORY_CAPTURE", &capture)
+            .env("VICTORY_CAPTURE_WORLD", "1")
+            .env("VICTORY_CAPTURE_HEAVY_FRAMES", "1,4,12,20,50")
+            .env("VICTORY_CAPTURE_WORLD_ALSO", "1,10,16,45,60,100,118,140,180,240,320")
+            .env("VICTORY_CAPTURE_OPS", "0");
+        writeln!(log, "World frame captures: {}", capture.display())?;
+    }
     if rt {
         child
             .env("VICTORY_BVH_BUILDER", "1")

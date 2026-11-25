@@ -19,6 +19,12 @@ To warm the shader cache, open `victory-warm.exe` in the installed runtime direc
 
 For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --locked --release -p victory --features diagnostics --bins`. The release binaries are in `target\release`. Place all three together outside the checkout and pass the game executable path to `victory-play.exe`. Custom data and cache directories are documented in the configuration example. [Configuration example](victory.example.toml)
 
+## Capture the start of a 3D scene
+
+Run `victory-play.exe --capture-world` with a diagnostics build. The launcher saves PNGs in a per-run directory inside `logs` and records its path in the run log. It captures frames after the first heavy draw workload so changes in loading time do not move the scene outside the capture window. This mode uses the normal renderer and skips the per-operation text trace. The PNGs use the runtime's existing half-resolution capture format.
+
+On a Ryzen 5 5600X and Radeon RX 6600 (8 GB), a second launch at [DexNom revision `921d8d3`](https://github.com/DexNom/VIctory/commit/921d8d3b43b44f3a6ca4b44095edd3c4baf10a87) with a warm cache showed terrain and several shots of the opening cutscene in Series X mode. The world often ran below 1 FPS, shadows remained very dark, and player control was unverified. [Run notes](https://github.com/anrq0/SeriesX-Emulator/issues/1#issuecomment-7168908492)
+
 ## Try experimental ray tracing on Radeon
 
 After running **Setup.cmd**, open **DexNom Runtime (Experimental RT)** from the Windows Start menu. This starts the game with the acceleration-structure builder, ray traversal and lighting resolve enabled. The shortcut uses your existing saves. Open **DexNom Runtime** for the usual renderer.

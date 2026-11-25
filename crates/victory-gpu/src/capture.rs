@@ -94,6 +94,12 @@ fn heavy_listed(n: u64) -> bool {
     !offsets.is_empty() && heavy_frame(n, 0, &mut HEAVY.lock().unwrap_or_else(|e| e.into_inner()), offsets)
 }
 
+/// Whether frame captures include command traces and indirect argument readbacks.
+fn ops_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_OPS").is_none_or(|v| v != "0"))
+}
+
 /// With a capture folder, for the frames [`listed`]: `what` is added to
 /// the frame's `frame-<n>-ops.txt`, one line per draw, dispatch, copy or
 /// drop in the order recorded (the title records on several threads, so
@@ -103,6 +109,9 @@ fn heavy_listed(n: u64) -> bool {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     use std::io::Write;
+    if !ops_enabled() {
+        return;
+    }
     let frame = crate::queue::presented() + 1;
     if !listed(frame) {
         // Before the world: the last lines are kept, and written out when
@@ -190,7 +199,7 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     {
         tracing::info!(frame, "the first frame of 500 draws or more: frames {} and {} are captured", frame + 2, frame + 6);
         #[cfg(feature = "diagnostics")]
-        if let Some(folder) = folder() {
+        if let Some(folder) = folder().filter(|_| ops_enabled()) {
             let lines: Vec<String> = std::mem::take(&mut *RING.lock().unwrap_or_else(|e| e.into_inner())).into();
             let _ = std::fs::write(folder.join("before-world-ops.txt"), lines.join("
 "));
@@ -243,6 +252,9 @@ pub(crate) fn read_indirect(
     (kind, stride, max): (u32, u32, u32),
     name: String,
 ) {
+    if !ops_enabled() {
+        return;
+    }
     struct Readback(ID3D12Resource);
     // SAFETY: D3D12 objects are free-threaded.
     unsafe impl Send for Readback {}
