@@ -986,11 +986,12 @@ fn into_destination(
     // Page number 0 is no page (numbers start at 0x10_0000): a list naming
     // it is one the title has not filled yet. The title writes a request's
     // page list after enqueueing it, and a queue half full is submitted on
-    // its own, so a read can start first. Read the list again for a few
-    // milliseconds before failing: the title never looks at a request's
+    // its own, so a read can start first. Read the list again for up to
+    // `LATE_LIST_WAIT` before failing: the title never looks at a request's
     // result, so a failed one is a model or texture left unwritten.
     if pages.contains(&0) {
-        for _ in 0..LATE_LIST_TRIES {
+        let started = std::time::Instant::now();
+        while started.elapsed() < LATE_LIST_WAIT {
             std::thread::sleep(std::time::Duration::from_millis(1));
             // SAFETY: as above; the title's list, read again.
             let again = unsafe {
@@ -1001,6 +1002,7 @@ fn into_destination(
                 if late.is_power_of_two() {
                     tracing::info!(
                         late,
+                        waited_ms = started.elapsed().as_millis() as u64,
                         "dstorage: a page list filled after its request started: written late"
                     );
                 }
@@ -1017,8 +1019,13 @@ fn into_destination(
     Err(E_INVALIDARG)
 }
 
-/// Milliseconds a page list naming page 0 is read again for.
-const LATE_LIST_TRIES: u32 = 8;
+/// How long a page list naming page 0 is read again for. The title fills
+/// a list a few milliseconds after enqueueing its request, and a fast host
+/// has the data read and inflated before that: on one Windows 11 host the
+/// lists came 3 to 6.5 ms after the 8 ms waited before had run out, and
+/// every one of them named pages the title holds. A list still naming page
+/// 0 after this fails its request.
+const LATE_LIST_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 /// Page lists filled after their request started (written late).
 static LATE_LISTS: AtomicU32 = AtomicU32::new(0);
 
@@ -1529,6 +1536,19 @@ mod tests {
     }
     #[test]
     fn a_page_list_filled_after_its_request_starts() {
+        a_page_list_filled_late(std::time::Duration::from_millis(2));
+    }
+
+    /// Past the 8 ms a list was read again for before: on a fast host lists
+    /// came 3 to 6.5 ms after those had run out.
+    #[test]
+    fn a_page_list_filled_well_after_its_request_starts() {
+        a_page_list_filled_late(std::time::Duration::from_millis(40));
+    }
+
+    /// A request into one physical page whose list the title fills `after`
+    /// its request is enqueued and submitted writes the page.
+    fn a_page_list_filled_late(after: std::time::Duration) {
         use crate::modules::xmem;
         let (mut given, mut page) = (1usize, [0usize; 1]);
         assert_eq!(
@@ -1560,7 +1580,7 @@ mod tests {
         );
         let number = page[0];
         let filler = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(after);
             // SAFETY: the leaked list, alive for the whole test.
             unsafe { std::ptr::write_volatile(at as *mut usize, number) };
         });
