@@ -7,14 +7,16 @@
 //! `ResourceDescriptorHeap[]` draw or dispatch materializes and refreshes
 //! deferred buffer, constant-buffer, and placed-texture slots.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{VIEW_TAG, View, stale_views, view_at};
+use super::{
+    VIEW_TAG, View, freed_views_since, freed_views_total, stale_views, view_at, views_at_batch,
+};
 use crate::host::{Host, host};
 
 pub(crate) struct HostHeap {
@@ -63,6 +65,9 @@ pub(crate) struct HostHeap {
     rewrites_seen: AtomicU64,
     /// The views of memory by address made ([`crate::memory::fill`]).
     memory_seen: Mutex<u64>,
+    /// Number of entries currently in `kept_textures` so buffer-only updates
+    /// can skip locking `kept_textures` when it is empty.
+    kept_textures_count: AtomicUsize,
 }
 
 /// The dword of the stride table the element counts start at.
@@ -156,16 +161,268 @@ struct BounceSlot {
     active: bool,
 }
 
+/// Fast non-cryptographic integer hasher for internal slot and pointer tables.
+#[derive(Clone, Copy, Default)]
+struct SlotMix(u64);
+
+impl std::hash::BuildHasher for SlotMix {
+    type Hasher = SlotMix;
+    fn build_hasher(&self) -> SlotMix {
+        SlotMix(0)
+    }
+}
+
+impl std::hash::Hasher for SlotMix {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u32(u32::from(b));
+        }
+    }
+    fn write_u32(&mut self, x: u32) {
+        self.0 = (self.0.rotate_left(5) ^ u64::from(x)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = (self.0.rotate_left(5) ^ x).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    fn write_usize(&mut self, x: usize) {
+        self.write_u64(x as u64);
+    }
+}
+
+/// Compact set of heap slot indices sharing a resource-backed view entry.
+/// Most views live in a single slot, avoiding a per-view heap allocation.
+enum SlotSet {
+    One(u32),
+    Many(HashSet<u32, SlotMix>),
+}
+
+impl SlotSet {
+    fn insert(&mut self, slot: u32) {
+        match self {
+            SlotSet::One(existing) if *existing == slot => {}
+            SlotSet::One(existing) => {
+                let mut set = HashSet::with_capacity_and_hasher(4, SlotMix::default());
+                set.insert(*existing);
+                set.insert(slot);
+                *self = SlotSet::Many(set);
+            }
+            SlotSet::Many(set) => {
+                set.insert(slot);
+            }
+        }
+    }
+
+    /// Removes `slot` and returns whether the set is now empty.
+    fn remove(&mut self, slot: u32) -> bool {
+        match self {
+            SlotSet::One(existing) => *existing == slot,
+            SlotSet::Many(set) => {
+                set.remove(&slot);
+                if set.len() == 1 {
+                    let only = *set.iter().next().unwrap();
+                    *self = SlotSet::One(only);
+                }
+                false
+            }
+        }
+    }
+
+    fn for_each(&self, mut f: impl FnMut(u32)) {
+        match self {
+            SlotSet::One(slot) => f(*slot),
+            SlotSet::Many(set) => {
+                for &slot in set {
+                    f(slot);
+                }
+            }
+        }
+    }
+}
+
+/// Read intervals starting in a single [`READ_GAP`]-aligned bucket.
+///
+/// Any two intervals starting in the same `READ_GAP`-aligned bucket satisfy
+/// `s2 - s1 < READ_GAP <= e1 - s1 + READ_GAP` (i.e. `s2 <= e1 + READ_GAP`), so
+/// the entire bucket always merges to `[min_start, max_end)`.
+#[derive(Default)]
+struct ReadBucket {
+    starts: BTreeMap<usize, u32>,
+    ends: BTreeMap<usize, u32>,
+}
+
+struct ReadShadow {
+    shadow: Arc<crate::shadow::Shadow>,
+    buckets: BTreeMap<usize, ReadBucket>,
+}
+
+#[derive(Default)]
+struct ReadIndex {
+    shadows: BTreeMap<usize, ReadShadow>,
+}
+
+impl ReadIndex {
+    fn insert(&mut self, shadow: &Arc<crate::shadow::Shadow>, addr: usize, len: usize) {
+        let end = addr.saturating_add(len);
+        let key = Arc::as_ptr(shadow) as usize;
+        let entry = self.shadows.entry(key).or_insert_with(|| ReadShadow {
+            shadow: shadow.clone(),
+            buckets: BTreeMap::new(),
+        });
+        let bucket = entry.buckets.entry(addr / READ_GAP).or_default();
+        *bucket.starts.entry(addr).or_insert(0) += 1;
+        *bucket.ends.entry(end).or_insert(0) += 1;
+    }
+
+    fn remove(&mut self, shadow: &Arc<crate::shadow::Shadow>, addr: usize, len: usize) {
+        let end = addr.saturating_add(len);
+        let key = Arc::as_ptr(shadow) as usize;
+        let Some(entry) = self.shadows.get_mut(&key) else {
+            return;
+        };
+        let bkey = addr / READ_GAP;
+        if let Some(bucket) = entry.buckets.get_mut(&bkey) {
+            if let Some(c) = bucket.starts.get_mut(&addr) {
+                if *c <= 1 {
+                    bucket.starts.remove(&addr);
+                } else {
+                    *c -= 1;
+                }
+            }
+            if let Some(c) = bucket.ends.get_mut(&end) {
+                if *c <= 1 {
+                    bucket.ends.remove(&end);
+                } else {
+                    *c -= 1;
+                }
+            }
+            if bucket.starts.is_empty() {
+                entry.buckets.remove(&bkey);
+            }
+        }
+        if entry.buckets.is_empty() {
+            self.shadows.remove(&key);
+        }
+    }
+
+    fn build(&self) -> Vec<(Arc<crate::shadow::Shadow>, usize, usize)> {
+        let mut out = Vec::new();
+        for entry in self.shadows.values() {
+            let mut cur: Option<(usize, usize)> = None;
+            for bucket in entry.buckets.values() {
+                let Some((&min_s, _)) = bucket.starts.first_key_value() else {
+                    continue;
+                };
+                let Some((&max_e, _)) = bucket.ends.last_key_value() else {
+                    continue;
+                };
+                match &mut cur {
+                    Some((_, cur_e)) if min_s <= cur_e.saturating_add(READ_GAP) => {
+                        *cur_e = (*cur_e).max(max_e);
+                    }
+                    Some((cur_s, cur_e)) => {
+                        out.push((entry.shadow.clone(), *cur_s, *cur_e - *cur_s));
+                        cur = Some((min_s, max_e));
+                    }
+                    None => cur = Some((min_s, max_e)),
+                }
+            }
+            if let Some((cur_s, cur_e)) = cur {
+                out.push((entry.shadow.clone(), cur_s, cur_e - cur_s));
+            }
+        }
+        out
+    }
+}
+
+struct WriteShadow {
+    shadow: Arc<crate::shadow::Shadow>,
+    ranges: BTreeMap<(usize, usize), u32>,
+}
+
+#[derive(Default)]
+struct WriteIndex {
+    shadows: BTreeMap<usize, WriteShadow>,
+}
+
+impl WriteIndex {
+    fn insert(&mut self, shadow: &Arc<crate::shadow::Shadow>, addr: usize, len: usize) {
+        let end = addr.saturating_add(len);
+        let key = Arc::as_ptr(shadow) as usize;
+        let entry = self.shadows.entry(key).or_insert_with(|| WriteShadow {
+            shadow: shadow.clone(),
+            ranges: BTreeMap::new(),
+        });
+        *entry.ranges.entry((addr, end)).or_insert(0) += 1;
+    }
+
+    fn remove(&mut self, shadow: &Arc<crate::shadow::Shadow>, addr: usize, len: usize) {
+        let end = addr.saturating_add(len);
+        let key = Arc::as_ptr(shadow) as usize;
+        let Some(entry) = self.shadows.get_mut(&key) else {
+            return;
+        };
+        if let Some(c) = entry.ranges.get_mut(&(addr, end)) {
+            if *c <= 1 {
+                entry.ranges.remove(&(addr, end));
+            } else {
+                *c -= 1;
+            }
+        }
+        if entry.ranges.is_empty() {
+            self.shadows.remove(&key);
+        }
+    }
+
+    fn build(&self) -> Vec<(Arc<crate::shadow::Shadow>, usize, usize)> {
+        let mut out = Vec::new();
+        for entry in self.shadows.values() {
+            let mut cur: Option<(usize, usize)> = None;
+            for &(start, end) in entry.ranges.keys() {
+                match &mut cur {
+                    Some((_, cur_e)) if start <= *cur_e => {
+                        *cur_e = (*cur_e).max(end);
+                    }
+                    Some((cur_s, cur_e)) => {
+                        out.push((entry.shadow.clone(), *cur_s, *cur_e - *cur_s));
+                        cur = Some((start, end));
+                    }
+                    None => cur = Some((start, end)),
+                }
+            }
+            if let Some((cur_s, cur_e)) = cur {
+                out.push((entry.shadow.clone(), cur_s, cur_e - cur_s));
+            }
+        }
+        out
+    }
+}
+
+/// If `u` reads through a host resource distinct from its `Shadow::buffer`
+/// (e.g. an element-aligned alias buffer), returns that resource so the plan
+/// retains it separately from `plan.reads`.
+fn alias_retained_resource(u: &SlotUse) -> Option<&ID3D12Resource> {
+    use windows::core::Interface;
+    let (shadow, _, _) = u.read.as_ref()?;
+    let res = u.retained.as_ref()?;
+    (res.as_raw() != shadow.buffer.as_raw()).then_some(res)
+}
+
 #[derive(Default)]
 struct Bindless {
     /// Active `View::is_buffer()` slots: `slot_index -> (view_index, generation)`.
-    slots: BTreeMap<u32, (u32, u32)>,
+    slots: HashMap<u32, (u32, u32), SlotMix>,
+    /// Reverse index for resource-backed slots (`View::Shader` / `View::Unordered`)
+    /// that can go stale when a resource is released: `view_index -> slot(s)`.
+    by_view: HashMap<u32, SlotSet, SlotMix>,
     /// Of them, those viewing placed textures.
-    placed_set: BTreeMap<u32, (u32, u32)>,
+    placed_set: HashMap<u32, (u32, u32), SlotMix>,
     /// Placed-texture slots changed since draws last prepared them.
     record_pending: BTreeSet<u32>,
     /// Persistent 256-byte-aligned bounce slices by `slot_index`.
-    cbv_bounce: HashMap<u32, BounceSlot>,
+    cbv_bounce: HashMap<u32, BounceSlot, SlotMix>,
     /// Backing 256 KiB shared buffers `(resource, cpu_ptr, gpu_va, used_bytes)`.
     bounce_chunks: Vec<(ID3D12Resource, usize, u64, u64)>,
     /// Slots written since the plan was made: only they are made again.
@@ -174,24 +431,35 @@ struct Bindless {
     /// since): the last ones are the tables of the work being submitted.
     recent: Vec<u32>,
     /// What each slot made for bindless access needs at submission.
-    uses: BTreeMap<u32, SlotUse>,
-    /// Of them, those with work at each submission.
-    busy: BTreeSet<u32>,
+    uses: HashMap<u32, SlotUse, SlotMix>,
+    /// Subset of `uses` with `placed.is_some()`: `slot_index -> texture_object`.
+    placed_uses: HashMap<u32, usize, SlotMix>,
+    /// Incremental read/write/bounce/alias indexes maintained in lockstep with `uses`.
+    reads: ReadIndex,
+    writes: WriteIndex,
+    bounce_entries: BTreeMap<(u64, u32), (usize, u32)>,
+    alias_retained: HashMap<usize, (ID3D12Resource, u32), SlotMix>,
+    reads_dirty: bool,
+    writes_dirty: bool,
+    bounces_dirty: bool,
+    retained_dirty: bool,
     /// Subset of `uses` currently marked unmapped (checked on memory remap).
-    unmapped_slots: std::collections::HashSet<u32>,
+    unmapped_slots: HashSet<u32, SlotMix>,
     /// Subset of `uses` holding a direct-memory window (checked for `is_dead`).
-    direct_slots: std::collections::HashSet<u32>,
+    direct_slots: HashSet<u32, SlotMix>,
     /// The released-view, placed-texture, and memory-remap epochs `uses` was checked at.
     checked: (u64, u64, u64),
+    /// Freed-view journal cursor (`descriptor::freed_views_since`) last consumed.
+    freed_seen: u64,
     /// What submissions do for the slots, until they or what they view change.
     plan: Option<Arc<BindlessPlan>>,
     /// Placed-texture slots as last prepared at recording: view key,
     /// texture.
-    recorded: HashMap<u32, (u64, usize)>,
+    recorded: HashMap<u32, (u64, usize), SlotMix>,
     /// Placed textures reached through slots, by resource object: the host
     /// texture (held, so its address names it alone) and the frame last
     /// uploaded.
-    uploaded: HashMap<usize, (ID3D12Resource, u64)>,
+    uploaded: HashMap<usize, (ID3D12Resource, u64), SlotMix>,
     /// Uploaded textures by frame, oldest first, to look at again.
     recheck: VecDeque<(u64, usize)>,
     /// A frame and the uploads of known textures done in it.
@@ -240,10 +508,163 @@ impl Bindless {
         }
         left
     }
+
+    fn add_by_view(&mut self, vi: u32, slot: u32) {
+        match self.by_view.get_mut(&vi) {
+            Some(set) => set.insert(slot),
+            None => {
+                self.by_view.insert(vi, SlotSet::One(slot));
+            }
+        }
+    }
+
+    fn remove_by_view(&mut self, vi: u32, slot: u32) {
+        if let Some(set) = self.by_view.get_mut(&vi)
+            && set.remove(slot)
+        {
+            self.by_view.remove(&vi);
+        }
+    }
+
+    fn push_recent(&mut self, index: u32) {
+        if self.recent.last() == Some(&index) {
+            return;
+        }
+        self.recent.push(index);
+        if self.recent.len() > 8 * URGENT {
+            let mut seen: HashSet<u32, SlotMix> =
+                HashSet::with_capacity_and_hasher(2 * URGENT, SlotMix::default());
+            let mut compact = Vec::with_capacity(2 * URGENT);
+            for &i in self.recent.iter().rev() {
+                if seen.insert(i) {
+                    compact.push(i);
+                    if compact.len() >= 2 * URGENT {
+                        break;
+                    }
+                }
+            }
+            compact.reverse();
+            self.recent = compact;
+        }
+    }
+
+    fn index_use(&mut self, index: u32, u: &SlotUse) {
+        use windows::core::Interface;
+        if let Some((s, addr, len)) = &u.read {
+            self.reads.insert(s, *addr, *len);
+            self.reads_dirty = true;
+        }
+        if let Some((s, addr, len)) = &u.write {
+            self.writes.insert(s, *addr, *len);
+            self.writes_dirty = true;
+        }
+        if let Some((cpu, addr, len)) = u.bounce {
+            self.bounce_entries.insert((addr, index), (cpu, len));
+            self.bounces_dirty = true;
+        }
+        if let Some(res) = alias_retained_resource(u) {
+            let key = res.as_raw() as usize;
+            match self.alias_retained.get_mut(&key) {
+                Some((_, count)) => *count += 1,
+                None => {
+                    self.alias_retained.insert(key, (res.clone(), 1));
+                    self.retained_dirty = true;
+                }
+            }
+        }
+        if let Some(t) = u.placed {
+            self.placed_uses.insert(index, t);
+        }
+        if u.unmapped {
+            self.unmapped_slots.insert(index);
+        }
+        if u.direct.is_some() {
+            self.direct_slots.insert(index);
+        }
+    }
+
+    fn unindex_use(&mut self, index: u32, u: &SlotUse) {
+        use windows::core::Interface;
+        if let Some((s, addr, len)) = &u.read {
+            self.reads.remove(s, *addr, *len);
+            self.reads_dirty = true;
+        }
+        if let Some((s, addr, len)) = &u.write {
+            self.writes.remove(s, *addr, *len);
+            self.writes_dirty = true;
+        }
+        if let Some((_, addr, _)) = u.bounce {
+            self.bounce_entries.remove(&(addr, index));
+            self.bounces_dirty = true;
+        }
+        if let Some(res) = alias_retained_resource(u) {
+            let key = res.as_raw() as usize;
+            if let Some((_, count)) = self.alias_retained.get_mut(&key) {
+                if *count <= 1 {
+                    self.alias_retained.remove(&key);
+                    self.retained_dirty = true;
+                } else {
+                    *count -= 1;
+                }
+            }
+        }
+        if u.placed.is_some() {
+            self.placed_uses.remove(&index);
+        }
+        if u.unmapped {
+            self.unmapped_slots.remove(&index);
+        }
+        if u.direct.is_some() {
+            self.direct_slots.remove(&index);
+        }
+    }
+
+    fn set_use(&mut self, index: u32, new_use: Option<SlotUse>) {
+        if let Some(old) = self.uses.remove(&index) {
+            self.unindex_use(index, &old);
+        }
+        if let Some(u) = new_use {
+            self.index_use(index, &u);
+            self.uses.insert(index, u);
+        }
+    }
+
+    fn build_bounces(&self) -> Vec<(usize, u64, u32)> {
+        let mut bounces = Vec::with_capacity(self.bounce_entries.len());
+        for (&(addr, _), &(cpu, len)) in &self.bounce_entries {
+            bounces.push((cpu, addr, len));
+        }
+        bounces
+    }
+
+    fn build_retained(&self) -> Vec<ID3D12Resource> {
+        self.alias_retained
+            .values()
+            .map(|(res, _)| res.clone())
+            .collect()
+    }
 }
 
 /// Slots waiting to be made: at submission, at recording (for the log).
 pub(crate) static BACKLOG: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+struct CbvMaterialized {
+    resource: ID3D12Resource,
+    read: Option<(Arc<crate::shadow::Shadow>, usize, usize)>,
+    bounce: Option<(usize, u64, u32)>,
+    clear_bounce: bool,
+}
+
+struct SlotEval {
+    slot: SlotUse,
+    clear_bounce: bool,
+}
+
+enum SlotResult {
+    Untracked,
+    Ready(SlotEval),
+    Stale((u32, u32)),
+}
 
 /// What one bindless slot needs at submission.
 #[derive(Default)]
@@ -453,6 +874,7 @@ fn copy_bounces(list: &[(usize, u64, u32)]) {
 
 /// `ranges` (host copy, address, bytes) sorted and merged per host copy
 /// where they overlap or lie within `gap` of each other.
+#[cfg(test)]
 fn merged(
     mut ranges: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
     gap: usize,
@@ -649,13 +1071,17 @@ impl HostHeap {
             kept_textures: Mutex::default(),
             next: Mutex::new((0, vec![false; extra as usize], usize::MAX)),
             strides,
-            bindless: Mutex::default(),
+            bindless: Mutex::new(Bindless {
+                freed_seen: freed_views_total(),
+                ..Bindless::default()
+            }),
             recording: std::sync::atomic::AtomicBool::new(false),
             record_hint: std::sync::atomic::AtomicBool::new(false),
             record_looked: [AtomicU64::new(0), AtomicU64::new(0)],
             recheck_at: AtomicU64::new(u64::MAX),
             rewrites_seen: AtomicU64::new(0),
             memory_seen: Mutex::new(0),
+            kept_textures_count: AtomicUsize::new(0),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -975,12 +1401,18 @@ impl HostHeap {
             kept.get_mut(index as usize)
                 .and_then(|slot| std::mem::replace(slot, resource))
         };
-        let old_tex = {
+        let old_tex = if texture.is_some()
+            || self.kept_textures_count.load(Ordering::Acquire) > 0
+        {
             let mut texs = self.kept_textures.lock().unwrap_or_else(|e| e.into_inner());
-            match texture {
+            let old_tex = match texture {
                 Some(t) => texs.insert(index, t),
                 None => texs.remove(&index),
-            }
+            };
+            self.kept_textures_count.store(texs.len(), Ordering::Release);
+            old_tex
+        } else {
+            None
         };
         if let Some(old) = old {
             crate::host::retire(old);
@@ -1109,7 +1541,8 @@ impl HostHeap {
         if !self.sampler {
             if is_buf {
                 let placed = matches!(&view, View::Placed(false, r, _) if r[0] != 1);
-                self.track_bindless(index, (i, generation), placed);
+                let resource_backed = matches!(&view, View::Shader(..) | View::Unordered(..));
+                self.track_bindless(index, (i, generation), placed, resource_backed);
             } else {
                 self.untrack_bindless(index);
             }
@@ -1117,11 +1550,24 @@ impl HostHeap {
         Some(view)
     }
 
-    fn track_bindless(&self, index: u32, entry: (u32, u32), placed: bool) {
+    fn track_bindless(
+        &self,
+        index: u32,
+        entry: (u32, u32),
+        placed: bool,
+        resource_backed: bool,
+    ) {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-        if b.slots.insert(index, entry) != Some(entry) {
+        let old = b.slots.insert(index, entry);
+        if old != Some(entry) {
+            if let Some((old_vi, _)) = old {
+                b.remove_by_view(old_vi, index);
+            }
+            if resource_backed {
+                b.add_by_view(entry.0, index);
+            }
             b.dirty.insert(index);
-            b.recent.push(index);
+            b.push_recent(index);
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
                 bounce.active = false;
             }
@@ -1139,9 +1585,10 @@ impl HostHeap {
 
     fn untrack_bindless(&self, index: u32) {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-        if b.slots.remove(&index).is_some() {
+        if let Some((old_vi, _)) = b.slots.remove(&index) {
+            b.remove_by_view(old_vi, index);
             b.dirty.insert(index);
-            b.recent.push(index);
+            b.push_recent(index);
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
                 bounce.active = false;
             }
@@ -1153,13 +1600,12 @@ impl HostHeap {
 
     /// Slot `index` (viewing `entry`) is no longer one for bindless access.
     fn drop_bindless(&self, b: &mut Bindless, index: u32, entry: Option<(u32, u32)>) {
-        b.uses.remove(&index);
-        b.busy.remove(&index);
-        b.unmapped_slots.remove(&index);
-        b.direct_slots.remove(&index);
+        b.set_use(index, None);
         b.recorded.remove(&index);
         if entry.is_none_or(|e| b.slots.get(&index) == Some(&e)) {
-            b.slots.remove(&index);
+            if let Some((old_vi, _)) = b.slots.remove(&index) {
+                b.remove_by_view(old_vi, index);
+            }
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
                 bounce.active = false;
             }
@@ -1282,22 +1728,14 @@ impl HostHeap {
         key: u64,
         address: u64,
         capped: u32,
-        reads: &mut Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
-        bounces: &mut Vec<(usize, u64, u32)>,
-    ) -> Option<ID3D12Resource> {
+        bounce_active: bool,
+    ) -> Option<CbvMaterialized> {
         let host = host()?;
         let aligned = capped.next_multiple_of(256);
         if address.is_multiple_of(256)
             && let Some(shadow) = crate::shadow::find(address, u64::from(capped))
             && shadow.gpu(address).is_multiple_of(256)
         {
-            let bounce_active = self
-                .bindless
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .cbv_bounce
-                .get(&index)
-                .is_some_and(|s| s.active);
             {
                 let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
                 if made[index as usize] != key || bounce_active {
@@ -1314,24 +1752,18 @@ impl HostHeap {
                     self.keep(index, Some(shadow.buffer.clone()));
                 }
             }
-            if bounce_active
-                && let Some(slot) = self
-                    .bindless
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .cbv_bounce
-                    .get_mut(&index)
-            {
-                slot.active = false;
-            }
             let len = u64::from(capped).min(shadow.left(address)) as usize;
-            if len > 0 {
-                reads.push((shadow.clone(), address as usize, len));
-            }
-            return Some(shadow.buffer.clone());
+            let resource = shadow.buffer.clone();
+            let read = (len > 0).then_some((shadow, address as usize, len));
+            return Some(CbvMaterialized {
+                resource,
+                read,
+                bounce: None,
+                clear_bounce: bounce_active,
+            });
         }
 
-        let (gpu, cpu, res, was_active) = self.ensure_cbv_bounce(index, aligned)?;
+        let (gpu, cpu, resource, was_active) = self.ensure_cbv_bounce(index, aligned)?;
         {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             if made[index as usize] != key || !was_active {
@@ -1339,17 +1771,21 @@ impl HostHeap {
                     BufferLocation: gpu,
                     SizeInBytes: aligned,
                 };
-                // SAFETY: a slot of our heap; `gpu` is 256-byte aligned in `res`.
+                // SAFETY: a slot of our heap; `gpu` is 256-byte aligned in `resource`.
                 unsafe {
                     host.device
                         .CreateConstantBufferView(Some(&desc), self.cpu(index))
                 };
                 made[index as usize] = key;
-                self.keep(index, Some(res.clone()));
+                self.keep(index, Some(resource.clone()));
             }
         }
-        bounces.push((cpu, address, capped));
-        Some(res)
+        Some(CbvMaterialized {
+            resource,
+            read: None,
+            bounce: Some((cpu, address, capped)),
+            clear_bounce: false,
+        })
     }
 
     /// At draw/dispatch recording time: makes the placed-texture slots
@@ -1603,15 +2039,21 @@ impl HostHeap {
             crate::resource::placed_epoch(),
             MEMORY_EPOCH.load(Ordering::Acquire),
         );
-        // Asked before taking the heap's lock: the placed textures' lock is
-        // taken first where both are held.
+        // Asked before taking the heap's lock: the placed textures' lock and
+        // the global views lock are taken outside `self.bindless`.
         let frame = crate::queue::presented() + 1;
-        let evictions = {
+        let (check_viewed, evictions, freed_seen) = {
             let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-            b.checked.1 != epochs.1 && b.looked[0] != frame
+            let look = b.looked[0] != frame;
+            (
+                look && b.checked.0 != epochs.0,
+                look && b.checked.1 != epochs.1,
+                b.freed_seen,
+            )
         };
         let live = evictions.then(crate::resource::placed_live);
-        let (mut todo, check, remade, exempt) = {
+        let freed = check_viewed.then(|| freed_views_since(freed_seen));
+        let (mut todo, mut check, remade, exempt) = {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             let b = &mut *b;
             // Released views, evicted textures, and remapped memory are looked for once a frame.
@@ -1669,8 +2111,8 @@ impl HostHeap {
                 dirty.insert(i);
             }
             if let Some(l) = live {
-                for (&i, u) in &b.uses {
-                    if u.placed.is_some_and(|t| !l.contains(&t)) {
+                for (&i, &t) in &b.placed_uses {
+                    if !l.contains(&t) {
                         dirty.insert(i);
                     }
                 }
@@ -1697,11 +2139,43 @@ impl HostHeap {
                 }
             }
             let check: Vec<(u32, (u32, u32))> = if viewed {
-                b.slots
-                    .iter()
-                    .filter(|(i, _)| !dirty.contains(i))
-                    .map(|(&i, &v)| (i, v))
-                    .collect()
+                let mut urgent_set: HashSet<u32, SlotMix> =
+                    HashSet::with_capacity_and_hasher(urgent.len(), SlotMix::default());
+                urgent_set.extend(urgent.iter().copied());
+                let mut out = Vec::new();
+                let mut push_set = |set: &SlotSet| {
+                    set.for_each(|i| {
+                        if !dirty.contains(&i)
+                            && !urgent_set.contains(&i)
+                            && let Some(&v) = b.slots.get(&i)
+                        {
+                            out.push((i, v));
+                        }
+                    });
+                };
+                match freed {
+                    Some((Some(mut ids), freed_now)) => {
+                        b.freed_seen = b.freed_seen.max(freed_now);
+                        if !ids.is_empty() {
+                            ids.sort_unstable();
+                            ids.dedup();
+                            for vi in ids {
+                                if let Some(set) = b.by_view.get(&vi) {
+                                    push_set(set);
+                                }
+                            }
+                        }
+                    }
+                    other => {
+                        if let Some((None, freed_now)) = other {
+                            b.freed_seen = b.freed_seen.max(freed_now);
+                        }
+                        for set in b.by_view.values() {
+                            push_set(set);
+                        }
+                    }
+                }
+                out
             } else {
                 Vec::new()
             };
@@ -1709,10 +2183,14 @@ impl HostHeap {
                 dirty.remove(i);
             }
             let exempt = urgent.len();
-            let todo: Vec<(u32, Option<(u32, u32)>)> = urgent
+            let todo: Vec<(u32, Option<(u32, u32)>, bool)> = urgent
                 .into_iter()
                 .chain(dirty)
-                .map(|i| (i, b.slots.get(&i).copied()))
+                .map(|i| {
+                    let entry = b.slots.get(&i).copied();
+                    let bounce_active = b.cbv_bounce.get(&i).is_some_and(|s| s.active);
+                    (i, entry, bounce_active)
+                })
                 .collect();
             (todo, check, remade, exempt)
         };
@@ -1722,38 +2200,62 @@ impl HostHeap {
                 made[i as usize] = 0;
             }
         }
-        todo.extend(stale_views(&check).into_iter().map(|(i, v)| (i, Some(v))));
+        if !check.is_empty() {
+            // Preserve ascending slot-index order before budget-limited processing.
+            check.sort_unstable_by_key(|&(i, _)| i);
+            todo.extend(
+                stale_views(&check)
+                    .into_iter()
+                    .map(|(i, v)| (i, Some(v), false)),
+            );
+        }
         let (started, left) = (std::time::Instant::now(), self.budget_left(0));
         let mut made_any = false;
         let mut fresh = Vec::new();
         let mut fresh_reads = Vec::new();
-        let mut results: Vec<(u32, Option<((u32, u32), Option<SlotUse>)>)> =
-            Vec::with_capacity(todo.len());
-        let mut over: Option<u32> = None;
-        let mut todo = todo.into_iter();
-        let mut count = 0usize;
-        for (index, entry) in todo.by_ref() {
-            if count >= exempt && (count & 15) == 0 && started.elapsed().as_micros() as u64 > left {
+        let mut results: Vec<(u32, SlotResult)> = Vec::with_capacity(todo.len());
+        const BATCH: usize = 16;
+        let mut batch_entries = [None; BATCH];
+        let mut view_buf: Vec<Option<View>> = Vec::with_capacity(BATCH);
+        let mut pos = 0usize;
+        while pos < todo.len() {
+            if pos >= exempt && started.elapsed().as_micros() as u64 > left {
                 // Over budget: the rest waits for the next submission.
-                over = Some(index);
                 break;
             }
-            count += 1;
-            made_any = true;
-            let made = entry.map(|e| (e, self.use_slot(index, e)));
-            results.push((index, made));
+            let mut end = (pos + BATCH).min(todo.len());
+            if pos < exempt && end > exempt {
+                end = exempt;
+            }
+            let n = end - pos;
+            for (dst, &(_, entry, _)) in batch_entries[..n].iter_mut().zip(&todo[pos..end]) {
+                *dst = entry;
+            }
+            views_at_batch(&batch_entries[..n], &mut view_buf);
+            for (&(index, entry, bounce_active), view) in
+                todo[pos..end].iter().zip(view_buf.drain(..))
+            {
+                made_any = true;
+                let result = match entry {
+                    None => SlotResult::Untracked,
+                    Some(e) => match self.use_slot_view(index, e, view, bounce_active) {
+                        Some(eval) => SlotResult::Ready(eval),
+                        None => SlotResult::Stale(e),
+                    },
+                };
+                results.push((index, result));
+            }
+            pos = end;
         }
         self.budget_spend(0, started.elapsed().as_micros() as u64);
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-        for (index, made) in results {
-            match made {
-                None => {
-                    b.uses.remove(&index);
-                    b.busy.remove(&index);
-                    b.unmapped_slots.remove(&index);
-                    b.direct_slots.remove(&index);
-                }
-                Some((_, Some(u))) => {
+        for (index, result) in results {
+            match result {
+                SlotResult::Untracked => b.set_use(index, None),
+                SlotResult::Ready(SlotEval { slot: u, clear_bounce }) => {
+                    if clear_bounce && let Some(slot) = b.cbv_bounce.get_mut(&index) {
+                        slot.active = false;
+                    }
                     fresh.extend(u.bounce);
                     fresh_reads.extend(u.read.clone());
                     // Drawn textures are brought up to date at recording.
@@ -1761,30 +2263,14 @@ impl HostHeap {
                         b.record_pending.insert(index);
                         self.record_hint.store(true, Ordering::Release);
                     }
-                    if u.read.is_some() || u.write.is_some() || u.bounce.is_some() {
-                        b.busy.insert(index);
-                    } else {
-                        b.busy.remove(&index);
-                    }
-                    if u.unmapped {
-                        b.unmapped_slots.insert(index);
-                    } else {
-                        b.unmapped_slots.remove(&index);
-                    }
-                    if u.direct.is_some() {
-                        b.direct_slots.insert(index);
-                    } else {
-                        b.direct_slots.remove(&index);
-                    }
-                    b.uses.insert(index, u);
+                    b.set_use(index, Some(u));
                 }
-                Some((e, None)) => self.drop_bindless(&mut b, index, Some(e)),
+                SlotResult::Stale(e) => self.drop_bindless(&mut b, index, Some(e)),
             }
         }
-        if let Some(index) = over {
-            b.dirty.insert(index);
+        if pos < todo.len() {
+            b.dirty.extend(todo[pos..].iter().map(|&(i, _, _)| i));
         }
-        b.dirty.extend(todo.map(|(i, _)| i));
         BACKLOG[0].store(b.dirty.len() as u64, Ordering::Relaxed);
         BACKLOG[1].store(b.record_pending.len() as u64, Ordering::Relaxed);
         b.full.1 |= made_any;
@@ -1808,36 +2294,56 @@ impl HostHeap {
             return Some(plan);
         }
         b.full = (frame, false);
-        let (mut reads, mut writes, mut bounces, mut retained) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        // What slots view is held by the slots, and for some frames after
-        // (`host::retire`).
-        for u in b.busy.iter().filter_map(|i| b.uses.get(i)) {
-            reads.extend(u.read.clone());
-            writes.extend(u.write.clone());
-            bounces.extend(u.bounce);
-            retained.extend(u.read.is_some().then(|| u.retained.clone()).flatten());
-        }
-        bounces.sort_unstable_by_key(|b| b.1);
+        let prev = b.plan.clone();
+        let reads = if b.reads_dirty || prev.is_none() {
+            b.reads_dirty = false;
+            Arc::new(b.reads.build())
+        } else {
+            prev.as_ref().unwrap().reads.clone()
+        };
+        let writes = if b.writes_dirty || prev.is_none() {
+            b.writes_dirty = false;
+            Arc::new(b.writes.build())
+        } else {
+            prev.as_ref().unwrap().writes.clone()
+        };
+        let bounces = if b.bounces_dirty || prev.is_none() {
+            b.bounces_dirty = false;
+            Arc::new(b.build_bounces())
+        } else {
+            prev.as_ref().unwrap().bounces.clone()
+        };
+        let retained = if b.retained_dirty || prev.is_none() {
+            b.retained_dirty = false;
+            Arc::new(b.build_retained())
+        } else {
+            prev.as_ref().unwrap()._retained.clone()
+        };
         let plan = Arc::new(BindlessPlan {
-            reads: Arc::new(merged(reads, READ_GAP)),
-            writes: Arc::new(merged(writes, 0)),
-            bounces: Arc::new(bounces),
+            reads,
+            writes,
+            bounces,
             fresh,
             fresh_reads,
             copied_in: AtomicU64::new(0),
-            _retained: Arc::new(retained),
+            _retained: retained,
         });
         b.plan = Some(plan.clone());
         Some(plan)
     }
 
-    /// Materializes bindless slot `index` from its view `(vi, generation)`
-    /// and finds what it reads and writes; `None` if the slot is no longer
-    /// one for bindless access (its view went stale, or is not of a buffer).
-    fn use_slot(&self, index: u32, (vi, generation): (u32, u32)) -> Option<SlotUse> {
+    /// Materializes bindless slot `index` from its pre-fetched `view` and
+    /// finds what it reads and writes; `None` if the slot is no longer one for
+    /// bindless access (its view went stale, or is not of a buffer).
+    fn use_slot_view(
+        &self,
+        index: u32,
+        (vi, generation): (u32, u32),
+        view: Option<View>,
+        bounce_active: bool,
+    ) -> Option<SlotEval> {
         use windows::core::Interface;
-        let Some(view) = view_at(vi, generation) else {
+        let Some(view) = view else {
             self.clear_stale_slot(index);
             return None;
         };
@@ -1846,44 +2352,43 @@ impl HostHeap {
         }
         let unmapped = |view: &View, address: u64, len: u64| {
             self.set_unmapped_null(index, view);
-            Some(SlotUse {
-                unmapped: true,
-                at: (address, address.saturating_add(len.max(1))),
-                ..SlotUse::default()
+            Some(SlotEval {
+                slot: SlotUse {
+                    unmapped: true,
+                    at: (address, address.saturating_add(len.max(1))),
+                    ..SlotUse::default()
+                },
+                clear_bounce: false,
             })
         };
         let key = u64::from(generation) << 32 | u64::from(vi);
         let mut slot = SlotUse::default();
+        let mut clear_bounce = false;
         match &view {
             &View::Constant(address, size) => {
                 let capped = size.min(65_536);
                 if !valid_title_address(address, u64::from(capped)) {
                     return unmapped(&view, address, u64::from(capped));
                 }
-                let (mut reads, mut bounces) = (Vec::new(), Vec::new());
-                match self.materialize_bindless_cbv(
-                    index,
-                    key,
-                    address,
-                    capped,
-                    &mut reads,
-                    &mut bounces,
-                ) {
-                    Some(res) => slot.retained = Some(res),
+                match self.materialize_bindless_cbv(index, key, address, capped, bounce_active) {
+                    Some(cbv) => {
+                        slot.retained = Some(cbv.resource);
+                        clear_bounce = cbv.clear_bounce;
+                        match cbv.read {
+                            Some((s, _, _)) if s.is_direct() => slot.direct = Some(s),
+                            read => slot.read = read,
+                        }
+                        slot.bounce = cbv.bounce;
+                    }
                     None => return unmapped(&view, address, u64::from(capped)),
                 }
-                match reads.pop() {
-                    Some((s, _, _)) if s.is_direct() => slot.direct = Some(s),
-                    read => slot.read = read,
-                }
-                slot.bounce = bounces.pop();
             }
             View::Placed(false, resource, desc) if resource[0] != 1 => {
                 slot.placed = Some(0);
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 if !plausible(address, 1) {
                     self.set_unmapped_null(index, &view);
-                    return Some(slot);
+                    return Some(SlotEval { slot, clear_bounce: false });
                 }
                 if let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view)
                     && let Some(host_tex) =
@@ -1905,7 +2410,7 @@ impl HostHeap {
             _ => {
                 let Some((address, len)) = buffer_range(&view) else {
                     self.set_unmapped_null(index, &view);
-                    return Some(slot);
+                    return Some(SlotEval { slot, clear_bounce: false });
                 };
                 if !valid_title_address(address, len) {
                     return unmapped(&view, address, len);
@@ -1934,7 +2439,7 @@ impl HostHeap {
                 }
             }
         }
-        Some(slot)
+        Some(SlotEval { slot, clear_bounce })
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -3629,5 +4134,586 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Clean up `addr_b` too.
         crate::watch::title_memory_remapped(addr_b as usize, 64 << 10);
         assert!(!crate::resource::has_placed_texture(addr_b, &desc));
+    }
+
+    /// Verifies incremental `ReadIndex` and `WriteIndex` produce bit-for-bit
+    /// identical merged ranges to the reference `merged()` across insertions,
+    /// boundary gaps (`READ_GAP - 1`, `READ_GAP`, `READ_GAP + 1`), duplicates,
+    /// min/max bucket removals, and shadow removal.
+    #[test]
+    fn read_and_write_indexes_match_reference_merged() {
+        if host().is_none() {
+            return;
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let bufs: Vec<_> = (0..3)
+            .map(|_| {
+                let res = crate::resource::test_buffer(1 << 20);
+                let (ptr, len) = crate::resource::buffer_bytes(res).unwrap();
+                let shadow = crate::shadow::find(ptr as u64, len).unwrap();
+                (res, ptr as usize, shadow)
+            })
+            .collect();
+
+        let to_comparable = |v: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>| -> Vec<(usize, usize, usize)> {
+            v.into_iter()
+                .map(|(s, a, l)| (Arc::as_ptr(&s) as usize, a, l))
+                .collect()
+        };
+
+        let mut read_idx = ReadIndex::default();
+        let mut write_idx = WriteIndex::default();
+        let mut active: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+
+        // Explicit READ_GAP boundary cases on shadow 0.
+        let base0 = bufs[0].1;
+        let boundary = [
+            (0usize, 16usize),
+            (READ_GAP - 1 + 16, 16),     // gap = READ_GAP - 1 (merges)
+            (2 * READ_GAP + 32, 16),     // gap = READ_GAP (merges)
+            (3 * READ_GAP + 49, 16),     // gap = READ_GAP + 1 (splits)
+            (3 * READ_GAP + 49, 16),     // exact duplicate
+            (3 * READ_GAP + 49, 64),     // same start, longer end
+            (3 * READ_GAP + 100, 16),    // same bucket, later start
+            (4 * READ_GAP + 65, 32),     // touches previous bucket
+        ];
+        for (off, len) in boundary {
+            let s = bufs[0].2.clone();
+            read_idx.insert(&s, base0 + off, len);
+            write_idx.insert(&s, base0 + off, len);
+            active.push((s, base0 + off, len));
+        }
+
+        // Deterministic pseudo-random ranges across all 3 shadows.
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed
+        };
+        for _ in 0..300 {
+            let bi = (next() % 3) as usize;
+            let off = ((next() >> 16) as usize) % ((1 << 20) - 4096);
+            let len = (((next() >> 32) as usize) % 4096).max(1);
+            let s = bufs[bi].2.clone();
+            let addr = bufs[bi].1 + off;
+            read_idx.insert(&s, addr, len);
+            write_idx.insert(&s, addr, len);
+            active.push((s, addr, len));
+        }
+
+        assert_eq!(
+            to_comparable(read_idx.build()),
+            to_comparable(merged(active.clone(), READ_GAP)),
+            "ReadIndex must match reference merged(_, READ_GAP) after inserts"
+        );
+        assert_eq!(
+            to_comparable(write_idx.build()),
+            to_comparable(merged(active.clone(), 0)),
+            "WriteIndex must match reference merged(_, 0) after inserts"
+        );
+
+        // Remove half the ranges (including boundary entries & whole shadow 1).
+        let mut kept = Vec::new();
+        for (idx, (s, addr, len)) in active.into_iter().enumerate() {
+            if idx < 5 || Arc::ptr_eq(&s, &bufs[1].2) || idx % 3 == 0 {
+                read_idx.remove(&s, addr, len);
+                write_idx.remove(&s, addr, len);
+            } else {
+                kept.push((s, addr, len));
+            }
+        }
+        assert_eq!(
+            to_comparable(read_idx.build()),
+            to_comparable(merged(kept.clone(), READ_GAP)),
+            "ReadIndex must match reference merged(_, READ_GAP) after removals"
+        );
+        assert_eq!(
+            to_comparable(write_idx.build()),
+            to_comparable(merged(kept.clone(), 0)),
+            "WriteIndex must match reference merged(_, 0) after removals"
+        );
+
+        // Drain everything and verify empty output.
+        for (s, addr, len) in kept {
+            read_idx.remove(&s, addr, len);
+            write_idx.remove(&s, addr, len);
+        }
+        assert!(read_idx.build().is_empty());
+        assert!(write_idx.build().is_empty());
+
+        for (res, _, _) in bufs {
+            assert_eq!(release(res), 0);
+        }
+    }
+
+    /// Verifies `freed_views_since` + `by_view` (`SlotSet` transitions) invalidates
+    /// only slots of the released resource, leaves overwritten and non-resource CBV
+    /// slots intact, and preserves ascending slot order under budget.
+    #[test]
+    fn stale_view_journal_and_by_view_invalidation() {
+        if host().is_none() {
+            return;
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let (title_heap, base) = make_shader_heap(32);
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let stride = 32u64;
+
+        let buf_a = crate::resource::test_buffer(4096);
+        let buf_b = crate::resource::test_buffer(4096);
+        let (ptr_b, _) = crate::resource::buffer_bytes(buf_b).unwrap();
+        let srv_desc: [u32; 10] = [
+            DXGI_FORMAT_R32_UINT.0 as u32,
+            1, // BUFFER
+            0,
+            0, // FirstElement = 0
+            0,
+            64, // NumElements = 64
+            0,
+            0,
+            0,
+            0,
+        ];
+
+        // Put buf_a's same view in slots 12, 10, 11 (non-ascending order to test SlotSet
+        // One -> Many and ascending sort), buf_b in slot 13, aligned CBV in slot 14,
+        // and misaligned CBV in slot 15.
+        for s in [12u64, 10, 11] {
+            create_srv(std::ptr::null_mut(), buf_a, &srv_desc, base + s * stride);
+        }
+        create_srv(std::ptr::null_mut(), buf_b, &srv_desc, base + 13 * stride);
+        let cbv_aligned: [u32; 4] = [ptr_b as u32, (ptr_b as u64 >> 32) as u32, 256, 0];
+        let mis = ptr_b as u64 + 16;
+        let cbv_misaligned: [u32; 4] = [mis as u32, (mis >> 32) as u32, 64, 0];
+        create_cbv(std::ptr::null_mut(), &cbv_aligned, base + 14 * stride);
+        create_cbv(std::ptr::null_mut(), &cbv_misaligned, base + 15 * stride);
+
+        let plan1 = host_heap.bindless_plan().unwrap();
+        assert_eq!(plan1.bounces.len(), 1);
+        {
+            let b = host_heap.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            // Only resource-backed slots (10, 11, 12, 13) belong in `by_view`; CBVs (14, 15) do not.
+            let mut tracked: Vec<u32> = Vec::new();
+            for set in b.by_view.values() {
+                set.for_each(|i| tracked.push(i));
+            }
+            tracked.sort_unstable();
+            assert_eq!(tracked, vec![10, 11, 12, 13]);
+        }
+
+        // Overwrite slot 11 with buf_b's view (removes 11 from buf_a's SlotSet, adds to buf_b's).
+        create_srv(std::ptr::null_mut(), buf_b, &srv_desc, base + 11 * stride);
+        let _ = host_heap.bindless_plan().unwrap();
+
+        // Release buf_a: only slots 10 and 12 must go stale, while 11, 13, 14, 15 stay live.
+        assert_eq!(release(buf_a), 0);
+        // Advance `looked[0]` so `bindless_plan` runs the once-per-frame stale check.
+        host_heap
+            .bindless
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .looked[0] = 0;
+
+        let plan2 = host_heap.bindless_plan().unwrap();
+        assert_eq!(plan2.bounces.len(), 1, "misaligned CBV must remain intact");
+        {
+            let b = host_heap.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!b.slots.contains_key(&10) && !b.uses.contains_key(&10));
+            assert!(!b.slots.contains_key(&12) && !b.uses.contains_key(&12));
+            assert!(b.slots.contains_key(&11) && b.uses.contains_key(&11));
+            assert!(b.slots.contains_key(&13) && b.uses.contains_key(&13));
+            assert!(b.slots.contains_key(&14) && b.uses.contains_key(&14));
+            assert!(b.slots.contains_key(&15) && b.uses.contains_key(&15));
+        }
+
+        assert_eq!(release(buf_b), 0);
+        assert_eq!(release(title_heap), 0);
+    }
+
+    /// Verifies `alias_retained` omits the root `Shadow::buffer` (already held
+    /// by `BindlessPlan::reads`) and deduplicates distinct alias `ID3D12Resource`s.
+    #[test]
+    fn alias_retained_deduplicates_and_omits_shadow_buffer() {
+        let Some(host) = host() else {
+            return;
+        };
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let buf = crate::resource::test_buffer(4096);
+        let (ptr, len) = crate::resource::buffer_bytes(buf).unwrap();
+        let shadow = crate::shadow::find(ptr as u64, len).unwrap();
+        let (alias_res, _) = host.shared_buffer(4096).unwrap();
+
+        let mut b = Bindless::default();
+        // Slot 0 uses shadow.buffer directly -> not duplicated in `_retained`.
+        b.set_use(
+            0,
+            Some(SlotUse {
+                read: Some((shadow.clone(), ptr as usize, 256)),
+                retained: Some(shadow.buffer.clone()),
+                ..SlotUse::default()
+            }),
+        );
+        assert!(b.build_retained().is_empty());
+
+        // Slots 1 and 2 share a distinct alias resource -> retained once.
+        for idx in [1u32, 2] {
+            b.set_use(
+                idx,
+                Some(SlotUse {
+                    read: Some((shadow.clone(), ptr as usize, 256)),
+                    retained: Some(alias_res.clone()),
+                    ..SlotUse::default()
+                }),
+            );
+        }
+        assert_eq!(b.build_retained().len(), 1);
+
+        // Clearing one slot keeps the alias retained; clearing both drops it.
+        b.set_use(1, None);
+        assert_eq!(b.build_retained().len(), 1);
+        b.set_use(2, None);
+        assert!(b.build_retained().is_empty());
+
+        assert_eq!(release(buf), 0);
+    }
+
+    /// Verifies switching a slot from a misaligned bounced CBV to an aligned CBV
+    /// deactivates `cbv_bounce[index].active` and updates `bounces`/`reads`.
+    #[test]
+    fn cbv_bounce_to_aligned_transition_clears_active() {
+        if host().is_none() {
+            return;
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let (title_heap, base) = make_shader_heap(8);
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let buf = crate::resource::test_buffer(4096);
+        let (ptr, _) = crate::resource::buffer_bytes(buf).unwrap();
+
+        // Start misaligned on slot 3.
+        let mis = ptr as u64 + 16;
+        let cbv_mis: [u32; 4] = [mis as u32, (mis >> 32) as u32, 64, 0];
+        create_cbv(std::ptr::null_mut(), &cbv_mis, base + 3 * 32);
+        let plan1 = host_heap.bindless_plan().unwrap();
+        assert_eq!(plan1.bounces.len(), 1);
+        assert!(
+            host_heap
+                .bindless
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cbv_bounce
+                .get(&3)
+                .is_some_and(|s| s.active)
+        );
+
+        // Overwrite slot 3 with an aligned CBV.
+        let cbv_ok: [u32; 4] = [ptr as u32, (ptr as u64 >> 32) as u32, 256, 0];
+        create_cbv(std::ptr::null_mut(), &cbv_ok, base + 3 * 32);
+        let plan2 = host_heap.bindless_plan().unwrap();
+        assert!(plan2.bounces.is_empty());
+        assert_eq!(plan2.reads.len(), 1);
+        assert!(
+            !host_heap
+                .bindless
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cbv_bounce
+                .get(&3)
+                .is_some_and(|s| s.active)
+        );
+
+        assert_eq!(release(buf), 0);
+        assert_eq!(release(title_heap), 0);
+    }
+
+    /// Synthetic CPU benchmark for submission-time bindless planning
+    /// (`HostHeap::bindless_plan`) over a populated 64K-slot bindless heap.
+    /// Run in release mode:
+    /// `cargo test --release -p victory-gpu -j 2 -- --ignored --nocapture benchmark_bindless_plan`
+    #[test]
+    #[ignore = "benchmark"]
+    fn benchmark_bindless_plan() {
+        let Some(_) = host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        const SLOTS: usize = 65_536;
+        const BUFFERS: usize = 8;
+        const BUF_SIZE: u64 = 4 << 20;
+        const WARMUP: usize = 3;
+        const SAMPLES: usize = 25;
+
+        let stats = |name: &str, mut times_us: Vec<f64>| {
+            times_us.sort_by(f64::total_cmp);
+            let n = times_us.len();
+            let med = times_us[n / 2];
+            let p25 = times_us[n / 4];
+            let p75 = times_us[(3 * n) / 4];
+            let min = times_us[0];
+            let max = times_us[n - 1];
+            let mean = times_us.iter().sum::<f64>() / n as f64;
+            println!(
+                "{name:34} n={n:2}  median={med:9.1} us ({:6.3} ms)  iqr=[{p25:8.1}, {p75:8.1}] us  min={min:8.1}  max={max:8.1}  mean={mean:8.1}",
+                med / 1e3
+            );
+        };
+
+        let (title_heap, base) = make_shader_heap(SLOTS as u32);
+        let slot_handle = |i: usize| base + i as u64 * 32;
+
+        // Backing title memory: 8 x 4 MiB buffers + 1 MiB for placed texture eviction probes.
+        let mem = crate::resource::Memory::zeroed(
+            BUFFERS as u64 * BUF_SIZE + (1 << 20),
+            64 << 10,
+        )
+        .unwrap();
+        let mem_base = mem.address();
+        let mut buffers = Vec::with_capacity(BUFFERS);
+        for b in 0..BUFFERS {
+            let addr = mem_base + b as u64 * BUF_SIZE;
+            buffers.push((addr, make_title_buffer(addr, BUF_SIZE, true)));
+        }
+
+        let make_raw_srv = |first_elem: u64, count: u32| -> [u32; 10] {
+            let d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: first_elem,
+                        NumElements: count,
+                        StructureByteStride: 0,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    },
+                },
+            };
+            // SAFETY: 40-byte POD view description.
+            unsafe { std::ptr::from_ref(&d).cast::<[u32; 10]>().read() }
+        };
+        let make_raw_uav = |first_elem: u64, count: u32| -> [u32; 10] {
+            let d = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: first_elem,
+                        NumElements: count,
+                        StructureByteStride: 0,
+                        CounterOffsetInBytes: 0,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    },
+                },
+            };
+            // SAFETY: 40-byte POD view description.
+            unsafe { std::ptr::from_ref(&d).cast::<[u32; 10]>().read() }
+        };
+
+        let mut placed_buf_res = [0u32; 14];
+        placed_buf_res[0] = 1; // BUFFER
+        placed_buf_res[4] = BUF_SIZE as u32;
+        placed_buf_res[5] = (BUF_SIZE >> 32) as u32;
+        placed_buf_res[6] = 1;
+        placed_buf_res[7] = 0x0001_0001;
+        placed_buf_res[9] = 1;
+        placed_buf_res[11] = 1;
+
+        // Populate 65,536 bindless slots with a realistic mix of views:
+        // 40% aligned CBVs, 25% misaligned CBVs, 20% resource buffer SRVs,
+        // 10% placed buffer SRVs, 5% resource buffer UAVs.
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        for i in 0..SLOTS {
+            let b = i % BUFFERS;
+            let (b_addr, b_res) = buffers[b];
+            // Spread across the 4 MiB buffer in 256-byte steps (with some gaps).
+            let off = ((i / BUFFERS) as u64 * 256) % (BUF_SIZE - 512);
+            let kind = i % 20;
+            if kind < 8 {
+                let addr = b_addr + off;
+                create_cbv(
+                    std::ptr::null(),
+                    &[addr as u32, (addr >> 32) as u32, 256, 0],
+                    slot_handle(i),
+                );
+            } else if kind < 13 {
+                // 16B-aligned, non-256B-aligned CBV -> bounce slice.
+                let addr = b_addr + off + 0x30;
+                create_cbv(
+                    std::ptr::null(),
+                    &[addr as u32, (addr >> 32) as u32, 128, 0],
+                    slot_handle(i),
+                );
+            } else if kind < 17 {
+                let words = make_raw_srv(off / 4, 64);
+                create_srv(std::ptr::null(), b_res, &words, slot_handle(i));
+            } else if kind < 19 {
+                let srv = make_raw_srv(0, 64);
+                let mut desc = [0u32; 16];
+                desc[..10].copy_from_slice(&srv);
+                let addr = b_addr + off;
+                desc[10] = addr as u32;
+                desc[11] = (addr >> 32) as u32;
+                create_placed_srv(std::ptr::null(), &placed_buf_res, &desc, slot_handle(i));
+            } else {
+                let words = make_raw_uav(off / 4, 64);
+                create_uav(std::ptr::null(), b_res, std::ptr::null(), &words, slot_handle(i));
+            }
+        }
+
+        // Materialize all 65,536 slots into Bindless before timing steady-state frames.
+        loop {
+            crate::queue::pass_frame();
+            {
+                let mut b = host_heap.bindless.lock().unwrap();
+                b.budget = None;
+            }
+            let _ = host_heap.bindless_plan().unwrap();
+            if host_heap.bindless.lock().unwrap().dirty.is_empty() {
+                break;
+            }
+        }
+        let initial_plan = host_heap.bindless_plan().unwrap();
+        assert_eq!(initial_plan.reads.len(), BUFFERS);
+        assert_eq!(initial_plan.writes.len(), SLOTS / 20);
+        assert!(initial_plan.bounces.len() >= SLOTS / 4);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let tex_addr_base = mem_base + BUFFERS as u64 * BUF_SIZE;
+        let tex_desc: [u32; 14] = [
+            3, 0, 0, 0, 16, 0, 16, 0x0001_0001, DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, 1, 0, 0x100,
+            0, 0,
+        ];
+
+        // Scenario 1: Steady-state frame with 1 released transient resource + 256 rewritten slots.
+        let mut s1 = Vec::with_capacity(SAMPLES);
+        for iter in 0..(WARMUP + SAMPLES) {
+            crate::queue::pass_frame();
+            // Create and release a transient buffer + view so VIEWED bumps realistically.
+            let trans = make_title_buffer(tex_addr_base, 256, false);
+            let words = make_raw_srv(0, 16);
+            create_srv(std::ptr::null(), trans, &words, slot_handle(0));
+            assert_eq!(release(trans), 0);
+            // Rewrite 256 slots across the heap.
+            let base_slot = (iter * 256) % (SLOTS - 256);
+            for k in 0..256 {
+                let s = base_slot + k;
+                let (b_addr, b_res) = buffers[s % BUFFERS];
+                let off = (((s + iter * 7) % 1024) as u64) * 256;
+                match k % 4 {
+                    0 => {
+                        let addr = b_addr + off;
+                        create_cbv(
+                            std::ptr::null(),
+                            &[addr as u32, (addr >> 32) as u32, 256, 0],
+                            slot_handle(s),
+                        );
+                    }
+                    1 => {
+                        let addr = b_addr + off + 0x30;
+                        create_cbv(
+                            std::ptr::null(),
+                            &[addr as u32, (addr >> 32) as u32, 128, 0],
+                            slot_handle(s),
+                        );
+                    }
+                    2 => {
+                        let w = make_raw_srv(off / 4, 64);
+                        create_srv(std::ptr::null(), b_res, &w, slot_handle(s));
+                    }
+                    _ => {
+                        let w = make_raw_uav(off / 4, 64);
+                        create_uav(std::ptr::null(), b_res, std::ptr::null(), &w, slot_handle(s));
+                    }
+                }
+            }
+            {
+                let mut b = host_heap.bindless.lock().unwrap();
+                b.budget = None;
+            }
+            let t0 = std::time::Instant::now();
+            let plan = std::hint::black_box(host_heap.bindless_plan().unwrap());
+            let us = t0.elapsed().as_secs_f64() * 1e6;
+            assert!(!plan.reads.is_empty());
+            if iter >= WARMUP {
+                s1.push(us);
+            }
+        }
+        stats("steady_frame_256_rewrites_64k", s1);
+
+        // Scenario 2: Frame with placed-texture eviction epoch + VIEWED bump + 256 rewrites.
+        let mut s2 = Vec::with_capacity(SAMPLES);
+        for iter in 0..(WARMUP + SAMPLES) {
+            crate::queue::pass_frame();
+            let probe_addr = tex_addr_base + (64 << 10);
+            assert!(crate::resource::texture_at(probe_addr, &tex_desc, 0).is_some());
+            crate::watch::title_memory_remapped(probe_addr as usize, 64 << 10);
+            let trans = make_title_buffer(tex_addr_base, 256, false);
+            let words = make_raw_srv(0, 16);
+            create_srv(std::ptr::null(), trans, &words, slot_handle(1));
+            assert_eq!(release(trans), 0);
+            let base_slot = (iter * 256) % (SLOTS - 256);
+            for k in 0..256 {
+                let s = base_slot + k;
+                let (b_addr, _) = buffers[s % BUFFERS];
+                let addr = b_addr + (((s + iter * 13) % 1024) as u64) * 256;
+                create_cbv(
+                    std::ptr::null(),
+                    &[addr as u32, (addr >> 32) as u32, 256, 0],
+                    slot_handle(s),
+                );
+            }
+            {
+                let mut b = host_heap.bindless.lock().unwrap();
+                b.budget = None;
+            }
+            let t0 = std::time::Instant::now();
+            let plan = std::hint::black_box(host_heap.bindless_plan().unwrap());
+            let us = t0.elapsed().as_secs_f64() * 1e6;
+            assert!(!plan.reads.is_empty());
+            if iter >= WARMUP {
+                s2.push(us);
+            }
+        }
+        stats("steady_frame_eviction_64k", s2);
+
+        // Scenario 3: Urgent dirty burst (2,048 rewritten buffer/CBV slots in one submission).
+        let mut s3 = Vec::with_capacity(SAMPLES);
+        for iter in 0..(WARMUP + SAMPLES) {
+            crate::queue::pass_frame();
+            let base_slot = (iter * URGENT) % (SLOTS - URGENT);
+            for k in 0..URGENT {
+                let s = base_slot + k;
+                let (b_addr, b_res) = buffers[s % BUFFERS];
+                let off = (((s + iter * 11) % 2048) as u64) * 256;
+                if k % 2 == 0 {
+                    let w = make_raw_srv(off / 4, 64);
+                    create_srv(std::ptr::null(), b_res, &w, slot_handle(s));
+                } else {
+                    let addr = b_addr + off;
+                    create_cbv(
+                        std::ptr::null(),
+                        &[addr as u32, (addr >> 32) as u32, 256, 0],
+                        slot_handle(s),
+                    );
+                }
+            }
+            {
+                let mut b = host_heap.bindless.lock().unwrap();
+                b.budget = None;
+            }
+            let t0 = std::time::Instant::now();
+            let plan = std::hint::black_box(host_heap.bindless_plan().unwrap());
+            let us = t0.elapsed().as_secs_f64() * 1e6;
+            assert!(!plan.reads.is_empty());
+            if iter >= WARMUP {
+                s3.push(us);
+            }
+        }
+        stats("urgent_burst_2048_slots_64k", s3);
+
+        for (_, res) in buffers {
+            assert_eq!(release(res), 0);
+        }
+        assert_eq!(release(title_heap), 0);
     }
 }
