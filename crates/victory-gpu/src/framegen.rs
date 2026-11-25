@@ -33,7 +33,8 @@ use crate::resource::HostTexture;
 const DLL: &str = "amd_fidelityfx_framegeneration_dx12.dll";
 const OK: u32 = 0;
 
-// Description types (`ffx_api.h`, `ffx_framegeneration.h`, the DX12 headers).
+// FidelityFX SDK v2.4.0: ffx_api.h, ffx_framegeneration.h,
+// ffx_api_dx12.h, and dx12/ffx_api_framegeneration_dx12.h.
 const BACKEND_DX12: u64 = 2;
 const GET_VERSIONS: u64 = 4;
 const OVERRIDE_VERSION: u64 = 5;
@@ -174,14 +175,39 @@ struct ProviderVersion {
 }
 
 const _: () = {
+    use std::mem::offset_of;
+
+    // These x64 offsets catch reordered fields even when the size is unchanged.
     assert!(size_of::<Resource>() == 48);
+    assert!(offset_of!(Resource, description) == 8);
+    assert!(offset_of!(Resource, state) == 40);
     assert!(size_of::<Versions>() == 56);
+    assert!(offset_of!(Versions, count) == 32);
+    assert!(offset_of!(Versions, ids) == 40);
+    assert!(offset_of!(Versions, names) == 48);
     assert!(size_of::<ProviderOverride>() == 24);
+    assert!(offset_of!(ProviderOverride, id) == 16);
     assert!(size_of::<SwapchainDesc>() == 64);
+    assert!(offset_of!(SwapchainDesc, output) == 16);
+    assert!(offset_of!(SwapchainDesc, desc) == 32);
+    assert!(offset_of!(SwapchainDesc, queue) == 56);
     assert!(size_of::<Create>() == 40);
+    assert!(offset_of!(Create, display) == 20);
+    assert!(offset_of!(Create, max_render) == 28);
     assert!(size_of::<Configure>() == 144);
+    assert!(offset_of!(Configure, generate_callback) == 40);
+    assert!(offset_of!(Configure, generate_user) == 48);
+    assert!(offset_of!(Configure, enabled) == 56);
+    assert!(offset_of!(Configure, id) == 136);
     assert!(size_of::<Prepare>() == 232);
-    assert!(std::mem::offset_of!(Generate, count) == 264);
+    assert!(offset_of!(Prepare, render) == 40);
+    assert!(offset_of!(Prepare, jitter) == 48);
+    assert!(offset_of!(Prepare, scale) == 56);
+    assert!(offset_of!(Prepare, depth) == 88);
+    assert!(offset_of!(Prepare, motion) == 136);
+    assert!(offset_of!(Generate, color) == 24);
+    assert!(offset_of!(Generate, output) == 72);
+    assert!(offset_of!(Generate, count) == 264);
 };
 
 type CreateFn = unsafe extern "C" fn(*mut *mut c_void, *mut Header, *const c_void) -> u32;

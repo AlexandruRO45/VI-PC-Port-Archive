@@ -99,9 +99,17 @@ struct DispatchUpscale {
     rest: [u32; 18],
 }
 
-const _: () = assert!(size_of::<CreateUpscale>() == 0x30);
-const _: () = assert!(size_of::<Resource>() == 0x30);
-const _: () = assert!(size_of::<DispatchUpscale>() == 0x1b0);
+// FidelityFX SDK v2.4.0, upscalers/include/ffx_upscale.h.
+const _: () = {
+    use std::mem::offset_of;
+
+    assert!(size_of::<CreateUpscale>() == 0x30);
+    assert!(size_of::<Resource>() == 0x30);
+    assert!(size_of::<DispatchUpscale>() == 0x1b0);
+    assert!(offset_of!(DispatchUpscale, list) == 0x10);
+    assert!(offset_of!(DispatchUpscale, resources) == 0x18); // color
+    assert!(offset_of!(DispatchUpscale, rest) == 0x168); // jitterOffset
+};
 
 /// The versions a backend offers: count in and out, ids, names.
 #[repr(C)]
