@@ -2050,23 +2050,34 @@ impl Batch {
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    let _ = copy_mapped_with(dst, src, len, title_dst, |_, _| false);
+}
+
+/// A shadow may already contain valid contents where its title backing is
+/// still reserved. The callback may preserve such runs; other destinations
+/// (including staging and the title itself) always use the zero-fill path.
+pub(crate) fn copy_shadow(dst: *mut u8, src: *const u8, len: usize, preserve: impl FnMut(usize, usize) -> bool) -> usize {
+    copy_mapped_with(dst, src, len, false, preserve)
+}
+
+fn copy_mapped_with(dst: *mut u8, src: *const u8, len: usize, title_dst: bool, mut preserve: impl FnMut(usize, usize) -> bool) -> usize {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
             // SAFETY: timing only: the caller vouches for the source.
             unsafe { std::ptr::copy(src, dst, len) };
-            return;
+            return len;
         }
-        2 => return,
+        2 => return 0,
         _ => {}
     }
     if len == 0 {
-        return;
+        return 0;
     }
     // The kernel writes the destination: it must not be guarded meanwhile.
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     if title_dst && !crate::texture::committed_writable(dst, len) {
-        return;
+        return 0;
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
@@ -2074,14 +2085,21 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
-        return;
+        return len;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     // A large lazy reservation can be mostly empty. Skip each unreadable
     // VirtualQuery run in one operation; only race/remap failures need the
     // page-sized fallback.
-    crate::texture::read_runs(src as usize, len, |at, n, readable| {
+    use crate::texture::Readable;
+    let mut skipped = 0;
+    crate::texture::read_runs(src as usize, len, |at, n, state| {
+        if state == Readable::Reserved && preserve(at, n) {
+            skipped += n;
+            return;
+        }
+        let readable = state == Readable::Yes;
         let to = dst.wrapping_add(at - src as usize);
         let zero = |at, n| {
             #[cfg(feature = "diagnostics")]
@@ -2099,6 +2117,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
             });
         }
     });
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::ReservedBytesKept, skipped as u64);
+    len - skipped
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not

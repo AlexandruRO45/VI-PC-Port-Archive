@@ -460,12 +460,21 @@ impl Drop for Writing {
 
 static ON_KERNEL_WRITE: std::sync::OnceLock<fn(usize, usize)> = std::sync::OnceLock::new();
 static LAZY_RESERVED: std::sync::OnceLock<fn(usize, usize) -> bool> = std::sync::OnceLock::new();
+static LAZY_COVERS: std::sync::OnceLock<fn(usize, usize) -> bool> = std::sync::OnceLock::new();
 
 /// Unlike an unmapped physical view, a lazy page can become readable
 /// through a CPU fault without a mapping notification. Keep it dirty
 /// until we can protect and observe its writes.
-pub fn on_lazy_reserved(query: fn(usize, usize) -> bool) {
+pub fn on_lazy_reserved(query: fn(usize, usize) -> bool, covers: fn(usize, usize) -> bool) {
     let _ = LAZY_RESERVED.set(query);
+    let _ = LAZY_COVERS.set(covers);
+}
+
+/// The runtime owns the full span as zero-on-first-touch backing. Only
+/// use this after VirtualQuery showed it is still reserved; do not use
+/// it for ordinary decommits or physical placeholders.
+pub(crate) fn lazy_covers(at: usize, len: usize) -> bool {
+    LAZY_COVERS.get().is_some_and(|covers| covers(at, len))
 }
 
 /// Register the runtime's lazy-page commit callback.

@@ -408,21 +408,27 @@ fn committed_for(mut at: usize, len: usize, mask: u32) -> bool {
     true
 }
 
-/// Visit readable and unreadable runs without accessing title memory.
-pub(crate) fn read_runs(mut at: usize, len: usize, mut visit: impl FnMut(usize, usize, bool)) {
+/// Visit readable, reserved and other unreadable runs without accessing title memory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Readable { Yes, Reserved, No }
+
+pub(crate) fn read_runs(mut at: usize, len: usize, mut visit: impl FnMut(usize, usize, Readable)) {
+    use windows_sys::Win32::System::Memory::MEM_RESERVE;
     let Some(end) = at.checked_add(len) else {
-        visit(at, len, false);
+        visit(at, len, Readable::No);
         return;
     };
     while at < end {
         let Some(info) = region(at) else { break };
         let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
         if next <= at { break; }
-        visit(at, next - at, accessible(&info, READABLE));
+        let state = if accessible(&info, READABLE) { Readable::Yes }
+            else if info.State == MEM_RESERVE { Readable::Reserved } else { Readable::No };
+        visit(at, next - at, state);
         at = next;
     }
     if at < end {
-        visit(at, end - at, false);
+        visit(at, end - at, Readable::No);
     }
 }
 
@@ -436,7 +442,8 @@ fn read_resident(src: *const u8, out: &mut [u8]) -> Option<(blake3::Hash, usize)
     let mut bytes = 0;
     let mut hash = blake3::Hasher::new();
     hash.update(b"partial texture");
-    read_runs(base, out.len(), |at, len, readable| {
+    read_runs(base, out.len(), |at, len, state| {
+        let readable = state == Readable::Yes;
         let start = at - base;
         let part = &mut out[start..start + len];
         if readable {

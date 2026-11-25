@@ -164,6 +164,14 @@ pub(super) fn overlaps(at: usize, len: usize) -> bool {
         .is_some_and(|(_, r)| at < r.end)
 }
 
+/// True only when the whole span belongs to one live lazy reservation.
+pub(super) fn covers(at: usize, len: usize) -> bool {
+    at.checked_add(len).is_some_and(|end| {
+        cover(&RANGES.read().unwrap_or_else(|e| e.into_inner()), at)
+            .is_some_and(|(_, r)| end <= r.end)
+    })
+}
+
 /// Kernel writes cannot fault into the user-mode handler. Only commit
 /// private writable ranges; do not change existing protections.
 pub(super) fn before_write(at: usize, len: usize) {

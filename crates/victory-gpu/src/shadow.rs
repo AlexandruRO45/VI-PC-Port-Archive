@@ -434,14 +434,14 @@ impl Shadow {
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        let copied = self.copy(from, to);
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
-            add(C::WholeBytes, (to - from) as u64);
+            add(C::WholeBytes, copied as u64);
             add(C::WholeUs, started.elapsed().as_micros() as u64);
         }
-        to - from
+        copied
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
@@ -450,8 +450,11 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
-        to - from
+        // These are zero-initialized committed D3D12 buffers (no
+        // CREATE_NOT_ZEROED). An untouched lazy CPU reservation supplies no
+        // newer bytes; the shadow's initial zeros or GPU results stay valid.
+        // When a page commits it stays dirty until the first readable copy.
+        crate::host::copy_shadow(at, from as *const u8, to - from, crate::watch::lazy_covers)
     }
 }
 
@@ -750,6 +753,63 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lazy_reserved_refresh_keeps_gpu_bytes_until_cpu_commit() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const LEN: usize = 4 * PAGE;
+        static BASE: AtomicUsize = AtomicUsize::new(0);
+        let host = host().expect("D3D12 host");
+        // SAFETY: a new private reservation; no bytes are accessed before commit.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(title, 0);
+        BASE.store(title, Relaxed);
+        let covers = |at: usize, len: usize| {
+            let base = BASE.load(Relaxed);
+            base != 0 && at >= base && at.saturating_add(len) <= base + LEN
+        };
+        crate::watch::on_lazy_reserved(covers, covers);
+        let (buffer, mapped) = host.shared_buffer(LEN as u64).unwrap();
+        let copy = Shadow::new(buffer, mapped, 0, title as u64, LEN as u64);
+        assert_eq!(copy.update(title, LEN), 0, "fresh shadow keeps its initial zeros");
+        assert_eq!(copy.read_host(title as u64, 1), [0]);
+        let (upload, data) = host.upload_buffer(4).unwrap();
+        let value = 0x1234_5678u32;
+        let list = host.new_list().unwrap();
+        // SAFETY: both buffers cover four bytes; COMMON promotes to COPY_DEST.
+        unsafe {
+            data.cast::<u32>().write(value);
+            list.list.CopyBufferRegion(&copy.buffer, PAGE as u64, &upload, 0, 4);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let before = copy.read_host((title + PAGE) as u64, 1);
+        assert_eq!(before, [value]);
+        let bytes = (0..32).map(|_| copy.update(title, LEN)).sum::<usize>();
+        assert_eq!(bytes, 0);
+        assert_eq!(copy.read_host((title + PAGE) as u64, 1), before);
+        // An actual commit/write supplies authoritative bytes and must win.
+        let page = (title + PAGE) as *mut std::ffi::c_void;
+        // SAFETY: within the original reservation, committed before writing.
+        unsafe {
+            assert_eq!(VirtualAlloc(page, PAGE, MEM_COMMIT, PAGE_READWRITE), page);
+            page.cast::<u32>().write(42);
+        }
+        assert_eq!(copy.update(title, LEN), PAGE);
+        assert_eq!(copy.read_host((title + PAGE) as u64, 1), [42]);
+        // The old policy demonstrably overwrites the same GPU value.
+        copy.write_host((title + 2 * PAGE) as u64, &value.to_le_bytes());
+        // SAFETY: this is the live writable shadow mapping, not title memory.
+        let legacy_dst = unsafe { mapped.add(2 * PAGE) };
+        crate::host::copy_mapped(legacy_dst, (title + 2 * PAGE) as *const u8, PAGE, false);
+        assert_eq!(copy.read_host((title + 2 * PAGE) as u64, 1), [0]);
+        eprintln!("reserved refresh fixture: {} -> {bytes} bytes over 32 refreshes; real GPU copy preserved, CPU commit wins", 32 * LEN);
+        drop(copy);
+        BASE.store(0, Relaxed);
+        // SAFETY: original reservation, no tracker left on it.
+        assert_ne!(unsafe { VirtualFree(title as _, 0, MEM_RELEASE) }, 0);
+    }
 
     /// Ranges shaders write far apart are kept apart (not the copy between
     /// them); what the GPU wrote goes back once, whichever overlapping
