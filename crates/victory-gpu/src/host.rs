@@ -5473,9 +5473,10 @@ impl Host {
             working(was_working);
             return Some((submitted, sent));
         }
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        // Diagnostics: each title list timed on its own. Without title
+        // lists, one signal still covers any auxiliary work.
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() && !runs.is_empty() {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
@@ -5494,7 +5495,9 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                if !group.is_empty() {
+                    self.queue.ExecuteCommandLists(group);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -5514,10 +5517,10 @@ impl Host {
             // of copies in the card's memory, with the last): every
             // command's time on the card goes to the sums by pipeline.
             #[cfg(feature = "diagnostics")]
-            if timing() {
+            if let Some(run) = runs.get(i).filter(|_| timing()) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                for (ms, op) in runs[i].slowest(frequency, usize::MAX) {
+                for (ms, op) in run.slowest(frequency, usize::MAX) {
                     crate::copystat::command_took(&op, ms);
                 }
             }
@@ -5525,12 +5528,12 @@ impl Host {
             // > 1` was the test): the two 50 ms lists of the gameplay
             // frame, each a submission of its own, printed nothing.
             #[cfg(feature = "diagnostics")]
-            if timing() && started.elapsed() > std::time::Duration::from_millis(50) {
+            if let Some(run) = runs.get(i).filter(|_| timing() && started.elapsed() > std::time::Duration::from_millis(50)) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                let commands = run.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
                 tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
+                for (ms, op) in run.slowest(frequency, 6) {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }

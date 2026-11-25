@@ -270,7 +270,10 @@ pub(crate) fn collect() {
     if completed == u64::MAX {
         return; // the device was removed
     }
-    let now = Instant::now();
+    collect_ready(m, completed, Instant::now());
+}
+
+fn collect_ready(m: &mut Meter, completed: u64, now: Instant) {
     while let Some((pair, kind)) = m.slots.take_ready(completed, now) {
         // SAFETY: the fence covers both writes to the pair's readback bytes.
         // The meter lock keeps a new submission from writing them meanwhile.
@@ -362,10 +365,9 @@ mod tests {
         let pair = list.meter_pair().expect("the closed list owns its timestamp pair");
         host.execute(&[&list]);
 
-        let meter = METER.lock().unwrap();
-        let m = meter.as_ref().unwrap().as_ref().unwrap();
-        let slot = m.slots.entries[pair as usize].as_ref().unwrap();
-        let (signal, _) = slot.submitted.unwrap();
+        let mut meter = METER.lock().unwrap();
+        let m = meter.as_mut().unwrap().as_mut().unwrap();
+        let (signal, at) = m.slots.entries[pair as usize].as_ref().unwrap().submitted.unwrap();
         // SAFETY: the fence belongs to the queue that executed the list.
         let completed = unsafe { m.fence.GetCompletedValue() };
         assert!(completed != u64::MAX && completed >= signal);
@@ -375,8 +377,31 @@ mod tests {
             (p.read_volatile(), p.add(1).read_volatile())
         };
         assert!(end > 0 && end >= begin, "invalid timestamps {begin}, {end}");
-        assert!(m.slots.pending.contains(&(signal, pair)));
+        collect_ready(m, completed, at + AFTER);
+        let slot = m.slots.entries[pair as usize].as_ref().unwrap();
+        assert_eq!(slot.submitted, None);
         assert!(slot.owned);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_grouped_empty_submission_signals_the_direct_queue() {
+        if std::env::var_os("VICTORY_GPU_TIMING").is_none() {
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            assert!(std::env::var_os("VICTORY_D3D12_WARP").is_none(), "a WARP host is required");
+            return;
+        };
+        // SAFETY: the direct queue's live fence; the submission waits for
+        // its own signal before returning.
+        let before = unsafe { host.completion_fence().GetCompletedValue() };
+        host.execute(&[]);
+        let after = unsafe { host.completion_fence().GetCompletedValue() };
+        assert!(
+            after != u64::MAX && after > before,
+            "an empty timed submission needs a new completion signal"
+        );
     }
 
     #[test]
