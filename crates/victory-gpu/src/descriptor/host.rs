@@ -721,10 +721,11 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            // Diagnostic (NVIDIA heap cap): log once per 64 Ki-slot band past
+            // the host heap so sequential heap initialization does not flood stderr.
+            static HIGHEST_BAND: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            if note_capped_slot(&HIGHEST_BAND, index) {
                 tracing::warn!(
                     index,
                     count = self.count,
@@ -1821,6 +1822,14 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// Returns whether `index` enters a new 64 Ki-slot band past the host heap,
+/// recording that band so sequential heap writes warn once per band instead
+/// of once per slot.
+fn note_capped_slot(highest_band: &std::sync::atomic::AtomicU32, index: u32) -> bool {
+    let band = (index >> 16) + 1;
+    highest_band.fetch_max(band, std::sync::atomic::Ordering::Relaxed) < band
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2461,5 +2470,28 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn capped_slot_warning_fires_once_per_64k_band() {
+        let highest = std::sync::atomic::AtomicU32::new(0);
+        // Sequential heap initialization across 113,664 slots past a 1M-capped
+        // heap (bands 14 -> 15) warns only when entering each new 64 Ki-slot band.
+        let mut logged = Vec::new();
+        for index in 934_912..1_048_576 {
+            if note_capped_slot(&highest, index) {
+                logged.push(index);
+            }
+        }
+        assert_eq!(logged, [934_912, 983_040]);
+        // Revisiting earlier slots or bands stays quiet.
+        assert!(!note_capped_slot(&highest, 0));
+        assert!(!note_capped_slot(&highest, 983_040));
+        assert!(!note_capped_slot(&highest, 1_048_575));
+        // Entering the next band and u32::MAX (no overflow) each fire once.
+        assert!(note_capped_slot(&highest, 1_048_576));
+        assert!(!note_capped_slot(&highest, 1_048_577));
+        assert!(note_capped_slot(&highest, u32::MAX));
+        assert!(!note_capped_slot(&highest, u32::MAX));
     }
 }
