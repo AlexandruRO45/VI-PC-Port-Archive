@@ -8347,7 +8347,8 @@ impl<'a> Lower<'a> {
     /// texels at float coordinate `f`: `floor(u × size − 0.5)` (or
     /// `floor(u − 0.5)` when `unnormalized`) with the product exact and
     /// rounded to 1/256 of a texel, half up, as the hardware does, i.e.
-    /// `(floor(u × mul × 512) − 255) >> 9`, in 64-bit integers.
+    /// `(floor(u × mul × 512) − 255) >> 9` via a split 32-bit product (so
+    /// `Int64ShaderOps` is not required).
     ///
     /// For periodic modes (`WRAP`, `MIRROR`) exact integer-period reduction
     /// (`u - trunc(u)` or `u - 2 * trunc(u * 0.5)`) keeps the coordinate in
@@ -8412,40 +8413,55 @@ impl<'a> Lower<'a> {
         // u × mul_size × 512 = m × mul_size × 2^(e − 141).
         let k141 = k(self, 141);
         let shift = self.s.m.bin(c, Bin::Sub, k141, e);
-        let i64t = self.s.m.int(64);
-        self.s.flags |= flags::INT64;
-        let m = self.s.m.cast(c, Cast::ZExt, m, i64t);
-        let n = self.s.m.cast(c, Cast::ZExt, mul_size, i64t);
-        let p = self.s.m.bin(c, Bin::Mul, m, n);
-        let z64 = self.s.m.int_const(i64t, 0);
-        let neg = self.s.m.bin(c, Bin::Sub, z64, p);
+        let neg = self.s.m.bin(c, Bin::Sub, zero, m);
         let negative = self.s.m.cmp(c, pred::SLT, x, zero);
-        let p = self.s.m.select(c, negative, neg, p);
-        let k63 = k(self, 63);
-        let far = self.s.m.cmp(c, pred::SGT, shift, k63);
+        let m = self.s.m.select(c, negative, neg, m);
+
+        // Every D3D12 texture axis is at most 16,384 texels (`2^14`), so
+        // splitting the signed 24-bit mantissa at bit 16 keeps both partial
+        // products (and the low-half carry) exact in 32-bit integers without
+        // requesting `Int64ShaderOps`.
+        let (k16, mask16, k31) = (k(self, 16), k(self, 0xFFFF), k(self, 31));
+        let low = self.s.m.bin(c, Bin::And, m, mask16);
+        let low = self.s.m.bin(c, Bin::Mul, low, mul_size);
+        let carry = self.s.m.bin(c, Bin::LShr, low, k16);
+        let low = self.s.m.bin(c, Bin::And, low, mask16);
+        let high = self.s.m.bin(c, Bin::AShr, m, k16);
+        let high = self.s.m.bin(c, Bin::Mul, high, mul_size);
+        let high = self.s.m.bin(c, Bin::Add, high, carry);
+
+        const IMAX: u32 = 37;
+        const IMIN: u32 = 38;
+        let bound = |l: &mut Self, op, a, b| {
+            l.s.op(c, "binary.i32", Attr::ReadNone, l.s.t.i32, op, &[a, b])
+        };
+        let right = if unnormalized {
+            bound(self, IMAX, shift, zero)
+        } else {
+            shift
+        };
+        let low_right = bound(self, IMIN, right, k16);
+        let low = self.s.m.bin(c, Bin::LShr, low, low_right);
+        let high_right = self.s.m.bin(c, Bin::Sub, right, k16);
+        let high_right = bound(self, IMAX, high_right, zero);
+        let high_right = bound(self, IMIN, high_right, k31);
+        let high = self.s.m.bin(c, Bin::AShr, high, high_right);
+        let high_left = self.s.m.bin(c, Bin::Sub, k16, right);
+        let high_left = bound(self, IMAX, high_left, zero);
+        let high = self.s.m.bin(c, Bin::Shl, high, high_left);
+        let g = self.s.m.bin(c, Bin::Or, high, low);
         let g = if unnormalized {
             // `|f| <= 65536` gives `e <= 143`, so `shift` may be `-2` or `-1`.
-            let left_shift = self.s.m.cmp(c, pred::SLT, shift, zero);
-            let rsh = self.s.m.select(c, far, k63, shift);
-            let rsh = self.s.m.select(c, left_shift, zero, rsh);
-            let rsh = self.s.m.cast(c, Cast::ZExt, rsh, i64t);
-            let right_val = self.s.m.bin(c, Bin::AShr, p, rsh);
-            let neg_sh = self.s.m.bin(c, Bin::Sub, zero, shift);
-            let lsh = self.s.m.select(c, left_shift, neg_sh, zero);
-            let lsh = self.s.m.cast(c, Cast::ZExt, lsh, i64t);
-            let left_val = self.s.m.bin(c, Bin::Shl, p, lsh);
-            self.s.m.select(c, left_shift, left_val, right_val)
+            let left = self.s.m.bin(c, Bin::Sub, zero, shift);
+            let left = bound(self, IMAX, left, zero);
+            self.s.m.bin(c, Bin::Shl, g, left)
         } else {
-            // `|f| <= 64` keeps `e <= 133`, so `shift >= 8`.
-            let shift = self.s.m.select(c, far, k63, shift);
-            let shift = self.s.m.cast(c, Cast::ZExt, shift, i64t);
-            self.s.m.bin(c, Bin::AShr, p, shift)
+            g
         };
-        let k255 = self.s.m.int_const(i64t, 255);
+        let k255 = k(self, 255);
         let g = self.s.m.bin(c, Bin::Sub, g, k255);
-        let k9 = self.s.m.int_const(i64t, 9);
-        let g = self.s.m.bin(c, Bin::AShr, g, k9);
-        self.s.m.cast(c, Cast::Trunc, g, self.s.t.i32)
+        let k9 = k(self, 9);
+        self.s.m.bin(c, Bin::AShr, g, k9)
     }
 
     /// Like [`Self::whole`], for a 16-bit float stored in the low (`!hi`) or
@@ -8567,7 +8583,12 @@ impl<'a> Lower<'a> {
                 if hi {
                     if let (Some(c0), Some(c2)) = (const_u32(0), const_u32(2)) {
                         f16_whole((c0 << 16) | c2, true)?
-                    } else if self.high16_zero_op(inst, f.src.get(2)?, &mut HashSet::new()) {
+                    } else if self.high16_zero_op(
+                        inst,
+                        f.src.get(2)?,
+                        &mut HashSet::new(),
+                        &mut HashMap::new(),
+                    ) {
                         src_f16(0, false, false)?
                     } else {
                         return None;
@@ -8582,119 +8603,152 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether bits `[31:16]` of operand `op` are provably zero in every lane.
-    fn high16_zero_op(&self, inst: &Inst, op: &Operand, seen: &mut HashSet<Value>) -> bool {
+    fn high16_zero_op(
+        &self,
+        inst: &Inst,
+        op: &Operand,
+        visiting: &mut HashSet<Value>,
+        known: &mut HashMap<Value, bool>,
+    ) -> bool {
         match *op {
             Operand::Const(c) => crate::resource::inline(c).is_some_and(|x| x >> 16 == 0),
             Operand::Literal(x) => x >> 16 == 0,
             Operand::Vector { reg, .. } => inst
                 .read(Reg::V(reg))
-                .is_some_and(|v| self.high16_zero(v, seen)),
+                .is_some_and(|v| self.high16_zero(v, visiting, known)),
             Operand::Scalar { code, .. } if code != NULL => inst
                 .read(Reg::S(code))
-                .is_some_and(|v| self.high16_zero(v, seen)),
+                .is_some_and(|v| self.high16_zero(v, visiting, known)),
             Operand::Scalar { .. } => true,
             _ => false,
         }
     }
 
     /// Whether bits `[31:16]` of SSA value `v` are provably zero in every lane.
-    fn high16_zero(&self, v: Value, seen: &mut HashSet<Value>) -> bool {
-        if !seen.insert(v) {
+    fn high16_zero(
+        &self,
+        v: Value,
+        visiting: &mut HashSet<Value>,
+        known: &mut HashMap<Value, bool>,
+    ) -> bool {
+        if let Some(&ok) = known.get(&v) {
+            return ok;
+        }
+        if !visiting.insert(v) {
             return true;
         }
         let p = self.x.p;
-        if let Some(&(b, i)) = self.phi_at.get(&v) {
-            return p.blocks[b].phis[i]
+        let ok = if let Some(&(b, i)) = self.phi_at.get(&v) {
+            p.blocks[b].phis[i]
                 .args
                 .iter()
-                .all(|&arg| self.high16_zero(arg, seen));
-        }
-        let Some(&b) = self.def_block.get(&v) else {
-            return false;
-        };
-        let Some((i, inst)) = p.blocks[b]
-            .insts
-            .iter()
-            .enumerate()
-            .find(|(_, i)| i.writes.iter().any(|w| w.1 == v))
-        else {
-            return false;
-        };
-        let const_u32 = |op: Option<&Operand>| -> Option<u32> {
-            match *op? {
-                Operand::Const(c) => crate::resource::inline(c),
-                Operand::Literal(x) => Some(x),
-                _ => None,
-            }
-        };
-        match &inst.fields {
-            Fields::Valu(f) => {
-                if f.omod != 0 || f.abs != 0 || f.neg != 0 || f.clamp || f.sdwa.is_some() || f.dpp.is_some() {
-                    return false;
+                .all(|&arg| self.high16_zero(arg, visiting, known))
+        } else if let Some(&b) = self.def_block.get(&v)
+            && let Some((i, inst)) = p.blocks[b]
+                .insts
+                .iter()
+                .enumerate()
+                .find(|(_, i)| i.writes.iter().any(|w| w.1 == v))
+        {
+            let const_u32 = |op: Option<&Operand>| -> Option<u32> {
+                match *op? {
+                    Operand::Const(c) => crate::resource::inline(c),
+                    Operand::Literal(x) => Some(x),
+                    _ => None,
                 }
-                if self.x.st.guards[b][i].is_some() {
-                    let Some(Operand::Vector { reg, .. }) = f.dst else {
-                        return false;
-                    };
-                    let Some(old) = inst.read(Reg::V(reg)) else {
-                        return false;
-                    };
-                    if !self.high16_zero(old, seen) {
-                        return false;
+            };
+            match &inst.fields {
+                Fields::Valu(f) => {
+                    let guarded_ok = self.x.st.guards[b][i].is_none()
+                        || matches!(
+                            f.dst,
+                            Some(Operand::Vector { reg, .. })
+                                if inst.read(Reg::V(reg)).is_some_and(|old| {
+                                    self.high16_zero(old, visiting, known)
+                                })
+                        );
+                    if f.omod != 0
+                        || f.abs != 0
+                        || f.neg != 0
+                        || f.clamp
+                        || f.sdwa.is_some()
+                        || f.dpp.is_some()
+                        || !guarded_ok
+                    {
+                        false
+                    } else {
+                        match inst.name() {
+                            "v_mov_b32" => f
+                                .src
+                                .first()
+                                .is_some_and(|op| self.high16_zero_op(inst, op, visiting, known)),
+                            "v_and_b32" | "v_min_u32" => f
+                                .src
+                                .iter()
+                                .take(2)
+                                .any(|op| self.high16_zero_op(inst, op, visiting, known)),
+                            "v_or_b32" | "v_xor_b32" | "v_cndmask_b32" => {
+                                f.src.len() >= 2
+                                    && f.src
+                                        .iter()
+                                        .take(2)
+                                        .all(|op| self.high16_zero_op(inst, op, visiting, known))
+                            }
+                            "v_and_or_b32" => {
+                                f.src.len() >= 3
+                                    && f.src
+                                        .iter()
+                                        .take(2)
+                                        .any(|op| self.high16_zero_op(inst, op, visiting, known))
+                                    && self.high16_zero_op(inst, &f.src[2], visiting, known)
+                            }
+                            "v_lshrrev_b32" => {
+                                const_u32(f.src.first()).is_some_and(|s| (s & 31) >= 16)
+                                    || f.src
+                                        .get(1)
+                                        .is_some_and(|op| self.high16_zero_op(inst, op, visiting, known))
+                            }
+                            "v_bfe_u32" => const_u32(f.src.get(2)).is_some_and(|w| (w & 31) <= 16),
+                            _ => false,
+                        }
                     }
                 }
-                match inst.name() {
-                    "v_mov_b32" => f.src.first().is_some_and(|op| self.high16_zero_op(inst, op, seen)),
-                    "v_and_b32" | "v_min_u32" => f
-                        .src
+                Fields::Sop { src, .. } => match inst.name() {
+                    "s_mov_b32" => src
+                        .first()
+                        .is_some_and(|op| self.high16_zero_op(inst, op, visiting, known)),
+                    "s_and_b32" | "s_min_u32" => src
                         .iter()
                         .take(2)
-                        .any(|op| self.high16_zero_op(inst, op, seen)),
-                    "v_or_b32" | "v_xor_b32" | "v_cndmask_b32" => {
-                        f.src.len() >= 2
-                            && f.src
+                        .any(|op| self.high16_zero_op(inst, op, visiting, known)),
+                    "s_or_b32" | "s_xor_b32" | "s_cselect_b32" => {
+                        src.len() >= 2
+                            && src
                                 .iter()
                                 .take(2)
-                                .all(|op| self.high16_zero_op(inst, op, seen))
+                                .all(|op| self.high16_zero_op(inst, op, visiting, known))
                     }
-                    "v_and_or_b32" => {
-                        f.src.len() >= 3
-                            && f.src
-                                .iter()
-                                .take(2)
-                                .any(|op| self.high16_zero_op(inst, op, seen))
-                            && self.high16_zero_op(inst, &f.src[2], seen)
+                    "s_lshr_b32" => {
+                        const_u32(src.get(1)).is_some_and(|s| (s & 31) >= 16)
+                            || src
+                                .first()
+                                .is_some_and(|op| self.high16_zero_op(inst, op, visiting, known))
                     }
-                    "v_lshrrev_b32" => {
-                        const_u32(f.src.first()).is_some_and(|s| (s & 31) >= 16)
-                            || f.src.get(1).is_some_and(|op| self.high16_zero_op(inst, op, seen))
+                    "s_bfe_u32" => {
+                        const_u32(src.get(1)).is_some_and(|spec| ((spec >> 16) & 0x7F) <= 16)
                     }
-                    "v_bfe_u32" => const_u32(f.src.get(2)).is_some_and(|w| (w & 31) <= 16),
                     _ => false,
-                }
-            }
-            Fields::Sop { src, .. } => match inst.name() {
-                "s_mov_b32" => src.first().is_some_and(|op| self.high16_zero_op(inst, op, seen)),
-                "s_and_b32" | "s_min_u32" => src
-                    .iter()
-                    .take(2)
-                    .any(|op| self.high16_zero_op(inst, op, seen)),
-                "s_or_b32" | "s_xor_b32" | "s_cselect_b32" => {
-                    src.len() >= 2
-                        && src
-                            .iter()
-                            .take(2)
-                            .all(|op| self.high16_zero_op(inst, op, seen))
-                }
-                "s_lshr_b32" => {
-                    const_u32(src.get(1)).is_some_and(|s| (s & 31) >= 16)
-                        || src.first().is_some_and(|op| self.high16_zero_op(inst, op, seen))
-                }
-                "s_bfe_u32" => const_u32(src.get(1)).is_some_and(|spec| ((spec >> 16) & 0x7F) <= 16),
+                },
                 _ => false,
-            },
-            _ => false,
+            }
+        } else {
+            false
+        };
+        visiting.remove(&v);
+        if !ok || visiting.is_empty() {
+            known.insert(v, ok);
         }
+        ok
     }
 
     /// Whether `v` holds, as a float, a whole number or an infinity in

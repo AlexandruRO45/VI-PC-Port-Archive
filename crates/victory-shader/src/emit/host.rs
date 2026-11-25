@@ -1178,10 +1178,10 @@ pub enum View<'a> {
     /// An RGBA32F cube SRV with mips (face size, levels, texels of each
     /// face's levels in turn).
     MippedCube(u32, u32, &'a [[f32; 4]]),
-    /// An RGBA32F square texture SRV (size, levels) whose texels in level
     /// A mipped 2D texture array `(width, height, levels, slices, texels)` —
     /// slice by slice, each mip level in turn.
     MippedArray(u32, u32, u32, u32, &'a [[f32; 4]]),
+    /// An RGBA32F square texture SRV (size, levels) whose texels in level
     /// `n` are all `n`.
     Levels(u32, u32),
     /// A raw buffer UAV of this many dwords, zeroed.
