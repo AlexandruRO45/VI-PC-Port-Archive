@@ -2385,6 +2385,41 @@ mod title_copies {
         assert_eq!(untracked, [(0, 1280)]);
     }
 
+    /// A copy's refresh brings up to date what its ranges declare, not the
+    /// span between them: a page the title wrote between two declared ranges
+    /// is left for a submission that declares it (it stays changed). Kept
+    /// on purpose: the old bounding span refreshed it only by chance (a
+    /// view's size is what a shader may read), and across a 174 MB buffer's
+    /// ranges it was most of the copy cost.
+    #[test]
+    fn a_refresh_leaves_the_gap_between_its_declared_ranges() {
+        let page = crate::watch::PAGE;
+        let pool = crate::watch::tests::pool(3);
+        crate::shadow::register(pool, pool as u64, (3 * page) as u64);
+        let Some(copy) = crate::shadow::find(pool as u64, (3 * page) as u64) else {
+            crate::shadow::unregister(pool, pool as u64);
+            return; // no host GPU here
+        };
+        let host = |at: usize| copy.read_host((pool + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+        copy.update(pool, 3 * page);
+        // The title writes a byte in each page; two ranges are declared.
+        for p in 0..3 {
+            // SAFETY: a byte of our pool.
+            unsafe { ((pool + p * page + 8) as *mut u8).write_volatile(0x40 + p as u8) };
+        }
+        let mut batch = super::Batch::default();
+        batch.add(&copy, pool, 64);
+        batch.add(&copy, pool + 2 * page, 64);
+        batch.flush();
+        assert_eq!([host(8), host(2 * page + 8)], [0x40, 0x42], "the declared ranges are current");
+        assert_eq!(host(page + 8), 0, "the gap is not copied");
+        // Declared later, it is.
+        batch.add(&copy, pool + page, 64);
+        batch.flush();
+        assert_eq!(host(page + 8), 0x41);
+        crate::shadow::unregister(pool, pool as u64);
+    }
+
     #[test]
     #[ignore = "throughput benchmark comparing fast VEH copy vs ReadProcessMemory"]
     fn bench_copy_and_watch_throughput() {
