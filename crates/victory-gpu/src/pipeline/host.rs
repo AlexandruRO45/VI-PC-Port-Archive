@@ -760,7 +760,6 @@ fn mesh_pipeline(
     )
 }
 
-/// The bytes of shader code (none for an absent stage).
 /// A mesh program whose outputs pass D3D12's 32 KiB (the validator refuses
 /// it; drivers may take it and misbehave) and its pixel program, re-emitted
 /// for each other without the values the pixel program never reads
@@ -796,6 +795,7 @@ fn linked(ms: &Arc<Shader>, ps: &Arc<Shader>) -> Option<(HostShader, HostShader)
     }
 }
 
+/// The bytes of shader code (none for an absent stage).
 fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     if code.pShaderBytecode.is_null() {
         return Vec::new();
