@@ -601,8 +601,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     /// Two lists of a submission read title memory through one page table;
     /// the copies' views stay where they are for later lists and
-    /// submissions, also when another copy comes; none takes a per-draw
-    /// dynamic slot.
+    /// submissions, also when another copy comes; live view pairs do not
+    /// overlap each other or a per-draw dynamic allocation.
     #[test]
     fn lists_share_a_table_and_copies_keep_their_views() {
         use crate::watch::PAGE;
@@ -670,7 +670,16 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&lists[0], &lists[1]]);
         assert_eq!(read(), [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]);
         let pairs = (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap());
-        assert!(pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18, "past the dynamic slots");
+        // A capped heap can allocate pairs from the same pool as draw tables.
+        // Verify that all live allocations are disjoint in either layout.
+        let temporary = views.dynamic(2).expect("draw-table descriptors");
+        let disjoint = |a, b| a + 2 <= b || b + 2 <= a;
+        assert!(disjoint(pairs.0, pairs.1), "each copy has its own pair");
+        for pair in [pairs.0, pairs.1] {
+            assert!(pair >= views.count(), "outside the title slots");
+            assert!(disjoint(pair, temporary), "separate from the draw table");
+        }
+        views.release(temporary, 2);
         // A second submission, after a third copy came.
         let c = copy(memory[2], 1);
         for list in &lists {
