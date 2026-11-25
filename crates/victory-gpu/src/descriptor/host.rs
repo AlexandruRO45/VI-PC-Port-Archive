@@ -710,9 +710,48 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
     }
 }
 
-/// Buffer views left null because the host would refuse them
-/// ([`buffer_view_ok`]), since the start.
-pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Why a buffer view of the title's was left null ([`NULL_BUFFER_VIEWS`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NullView {
+    /// No elements: the null view reads as the empty one would.
+    Empty,
+    /// A raw view that starts off 16 bytes, which the host refuses.
+    RawStart,
+    /// A raw view of another format than R32 typeless, or with a stride.
+    RawFormat,
+    /// A structured view with a format, or a stride the host has none for.
+    Structured,
+    /// A typed view of a typeless or unsized format.
+    Typed,
+    /// A view past its memory's end.
+    PastEnd,
+    /// A typed or structured view whose start is not on an element of its
+    /// host copy.
+    OffElement,
+    /// Memory with no host copy.
+    NoCopy,
+    /// Unordered access to a host copy shaders cannot write.
+    Unwritable,
+}
+
+/// How many kinds of [`NullView`] there are; the first six are the views
+/// the host would refuse ([`buffer_view_refusal`]).
+pub(crate) const NULL_VIEW_KINDS: usize = 9;
+
+/// Buffer views left null, by [`NullView`], since the start (counted each
+/// time a slot is made, not per distinct view).
+pub(crate) static NULL_BUFFER_VIEWS: [std::sync::atomic::AtomicU64; NULL_VIEW_KINDS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; NULL_VIEW_KINDS];
+
+/// A buffer view left null for `why`: counted; true the first time for that
+/// reason (the caller then logs the view).
+fn left_null(why: NullView) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    NULL_BUFFER_VIEWS[why as usize].fetch_add(1, Relaxed);
+    static LOGGED: [std::sync::atomic::AtomicBool; NULL_VIEW_KINDS] =
+        [const { std::sync::atomic::AtomicBool::new(false) }; NULL_VIEW_KINDS];
+    !LOGGED[why as usize].swap(true, Relaxed)
+}
 
 /// Whether the host device is gone, and why (the first time it is asked
 /// after that): for passes that make many views, to name the one that did
@@ -1960,26 +1999,42 @@ fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, 
         .flatten()
 }
 
-/// Whether the host accepts a buffer view with these fields of a buffer of
-/// `width` bytes. It removes the device for one it does not (view creation
-/// returns nothing), and the console is laxer: the title's heap holds
-/// views past their memory's end, of no elements, of typeless formats
-/// without the raw flag, with strides the host has no structured buffers
-/// for. Since every buffer view of the heap is made for shaders that pick
-/// them by index, one such view ended the run (2026-11-24, run 10).
-fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bool, width: u64) -> bool {
+/// Why the host would refuse a buffer view with these fields of a buffer of
+/// `width` bytes, if it would. It removes the device for one it does not
+/// take (view creation returns nothing), and the console is laxer: the
+/// title's heap holds views past their memory's end, of no elements, of
+/// typeless formats without the raw flag, with strides the host has no
+/// structured buffers for. Since every buffer view of the heap is made for
+/// shaders that pick them by index, one such view ended the run
+/// (2026-11-24, run 10). The reason tells a view that loses nothing (no
+/// elements) from one whose data the shader does not see.
+fn buffer_view_refusal(
+    format: DXGI_FORMAT,
+    first: u64,
+    count: u32,
+    stride: u32,
+    raw: bool,
+    width: u64,
+) -> Option<NullView> {
     use crate::resource::family;
+    // (first: an empty view loses nothing, whatever else it says)
+    if count == 0 {
+        return Some(NullView::Empty);
+    }
     let f = format.0 as u32;
     let element = if raw {
         // raw: R32 typeless, counted in dwords, starting on 16 bytes
-        if format != DXGI_FORMAT_R32_TYPELESS || stride != 0 || !first.is_multiple_of(4) {
-            return false;
+        if format != DXGI_FORMAT_R32_TYPELESS || stride != 0 {
+            return Some(NullView::RawFormat);
+        }
+        if !first.is_multiple_of(4) {
+            return Some(NullView::RawStart);
         }
         4
     } else if stride > 0 {
         // structured: no format, a stride the host takes
         if format != DXGI_FORMAT_UNKNOWN || stride > 2048 || !stride.is_multiple_of(4) {
-            return false;
+            return Some(NullView::Structured);
         }
         u64::from(stride)
     } else {
@@ -1987,14 +2042,14 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
         let typeless = family(f) == f && family(f + 1) == f;
         match crate::resource::element(f) {
             Some((bytes, 1)) if f != 0 && !typeless && bytes > 0 => bytes,
-            _ => return false,
+            _ => return Some(NullView::Typed),
         }
     };
-    count > 0
-        && first
-            .checked_add(u64::from(count))
-            .and_then(|end| end.checked_mul(element))
-            .is_some_and(|end| end <= width)
+    let fits = first
+        .checked_add(u64::from(count))
+        .and_then(|end| end.checked_mul(element))
+        .is_some_and(|end| end <= width);
+    (!fits).then_some(NullView::PastEnd)
 }
 
 fn buffer_srv(
@@ -2003,7 +2058,12 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let Some(shadow) = crate::shadow::find(address, len) else {
+        if left_null(NullView::NoCopy) {
+            tracing::warn!(address, len, "buffer view of memory with no host copy left null");
+        }
+        return None;
+    };
     let offset = shadow.offset(address);
     // A structured view as a raw view of the same bytes (see `raw_window`).
     // SAFETY: a buffer view's union member.
@@ -2025,11 +2085,9 @@ fn buffer_srv(
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     if window.is_none() {
         if element == 0 || offset % element != 0 {
-            once!(
-                offset,
-                element,
-                "buffer view not on an element of its host copy"
-            );
+            if left_null(NullView::OffElement) {
+                tracing::warn!(offset, element, "buffer view not on an element of its host copy left null");
+            }
             return None;
         }
         buffer.FirstElement += offset / element;
@@ -2038,17 +2096,19 @@ fn buffer_srv(
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
-        REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        once!(
-            format = desc.Format.0,
-            first,
-            count,
-            stride,
-            raw,
-            width,
-            "buffer view the host would refuse left null"
-        );
+    if let Some(why) = buffer_view_refusal(desc.Format, first, count, stride, raw, width) {
+        if left_null(why) {
+            tracing::warn!(
+                ?why,
+                format = desc.Format.0,
+                first,
+                count,
+                stride,
+                raw,
+                width,
+                "buffer view the host would refuse left null"
+            );
+        }
         return None;
     }
     // The console has no component mapping; one the host does not know is the default's.
@@ -2075,11 +2135,18 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let Some(shadow) = crate::shadow::find(address, len) else {
+        if left_null(NullView::NoCopy) {
+            tracing::warn!(address, len, "unordered buffer view of memory with no host copy left null");
+        }
+        return None;
+    };
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-        once!("unordered access to a buffer whose host copy shaders cannot write");
+        if left_null(NullView::Unwritable) {
+            tracing::warn!("unordered access to a buffer whose host copy shaders cannot write left null");
+        }
         return None;
     }
     // SAFETY: a buffer view's union member.
@@ -2103,7 +2170,9 @@ fn buffer_uav(
         buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     } else {
         if element == 0 || offset % element != 0 {
-            once!(offset, element, "unordered buffer view not on an element of its host copy");
+            if left_null(NullView::OffElement) {
+                tracing::warn!(offset, element, "unordered buffer view not on an element of its host copy left null");
+            }
             return None;
         }
         buffer.FirstElement += offset / element;
@@ -2113,22 +2182,24 @@ fn buffer_uav(
     let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
     if window.is_some() {
         // (Left out at first: every structured unordered access view was then
-        // refused by `buffer_view_ok` and left null, runs 15 and 16.)
+        // refused by `buffer_view_refusal` and left null, runs 15 and 16.)
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
-        REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        once!(
-            format = desc.Format.0,
-            first,
-            count,
-            stride,
-            raw,
-            width,
-            "unordered buffer view the host would refuse left null"
-        );
+    if let Some(why) = buffer_view_refusal(desc.Format, first, count, stride, raw, width) {
+        if left_null(why) {
+            tracing::warn!(
+                ?why,
+                format = desc.Format.0,
+                first,
+                count,
+                stride,
+                raw,
+                width,
+                "unordered buffer view the host would refuse left null"
+            );
+        }
         return None;
     }
     let host = host()?;
@@ -2768,15 +2839,28 @@ mod tests {
         // bytes before the view's memory: bytes 192..2192.
         let (first, count) = raw_window(32, 8, 100, 20).unwrap();
         assert_eq!((first, count), (48, 500));
-        assert!(buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 4096));
+        assert_eq!(buffer_view_refusal(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 4096), None);
         // the format a raw view must name; the structured one's is refused
-        assert!(!buffer_view_ok(DXGI_FORMAT_UNKNOWN, first, count, 0, true, 4096));
+        assert_eq!(
+            buffer_view_refusal(DXGI_FORMAT_UNKNOWN, first, count, 0, true, 4096),
+            Some(NullView::RawFormat)
+        );
         // past the buffer, not on 16 bytes, no elements
-        assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 2000));
+        assert_eq!(
+            buffer_view_refusal(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, 2000),
+            Some(NullView::PastEnd)
+        );
         assert!(raw_window(4, 0, 100, 20).is_none());
-        assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096));
-        // a structured view the host takes as it is
-        assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
+        assert_eq!(
+            buffer_view_refusal(DXGI_FORMAT_R32_TYPELESS, 2, 184, 0, true, 4096),
+            Some(NullView::RawStart)
+        );
+        // an empty view is empty first, whatever else it says
+        assert_eq!(buffer_view_refusal(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096), Some(NullView::Empty));
+        assert_eq!(buffer_view_refusal(DXGI_FORMAT_UNKNOWN, 3, 0, 0, true, 0), Some(NullView::Empty));
+        // a structured view the host takes as it is, and one with a stride it has none for
+        assert_eq!(buffer_view_refusal(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096), None);
+        assert_eq!(buffer_view_refusal(DXGI_FORMAT_UNKNOWN, 1, 10, 6, false, 4096), Some(NullView::Structured));
     }
 
     #[test]

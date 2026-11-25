@@ -10059,7 +10059,25 @@ impl Meter {
                 du3 = crate::resource::DEPTH_UNORDERED[3].load(Ordering::Relaxed),
                 refused = format!(
                     "{}; depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass",
-                    crate::descriptor::host::REFUSED_VIEWS.load(Ordering::Relaxed),
+                    {
+                        // the old total (those the host would refuse), then every reason
+                        use crate::descriptor::host::{NULL_BUFFER_VIEWS, NULL_VIEW_KINDS};
+                        let n: [u64; NULL_VIEW_KINDS] = NULL_BUFFER_VIEWS.each_ref().map(|c| c.load(Ordering::Relaxed));
+                        format!(
+                            "{} (empty {}, raw off 16 bytes {}, raw of another format {}, structured {}, typed {}, past the end {}); \
+                             also left null: not on an element {}, no host copy {}, unordered and unwritable {}",
+                            n[..6].iter().sum::<u64>(),
+                            n[0],
+                            n[1],
+                            n[2],
+                            n[3],
+                            n[4],
+                            n[5],
+                            n[6],
+                            n[7],
+                            n[8]
+                        )
+                    },
                     crate::resource::TWINS[0].load(Ordering::Relaxed),
                     crate::resource::TWINS[1].load(Ordering::Relaxed),
                     crate::resource::PLANES[1].load(Ordering::Relaxed),
