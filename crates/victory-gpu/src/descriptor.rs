@@ -11,6 +11,8 @@ use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, T
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
+mod buffer_spans;
+#[cfg(windows)]
 pub(crate) mod host;
 
 const HEAP_IIDS: [Iid; 4] = [
@@ -56,7 +58,7 @@ pub(crate) struct Heap {
     /// descriptor order when a draw first uses them (decision 0007, step
     /// 3); slots written before wait in `pending`.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<host::HostHeap>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<host::HostHeap>>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
 }
@@ -76,7 +78,7 @@ impl Heap {
     /// Made late because a host view heap the size of the title's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
-    pub(crate) fn host(&self) -> Option<&host::HostHeap> {
+    pub(crate) fn host(&self) -> Option<&std::sync::Arc<host::HostHeap>> {
         if let Some(h) = self.host.get() {
             return h.as_ref();
         }
@@ -94,7 +96,7 @@ impl Heap {
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
-                Some(h)
+                Some(std::sync::Arc::new(h))
             })
             .as_ref()
     }

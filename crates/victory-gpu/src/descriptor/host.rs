@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use super::buffer_spans::{BufferRange, BufferSlots, BufferSpans};
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
@@ -59,6 +60,8 @@ pub(crate) struct HostHeap {
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
     /// buffers from the whole heap.
     buffers: Mutex<std::collections::BTreeSet<u32>>,
+    /// Per-slot host copies and the grouped ranges used by indexed draws.
+    indexed_buffers: Mutex<BufferSlots<crate::shadow::Shadow>>,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Mutex<std::collections::HashSet<u32>>,
@@ -633,6 +636,7 @@ impl HostHeap {
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
+            indexed_buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
@@ -778,11 +782,6 @@ impl HostHeap {
     /// heaps).
     pub(crate) fn strides_gpu(&self) -> Option<u64> {
         self.strides.as_ref().map(|s| s.1)
-    }
-
-    /// The table's buffer, for a list to hold.
-    pub(crate) fn strides_buffer(&self) -> Option<&ID3D12Resource> {
-        self.strides.as_ref().map(|s| &s.0)
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -956,6 +955,16 @@ impl HostHeap {
         } else {
             textures.remove(index);
         }
+    }
+
+    /// Resolve the changed slots and take a snapshot that can be refreshed
+    /// after the cache lock has been released.
+    pub(crate) fn indexed_buffer_spans(
+        &self,
+        resolve: impl FnMut(usize, u32, &[u32]) -> Option<BufferRange<crate::shadow::Shadow>>,
+    ) -> (usize, std::sync::Arc<BufferSpans<crate::shadow::Shadow>>) {
+        self.indexed_buffers.lock().unwrap_or_else(|e| e.into_inner())
+            .pass(self.buffer_changes(), || self.buffer_slots(), resolve)
     }
 
     /// The title slots that hold buffer views.

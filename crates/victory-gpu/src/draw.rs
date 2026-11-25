@@ -857,9 +857,11 @@ impl State {
                 .iter()
                 .filter(|&&h| h != 0)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
+                .map(|h| {
+                    list.keep_heap(h);
+                    Some(h.heap.clone())
+                })
                 .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
             self.host_heaps = self.heaps;
@@ -1281,10 +1283,6 @@ impl State {
         if !list.first_use(ONCE) {
             return Some(gpu);
         }
-        // The list may outlive the title's heap object, which owns the table.
-        if let Some(buffer) = host.strides_buffer() {
-            list.keep(buffer);
-        }
         // The pass itself once per frame: per list it ran up to 51 times a
         // frame over 81,000 views and 4,100 host copies, 18 s of every
         // frame (2026-11-24, run 11).
@@ -1296,40 +1294,18 @@ impl State {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
+        // Whether the device was there before the pass: a view that removes
+        // it is named below.
+        static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
         // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
-            .get_or_insert_with(Default::default)
-            .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
-        let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
-        };
-        *passes += 1;
-        // Whether the device was there before the pass: a view that removes
-        // it is named below.
-        static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
-        for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
-            let Some(handle) = heap.handle(index) else {
-                continue;
-            };
-            let Some(view) = host.mirror(index, handle, true) else {
-                continue;
-            };
+        let (visited, spans) = host.indexed_buffer_spans(|n, index, slots| {
+            let view = host.mirror(index, heap.handle(index)?, true)?;
             // Every 64 views while the device lives (a cheap query).
             if alive
                 && n % 64 == 63
@@ -1347,27 +1323,14 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
-                continue;
-            };
+            let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
-        }
-        let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
-        }
-        drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+            Some((shadow, address, address + len))
+        });
+        let views = spans.views;
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1378,7 +1341,7 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
+        for (shadow, from, to) in &spans.ranges {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
@@ -1409,10 +1372,10 @@ impl State {
         if u64::from(views) > seen + seen / 2 {
             LOGGED.store(u64::from(views), Ordering::Relaxed);
             tracing::info!(
-                slots = slots.len(),
+                slots = visited,
                 views,
-                copies = spans.len(),
-                mb = bytes >> 20,
+                copies = spans.ranges.len(),
+                mb = spans.bytes >> 20,
                 ms = started.elapsed().as_millis(),
                 "buffer views of the heap made ready for shaders that pick them by index"
             );

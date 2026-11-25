@@ -648,6 +648,34 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn bound_heaps_survive_until_the_last_recorded_list_resets() {
+        use crate::descriptor::host::HostHeap;
+        use std::sync::Arc;
+
+        let Some(host) = super::host() else { return };
+        let view = Arc::new(HostHeap::new(false, 4).unwrap());
+        let sampler = Arc::new(HostHeap::new(true, 4).unwrap());
+        let view_owner = Arc::downgrade(&view);
+        let sampler_owner = Arc::downgrade(&sampler);
+        let first = host.new_list().unwrap();
+        let later = host.new_list().unwrap();
+        first.keep_heap(&view);
+        later.keep_heap(&view);
+        later.keep_heap(&sampler);
+        later.keep_heap(&view);
+        assert_eq!(later.deferred().heaps.len(), 2);
+        first.close();
+        later.close();
+        drop((view, sampler));
+        first.reset();
+        assert!(view_owner.upgrade().is_some());
+        assert!(sampler_owner.upgrade().is_some());
+        later.reset();
+        assert!(view_owner.upgrade().is_none());
+        assert!(sampler_owner.upgrade().is_none());
+    }
+
+    #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
@@ -1581,10 +1609,11 @@ struct Deferred {
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
-    /// Host objects the list's commands name (pipelines, root signatures,
-    /// descriptor heaps): the title may release its objects before it
-    /// submits the list.
+    /// Host objects the list's commands name, such as pipelines and root
+    /// signatures: the title may release its objects before submission.
     kept: Vec<windows::core::IUnknown>,
+    /// Bound shader heaps own the current native descriptors' resources and stride tables.
+    heaps: Vec<std::sync::Arc<crate::descriptor::host::HostHeap>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -4829,6 +4858,7 @@ impl HostList {
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
+                && deferred.heaps.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty())
@@ -5042,6 +5072,15 @@ impl HostList {
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
+        }
+    }
+
+    /// A later list may use the heap without recording its own refresh. Keep
+    /// the live heap since a slot can also change before the list is submitted.
+    pub(crate) fn keep_heap(&self, heap: &std::sync::Arc<crate::descriptor::host::HostHeap>) {
+        let mut deferred = self.deferred();
+        if !deferred.heaps.iter().any(|h| std::sync::Arc::ptr_eq(h, heap)) {
+            deferred.heaps.push(heap.clone());
         }
     }
 
