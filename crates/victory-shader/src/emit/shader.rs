@@ -20,9 +20,18 @@ pub const VIEW_STRIDES: u8 = 255;
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
 /// Heap indices are clamped below these (views, samplers): the host's heaps
-/// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
-pub const HEAP_VIEWS: u32 = 1 << 21;
+/// are this large, the slots past their own null (`emit`, "Heap indices").
+///
+/// Every shader-visible view heap is made this large (D3D12's limit is
+/// 1,000,000), so the clamp and the null buffer views at the top
+/// (`NULL_BUFFER_VIEW`) stay inside it. The size is a memory choice: each
+/// slot costs 32 bytes of descriptor heap, and the tables beside it four
+/// and eight bytes. 262,144 is four times the slots the old 65,536-slot
+/// fallback kept, while costing a quarter of a 1,000,000-slot heap; a title
+/// heap with more slots has the rest dropped (the old fallback dropped
+/// everything past 65,536). Raise it for a larger card if descriptors past
+/// it turn out to matter.
+pub const HEAP_VIEWS: u32 = 1 << 18;
 pub const HEAP_SAMPLERS: u32 = 2048;
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
