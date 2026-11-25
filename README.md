@@ -224,8 +224,10 @@ To compare two builds, capture the same numbered frames with
 `VICTORY_CAPTURE` directory for each run. Run
 `victory compare-targets <before-dir> <after-dir>` on those directories.
 It compares the raw bytes of subresource zero of captured single-sample
-textures, including depth-twin planes. It pairs submissions with captured
-targets in order within each frame, and targets by first-use slot. The
+textures, including depth-twin planes. Multisampled targets keep their
+place in the capture with an unavailable digest. A comparison that reaches
+one is inconclusive. The command pairs submissions with captured targets
+in order within each frame, and targets by first-use slot. The
 report gives both submission IDs and the recorded writers when available.
 The exit code is 0 for a match, 1 for the first difference, or 2 if the
 captures cannot be compared. Older PNG-only directories lack the raw digests.

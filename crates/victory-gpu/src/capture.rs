@@ -410,16 +410,26 @@ pub(crate) fn dump_targets(frame: u64) {
 /// rendered to or wrote, as `frame-<n>-s<sub>-<i>-...` (what each holds
 /// then, to follow a frame pass by pass).
 pub(crate) fn dump_submission(frame: u64, sub: u64, targets: &[(usize, String)]) {
-    use crate::capture_diff::{Target, write_submission};
-    use std::sync::atomic::Ordering::Relaxed;
-
-    let prefix = format!("frame-{frame}-s{sub:04}");
-    peek(&prefix);
+    peek(frame, sub);
     // The readback lists we submit here have no targets of their own.
     if targets.is_empty() || !dump_on() {
         return;
     }
     let (Some(host), Some(dir)) = (crate::host::host(), folder()) else { return };
+    dump_submission_to(host, dir, frame, sub, targets);
+}
+
+fn dump_submission_to(
+    host: &crate::host::Host,
+    dir: &std::path::Path,
+    frame: u64,
+    sub: u64,
+    targets: &[(usize, String)],
+) {
+    use crate::capture_diff::{Target, write_submission};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let prefix = format!("frame-{frame}-s{sub:04}");
     let mut observations = Vec::new();
     for (slot, (resource, writer)) in targets.iter().enumerate() {
         let resource = *resource as crate::object::This;
@@ -470,12 +480,18 @@ fn submission_target(
 ) -> Option<crate::capture_diff::Target> {
     // SAFETY: a live host texture.
     let d = unsafe { texture.GetDesc() };
-    if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+    if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
         return None;
     }
-    let label = plane.map(|p| format!("{writer}-twin{p}"));
-    let target = (slot, resource, label.as_deref().unwrap_or(writer));
-    let hash = dump_one(host, texture, state, prefix, target, &d, true);
+    // A multisampled texture cannot be copied directly to the readback buffer.
+    // Keep its slot so the comparison reports where coverage ends.
+    let hash = if d.SampleDesc.Count > 1 {
+        None
+    } else {
+        let label = plane.map(|p| format!("{writer}-twin{p}"));
+        let target = (slot, resource, label.as_deref().unwrap_or(writer));
+        dump_one(host, texture, state, prefix, target, &d, true)
+    };
     Some(crate::capture_diff::Target {
         slot,
         plane,
@@ -495,7 +511,7 @@ fn submission_target(
 /// `VICTORY_PEEK=<address>[:<bytes>],...` (hex addresses, 16 bytes by
 /// default): those bytes of title memory, as dwords and floats, after each
 /// submission of a listed frame.
-fn peek(when: &str) {
+fn peek(frame: u64, sub: u64) {
     static LIST: std::sync::OnceLock<Vec<(u64, usize)>> = std::sync::OnceLock::new();
     let list = LIST.get_or_init(|| {
         std::env::var("VICTORY_PEEK")
@@ -520,7 +536,7 @@ fn peek(when: &str) {
                 format!("{w:#x}={}", f32::from_bits(w))
             })
             .collect();
-        tracing::info!("peek {when} {at:#x}: {}", words.join(" "));
+        tracing::info!("peek frame-{frame}-s{sub:04} {at:#x}: {}", words.join(" "));
     }
 }
 

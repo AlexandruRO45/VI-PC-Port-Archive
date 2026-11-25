@@ -322,13 +322,14 @@ mod tests {
     }
 
     #[test]
-    fn an_unavailable_readback_cannot_compare_equal() {
+    fn matching_targets_before_an_unavailable_readback_cannot_compare_equal() {
         let before = tempfile::tempdir().unwrap();
         let unreadable = Target {
             hash: None,
             ..target(4, None, b"", "draw")
         };
-        write_submission(before.path(), 4, 10, &[unreadable]).unwrap();
+        let single_sample = target(0, None, b"same", "draw");
+        write_submission(before.path(), 4, 10, &[single_sample, unreadable]).unwrap();
         let error = compare(before.path(), before.path())
             .unwrap_err()
             .to_string();
