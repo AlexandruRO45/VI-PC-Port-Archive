@@ -1885,9 +1885,54 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
     flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
 }
 
+/// Whether a landing tells the title about flights with nothing to copy
+/// back before the copy-back of the later flights it lands with
+/// (`VICTORY_EARLY_SIGNAL=1`; off by default; only with residents,
+/// `VICTORY_INPLACE=4`, and the relay).
+///
+/// With residents and memory in place a flight's shader writes are in the
+/// title's memory when the host fence reaches it: the card wrote them
+/// there itself, in the submission (writes of the card to the write-back
+/// pages of an arena are seen by the CPU once the fence completes). Such a
+/// flight has nothing for the relay to fetch, compare or merge
+/// ([`Flight::covered`]). But the relay lands every flight the card has
+/// run in one go, the copy-back of all of them first: a covered flight's
+/// fence signals, events and bottom-of-pipe writes waited for the
+/// copy-back of the flights after it. With the switch the flights ahead of
+/// the first one that still has copies to bring back, and what follows
+/// each, are told at once; the rest as before. The line's order is kept:
+/// nothing behind a flight with a copy-back is told before it.
+fn early_signal() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay() && crate::resident::on() && std::env::var_os("VICTORY_EARLY_SIGNAL").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line: flights told before the copy-back of
+/// later ones ([`early_signal`]); title fence signals set by the relay,
+/// their microseconds from when it took their flights, and the longest.
+static EARLY: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// With [`early_signal`]: of the things a landing takes, in the line's
+/// order (a flight: whether it has nothing to copy back; a write or a
+/// signal behind one: `None`), how many from the front are told before
+/// the copy-back: everything ahead of the first flight that has one.
+fn told_ahead(line: &[Option<bool>]) -> usize {
+    line.iter().position(|f| *f == Some(false)).unwrap_or(line.len())
+}
+
+impl Flight {
+    /// Whether nothing of it is left to copy back once the card has run
+    /// it: no ranges of copies in the PC's memory, no pieces of copies in
+    /// the card's memory to fetch. Its writes in place and in residents
+    /// are in the title's memory then.
+    fn covered(&self) -> bool {
+        self.back.is_empty() && self.card.as_ref().is_none_or(|c| c.ranges.is_empty())
+    }
+}
+
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{flagged_pieces, landable, told_ahead};
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -1907,6 +1952,33 @@ mod relay_tests {
         // After the first three landed, the rest when its turn comes.
         assert_eq!(landable(&line[3..], 5), 0);
         assert_eq!(landable(&line[3..], 6), 2);
+    }
+
+    /// With early signals: a flight with nothing to copy back is told as
+    /// soon as the card has run it, with what follows it; a flight that
+    /// still has a copy-back, and everything behind it (a covered flight
+    /// too), waits for that copy-back, so the line's order is kept.
+    #[test]
+    fn covered_flights_are_told_before_the_copy_back_of_later_ones() {
+        // Covered flight (fence 5), its write, a signal; a flight with a
+        // copy-back (fence 6), its signal; a covered flight (fence 7).
+        let fences = [Some(5), None, None, Some(6), None, Some(7)];
+        let covered = [Some(true), None, None, Some(false), None, Some(true)];
+        // The card has run the first only: it and what follows it go.
+        let n = landable(&fences, 5);
+        assert_eq!(n, 3);
+        assert_eq!(told_ahead(&covered[..n]), 3);
+        // It has run all three in one landing: the first at once, the
+        // second after its copy-back, and the third behind it.
+        let n = landable(&fences, 7);
+        assert_eq!(n, 6);
+        assert_eq!(told_ahead(&covered[..n]), 3);
+        // A landing that begins with a copy-back tells nothing ahead.
+        assert_eq!(told_ahead(&covered[3..]), 0);
+        // All covered: all at once; signals alone too.
+        assert_eq!(told_ahead(&[Some(true), None, Some(true), None]), 4);
+        assert_eq!(told_ahead(&[None, None]), 2);
+        assert_eq!(told_ahead(&[]), 0);
     }
 
     /// A piece flagged under one range of a plan is fetched under every
@@ -2574,6 +2646,16 @@ fn late_line(frames: f64) {
             r[2] / 1000.0,
             r[3] / 1000.0,
             r[4] / 1000.0,
+        );
+        let [ahead, signals, us, longest] = [0, 1, 2, 3].map(|i| EARLY[i].swap(0, Ordering::Relaxed) as f64);
+        tracing::info!(
+            "title fence signals set by the relay per frame: {:.1}, {:.2} ms on average after it took their flights from the card \
+             (the longest {:.1} ms); {:.1} flights told before the copy-back of later ones (VICTORY_EARLY_SIGNAL=1: now {})",
+            signals / frames,
+            if signals > 0.0 { us / signals / 1000.0 } else { 0.0 },
+            longest / 1000.0,
+            ahead / frames,
+            if early_signal() { "on" } else { "off" }
         );
     }
     if late_exact() {
@@ -3584,8 +3666,42 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+    ///
+    /// With [`early_signal`], the flights before the first one that has
+    /// something to copy back, and what follows each of them, are told
+    /// first, before that copy-back.
+    fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        let mut landed = Vec::new();
+        // SAFETY: a plain query (a removed device fails below, with what
+        // the flights ran).
+        if early_signal() && unsafe { self.device.GetDeviceRemovedReason() }.is_ok() {
+            let covered: Vec<Option<bool>> = items
+                .iter()
+                .map(|l| match l {
+                    Late::Run(flight) => Some(flight.covered()),
+                    _ => None,
+                })
+                .collect();
+            let rest = items.split_off(told_ahead(&covered));
+            let ahead = std::mem::replace(&mut items, rest);
+            let plans: Vec<&CardPlan> = ahead
+                .iter()
+                .filter_map(|l| match l {
+                    Late::Run(flight) => flight.card.as_ref(),
+                    _ => None,
+                })
+                .collect();
+            // Nothing to fetch for these: their sends are noted as seen.
+            self.relay_card_back(&plans, fetch);
+            let flights = ahead.iter().filter(|l| matches!(l, Late::Run(_))).count() as u64;
+            EARLY[0].fetch_add(flights, Ordering::Relaxed);
+            RELAY_STATS[1].fetch_add(flights, Ordering::Relaxed);
+            if flights > 0 && !items.iter().any(|l| matches!(l, Late::Run(_))) {
+                RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
+            }
+            landed.extend(self.relay_tell(ahead, landing));
+        }
         {
             let flights: Vec<&Flight> = items
                 .iter()
@@ -3636,29 +3752,7 @@ impl Host {
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
-        // In the order given: what tells the title the card is done.
-        let mut last = 0;
-        let mut landed = Vec::new();
-        for item in items {
-            match item {
-                Late::Run(flight) => {
-                    last = flight.number;
-                    for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
-                    }
-                    if let Some(card) = flight.card {
-                        self.card_done(card);
-                    }
-                    landed.push((flight.lists, flight.order));
-                }
-                Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
-            }
-        }
-        if last > 0 {
-            FINISHED.store(last, Ordering::Release);
-            bury(last);
-        }
+        landed.extend(self.relay_tell(items, landing));
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
         {
@@ -3694,6 +3788,42 @@ impl Host {
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
+    }
+
+    /// [`relay`], landing: what tells the title the card is done with
+    /// `items`, in the order given (each flight's read-backs, its
+    /// bottom-of-pipe writes, the fence signals behind it). `landing` is
+    /// when the relay took them. Returns the flights' host lists.
+    fn relay_tell(&self, items: Vec<Late>, landing: std::time::Instant) -> Vec<(Vec<crate::list::Detached>, Vec<usize>)> {
+        let mut last = 0;
+        let mut landed = Vec::new();
+        for item in items {
+            match item {
+                Late::Run(flight) => {
+                    last = flight.number;
+                    for &i in &flight.order {
+                        read_backs(flight.lists[i].host());
+                    }
+                    if let Some(card) = flight.card {
+                        self.card_done(card);
+                    }
+                    landed.push((flight.lists, flight.order));
+                }
+                Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
+                Late::Signal(fence, value) => {
+                    crate::fence::set(fence as crate::object::This, value);
+                    let us = landing.elapsed().as_micros() as u64;
+                    EARLY[1].fetch_add(1, Ordering::Relaxed);
+                    EARLY[2].fetch_add(us, Ordering::Relaxed);
+                    EARLY[3].fetch_max(us, Ordering::Relaxed);
+                }
+            }
+        }
+        if last > 0 {
+            FINISHED.store(last, Ordering::Release);
+            bury(last);
+        }
+        landed
     }
 
     /// After a submission ran, for copies in the card's memory: the pieces
