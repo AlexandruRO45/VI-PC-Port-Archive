@@ -1508,6 +1508,14 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_with_input_width(words, input_addr, false)
+    }
+
+    fn pixel_with_input_width(
+        words: &[u32],
+        input_addr: u32,
+        fp16: bool,
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1521,8 +1529,8 @@ mod barycentric_tests {
                     mask: 0b1111,
                     attr: 0,
                     flat: false,
-                    fp16: false,
-                    pack2: false,
+                    fp16,
+                    pack2: fp16,
                     row2: 0,
                 }],
                 input_addr,
@@ -1640,6 +1648,59 @@ mod barycentric_tests {
         assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
         assert_eq!(texcoord_mode(&shader), 1);
         validate(&shader);
+    }
+
+    #[test]
+    fn interpolation_first_half_can_be_read_as_well_as_completed() {
+        let [e0, e1] = exp_mrt0(4);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            v_add_f32(4, 2, 3),
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    #[test]
+    fn standalone_f16_interpolation_first_half_reads_the_vertices() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xD742_0002,
+            0x0002_0000, // v_interp_p1ll_f16 v2, attr0.x, v0
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel_with_input_width(&words, PERSP_CENTER, true).unwrap();
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    #[test]
+    fn f16_second_half_writes_the_selected_half_of_its_accumulator() {
+        let [e0, e1] = exp_mrt0(2);
+        let lower = |high| {
+            let words = [
+                0xD742_0002,
+                0x0002_0100, // v_interp_p1ll_f16 v2, attr0.x high, v0
+                0xD75A_0002 | (u32::from(high) << 14),
+                0x040a0300, // v_interp_p2_f16 v2, attr0.x high, v1, v2
+                e0,
+                e1,
+                S_ENDPGM,
+            ];
+            let shader = pixel_with_input_width(&words, PERSP_CENTER, true).unwrap();
+            assert_eq!(texcoord_mode(&shader), 1);
+            validate(&shader);
+            shader.dxil
+        };
+        assert!(lower(false) != lower(true));
     }
 
     /// Both: the attribute is interpolated and J is used as a value.
