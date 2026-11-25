@@ -412,7 +412,7 @@ mod gpu {
                 waves.WaveLaneCountMin,
                 waves.WaveLaneCountMax,
             );
-            (Host { device }, name, supported)
+            (Host::from_device(device), name, supported)
         }
     }
 
