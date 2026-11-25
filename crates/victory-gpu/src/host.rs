@@ -7362,6 +7362,8 @@ struct PresentTimes {
     path: Option<std::ffi::OsString>,
     last: Option<std::time::Instant>,
     intervals: Vec<u64>,
+    window_frames: usize,
+    window_us: u64,
     stall: Option<f64>,
     counts: [u64; 3],
 }
@@ -7403,15 +7405,23 @@ impl PresentTimes {
                 }
             }
             if self.path.is_some() {
-                self.intervals.push(now.duration_since(last).as_micros() as u64);
+                let us = now.duration_since(last).as_micros() as u64;
+                self.intervals.push(us);
+                self.window_us = self.window_us.saturating_add(us);
             }
         }
         if let Some(counts) = counts {
             self.counts = counts;
         }
-        if self.path.is_none() || (self.intervals.len() + 1) % 300 != 0 {
+        if self.path.is_none() {
             return Ok(());
         }
+        self.window_frames += 1;
+        if self.window_frames < 300 && self.window_us < 5_000_000 {
+            return Ok(());
+        }
+        self.window_frames = 0;
+        self.window_us = 0;
         self.write()
     }
 
@@ -7429,12 +7439,29 @@ impl PresentTimes {
         writeln!(out, "frame,interval_us,p50_us,p95_us,p99_us,max_us,dropped_estimate")?;
         writeln!(out, "1,,{p50},{p95},{p99},{max},0")?;
         let (mut total, mut dropped) = (0u64, 0u64);
+        let (mut from, mut window_us) = (1usize, 0u64);
+        let mut window = Vec::with_capacity(300);
         for (i, &us) in self.intervals.iter().enumerate() {
             // Missing median-sized slots, rounded to nearest; not DXGI drop telemetry.
             let missed = ((us as f64 / p50.max(1) as f64).round() as u64).saturating_sub(1);
             total = total.saturating_add(us);
             dropped = dropped.saturating_add(missed);
             writeln!(out, "{},{us},{p50},{p95},{p99},{max},{missed}", i + 2)?;
+            // Attribute each interval to its ending frame, including boundary stalls.
+            window.push(us);
+            window_us = window_us.saturating_add(us);
+            let to = i + 2;
+            if to - from + 1 >= 300 || window_us >= 5_000_000 {
+                window.sort_unstable();
+                let stalls = window.iter().filter(|&&us| us > 100_000).count();
+                let p99 = window.get((window.len() * 99).div_ceil(100).saturating_sub(1))
+                    .copied().unwrap_or(0);
+                let max = window.last().copied().unwrap_or(0);
+                writeln!(out, "window,{from},{to},{stalls},{p99},{max}")?;
+                from = to + 1;
+                window_us = 0;
+                window.clear();
+            }
         }
         // Summary: frame = total:N, interval_us = first-to-last Present span.
         writeln!(out, "total:{},{total},{p50},{p95},{p99},{max},{dropped}",
