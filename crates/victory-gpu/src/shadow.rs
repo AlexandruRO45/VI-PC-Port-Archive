@@ -24,6 +24,11 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+/// Byte ranges (start, end).
+type ByteRanges = Vec<(usize, usize)>;
+/// Byte ranges shared by the notes that sent them and the merge.
+type SharedRanges = Arc<[(usize, usize)]>;
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -135,7 +140,7 @@ pub(crate) struct CardNotes {
     loose: Option<usize>,
     /// Per send still of use: its number and the ranges it took, in order
     /// and apart.
-    sent: Vec<(u64, Arc<[(usize, usize)]>)>,
+    sent: Vec<(u64, SharedRanges)>,
 }
 
 /// How many of [`CardNotes`]'s ranges noted out of order are passed over
@@ -398,7 +403,7 @@ impl Room {
 /// go as patches (`patchable`, shorter than
 /// [`crate::host::CARD_PATCH_RUN`]) while `room` (dword patches) lasts;
 /// the short ones past it go by copies.
-pub(crate) fn card_split(ranges: &[(usize, usize)], patchable: bool, room: &mut usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+pub(crate) fn card_split(ranges: &[(usize, usize)], patchable: bool, room: &mut usize) -> (ByteRanges, ByteRanges) {
     let (mut copied, mut patched) = (Vec::new(), Vec::new());
     for &(a, b) in ranges {
         if patchable && b - a < crate::host::CARD_PATCH_RUN && dwords_of(a, b) <= *room {
@@ -600,7 +605,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
-pub(crate) fn card_dirty(sent_as: u64, relay: bool) -> Vec<(Arc<Shadow>, Arc<[(usize, usize)]>)> {
+pub(crate) fn card_dirty(sent_as: u64, relay: bool) -> Vec<(Arc<Shadow>, SharedRanges)> {
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
@@ -1352,7 +1357,7 @@ mod card_tests {
     fn shader_piece(span: &CardSpan, i: u32) -> (u32, u32) {
         let piece = span.first + i;
         let lo = piece * 65536;
-        let lo = if lo > span.skew { lo - span.skew } else { 0 };
+        let lo = lo.saturating_sub(span.skew);
         let hi = (piece + 1) * 65536 - span.skew;
         (lo.max(span.from), hi.min(span.to))
     }
@@ -1629,9 +1634,7 @@ mod relay_tests {
             snap[at..at + n].copy_from_slice(&title[at..at + n]);
         }
         // The card starts B: it has written 32..36 so far, over A's 32..34.
-        for at in 32..36 {
-            copy[at] = 0xb0;
-        }
+        copy[32..36].fill(0xb0);
         // A lands (B still on the card): its range is merged. The copy is
         // read once and not written.
         let seen = copy.clone();
@@ -1648,13 +1651,11 @@ mod relay_tests {
             assert_eq!(title[at], 0xa0, "A's byte at {at}");
         }
         assert_eq!((title[8], title[9], title[20], title[50]), (0x77, 0x77, 0x77, 0x77));
-        for at in 32..36 {
-            assert_eq!(title[at], 0xb0, "B's byte so far at {at}");
+        for (at, &b) in title.iter().enumerate().take(36).skip(32) {
+            assert_eq!(b, 0xb0, "B's byte so far at {at}");
         }
         // The card finishes B: 36..44.
-        for at in 36..44 {
-            copy[at] = 0xb1;
-        }
+        copy[36..44].fill(0xb1);
         // The title's CPU writes 40 after B's shader did: found against
         // the snapshot at the next preparing, which is before B lands.
         title[40] = 0x55;
@@ -1673,8 +1674,8 @@ mod relay_tests {
             title[b.0..b.1].copy_from_slice(&t);
         }
         // B's results are there, never replaced by A's older ones.
-        for at in 32..36 {
-            assert_eq!(title[at], 0xb0);
+        for &b in &title[32..36] {
+            assert_eq!(b, 0xb0);
         }
         for at in (36..40).chain(41..44) {
             assert_eq!(title[at], 0xb1, "B's byte at {at}");
@@ -1701,9 +1702,7 @@ mod relay_tests {
         let base: Vec<u8> = (0..N as u32).map(|i| (i + 100) as u8).collect();
         let (mut card, mut cpu, mut title) = (base.clone(), base.clone(), base.clone());
         // Flight A's shaders write 10..14 on the card.
-        for at in 10..14 {
-            card[at] = 0xa0;
-        }
+        card[10..14].fill(0xa0);
         // The title's CPU writes 12 (over A's) and 30; the preparing of
         // the next submission puts both into the CPU's side and notes them
         // to go up (send 5). They are not on the card yet.
@@ -3680,7 +3679,8 @@ impl Shadow {
         if !crate::host::walls_trace() {
             return;
         }
-        static SEEN: Mutex<(u64, BTreeMap<u64, (u64, u32, u64, u64)>)> = Mutex::new((0, BTreeMap::new()));
+        type Seen = (u64, BTreeMap<u64, (u64, u32, u64, u64)>);
+    static SEEN: Mutex<Seen> = Mutex::new((0, BTreeMap::new()));
         let frame = crate::frame::current();
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
         if seen.0 != frame {
@@ -3881,7 +3881,7 @@ impl Shadow {
 
     /// The ranges not sent yet (joined), and per send still noted its
     /// number and ranges.
-    pub(crate) fn notes_for_test(&self) -> (Vec<(usize, usize)>, Vec<(u64, Vec<(usize, usize)>)>) {
+    pub(crate) fn notes_for_test(&self) -> (ByteRanges, Vec<(u64, ByteRanges)>) {
         let Some(card) = &self.card else {
             return (Vec::new(), Vec::new());
         };

@@ -307,7 +307,7 @@ fn mesh_kept(pipeline: usize) -> bool {
     let Some(at) = p.name.find("mesh ") else {
         return true;
     };
-    let hash = p.name[at + 5..].as_bytes();
+    let hash = &p.name.as_bytes()[at + 5..];
     if hash.len() < 16 {
         return true;
     }
@@ -2384,7 +2384,7 @@ impl State {
             return;
         }
         let words: Vec<u32> =
-            bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+            bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
         let _ = write!(text, "\n    ~raw {label} at {address:#x} bytes {len}:");
         for w in &words {
             let _ = write!(text, " {w:08x}");
@@ -3379,7 +3379,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
-            if !list.twin_use(*resource as This, true, true) {
+            let twin = list.twin_use(*resource as This, true, true);
+            if !twin {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
             }
         }

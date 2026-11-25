@@ -510,9 +510,10 @@ fn unspill(
     let field = |code: u8| if code < PARKED { u32::from(code) } else { 0 };
     let mov = |wide: bool, dst: u8, src: u8| 0xBE80_0000 | field(dst) << 16 | (3 + u32::from(wide)) << 8 | field(src);
     const NOP: u32 = 0xBF80_0000;
-    let mut edits: Vec<(usize, Option<(bool, u8, u8)>)> = Vec::new();
-    for i in 0..list.len() {
-        let Some((save, reg, code, lane)) = parks[i] else {
+    type Edit = (usize, Option<(bool, u8, u8)>);
+    let mut edits: Vec<Edit> = Vec::new();
+    for (i, &park) in parks.iter().enumerate().take(list.len()) {
+        let Some((save, reg, code, lane)) = park else {
             continue;
         };
         if physical(reg, lane) {
@@ -1300,11 +1301,11 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     };
     let mut blocks = p.blocks.clone();
     let mut any = false;
-    for b in 0..n {
-        let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
+    for (b, block) in p.blocks.iter().enumerate().take(n) {
+        let Exit::Branch { taken, not_taken } = block.exit else {
             continue;
         };
-        if !p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
+        if !block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
             continue;
         }
         let Some((region, inside)) = skipped_region(p, b, not_taken, taken) else { continue };

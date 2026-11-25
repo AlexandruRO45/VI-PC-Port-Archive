@@ -455,6 +455,7 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
+    // SAFETY: commands recorded on an open list, on buffers that live until it has run.
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -868,7 +869,7 @@ void main() {
         };
         let run = |warp: &mut WarpHarness, mode| run_with_skew(warp, mode, 0);
         let at = PIECE + 1234;
-        // SAFETY (each): inside the mapping.
+        // SAFETY: inside the mapping.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         // 0: the hashes are stored, nothing is flagged.
         assert_eq!(run(&mut warp, 0), [7, 7, 7]);
@@ -960,14 +961,17 @@ void main() {
             // SAFETY: as above.
             (0..PIECES as usize).map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() }).collect()
         };
-        // SAFETY (each): inside the mappings.
+        // SAFETY: inside the mappings.
         let taken = || unsafe { ring_ptr.cast::<u32>().read_volatile() };
         // As the host makes the ring: no count, the limit at the slots.
+        // SAFETY: inside the mappings.
         let reset = || unsafe {
             ring_ptr.cast::<u32>().write_volatile(0);
             crate::host::set_card_limit(ring_ptr, SLOTS);
         };
+        // SAFETY: inside the mappings.
         let slot = |s: u32| unsafe { std::slice::from_raw_parts(ring_ptr.add(SLOT * (s as usize + 1)), SLOT) };
+        // SAFETY: inside the mappings.
         let flip = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         for skew in [0u32, 4096] {
             let skew_bytes = skew as usize;
@@ -1060,22 +1064,28 @@ void main() {
         unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
         let mut areas = CardAreas::new(RESULTS, Some(SLOTS));
         let results = differs_ptr.cast::<u32>();
-        // SAFETY (each): the ring's count and limit, its slots, the
+        // SAFETY: the ring's count and limit, its slots, the
         // results, the copy.
         let count = || unsafe { ring_ptr.cast::<u32>().read_volatile() };
+        // SAFETY: the ring's count and limit, its slots, the results, the copy.
         let set_count = |count: u32| unsafe { ring_ptr.cast::<u32>().write_volatile(count) };
+        // SAFETY: the ring's count and limit, its slots, the results, the copy.
         let limit = || unsafe { ring_ptr.add(crate::host::CARD_RING_LIMIT).cast::<u32>().read_volatile() };
+        // SAFETY: the ring's count and limit, its slots, the results, the copy.
         let read = |d: u32| unsafe { results.add(d as usize).read_volatile() };
+        // SAFETY: the ring's count and limit, its slots, the results, the copy.
         let slot = |s: u32| unsafe { std::slice::from_raw_parts(ring_ptr.add(SLOT * (s as usize + 1)), PIECE) };
         let change = |content: &mut Vec<u8>, pieces: &[u32]| {
             for &p in pieces {
                 let at = p as usize * PIECE + 4321;
                 content[at] = content[at].wrapping_add(1);
+                // SAFETY: `at` is inside the copy's `size` bytes.
                 unsafe { now_ptr.add(at).write_volatile(content[at]) };
             }
         };
         // As the host makes the ring.
         set_count(0);
+        // SAFETY: the ring's first slot, inside its mapping.
         unsafe { crate::host::set_card_limit(ring_ptr, areas.limit().unwrap()) };
         // A plan as `Host::card_before` lays it out and records it, with two
         // ranges (the copy's first four pieces, and the other five), the
@@ -1085,6 +1095,7 @@ void main() {
             let laid = areas.lay_out(&[4, 5], true).expect("room for the plan's results");
             let count_at = laid.count_at.expect("with the ring, the count's dword");
             for d in laid.ats[0]..=count_at {
+                // SAFETY: `d` is a dword of the results the plan laid out, inside their mapping.
                 unsafe { results.add(d as usize).write_volatile(0xDEAD) };
             }
             let ranges: Vec<RangeCompare> = [(0, 4), (4, 5)]
@@ -1568,7 +1579,7 @@ void main() {
             };
             for (i, groups) in filled.into_iter().enumerate() {
                 let rec = &out[i * 8..i * 8 + 4];
-                assert_eq!(rec, [groups, u32::from(groups > 0).max(1).min(1), 1, 0xAB00 + i as u32], "filled record {i}, ahead {ahead}");
+                assert_eq!(rec, [groups, 1, 1, 0xAB00 + i as u32], "filled record {i}, ahead {ahead}");
             }
             let charged_filled = (5 + 519) * 128;
             if ahead {

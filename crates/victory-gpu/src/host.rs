@@ -2327,10 +2327,13 @@ mod card_area_tests {
         let mut results = vec![0xDEADu32; 64];
         let mut first_slot = vec![0u32; CARD_SLOT_BYTES / 4];
         let ring = first_slot.as_mut_ptr().cast::<u8>();
-        // SAFETY (each): inside the ring's first slot's worth of bytes.
+        // SAFETY: inside the ring's first slot's worth of bytes.
         let count = || unsafe { ring.cast::<u32>().read() };
+        // SAFETY: inside the ring's first slot's worth of bytes.
         let limit = || unsafe { ring.add(CARD_RING_LIMIT).cast::<u32>().read() };
+        // SAFETY: inside the ring's first slot's worth of bytes.
         let lose_limit = || unsafe { ring.add(CARD_RING_LIMIT).cast::<u32>().write(3) };
+        // SAFETY: inside the ring's first slot's worth of bytes.
         unsafe { set_card_limit(ring, areas.limit().unwrap()) };
         assert_eq!((count(), limit()), (0, 16));
         let a = areas.lay_out(&[3, 2], true).unwrap();
@@ -2361,8 +2364,10 @@ mod card_area_tests {
         // Without the ring nothing is written; a plan with no run of the
         // results writes the limit all the same.
         lose_limit();
+        // SAFETY: `results` holds the 64 dwords the areas were made for; no ring is given.
         unsafe { card_run_done(&mut areas, results.as_ptr(), None, None, None) };
         assert_eq!(limit(), 3);
+        // SAFETY: `results` holds the 64 dwords the areas were made for, `ring` one slot's worth of bytes.
         unsafe { card_run_done(&mut areas, results.as_ptr(), Some(ring), None, None) };
         assert_eq!(limit(), 5 + 16);
         assert_eq!(areas.refused(), 0);
@@ -2574,10 +2579,12 @@ mod card_work_tests {
         let mut work = host.make_card_work(Some(16)).expect("the compare's work, with a ring");
         let (ring, slots) = work.ring.as_ref().map(|r| (r.1 as *mut u8, r.2)).expect("a ring of 16 MB");
         let results = work.differs.1 as *mut u32;
-        // SAFETY (each): inside the ring's first slot's worth of bytes and
+        // SAFETY: inside the ring's first slot's worth of bytes and
         // the results, both mapped while `work` lives.
         let count = || unsafe { ring.cast::<u32>().read_volatile() };
+        // SAFETY: inside the ring's first slot's worth of bytes and the results, both mapped while `work` lives.
         let limit = || unsafe { ring.add(CARD_RING_LIMIT).cast::<u32>().read_volatile() };
+        // SAFETY: inside the ring's first slot's worth of bytes and the results, both mapped while `work` lives.
         let put = |d: u32, value: u32| unsafe { results.add(d as usize).write_volatile(value) };
         assert_eq!((count(), limit()), (0, slots), "made with no count, and the limit at the slots");
         // Two ranges, of 3 and 2 pieces: their compares flagged three, the
@@ -3051,7 +3058,7 @@ const _: () = assert!(CARD_RING_LIMIT >= 256 && CARD_RING_LIMIT.is_multiple_of(4
 /// it (`skew`: where the copy starts in its piece 0).
 pub(crate) fn card_slot_start(piece: u32, skew: u32) -> usize {
     let lo = (piece as usize) * 65536;
-    let lo = if lo > skew as usize { lo - skew as usize } else { 0 };
+    let lo = lo.saturating_sub(skew as usize);
     lo & !15
 }
 
@@ -3313,12 +3320,15 @@ struct SendCopy<'a> {
     rehash: Rehash,
 }
 
+/// Byte ranges (start, end).
+type ByteRanges = Vec<(usize, usize)>;
+
 /// A send to copies in the card's memory, planned before the queue's order
 /// and the card's work are taken ([`plan_send`]).
 struct SendPlan<B> {
     /// Per copy: the ranges that go up by a copy each, and those that go
     /// as patches.
-    splits: Vec<(Vec<(usize, usize)>, Vec<(usize, usize)>)>,
+    splits: Vec<(ByteRanges, ByteRanges)>,
     /// The patches of all the copies, and per copy where its own lie.
     patches: Vec<[u32; 3]>,
     patched_at: Vec<std::ops::Range<usize>>,
@@ -3352,7 +3362,7 @@ fn plan_send<B>(
     give_back: impl FnOnce((B, u64)),
     mut patches_of: impl FnMut(usize, &[(usize, usize)], &mut Vec<[u32; 3]>),
 ) -> SendPlan<B> {
-    let split = |room: usize| -> (Vec<(Vec<(usize, usize)>, Vec<(usize, usize)>)>, usize) {
+    let split = |room: usize| -> (Vec<(ByteRanges, ByteRanges)>, usize) {
         let mut left = room;
         let split = copies.iter().map(|c| crate::shadow::card_split(c.ranges, c.patchable, &mut left)).collect();
         (split, room - left)
@@ -3801,7 +3811,8 @@ mod relay_tests {
         let mut upto = std::collections::HashMap::new();
         let piece = (0x1000usize, 7u32);
         let other = (0x1000usize, 8u32);
-        let notes = |upto: &std::collections::HashMap<(usize, u32), Vec<(usize, usize, u64)>>, key| {
+        type Notes = std::collections::HashMap<(usize, u32), Vec<(usize, usize, u64)>>;
+    let notes = |upto: &Notes, key| {
             upto.get(&key).cloned().unwrap_or_default()
         };
         // Flights 8, 9 and 10 are in the air; flight 7's landing fetches
@@ -5246,7 +5257,7 @@ mod patch_tests {
 
     /// Ranges of three copies, offsets in order and apart, as `card_dirty`
     /// takes them, and the CPU side's bytes of each.
-    fn three_copies() -> ([Vec<(usize, usize)>; 3], [Vec<u8>; 3]) {
+    fn three_copies() -> ([super::ByteRanges; 3], [Vec<u8>; 3]) {
         use super::CARD_PATCH_RUN;
         // Copy 0: short ranges (dwords 1, 1 and 64: 255 bytes from byte 1
         // of a dword) and a long one. Copy 1: short ranges of a copy that
@@ -6480,8 +6491,9 @@ impl Host {
     /// never writes the ring then, but the root parameter is set).
     fn card_ring(work: &CardWork, flown: bool) -> (u64, u32) {
         match (&work.ring, flown) {
-            // SAFETY (both): plain queries of live buffers.
+            // SAFETY: plain queries of live buffers.
             (Some((ring, _, slots)), true) => (unsafe { ring.GetGPUVirtualAddress() }, *slots),
+            // SAFETY: plain queries of live buffers.
             _ => (unsafe { work.differs.0.GetGPUVirtualAddress() }, 0),
         }
     }
@@ -6506,7 +6518,7 @@ impl Host {
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
-        let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        let mut declared: Vec<(Arc<crate::shadow::Shadow>, ByteRanges)> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
@@ -6790,10 +6802,10 @@ impl Host {
                 .filter_map(|r| {
                     let (_, before, size) = r.shadow.card_sides()?;
                     let before = before?;
-                    // SAFETY (both): plain queries of live buffers (the
-                    // plan holds the copy, the copy its hashes).
                     Some(RangeCompare {
+                        // SAFETY: plain queries of live buffers (the plan holds the copy, the copy its hashes).
                         copy: unsafe { r.shadow.buffer.GetGPUVirtualAddress() },
+                        // SAFETY: plain queries of live buffers (the plan holds the copy, the copy its hashes).
                         hashes: unsafe { before.GetGPUVirtualAddress() },
                         size: size as u32,
                         first: r.span.first,
@@ -9392,6 +9404,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let remaining = len - offset;
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the query inspects an address and fills a local structure.
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);

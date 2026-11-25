@@ -803,7 +803,8 @@ fn first_lane_reads_of_results_made_with_old_values_need_every_lane() {
         ("v_add_nc_u16", &[0xD703_0008, 0x0002_0411]),   // ... = s17 + v2
         ("v_fma_mixlo_f16", &[0xCC21_0008, 0x040A_0411]), // ... = s17 * v2 + v2
     ];
-    let mut cases: Vec<(&str, Vec<u32>, Vec<u32>, u32, u16)> = keep_old
+    type Case<'a> = (&'a str, Vec<u32>, Vec<u32>, u32, u16);
+    let mut cases: Vec<Case> = keep_old
         .iter()
         .map(|&(name, writer)| (name, vec![PER_LANE_V8], lds(writer), 8, 16))
         .collect();
