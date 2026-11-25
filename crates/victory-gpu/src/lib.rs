@@ -50,6 +50,8 @@ pub mod query;
 pub mod queue;
 #[cfg(windows)]
 mod rects;
+#[cfg(windows)]
+pub mod report;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
