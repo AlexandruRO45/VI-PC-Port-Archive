@@ -51,5 +51,18 @@ Then run `victory.exe` with `~/proton-victory/proton runinprefix ...`.
   prefix with another Proton while the title runs: the first process
   started picks the server, and a run on the stock server is back to the
   old frame times without any warning.
-- The patch is against wine-cachyos 11.0; other Wine versions may need it
-  adjusted. It is Wine code (LGPL-2.1-or-later), credit to ajsem1337.
+- The patch is ported to these trees; the script uses the first that
+  applies, and says which:
+
+  | Proton / Wine | source to build from | patch |
+  |---|---|---|
+  | proton-cachyos 11.0 | `CachyOS/wine-cachyos`, tag of your release | `-cachyos11` |
+  | Proton Experimental (11.0) | `ValveSoftware/wine`, `experimental_11.0` | `-cachyos11` |
+  | GE-Proton 11 | Valve's wine at the commit GE pins, plus GE's patches | `-cachyos11` |
+  | Valve Proton 10 | `ValveSoftware/wine`, `proton_10.0` | `-proton10` |
+  | upstream Wine | `gitlab.winehq.org/wine/wine`, `master` | `-upstream` |
+
+  Each port builds without warnings and was checked against the original
+  lookups by a randomized comparison; only proton-cachyos 11.0 has been
+  run with the title. It is Wine code (LGPL-2.1-or-later), credit to
+  ajsem1337.

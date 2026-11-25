@@ -1,11 +1,16 @@
 #!/bin/sh
-# Builds a wineserver with the view-tree patch (wineserver-view-tree.patch.txt)
-# from the Wine source a Proton build was made from.
+# Builds a wineserver with the view-tree patch from the Wine source a Proton
+# build was made from. The patch is ported to several trees
+# (wineserver-view-tree-*.patch.txt); the first that applies is used.
 #
 # Usage: build-wineserver.sh <git url> <tag or branch> <work dir>
-# Example (proton-cachyos 11.0):
-#   build-wineserver.sh https://github.com/CachyOS/wine-cachyos.git \
-#       cachyos-11.0-20260702-proton-native ~/wineserver-build
+# Examples:
+#   proton-cachyos 11.0: https://github.com/CachyOS/wine-cachyos.git cachyos-11.0-20260702-proton-native
+#   Valve Proton 10:     https://github.com/ValveSoftware/wine.git proton_10.0
+#   Proton Experimental: https://github.com/ValveSoftware/wine.git experimental_11.0 (the 11.0 patch)
+#   upstream Wine:       https://gitlab.winehq.org/wine/wine.git master
+# GE-Proton 11 builds from Valve's wine plus GE's patches: the
+# 11.0 patch applies to it.
 #
 # The server must speak the same protocol as the Proton it runs with: build
 # from the source of that exact Proton release. The result is
@@ -19,9 +24,17 @@ if [ ! -d src ]; then
     git clone --depth 1 --branch "$ref" "$url" src
 fi
 cd src
-if ! git apply --check --reverse "$here/wineserver-view-tree.patch.txt" 2>/dev/null; then
-    git apply "$here/wineserver-view-tree.patch.txt"
-fi
+applied=
+for p in "$here"/wineserver-view-tree-*.patch.txt; do
+    if git apply --check --reverse "$p" 2>/dev/null; then
+        applied=$p; break
+    fi
+    if git apply --check "$p" 2>/dev/null; then
+        git apply "$p"; applied=$p; break
+    fi
+done
+[ -n "$applied" ] || { echo "no view-tree patch applies to this tree" >&2; exit 1; }
+echo "using $(basename "$applied")"
 [ -x configure ] || ./autogen.sh
 grep -m1 "define SERVER_PROTOCOL_VERSION" include/wine/server_protocol.h
 mkdir -p ../build
