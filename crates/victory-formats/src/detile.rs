@@ -103,6 +103,12 @@ fn validate_plan<'a>(
 ) -> Result<CopyPlan<'a>, Error> {
     let m = *layout.mips.get(mip as usize).ok_or(Error::Invalid)?;
     let depth = m.depth;
+    if m.width == 0 || m.height == 0 || depth == 0 {
+        return Err(Error::Invalid);
+    }
+    if !layout.desc.element_bytes.is_power_of_two() || layout.desc.element_bytes > 16 {
+        return Err(Error::Invalid);
+    }
     let first_slice = if layout.desc.dimension == Dimension::Tex3d {
         if slice != 0 {
             return Err(Error::Invalid);
@@ -111,14 +117,27 @@ fn validate_plan<'a>(
     } else {
         slice
     };
-    if first_slice >= layout.slices {
-        return Err(Error::Invalid);
+    if layout.thick {
+        if layout.block[2] == 0 {
+            return Err(Error::Invalid);
+        }
+        let last_z = first_slice.checked_add(depth - 1).ok_or(Error::Invalid)?;
+        if last_z / layout.block[2] >= layout.slices {
+            return Err(Error::Invalid);
+        }
+    } else {
+        let slice_end = first_slice.checked_add(depth).ok_or(Error::Invalid)?;
+        if slice_end > layout.slices {
+            return Err(Error::Invalid);
+        }
     }
     if !layout.addressable() {
         return Err(Error::Unsupported);
     }
     let element_bytes = layout.desc.element_bytes as usize;
-    let row_bytes = m.width as usize * element_bytes;
+    let row_bytes = (m.width as usize)
+        .checked_mul(element_bytes)
+        .ok_or(Error::TooSmall)?;
     let need = (depth as usize - 1)
         .checked_mul(depth_pitch)
         .zip((m.height as usize - 1).checked_mul(row_pitch))
@@ -163,21 +182,25 @@ pub(crate) fn detile(
         copy_linear_detile(&plan, tiled, linear);
         return Ok(());
     }
-    if layout.thick {
+    if let Some((params, full_mx, full_my, full_w, full_h, strips_per_block)) =
+        prepare_thin_geometry(&plan, tiled.len(), linear.len(), Direction::Detile, use_avx2())
+    {
+        copy_thin_tiled(
+            &plan,
+            &params,
+            full_mx,
+            full_my,
+            full_w,
+            full_h,
+            strips_per_block,
+            tiled.as_ptr(),
+            tiled.len(),
+            linear.as_mut_ptr(),
+            linear.len(),
+        );
+    } else {
         copy_thick_detile(&plan, tiled, linear);
-        return Ok(());
     }
-    let tiled_len = tiled.len();
-    let linear_len = linear.len();
-    copy_thin_tiled(
-        &plan,
-        tiled.as_ptr(),
-        tiled_len,
-        linear.as_mut_ptr(),
-        linear_len,
-        Direction::Detile,
-        use_avx2(),
-    );
     Ok(())
 }
 
@@ -204,21 +227,25 @@ pub(crate) fn tile(
         copy_linear_tile(&plan, tiled, linear);
         return Ok(());
     }
-    if layout.thick {
+    if let Some((params, full_mx, full_my, full_w, full_h, strips_per_block)) =
+        prepare_thin_geometry(&plan, tiled.len(), linear.len(), Direction::Tile, use_avx2())
+    {
+        copy_thin_tiled(
+            &plan,
+            &params,
+            full_mx,
+            full_my,
+            full_w,
+            full_h,
+            strips_per_block,
+            tiled.as_mut_ptr(),
+            tiled.len(),
+            linear.as_ptr().cast_mut(),
+            linear.len(),
+        );
+    } else {
         copy_thick_tile(&plan, tiled, linear);
-        return Ok(());
     }
-    let tiled_len = tiled.len();
-    let linear_len = linear.len();
-    copy_thin_tiled(
-        &plan,
-        tiled.as_mut_ptr(),
-        tiled_len,
-        linear.as_ptr().cast_mut(),
-        linear_len,
-        Direction::Tile,
-        use_avx2(),
-    );
     Ok(())
 }
 
@@ -245,20 +272,24 @@ pub(crate) fn detile_portable(
     )?;
     if layout.desc.swizzle == Swizzle::LINEAR {
         copy_linear_detile(&plan, tiled, linear);
-    } else if layout.thick {
-        copy_thick_detile(&plan, tiled, linear);
-    } else {
-        let tiled_len = tiled.len();
-        let linear_len = linear.len();
+    } else if let Some((params, full_mx, full_my, full_w, full_h, strips_per_block)) =
+        prepare_thin_geometry(&plan, tiled.len(), linear.len(), Direction::Detile, false)
+    {
         copy_thin_tiled(
             &plan,
+            &params,
+            full_mx,
+            full_my,
+            full_w,
+            full_h,
+            strips_per_block,
             tiled.as_ptr(),
-            tiled_len,
+            tiled.len(),
             linear.as_mut_ptr(),
-            linear_len,
-            Direction::Detile,
-            false,
+            linear.len(),
         );
+    } else {
+        copy_thick_detile(&plan, tiled, linear);
     }
     Ok(())
 }
@@ -284,20 +315,24 @@ pub(crate) fn tile_portable(
     )?;
     if layout.desc.swizzle == Swizzle::LINEAR {
         copy_linear_tile(&plan, tiled, linear);
-    } else if layout.thick {
-        copy_thick_tile(&plan, tiled, linear);
-    } else {
-        let tiled_len = tiled.len();
-        let linear_len = linear.len();
+    } else if let Some((params, full_mx, full_my, full_w, full_h, strips_per_block)) =
+        prepare_thin_geometry(&plan, tiled.len(), linear.len(), Direction::Tile, false)
+    {
         copy_thin_tiled(
             &plan,
+            &params,
+            full_mx,
+            full_my,
+            full_w,
+            full_h,
+            strips_per_block,
             tiled.as_mut_ptr(),
-            tiled_len,
+            tiled.len(),
             linear.as_ptr().cast_mut(),
-            linear_len,
-            Direction::Tile,
-            false,
+            linear.len(),
         );
+    } else {
+        copy_thick_tile(&plan, tiled, linear);
     }
     Ok(())
 }
@@ -726,61 +761,119 @@ impl ThinStripParams {
     }
 }
 
-/// Fast path for all addressable thin tiled layouts (`SW_256B_*`, `SW_4KB_*`,
-/// `SW_64KB_*`), handling full 256-byte micro-tiles with SIMD/LUT kernels and
-/// partial right/bottom edges with minimal run copies.
-fn copy_thin_tiled(
+/// Validates all geometry, bounds, and micro-tile disjointness invariants
+/// required by the unsafe thin strip kernels. Returns `None` if any `pub` field
+/// of `Layout` was mutated into an inconsistent state so callers safely fall
+/// back to `copy_thick_*` without ever entering `unsafe`.
+fn prepare_thin_geometry(
     plan: &CopyPlan<'_>,
-    tiled_ptr: *const u8,
     tiled_len: usize,
-    linear_ptr: *mut u8,
     linear_len: usize,
     dir: Direction,
     avx2: bool,
-) {
+) -> Option<(ThinStripParams, usize, usize, u32, u32, usize)> {
     #[cfg(not(target_arch = "x86_64"))]
     let _ = avx2;
     let layout = plan.layout;
+    if layout.thick {
+        return None;
+    }
     let m = &plan.mip_info;
     let element_log2 = layout.desc.element_bytes.trailing_zeros();
     let [micro_w, micro_h] = BLOCK_256_2D[element_log2 as usize];
     let kind = MicroKind::from_layout(layout.desc.swizzle.display(), element_log2);
     let micro_row_bytes = kind.row_bytes();
 
+    let block_bytes = usize::try_from(layout.alignment).ok()?;
     let bw = layout.block[0];
     let bh = layout.block[1];
+    if !bw.is_power_of_two() || !bh.is_power_of_two() || bw < micro_w || bh < micro_h {
+        return None;
+    }
     let mx_per_block = (bw / micro_w) as usize;
     let my_per_block = (bh / micro_h) as usize;
-    debug_assert!((1..=16).contains(&mx_per_block));
-    debug_assert!((1..=16).contains(&my_per_block) && my_per_block.is_power_of_two());
+    if !(1..=16).contains(&mx_per_block)
+        || !(1..=16).contains(&my_per_block)
+        || !my_per_block.is_power_of_two()
+    {
+        return None;
+    }
+    if mx_per_block
+        .checked_mul(my_per_block)?
+        .checked_mul(256)?
+        != block_bytes
+    {
+        return None;
+    }
+
     let mut x_in_block = [0usize; 16];
     for (i, slot) in x_in_block.iter_mut().take(mx_per_block).enumerate() {
-        *slot = layout.pattern[0][i * micro_w as usize] as usize;
+        let idx = i.checked_mul(micro_w as usize)?;
+        let off = *layout.pattern[0].get(idx)? as usize;
+        if (off & 0xff) != 0 || off >= block_bytes {
+            return None;
+        }
+        *slot = off;
     }
     let mut y_in_block = [0usize; 16];
     for (i, slot) in y_in_block.iter_mut().take(my_per_block).enumerate() {
-        *slot = layout.pattern[1][i * micro_h as usize] as usize;
+        let idx = i.checked_mul(micro_h as usize)?;
+        let off = *layout.pattern[1].get(idx)? as usize;
+        if (off & 0xff) != 0 || off >= block_bytes {
+            return None;
+        }
+        *slot = off;
+    }
+
+    // Prove every `(ix, iy)` inside a macro-block maps to a strictly distinct
+    // 256-byte micro-tile completely inside `0..block_bytes` so parallel
+    // macro-row / strip workers never race or step out of `block_base..block_base+block_bytes`.
+    let total_micro = mx_per_block * my_per_block;
+    let mut seen_tiles = [usize::MAX; 256];
+    let mut count = 0usize;
+    for &yo in &y_in_block[..my_per_block] {
+        for &xo in &x_in_block[..mx_per_block] {
+            let sum = yo.checked_add(xo)?;
+            if (sum & 0xff) != 0 || sum.checked_add(256)? > block_bytes {
+                return None;
+            }
+            seen_tiles[count] = sum;
+            count += 1;
+        }
+    }
+    seen_tiles[..total_micro].sort_unstable();
+    if seen_tiles[..total_micro].windows(2).any(|w| w[0] == w[1]) {
+        return None;
     }
 
     let full_mx = (m.width / micro_w) as usize;
     let full_my = (m.height / micro_h) as usize;
-    let full_w = full_mx as u32 * micro_w;
-    let full_h = full_my as u32 * micro_h;
+    let full_w = u32::try_from(full_mx).ok()?.checked_mul(micro_w)?;
+    let full_h = u32::try_from(full_my).ok()?.checked_mul(micro_h)?;
 
     let tail_x = m.tail.map_or(0, |t| t.x);
     let tail_y = m.tail.map_or(0, |t| t.y);
-    debug_assert_eq!(tail_x % micro_w, 0);
-    debug_assert_eq!(tail_y % micro_h, 0);
+    if !tail_x.is_multiple_of(micro_w) || !tail_y.is_multiple_of(micro_h) {
+        return None;
+    }
     let start_mx = (tail_x / micro_w) as usize;
     let start_my = (tail_y / micro_h) as usize;
+    if m.tail.is_some()
+        && (start_mx.checked_add(full_mx)? > mx_per_block
+            || start_my.checked_add(full_my)? > my_per_block)
+    {
+        return None;
+    }
     let (full_blocks_x, rem_full_mx) = if start_mx == 0 {
         (full_mx / mx_per_block, full_mx % mx_per_block)
     } else {
-        debug_assert!(start_mx + full_mx <= mx_per_block);
+        if start_mx.checked_add(full_mx)? > mx_per_block {
+            return None;
+        }
         (0, full_mx)
     };
-    let block_bytes = layout.alignment as usize;
-    let row_block_stride = (m.pitch / bw) as usize * block_bytes;
+    let pitch_blocks = (m.pitch / bw) as usize;
+    let row_block_stride = pitch_blocks.checked_mul(block_bytes)?;
 
     let params = ThinStripParams {
         kind,
@@ -803,50 +896,74 @@ fn copy_thin_tiled(
         dir,
     };
 
+    if full_mx > 0 && full_my > 0 {
+        let last_linear_end = (plan.depth as usize - 1)
+            .checked_mul(plan.depth_pitch)?
+            .checked_add((full_h as usize - 1).checked_mul(plan.row_pitch)?)?
+            .checked_add(full_mx.checked_mul(micro_row_bytes)?)?;
+        if last_linear_end > linear_len {
+            return None;
+        }
+
+        let last_slice = plan.first_slice.checked_add(plan.depth - 1)?;
+        let (last_s, _) = layout.split(last_slice);
+        let last_plane_base_u64 = u64::from(last_s)
+            .checked_mul(layout.slice_size)?
+            .checked_add(m.offset)?;
+        let last_plane_base = usize::try_from(last_plane_base_u64).ok()?;
+
+        let last_my_shifted = (full_my - 1).checked_add(start_my)?;
+        let last_by = last_my_shifted >> params.my_per_block_shift;
+        if m.tail.is_some() && last_by != 0 {
+            return None;
+        }
+        let blocks_x = if start_mx > 0 {
+            1
+        } else {
+            full_blocks_x.checked_add(usize::from(rem_full_mx > 0))?
+        };
+        if last_by > 0 && pitch_blocks < blocks_x {
+            return None;
+        }
+        let last_bx = blocks_x - 1;
+        let _ = u32::try_from(last_by).ok()?.checked_mul(bh)?;
+        let _ = u32::try_from(last_bx).ok()?.checked_mul(bw)?;
+
+        let last_block_base = last_by
+            .checked_mul(row_block_stride)?
+            .checked_add(last_plane_base)?
+            .checked_add(last_bx.checked_mul(block_bytes)?)?;
+        if last_block_base.checked_add(block_bytes)? > tiled_len {
+            return None;
+        }
+    }
+
+    Some((params, full_mx, full_my, full_w, full_h, my_per_block))
+}
+
+/// Fast path for all addressable thin tiled layouts (`SW_256B_*`, `SW_4KB_*`,
+/// `SW_64KB_*`), handling full 256-byte micro-tiles with SIMD/LUT kernels and
+/// partial right/bottom edges with minimal run copies.
+#[allow(clippy::too_many_arguments)]
+fn copy_thin_tiled(
+    plan: &CopyPlan<'_>,
+    params: &ThinStripParams,
+    full_mx: usize,
+    full_my: usize,
+    full_w: u32,
+    full_h: u32,
+    strips_per_block: usize,
+    tiled_ptr: *const u8,
+    tiled_len: usize,
+    linear_ptr: *mut u8,
+    linear_len: usize,
+) {
+    let layout = plan.layout;
+    let m = &plan.mip_info;
+
     // Full micro-tile body.
     if full_mx > 0 && full_my > 0 {
-        // Verify bounds of the last micro-tile before entering unsafe pointer kernels.
-        let last_linear_end = (plan.depth as usize - 1) * plan.depth_pitch
-            + (full_h as usize - 1) * plan.row_pitch
-            + full_mx * micro_row_bytes;
-        assert!(last_linear_end <= linear_len);
-
-        let last_slice = plan.first_slice + plan.depth - 1;
-        let (last_s, _) = layout.split(last_slice);
-        let last_plane_base = (u64::from(last_s) * layout.slice_size + m.offset) as usize;
-        let max_col_off = if start_mx > 0 {
-            x_in_block[start_mx..start_mx + rem_full_mx]
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(0)
-        } else if rem_full_mx > 0 {
-            full_blocks_x * params.block_bytes
-                + x_in_block[..rem_full_mx].iter().copied().max().unwrap_or(0)
-        } else {
-            (full_blocks_x - 1) * params.block_bytes
-                + x_in_block[..mx_per_block].iter().copied().max().unwrap_or(0)
-        };
-        let last_my_shifted = (full_my - 1) + start_my;
-        let last_by = last_my_shifted >> params.my_per_block_shift;
-        let max_row_off = if start_my > 0 {
-            y_in_block[start_my..start_my + full_my]
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(0)
-        } else if last_by == 0 {
-            y_in_block[..full_my].iter().copied().max().unwrap_or(0)
-        } else {
-            let last_in_by = last_my_shifted & params.my_per_block_mask;
-            last_by * row_block_stride
-                + y_in_block[..=last_in_by].iter().copied().max().unwrap_or(0)
-        };
-        // Every micro-tile sits on a 256-byte boundary inside its block.
-        assert!(last_plane_base + max_row_off + max_col_off + 256 <= tiled_len);
-
-        let body_bytes = full_mx * full_my * 256;
-        let strips_per_block = (bh / micro_h) as usize;
+        let body_bytes = full_mx.saturating_mul(full_my).saturating_mul(256);
         let tiled_send = SendPtr(tiled_ptr.cast_mut());
         let linear_send = SendPtr(linear_ptr);
 
@@ -869,7 +986,8 @@ fn copy_thin_tiled(
                     let my_end = (u_end * unit).min(full_my);
                     if my_start < my_end {
                         // SAFETY: disjoint `my_start..my_end` strips own disjoint linear rows
-                        // and disjoint 256-byte micro-tiles; bounds were verified above.
+                        // and disjoint 256-byte micro-tiles; bounds and disjointness were
+                        // verified in `prepare_thin_geometry`.
                         unsafe {
                             params.run_strips(
                                 tiled_send.as_ptr(),
@@ -883,7 +1001,7 @@ fn copy_thin_tiled(
                     }
                 });
             } else {
-                // SAFETY: bounds were verified above.
+                // SAFETY: bounds and disjointness were verified in `prepare_thin_geometry`.
                 unsafe {
                     params.run_strips(
                         tiled_send.0,
@@ -917,7 +1035,7 @@ fn copy_thin_tiled(
         Vec::new()
     };
 
-    match dir {
+    match params.dir {
         Direction::Detile => {
             // SAFETY: `tiled_ptr[..tiled_len]` comes from the caller's `&[u8]` slice
             // and all parallel workers above have joined.
@@ -1860,6 +1978,119 @@ mod pool_tests {
         assert!(
             seen.lock().unwrap().len() >= 2,
             "pool should still execute across worker threads after recovery"
+        );
+    }
+
+    #[test]
+    fn mutated_public_layout_fields_never_enter_unsound_fast_path() {
+        use crate::texture::{Desc, Tail};
+
+        let base_desc = Desc {
+            dimension: Dimension::Tex2d,
+            width: 512,
+            height: 512,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_4KB_D,
+        };
+
+        let mut pitch_zero = Layout::new(&base_desc).unwrap();
+        pitch_zero.mips[0].pitch = 0;
+        let row = 512 * 4;
+        let lin_len = row * 512;
+        let plan = validate_plan(&pitch_zero, pitch_zero.size as usize, 0, 0, lin_len, row, 0)
+            .unwrap();
+        assert!(
+            prepare_thin_geometry(&plan, pitch_zero.size as usize, lin_len, Direction::Tile, true)
+                .is_none(),
+            "m.pitch = 0 with last_by > 0 must reject thin fast path"
+        );
+
+        let small_desc = Desc {
+            width: 64,
+            height: 64,
+            ..base_desc
+        };
+        let row3 = 64 * 4;
+        let plane3 = row3 * 64;
+        let mut wrap_slice = Layout::new(&small_desc).unwrap();
+        wrap_slice.slices = 3;
+        wrap_slice.mips[0].depth = 3;
+        wrap_slice.slice_size = 1u64 << 63;
+        wrap_slice.size = 65536;
+        let plan3 = validate_plan(&wrap_slice, 65536, 0, 0, plane3 * 3, row3, plane3).unwrap();
+        assert!(
+            prepare_thin_geometry(&plan3, 65536, plane3 * 3, Direction::Detile, true).is_none(),
+            "wrapping slice_size must reject thin fast path"
+        );
+
+        let mut wrap_off = Layout::new(&small_desc).unwrap();
+        wrap_off.slices = 2;
+        wrap_off.mips[0].depth = 2;
+        wrap_off.slice_size = 1;
+        wrap_off.mips[0].offset = u64::MAX;
+        wrap_off.size = 65536;
+        let plan4 = validate_plan(&wrap_off, 65536, 0, 0, plane3 * 2, row3, plane3).unwrap();
+        assert!(
+            prepare_thin_geometry(&plan4, 65536, plane3 * 2, Direction::Detile, true).is_none(),
+            "wrapping m.offset must reject thin fast path"
+        );
+
+        let mut bad_block = Layout::new(&base_desc).unwrap();
+        bad_block.block = [8, 128, 1];
+        let plan_b = validate_plan(&bad_block, bad_block.size as usize, 0, 0, lin_len, row, 0)
+            .unwrap();
+        assert!(
+            prepare_thin_geometry(&plan_b, bad_block.size as usize, lin_len, Direction::Tile, true)
+                .is_none(),
+            "mutated layout.block with colliding micro-tiles must reject thin fast path"
+        );
+
+        let mut bad_tail = Layout::new(&base_desc).unwrap();
+        bad_tail.mips[0].tail = Some(Tail {
+            offset: 0,
+            x: 0,
+            y: 0,
+        });
+        let plan_t = validate_plan(&bad_tail, bad_tail.size as usize, 0, 0, lin_len, row, 0)
+            .unwrap();
+        assert!(
+            prepare_thin_geometry(&plan_t, bad_tail.size as usize, lin_len, Direction::Detile, true)
+                .is_none(),
+            "oversized mutated tail mip must reject thin fast path"
+        );
+
+        let tiled = vec![0u8; 65536];
+        let mut linear = vec![0u8; 65536];
+
+        let mut zero_h = Layout::new(&base_desc).unwrap();
+        zero_h.mips[0].height = 0;
+        assert_eq!(zero_h.detile(&tiled, 0, 0, &mut linear, row, 0), Err(Error::Invalid));
+
+        let mut zero_d = Layout::new(&base_desc).unwrap();
+        zero_d.mips[0].depth = 0;
+        assert_eq!(zero_d.detile(&tiled, 0, 0, &mut linear, row, 0), Err(Error::Invalid));
+
+        let mut zero_w = Layout::new(&base_desc).unwrap();
+        zero_w.mips[0].width = 0;
+        assert_eq!(zero_w.detile(&tiled, 0, 0, &mut linear, row, 0), Err(Error::Invalid));
+
+        let mut bad_bpe = Layout::new(&base_desc).unwrap();
+        bad_bpe.desc.element_bytes = 3;
+        assert_eq!(bad_bpe.detile(&tiled, 0, 0, &mut linear, row, 0), Err(Error::Invalid));
+
+        let mut huge_bpe = Layout::new(&base_desc).unwrap();
+        huge_bpe.desc.element_bytes = 32;
+        assert_eq!(huge_bpe.detile(&tiled, 0, 0, &mut linear, row, 0), Err(Error::Invalid));
+
+        let mut bad_depth = Layout::new(&small_desc).unwrap();
+        bad_depth.mips[0].depth = 10;
+        assert_eq!(
+            bad_depth.detile(&tiled, 0, 0, &mut linear, row3, plane3),
+            Err(Error::Invalid)
         );
     }
 }
