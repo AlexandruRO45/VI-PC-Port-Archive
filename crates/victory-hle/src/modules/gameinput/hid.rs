@@ -272,7 +272,7 @@ fn feature(handle: HANDLE, id: u8, size: usize) -> Option<Vec<u8>> {
 }
 
 /// Writes an output report over the synchronous handle.
-fn write(control: HANDLE, report: &[u8]) {
+fn write(control: HANDLE, report: &[u8]) -> u32 {
     let mut written = 0u32;
     // SAFETY: the report's bytes and a synchronous handle of our own.
     let ok = unsafe {
@@ -286,8 +286,11 @@ fn write(control: HANDLE, report: &[u8]) {
     };
     if ok == 0 {
         // SAFETY: a plain query.
-        tracing::debug!(error = unsafe { GetLastError() }, "HID write failed");
+        let error = unsafe { GetLastError() };
+        tracing::debug!(error, "HID write failed");
+        return error;
     }
+    0
 }
 
 /// What turns a pad's reports into readings.
@@ -449,6 +452,8 @@ struct Rumble {
     output_len: usize,
     sequence: u8,
     sent: (u16, u16),
+    /// The error of the last write, 0 for none.
+    last_error: u32,
 }
 
 impl Rumble {
@@ -465,7 +470,7 @@ impl Rumble {
         // The device wants its own report size.
         report.resize(self.output_len.max(report.len()), 0);
         report.truncate(self.output_len.max(1));
-        write(self.control, &report);
+        self.last_error = write(self.control, &report);
         self.sent = (low, high);
     }
 
@@ -512,12 +517,10 @@ fn read_pad(found: &Found) -> bool {
                 if found.bluetooth || kind == playstation::Kind::DualSense {
                     let _ = feature(control, 0x05, 41);
                 }
-                // DualSense firmware before update 2.21 wants the old bit.
-                let new_vibration = match (kind, found.product) {
-                    (playstation::Kind::DualSense, 0x0CE6) => feature(control, 0x20, 64)
-                        .is_none_or(|f| u16::from_le_bytes([f[44], f[45]]) >= 0x0215),
-                    _ => true,
-                };
+                // Classic vibration: felt clearly stronger on a DualSense
+                // (firmware that takes the improved emulation too) than the
+                // improved emulation was.
+                let new_vibration = false;
                 if output_len > 0 {
                     rumble = Some(Rumble {
                         control,
@@ -527,6 +530,7 @@ fn read_pad(found: &Found) -> bool {
                         output_len,
                         sequence: 0,
                         sent: (0, 0),
+                        last_error: 0,
                     });
                 }
             }
@@ -716,6 +720,62 @@ mod tests {
                     println!("{p:?}");
                 }
             }
+        }
+    }
+
+    /// Hardware check: vibrates the connected PlayStation pad for about a
+    /// second (strong motor, then weak, then both). Run by hand and feel it:
+    /// `cargo test -p victory-hle rumble_of_a_real_pad -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs a PlayStation pad"]
+    fn rumble_of_a_real_pad() {
+        let mut skip = std::collections::HashSet::new();
+        let all = devices(&mut skip);
+        println!(
+            "{:?}",
+            all.iter()
+                .map(|f| (f.driver, f.vendor, f.product))
+                .collect::<Vec<_>>()
+        );
+        let found = all
+            .into_iter()
+            .find(|f| matches!(f.driver, Driver::Sony(_)))
+            .expect("no PlayStation pad connected");
+        let Driver::Sony(kind) = found.driver else {
+            unreachable!()
+        };
+        let control = open(&found.path, GENERIC_READ | GENERIC_WRITE, 0);
+        assert_ne!(control, INVALID_HANDLE_VALUE, "cannot open for writing");
+        let (_, output_len) = report_sizes(control).unwrap();
+        if found.bluetooth || kind == playstation::Kind::DualSense {
+            let _ = feature(control, 0x05, 41);
+        }
+        let new_vibration = false;
+        println!(
+            "{kind:?} bluetooth={} output_len={output_len} new_vibration={new_vibration}",
+            found.bluetooth
+        );
+        let mut rumble = Rumble {
+            control,
+            kind,
+            bluetooth: found.bluetooth,
+            new_vibration,
+            output_len,
+            sequence: 0,
+            sent: (0, 0),
+            last_error: 0,
+        };
+        for (what, low, high) in [
+            ("strong (left)", 0xFFFF, 0),
+            ("weak (right)", 0, 0xFFFF),
+            ("both", 0xFFFF, 0xFFFF),
+        ] {
+            println!("{what}");
+            rumble.send(low, high);
+            println!("write error: {}", rumble.last_error);
+            std::thread::sleep(Duration::from_millis(700));
+            rumble.send(0, 0);
+            std::thread::sleep(Duration::from_millis(500));
         }
     }
 
