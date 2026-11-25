@@ -82,12 +82,22 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+    // The host device first: it tells the translation its wave sizes.
+    let _ = crate::host::host();
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options { view_marks: true };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => {
+            // Translations for hosts without 64-lane waves differ.
+            let key = if victory_shader::emit::host_wave64() {
+                *build()
+            } else {
+                *blake3::hash(&[&build()[..], b"wave32"].concat()).as_bytes()
+            };
+            cached(cache, &key, container, translate)
+        }
         None => (translate(container), false),
     }
 }
