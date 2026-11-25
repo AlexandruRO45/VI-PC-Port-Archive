@@ -9976,20 +9976,71 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// All paths selecting an incoming scalar word run the same way in
+    /// every lane reaching the fork. A divergent path can leave different
+    /// scalar values in host lanes even though the console has one value.
+    fn uniform_forward_join(&self, b: usize, dominators: &mut Option<Vec<usize>>) -> bool {
+        let p = self.x.p;
+        let st = self.x.st;
+        let fork = dominators.get_or_insert_with(|| {
+            let order = crate::ir::reverse_postorder(&p.blocks);
+            crate::ir::idoms(&p.blocks, &order, &self.rpo)
+        })[b];
+        let mut seen = HashSet::new();
+        let mut work = p.blocks[b].preds.clone();
+        while let Some(q) = work.pop() {
+            if self.tail[q].is_none() || !seen.insert(q) {
+                continue;
+            }
+            if let LaneExit::Branch { when, .. } = st.exits[q]
+                && st.bools.support(when).iter().any(|a| !matches!(a, Atom::Uniform(_)))
+            {
+                return false;
+            }
+            if q != fork {
+                for &from in &p.blocks[q].preds {
+                    if self.tail[from].is_some() && self.rpo[from] >= self.rpo[q] {
+                        return false;
+                    }
+                    work.push(from);
+                }
+            }
+        }
+        seen.contains(&fork)
+    }
+
     fn fill_mask_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
+        let mut dominators = None;
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
+            let st = self.x.st;
+            let scalar_edges = self.console_lanes
+                && !p.wave64
+                && matches!(phi.reg, Reg::S(c) if c != EXEC && c != EXEC + 1)
+                && p.blocks[b]
+                    .preds
+                    .iter()
+                    .all(|&q| self.tail[q].is_none() || self.rpo[q] < self.rpo[b]);
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+                let arg = phi.args[n];
+                let x = if let Some(&m) = st.masks.get(&arg) {
+                    self.boolean(m, qb)
+                } else if scalar_edges
+                    && st.other.contains_key(&arg)
+                    && matches!(self.vals.get(&arg), Some(Val::I32(_)))
+                    && self.uniform_forward_join(b, &mut dominators)
+                {
+                    let word = self.i32_of(arg).map_err(|w| unsupported(offset, w))?;
+                    Ok(self.lane_bit(qb, word, None))
+                } else {
+                    Err("a lane-mask join of an untracked mask")
+                }
+                .map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);

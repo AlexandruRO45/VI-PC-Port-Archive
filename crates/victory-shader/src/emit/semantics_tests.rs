@@ -383,15 +383,60 @@ fn run(
         .collect())
 }
 
+fn check_wave32(
+    name: &str,
+    body: &[u32],
+    inputs: &[[u32; 4]],
+    expected: impl Fn(usize) -> [u32; 4],
+) {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let shader =
+        lower_program(&program(body, false)).unwrap_or_else(|e| panic!("lower {name}: {e}"));
+    if let Ok(mut val) = validator::Validator::load(validator::Validator::default_path().as_deref())
+    {
+        val.validate(&mut shader.dxil.clone())
+            .expect("validate the shader's DXIL");
+        eprintln!("{name} DXIL validated");
+    }
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device for {name}");
+        return;
+    };
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the feature query writes the matching options structure.
+    let support = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut waves).cast(),
+            size_of_val(&waves) as u32,
+        )
+    };
+    if support.is_err()
+        || !waves.WaveOps.as_bool()
+        || !(waves.WaveLaneCountMin..=waves.WaveLaneCountMax).contains(&32)
+    {
+        eprintln!("Wave32 unavailable for the loop test");
+        return;
+    }
+
+    let out = run(&host, &shader, inputs, false).expect("dispatch the shader");
+    assert_eq!(out.len(), inputs.len());
+    for (t, actual) in out.into_iter().enumerate() {
+        assert_eq!(actual, expected(t), "thread {t}");
+    }
+    eprintln!("{name} readback matched on {} threads", inputs.len());
+}
+
 /// A single loop entry supplies a Wave32 mask, and the latch replaces it
 /// with integer data. Each iteration reads the dword and the lane's bit.
 /// A wave-uniform branch then joins a masked dword with an integer.
 #[test]
 fn wave32_mask_data_at_loop_entry() {
-    use windows::Win32::Graphics::Direct3D12::{
-        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
-    };
-
     let mut body = Vec::from(vop3(0x0C5, 22, [int(0), v(1), 0], NONE)); // s22 = v1 != 0
     body.extend([
         sop1(0x03, 20, s(22)),  // s_mov_b32 s20, s22
@@ -418,57 +463,111 @@ fn wave32_mask_data_at_loop_entry() {
         vop1(0x01, 9, s(28)),           // v_mov_b32 v9, s28
     ]);
     body.extend(vop3(0x346, 8, [v(9), int(1), v(8)], NONE)); // pack the dword and bit
-    let shader = lower_program(&program(&body, false)).expect("lower the loop");
-    if let Ok(mut val) = validator::Validator::load(validator::Validator::default_path().as_deref())
-    {
-        val.validate(&mut shader.dxil.clone())
-            .expect("validate the loop's DXIL");
-        eprintln!("Wave32 loop DXIL validated");
-    }
-
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device for the Wave32 loop test");
-        return;
-    };
-    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-    // SAFETY: the feature query writes the matching options structure.
-    let support = unsafe {
-        host.device.CheckFeatureSupport(
-            D3D12_FEATURE_D3D12_OPTIONS1,
-            (&raw mut waves).cast(),
-            size_of_val(&waves) as u32,
-        )
-    };
-    if support.is_err()
-        || !waves.WaveOps.as_bool()
-        || !(waves.WaveLaneCountMin..=waves.WaveLaneCountMax).contains(&32)
-    {
-        eprintln!("Wave32 unavailable for the loop test");
-        return;
-    }
-
     let masks: [u32; 2] = [0x9123_4321, 0x8321_1234];
     let inputs: [[u32; 4]; 64] =
         std::array::from_fn(|t| [(masks[t / 32] >> (t % 32)) & 1, (t / 32) as u32, 0, 0]);
-    let out = run(&host, &shader, &inputs, false).expect("dispatch the loop");
-    for (t, actual) in out.into_iter().enumerate() {
+    check_wave32("Wave32 loop", &body, &inputs, |t| {
         let lane = t % 32;
         let first = masks[t / 32];
         let second = 0x5319;
         let joined = if t < 32 { 42 } else { second & 63 };
-        assert_eq!(
-            actual,
-            [
-                first,
-                second,
-                (first >> lane) & 1,
-                (joined << 1) | ((second >> lane) & 1)
-            ],
-            "thread {t}"
-        );
-    }
-    eprintln!("Wave32 loop readback matched on 64 threads");
+        [
+            first,
+            second,
+            (first >> lane) & 1,
+            (joined << 1) | ((second >> lane) & 1),
+        ]
+    });
+}
+
+/// A compare mask and a scalar phi supply the lane bits on different
+/// edges of a forward join. The scalar phi selects two computed words.
+#[test]
+fn wave32_forward_mask_join_uses_scalar_input() {
+    let mut body = vec![
+        vop1(0x02, 26, v(2)),          // v_readfirstlane_b32 s26, v2
+        vop1(0x02, 27, v(3)),          // v_readfirstlane_b32 s27, v3
+        sopc(0x06, s(26), int(0)),     // s_cmp_eq_u32 s26, 0
+        0xBF85_0007,                   // s_cbranch_scc1 compare
+        sopc(0x06, s(26), int(1)),     // s_cmp_eq_u32 s26, 1
+        0xBF85_0002,                   // s_cbranch_scc1 add_one
+        sop2(0x00, 20, s(27), int(2)), // s_add_u32 s20, s27, 2
+        0xBF82_0001,                   // s_branch scalar_join
+        sop2(0x00, 20, s(27), int(1)), // add_one: s_add_u32 s20, s27, 1
+        vop1(0x01, 7, s(20)),          // scalar_join: v_mov_b32 v7, s20
+        0xBF82_0003,                   // s_branch mask_join
+    ];
+    body.extend(vop3(0x0C5, 20, [int(0), v(1), 0], NONE)); // compare: s20 = v1 != 0
+    body.push(vop1(0x01, 7, int(0)));
+    body.extend(vop3(0x101, 5, [int(0), int(1), s(20)], NONE)); // mask_join: this lane's bit
+    body.extend(vop3(0x365, 6, [193, int(0), 0], NONE)); // v_mbcnt_lo_u32_b32 v6, -1, 0
+
+    let compare_mask: u32 = 0x8AA5_1243;
+    let seeds = [0, 0xA622_B270, 0xF123_4500, 0x62AA_1230];
+    let inputs: [[u32; 4]; 128] = std::array::from_fn(|t| {
+        [
+            (compare_mask >> (t % 32)) & 1,
+            (t / 32) as u32,
+            seeds[t / 32],
+            0,
+        ]
+    });
+    check_wave32("Wave32 forward mask join", &body, &inputs, |t| {
+        let wave = t / 32;
+        let lane = (t % 32) as u32;
+        let value = seeds[wave] + if wave == 1 { 1 } else { 2 };
+        let (mask, word) = if wave == 0 {
+            (compare_mask, 0)
+        } else {
+            (value, value)
+        };
+        [(mask >> lane) & 1, lane, word, 0]
+    });
+}
+
+/// One incoming scalar word passes through an earlier join. A branch
+/// guarantees that the descriptor word on its other edge is never read.
+#[test]
+fn wave32_mask_join_reads_only_the_live_scalar_word() {
+    let mut body = vec![
+        vop1(0x02, 26, v(2)),          // v_readfirstlane_b32 s26, v2
+        vop1(0x02, 27, v(3)),          // v_readfirstlane_b32 s27, v3
+        sopc(0x06, s(26), int(0)),     // s_cmp_eq_u32 s26, 0
+        0xBF85_0003,                   // s_cbranch_scc1 descriptor
+        sop2(0x00, 20, s(27), int(1)), // s_add_u32 s20, s27, 1
+        sop1(0x03, 22, int(1)),        // s_mov_b32 s22, 1
+        0xBF82_0002,                   // s_branch test_valid
+        sop1(0x03, 20, s(8)),          // descriptor: s_mov_b32 s20, s8
+        sop1(0x03, 22, int(0)),        // s_mov_b32 s22, 0
+        sopc(0x06, s(22), int(0)),     // test_valid: s_cmp_eq_u32 s22, 0
+        0xBF85_0002,                   // s_cbranch_scc1 compare
+        vop1(0x01, 7, int(1)),         // v_mov_b32 v7, 1
+        0xBF82_0003,                   // s_branch mask_join
+    ];
+    body.extend(vop3(0x0C5, 20, [int(0), v(1), 0], NONE)); // compare: s20 = v1 != 0
+    body.push(vop1(0x01, 7, int(0)));
+    body.extend(vop3(0x101, 5, [int(0), int(1), s(20)], NONE)); // mask_join: this lane's bit
+    body.extend(vop3(0x365, 6, [193, int(0), 0], NONE)); // v_mbcnt_lo_u32_b32 v6, -1, 0
+
+    let compare_mask: u32 = 0x8421_35A7;
+    let scalar_seed = 0x9122_53E0;
+    let inputs: [[u32; 4]; 64] = std::array::from_fn(|t| {
+        [
+            (compare_mask >> (t % 32)) & 1,
+            (t / 32) as u32,
+            scalar_seed,
+            0,
+        ]
+    });
+    check_wave32("Wave32 live scalar join", &body, &inputs, |t| {
+        let lane = (t % 32) as u32;
+        let (mask, branch) = if t < 32 {
+            (compare_mask, 0)
+        } else {
+            (scalar_seed + 1, 1)
+        };
+        [(mask >> lane) & 1, lane, branch, 0]
+    });
 }
 
 // ---- comparing ----
