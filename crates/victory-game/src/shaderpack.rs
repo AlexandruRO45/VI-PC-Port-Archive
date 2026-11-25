@@ -301,44 +301,88 @@ impl<'a> Pack<'a> {
 /// run of zlib streams (each starting at a multiple of 16 bytes and
 /// inflating to at most 64 KiB), found by its magic.
 pub fn find(file: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+    use miniz_oxide::inflate::TINFLStatus;
+    use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
+
     if file.starts_with(MAGIC) {
         return Some(std::borrow::Cow::Borrowed(file));
     }
+    let flags = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
+        | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+    let mut decomp = Box::new(DecompressorOxide::new());
     let mut chunk = vec![0u8; 0x20000];
-    // One zlib stream at `at`: its output and the bytes it took.
-    let mut inflate = |at: usize| {
-        use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
-        use miniz_oxide::inflate::TINFLStatus;
-        let flags = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
-            | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
-        let (status, used, out) =
-            decompress(&mut DecompressorOxide::new(), file.get(at..)?, &mut chunk, 0, flags);
-        (status == TINFLStatus::Done).then(|| (chunk[..out].to_vec(), used))
+    let mut probe = [0u8; 4];
+
+    // Check only the first 4 output bytes before inflating a full 64 KiB stream.
+    let mut starts_with_magic = |decomp: &mut DecompressorOxide, at: usize| -> bool {
+        let Some(input) = file.get(at..) else {
+            return false;
+        };
+        decomp.init();
+        let (status, _, out) = decompress(decomp, input, &mut probe, 0, flags);
+        matches!(status, TINFLStatus::Done | TINFLStatus::HasMoreOutput)
+            && out == MAGIC.len()
+            && probe == *MAGIC
     };
+
+    // One zlib stream at `at`: writes into `chunk` and returns `(out_len, used)`.
+    let inflate_into =
+        |decomp: &mut DecompressorOxide, chunk: &mut [u8], at: usize| -> Option<(usize, usize)> {
+            let input = file.get(at..)?;
+            decomp.init();
+            let (status, used, out) = decompress(decomp, input, chunk, 0, flags);
+            (status == TINFLStatus::Done).then_some((out, used))
+        };
+
+    let size = |p: &[u8]| -> Option<usize> {
+        let n = |o: usize| u32_at(p, o).map(|v| v as usize);
+        let tables = n(0x50)?
+            .checked_mul(GRAPHICS)?
+            .checked_add(n(0x54)?.checked_mul(COMPUTE)?)?
+            .checked_add(n(0x58)?.checked_add(n(0x5c)?)?.checked_mul(8)?)?;
+        HEADER
+            .checked_add(tables)?
+            .checked_add(n(0x60)?)?
+            .checked_add(n(0x64)?)
+    };
+
     let zlib = |at: usize| {
         file[at] == 0x78 && u16::from_be_bytes([file[at], file[at + 1]]).is_multiple_of(31)
     };
-    let start = (0..file.len().saturating_sub(1))
-        .step_by(16)
-        .filter(|&at| zlib(at))
-        .find_map(|at| inflate(at).filter(|(out, _)| out.starts_with(MAGIC)).map(|o| (at, o)))?;
-    let (mut at, (mut pack, used)) = start;
-    at += used;
-    let size = |p: &[u8]| -> Option<usize> {
-        let n = |o: usize| u32_at(p, o).map(|v| v as usize);
-        let tables = n(0x50)? * GRAPHICS + n(0x54)? * COMPUTE + (n(0x58)? + n(0x5c)?) * 8;
-        Some(HEADER + tables + n(0x60)? + n(0x64)?)
-    };
-    loop {
-        // The header gives the size once it is whole.
-        if let Some(total) = size(&pack).filter(|&t| pack.len() >= t) {
-            return (pack.len() == total).then_some(std::borrow::Cow::Owned(pack));
+
+    for start in (0..file.len().saturating_sub(1)).step_by(16) {
+        if !zlib(start) || !starts_with_magic(&mut decomp, start) {
+            continue;
         }
-        at = at.next_multiple_of(16);
-        let (out, used) = inflate(at)?;
-        pack.extend(out);
-        at += used;
+        let Some((out, used)) = inflate_into(&mut decomp, &mut chunk, start) else {
+            continue;
+        };
+        if !chunk[..out].starts_with(MAGIC) {
+            continue;
+        }
+        let mut pack = Vec::new();
+        if let Some(total) = size(&chunk[..out]).filter(|&t| t >= out && t <= file.len().saturating_mul(64).max(0x20000)) {
+            pack.reserve(total);
+        }
+        pack.extend_from_slice(&chunk[..out]);
+        let mut at = start + used;
+        loop {
+            // The header gives the size once it is whole.
+            if let Some(total) = size(&pack).filter(|&t| pack.len() >= t) {
+                if pack.len() == total {
+                    return Some(std::borrow::Cow::Owned(pack));
+                }
+                break;
+            }
+            at = at.next_multiple_of(16);
+            let Some((out, used)) = inflate_into(&mut decomp, &mut chunk, at) else {
+                break;
+            };
+            pack.extend_from_slice(&chunk[..out]);
+            at += used;
+        }
     }
+    None
 }
 
 /// The two 12-byte instructions a native program starts with, which carry
@@ -483,6 +527,21 @@ mod tests {
         assert_eq!(find(&archive).as_deref(), Some(&pack[..]));
         assert_eq!(find(&pack).as_deref(), Some(&pack[..]));
         assert!(find(&archive[..archive.len() - 200]).is_none());
+    }
+
+    #[test]
+    fn skips_false_positive_magic_stream_before_real_pack() {
+        let pack = pack_bytes();
+        let mut archive = vec![0u8; 0x20];
+        // A 16-byte-aligned zlib stream starting with `MAGIC` that is not a valid pack.
+        let fake = [MAGIC.as_slice(), b"not actually a shader pack"].concat();
+        archive.extend(miniz_oxide::deflate::compress_to_vec_zlib(&fake, 6));
+        archive.resize(archive.len().next_multiple_of(16) + 0x20, 0xCC);
+        for part in pack.chunks(100) {
+            archive.resize(archive.len().next_multiple_of(16), 0);
+            archive.extend(miniz_oxide::deflate::compress_to_vec_zlib(part, 6));
+        }
+        assert_eq!(find(&archive).as_deref(), Some(&pack[..]));
     }
 
     #[test]
