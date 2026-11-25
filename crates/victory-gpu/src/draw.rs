@@ -220,6 +220,28 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// Validates the source and expanded destination byte ranges for expanding
+/// `count` vertices starting at `first` of a rectangle list into triangles.
+/// Returns `(source_address, source_bytes, expanded_bytes)` or `None` when
+/// the view is invalid, out of bounds, or overflows `u32`/`u64`.
+fn rect_vertex_range(v: VertexView, first: u32, count: u32) -> Option<(u64, u64, u32)> {
+    if v.address == 0 || v.stride == 0 {
+        return None;
+    }
+    let stride = u64::from(v.stride);
+    let first_bytes = u64::from(first).checked_mul(stride)?;
+    let end_bytes = (u64::from(first) + u64::from(count)).checked_mul(stride)?;
+    if end_bytes > u64::from(v.size) {
+        return None;
+    }
+    let from = v.address.checked_add(first_bytes)?;
+    let rects = u64::from(count / 3);
+    let src_bytes = rects.checked_mul(3)?.checked_mul(stride)?;
+    from.checked_add(src_bytes)?;
+    let dst_bytes = u32::try_from(rects.checked_mul(6)?.checked_mul(stride)?).ok()?;
+    Some((from, src_bytes, dst_bytes))
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -1444,20 +1466,18 @@ impl State {
                 continue;
             }
             let v = self.vertex[slot as usize];
-            let stride = u64::from(v.stride);
-            let from = v.address + u64::from(first) * stride;
-            if v.address == 0
-                || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
-            {
+            let Some((from, src_bytes, dst_bytes)) = rect_vertex_range(v, first, count) else {
+                once!(slot, "rectangle vertices outside their buffer");
+                return false;
+            };
+            if crate::shadow::find(from, src_bytes).is_none() {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
             }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+            let Some((gpu, to)) = list.scratch(u64::from(dst_bytes)) else {
                 return false;
             };
-            let (from, to, stride) = (from as usize, to as usize, stride as usize);
+            let (from, to, stride) = (from as usize, to as usize, v.stride as usize);
             let n = rects as usize;
             list.defer_host(move || {
                 // SAFETY: the vertices lie in a title buffer (checked when
@@ -1472,7 +1492,7 @@ impl State {
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
+                SizeInBytes: dst_bytes,
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
@@ -2491,5 +2511,38 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+
+    #[test]
+    fn rect_vertex_range_rejects_u32_wrap_address_overflow_and_size_truncation() {
+        // Valid slice: 1 rectangle (3 vertices) starting at vertex 3.
+        let ok = VertexView {
+            address: 0x1000,
+            size: 96,
+            stride: 16,
+        };
+        assert_eq!(rect_vertex_range(ok, 3, 3), Some((0x1030, 48, 96)));
+
+        // `first + count` wraps in u32 (`u32::MAX + 3 == 2`); must be rejected
+        // instead of panicking in debug or bypassing `v.size` in release.
+        assert_eq!(rect_vertex_range(ok, u32::MAX, 3), None);
+
+        // `v.address + first * stride` and `from + src_bytes` overflow u64.
+        let near_max = VertexView {
+            address: u64::MAX - 8,
+            size: 64,
+            stride: 16,
+        };
+        assert_eq!(rect_vertex_range(near_max, 1, 3), None);
+        assert_eq!(rect_vertex_range(near_max, 0, 3), None);
+
+        // Source fits in `u32::MAX` (0xC000_0000), but expanded triangle buffer
+        // (0x1_8000_0000) would silently truncate `D3D12_VERTEX_BUFFER_VIEW::SizeInBytes`.
+        let huge = VertexView {
+            address: 0x1000,
+            size: u32::MAX,
+            stride: 16,
+        };
+        assert_eq!(rect_vertex_range(huge, 0, 3 * 0x0400_0000), None);
     }
 }
