@@ -61,6 +61,10 @@ time on the test machines. Set them in PowerShell before running the script.
 | `VICTORY_HOST_MAX_WAVE=32` | with `victory translate`: assume a host whose waves have at most this many lanes, as an NVIDIA card does — without it every wave-64 compute program looks refused. `VICTORY_WAVE_WHY=1` says why one keeps 64 lanes |
 | `VICTORY_TRANSLATE_ONLY=<hash>,...` | with `victory translate`: those containers alone, by the 16-digit hash a run's log prints. Prefixes work, case is folded |
 | `VICTORY_VIEW_LIMIT=<slot>` | with `victory translate`: assume the host's view heap is capped, shaders reading past `slot` getting its null view |
+| `VICTORY_CARD_BUFFERS_MIN_MB=1` | copies of at least this many MiB of a title buffer go to the card's memory, where the card does the search for shader writes; the default is 16, so smaller copies stay on the CPU. The per-frame line names this switch — note `VICTORY_CARD_BUFFERS_MIN` is **not** a variable this build reads |
+| `VICTORY_CARD_BUFFERS_MB=1024` | the total those copies may hold, default 512 |
+| `VICTORY_TEXTURE_BUDGET_MB` | sets a limit on the bytes of texture copies the card may hold, instead of the default rule (a floor, then nine tenths of the budget the system gives the process) |
+| `VICTORY_TEXTURE_GUARD=0` | hash view-memory textures at every check instead of once every eighth frame |
 
 Diagnostics build: `cargo build --profile diag -p victory --features diagnostics`
 
