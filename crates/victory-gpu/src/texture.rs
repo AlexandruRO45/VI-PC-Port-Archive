@@ -51,8 +51,6 @@ pub(crate) struct Staging {
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
     tracked: Option<crate::watch::Tracked>,
-    /// Set when a title write invalidates `host_written` via `tracked.take`.
-    pending_refresh: std::sync::atomic::AtomicBool,
     /// Per subresource, the bytes of the texture's memory it lies in (from
     /// its start, whole layout blocks); empty where the layout gives none.
     spans: Vec<(usize, usize)>,
@@ -218,7 +216,10 @@ unsafe impl Sync for Staging {}
 /// submission that runs `list` on, its host texture's contents are the
 /// host's, not title memory's, which stays as it was, until the title
 /// writes its watched memory. Marked when that submission is made, not
-/// when `list` is recorded.
+/// when `list` is recorded: a list recorded before it but run after it
+/// must not upload title memory over the host's texels (submissions run
+/// in the order they are made, which need not be the order their lists
+/// were recorded in), and one run before it must still get its upload.
 pub(crate) fn host_writes(list: &HostList, resource: This) {
     if let Some(copy) = crate::resource::host_copy(resource) {
         list.defer_host(move || {
@@ -227,11 +228,7 @@ pub(crate) fn host_writes(list: &HostList, resource: This) {
                 let size = staging.layout.size as usize;
                 if let Some(tracked) = &staging.tracked {
                     let start = staging.memory as usize;
-                    if !tracked.take(start, start + size).is_empty() {
-                        staging
-                            .pending_refresh
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    let _ = tracked.take(start, start + size);
                 } else if committed(staging.memory, size) {
                     // SAFETY: committed memory of the texture's layout size.
                     let tiled = unsafe { std::slice::from_raw_parts(staging.memory, size) };
@@ -245,22 +242,16 @@ pub(crate) fn host_writes(list: &HostList, resource: This) {
     }
 }
 
-fn copy_host_written(copy: &crate::resource::HostTexture) -> bool {
+/// Whether `copy`'s contents are still the host's (written by a host copy
+/// or resolve, and not since written by the title in its watched memory).
+pub(crate) fn copy_host_written(copy: &crate::resource::HostTexture) -> bool {
     if !copy.host_written.load(std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
     if let Some(staging) = copy.staging.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         let size = staging.layout.size as usize;
         let invalidated = if let Some(tracked) = &staging.tracked {
-            let start = staging.memory as usize;
-            if !tracked.take(start, start + size).is_empty() {
-                staging
-                    .pending_refresh
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                true
-            } else {
-                false
-            }
+            !tracked.clean()
         } else if committed(staging.memory, size) {
             // SAFETY: committed memory of the texture's layout size.
             let tiled = unsafe { std::slice::from_raw_parts(staging.memory, size) };
@@ -611,16 +602,13 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some(t) = &self.tracked {
-            let pending = self
-                .pending_refresh
-                .swap(false, std::sync::atomic::Ordering::Relaxed);
             // Most refreshes find nothing: the tracker's dense bit says so
             // without its lock (123,000 refreshes a frame, run evict3).
-            if t.clean() && !pending {
+            if t.clean() {
                 return (0, None);
             }
             let ranges = t.take(start, start + size);
-            if ranges.is_empty() && !pending {
+            if ranges.is_empty() {
                 return (0, None);
             }
             // Only the subresources in the pages that changed (streamed
@@ -628,16 +616,12 @@ impl Staging {
             // each cost up to 430 MB a frame, run integ2).
             let n = self.footprints.len();
             let span = |i: usize| self.spans.get(i).copied().unwrap_or((0, size));
-            let touched: Vec<usize> = if pending && ranges.is_empty() {
-                (0..n).collect()
-            } else {
-                (0..n)
-                    .filter(|&i| {
-                        let (a, b) = span(i);
-                        ranges.iter().any(|&(f, e)| f - start < b && a < e - start)
-                    })
-                    .collect()
-            };
+            let touched: Vec<usize> = (0..n)
+                .filter(|&i| {
+                    let (a, b) = span(i);
+                    ranges.iter().any(|&(f, e)| f - start < b && a < e - start)
+                })
+                .collect();
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page. Not kept: it would
             // double each texture's system memory. Only the touched spans
@@ -890,7 +874,6 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         mips: u32::from(d.MipLevels),
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
-        pending_refresh: false.into(),
         spans,
         last: Mutex::default(),
         uploads: Default::default(),
@@ -974,7 +957,6 @@ mod tests {
             mips: 1,
             memory: base as *const u8,
             tracked: Some(tracked),
-            pending_refresh: false.into(),
             spans: Vec::new(),
             last: Mutex::default(),
             uploads: Default::default(),
@@ -993,5 +975,9 @@ mod tests {
         unsafe { (base as *mut u8).write_volatile(0x42) };
         assert!(!copy_host_written(&copy));
         assert!(!copy.host_written.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            !staging.tracked.as_ref().unwrap().clean(),
+            "invalidation keeps dirty ranges for refresh_now"
+        );
     }
 }
