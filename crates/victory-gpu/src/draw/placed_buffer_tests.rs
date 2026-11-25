@@ -217,7 +217,7 @@ fn registered_buffer_replaces_loose_shadow_on_next_dispatch() {
     let record = |views: &Guest| {
         let handle = crate::descriptor::heap(views.0).start;
         let list = host.new_list().unwrap();
-        crate::texture::upload(&list, output, texture);
+        crate::texture::upload(&list, output, &texture);
         let mut state = crate::draw::State::default();
         state.set_pipeline(pipe.0);
         state.set_heaps(&[views.0]);
@@ -231,7 +231,7 @@ fn registered_buffer_replaces_loose_shadow_on_next_dispatch() {
         );
         crate::list::ensure_state(&list, output, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
         let (readback, footprint) =
-            crate::capture::read_back(&host.device, &list.list, texture).unwrap();
+            crate::capture::read_back(&host.device, &list.list, &texture).unwrap();
         list.close();
         Recorded { state, list, readback, footprint }
     };
