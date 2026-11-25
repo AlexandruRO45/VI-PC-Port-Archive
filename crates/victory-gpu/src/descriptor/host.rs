@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -94,6 +95,32 @@ impl<T> BufferViews<T> {
     }
 }
 
+/// A descriptor header (`[tag, view index, generation]`) as the kernel's
+/// snapshot last held it, read without a lock. Written only under
+/// `HostHeap::making`; a read that meets a write half done finds no match
+/// and takes the lock.
+#[derive(Default)]
+pub(crate) struct Record {
+    tag: AtomicU32,
+    key: AtomicU64,
+}
+
+impl Record {
+    fn holds(&self, [tag, i, generation]: [u32; 3]) -> bool {
+        self.key.load(Ordering::Acquire) == (u64::from(generation) << 32 | u64::from(i))
+            && self.tag.load(Ordering::Acquire) == tag
+    }
+
+    fn set(&self, [tag, i, generation]: [u32; 3]) {
+        self.tag.store(tag, Ordering::Release);
+        self.key.store(u64::from(generation) << 32 | u64::from(i), Ordering::Release);
+    }
+}
+
+/// Slots a draw found made from the record it read, without a lock, since
+/// the start (the line on texture slots reports them).
+pub(crate) static MIRRORED_UNLOCKED: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -105,10 +132,16 @@ pub(crate) struct HostHeap {
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
     sampler: bool,
-    /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
-    /// Last descriptor headers seen in a placed heap, including API writes.
-    copied: Option<Mutex<Vec<[u32; 3]>>>,
+    /// The record (view index and generation) each slot was last made
+    /// from, 0 while it is being made. Written under `making`; a draw that
+    /// finds its slot made from the record it reads, the common case, takes
+    /// no lock ([`HostHeap::mirror`]).
+    made: Box<[AtomicU64]>,
+    /// Held while a slot is made, made null or let go: one maker at a time.
+    making: Mutex<()>,
+    /// Last descriptor headers seen in a placed heap, including API writes
+    /// (written under `making`).
+    copied: Option<Box<[Record]>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -962,7 +995,8 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made: (0..count).map(|_| AtomicU64::new(0)).collect(),
+            making: Mutex::new(()),
             copied: None,
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
@@ -1257,8 +1291,10 @@ impl HostHeap {
         // texture is held by no slot, may have been let go, and would be
         // made anew here, with the card full. `made` first, then `kept`,
         // as `mirror` takes them.
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        made.get(index as usize).is_some_and(|&made| made != 0 && made == key)
+        let _making = self.making.lock().unwrap_or_else(|e| e.into_inner());
+        let made = self.made[index as usize].load(Ordering::Acquire);
+        made != 0
+            && made == key
             && self
                 .kept
                 .lock()
@@ -1272,19 +1308,19 @@ impl HostHeap {
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
     /// keeps what it views). True if the slot was made.
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        if made.get(index as usize).is_none_or(|&key| key == 0) {
+        let _making = self.making.lock().unwrap_or_else(|e| e.into_inner());
+        if self.made.get(index as usize).is_none_or(|key| key.load(Ordering::Acquire) == 0) {
             return false;
         }
-        self.unmake(&mut made, index);
+        self.unmake(index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
     }
 
     /// Makes host slot `index` null again, as it is before its view is
-    /// made: a null view of the kind it held.
-    fn unmake(&self, made: &mut [u64], index: u32) {
-        let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
+    /// made: a null view of the kind it held. The caller holds `making`.
+    fn unmake(&self, index: u32) {
+        let Some(key) = self.made.get(index as usize).map(|made| made.swap(0, Ordering::AcqRel)) else {
             return;
         };
         if key == 0 {
@@ -1657,27 +1693,22 @@ impl HostHeap {
     }
 
     pub(crate) fn track_copied_records(&mut self) {
-        self.copied = Some(Mutex::new(vec![[0; 3]; self.count as usize]));
+        self.copied = Some((0..self.count).map(|_| Record::default()).collect());
     }
 
     /// Mirrors the changed headers (index, handle, words) of the kernel's snapshot of a heap
     /// page, and says how many changed. Most of a written page is as it was: those are
-    /// found under one lock of the kept records, not two locks each.
+    /// found without a lock.
     pub(crate) fn mirror_copied_run(&self, records: &[(u32, u64, [u32; 3])]) -> u64 {
-        let changed: Vec<(u32, u64, [u32; 3])> = match &self.copied {
-            Some(kept) => {
-                let kept = kept.lock().unwrap_or_else(|e| e.into_inner());
-                records
-                    .iter()
-                    .filter(|&&(index, _, words)| kept.get(index as usize).is_none_or(|k| *k != words))
-                    .copied()
-                    .collect()
-            }
-            None => records.to_vec(),
-        };
-        changed
-            .into_iter()
-            .map(|(index, handle, words)| u64::from(self.mirror_words(index, handle, words, false, true).1))
+        records
+            .iter()
+            .filter(|&&(index, _, words)| {
+                self.copied
+                    .as_ref()
+                    .and_then(|kept| kept.get(index as usize))
+                    .is_none_or(|k| !k.holds(words))
+            })
+            .map(|&(index, handle, words)| u64::from(self.mirror_words(index, handle, words, false, true).1))
             .sum()
     }
 
@@ -1713,24 +1744,39 @@ impl HostHeap {
         for_draw: bool,
         copied: bool,
     ) -> (Option<View>, bool) {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(records) = &self.copied {
-            let mut records = records.lock().unwrap_or_else(|e| e.into_inner());
-            let record = &mut records[index as usize];
-            if copied && *record == words {
-                return (None, false);
-            }
-            *record = words;
-        }
         let [tag, i, generation] = words;
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        let record = self.copied.as_ref().map(|records| &records[index as usize]);
+        if copied && record.is_some_and(|r| r.holds(words)) {
+            return (None, false);
+        }
+        // The slot is made from this record already, and the snapshot
+        // holds it: nothing to make, so no lock. The threads that record
+        // the title's lists bind slots all frame, most of them as they
+        // were, and under one lock each they waited on each other.
+        if tag == VIEW_TAG
+            && self.made[index as usize].load(Ordering::Acquire) == key
+            && record.is_none_or(|r| r.holds(words))
+            && let Some(view) = view_at(i, generation)
+        {
+            MIRRORED_UNLOCKED.fetch_add(1, Ordering::Relaxed);
+            return (Some(view), true);
+        }
+        let _making = self.making.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(record) = record {
+            if copied && record.holds(words) {
+                return (None, false);
+            }
+            record.set(words);
+        }
+        let made = &self.made[index as usize];
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
+            if made.load(Ordering::Acquire) != 0 {
+                made.store(0, Ordering::Release);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw || copied {
@@ -1739,13 +1785,14 @@ impl HostHeap {
             }
             return (None, true);
         };
-        if made[index as usize] != key {
+        let old = made.load(Ordering::Acquire);
+        if old != key {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
             for stale in self.note_buffer(index, Some(&view), for_draw) {
                 if stale != index {
-                    self.unmake(&mut made, stale);
+                    self.unmake(stale);
                 }
             }
             // A view of a texture object that has no host copy yet waits
@@ -1766,13 +1813,16 @@ impl HostHeap {
             // time it got sharper.
             if later
                 && keep_views()
-                && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
+                && view_at(old as u32, (old >> 32) as u32)
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return (Some(view), true);
             }
-            made[index as usize] = if later { 0 } else { key };
+            // 0 while the slot is made: a draw that reads this record
+            // meanwhile waits for `making` instead of using a slot half
+            // written.
+            made.store(0, Ordering::Release);
             let kept = if later {
                 None
             } else {
@@ -1782,6 +1832,7 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
+            made.store(if later { 0 } else { key }, Ordering::Release);
         }
         (Some(view), true)
     }
@@ -1790,10 +1841,8 @@ impl HostHeap {
     #[cfg(test)]
     pub(crate) fn made_key(&self, index: u32) -> Option<u64> {
         self.made
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
             .get(index as usize)
-            .copied()
+            .map(|key| key.load(Ordering::Acquire))
             .filter(|&key| key != 0)
     }
 
@@ -1830,7 +1879,7 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let key = self.made.get(index as usize)?.load(Ordering::Acquire);
         if key == 0 {
             return Some("null".into());
         }
