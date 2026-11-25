@@ -140,10 +140,6 @@ enum Command {
         /// shaders, search URL, excerpt.
         #[arg(long)]
         json: bool,
-        /// Write a page to open in a browser: each failure with its search
-        /// link, log lines, a copyable issue draft and GitHub's form filled in.
-        #[arg(long, value_name = "FILE")]
-        html: Option<PathBuf>,
     },
     /// Show the resolved configuration and check it.
     Config,
@@ -228,8 +224,7 @@ fn main() -> Result<()> {
             draft,
             repo,
             json,
-            html,
-        } => doctor::run(&log, crashes, draft, &repo, json, html),
+        } => doctor::run(&log, crashes, draft, &repo, json),
         Command::Config => show_config(),
     }
 }

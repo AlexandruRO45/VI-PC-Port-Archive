@@ -463,95 +463,12 @@ pub fn to_json(repo: &str, log: &Path, found: &[Failure]) -> String {
     )
 }
 
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-/// A page to open in a browser: one card per failure with its search link,
-/// its log lines, a copyable issue draft and GitHub's issue form filled in.
-/// Self-contained (no scripts or styles from elsewhere).
-pub fn to_html(repo: &str, log: &Path, found: &[Failure]) -> String {
-    let mut cards = String::new();
-    for (i, f) in found.iter().enumerate() {
-        let kind = ["crash", "fatal", "error", "warning"][usize::from(f.severity.min(3))];
-        let draft = issue_draft(repo, f);
-        let body = draft.split_once("\n\n").map_or(draft.as_str(), |(_, b)| b);
-        let cut = body.chars().count() > 6000;
-        let mut body: String = body.chars().take(6000).collect();
-        if cut {
-            body.push_str("\n(cut: the whole draft is in `victory doctor --draft`)");
-        }
-        // The form's title is the draft's: no fault address goes to GitHub.
-        let new_issue = format!(
-            "https://github.com/{repo}/issues/new?title={}&body={}",
-            encode(&public_title(f)),
-            encode(&body)
-        );
-        let search = search_link(repo, f).map_or(String::new(), |l| {
-            format!(
-                r#"<a class="btn" href="{}" target="_blank">Who else reported it?</a>"#,
-                html_escape(&l)
-            )
-        });
-        let shaders = if f.shaders.is_empty() {
-            String::new()
-        } else {
-            format!(
-                r#"<p class="muted">Shaders (for you; title shader hashes stay out of posts): {}</p>"#,
-                html_escape(&f.shaders.join(", "))
-            )
-        };
-        write!(
-            cards,
-            r#"<div class="card {kind}"><div class="head"><span class="badge">{kind}</span><b>{n}. {title}</b><span class="muted">x{count}</span></div>
-{shaders}<div class="row">{search}<a class="btn ghost" href="{new_issue}" target="_blank">Open a new issue (filled in)</a><button class="btn ghost" onclick="copy('d{n}')">Copy the draft</button></div>
-<details><summary>Log lines (for you: they can hold values from title memory, so they are not in the draft)</summary><pre>{excerpt}</pre></details>
-<details><summary>Issue draft</summary><pre id="d{n}">{draft}</pre></details></div>
-"#,
-            n = i + 1,
-            title = html_escape(&f.title),
-            count = f.count,
-            new_issue = html_escape(&new_issue),
-            excerpt = html_escape(&f.excerpt.join("\n")),
-            draft = html_escape(&draft),
-        )
-        .ok();
-    }
-    if found.is_empty() {
-        cards.push_str(r#"<div class="card">No failures in this run.</div>"#);
-    }
-    format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>victory doctor</title><style>
-:root{{--bg:#f6f7f9;--card:#fff;--fg:#16181d;--muted:#5b6270;--line:#e3e6eb;--acc:#2f6fed}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#111318;--card:#1a1d24;--fg:#e8eaee;--muted:#9aa1ad;--line:#2a2f39;--acc:#6c9bff}}}}
-body{{margin:0;font:14px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--fg)}}main{{max-width:980px;margin:0 auto;padding:20px 16px}}
-.card{{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--line);border-radius:10px;padding:12px 14px;margin:10px 0}}
-.crash{{border-left-color:#c0392b}}.fatal{{border-left-color:#d35400}}.error{{border-left-color:#b7791f}}.warning{{border-left-color:#6b7280}}
-.head,.row{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}.row{{margin:8px 0}}.muted{{color:var(--muted)}}
-.badge{{font-size:12px;font-weight:600;padding:1px 8px;border-radius:999px;background:var(--line)}}
-.btn{{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:5px 10px;font:inherit;text-decoration:none;cursor:pointer}}
-.ghost{{background:none;color:var(--fg);border:1px solid var(--line)}}
-pre{{white-space:pre-wrap;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px;font-size:12px;max-height:320px;overflow:auto}}
-</style></head><body><main><h1>victory doctor</h1>
-<p class="muted">{log}: {n} kinds of failure, most severe first. Check who else reported each before opening a new issue; if one matches, add your setup there.</p>
-{cards}</main><script>function copy(id){{navigator.clipboard.writeText(document.getElementById(id).textContent)}}</script></body></html>
-"#,
-        log = html_escape(&redact(&log.display().to_string())),
-        n = found.len(),
-    )
-}
-
 pub fn run(
     log: &Path,
     crashes: Option<PathBuf>,
     draft: Option<usize>,
     repo: &str,
     json: bool,
-    html: Option<PathBuf>,
 ) -> Result<()> {
     let text =
         // Bytes, not UTF-8: a crash can cut a log mid-character.
@@ -578,16 +495,6 @@ pub fn run(
     let found = failures(lines.iter().map(String::as_str));
     if json {
         print!("{}", to_json(repo, log, &found));
-        return Ok(());
-    }
-    if let Some(page) = html {
-        std::fs::write(&page, to_html(repo, log, &found))
-            .with_context(|| format!("writing {}", page.display()))?;
-        println!(
-            "{} kinds of failure; open {} in a browser.",
-            found.len(),
-            page.display()
-        );
         return Ok(());
     }
     if let Some(n) = draft {
@@ -826,64 +733,6 @@ VIctory: unhandled exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x
         }
         let crash = found.iter().find(|f| f.severity == 0).unwrap();
         assert!(issue_draft("Marvisak/VIctory", crash).contains("image+0x23cf683 (write)"));
-        let page = to_html("Marvisak/VIctory", Path::new("run.log"), &found);
-        let forms: Vec<&str> = page
-            .split("issues/new?")
-            .skip(1)
-            .map(|s| s.split('"').next().unwrap())
-            .collect();
-        assert_eq!(forms.len(), found.len());
-        for form in &forms {
-            for secret in [
-                "6f225b641c5b0708",
-                "11223344",
-                "peek",
-                "7ffe12345678",
-                "1a2b3c4d00",
-            ] {
-                assert!(!form.contains(secret), "{secret} in the form: {form}");
-            }
-        }
-        // The crash's form title, decoded, keeps the access kind only.
-        let title = forms
-            .iter()
-            .filter_map(|f| f.strip_prefix("title=")?.split("&amp;").next())
-            .map(decode)
-            .find(|t| t.starts_with("Crash"))
-            .unwrap();
-        assert_eq!(title, "Crash: access violation at image+0x23cf683 (write)");
-    }
-
-    /// A query value back from [`encode`].
-    fn decode(s: &str) -> String {
-        let b = s.as_bytes();
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < b.len() {
-            match b[i] {
-                b'+' => out.push(b' '),
-                b'%' if i + 2 < b.len() => {
-                    out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
-                    i += 2;
-                }
-                c => out.push(c),
-            }
-            i += 1;
-        }
-        String::from_utf8(out).unwrap()
-    }
-
-    #[test]
-    fn the_page_escapes_log_text_and_links_each_failure() {
-        let found = failures(
-            "2026-11-25T10:24:00.000000Z  WARN victory_gpu::draw: a view <script>alert(1)</script> was refused slot=0x10"
-                .lines(),
-        );
-        let page = to_html("Marvisak/VIctory", Path::new("run.log"), &found);
-        assert!(!page.contains("<script>alert"), "log text is escaped");
-        assert!(page.contains("&lt;script&gt;"));
-        assert!(page.contains("https://github.com/Marvisak/VIctory/issues/new?title="));
-        assert_eq!(page.matches(r#"class="card "#).count(), found.len());
     }
 
     #[test]
@@ -901,7 +750,7 @@ VIctory: unhandled exception 0xc0000005 at victory-image-b99f876b74d4a77f.dll+0x
         bytes.extend_from_slice(&[0xff, 0xfe, b'\n']);
         std::fs::write(&log, bytes).unwrap();
         let none = dir.join("none.log");
-        assert!(run(&log, Some(none), None, "Marvisak/VIctory", true, None).is_ok());
+        assert!(run(&log, Some(none), None, "Marvisak/VIctory", true).is_ok());
     }
 
     #[test]
