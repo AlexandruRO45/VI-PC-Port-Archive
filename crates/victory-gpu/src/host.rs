@@ -1524,6 +1524,25 @@ fn wide_merge() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
 }
 
+/// Sorts `(key, lo, hi)` intervals per key and merges strictly overlapping
+/// intervals (`lo < prev_hi`), leaving touching 64 KiB pieces separate so
+/// parallel relay merges retain piece-level work granularity while guaranteeing
+/// disjoint byte slices per copy.
+fn merge_piece_intervals<K: Ord>(mut ranges: Vec<(K, usize, usize)>) -> Vec<(K, usize, usize)> {
+    ranges.retain(|(_, lo, hi)| lo < hi);
+    ranges.sort_unstable();
+    let mut out: Vec<(K, usize, usize)> = Vec::with_capacity(ranges.len());
+    for (key, lo, hi) in ranges {
+        match out.last_mut() {
+            Some((prev_key, _, prev_hi)) if *prev_key == key && lo < *prev_hi => {
+                *prev_hi = (*prev_hi).max(hi);
+            }
+            _ => out.push((key, lo, hi)),
+        }
+    }
+    out
+}
+
 /// One declared range of a copy in the card's memory, in a submission.
 struct CardRange {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
@@ -2429,6 +2448,49 @@ fn relay_hand_back(back: &[Declared]) {
     let found = crate::shadow::find_all(&work);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
+    let total_pieces: usize = found.iter().map(Vec::len).sum();
+    if wide_merge() && total_pieces >= 8 {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let shadows: Arc<Vec<Arc<crate::shadow::Shadow>>> =
+            Arc::new(work.iter().map(|(shadow, _, _)| shadow.clone()).collect());
+        let counts: Arc<Vec<AtomicUsize>> =
+            Arc::new((0..work.len()).map(|_| AtomicUsize::new(0)).collect());
+        let mut flat: Vec<(usize, usize, usize)> = Vec::with_capacity(total_pieces);
+        for (idx, pieces) in found.into_iter().enumerate() {
+            for (at, n) in pieces {
+                flat.push((idx, at, n));
+            }
+        }
+        let chunks = (crate::shadow::wide_threads() + 1).max(2);
+        let each = flat.len().div_ceil(chunks);
+        let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(chunks);
+        while !flat.is_empty() {
+            let at = flat.len().saturating_sub(each);
+            let chunk: Vec<(usize, usize, usize)> = flat.drain(at..).collect();
+            let shadows = shadows.clone();
+            let counts = counts.clone();
+            jobs.push(Box::new(move || {
+                let (mut now, mut title) = (Vec::new(), Vec::new());
+                for (idx, offset, len) in chunk {
+                    let written = shadows[idx].relay_merge(offset, len, &mut now, &mut title);
+                    if written > 0 {
+                        counts[idx].fetch_add(written, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        crate::shadow::wide_run(jobs);
+        for ((_, from, to), count) in work.iter().zip(counts.iter()) {
+            let written = count.load(Ordering::Relaxed);
+            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::compared(*from, to - from, written);
+            let _ = (from, to);
+        }
+        return;
+    }
     let (mut now, mut title) = (Vec::new(), Vec::new());
     for ((shadow, from, to), found) in work.iter().zip(found) {
         let mut written = 0;
@@ -2519,7 +2581,7 @@ fn late_line(frames: f64) {
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{continues, join_ranges, merge_piece_intervals, touches};
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -2566,6 +2628,29 @@ mod late_tests {
             assert_eq!(touches(&ranges, from, to), hit, "{from}..{to}");
         }
         assert!(!touches(&[], 0, usize::MAX));
+    }
+
+    #[test]
+    fn piece_intervals_merge_only_overlapping_per_key() {
+        assert_eq!(merge_piece_intervals::<usize>(Vec::new()), Vec::new());
+        let out = merge_piece_intervals(vec![
+            (2usize, 100, 200),
+            (1, 0, 64),
+            (1, 64, 128),
+            (1, 100, 160),
+            (1, 64, 128),
+            (1, 10, 20),
+            (2, 150, 180),
+            (2, 200, 200),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                (1, 0, 64),
+                (1, 64, 160),
+                (2, 100, 200),
+            ]
+        );
     }
 }
 
@@ -3249,7 +3334,9 @@ impl Host {
             // plans have run, and their dwords are given to no other plan
             // before these are done with (`card_done`).
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
-            let mut seen = std::collections::HashSet::new();
+            let mut shadows_by_ptr: std::collections::HashMap<usize, std::sync::Arc<crate::shadow::Shadow>> =
+                std::collections::HashMap::new();
+            let mut raw_pieces: Vec<(usize, usize, usize)> = Vec::new();
             for plan in plans {
                 let flags: Vec<(usize, u32, bool)> = plan
                     .ranges
@@ -3269,12 +3356,18 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && seen.insert((copy, lo, hi)) {
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
+                        if lo < hi {
+                            shadows_by_ptr.entry(copy).or_insert_with(|| r.shadow.clone());
+                            raw_pieces.push((copy, lo, hi));
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+                }
+            }
+            for (copy, lo, hi) in merge_piece_intervals(raw_pieces) {
+                if let Some(shadow) = shadows_by_ptr.get(&copy) {
+                    pieces.push((shadow.clone(), lo, hi, total));
+                    total += (hi - lo) as u64;
                 }
             }
         }
@@ -3337,14 +3430,47 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
-        }
+        let written = if wide_merge() && pieces.len() >= 8 {
+            use std::sync::Arc;
+            use std::sync::atomic::AtomicUsize;
+
+            let written = Arc::new(AtomicUsize::new(0));
+            let chunks = (crate::shadow::wide_threads() + 1).max(2);
+            let each = pieces.len().div_ceil(chunks);
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(chunks);
+            while !pieces.is_empty() {
+                let at = pieces.len().saturating_sub(each);
+                let chunk: Vec<_> = pieces.drain(at..).collect();
+                let written = written.clone();
+                jobs.push(Box::new(move || {
+                    let mut title = Vec::new();
+                    let mut local = 0usize;
+                    for (shadow, lo, hi, offset) in chunk {
+                        // SAFETY: the mapping of the fetched bytes; the copy
+                        // into it has run, pieces per copy are disjoint
+                        // (`merge_piece_intervals`), and the caller waits for
+                        // all jobs before returning.
+                        let gpu = unsafe { std::slice::from_raw_parts((data + offset as usize) as *const u8, hi - lo) };
+                        local += shadow.card_merge_relay(lo, gpu, after, &mut title);
+                    }
+                    if local > 0 {
+                        written.fetch_add(local, Ordering::Relaxed);
+                    }
+                }));
+            }
+            crate::shadow::wide_run(jobs);
+            written.load(Ordering::Relaxed)
+        } else {
+            let mut title = Vec::new();
+            let mut written = 0usize;
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            }
+            written
+        };
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);

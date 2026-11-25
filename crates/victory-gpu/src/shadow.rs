@@ -16,13 +16,56 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
+
+/// Snapshot backing storage inside [`Shadow::before`].
+///
+/// Whole-allocation operations (`writing`, `merge_under_writes`, `copy_back_done`) take the
+/// outer `RwLock` write guard. Concurrent merges during relay landing (`relay_merge`) take the
+/// read guard and mutate strictly disjoint `[at, at + n)` slices via [`SnapshotBuf::slice_mut`].
+struct SnapshotBuf(std::cell::UnsafeCell<Vec<u8>>);
+
+// SAFETY: Access is synchronized by `Shadow::before: RwLock<Option<SnapshotBuf>>`; exclusive
+// writers take `.write()`, while concurrent `.read()` mutators touch strictly disjoint slices.
+unsafe impl Send for SnapshotBuf {}
+// SAFETY: As above.
+unsafe impl Sync for SnapshotBuf {}
+
+impl SnapshotBuf {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self(std::cell::UnsafeCell::new(bytes))
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.0.into_inner()
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        // SAFETY: Called under at least the read lock while no thread resizes or moves the Vec.
+        unsafe { (*self.0.get()).as_ptr() }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.0.get_mut().as_mut_ptr()
+    }
+
+    /// Returns a mutable slice to `[at, at + n)` within the snapshot allocation.
+    ///
+    /// # Safety
+    /// Caller must hold at least the read lock on `Shadow::before`, ensure `at + n` is within
+    /// the allocation's capacity, and ensure no other thread concurrently accesses `[at, at + n)`.
+    #[allow(clippy::mut_from_ref)] // Interior mutability via UnsafeCell over strictly disjoint slices.
+    unsafe fn slice_mut(&self, at: usize, n: usize) -> &mut [u8] {
+        // SAFETY: Caller upholds bounds and disjointness; only the backing bytes are modified.
+        unsafe { std::slice::from_raw_parts_mut((*self.0.get()).as_mut_ptr().add(at), n) }
+    }
+}
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -48,7 +91,7 @@ pub(crate) struct Shadow {
     /// shaders write (`pending`), each at its offset in the copy: what the
     /// GPU wrote differs. Room for the whole copy; only those ranges' bytes
     /// are set (and read).
-    before: Mutex<Option<Vec<u8>>>,
+    before: RwLock<Option<SnapshotBuf>>,
     /// With snapshots kept ([`keeps`]): which 64 KiB pieces of the snapshot
     /// hold the copy's bytes as they are now, and whether the snapshot is
     /// counted in [`KEPT_BYTES`].
@@ -555,13 +598,97 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let len = now.len().min(held.len()).min(title.len());
+    let chunks = len / 32;
     let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    for c in 0..chunks {
+        let at = c * 32;
+        let nb = &now[at..at + 32];
+        let hb = &mut held[at..at + 32];
+        let tb = &mut title[at..at + 32];
+        for i in 0..32 {
+            let n = nb[i];
+            let wrote = 0u8.wrapping_sub(u8::from(n != hb[i]));
+            let t = tb[i];
+            let merged = (t & !wrote) | (n & wrote);
+            differs |= merged ^ t;
+            tb[i] = merged;
+            hb[i] = n;
+        }
+    }
+    for i in (chunks * 32)..len {
+        let n = now[i];
+        let wrote = 0u8.wrapping_sub(u8::from(n != held[i]));
+        let t = title[i];
+        let merged = (t & !wrote) | (n & wrote);
+        differs |= merged ^ t;
+        title[i] = merged;
+        held[i] = n;
+    }
+    differs != 0
+}
+
+/// Non-relay merge where `old` is the reference before the submission and both
+/// `title` and `old` receive `gpu` where `gpu != old`, or `title` otherwise.
+fn merge_piece_both(gpu: &[u8], old: &mut [u8], title: &mut [u8]) -> bool {
+    let len = gpu.len().min(old.len()).min(title.len());
+    let chunks = len / 32;
+    let mut differs = 0u8;
+    for c in 0..chunks {
+        let at = c * 32;
+        let gb = &gpu[at..at + 32];
+        let ob = &mut old[at..at + 32];
+        let tb = &mut title[at..at + 32];
+        for i in 0..32 {
+            let g = gb[i];
+            let wrote = 0u8.wrapping_sub(u8::from(g != ob[i]));
+            let t = tb[i];
+            let merged = (t & !wrote) | (g & wrote);
+            differs |= merged ^ t;
+            tb[i] = merged;
+            ob[i] = merged;
+        }
+    }
+    for i in (chunks * 32)..len {
+        let g = gpu[i];
+        let wrote = 0u8.wrapping_sub(u8::from(g != old[i]));
+        let t = title[i];
+        let merged = (t & !wrote) | (g & wrote);
+        differs |= merged ^ t;
+        title[i] = merged;
+        old[i] = merged;
+    }
+    differs != 0
+}
+
+/// Non-relay merge where `host` is updated to match `title` on unchanged bytes.
+fn merge_piece_host(host: &mut [u8], old: &[u8], title: &mut [u8]) -> bool {
+    let len = host.len().min(old.len()).min(title.len());
+    let chunks = len / 32;
+    let mut differs = 0u8;
+    for c in 0..chunks {
+        let at = c * 32;
+        let hb = &mut host[at..at + 32];
+        let ob = &old[at..at + 32];
+        let tb = &mut title[at..at + 32];
+        for i in 0..32 {
+            let h = hb[i];
+            let wrote = 0u8.wrapping_sub(u8::from(h != ob[i]));
+            let t = tb[i];
+            let merged = (t & !wrote) | (h & wrote);
+            differs |= merged ^ t;
+            tb[i] = merged;
+            hb[i] = merged;
+        }
+    }
+    for i in (chunks * 32)..len {
+        let h = host[i];
+        let wrote = 0u8.wrapping_sub(u8::from(h != old[i]));
+        let t = title[i];
+        let merged = (t & !wrote) | (h & wrote);
+        differs |= merged ^ t;
+        title[i] = merged;
+        host[i] = merged;
     }
     differs != 0
 }
@@ -591,7 +718,7 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{Flights, changed_runs, merge_piece, merge_piece_both, merge_piece_host, outside};
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -804,6 +931,62 @@ mod relay_tests {
         merge_piece(&fetched, &mut wrong_cpu, &mut wrong_title);
         assert_eq!(wrong_title[30], base[30]);
     }
+
+    #[test]
+    fn vectorized_merge_variants_match_scalar_reference() {
+        for len in [0usize, 1, 7, 15, 16, 31, 32, 33, 63, 64, 65, 100, 4096] {
+            let base: Vec<u8> = (0..len).map(|i| (i * 13 + 7) as u8).collect();
+            let mut now = base.clone();
+            let mut title0 = base.clone();
+            for i in 0..len {
+                if i % 5 == 0 {
+                    now[i] ^= 0x5a;
+                }
+                if i % 7 == 0 {
+                    title0[i] ^= 0xa5;
+                }
+            }
+
+            let mut expected_held = base.clone();
+            let mut expected_title_relay = title0.clone();
+            let mut expected_relay_differs = 0u8;
+            let mut expected_old = base.clone();
+            let mut expected_title_both = title0.clone();
+            let mut expected_both_differs = 0u8;
+            for i in 0..len {
+                let w = if now[i] != base[i] { 0xffu8 } else { 0 };
+                let m = (title0[i] & !w) | (now[i] & w);
+                expected_relay_differs |= m ^ title0[i];
+                expected_title_relay[i] = m;
+                expected_held[i] = (expected_held[i] & !w) | (now[i] & w);
+
+                expected_both_differs |= m ^ title0[i];
+                expected_title_both[i] = m;
+                expected_old[i] = m;
+            }
+
+            let mut held = base.clone();
+            let mut title = title0.clone();
+            let relay_changed = merge_piece(&now, &mut held, &mut title);
+            assert_eq!(relay_changed, expected_relay_differs != 0, "len={len}");
+            assert_eq!(held, expected_held, "len={len}");
+            assert_eq!(title, expected_title_relay, "len={len}");
+
+            let mut old = base.clone();
+            let mut title_b = title0.clone();
+            let both_changed = merge_piece_both(&now, &mut old, &mut title_b);
+            assert_eq!(both_changed, expected_both_differs != 0, "len={len}");
+            assert_eq!(old, expected_old, "len={len}");
+            assert_eq!(title_b, expected_title_both, "len={len}");
+
+            let mut host = now.clone();
+            let mut title_h = title0.clone();
+            let host_changed = merge_piece_host(&mut host, &base, &mut title_h);
+            assert_eq!(host_changed, expected_both_differs != 0, "len={len}");
+            assert_eq!(host, expected_old, "len={len}");
+            assert_eq!(title_h, expected_title_both, "len={len}");
+        }
+    }
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -970,6 +1153,21 @@ struct Workers {
     more: std::sync::Condvar,
 }
 
+/// Number of worker threads kept for parallel copy/compare/merge passes
+/// (`VICTORY_WIDE_THREADS`, defaulting to half the logical cores, clamped to 2..=8).
+pub(crate) fn wide_threads() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or_else(
+                || std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 8),
+                |n| n.clamp(1, 16),
+            )
+    })
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -978,7 +1176,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = wide_threads();
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1010,17 +1208,17 @@ fn wide(jobs: Vec<Job>) {
         return;
     }
     let workers = workers();
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let done = Arc::new((AtomicUsize::new(jobs.len()), Mutex::new(false), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
-            let left = left.clone();
+            let done = done.clone();
             queue.push_back(Box::new(move || {
                 job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
+                if done.0.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    let mut finished = done.1.lock().unwrap_or_else(|e| e.into_inner());
+                    *finished = true;
+                    done.2.notify_all();
                 }
             }));
         }
@@ -1033,9 +1231,9 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    let mut finished = done.1.lock().unwrap_or_else(|e| e.into_inner());
+    while !*finished {
+        finished = done.2.wait(finished).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -1109,7 +1307,7 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
             // The snapshot's memory stays until the range is done with
             // (`copy_back_done`), which comes after this.
-            match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            match shadow.before.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
                 Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
                 None => (0, 0, 0, 0, 0),
             }
@@ -1708,7 +1906,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
-            before: Mutex::default(),
+            before: RwLock::default(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
@@ -1807,8 +2005,8 @@ impl Shadow {
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let snapshot = before.get_or_insert_with(|| pooled(total));
+        let mut before = self.before.write().unwrap_or_else(|e| e.into_inner());
+        let snapshot = before.get_or_insert_with(|| SnapshotBuf::new(pooled(total)));
         if keeps() {
             // Piece by piece, and only the pieces not known current. A
             // piece the part holds whole is current from now on; of a
@@ -1882,7 +2080,7 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
-        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = self.before.read().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
@@ -1936,19 +2134,7 @@ impl Shadow {
                 }
                 // Title memory with the GPU's bytes put in; the copy takes
                 // the title's bytes in turn.
-                // Without a branch, so the loop runs many bytes at a time:
-                // the GPU's byte where the copy's byte is not what it was
-                // before the submission, else the title's. (With the two
-                // searches above this was 44 ms a frame for 970 pieces.)
-                let mut differs = 0u8;
-                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                    let gpu = if *h != *o { 0xffu8 } else { 0 };
-                    let merged = (*t & !gpu) | (*h & gpu);
-                    differs |= merged ^ *t;
-                    *t = merged;
-                    *h = merged;
-                }
-                if differs != 0 {
+                if merge_piece_host(host, old, title) {
                     crate::watch::writing(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                     written += n;
@@ -1994,18 +2180,19 @@ impl Shadow {
     /// the first to the last such byte, and into the snapshot, so that the
     /// next flight's merge finds only what the card writes from now on.
     /// The copy is read once and never written: a later flight's shaders
-    /// may be writing it at this moment. Under the snapshot's lock, which
-    /// [`Shadow::merge_under_writes`] holds while it reads title memory
-    /// and puts the title's bytes into the copy and the snapshot: the two
-    /// never see each other half done. `now` and `title` are scratch
-    /// memory. Returns the bytes written to title memory.
+    /// may be writing it at this moment. Under the snapshot's read lock,
+    /// which allows parallel merges of disjoint `[at, at + n)` pieces
+    /// while excluding [`Shadow::merge_under_writes`] (which takes the write
+    /// lock). Concurrent callers for the same copy must pass disjoint
+    /// `[at, at + n)` ranges. `now` and `title` are scratch memory. Returns
+    /// the bytes written to title memory.
     pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
         }
-        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(before) = snapshot.as_mut() else {
+        let snapshot = self.before.read().unwrap_or_else(|e| e.into_inner());
+        let Some(before) = snapshot.as_ref() else {
             return 0;
         };
         now.clear();
@@ -2018,10 +2205,9 @@ impl Shadow {
             now.set_len(n);
         }
         // SAFETY: the snapshot's allocation holds the copy's length
-        // (`writing`), and these offsets are in a range declared and not
-        // done with, whose bytes it holds; nothing else touches them
-        // without the lock held here.
-        let held = unsafe { std::slice::from_raw_parts_mut(before.as_mut_ptr().add(at), n) };
+        // (`writing`), and concurrent `relay_merge` callers handle disjoint
+        // `[at, at + n)` ranges while exclusive writers take `.write()`.
+        let held = unsafe { before.slice_mut(at, n) };
         let Some(first) = first_difference(now, held) else {
             return 0;
         };
@@ -2136,8 +2322,8 @@ impl Shadow {
             // the snapshot's.)
             kept.0.clear();
         }
-        if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            give_back(bytes);
+        if let Some(bytes) = self.before.write().unwrap_or_else(|e| e.into_inner()).take() {
+            give_back(bytes.into_inner());
         }
     }
 
@@ -2278,15 +2464,7 @@ impl Shadow {
                 }
                 let n = hi - lo;
                 let title = &mut title[..n];
-                // The lock of the copy's reference (the snapshot, or the
-                // CPU's side of a copy in the card's memory), from before
-                // title memory is read until the title's bytes are in: with
-                // the copy-back on its own thread ([`relay`]) that thread
-                // puts what the card wrote into title memory and into the
-                // reference under the same lock, and a page read before
-                // such a merge and compared after it would take the card's
-                // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                let mut before = self.before.write().unwrap_or_else(|e| e.into_inner());
                 // A page that is not there is left as it is, and looked at
                 // again next time.
                 if !crate::host::read_into(lo as *const u8, title) {
@@ -2557,15 +2735,7 @@ impl Shadow {
         if crate::host::read_into((start + at) as *const u8, title) {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
-            let mut differs = 0u8;
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                let wrote = if *g != *o { 0xffu8 } else { 0 };
-                let merged = (*t & !wrote) | (*g & wrote);
-                differs |= merged ^ *t;
-                *t = merged;
-                *o = merged;
-            }
-            if differs != 0 {
+            if merge_piece_both(gpu, old, title) {
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
@@ -2606,7 +2776,7 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let _side = self.before.read().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
