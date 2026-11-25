@@ -15,7 +15,9 @@ publisher.
 
 ## Compatibility fixes (2026-11-25)
 
-- Save recovery limits cleanup to the staging names it owns. See
+- Save recovery limits cleanup to the staging names it owns. A staging
+  file locked by another process leaves the last committed save readable.
+  A write can be retried when the file is released. See
   [VIctory #2716](https://github.com/Marvisak/VIctory/pull/2716).
 - Shader fixes improve normalized buffer conversion and declare the required
   feature for writable views in vertex, geometry, and mesh shaders. The
@@ -24,10 +26,39 @@ publisher.
   Direct3D 12 commands. Capture logs include alpha ranges and traced barriers.
 - The loader releases the source executable buffer as soon as its prepared
   image is available.
+- Pixel shader quad reads reach helper lanes at triangle edges. A helper
+  lane in a first-lane read uses its own value. The CPU rectangle fallback
+  completes the rectangle opposite its right angle in any input order.
+- The wave-wide shader path supports independent branches for multiple
+  console waves in one group. Descriptor synchronization checks records
+  one page at a time under one lock. Diagnostics identify wave64 refusals,
+  skipped draws and dispatches, and null buffer views.
+- Host constant-buffer views use at most 64 KiB and apply 256-byte
+  alignment after the limit. Oversized guest views can still use their
+  host-addressable prefix.
 
 These changes use the [VIctory main snapshot](https://github.com/Marvisak/VIctory/commit/13f91caee25f2fdf2c062be5f7a27f058e51cbca)
 and the [fxceless texture-copy fix](https://github.com/fxceless/victory-fork/commit/a25370661ed1343e2f2d5e79669ec8db4e60dc68)
-as references. The run measurements below identify their own revisions.
+as references. The CPU rectangle fix follows
+[VIctory `8ff7913`](https://github.com/Marvisak/VIctory/commit/8ff7913).
+The pixel fixes come from VItoriaBr
+[`fe0506a`](https://github.com/uiliannn/VItoriaBr/commit/fe0506a) and
+[`2b3c339`](https://github.com/uiliannn/VItoriaBr/commit/2b3c339).
+The constant-buffer fix follows
+[VItoriaBr `ed6e5af`](https://github.com/uiliannn/VItoriaBr/commit/ed6e5af).
+The wave and descriptor work comes from Vice-Tay
+[#5](https://github.com/TaynanGT/Vice-Tay/pull/5),
+[#7](https://github.com/TaynanGT/Vice-Tay/pull/7), and
+[#9](https://github.com/TaynanGT/Vice-Tay/pull/9), including
+[#6](https://github.com/TaynanGT/Vice-Tay/pull/6).
+The run measurements below identify their own revisions.
+
+The integration is checked with `cargo test --workspace --locked` and
+`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`.
+The synthetic shader comparisons across triangle edges use
+`VICTORY_CONSOLE_DXC` and a PC `dxc.exe`, as described in the shader tests.
+See [Windows CI](https://github.com/TaynanGT/Vice-Tay/actions/workflows/ci.yml)
+for the result on each revision.
 
 ## Development PC
 

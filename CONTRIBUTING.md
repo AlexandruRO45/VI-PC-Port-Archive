@@ -32,6 +32,10 @@ its own description and tests.
 - Write the commit and PR in English. Describe the problem, the change,
   and the verification. Credit the source commit or contributor and
   disclose AI assistance when relevant.
+- Update the documentation with the fix. In Vice-Tay, keep usage,
+  affected behavior, sources, and verification current where relevant.
+  For VIctory, document the change in its PR description and update
+  upstream files when the fix changes their documented behavior.
 - Push the focused branch to Vice-Tay and target `Marvisak/VIctory:main`
   in the PR. Verify the base, changed files, and check results on GitHub.
   [XGameSave example](https://github.com/Marvisak/VIctory/pull/2716)
