@@ -43,7 +43,6 @@ const BUDGET: u64 = 64 << 20;
 pub(super) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_DETILE").is_some_and(|value| value == "1"))
-        && !crate::host::late()
 }
 
 fn kernel(host: &Host) -> Option<&'static Kernel> {
