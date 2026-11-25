@@ -74,7 +74,21 @@ Le flux de pipeline du titre nomme deux choses que la couche ne savait pas
 lire (le nombre d'échantillons forcé du rasteriseur, et les formats de cible
 un par un). Elles sont lues ; un flux qui les nomme n'est plus refusé.
 
-## 6. Ce qui reste à changer, du plus utile au moins utile
+## 6. Essayé et abandonné (mesuré, pas supposé)
+
+Deux pistes ont été écrites, compilées, mesurées, puis retirées parce
+qu'elles n'aidaient pas :
+
+- **Un budget de 8 ms par image sur la passe des tampons du tas**
+  (`heap_buffers`, 260 à 970 ms par image). Quand la passe est coupée, les
+  copies de l'image suivante sont plus grosses : le total ne bouge pas.
+- **Lire une texture partiellement en mémoire niveau par niveau** (une
+  texture dont seuls les niveaux du milieu sont arrivés). Le détilage refuse
+  chaque niveau (`TooSmall`) et le total des textures passe de 310 à
+  10 400 ms par image. La bonne façon est celle de DexNom (reprendre les
+  textures éparses à l'envoi), pas de découper la lecture ici.
+
+## 7. Ce qui reste à changer, du plus utile au moins utile
 
 1. **Les zones à l'ombre sont noires** : le lancer de rayons (l'éclairage
    indirect, les ombres) ne tourne pas. C'est ce que le fork de DexNom a en
