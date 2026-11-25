@@ -132,12 +132,12 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
     }
-    if (gi == 0) {
+    if (gi == 0 && active) {
         // What the records charge, from `before` on, in lane order: a
         // record that does not fit whole runs empty and takes the rest.
-        // Only the group's own records are walked (one, clamped alone).
+        // The first lane is active only if the group has valid records.
         uint first = id.x;
-        uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
+        uint n = min(64u, eff_count - first);
         uint before;
         budget.InterlockedOr(0, 0, before);
         [allow_uav_condition]
@@ -167,7 +167,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi == 0 && kind > 2) {
+    if (gi == 0 && active && kind > 2) {
         uint was;
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);

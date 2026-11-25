@@ -140,11 +140,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = if wave_wide_only().contains(&self.hash) {
-                    victory_shader::emit::with_wave_wide(|| translate(&self.container))
-                } else {
-                    translate(&self.container)
-                };
+                let done = translate(&self.container, wave_wide_only().contains(&self.hash));
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -182,7 +178,7 @@ impl Shader {
 }
 
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn translate(container: &[u8], wave_wide: bool) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
@@ -191,7 +187,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let host = crate::shader_cache::host_shader(container, wave_wide)?;
     let stores = programs.is_empty() || programs.iter().any(|p| stores(&p.code));
     let stores_by_address = programs.is_empty() || programs.iter().any(|p| stores_by_address(&p.code));
     let used = programs

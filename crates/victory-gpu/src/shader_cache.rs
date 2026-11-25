@@ -62,7 +62,6 @@ fn build() -> &'static [u8; 32] {
                 // executable had cached with the switch unset.
                 for name in [
                     "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_WIDE_ONLY",
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
@@ -95,12 +94,20 @@ fn build() -> &'static [u8; 32] {
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| translate_one(|| victory_shader::emit::translate(c));
+pub(crate) fn host_shader(container: &[u8], wave_wide: bool) -> Result<HostShader, String> {
+    let translate = |c: &[u8]| {
+        translate_one(|| {
+            if wave_wide {
+                victory_shader::emit::with_wave_wide(|| victory_shader::emit::translate(c))
+            } else {
+                victory_shader::emit::translate(c)
+            }
+        })
+    };
     match CACHE.get() {
         Some(cache) => cached(
             cache,
-            &for_view_limit(build(), victory_shader::emit::view_heap_limit()),
+            &for_translation_target(build(), victory_shader::emit::view_heap_limit(), wave_wide),
             victory_shader::emit::host_uses_wave32(),
             container,
             translate,
@@ -109,14 +116,13 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     }
 }
 
-/// The build as the cache knows it on a host whose view heap ends at
-/// `limit`: translations clamp view indices to it (none for 0), so one made
-/// for another host's heap is not this host's. (The cache folder is one for
-/// all adapters; a card that caps its heap hangs on a read past the end.)
-fn for_view_limit(build: &[u8; 32], limit: u32) -> [u8; 32] {
+/// Translations clamp indices to the host's view heap limit (none for 0).
+/// The selective wave-wide setting only changes the chosen shader's key.
+fn for_translation_target(build: &[u8; 32], limit: u32, wave_wide: bool) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(build);
     hasher.update(&limit.to_le_bytes());
+    hasher.update(&[u8::from(wave_wide)]);
     *hasher.finalize().as_bytes()
 }
 
@@ -449,11 +455,32 @@ mod tests {
     #[test]
     fn each_view_heap_limit_has_its_own_translations() {
         let build = [7u8; 32];
-        let capped = for_view_limit(&build, 999_999);
-        assert_ne!(capped, for_view_limit(&build, 0));
-        assert_ne!(capped, for_view_limit(&build, 999_998));
-        assert_ne!(capped, for_view_limit(&[8; 32], 999_999));
-        assert_eq!(capped, for_view_limit(&build, 999_999));
+        let capped = for_translation_target(&build, 999_999, false);
+        assert_ne!(capped, for_translation_target(&build, 0, false));
+        assert_ne!(capped, for_translation_target(&build, 999_998, false));
+        assert_ne!(capped, for_translation_target(&[8; 32], 999_999, false));
+        assert_eq!(capped, for_translation_target(&build, 999_999, false));
+    }
+
+    #[test]
+    fn selecting_a_wave_wide_shader_preserves_other_cache_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = for_translation_target(&[7; 32], 999_999, false);
+        let wide = for_translation_target(&[7; 32], 999_999, true);
+        let selected = b"selected shader";
+        let other = b"another shader";
+        let mut wide_shader = shader();
+        wide_shader.dxil.push(32);
+        let cache = Cache::open(dir.path()).unwrap();
+        assert_eq!(cached(&cache, &plain, true, selected, |_| Ok(shader())), Ok(shader()));
+        assert_eq!(cached(&cache, &plain, true, other, |_| Ok(shader())), Ok(shader()));
+        assert_eq!(cached(&cache, &wide, true, selected, |_| Ok(wide_shader.clone())), Ok(wide_shader.clone()));
+
+        let cache = Cache::open(dir.path()).unwrap();
+        let no_translation = |_: &[u8]| -> Result<HostShader, String> { panic!("cached shader translated again") };
+        assert_eq!(cached(&cache, &plain, true, selected, no_translation), Ok(shader()));
+        assert_eq!(cached(&cache, &plain, true, other, no_translation), Ok(shader()));
+        assert_eq!(cached(&cache, &wide, true, selected, no_translation), Ok(wide_shader));
     }
 
     #[test]
