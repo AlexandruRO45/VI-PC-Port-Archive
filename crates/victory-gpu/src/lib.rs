@@ -31,6 +31,8 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(feature = "diagnostics")]
+mod frameprof;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]

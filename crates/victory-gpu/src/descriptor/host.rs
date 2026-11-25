@@ -1470,6 +1470,8 @@ impl HostHeap {
     /// that uploads it and keeps that state after; one another list moves
     /// (a copy into it, say) is read in that state through bindless slots.
     pub(crate) fn prepare_bindless_record(&self, list: &crate::host::HostList) {
+        #[cfg(feature = "diagnostics")]
+        let _prof = crate::frameprof::enter(&crate::frameprof::RECORD);
         if self.sampler {
             return;
         }
@@ -1702,6 +1704,8 @@ impl HostHeap {
     /// nothing changed it is the last plan, whose reads the caller
     /// refreshes, which costs little when the title changed nothing.
     pub(crate) fn bindless_plan(&self) -> Option<Arc<BindlessPlan>> {
+        #[cfg(feature = "diagnostics")]
+        let _prof = crate::frameprof::enter(&crate::frameprof::PLAN);
         if self.sampler {
             return None;
         }
@@ -1714,6 +1718,8 @@ impl HostHeap {
         // taken first where both are held.
         let frame = crate::queue::presented() + 1;
         let evictions = {
+            #[cfg(feature = "diagnostics")]
+            let _lock = crate::frameprof::enter(&crate::frameprof::BINDLESS_LOCK);
             let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             b.checked.1 != epochs.1 && b.looked[0] != frame
         };

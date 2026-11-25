@@ -159,6 +159,8 @@ pub(crate) extern "system" fn wait(
     } else {
         let limit = Duration::from_millis(u64::from(timeout_ms));
         let (_, wait) = next_tick(kind, limit);
+        #[cfg(feature = "diagnostics")]
+        let _prof = crate::frameprof::enter(&crate::frameprof::FRAME_WAIT);
         let hr = if wait > limit {
             std::thread::sleep(limit);
             TIMEOUT

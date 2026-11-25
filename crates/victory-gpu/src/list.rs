@@ -1597,6 +1597,8 @@ mod state {
         first: u32,
         first_instance: u32,
     ) {
+        #[cfg(feature = "diagnostics")]
+        let _prof = crate::frameprof::enter(&crate::frameprof::DRAW);
         super::count_draw();
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
@@ -1676,6 +1678,8 @@ mod state {
         base: i32,
         first_instance: u32,
     ) {
+        #[cfg(feature = "diagnostics")]
+        let _prof = crate::frameprof::enter(&crate::frameprof::DRAW);
         super::count_draw();
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)

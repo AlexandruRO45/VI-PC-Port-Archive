@@ -362,6 +362,10 @@ extern "system" fn present(
 /// Shows a frame.
 fn show(shown: Option<object::Ref>, over: Option<object::Ref>) {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(feature = "diagnostics")]
+    crate::frameprof::frame_boundary(frame, crate::frame::current());
+    #[cfg(feature = "diagnostics")]
+    let _prof = crate::frameprof::enter(&crate::frameprof::PRESENT_SHOW);
     #[cfg(windows)]
     crate::shadow::sweep(frame);
     if frame.is_power_of_two() {

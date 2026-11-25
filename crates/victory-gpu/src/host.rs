@@ -1265,6 +1265,8 @@ impl Host {
     /// left alone (`Shadow::update` goes around them), and the steps in
     /// their order do it all again after the wait, finding little left.
     fn prewarm(&self, runs: &[&HostList]) {
+        #[cfg(feature = "diagnostics")]
+        let _prof = crate::frameprof::enter(&crate::frameprof::PREWARM);
         let started = std::time::Instant::now();
         let mut batch = Batch::default();
         for list in runs {
@@ -1281,9 +1283,15 @@ impl Host {
     fn execute_inner(&self, runs: &[&HostList], keep: Option<&[std::sync::Arc<HostList>]>) {
         #[cfg(feature = "diagnostics")]
         let _inside = crate::profile::here();
+        #[cfg(feature = "diagnostics")]
+        let _prof = crate::frameprof::enter(&crate::frameprof::SUBMIT);
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        #[cfg(feature = "diagnostics")]
+        let _lock = crate::frameprof::enter(&crate::frameprof::SUBMIT_LOCK);
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        drop(_lock);
         // Wait for any previous async submission before mutating shared Shadow
         // buffers in `prepare`. During the gap between submissions, the GPU
         // ran in parallel with the title's CPU command-list recording, and
@@ -1291,8 +1299,14 @@ impl Host {
         if keep.is_some() && self.has_in_flight() {
             self.prewarm(runs);
         }
+        #[cfg(feature = "diagnostics")]
+        let _drain = crate::frameprof::enter(&crate::frameprof::DRAIN);
         self.drain_in_flight_locked();
+        #[cfg(feature = "diagnostics")]
+        drop(_drain);
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        #[cfg(feature = "diagnostics")]
+        let _prepare = crate::frameprof::enter(&crate::frameprof::PREPARE);
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -1366,6 +1380,8 @@ impl Host {
             } else {
                 (None, None, None)
             };
+        #[cfg(feature = "diagnostics")]
+        drop(_prepare);
         let prepared = std::time::Instant::now();
         // Each run (prelude and list) is a submission of its own: the host
         // resets the device when one submission runs for about 2 s, and
@@ -1407,7 +1423,11 @@ impl Host {
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists.
+            #[cfg(feature = "diagnostics")]
+            let _execute = crate::frameprof::enter(&crate::frameprof::EXECUTE);
             unsafe { self.queue.ExecuteCommandLists(group) };
+            #[cfg(feature = "diagnostics")]
+            drop(_execute);
             if !each && i + 1 < groups.len() {
                 continue;
             }
@@ -1432,6 +1452,8 @@ impl Host {
                 }
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
+            let _wait = crate::frameprof::enter(&crate::frameprof::WAIT_GPU);
             // SAFETY: the fence and event are ours.
             unsafe {
                 let waited = self
@@ -1445,6 +1467,8 @@ impl Host {
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            drop(_wait);
             #[cfg(feature = "diagnostics")]
             if each {
                 // SAFETY: a plain query.
@@ -1523,6 +1547,8 @@ impl Host {
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
+        #[cfg(feature = "diagnostics")]
+        let _copy = crate::frameprof::enter(&crate::frameprof::COPY_BACK);
         let copying = std::time::Instant::now();
         if let Some(plan) = card_plan {
             if card_after_ran {
@@ -1537,6 +1563,8 @@ impl Host {
                 plan.clear_pending();
             }
         }
+        #[cfg(feature = "diagnostics")]
+        drop(_copy);
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         self.finish_submission(runs, cpu_back);
         self.log_messages();
@@ -1550,6 +1578,8 @@ impl Host {
         runs: &[&HostList],
         back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     ) {
+        #[cfg(feature = "diagnostics")]
+        let _copy = crate::frameprof::enter(&crate::frameprof::COPY_BACK);
         let copying = std::time::Instant::now();
         if back.len() <= 1 {
             for (shadow, address, len) in &back {
@@ -1587,6 +1617,8 @@ impl Host {
                 });
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let _readbacks = crate::frameprof::enter(&crate::frameprof::READBACKS);
         for list in runs {
             for rb in &list.deferred().readbacks {
                 let written = if rb.dst_pitch == rb.row_bytes && rb.src_pitch == rb.row_bytes {
@@ -1608,7 +1640,13 @@ impl Host {
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        drop(_readbacks);
+        #[cfg(feature = "diagnostics")]
+        drop(_copy);
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let _writes = crate::frameprof::enter(&crate::frameprof::WRITES);
         // Host timestamps the lists resolved, on the title's GPU clock.
         let mut clock = None;
         for list in runs {
@@ -1627,6 +1665,8 @@ impl Host {
             }
             deferred.early = 0;
         }
+        #[cfg(feature = "diagnostics")]
+        drop(_writes);
     }
 
     /// How host GPU timestamps map onto the title's GPU clock
@@ -2091,6 +2131,8 @@ impl HostList {
         )],
     ) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
+        #[cfg(feature = "diagnostics")]
+        let _prof = crate::frameprof::enter(&crate::frameprof::PRELUDE);
         let mut pre_barriers = Vec::new();
         for (_, copy) in uploads {
             let real = copy.state.swap(COPY_DEST, Ordering::Relaxed);
@@ -2725,6 +2767,8 @@ impl HostList {
     )> {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        #[cfg(feature = "diagnostics")]
+        let _prof = crate::frameprof::enter(&crate::frameprof::DEFERRED);
         let mut uploads = Vec::new();
         let deferred = self.deferred();
         for (heap, writes) in &deferred.bindless {
@@ -3051,6 +3095,8 @@ impl Early {
 
 /// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
 pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + Sync) {
+    #[cfg(feature = "diagnostics")]
+    let _prof = crate::frameprof::enter(&crate::frameprof::PARALLEL);
     const THREADS: usize = 6;
     if list.len() <= least {
         return f(list);
@@ -3714,6 +3760,8 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        #[cfg(feature = "diagnostics")]
+        let _prof = crate::frameprof::enter(&crate::frameprof::PRESENT);
         self.wait_in_flight();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };

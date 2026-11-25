@@ -550,6 +550,8 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let _prof = crate::frameprof::enter(&crate::frameprof::SHADOW_COPY_BACK);
         if self.direct.is_some() || self.card.is_some() {
             return 0;
         }
@@ -659,6 +661,8 @@ impl Shadow {
     /// [`Shadow::update`]; `lazy`: the tiles of a sparse copy that did not
     /// change the last times are looked at less often.
     pub(crate) fn update_lazily(&self, address: usize, len: usize, lazy: bool) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let _prof = crate::frameprof::enter(&crate::frameprof::SHADOW_UPDATE);
         if self.direct.is_some() {
             return 0;
         }
