@@ -793,7 +793,11 @@ pub(crate) fn compile(
     let Ok(fallback) = std::ffi::CString::new(format!("{head}_5_0")) else {
         return first;
     };
-    match compile_at(source, entry, windows::core::PCSTR::from_raw(fallback.as_ptr().cast())) {
+    match compile_at(
+        source,
+        entry,
+        windows::core::PCSTR::from_raw(fallback.as_ptr().cast()),
+    ) {
         Ok(code) => {
             let used = fallback.to_str().unwrap_or("?");
             tracing::info!("`{name}` is beyond this compiler; using `{used}`");

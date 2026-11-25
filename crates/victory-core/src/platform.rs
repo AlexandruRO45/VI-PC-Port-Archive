@@ -15,7 +15,10 @@ pub fn wine_version() -> Option<String> {
     use std::mem::transmute;
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
-    let name: Vec<u16> = "ntdll.dll".encode_utf16().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = "ntdll.dll"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     // SAFETY: ntdll is always mapped in a Windows process; the string is
     // NUL-terminated UTF-16.
     let ntdll = unsafe { GetModuleHandleW(name.as_ptr()) };
