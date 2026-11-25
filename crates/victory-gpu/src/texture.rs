@@ -15,13 +15,63 @@
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
 use crate::object::This;
+
+/// Computes the automatic mip drop level (`0` or `1`) from the host adapter's
+/// dedicated video memory when `VICTORY_TEXTURE_MIP_DROP` is not explicitly set.
+pub(crate) fn auto_mip_drop_for_memory(vram_bytes: u64) -> u32 {
+    const LOW_VRAM_THRESHOLD: u64 = (8 * 1024 + 512) * 1024 * 1024;
+    if vram_bytes > 0 && vram_bytes <= LOW_VRAM_THRESHOLD {
+        1
+    } else {
+        0
+    }
+}
+
+/// Number of top texture mip levels to drop on pure sampled textures to save VRAM
+/// (`VICTORY_TEXTURE_MIP_DROP=0..=3`). Automatically defaults to `1` on GPUs
+/// with <= 8 GiB dedicated VRAM when unset; explicit `0..=3` overrides it.
+pub(crate) fn texture_mip_drop() -> u32 {
+    static DROP: OnceLock<u32> = OnceLock::new();
+    *DROP.get_or_init(|| {
+        if let Ok(val) = std::env::var("VICTORY_TEXTURE_MIP_DROP") {
+            let parsed = val.trim().parse::<u32>().unwrap_or(0).min(3);
+            if parsed > 0 {
+                tracing::info!(mip_drop = parsed, "texture mip drop enabled");
+            }
+            return parsed;
+        }
+        let vram = crate::host::device_memory();
+        let auto_drop = auto_mip_drop_for_memory(vram);
+        if auto_drop > 0 {
+            tracing::info!(
+                mip_drop = auto_drop,
+                vram_mb = vram / (1024 * 1024),
+                "auto-enabling VICTORY_TEXTURE_MIP_DROP=1 for <= 8 GB GPU"
+            );
+        }
+        auto_drop
+    })
+}
+
+/// Minimum width and height a texture must have to qualify for mip dropping
+/// (`VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`, default `1024`).
+pub(crate) fn texture_mip_drop_min_size() -> u64 {
+    static MIN_SIZE: OnceLock<u64> = OnceLock::new();
+    *MIN_SIZE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1024)
+    })
+}
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -41,8 +91,10 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Host mips per array slice.
     mips: u32,
+    /// Number of top console mips dropped in the host texture.
+    mip_drop: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -448,15 +500,108 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// Subresource-level tracking of host GPU writes so partial `CopyTextureRegion`
+/// or `ResolveSubresource` only suppresses title-memory uploads for the specific
+/// subresources written on the host, while preserving untouched upper mips.
+#[derive(Clone)]
+enum HostWritten {
+    Low(u128),
+    Many(HashSet<u32>),
+    All,
+}
+
+impl Default for HostWritten {
+    fn default() -> Self {
+        Self::Low(0)
+    }
+}
+
+impl HostWritten {
+    fn mark_subresource(&mut self, sub: u32) {
+        match self {
+            Self::All => {}
+            Self::Low(mask) => {
+                if sub < u128::BITS {
+                    *mask |= 1u128 << sub;
+                } else {
+                    let mut set = HashSet::new();
+                    for i in 0..u128::BITS {
+                        if (*mask & (1u128 << i)) != 0 {
+                            set.insert(i);
+                        }
+                    }
+                    set.insert(sub);
+                    *self = Self::Many(set);
+                }
+            }
+            Self::Many(set) => {
+                set.insert(sub);
+            }
+        }
+    }
+
+    fn mark_all(&mut self) {
+        *self = Self::All;
+    }
+
+    fn contains(&self, sub: u32) -> bool {
+        match self {
+            Self::All => true,
+            Self::Low(mask) => sub < u128::BITS && (*mask & (1u128 << sub)) != 0,
+            Self::Many(set) => set.contains(&sub),
+        }
+    }
+
+    fn all_written(&self, total_subresources: u32) -> bool {
+        match self {
+            Self::All => true,
+            Self::Low(mask) => {
+                if total_subresources == 0 {
+                    return false;
+                }
+                if total_subresources >= u128::BITS {
+                    (0..total_subresources).all(|i| self.contains(i))
+                } else {
+                    let all_bits = (1u128 << total_subresources) - 1;
+                    (*mask & all_bits) == all_bits
+                }
+            }
+            Self::Many(set) => {
+                total_subresources > 0 && (0..total_subresources).all(|i| set.contains(&i))
+            }
+        }
+    }
+
+    fn any_written(&self) -> bool {
+        match self {
+            Self::All => true,
+            Self::Low(mask) => *mask != 0,
+            Self::Many(set) => !set.is_empty(),
+        }
+    }
+}
+
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static HOST_WRITTEN: Mutex<Option<HashMap<usize, HostWritten>>> = Mutex::new(None);
 
-/// A host copy or resolve writes `resource`.
+/// A whole-resource host copy writes `resource`.
 pub(crate) fn host_written(resource: This) {
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    set.get_or_insert_with(Default::default)
-        .insert(resource as usize);
+    let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(Default::default)
+        .entry(resource as usize)
+        .or_default()
+        .mark_all();
+}
+
+/// A host copy or resolve writes one subresource of `resource`, keeping
+/// untouched subresources eligible for title-memory upload.
+pub(crate) fn host_written_subresource(resource: This, sub: u32) {
+    let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(Default::default)
+        .entry(resource as usize)
+        .or_default()
+        .mark_subresource(sub);
 }
 
 /// Whether the host GPU wrote `resource` by a copy or resolve
@@ -467,7 +612,8 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .is_some_and(|set| set.contains(&resource))
+        .and_then(|map| map.get(&resource))
+        .is_some_and(HostWritten::any_written)
 }
 
 /// The title released a resource.
@@ -476,9 +622,9 @@ pub(crate) fn forget(resource: usize) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
+    let mut written = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(written) = written.as_mut() {
+        written.remove(&resource);
     }
     let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(through) = through.as_mut() {
@@ -499,19 +645,23 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
+    let written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+        .and_then(|map| map.get(&(resource as usize)).cloned());
+    if matches!(written, Some(HostWritten::All)) || !list.first_use(resource as usize) {
         return;
     }
     let Some(staging) = staging(resource, texture) else {
         return;
     };
+    if written
+        .as_ref()
+        .is_some_and(|w| w.all_written(staging.footprints.len() as u32))
+    {
+        return;
+    }
     use std::sync::atomic::Ordering::Relaxed;
     staging.used.store(crate::host::moment(), Relaxed);
     // The host texture has the staging buffer's contents: only the check
@@ -531,6 +681,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
+        if written.as_ref().is_some_and(|w| w.contains(i as u32)) {
+            continue;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
@@ -782,7 +935,8 @@ impl Staging {
             );
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let (host_mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let console_mip = host_mip + self.mip_drop;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -790,11 +944,15 @@ impl Staging {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
+            if let Err(e) = self.layout.detile(
+                tiled,
+                console_mip,
+                slice,
+                linear,
+                pitch,
+                pitch * rows as usize,
+            ) {
+                tracing::warn!(?e, console_mip, slice, "texture not detiled");
                 return;
             }
         }
@@ -1004,6 +1162,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    let mip_drop = crate::resource::host_copy(resource).map_or(0, |c| u32::from(c.mip_drop));
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -1032,7 +1191,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
         )
     });
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    tracing::debug!(?desc, total, mip_drop, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
@@ -1044,6 +1203,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        mip_drop,
         bytes: total,
         memory,
         last: Mutex::default(),
@@ -1163,5 +1323,57 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+
+    #[test]
+    fn texture_mip_drop_runs_without_panic() {
+        let _ = super::texture_mip_drop();
+    }
+
+    #[test]
+    fn auto_mip_drop_threshold_selects_low_vram_gpus() {
+        assert_eq!(super::auto_mip_drop_for_memory(0), 0);
+        assert_eq!(super::auto_mip_drop_for_memory(128 << 20), 1);
+        assert_eq!(super::auto_mip_drop_for_memory(6 << 30), 1);
+        assert_eq!(super::auto_mip_drop_for_memory(8_273_264_640), 1);
+        assert_eq!(super::auto_mip_drop_for_memory(12 << 30), 0);
+        assert_eq!(super::auto_mip_drop_for_memory(16 << 30), 0);
+    }
+
+    #[test]
+    fn host_written_tracks_subresources_and_many_promotion() {
+        let key = 0xDEAD_BEEFusize as super::This;
+        super::forget(key as usize);
+
+        super::host_written_subresource(key, 2);
+        super::host_written_subresource(key, 5);
+        assert!(super::host_wrote(key as usize));
+        {
+            let map = super::HOST_WRITTEN.lock().unwrap();
+            let entry = map.as_ref().unwrap().get(&(key as usize)).unwrap();
+            assert!(!entry.contains(0));
+            assert!(entry.contains(2));
+            assert!(entry.contains(5));
+            assert!(!entry.all_written(6));
+        }
+
+        super::host_written_subresource(key, 200);
+        {
+            let map = super::HOST_WRITTEN.lock().unwrap();
+            let entry = map.as_ref().unwrap().get(&(key as usize)).unwrap();
+            assert!(entry.contains(2));
+            assert!(entry.contains(5));
+            assert!(entry.contains(200));
+            assert!(!entry.contains(1));
+        }
+
+        super::host_written(key);
+        {
+            let map = super::HOST_WRITTEN.lock().unwrap();
+            let entry = map.as_ref().unwrap().get(&(key as usize)).unwrap();
+            assert!(entry.contains(0));
+            assert!(entry.all_written(256));
+        }
+        super::forget(key as usize);
     }
 }
