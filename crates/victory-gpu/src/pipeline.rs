@@ -722,6 +722,13 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+/// Cumulative host PSOs made and loaded; sampled without draining counters.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn cache_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]

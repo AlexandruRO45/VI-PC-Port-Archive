@@ -5615,6 +5615,8 @@ struct Presenter {
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
+    #[cfg(feature = "diagnostics")]
+    profile: Option<crate::profiling::Profile>,
     since: std::time::Instant,
     frames: u32,
     #[cfg(feature = "diagnostics")]
@@ -5629,6 +5631,8 @@ impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Meter {
+            #[cfg(feature = "diagnostics")]
+            profile: crate::profiling::Profile::from_env(),
             since: now,
             frames: 0,
             #[cfg(feature = "diagnostics")]
@@ -5640,7 +5644,12 @@ impl Meter {
     }
 
     /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND) {
+    fn frame(&mut self, hwnd: HWND, width: u32, height: u32) {
+        #[cfg(feature = "diagnostics")]
+        if let Some(profile) = &mut self.profile {
+            profile.present(std::time::Instant::now(), width, height);
+        }
+        let _ = (width, height);
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -5658,21 +5667,36 @@ impl Meter {
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
-        let draws = (drawn - self.drawn) as f64 / frames;
+        let draw_count = drawn - self.drawn;
+        let draws = draw_count as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-        });
+        let submission_us = [0, 1].map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed));
+        let [cpu, gpu] = submission_us.map(|us| us as f64 / 1000.0 / frames);
+        let preparing = [0, 1, 2, 3].map(|i| PREPARING[i].swap(0, Ordering::Relaxed));
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-            PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
+            preparing[i] as f64 / scale / frames
         });
-        let [back_ms, back_mb] = [0, 1].map(|i| {
-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-        });
-        let dropped = crate::draw::take_dropped() as f64 / frames;
-        let indirect = crate::list::take_indirect() as f64 / frames;
+        let back = [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed));
+        let [back_ms, back_mb] = [0, 1].map(|i| back[i] as f64 / [1e3, 1e6][i] / frames);
+        let dropped_count = crate::draw::take_dropped();
+        let indirect_count = crate::list::take_indirect();
+        let dropped = dropped_count as f64 / frames;
+        let indirect = indirect_count as f64 / frames;
+        #[cfg(feature = "diagnostics")]
+        if let Some(profile) = &mut self.profile {
+            profile.interval(crate::profiling::Interval {
+                frames: frames as u64,
+                duration_ns: elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
+                draws: draw_count,
+                dropped_draws: dropped_count,
+                indirect: indirect_count,
+                submission_us,
+                preparing,
+                back,
+            });
+        }
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
@@ -5791,8 +5815,8 @@ impl Meter {
             }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
-                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
+                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} waiting for the \
+                 GPU fence; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
@@ -5972,8 +5996,10 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            p.meter.frame(p.hwnd);
+            let presented = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if presented == windows::core::HRESULT(0) {
+                p.meter.frame(p.hwnd, width, height);
+            }
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
