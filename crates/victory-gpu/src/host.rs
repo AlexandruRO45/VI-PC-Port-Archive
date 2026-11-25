@@ -10078,9 +10078,13 @@ impl Meter {
         if self.logged.elapsed() >= meter_period() {
             self.logged = std::time::Instant::now();
             tracing::info!(
-                "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made); {} slots a draw found made already, without a lock",
+                "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made); {} slots a draw found made already, without a lock; staging buffers: {} now {} MB, {} of unchanged textures let go, {} made again",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed),
-                crate::descriptor::host::MIRRORED_UNLOCKED.load(Ordering::Relaxed)
+                crate::descriptor::host::MIRRORED_UNLOCKED.load(Ordering::Relaxed),
+                crate::texture::RESIDENT[0].load(Ordering::Relaxed),
+                crate::texture::RESIDENT[1].load(Ordering::Relaxed) >> 20,
+                crate::texture::LIGHTENED[0].load(Ordering::Relaxed),
+                crate::texture::REMADE[0].load(Ordering::Relaxed)
             );
             {
                 let [queued, due, away, partly, oldest] =
