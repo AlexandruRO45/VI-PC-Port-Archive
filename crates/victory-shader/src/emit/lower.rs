@@ -3987,10 +3987,12 @@ impl<'a> Lower<'a> {
     /// the code also reads as numbers: the console compiler computes sizes
     /// from descriptor bits (an image's width, height, depth, levels; a
     /// buffer's record count) instead of querying them. Those fields are
-    /// rebuilt from the host view's dimensions in the GFX10 layout (image
-    /// dword 1 bits 30-31 and dword 2 bits 0-13 width - 1, dword 2 bits
-    /// 14-29 height - 1, dword 3 identity swizzle, last level at 16, type at
-    /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count).
+    /// rebuilt for every consumed slice of the loaded range (including slices
+    /// used through other loads from the same base) from the host view's
+    /// dimensions in the GFX10 layout (image dword 1 bits 30-31 and dword 2
+    /// bits 0-13 width - 1, dword 2 bits 14-29 height - 1, dword 3 identity
+    /// swizzle, last level at 16, type at 28, dword 4 depth or layers - 1;
+    /// buffer dword 2 the record count).
     // shortcut: the base level reads 0 (the host view starts at its own
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
@@ -4012,22 +4014,11 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar memory read as data"),
         };
-        // How the program uses the descriptor tells the view's kind; a load
-        // read only as data takes it from a load of the same descriptor that
-        // the program uses (the compiler loads a descriptor again rather than
-        // keep it, and queries sizes in loops of their own).
-        let use_of = |site: Site| {
-            self.x
-                .res
-                .descriptors
-                .iter()
-                .filter(|d| d.role == Role::Resource)
-                .find_map(|d| {
-                    d.source.leaves().into_iter().find_map(|l| match *l {
-                        Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                        _ => None,
-                    })
-                })
+        let rank = |at: Site| match &self.x.p.blocks[at.0].insts[at.1].fields {
+            Fields::Image { .. } | Fields::Buffer { idxen: true, .. } => 3u8,
+            Fields::Buffer { .. } => 2,
+            Fields::Smem { .. } => 1,
+            _ => 0,
         };
         // The VGPR a waterfall loop reads the first lane of.
         let lane_source = |v: Value| {
@@ -4040,138 +4031,201 @@ impl<'a> Lower<'a> {
                 _ => None,
             }
         };
-        let same = |a: &Address, b: &Address| {
+        let same_base = |a: &Address, b: &Address| {
             a.param == b.param
-                && a.offset == b.offset
                 && (a.dynamic == b.dynamic
                     || a.dynamic.and_then(lane_source).is_some()
                         && a.dynamic.and_then(lane_source) == b.dynamic.and_then(lane_source))
         };
         let address = self.scalar.get(&site);
-        let use_at = use_of(site).or_else(|| {
-            self.x
-                .res
-                .scalar
-                .iter()
-                .filter(|&(s, a)| *s != site && address.is_some_and(|b| same(a, b)))
-                .find_map(|&(s, _)| use_of(s))
-        });
-        let Some((at, first)) = use_at else {
-            return self.view_addresses(inst, site, code, count);
-        };
-        let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
-                };
-                ((kind | u, 0x409), Some(kind))
+        let mut slices = BTreeMap::new();
+        for d in &self.x.res.descriptors {
+            if d.role != Role::Resource {
+                continue;
             }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
+            for l in d.source.leaves() {
+                let Source::Loaded { load, first } = *l else {
+                    continue;
+                };
+                let rel = if load == site {
+                    first
+                } else if let (Some(a), Some(b)) = (self.scalar.get(&load), address)
+                    && same_base(a, b)
                 {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
-                }
-                (props, None)
-            }
-            // A buffer the code reads with scalar loads (`buf[buf.Length - 1]`
-            // at a uniform index): structured by the used-resource entry's
-            // stride, so its record count is in elements, else raw (bytes).
-            Fields::Smem { .. } => {
-                let used = used.ok_or("a scalar-loaded buffer of unknown kind read as data")?;
-                if used.kind == ResourceType::Cbv {
-                    return Err("a constant buffer's descriptor read as data");
-                }
-                let props = match used.stride {
-                    0 | 1 => (11 | u, 0),
-                    s if s.is_multiple_of(4) => (12 | u, s),
-                    _ => return Err("a scalar-loaded buffer of odd stride read as data"),
-                };
-                (props, None)
-            }
-            _ => return Err("a scalar memory read as data"),
-        };
-        let h = self.handle(site, &src, false, props)?;
-        let c = self.cur;
-        let i32t = self.s.t.i32;
-        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
-            self.s.m.i32(0)
-        } else {
-            self.s.m.undef(i32t)
-        };
-        let d = self
-            .s
-            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-        let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
-        let words: Vec<(u32, V)> = match image {
-            Some(kind) => {
-                let one = self.s.m.i32(1);
-                let w = field(self, 0);
-                let (height, depth) = match kind {
-                    1 => (one, one),
-                    2 => (field(self, 1), one),
-                    6 => (one, field(self, 1)),
-                    _ => (field(self, 1), field(self, 2)),
-                };
-                let levels = if uav { one } else { field(self, 3) };
-                let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
-                let (w, height, depth, levels) = (
-                    less(self, w),
-                    less(self, height),
-                    less(self, depth),
-                    less(self, levels),
-                );
-                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (k30, k2, k14, k16, mask) = (
-                    k(self, 30),
-                    k(self, 2),
-                    k(self, 14),
-                    k(self, 16),
-                    k(self, 0x3FFF),
-                );
-                let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
-                let hi = self.s.m.bin(c, Bin::LShr, w, k2);
-                let hi = self.s.m.bin(c, Bin::And, hi, mask);
-                let ht = self.s.m.bin(c, Bin::Shl, height, k14);
-                let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
-                let base = k(self, 0xFAC | ty << 28);
-                let last = self.s.m.bin(c, Bin::Shl, levels, k16);
-                let d3 = self.s.m.bin(c, Bin::Or, base, last);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth)]
-            }
-            None => vec![(2, field(self, 0))],
-        };
-        for k in 0..count {
-            let rel = k.wrapping_sub(u32::from(first));
-            match words.iter().find(|w| w.0 == rel) {
-                Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
-                None => {
-                    if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
+                    let delta = a
+                        .offset
+                        .wrapping_add(4 * u32::from(first))
+                        .wrapping_sub(b.offset);
+                    if !delta.is_multiple_of(4) || delta / 4 >= count {
+                        continue;
                     }
+                    (delta / 4) as u8
+                } else {
+                    continue;
+                };
+                if slices.get(&rel).is_none_or(|&o| rank(d.site) > rank(o)) {
+                    slices.insert(rel, d.site);
+                }
+            }
+        }
+        if slices.is_empty() {
+            return self.view_addresses(inst, site, code, count);
+        }
+        if slices.values().all(|&at| rank(at) == 0) {
+            return Err("a scalar memory read as data");
+        }
+        for k in 0..count {
+            self.set(inst.write(Reg::S(code + k as u8)), Val::Missing(OTHER));
+        }
+        for (first, at) in slices {
+            if rank(at) == 0 {
+                continue;
+            }
+            let src = Source::Loaded { load: site, first };
+            let used = self.used_kind(&src);
+            let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+            let un = ui.name();
+            let span = if matches!(ui.fields, Fields::Image { .. }) {
+                8u32
+            } else {
+                4
+            };
+            let uav = un.contains("store")
+                || un.contains("atomic")
+                || used.is_some_and(|u| u.kind == ResourceType::Uav);
+            let u = if uav { 0x1000 } else { 0 };
+            let slice_res: Result<_, Why> = (|| {
+                let (props, image) = match &ui.fields {
+                    Fields::Image { dim, .. } => {
+                        let kind = match dim {
+                            0 => 1,
+                            1 => 2,
+                            2 => 4,
+                            3 if !uav
+                                && (un.starts_with("image_sample")
+                                    || un.starts_with("image_gather")
+                                    || un == "image_get_resinfo") =>
+                            {
+                                5
+                            }
+                            4 => 6,
+                            5 => 7,
+                            _ => return Err("an image dimension (cube loads or MSAA)"),
+                        };
+                        ((kind | u, 0x409), Some(kind))
+                    }
+                    Fields::Buffer { idxen, format, .. } => {
+                        let stride = used.map_or(0, |u| u.stride);
+                        let props = if un.starts_with("buffer_load_format")
+                            || un.starts_with("buffer_store_format")
+                        {
+                            (10 | u, 0x409)
+                        } else if *idxen
+                            && format.is_none()
+                            && stride >= 4
+                            && stride.is_multiple_of(4)
+                        {
+                            (12 | u, stride)
+                        } else {
+                            (11 | u, 0)
+                        };
+                        if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                            return Err("a constant buffer's descriptor read as data");
+                        }
+                        (props, None)
+                    }
+                    // A buffer the code reads with scalar loads (`buf[buf.Length - 1]`
+                    // at a uniform index): structured by the used-resource entry's
+                    // stride, so its record count is in elements, else raw (bytes).
+                    Fields::Smem { .. } => {
+                        let used =
+                            used.ok_or("a scalar-loaded buffer of unknown kind read as data")?;
+                        if used.kind == ResourceType::Cbv {
+                            return Err("a constant buffer's descriptor read as data");
+                        }
+                        let props = match used.stride {
+                            0 | 1 => (11 | u, 0),
+                            s if s.is_multiple_of(4) => (12 | u, s),
+                            _ => return Err("a scalar-loaded buffer of odd stride read as data"),
+                        };
+                        (props, None)
+                    }
+                    _ => return Err("a scalar memory read as data"),
+                };
+                let h = self.handle(site, &src, false, props)?;
+                Ok((h, image))
+            })();
+            let (h, image) = match slice_res {
+                Ok(v) => v,
+                Err(why) => {
+                    for rel in 0..span {
+                        let k = u32::from(first) + rel;
+                        if k < count {
+                            self.set(inst.write(Reg::S(code + k as u8)), Val::Missing(why));
+                        }
+                    }
+                    continue;
+                }
+            };
+            let c = self.cur;
+            let i32t = self.s.t.i32;
+            let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+            let mip = if image.is_some() && !uav {
+                self.s.m.i32(0)
+            } else {
+                self.s.m.undef(i32t)
+            };
+            let d = self
+                .s
+                .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+            let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
+            let words: Vec<(u32, V)> = match image {
+                Some(kind) => {
+                    let one = self.s.m.i32(1);
+                    let w = field(self, 0);
+                    let (height, depth) = match kind {
+                        1 => (one, one),
+                        2 | 5 => (field(self, 1), one),
+                        6 => (one, field(self, 1)),
+                        _ => (field(self, 1), field(self, 2)),
+                    };
+                    let levels = if uav { one } else { field(self, 3) };
+                    let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
+                    let (w, height, depth, levels) = (
+                        less(self, w),
+                        less(self, height),
+                        less(self, depth),
+                        less(self, levels),
+                    );
+                    let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+                    let (k30, k2, k14, k16, mask) = (
+                        k(self, 30),
+                        k(self, 2),
+                        k(self, 14),
+                        k(self, 16),
+                        k(self, 0x3FFF),
+                    );
+                    let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
+                    let hi = self.s.m.bin(c, Bin::LShr, w, k2);
+                    let hi = self.s.m.bin(c, Bin::And, hi, mask);
+                    let ht = self.s.m.bin(c, Bin::Shl, height, k14);
+                    let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
+                    let ty = [0, 8, 9, 0, 10, 11, 12, 13][kind as usize];
+                    let base = k(self, 0xFAC | ty << 28);
+                    let last = self.s.m.bin(c, Bin::Shl, levels, k16);
+                    let d3 = self.s.m.bin(c, Bin::Or, base, last);
+                    let mut out = vec![(1, d1), (2, d2), (3, d3)];
+                    if kind != 5 {
+                        out.push((4, depth));
+                    }
+                    out
+                }
+                None => vec![(2, field(self, 0))],
+            };
+            for (rel, x) in words {
+                let k = u32::from(first) + rel;
+                if k < count {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
                 }
             }
         }
