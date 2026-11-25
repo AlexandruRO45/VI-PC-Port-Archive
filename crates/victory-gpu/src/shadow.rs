@@ -3845,6 +3845,41 @@ impl Shadow {
         self.start as usize
     }
 
+    /// The lazy copy-back gives a card-only page back (`crate::lazyback`):
+    /// `gpu` is the card side's bytes at offset `at` of this copy in the
+    /// card's memory, as last fetched. The title could not touch the page
+    /// while it was card-only, so the CPU's side and title memory still
+    /// hold what the merge before left: the card's bytes are the page's
+    /// bytes. They go into the CPU's side and into title memory through our
+    /// own view, which the title views' protection does not stop. False
+    /// (nothing written to title memory) if there is no own view for it.
+    pub(crate) fn card_materialize(&self, at: usize, gpu: &[u8]) -> bool {
+        if self.card.is_none() || at + gpu.len() > self.len as usize || gpu.is_empty() {
+            return false;
+        }
+        let start = self.start as usize;
+        // No block locks: a thread that holds them (a merge under flights)
+        // may come here through a read, and a card-only page is merged by
+        // no one else meanwhile (the copy-back keeps its bytes instead).
+        // SAFETY: inside the mapping (checked above).
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        held.copy_from_slice(gpu);
+        crate::host::shaders_write(start + at, gpu);
+        self.put_back_own(start + at, gpu)
+    }
+
+    /// As [`Shadow::card_materialize`] where our own view could not take
+    /// the bytes: through the kernel, after the title views were given
+    /// their protection back.
+    pub(crate) fn card_materialize_kernel(&self, at: usize, gpu: &[u8]) {
+        if at + gpu.len() > self.len as usize || gpu.is_empty() {
+            return;
+        }
+        let start = self.start as usize;
+        crate::watch::writing(start + at, gpu.len());
+        crate::host::write_mapped((start + at) as *mut u8, gpu.as_ptr(), gpu.len());
+    }
+
     /// [`relay`], for a copy in the card's memory: `gpu` is what the
     /// card's side held at offset `at` on when a fetch sent after send
     /// `fetched_after` (`crate::host`'s order of the queue) ran, in a piece

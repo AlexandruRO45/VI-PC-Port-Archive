@@ -761,6 +761,25 @@ fn is_view(start: usize, end: usize) -> bool {
 /// one of those is this memory written, and only a fault can say so.
 /// `VICTORY_VIEW_GUARD=0` leaves the other views as they are, as before.
 fn protect(g: &mut Guards, from: usize, to: usize) {
+    // Blocks the lazy copy-back keeps from the CPU (`crate::lazyback`) are
+    // its own: their protection is not ours to change.
+    if crate::lazyback::any_card_only() {
+        let mut at = from;
+        for block in from..to {
+            if crate::lazyback::is_card_only(block * BLOCK) {
+                if at < block {
+                    protect(g, at, block);
+                }
+                at = block + 1;
+            }
+        }
+        if at > from {
+            if at < to {
+                protect(g, at, to);
+            }
+            return;
+        }
+    }
     protect_here(g, from, to);
     if !view_guard() {
         return;
@@ -789,6 +808,19 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     }
 }
 
+/// The 64 KiB block at `at` leaves the guards (the lazy copy-back takes
+/// its protection over, `crate::lazyback`): it is no longer counted as
+/// guarded or clean. Whether it was guarded.
+pub(crate) fn release(at: usize) -> bool {
+    let block = at / BLOCK;
+    let mut g = guards();
+    let was = g.protected.remove(&block);
+    g.clean.remove(&block);
+    g.viewed.remove(&block);
+    g.aliased.remove(&block);
+    was
+}
+
 /// Views of one page past which its views are not guarded together.
 pub(crate) const MANY_VIEWS: usize = 64;
 
@@ -815,7 +847,7 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// its copies took them, `open` would have opened it.
 fn protect_alias(g: &mut Guards, block: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    if g.protected.contains(&block) {
+    if g.protected.contains(&block) || crate::lazyback::is_card_only(block * BLOCK) {
         return;
     }
     let mut old = 0;
@@ -941,6 +973,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    // A page the lazy copy-back keeps from the CPU is given back first: the
+    // kernel cannot write a page with no access (`crate::lazyback`).
+    crate::lazyback::touched(at, len.min(usize::MAX - at));
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
