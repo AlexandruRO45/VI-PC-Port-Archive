@@ -2862,7 +2862,6 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.loads, [load]);
     }
 
-    
     /// [`WATERFALL_INDEXED_WAVE32`] with the pre-loop sampler load taking its
     /// offset from `v_readfirstlane_b32` in block 0.
     pub(crate) fn pre_loop_first_lane_waterfall() -> Vec<u32> {
