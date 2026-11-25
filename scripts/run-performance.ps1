@@ -4,6 +4,8 @@ param(
     [string]$GameExe,
     [ValidateSet('series-x', 'series-s')]
     [string]$Console = 'series-x',
+    [ValidateRange(0, 240)]
+    [int]$FrameRate = 0,
     [switch]$PrepareOnly
 )
 
@@ -52,10 +54,13 @@ $settings = [ordered]@{
     VICTORY_FRAME_LOG = '1'
     VICTORY_CARD_METER = '1'
 }
+$settings['VICTORY_FRAME_RATE'] = if ($FrameRate -gt 0) { [string]$FrameRate } else { '' }
+$frameRateLabel = if ($FrameRate -gt 0) { "$FrameRate FPS" } else { 'title default' }
 
 Write-Output "Executable: $binary"
 Write-Output "Game: $gamePath"
 Write-Output "Console: $Console"
+Write-Output "Frame rate override: $frameRateLabel"
 Write-Output "Logs: $runDir"
 if ($PrepareOnly) {
     Write-Output 'Paths validated; no game process started.'
