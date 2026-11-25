@@ -1,30 +1,31 @@
 # Vice-Tay
 
-Vice-Tay is an experimental Windows compatibility layer for the Xbox Series build of Grand Theft Auto VI. It is based on [VIctory](https://github.com/Marvisak/VIctory). It runs the title's x86-64 code natively, implements the Xbox services it uses, and translates console GPU programs to DXIL for Direct3D 12. The runtime operates offline. The repository contains source code and synthetic test fixtures.
+I develop and test Vice-Tay on my Ryzen 9 9950X3D and RTX 4090 Windows PC. Vice-Tay is my fork of [VIctory](https://github.com/Marvisak/VIctory) for the Xbox Series build of Grand Theft Auto VI. It runs the title's x86-64 code natively, provides Xbox platform services, and translates console GPU programs to DXIL for Direct3D 12. The runtime operates offline.
 
-## Current status
+## My PC
 
-The development build reaches the opening screens, loads saves, and has shown the prologue under player control. Rendering and frame pacing remain work in progress. Daylight scenes can show an overexposed sky, jagged shadows, and missing details. Ray-traced lighting is incomplete, and turning the camera or moving between scenes can cause long frames. Campaign completion and sustained stability are still unverified.
+| Component | My configuration |
+| --- | --- |
+| Processor | AMD Ryzen 9 9950X3D, 16 cores and 32 threads |
+| Motherboard | MSI MAG X870 TOMAHAWK WIFI (MS-7E51), revision 1.0 |
+| BIOS | MSI 1.A93 |
+| Graphics card | NVIDIA GeForce RTX 4090 with 24 GB GDDR6X |
+| NVIDIA driver | 621.40 (`32.0.16.2140`) |
+| Integrated graphics | AMD Radeon Graphics on the Ryzen CPU |
+| Memory | 48 GiB DDR5 (2 × 24 GiB), configured for 8000 MT/s |
+| System and benchmark SSD | Samsung 990 PRO 4 TB NVMe |
+| Additional SSDs | Samsung 990 PRO 2 TB NVMe and Samsung 970 PRO 1 TB NVMe |
+| Display | Samsung Odyssey OLED G8 G81SF, 3840 × 2160, 240 Hz class |
+| Operating system | Windows 11 Pro 26H2 x64, build 26300.10075 |
+| Windows paging file | 32 GiB allocated on the system SSD |
 
-The latest local run on 25 November 2026 reached the 3D opening cinematic on `main` at `b033e17a`. The cinematic had dark silhouettes and visible lighting defects while shader compilation was active. The gameplay measurements below come from a separate run in the prologue.
-
-Recent changes on `main` include recovery after texture remap queue overflow, pooled GPU upload buffers for texture copies, and reuse of pipeline references within a command list. [PR #14](https://github.com/TaynanGT/Vice-Tay/pull/14) records the changes and their sources.
+I recorded this configuration on 25 November 2026. Vice-Tay rendered on the RTX 4090 in the tests below. Each run records its own window, render or output setting where measured.
 
 ## Local test results
 
-### Test system
+### Current renderer build · 25 November 2026
 
-| Component | Test system |
-| --- | --- |
-| OS | Windows 11 Pro 26H2, build 26300.10075 |
-| CPU | AMD Ryzen 9 9950X3D |
-| GPU | NVIDIA GeForce RTX 4090, 24 GB |
-| GPU driver | NVIDIA 621.40 |
-| RAM | 48 GiB DDR5 |
-
-### 25 November 2026 — `main` at [`b033e17a`](https://github.com/TaynanGT/Vice-Tay/commit/b033e17a)
-
-This was a diagnostics build in Series X mode with command relay level 2 (`VICTORY_RELAY=2`), frame capture enabled, and a 1920 × 1080 window limit. The run started with an existing host pipeline library and an empty shader cache. The renderer was still compiling shaders during the test.
+I tested [`b033e17a`](https://github.com/TaynanGT/Vice-Tay/commit/b033e17a) on the system above in Series X mode. The diagnostics build used `VICTORY_RELAY=2`, frame capture, and a 1920 × 1080 window limit. I started with an existing D3D12 pipeline library and an empty shader cache. Shader compilation continued through loading and into the cinematic.
 
 | Segment | UTC sample times | Samples | Median FPS | FPS range | Median frame time |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -32,57 +33,58 @@ This was a diagnostics build in Series X mode with command relay level 2 (`VICTO
 | Later loading intervals | 20:41:06–20:41:39 | 7 | 15.2 | 0.6–22.3 | 65.6 ms |
 | Opening 3D cinematic | 20:41:46–20:43:01 | 11 | 0.8 | 0.1–1.1 | 1,207 ms |
 
-Each row summarises the renderer's periodic FPS and frame-time samples. The cinematic row includes intervals with at least 500 draw calls per frame. The first of those intervals appeared **88.5 s** after the first runtime log entry. The window was closed at **2 min 56 s**, during the cinematic, and the process exited with code 0.
+These are medians of the renderer's periodic samples. I used intervals with at least 500 draw calls per frame for the cinematic row. The first qualifying sample appeared **88.5 seconds** after the first log entry. I closed the window during the cinematic at **2 minutes 56 seconds**. The process exited with code 0.
 
-### Earlier camera and transition measurements
+### Prologue under player control · 24 November 2026
 
-The 24 November 2026 run used revision [`05a78e3`](https://github.com/TaynanGT/Vice-Tay/commit/05a78e37) in Series X mode at 2560 × 1440 internal resolution and 3840 × 2160 output. The command relay was set to level 2. Texture prefetching and the ray-tracing structure builder were disabled.
+I measured the prologue on the same RTX 4090 PC using [`05a78e3`](https://github.com/TaynanGT/Vice-Tay/commit/05a78e37) and the Series X profile. This run used 2560 × 1440 internal rendering, 3840 × 2160 output, and command relay level 2. Texture prefetching and the ray-tracing structure builder were disabled.
 
-| Prologue segment | Method | FPS | Frame time |
+| What I measured | Method | FPS | Frame time |
 | --- | --- | ---: | --- |
-| Camera stationary | PresentMon, 268 presents over 35.76 s | 7.47 | 132.2 ms median, 157.2 ms at the 95th percentile |
-| Turning the camera | Renderer log, 248 frames over 41.2 s | 6.01 | 166.3 ms mean |
+| Camera stationary in the first room | PresentMon, 268 presents over 35.76 s | 7.47 | 132.2 ms median, 157.2 ms at the 95th percentile |
+| Turning the camera in the first room | Renderer log, 248 frames over 41.2 s | 6.01 | 166.3 ms mean |
 | Scene transition | PresentMon, 155 presents over 35.51 s | 4.34 | 152.9 ms median, 521.7 ms at the 95th percentile |
 
-PresentMon FPS uses the intervals between presents over the sampled segment. These three segments describe different types of work. A matched before-and-after route is still needed to quantify the effect of the latest renderer changes.
+The PresentMon figures use the intervals between presents. The prologue and cinematic runs use different revisions, scenes and settings. A matched run is still needed to measure the performance effect of the latest renderer changes.
 
-### Regression checks
+## What I have verified on this PC
 
-On [`b033e17a`](https://github.com/TaynanGT/Vice-Tay/commit/b033e17a), the local graphics suite passed **262 tests** with **0 failures** and **9 ignored**. A Series X load-only check resolved every import in the executable and its four DLLs. [Windows CI](https://github.com/TaynanGT/Vice-Tay/actions/runs/45694584789) passed the workspace suite and Clippy in the normal and diagnostics configurations.
+- The prologue has reached player control. I could turn the camera in the first room and record a scene transition.
+- The current renderer build reached the 3D opening cinematic. Some figures appeared as dark silhouettes. In the earlier prologue run, the sky and window were overexposed, shadow edges were jagged, and some details were missing.
+- Campaign completion and long-session stability remain unverified on this setup.
 
-## Build and run
+The latest renderer changes recheck texture updates after queue overflow, reuse upload buffers for texture copies, and keep each pipeline and root signature once per command list. See [PR #14](https://github.com/TaynanGT/Vice-Tay/pull/14) for the changes and credits.
 
-### Requirements
+I ran the local graphics suite on [`b033e17a`](https://github.com/TaynanGT/Vice-Tay/commit/b033e17a). It reported **262 passed**, **0 failed**, and **9 ignored**. The Series X load-only check resolved every import in the executable and its four DLLs. [Windows CI](https://github.com/TaynanGT/Vice-Tay/actions/runs/45694584789) passed the workspace tests and both Clippy configurations.
 
-- Windows 10 or 11 x64 and an AVX2-capable CPU.
-- A Direct3D 12 GPU with Shader Model 6.6. Rendering the game world needs mesh shader support.
-- [Rustup](https://rustup.rs/) and the Visual Studio C++ build tools. The Rust release is pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
-- Your own compatible Xbox Series game files, stored outside this repository.
+## How I build and run Vice-Tay
 
-### Configuration
+I use Windows x64, the Visual Studio C++ build tools and the Rust toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml). The RTX 4090 provides Direct3D 12, Shader Model 6.6 and mesh shader support for the world renderer.
 
-Copy the example configuration and set the paths in `victory.toml`. Game files, saves and generated caches belong outside the repository. The default cache and data folders are `%LOCALAPPDATA%\victory\cache` and `%LOCALAPPDATA%\victory\data`.
+Copy [`victory.example.toml`](victory.example.toml) and set the game, cache and save paths. Use your own compatible Xbox Series files and keep them outside the repository. The paths below are examples on the system drive.
 
 ```powershell
 Copy-Item .\victory.example.toml .\victory.toml
-cargo build --locked --release -p victory
-$victory = '.\target\release\victory.exe'
+cargo build --profile diag --locked -p victory --features diagnostics
+$victory = '.\target\diag\victory.exe'
+$title = 'C:\Vice-TayData\game\game.exe'
 & $victory config
+& $victory run $title --console series-x
 ```
 
-`VICTORY_CONFIG` selects a different configuration file. `VICTORY_GAME_DIR`, `VICTORY_CACHE_DIR`, and `VICTORY_DATA_DIR` override the corresponding entries. See [`victory.example.toml`](victory.example.toml) for the optional settings.
-
-### Launch
-
-Set `$title` to the actual executable in your game folder. The first command checks module loading and import resolution. Add `--execute` to launch. Series X is the default console profile.
+The last command checks loading and import resolution. The launch below uses the same console profile, command relay and window limit as my 25 November benchmark.
 
 ```powershell
-$title = 'D:\victory-data\game\game.exe'
-& $victory run $title --console series-x
+$env:VICTORY_RELAY = '2'
+$env:VICTORY_WINDOW_MAX = '1920x1080'
 & $victory run $title --console series-x --execute
 ```
 
-Prebuilding shaders and pipelines is optional. To fill the same cache used by `run`, pass the shader archive, executable and applicable shader DLLs to `translate`. The host pipeline library is specific to the GPU and driver. New configurations may spend time compiling pipelines as scenes load.
+For a release build, use `cargo build --release --locked -p victory` and `target\release\victory.exe`. The window limit preserves aspect ratio and applies to the displayed window. I record console profile, window size, internal resolution and output resolution separately where available.
+
+The cache and save folders default to `%LOCALAPPDATA%\victory\cache` and `%LOCALAPPDATA%\victory\data`. Use `VICTORY_CONFIG` to select an isolated configuration for benchmarking, and `VICTORY_GAME_DIR`, `VICTORY_CACHE_DIR` and `VICTORY_DATA_DIR` to override individual paths.
+
+Use `translate --cache --pipelines` with your shader inputs to prebuild the data that `run` uses. Record the shader and pipeline cache states when measuring. The host pipeline library belongs to the GPU and driver that built it.
 
 ```powershell
 $game = Split-Path -Parent $title
@@ -90,13 +92,11 @@ $game = Split-Path -Parent $title
     "$game\XboxBvhBuilder.dll" "$game\amd_fidelityfx_upscaler_xbox.dll"
 ```
 
-Use `--console series-s` to select the Series S profile. To use AMD's PC upscaler with that profile, set `VICTORY_FIDELITYFX_DIR` or `paths.fidelityfx_dir` to a [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) directory containing `amd_fidelityfx_upscaler_dx12.dll`. The log reports which implementation loads.
-
-`VICTORY_WINDOW_MAX=1920x1080` limits the displayed window size while preserving its aspect ratio. It leaves the render resolution and swap-chain buffers at their original size.
+Series X is the profile used for the numbers above. For a separate Series S test, select `--console series-s`. To use the PC upscaler with that profile, point `VICTORY_FIDELITYFX_DIR` at the [AMD FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) directory containing `amd_fidelityfx_upscaler_dx12.dll`.
 
 ### Controls
 
-Use an XInput gamepad or the following keyboard controls while the title window has focus.
+Use an XInput controller or these keyboard mappings while the window has focus.
 
 | Keyboard | Gamepad |
 | --- | --- |
@@ -107,40 +107,25 @@ Use an XInput gamepad or the following keyboard controls while the title window 
 | `F` / `H` | Stick clicks |
 | `Esc`, `Tab` | Menu, View |
 
-## Development and diagnostics
+## Measuring and reporting a run
 
-[Architecture](docs/architecture.md) describes the loader, Xbox services, shader translator and renderer. Run `cargo xtask install-hooks` to enable the asset-policy check before each commit. [Asset policy](docs/asset-policy.md) covers what can be committed. Keep game-derived files, captures and dumps outside the repository.
+I record the revision, hardware, driver, console profile, cache state, scene and sample interval alongside every result. If you can reproduce an issue on your own setup, include those fields with the failure mode and the relevant lines from `crashes.log`. Captures and logs containing game-derived data belong outside the repository. See the [asset policy](docs/asset-policy.md).
 
-```powershell
-cargo test --workspace --locked
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo build --profile diag --locked -p victory --features diagnostics
-```
-
-Shader validation uses `dxil.dll`. Set `VICTORY_DXIL` to a current x64 validator from a Windows SDK or the [DirectX Shader Compiler](https://github.com/microsoft/DirectXShaderCompiler/releases) if the installed validator rejects Shader Model 6.6.
-
-Use `victory --help` or `victory <command> --help` for the complete options. `inspect` reports executable structure and imports, `census` checks import coverage, `lib-exports` lists import-library symbols, and `shader-info` and `translate` describe or translate shader programs.
-
-### Investigating a run
-
-Report the Vice-Tay revision, Windows build, GPU and driver, console profile, renderer settings, and the scene that reproduces the problem. For performance reports, include the measured interval, the measurement tool, and whether the camera was moving. `crashes.log` is stored under the title's data directory.
-
-| Setting | Use |
+| Diagnostics setting | What I use it for |
 | --- | --- |
-| `VICTORY_LOG` | Controls logging levels, for example `victory_loader=trace,info`. |
-| `VICTORY_KEYS` | Schedules diagnostic input, for example `30:Enter,35:X`. |
-| `VICTORY_CAPTURE` | Saves selected presented frames outside the repo in a diagnostics build. Set `VICTORY_CAPTURE_FRAMES` to choose frame numbers. |
-| `VICTORY_CAPTURE_WORLD` | Also captures frames at offsets from the first frame with 500 draws. |
-| `VICTORY_D3D12_DEBUG=1` | Enables the D3D12 debug layer. |
-| `VICTORY_D3D12_DRED=1` | Records device removal data after a GPU failure. |
-| `VICTORY_D3D12_WARP=1` | Uses the software D3D12 adapter for hardware versus software comparisons. |
-| `VICTORY_CRASH_BREAKPOINTS=1` | Records first-chance breakpoints in `crashes.log`. |
-| `VICTORY_PIPELINE_LOG` | Records pipeline creation, first use, and cache activity. |
+| `VICTORY_LOG` | Select logging levels, for example `victory_loader=trace,info`. |
+| `VICTORY_KEYS` | Schedule repeatable input, for example `30:Enter,35:X`. |
+| `VICTORY_CAPTURE` | Save selected presented frames outside the repository. Use `VICTORY_CAPTURE_FRAMES` to select frames. |
+| `VICTORY_CAPTURE_WORLD` | Capture frames relative to the first frame with 500 draw calls. |
+| `VICTORY_D3D12_DEBUG=1` | Enable the D3D12 debug layer. |
+| `VICTORY_D3D12_DRED=1` | Record device removal information. |
+| `VICTORY_D3D12_WARP=1` | Repeat a run on the software D3D12 adapter. |
+| `VICTORY_CRASH_BREAKPOINTS=1` | Record first-chance breakpoints in `crashes.log`. |
 
-If the loader reports a startup breakpoint at `+0x2237178` on Series 1.0.2.1, check that `appdata0.rpf` from the same package is present beside the executable. If Windows reports error 1455, check the system commit limit and paging-file capacity.
+The repository test suites use synthetic fixtures. Run `cargo test --workspace --locked` for the full suite, or `cargo test -p victory-gpu --lib --locked` for the graphics crate. Use a current x64 [DXIL validator](https://github.com/microsoft/DirectXShaderCompiler/releases) through `VICTORY_DXIL` if the installed validator rejects Shader Model 6.6. See [architecture](docs/architecture.md) for how the runtime is put together.
 
 ## Credits and licence
 
-Vice-Tay builds on [VIctory](https://github.com/Marvisak/VIctory), with contributions and adaptations from [victory-fork](https://github.com/fxceless/victory-fork), [VItoriaBr](https://github.com/uiliannn/VItoriaBr), [KLBF Lab](https://github.com/PastiiJay/klbf-lab), and [VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD). Commit history records the sources of individual changes.
+I build on [Marvisak's VIctory](https://github.com/Marvisak/VIctory) and adapt contributions from [victory-fork](https://github.com/fxceless/victory-fork), [VItoriaBr](https://github.com/uiliannn/VItoriaBr), [KLBF Lab](https://github.com/PastiiJay/klbf-lab), and [VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD). The commit history records individual contributions.
 
-Vice-Tay is an independent project. Its source code is licensed under GPL-3.0-or-later. See [LICENSE](LICENSE).
+Vice-Tay is an independent project. This repository contains source code and synthetic test fixtures. The source is licensed under GPL-3.0-or-later. See [LICENSE](LICENSE).
