@@ -384,6 +384,7 @@ struct Physical {
     /// which writes through views of our own.
     shown: HashMap<(usize, usize), Vec<usize>>,
     committed: HashSet<(usize, usize)>,
+    placeholders: HashSet<(usize, usize)>,
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -776,12 +777,18 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
+    if !physical.placeholders.remove(&(base, len)) {
+        // SAFETY: splits the placeholder around the range (failing harmlessly
+        // when the range is the whole placeholder).
+        unsafe {
+            VirtualFree(
+                base as *mut c_void,
+                len,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            );
+        }
+    }
     let view = unsafe {
-        VirtualFree(
-            base as *mut c_void,
-            len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
         MapViewOfFile3(
             slice.section.0,
             GetCurrentProcess(),
@@ -919,6 +926,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        if at >= base && at + size <= end { physical.placeholders.insert((at, size)); }
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
