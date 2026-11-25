@@ -680,6 +680,16 @@ pub fn with_kernel_write<T>(at: usize, len: usize, write: impl FnOnce() -> T) ->
     result
 }
 
+/// What a refresh does before it copies view memory: the 64 KiB pages of
+/// `[at, at + len)` (address / 64 KiB) written since it was last guarded,
+/// guarding them again, with every other view of them; `None` if the
+/// range is not view memory. For other crates' tests, whose kernel reads
+/// into title views race with it.
+#[cfg(feature = "test-support")]
+pub fn title_memory_guard(at: usize, len: usize) -> Option<Vec<usize>> {
+    guard(at, at.saturating_add(len))
+}
+
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
 /// of `section` (`crate::inplace::title_memory_view`): the view is
 /// writable, so the same bytes guarded at another view must be checked
@@ -988,6 +998,7 @@ mod tests {
             guard(view, view + 2 * BLOCK),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
+        assert!(!writable(view + 100), "the read no longer holds it open");
         // Told before the view goes, as the runtime does (`xmem`'s
         // `unmap`): told after, another test may have mapped and guarded a
         // view at the address meanwhile, and the telling forgets its guards.

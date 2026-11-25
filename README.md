@@ -59,6 +59,9 @@ for the rendering settings and implementation.
 - fxceless and the contributors to the Windows rendering fork developed
   rendering, shader translation, and texture upload improvements used here.
   [VIctory rendering fork](https://github.com/fxceless/victory-fork)
+- uiliannn and the VItoriaBr contributors shared fixes for GPU synchronization,
+  texture uploads, descriptor allocation, shader translation, and XMA audio.
+  [VItoriaBr](https://github.com/uiliannn/VItoriaBr)
 - ivall and the XCL contributors provided a reference for title behavior.
   The related changes in this repository are implemented in VIctory.
   [XCL](https://github.com/ivall/xcl)

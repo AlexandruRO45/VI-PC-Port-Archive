@@ -399,6 +399,18 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     E_NOTIMPL
 }
 
+/// The console device uses the host device's removal state.
+extern "system" fn removed_reason(_: This) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        // SAFETY: a plain query on a live device.
+        if let Err(error) = unsafe { host.device.GetDeviceRemovedReason() } {
+            return error.code().0;
+        }
+    }
+    S_OK
+}
+
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
 /// methods `ID3D12Device1` to `ID3D12Device8` add, in order: 3, 1, 3, 6, 9,
 /// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
@@ -431,6 +443,7 @@ static FUNCTIONS: Table<160> = {
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
     f[36] = fence::create as *const (); // 0x120
+    f[37] = removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
@@ -486,6 +499,13 @@ mod tests {
         );
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
+    }
+
+    #[test]
+    fn a_healthy_device_reports_no_removal() {
+        let device = device();
+        let reason = slot::<extern "system" fn(This) -> HRESULT>(device, 0x128);
+        assert_eq!(reason(device), S_OK);
     }
 
     #[test]
