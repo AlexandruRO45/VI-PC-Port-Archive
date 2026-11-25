@@ -1947,6 +1947,15 @@ fn workers() -> &'static Workers {
     workers
 }
 
+/// Helps with shared work only while the caller's batch is unfinished.
+fn next_wide_job(workers: &Workers, left: &Mutex<usize>) -> Option<Job> {
+    let remaining = left.lock().unwrap_or_else(|e| e.into_inner());
+    if *remaining == 0 {
+        return None;
+    }
+    workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
+}
+
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
@@ -1973,17 +1982,32 @@ fn wide(jobs: Vec<Job>) {
         }
     }
     workers.more.notify_all();
-    loop {
-        let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
-        match job {
-            Some(job) => job(),
-            None => break,
-        }
+    while let Some(job) = next_wide_job(workers, &left.0) {
+        job();
     }
     let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
     while *n > 0 {
         n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
     }
+}
+
+#[cfg(test)]
+#[test]
+fn completing_our_wide_batch_leaves_other_jobs_for_workers() {
+    let left = Arc::new(Mutex::new(1));
+    let mut jobs: std::collections::VecDeque<Job> = Default::default();
+    let count = left.clone();
+    jobs.push_back(Box::new(move || *count.lock().unwrap() = 0));
+    jobs.push_back(Box::new(|| panic!("another batch was taken")));
+    let workers = Workers {
+        jobs: Mutex::new(jobs),
+        more: std::sync::Condvar::new(),
+    };
+
+    while let Some(job) = next_wide_job(&workers, &left) {
+        job();
+    }
+    assert_eq!(workers.jobs.lock().unwrap().len(), 1);
 }
 
 /// [`wide`], for the host's own work on host copies (a submission's

@@ -32,6 +32,27 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+/// A title-memory range whose changed pages another subsystem needs to read.
+pub(crate) struct Tracked {
+    start: usize,
+    end: usize,
+    seen: Mutex<BTreeMap<usize, u64>>,
+}
+
+/// Tracks a runtime GPU-memory range, including physical-page views when
+/// `views` is true. Other process memory is not tracked.
+pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
+    let end = start.checked_add(len)?;
+    if len == 0 || writes(start, end, views).is_none() {
+        return None;
+    }
+    Some(Tracked {
+        start,
+        end,
+        seen: Mutex::default(),
+    })
+}
+
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
@@ -380,6 +401,36 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+impl Tracked {
+    /// Takes changed pages for the caller's fixed window within this range.
+    pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from >= to {
+            return Vec::new();
+        }
+        let Some((_, pages)) = writes(from, to, true) else {
+            return Vec::new();
+        };
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for (page, write) in pages {
+            if seen.get(&page).is_some_and(|&last| last >= write) {
+                continue;
+            }
+            let (start, end) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+            if start >= end {
+                continue;
+            }
+            seen.insert(page, write);
+            match ranges.last_mut() {
+                Some((_, last)) if *last == start => *last = end,
+                _ => ranges.push((start, end)),
+            }
+        }
+        ranges
+    }
 }
 
 /// Guarded blocks of view memory.
@@ -1006,6 +1057,20 @@ mod tests {
         unsafe { ((view + 200) as *mut u32).write_volatile(9) };
         let (_, found) = writes(view, view + PAGE, true).expect("view memory");
         assert!(found.iter().any(|&(p, at)| p == page && at > now), "{found:?}");
+        // Across two title views of the section (64 KiB each, as the heap's
+        // often are): written in two parts.
+        crate::title_memory_remapped(view, 2 * BLOCK);
+        crate::inplace::title_memory_view(view, BLOCK, section, 0);
+        crate::inplace::title_memory_view(view + BLOCK, BLOCK, section, BLOCK as u64);
+        let across = *b"across two views";
+        let at = view + BLOCK - 8;
+        let started = std::time::Instant::now();
+        while crate::host::write_unseen(at, across.as_ptr(), across.len()).is_none() {
+            assert!(started.elapsed().as_secs() < 5, "never written across the views");
+            std::thread::yield_now();
+        }
+        // SAFETY: our view.
+        assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, across.len()) }, &across);
         // Not a view of a section we know: written as before.
         let mut plain = [0u8; 16];
         assert!(crate::host::write_unseen(plain.as_mut_ptr() as usize, bytes.as_ptr(), 4).is_none());
