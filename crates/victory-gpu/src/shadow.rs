@@ -172,6 +172,58 @@ impl Masked {
         }
     }
 
+    /// The mask of the bytes where `now` and `was` differ, for the stretch of
+    /// the copy that starts at offset `at` (widened to whole words), and how
+    /// many runs of differing bytes there are: what [`Masked::of_runs`] of
+    /// `changed_runs(now, was)` gives, in one pass with no list of runs (a
+    /// gameplay frame has up to a million of them, under flights' writes).
+    pub(crate) fn of_diff(at: usize, now: &[u8], was: &[u8]) -> (Masked, usize) {
+        let n = now.len().min(was.len());
+        let from = at & !3;
+        let to = (at + n).next_multiple_of(4).max(from);
+        let mut bits = vec![0u32; (to - from).div_ceil(32)];
+        let mut runs = 0;
+        let mut inside = false;
+        let mut i = 0;
+        while i < n {
+            // Equal bytes, eight at a time while they last.
+            if i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
+                inside = false;
+                i += 8;
+                continue;
+            }
+            let differs = now[i] != was[i];
+            if differs {
+                let b = at + i - from;
+                bits[b / 32] |= 1 << (b % 32);
+                if !inside {
+                    runs += 1;
+                }
+            }
+            inside = differs;
+            i += 1;
+        }
+        // Ends at the word of the last difference, as `of_runs` ends: the
+        // pass on the card covers what changed.
+        let (from, to, bits) = match bits.iter().rposition(|&w| w != 0) {
+            Some(last) => {
+                // The last differing byte, and the word it is in.
+                let byte = last * 32 + (31 - bits[last].leading_zeros() as usize);
+                let to = (from + byte + 1).next_multiple_of(4).min(to);
+                (from, to, bits[..(to - from).div_ceil(32)].to_vec())
+            }
+            None => (from, from, Vec::new()),
+        };
+        (
+            Masked {
+                from,
+                to,
+                bits: bits.into(),
+            },
+            runs,
+        )
+    }
+
     /// The runs of set bits that lie in `[a, b)`, as offsets `(start, end)`.
     pub(crate) fn runs_in(&self, a: usize, b: usize) -> Vec<(usize, usize)> {
         let (a, b) = (a.max(self.from), b.min(self.to));
@@ -2314,6 +2366,42 @@ mod merge_tests {
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
     #[test]
+    fn a_mask_of_the_differences_is_the_mask_of_the_changed_runs() {
+        use super::{Masked, changed_runs};
+        // Pseudo-random bytes and changes, at offsets on and off words.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..200 {
+            let n = 1 + (next() % 4096) as usize;
+            let at = 4096 + (next() % 37) as usize;
+            let was: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+            let mut now = was.clone();
+            let changes = (next() % 64) as usize;
+            for _ in 0..changes {
+                let i = (next() as usize) % n;
+                let len = 1 + (next() as usize) % 9;
+                for b in now.iter_mut().skip(i).take(len) {
+                    *b = b.wrapping_add(1 + (next() % 255) as u8);
+                }
+            }
+            let runs = changed_runs(&now, &was);
+            let (m, count) = Masked::of_diff(at, &now, &was);
+            assert_eq!(count, runs.len(), "case {case}: the runs' count");
+            let want: Vec<(usize, usize)> = runs.iter().map(|&(r, len)| (at + r, at + r + len)).collect();
+            assert_eq!(m.runs_in(m.from, m.to), want, "case {case}: the mask's runs");
+            if !runs.is_empty() {
+                let wide = Masked::of_runs(at, &runs);
+                assert_eq!(m, wide, "case {case}: the same mask");
+            }
+        }
+    }
+
+    #[test]
     fn a_mask_holds_exactly_the_changed_runs() {
         use super::Masked;
         // Runs of a stretch at offset 4,099 (not a multiple of 4): the mask
@@ -3401,6 +3489,36 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    // Without a gap to join over (the default): the mask
+                    // and the runs' count in one pass, no list of runs.
+                    if merge_gap() == 0 {
+                        let (masked, count) = Masked::of_diff(at, title, held);
+                        if count == 0 {
+                            continue;
+                        }
+                        if count > *runs_left {
+                            if !self.card_mask_of(masked) {
+                                MERGE_WHY[2].fetch_add(1, Ordering::Relaxed);
+                                return true;
+                            }
+                            // The CPU's side takes the title's bytes: where
+                            // they do not differ they are the same.
+                            held.copy_from_slice(title);
+                            MERGED[1].fetch_add(count as u64, Ordering::Relaxed);
+                            MASKED[0].fetch_add(1, Ordering::Relaxed);
+                            MASKED[1].fetch_add(count as u64, Ordering::Relaxed);
+                            continue;
+                        }
+                        *runs_left -= count;
+                        for (a, b) in masked.runs_in(masked.from, masked.to) {
+                            let (r, m) = (a - at, b - a);
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            self.card_changed(at + r, at + r + m);
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
                     let runs = joined_over(changed_runs(title, held), merge_gap());
                     if runs.len() > *runs_left {
                         // Too many for a copy each: through a mask, one pass
@@ -3700,13 +3818,20 @@ impl Shadow {
     /// False (nothing noted) if the switch is off, the copy has no card
     /// side, or the widened stretch would pass the end of the card's buffer.
     fn card_mask(&self, at: usize, runs: &[(usize, usize)]) -> bool {
+        if runs.is_empty() {
+            return false;
+        }
+        self.card_mask_of(Masked::of_runs(at, runs))
+    }
+
+    /// [`Shadow::card_mask`] of a mask made already.
+    fn card_mask_of(&self, masked: Masked) -> bool {
         let Some(card) = &self.card else {
             return false;
         };
-        if !card_mask_on() || runs.is_empty() {
+        if !card_mask_on() || masked.from >= masked.to {
             return false;
         }
-        let masked = Masked::of_runs(at, runs);
         if masked.to as u64 > card.size {
             return false;
         }
