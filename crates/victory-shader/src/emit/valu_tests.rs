@@ -981,6 +981,45 @@ fn v_cvt_f16_u16_and_i16_widen_the_integer_first() {
 }
 
 #[test]
+fn v_vop2_shifts_min_max_and_logic_match_rdna2() {
+    // VOP2 in its VOP3 form (0x100 + opcode): v0 = op(v1, v2). The reversed
+    // shifts take the amount from the first operand and shift the second.
+    type Pick = fn(u32, u32) -> u32;
+    let ops: [(&str, u16, Pick); 9] = [
+        ("v_min_i32", 0x111, |a, b| (a as i32).min(b as i32) as u32),
+        ("v_max_i32", 0x112, |a, b| (a as i32).max(b as i32) as u32),
+        ("v_min_u32", 0x113, u32::min),
+        ("v_max_u32", 0x114, u32::max),
+        ("v_lshrrev_b32", 0x116, |a, b| b >> (a & 31)),
+        ("v_ashrrev_i32", 0x118, |a, b| {
+            ((b as i32) >> (a & 31)) as u32
+        }),
+        ("v_or_b32", 0x11C, |a, b| a | b),
+        ("v_xor_b32", 0x11D, |a, b| a ^ b),
+        ("v_xnor_b32", 0x11E, |a, b| !(a ^ b)),
+    ];
+    // Shift amounts as they stand (1, 31) and wrapped (32, 0x80000001).
+    let values = [0u32, 1, 31, 32, 0x8000_0001, 0xFFFF_FFFF];
+    let mut cases = Vec::new();
+    for a in values {
+        for b in values {
+            cases.push([a, b, 0, 0]);
+        }
+    }
+    for (name, op, pick) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), 0));
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let want = pick(inp[0], inp[1]);
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1],
+            );
+        });
+    }
+}
+
+#[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x061, 0, vgpr(1))]);
