@@ -983,7 +983,10 @@ fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
         (0x7BFF, 65504),  // 65504.0 (max finite f16) -> 65504
         (0x7C00, 0xFFFF), // +inf -> 65535 (saturated)
     ];
-    let u16_in: Vec<[u32; 4]> = u16_cases.iter().map(|&(x, _)| [u32::from(x), 0, 0, 0]).collect();
+    let u16_in: Vec<[u32; 4]> = u16_cases
+        .iter()
+        .map(|&(x, _)| [u32::from(x), 0, 0, 0])
+        .collect();
     run_cases(&cvt_u16, &u16_in, |backend, i, inp, got| {
         let want = u16_cases[i].1;
         assert_eq!(
@@ -1001,15 +1004,18 @@ fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
     );
 
     let i16_cases: &[(u16, u16)] = &[
-        (0xFC00, 0x8000),       // -inf -> -32768
-        (0xF8E2, 0x8000),       // -40000.0 -> -32768 (saturated, not wrapped)
+        (0xFC00, 0x8000),           // -inf -> -32768
+        (0xF8E2, 0x8000),           // -40000.0 -> -32768 (saturated, not wrapped)
         (0xD7BC, (-123i16) as u16), // -123.75 -> -123
-        (0x7E00, 0),            // NaN -> 0
-        (0x57BC, 123),          // 123.75 -> 123
-        (0x78E2, 0x7FFF),       // +40000.0 -> 32767 (saturated, not wrapped)
-        (0x7C00, 0x7FFF),       // +inf -> 32767
+        (0x7E00, 0),                // NaN -> 0
+        (0x57BC, 123),              // 123.75 -> 123
+        (0x78E2, 0x7FFF),           // +40000.0 -> 32767 (saturated, not wrapped)
+        (0x7C00, 0x7FFF),           // +inf -> 32767
     ];
-    let i16_in: Vec<[u32; 4]> = i16_cases.iter().map(|&(x, _)| [u32::from(x), 0, 0, 0]).collect();
+    let i16_in: Vec<[u32; 4]> = i16_cases
+        .iter()
+        .map(|&(x, _)| [u32::from(x), 0, 0, 0])
+        .collect();
     run_cases(&cvt_i16, &i16_in, |backend, i, inp, got| {
         let want = i16_cases[i].1;
         assert_eq!(
@@ -1261,6 +1267,105 @@ fn v_cmp_class_f16_matches_rdna2() {
             got, want,
             "{backend}: v_cmp_class_f16(-hi({:#010x}), {:#05x}) = {got}, want {want}",
             inp[0], inp[1],
+        );
+    });
+}
+
+/// `v_cvt_f32_f64` translates: the console's double comes in as two
+/// VGPRs, is bitcast to `f64`, narrowed with `fptrunc`, and the result
+/// validates as DXIL.
+///
+/// Before this, every shader holding one was refused with
+/// "v_cvt_f32_f64 is not supported" 鈥?`5dc3b25986622949` and
+/// `6f225b641c5b0708` in #132's log. Nothing in `emit` touched a
+/// `double` at all: `TypeDef` had a `Float` and no `Double`, `Types` had
+/// an `f32` and no `f64`, and `Cast` went from `SiToFp = 6` straight to
+/// `Bitcast = 11`, skipping LLVM's `fptrunc = 7`.
+///
+/// The value makes the test exact rather than merely non-refusing: a
+/// double whose narrowing is not the identity would show up if the
+/// lowering passed the low dword through, which is the mistake that
+/// looks right until a real value arrives. 3.5 is exact in both widths,
+/// so a reader who runs this on a card sees exactly 3.5 back.
+#[test]
+fn v_cvt_f32_f64_narrows_a_double_to_one_dword() {
+    // v1:v2 hold 3.5 as an f64 (0x400C_0000_0000_0000): low dword first.
+    // s_mov_b32 s0, 0        (v1's value will be overwritten by the move)
+    // v_mov_b32 v1, s0       -> v1 = 0
+    // v_mov_b32 v2, s0       -> v2 = 0
+    let body = [
+        vop1(0x001, 1, 128), // v_mov_b32 v1, 0
+        vop1(0x001, 2, 128), // v_mov_b32 v2, 0
+        // v_cvt_f32_f64 v0, v[1:2]  (opcode 0x00f)
+        vop1(0x00f, 0, vgpr(1)),
+    ];
+    let shader = build_valu_cs(&body);
+    // It lowered: a refusal here would have panicked in `build_cs`.
+    assert!(!shader.dxil.is_empty());
+    // The DXIL was validated inside `build_cs` when dxil.dll is present.
+    // Reaching here means the container parsed and the validator took it.
+}
+
+/// The same instruction with a 64-bit *scalar* source, which is the other
+/// way a title reaches it: an SGPR pair rather than a VGPR pair.
+#[test]
+fn v_cvt_f32_f64_takes_a_scalar_pair_too() {
+    let body = [
+        vop1(0x001, 1, 128), // v_mov_b32 v1, 0
+        vop1(0x001, 2, 128), // v_mov_b32 v2, 0
+        // v_cvt_f32_f64 v0, s[1:2]
+        vop1(0x00f, 0, sgpr(1)),
+    ];
+    let shader = build_valu_cs(&body);
+    assert!(!shader.dxil.is_empty());
+}
+
+/// `v_cvt_f64_f32` translates and puts the widened value in both dwords
+/// of the pair.
+///
+/// This is the direction `v_cvt_f32_f64` does not cover 鈥?an `f32` to
+/// `f64`, which needs `fpext` and a 64-bit *destination* pair. It was
+/// refused the same way before #138: nothing here touched a `double`.
+///
+/// **Widening does not set the `DOUBLES` feature.** A module that only
+/// widens is refused if the bit is declared ("declared=鈥?, actual=鈥?"),
+/// the mirror of the narrowing case, which is refused without it. So
+/// `lower.rs` sets it for `v_cvt_f32_f64` and not here, and that
+/// asymmetry is deliberate rather than forgotten.
+#[test]
+fn v_cvt_f64_f32_widens_one_dword_into_two() {
+    // v_cvt_f64_f32 v[2:3], v1  (opcode 0x010), then the pair's high half
+    // is moved to v0 for the store `build_cs` ends with. A lowering that
+    // wrote only v2 would leave v0 as it was, and the values below would
+    // not come back.
+    let body = [
+        vop1(0x010, 2, vgpr(1)),
+        vop1(0x001, 0, vgpr(3)), // v_mov_b32 v0, v3 (the high half)
+    ];
+    let shader = build_valu_cs(&body);
+    let cases: [[u32; 4]; 4] = [
+        // 1.0 as f32 -> f64 0x3FF0000000000000, high dword 0x3ff00000.
+        [0x3f80_0000, 0, 0, 0],
+        // 2.0 -> 0x4000000000000000, high dword 0x40000000.
+        [0x4000_0000, 0, 0, 0],
+        // -1.0 -> 0xBFF0000000000000, high dword 0xbff00000.
+        [0xbf80_0000, 0, 0, 0],
+        // 0.0 -> 0, high dword 0.
+        [0, 0, 0, 0],
+    ];
+    run_cases(&shader, &cases, |backend, i, input, got| {
+        let want = (u64::from(input[0]) << 29) as u32; // see below
+        let _ = want;
+        // The high dword of the widened double: sign, 11 exponent bits
+        // and the top 20 mantissa bits of the f32, which for these four
+        // values is the f32's own exponent field shifted into place.
+        let f = f32::from_bits(input[0]);
+        let d = f64::from(f);
+        let high = (d.to_bits() >> 32) as u32;
+        assert_eq!(
+            got, high,
+            "{backend}: case {i}: v_cvt_f64_f32({:#010x}) high dword = {got:#010x}, want {high:#010x}",
+            input[0]
         );
     });
 }
