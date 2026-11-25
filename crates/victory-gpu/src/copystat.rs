@@ -57,6 +57,17 @@ pub(crate) enum C {
     DynamicAsked,
     DynamicRefused,
     DynamicNs,
+    /// A draw's fresh descriptor tables: asked for, found already in the
+    /// list with the same contents (no copy), made; the title slots hashed
+    /// to tell them apart and the slots copied into dynamic ones, and the
+    /// time each of those took.
+    TableAsked,
+    TableReused,
+    TableMade,
+    TableHashed,
+    TableCopied,
+    TableHashNs,
+    TableCopyNs,
     /// Marker texts for device-removed data (`HostList::note`).
     NoteNs,
     /// Ranges given to shaders (steps), their snapshots, and the bytes
@@ -1097,19 +1108,20 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexPastTurn as usize]),
     );
     tracing::info!(
-        "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
-         threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
-         refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
-         {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
-         guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
-         sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
-         {:.0} steps {:.1} MB left out",
+        "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0}          refused, {:.1} ms searching; fresh tables: {:.0} asked, {:.0} already held with the          same contents, {:.0} made, {:.0} slots hashed in {:.2} ms and {:.0} slots copied in          {:.2} ms; notes {:.1} ms; shader-written ranges: {:.0} steps in          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms;          guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers:          {:.0} steps {:.1} MB left out",
         c[C::RecordCalls as usize],
         c[C::RecordNs as usize] / 1e6,
         ms(c[C::PipelineWaitUs as usize]),
         c[C::DynamicAsked as usize],
         c[C::DynamicRefused as usize],
         c[C::DynamicNs as usize] / 1e6,
+        c[C::TableAsked as usize],
+        c[C::TableReused as usize],
+        c[C::TableMade as usize],
+        c[C::TableHashed as usize],
+        ms(c[C::TableHashNs as usize]),
+        c[C::TableCopied as usize],
+        ms(c[C::TableCopyNs as usize]),
         c[C::NoteNs as usize] / 1e6,
         c[C::GpuWrites as usize],
         c[C::BackSubmissions as usize],
