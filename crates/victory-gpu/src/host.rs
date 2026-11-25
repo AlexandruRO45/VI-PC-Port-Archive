@@ -3111,9 +3111,14 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // (`VICTORY_MERGE_RUNS`: the cap. Run 218 had 500 to 5,400 changed
         // runs a frame of a few bytes each, and the cap of 512 settled the
         // flights twice a frame, 50 ms of the submitting thread.)
+        // 4,096 by default since an RTX 4070 A/B: with 512 the settle came
+        // once a frame "over VICTORY_MERGE_RUNS" and the picture had many
+        // more black textures and overblown light than with 4,096 (the
+        // title's bytes under the flights waited for the settle). Same
+        // frame rate either way.
         static RUNS: OnceLock<usize> = OnceLock::new();
         let mut runs_left = *RUNS.get_or_init(|| {
-            std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(512, |n| n.clamp(1, 1 << 16))
+            std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(4096, |n| n.clamp(1, 1 << 16))
         });
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
