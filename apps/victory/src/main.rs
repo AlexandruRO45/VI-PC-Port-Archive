@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod cpu;
 mod inspect;
 mod prebuild;
 mod run;
@@ -22,6 +23,16 @@ use clap::{Parser, Subcommand, ValueEnum};
     about = "Run an Xbox Series title natively on Windows"
 )]
 struct Cli {
+    /// Keep this whole process at or below this percentage of the machine's
+    /// CPU (1 to 100). Unset: no limit.
+    #[arg(
+        long,
+        global = true,
+        value_name = "PERCENT",
+        env = "VICTORY_CPU_PERCENT",
+        value_parser = clap::value_parser!(u8).range(1..=100)
+    )]
+    cpu_percent: Option<u8>,
     #[command(subcommand)]
     command: Command,
 }
@@ -144,6 +155,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
+    cpu::limit(cli.cpu_percent);
     match cli.command {
         Command::Inspect {
             file,

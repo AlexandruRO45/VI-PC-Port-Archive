@@ -21,6 +21,11 @@ memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
 tracing.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,

@@ -26,7 +26,7 @@ victory-game = { path = "crates/victory-game" }
 # External crates
 anyhow = "1.0.104"
 thiserror = "2.0.21"
-clap = { version = "4.6.9", features = ["derive"] }
+clap = { version = "4.6.9", features = ["derive", "env"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 serde = { version = "1.0.229", features = ["derive"] }
