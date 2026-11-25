@@ -187,7 +187,7 @@ impl Host {
             let factory: IDXGIFactory4 =
                 CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
             let (adapter_index, adapter): (u32, IDXGIAdapter1) = if warp {
-                let warp_adapter = factory.EnumWarpAdapter().map_err(err)?;
+                let warp_adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 let adapter: IDXGIAdapter1 = warp_adapter.cast().map_err(err)?;
                 let desc = adapter.GetDesc1().map_err(err)?;
                 (warp_adapter_index(&factory, &desc).unwrap_or(0), adapter)
