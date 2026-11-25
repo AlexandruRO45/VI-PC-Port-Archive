@@ -144,7 +144,11 @@ a pipeline whose creation ends the process is refused from the next run on
 costs one crash; delete its line to try it again. Pipelines are still created
 in parallel; when a crash leaves several in creation, they are listed in
 `pipeline-journal\suspects.txt` and each is created alone until it succeeds,
-so a repeat crash names only the pipeline that caused it.
+so a repeat crash names only the pipeline that caused it. Notes of a process
+that is still running (a second instance) are left alone. Quitting while a
+single pipeline is being created looks like a crash to the next run: delete
+that pipeline's line from `crashed.txt` (the comment above it names its
+stages) to have it tried again.
 
 ### Windows shader-test validator
 

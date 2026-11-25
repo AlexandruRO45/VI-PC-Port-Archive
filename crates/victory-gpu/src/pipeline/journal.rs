@@ -55,9 +55,34 @@ fn journal() -> Option<&'static Journal> {
                 tracing::warn!("VICTORY_PIPELINE_JOURNAL: no cache folder; journal off");
                 return None;
             };
-            Journal::open(dir)
+            Journal::open(dir, process_running)
         })
         .as_ref()
+}
+
+/// Whether process `pid` is still running.
+#[cfg(windows)]
+fn process_running(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: the handle is checked before use and closed after.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(h, &mut code) != 0;
+        CloseHandle(h);
+        ok && code == STILL_ACTIVE as u32
+    }
+}
+
+#[cfg(not(windows))]
+fn process_running(_pid: u32) -> bool {
+    false
 }
 
 fn read_list(path: &Path) -> HashSet<String> {
@@ -82,7 +107,9 @@ fn write_list<'a>(path: &Path, keys: impl IntoIterator<Item = &'a String>) {
 impl Journal {
     /// The journal in `dir`, with the notes a run that ended while creating
     /// pipelines left sorted into `crashed.txt` or `suspects.txt`.
-    fn open(dir: &Path) -> Option<Journal> {
+    /// `running` says whether a process id is still running: notes of a
+    /// running process (another instance) are left alone.
+    fn open(dir: &Path, running: impl Fn(u32) -> bool) -> Option<Journal> {
         let pending = dir.join("pending");
         let crashed_file = dir.join("crashed.txt");
         let suspects_file = dir.join("suspects.txt");
@@ -97,6 +124,15 @@ impl Journal {
         for entry in std::fs::read_dir(&pending).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let parts: Vec<&str> = name.split('@').collect();
+            // `<pid>-<n>` last: a process still running is creating this
+            // pipeline now, and did not end while doing so.
+            let pid = parts
+                .last()
+                .and_then(|t| t.split('-').next())
+                .and_then(|p| p.parse::<u32>().ok());
+            if pid.is_some_and(|p| p != std::process::id() && running(p)) {
+                continue;
+            }
             let key = parts[0].to_owned();
             let detail = if parts.len() == 3 { parts[1] } else { "" }.to_owned();
             if !crashed.contains(&key) && !left.iter().any(|(k, _)| *k == key) {
@@ -271,14 +307,14 @@ mod tests {
     fn a_note_left_by_a_crash_refuses_that_pipeline_from_then_on() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let j = Journal::open(dir.path()).unwrap();
+            let j = Journal::open(dir.path(), |_| false).unwrap();
             let done = j.enter("aaaaaaaaaaaaaaaa", "").unwrap();
             drop(done);
             let crashing = j.enter("bbbbbbbbbbbbbbbb+cccccccccccccccc", "").unwrap();
             // The process ends here: the note stays.
             std::mem::forget(crashing);
         }
-        let j = Journal::open(dir.path()).unwrap();
+        let j = Journal::open(dir.path(), |_| false).unwrap();
         assert!(j.enter("bbbbbbbbbbbbbbbb+cccccccccccccccc", "").is_none());
         assert!(j.enter("aaaaaaaaaaaaaaaa", "").is_some());
         let listed = std::fs::read_to_string(dir.path().join("crashed.txt")).unwrap();
@@ -295,12 +331,12 @@ mod tests {
     fn notes_left_by_pipelines_created_together_make_suspects_that_run_alone() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let j = Journal::open(dir.path()).unwrap();
+            let j = Journal::open(dir.path(), |_| false).unwrap();
             // Two pipelines in creation at once when the process ends.
             std::mem::forget(j.enter("eeeeeeeeeeeeeeee", "").unwrap());
             std::mem::forget(j.enter("ffffffffffffffff", "").unwrap());
         }
-        let j = Journal::open(dir.path()).unwrap();
+        let j = Journal::open(dir.path(), |_| false).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("crashed.txt")).unwrap_or_default(),
             ""
@@ -317,7 +353,7 @@ mod tests {
         // Created alone again, it crashes: now it is named.
         std::mem::forget(j.enter("ffffffffffffffff", "").unwrap());
         drop(j);
-        let j = Journal::open(dir.path()).unwrap();
+        let j = Journal::open(dir.path(), |_| false).unwrap();
         assert!(j.enter("ffffffffffffffff", "").is_none());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("suspects.txt")).unwrap(),
@@ -329,7 +365,7 @@ mod tests {
     fn a_crashed_pipeline_is_listed_with_its_stages_and_sizes() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let j = Journal::open(dir.path()).unwrap();
+            let j = Journal::open(dir.path(), |_| false).unwrap();
             std::mem::forget(
                 j.enter(
                     "1234123412341234+5678567856785678",
@@ -346,7 +382,7 @@ mod tests {
                 names[0].starts_with("1234123412341234+5678567856785678@vertex-1024+pixel-2048@")
             );
         }
-        let j = Journal::open(dir.path()).unwrap();
+        let j = Journal::open(dir.path(), |_| false).unwrap();
         assert!(j.enter("1234123412341234+5678567856785678", "").is_none());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("crashed.txt")).unwrap(),
@@ -355,9 +391,34 @@ mod tests {
     }
 
     #[test]
+    fn a_note_of_a_process_still_running_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = dir.path().join("pending");
+        std::fs::create_dir_all(&pending).unwrap();
+        // Another instance (process 4242) is creating this pipeline now.
+        std::fs::write(pending.join("abababababababab@compute-100@4242-7"), "").unwrap();
+        let j = Journal::open(dir.path(), |p| p == 4242).unwrap();
+        assert!(j.enter("abababababababab", "").is_some());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("crashed.txt")).unwrap_or_default(),
+            ""
+        );
+        assert!(pending.join("abababababababab@compute-100@4242-7").exists());
+        // Once that process is gone, the note it left counts.
+        drop(j);
+        let j = Journal::open(dir.path(), |_| false).unwrap();
+        assert!(j.enter("abababababababab", "").is_none());
+    }
+
+    #[test]
+    fn the_running_process_check_knows_this_process() {
+        assert!(process_running(std::process::id()));
+    }
+
+    #[test]
     fn ordinary_pipelines_are_created_together() {
         let dir = tempfile::tempdir().unwrap();
-        let j = Journal::open(dir.path()).unwrap();
+        let j = Journal::open(dir.path(), |_| false).unwrap();
         let a = j.enter("1111111111111111", "").unwrap();
         let b = j.enter("2222222222222222", "").unwrap();
         drop((a, b));
@@ -367,7 +428,7 @@ mod tests {
     fn a_line_removed_from_the_list_is_tried_again() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("crashed.txt"), "# tried again\n").unwrap();
-        let j = Journal::open(dir.path()).unwrap();
+        let j = Journal::open(dir.path(), |_| false).unwrap();
         assert!(j.enter("dddddddddddddddd", "").is_some());
     }
 }
