@@ -36,20 +36,20 @@ const STATUS_CONNECTED: u32 = 0x3;
 const ASYNC_ENUMERATION: u32 = 1;
 
 /// Gamepad buttons; the title maps each bit to one of its pad buttons.
-const MENU: u32 = 0x1;
-const VIEW: u32 = 0x2;
-const A: u32 = 0x4;
-const B: u32 = 0x8;
-const X: u32 = 0x10;
-const Y: u32 = 0x20;
-const UP: u32 = 0x40;
-const DOWN: u32 = 0x80;
-const LEFT: u32 = 0x100;
-const RIGHT: u32 = 0x200;
-const LEFT_SHOULDER: u32 = 0x400;
-const RIGHT_SHOULDER: u32 = 0x800;
-const LEFT_STICK: u32 = 0x1000;
-const RIGHT_STICK: u32 = 0x2000;
+pub(super) const MENU: u32 = 0x1;
+pub(super) const VIEW: u32 = 0x2;
+pub(super) const A: u32 = 0x4;
+pub(super) const B: u32 = 0x8;
+pub(super) const X: u32 = 0x10;
+pub(super) const Y: u32 = 0x20;
+pub(super) const UP: u32 = 0x40;
+pub(super) const DOWN: u32 = 0x80;
+pub(super) const LEFT: u32 = 0x100;
+pub(super) const RIGHT: u32 = 0x200;
+pub(super) const LEFT_SHOULDER: u32 = 0x400;
+pub(super) const RIGHT_SHOULDER: u32 = 0x800;
+pub(super) const LEFT_STICK: u32 = 0x1000;
+pub(super) const RIGHT_STICK: u32 = 0x2000;
 
 /// Devices: host pad slots, the keyboard's stand-in pad, the keyboard.
 const PADS: usize = 4;
@@ -81,17 +81,18 @@ const FALLBACK_BUTTONS: [(u8, u32); 15] = [
     (b'H', RIGHT_STICK),
 ];
 
-/// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
+/// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive). The
+/// DualSense reader (`dualsense`) fills the same shape.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct PadState {
-    buttons: u32,
-    left_trigger: f32,
-    right_trigger: f32,
-    left_x: f32,
-    left_y: f32,
-    right_x: f32,
-    right_y: f32,
+pub(super) struct PadState {
+    pub(super) buttons: u32,
+    pub(super) left_trigger: f32,
+    pub(super) right_trigger: f32,
+    pub(super) left_x: f32,
+    pub(super) left_y: f32,
+    pub(super) right_x: f32,
+    pub(super) right_y: f32,
 }
 
 /// Motor speeds for one pad, each 0 (off) to `u16::MAX` (full), in the
@@ -1164,18 +1165,8 @@ mod host {
             }
             // A DualSense is a HID device, not an XInput one; it plays slot 0
             // when no XInput pad answers there.
-            if slot == 0
-                && let Some(pad) = super::super::dualsense::latest()
-            {
-                return Some(PadState {
-                    buttons: pad.buttons,
-                    left_trigger: pad.left_trigger,
-                    right_trigger: pad.right_trigger,
-                    left_x: pad.left_x,
-                    left_y: pad.left_y,
-                    right_x: pad.right_x,
-                    right_y: pad.right_y,
-                });
+            if slot == 0 {
+                return super::super::dualsense::latest();
             }
             None
         }

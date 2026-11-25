@@ -34,21 +34,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
 };
 
-/// Gamepad buttons, the bits the title maps (same values as `gameinput`).
-const MENU: u32 = 0x1;
-const VIEW: u32 = 0x2;
-const A: u32 = 0x4;
-const B: u32 = 0x8;
-const X: u32 = 0x10;
-const Y: u32 = 0x20;
-const UP: u32 = 0x40;
-const DOWN: u32 = 0x80;
-const LEFT: u32 = 0x100;
-const RIGHT: u32 = 0x200;
-const LEFT_SHOULDER: u32 = 0x400;
-const RIGHT_SHOULDER: u32 = 0x800;
-const LEFT_STICK: u32 = 0x1000;
-const RIGHT_STICK: u32 = 0x2000;
+use super::gameinput::{
+    A, B, DOWN, LEFT, LEFT_SHOULDER, LEFT_STICK, MENU, PadState, RIGHT, RIGHT_SHOULDER,
+    RIGHT_STICK, UP, VIEW, X, Y,
+};
 
 /// Sony's vendor id and the DualSense / DualSense Edge product ids.
 const SONY: u16 = 0x054c;
@@ -57,23 +46,11 @@ const DUALSENSE_EDGE: u16 = 0x0df2;
 
 const GENERIC_READ: u32 = 0x8000_0000;
 
-/// A pad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Reading {
-    pub buttons: u32,
-    pub left_trigger: f32,
-    pub right_trigger: f32,
-    pub left_x: f32,
-    pub left_y: f32,
-    pub right_x: f32,
-    pub right_y: f32,
-}
-
-static READING: Mutex<Option<Reading>> = Mutex::new(None);
+static READING: Mutex<Option<PadState>> = Mutex::new(None);
 static START: Once = Once::new();
 
 /// The pad's newest state, starting the reader on first use.
-pub fn latest() -> Option<Reading> {
+pub(super) fn latest() -> Option<PadState> {
     START.call_once(|| {
         let _ = std::thread::Builder::new()
             .name("dualsense".into())
@@ -115,7 +92,7 @@ fn reader() {
 fn read_reports(pad: &Pad) {
     let mut buf = vec![0u8; pad.input_len.max(78)];
     let log = std::env::var_os("VICTORY_PAD_LOG").is_some();
-    let mut last: Option<Reading> = None;
+    let mut last: Option<PadState> = None;
     loop {
         let mut read = 0u32;
         // SAFETY: a live handle and a buffer of its report length.
@@ -351,7 +328,7 @@ fn input_report(report: &[u8]) -> bool {
 /// 5 L1, 6 R1, 7 L2, 8 R2, 9 create, 10 options, 11 L3, 12 R3, 13 PS,
 /// 14 touchpad. Square, cross, circle and triangle become the title's X, A,
 /// B and Y, so circle is back as on the console.
-fn parse(preparsed: isize, report: &[u8]) -> Option<Reading> {
+fn parse(preparsed: isize, report: &[u8]) -> Option<PadState> {
     if report.len() < 2 || !input_report(report) {
         return None;
     }
@@ -371,7 +348,7 @@ fn parse(preparsed: isize, report: &[u8]) -> Option<Reading> {
 }
 
 /// Turns the declared fields into the title's pad state.
-fn state(sticks: [u32; 4], triggers: [u32; 2], hat: u32, usages: &[u16]) -> Reading {
+fn state(sticks: [u32; 4], triggers: [u32; 2], hat: u32, usages: &[u16]) -> PadState {
     let centered = |v: u32| ((f32::from(v as u8) - 127.5) / 127.5).clamp(-1.0, 1.0);
     let mut buttons = 0u32;
     for usage in usages {
@@ -402,7 +379,7 @@ fn state(sticks: [u32; 4], triggers: [u32; 2], hat: u32, usages: &[u16]) -> Read
         7 => UP | LEFT,
         _ => 0,
     };
-    Reading {
+    PadState {
         buttons,
         left_trigger: f32::from(triggers[0] as u8) / 255.0,
         right_trigger: f32::from(triggers[1] as u8) / 255.0,
@@ -421,7 +398,7 @@ mod tests {
     const CENTER: [u32; 4] = [128, 128, 128, 128];
     const UP_NEUTRAL: u32 = 8;
 
-    fn pad(usages: &[u16], hat: u32) -> Reading {
+    fn pad(usages: &[u16], hat: u32) -> PadState {
         state(CENTER, [0, 0], hat, usages)
     }
 
