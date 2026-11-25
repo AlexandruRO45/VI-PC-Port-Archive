@@ -22,8 +22,8 @@ platform. These notes are what has worked for testers.
 
 Under Wine, much of a frame's time goes into the wineserver, which keeps
 each process's mapped views in a list and walks it on every memory query.
-VIctory asks many such questions per frame. ajsem1337's patch in #340 keeps
-the views in a tree instead. On an RTX 5080 with proton-cachyos 11.0 a
+VIctory asks many such questions per frame. ajsem1337's patch in #340, with
+tests and contributions by neonbyte1, keeps the views in a tree instead. On an RTX 5080 with proton-cachyos 11.0 a
 world frame took about 4.0 s with the stock server and about 1.0 s with
 the patched one; testers in #340 report similar gains.
 
@@ -118,4 +118,4 @@ Then run `victory.exe` with `~/proton-victory/proton runinprefix ...`.
   Each port builds without warnings and was checked against the original
   lookups by a randomized comparison; only proton-cachyos 11.0 has been
   run with the title. It is Wine code (LGPL-2.1-or-later), credit to
-  ajsem1337.
+  ajsem1337 and neonbyte1.

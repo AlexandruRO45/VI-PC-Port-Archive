@@ -1,6 +1,7 @@
 wineserver: keep a process's memory views in a tree instead of a list.
 
-Original patch and idea: ajsem1337 (Marvisak/VIctory#340); ported to
+Original patch and idea: ajsem1337 (Marvisak/VIctory#340), with tests and
+contributions by neonbyte1; ported to
 upstream Wine master (gitlab.winehq.org/wine/wine master, commit
 a79470449d0388ed3b5ff7975a4cefd6a3d80a2a; SERVER_PROTOCOL_VERSION 987).
 Wine code: LGPL-2.1-or-later. Apply in the Wine source tree with git apply.

@@ -1,6 +1,7 @@
 wineserver: keep a process's memory views in a tree instead of a list.
 
-Original patch and idea: ajsem1337 (Marvisak/VIctory#340); ported to
+Original patch and idea: ajsem1337 (Marvisak/VIctory#340), with tests and
+contributions by neonbyte1; ported to
 wine-cachyos 11.0 (cachyos-11.0-20260702-proton-native, protocol 932).
 Wine code: LGPL-2.1-or-later. Apply in the Wine source tree with git apply.
 

@@ -1,6 +1,7 @@
 wineserver: keep a process's memory views in a tree instead of a list.
 
-Original patch and idea: ajsem1337 (Marvisak/VIctory#340); ported to
+Original patch and idea: ajsem1337 (Marvisak/VIctory#340), with tests and
+contributions by neonbyte1; ported to
 Valve Proton 10 wine (ValveSoftware/wine branch proton_10.0, commit
 b8fdff8e1f855b5276ec4ddca0f31b2792554322; committed SERVER_PROTOCOL_VERSION 855,
 856 after tools/make_requests as run by the Proton build).
