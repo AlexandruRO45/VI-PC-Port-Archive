@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use super::Shader;
 use super::hold_clock::{CLOCK, HoldClock};
 use super::host::{GraphicsState, HostPipeline, MeshPass1};
+use super::{pressure, telemetry as stats};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -71,18 +72,25 @@ impl Pending {
     }
 
     // The queue grants one worker exclusive ownership of this attempt.
-    fn make(&self, mode: CompileMode) -> Option<Lane> {
+    fn make(&self, mode: CompileMode) -> Option<Deferred> {
+        let _phase = stats::phase(stats::Phase::Build);
         let (started, cpu) = (Instant::now(), super::thread_cpu());
         let mut compile = Compile::new(mode);
+        compile.requested = Some(&self.now);
         compile.mesh_pass1 = self.mesh_pass1.lock().unwrap_or_else(|e| e.into_inner()).take();
         let made = HostPipeline::build(&self.shaders, self.graphics.as_deref(), &mut compile);
-        if let Some(lane) = compile.deferred {
+        let (user, kernel) = super::thread_cpu_since(cpu);
+        if matches!(mode, CompileMode::Worker) {
+            stats::JOBS.fetch_add(1, Ordering::Relaxed);
+            stats::JOB_WALL_MS.fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            stats::JOB_CPU_MS.fetch_add(user + kernel, Ordering::Relaxed);
+        }
+        if let Some(deferred) = compile.deferred {
             *self.mesh_pass1.lock().unwrap_or_else(|e| e.into_inner()) = compile.mesh_pass1.take();
-            return Some(lane);
+            return Some(deferred);
         }
         #[cfg(feature = "diagnostics")]
         log_built(&self.key);
-        let (user, kernel) = super::thread_cpu_since(cpu);
         tracing::debug!(
             shaders = ?self.shaders,
             ms = started.elapsed().as_millis() as u64,
@@ -239,8 +247,17 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Queues `p` for the workers: once, and once more ahead of the early
 /// starts if a draw waits for it (`now`) while it is still queued.
 fn start(p: &Arc<Pending>, now: bool) {
+    // A previously requested job is already queued, running or deferred.
+    if now && p.now.load(Ordering::Relaxed) {
+        return;
+    }
     if let Some(now) = enqueue(p, now) {
         queue(p.clone(), now);
+    } else if now {
+        // Wake workers if the first draw promoted an already-deferred job.
+        // Synchronize with their empty-queue check before signaling.
+        let _queue = QUEUES.0.lock().unwrap_or_else(|e| e.into_inner());
+        QUEUES.1.notify_one();
     }
 }
 
@@ -324,17 +341,33 @@ pub(super) enum CompileMode {
     Worker,
 }
 
-/// One build attempt. A busy lane is neither a D3D12 error nor a refusal.
-pub(super) struct Compile {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Deferred {
+    Lane(Lane),
+    Pressure,
+}
+
+/// One build attempt. A deferral is neither a D3D12 error nor a refusal.
+pub(super) struct Compile<'a> {
     mode: CompileMode,
-    deferred: Option<Lane>,
+    requested: Option<&'a AtomicBool>,
+    deferred: Option<Deferred>,
     /// Pass 1, if pass 2 was deferred. Tied to a single pending pipeline.
     pub(super) mesh_pass1: Option<MeshPass1>,
 }
 
-impl Compile {
+impl Compile<'_> {
     pub(super) fn new(mode: CompileMode) -> Self {
-        Self { mode, deferred: None, mesh_pass1: None }
+        Self { mode, requested: None, deferred: None, mesh_pass1: None }
+    }
+
+    fn defer_for_memory(&mut self, paused: bool) -> bool {
+        let defer = paused && matches!(self.mode, CompileMode::Worker)
+            && self.requested.is_some_and(|now| !now.load(Ordering::Relaxed));
+        if defer {
+            self.deferred = Some(Deferred::Pressure);
+        }
+        defer
     }
 
     pub(super) fn cold<T>(
@@ -343,17 +376,31 @@ impl Compile {
         bytes: usize,
         create: impl FnOnce() -> windows::core::Result<T>,
     ) -> windows::core::Result<Option<T>> {
-        let Some(lane) = Lane::for_bytes(bytes).filter(|_| matches!(self.mode, CompileMode::Worker)) else {
-            return create().map(Some);
-        };
-        let Some(permit) = Permit::acquire(lane) else {
-            self.deferred = Some(lane);
+        if self.defer_for_memory(PREWARM_PAUSED.load(Ordering::Relaxed)) {
             return Ok(None);
+        }
+        let lane = Lane::for_bytes(bytes).filter(|_| matches!(self.mode, CompileMode::Worker));
+        let permit = if let Some(lane) = lane {
+            let Some(permit) = Permit::acquire(lane) else {
+                self.deferred = Some(Deferred::Lane(lane));
+                return Ok(None);
+            };
+            Some(permit)
+        } else {
+            None
         };
+        let phase = stats::phase(stats::Phase::DriverCreate);
         let started = Instant::now();
         let result = create();
+        drop(phase);
         drop(permit);
-        tracing::debug!(name, ?lane, bytes, ms = started.elapsed().as_millis() as u64, "cold host pipeline compile");
+        stats::CREATES.fetch_add(1, Ordering::Relaxed);
+        if result.is_err() {
+            stats::FAILED_CREATES.fetch_add(1, Ordering::Relaxed);
+        }
+        if lane.is_some() {
+            tracing::debug!(name, ?lane, bytes, ms = started.elapsed().as_millis() as u64, "cold host pipeline compile");
+        }
         result.map(Some)
     }
 }
@@ -379,6 +426,7 @@ struct Queues {
     fresh: [VecDeque<Arc<Pending>>; 2],
     deferred: [VecDeque<Arc<Pending>>; 2],
     busy: [bool; 2],
+    pressure: VecDeque<Arc<Pending>>,
 }
 
 impl Queues {
@@ -387,6 +435,7 @@ impl Queues {
             fresh: [VecDeque::new(), VecDeque::new()],
             deferred: [VecDeque::new(), VecDeque::new()],
             busy: [false; 2],
+            pressure: VecDeque::new(),
         }
     }
 
@@ -416,15 +465,69 @@ impl Queues {
         None
     }
 
-    fn next(&mut self) -> Option<Arc<Pending>> {
+    fn defer(&mut self, p: Arc<Pending>, reason: Deferred) {
+        match reason {
+            Deferred::Lane(lane) => self.deferred[lane as usize].push_back(p),
+            Deferred::Pressure => self.pressure.push_back(p),
+        }
+    }
+
+    fn next(&mut self, paused: bool) -> Option<Arc<Pending>> {
         self.retry(true)
             .or_else(|| self.claim(0))
-            .or_else(|| self.retry(false))
-            .or_else(|| self.claim(1))
+            .or_else(|| {
+                let at = self.pressure.iter().position(|p| p.now.load(Ordering::Relaxed))?;
+                self.pressure.remove(at)
+            })
+            .or_else(|| if paused { None } else { self.retry(false) })
+            .or_else(|| if paused { None } else { self.pressure.pop_front() })
+            .or_else(|| self.claim(1)) // Keep probing new early jobs for cache hits.
     }
 }
 
 static QUEUES: (Mutex<Queues>, Condvar) = (Mutex::new(Queues::new()), Condvar::new());
+static PREWARM_PAUSED: AtomicBool = AtomicBool::new(false);
+
+fn start_sampler() {
+    let initial = pressure::paused(false, pressure::available_mib());
+    PREWARM_PAUSED.store(initial, Ordering::Relaxed);
+    let spawn = std::thread::Builder::new().name("victory-pso-sampler".into()).spawn(move || {
+        use super::library::{LOADED, MADE};
+        let mut last = [0; 8];
+        pressure::sample_loop(initial, |paused| {
+            if PREWARM_PAUSED.load(Ordering::Relaxed) != paused {
+                let _queue = QUEUES.0.lock().unwrap_or_else(|e| e.into_inner());
+                PREWARM_PAUSED.store(paused, Ordering::Relaxed);
+                QUEUES.1.notify_all();
+            }
+        }, |available_mib, pages_input_s, paused| {
+            let total = [
+                LOADED.load(Ordering::Relaxed), stats::MISSES.load(Ordering::Relaxed),
+                MADE.load(Ordering::Relaxed), stats::CREATES.load(Ordering::Relaxed),
+                stats::FAILED_CREATES.load(Ordering::Relaxed), stats::JOBS.load(Ordering::Relaxed),
+                stats::JOB_WALL_MS.load(Ordering::Relaxed), stats::JOB_CPU_MS.load(Ordering::Relaxed),
+            ];
+            let delta: [u64; 8] = std::array::from_fn(|i| total[i].saturating_sub(last[i]));
+            last = total;
+            let (urgent, early, parked, lanes, busy) = {
+                let q = QUEUES.0.lock().unwrap_or_else(|e| e.into_inner());
+                let waiting = |i: usize| q.fresh[i].iter().filter(|p| !p.taken.load(Ordering::Relaxed)
+                    && (i == 0 || !p.now.load(Ordering::Relaxed))).count();
+                (waiting(0), waiting(1), q.pressure.len(), q.deferred.each_ref().map(VecDeque::len), q.busy)
+            };
+            tracing::info!(?available_mib, ?pages_input_s, prewarm_paused = paused,
+                outstanding = waiting(), urgent, early, pressure_deferred = parked,
+                large_deferred = lanes[0], huge_deferred = lanes[1], large_busy = busy[0], huge_busy = busy[1],
+                phases = %stats::snapshot(), hits = delta[0], misses = delta[1], made = delta[2],
+                creates_finished = delta[3], creates_failed = delta[4], attempts = delta[5],
+                worker_wall_ms = delta[6], worker_cpu_ms = delta[7], "host pipeline queue sample");
+        });
+    });
+    if let Err(error) = spawn {
+        PREWARM_PAUSED.store(false, Ordering::Relaxed);
+        tracing::warn!(%error, "pipeline memory sampler unavailable; prewarm not throttled");
+    }
+}
 
 const BOOST_ABOVE: u64 = 64;
 const LOWER_AT: u64 = 32;
@@ -489,11 +592,15 @@ fn queue(p: Arc<Pending>, now: bool) {
         });
         let priority = setting("VICTORY_PIPELINE_PRIORITY", Priority::Auto, Priority::parse);
         tracing::info!(workers = n, ?priority, "host pipeline worker configuration");
+        start_sampler();
         (0..n)
-            .filter(|i| {
+            .filter(|&i| {
                 let spawned = std::thread::Builder::new()
                     .name(format!("victory-pipelines-{i}"))
-                    .spawn(move || work(priority));
+                    .spawn(move || {
+                        stats::register(i);
+                        work(priority);
+                    });
                 if let Err(e) = &spawned {
                     tracing::warn!(error = %e, "no pipeline worker");
                 }
@@ -524,7 +631,7 @@ fn work(priority: Priority) {
         let p = {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(p) = queues.next() {
+                if let Some(p) = queues.next(PREWARM_PAUSED.load(Ordering::Relaxed)) {
                     break p;
                 }
                 let (held, waited) = work
@@ -540,9 +647,9 @@ fn work(priority: Priority) {
         };
         let next_priority = priority.normal(waiting(), normal == Some(true));
         set_priority(&mut normal, next_priority);
-        if let Some(lane) = p.make(CompileMode::Worker) {
+        if let Some(reason) = p.make(CompileMode::Worker) {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
-            queues.deferred[lane as usize].push_back(p);
+            queues.defer(p, reason);
             work.notify_one();
             continue;
         }
@@ -618,7 +725,7 @@ mod tests {
         assert!(Permit::acquire(Lane::Large).is_none());
         let mut worker = Compile::new(CompileMode::Worker);
         assert_eq!(worker.cold("large", large, || panic!("compile ran")).unwrap(), None::<()>);
-        assert_eq!(worker.deferred, Some(Lane::Large));
+        assert_eq!(worker.deferred, Some(Deferred::Lane(Lane::Large)));
         let mut sync = Compile::new(CompileMode::Sync);
         assert_eq!(sync.cold("prebuild", large, || Ok(1)).unwrap(), Some(1));
         let mut worker = Compile::new(CompileMode::Worker);
@@ -640,11 +747,35 @@ mod tests {
         queues.fresh[0].push_back(ready.clone());
         assert!(queues.take_lane(Lane::Large));
         p.now.store(true, Ordering::Relaxed);
-        assert!(Arc::ptr_eq(&queues.next().unwrap(), &ready));
-        assert!(queues.next().is_none());
+        assert!(Arc::ptr_eq(&queues.next(false).unwrap(), &ready));
+        assert!(queues.next(false).is_none());
         queues.busy[Lane::Large as usize] = false;
-        assert!(Arc::ptr_eq(&queues.next().unwrap(), &p));
-        assert!(Arc::ptr_eq(&queues.next().unwrap(), &early));
+        assert!(Arc::ptr_eq(&queues.next(false).unwrap(), &p));
+        assert!(Arc::ptr_eq(&queues.next(false).unwrap(), &early));
+    }
+
+    #[test]
+    fn pressure_defers_cold_early_work_but_promotion_and_hits_stay_eligible() {
+        let mut queues = Queues::new();
+        let early = Arc::new(Pending::new(Vec::new(), None));
+        let promote = Arc::new(Pending::new(Vec::new(), None));
+        let probe = Arc::new(Pending::new(Vec::new(), None));
+        let mut compile = Compile::new(CompileMode::Worker);
+        compile.requested = Some(&promote.now);
+        assert!(!compile.defer_for_memory(false));
+        assert!(compile.defer_for_memory(true));
+        assert_eq!(compile.deferred, Some(Deferred::Pressure));
+        assert!(!Compile::new(CompileMode::Sync).defer_for_memory(true));
+        queues.defer(early.clone(), Deferred::Pressure);
+        queues.defer(promote.clone(), Deferred::Pressure);
+        queues.fresh[1].push_back(probe.clone());
+        assert!(Arc::ptr_eq(&queues.next(true).unwrap(), &probe));
+        assert!(queues.next(true).is_none());
+        promote.now.store(true, Ordering::Relaxed);
+        assert!(!compile.defer_for_memory(true));
+        assert!(Arc::ptr_eq(&queues.next(true).unwrap(), &promote));
+        assert!(queues.next(true).is_none());
+        assert!(Arc::ptr_eq(&queues.next(false).unwrap(), &early));
     }
 
     /// An early start is queued once; a draw waiting for it puts it ahead,

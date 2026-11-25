@@ -113,6 +113,7 @@ impl Shader {
     pub(crate) fn mesh_fallback(
         &self,
     ) -> Option<&(Translated, victory_shader::emit::MeshRecordLayout)> {
+        let _phase = telemetry::phase(telemetry::Phase::Shader);
         self.mesh_fallback.get_or_init(|| {
             let result = victory_shader::emit::translate_mesh_fallback(&self.container)
                 .map_err(|e| e.to_string())
@@ -124,6 +125,10 @@ impl Shader {
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
+        if let Some(translated) = self.translated.get() {
+            return translated.as_ref();
+        }
+        let _phase = telemetry::phase(telemetry::Phase::Shader);
         self.translated
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
@@ -583,6 +588,10 @@ pub(crate) mod host;
 pub(crate) mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod pressure;
+#[cfg(windows)]
+mod telemetry;
 
 /// Tracks actual title bind waits for the opt-in title sleep policy.
 #[cfg(windows)]

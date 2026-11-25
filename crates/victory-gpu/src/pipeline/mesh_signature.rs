@@ -60,7 +60,9 @@ pub(super) fn get(
     if BYPASS.get() {
         return create(device, root, base, about).map(|sig| (root.clone(), sig));
     }
+    use crate::pipeline::telemetry::{Phase, phase};
     let identity: IUnknown = device.cast()?;
+    let _phase = phase(Phase::SignatureLock);
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let roots = cache
         .devices
@@ -73,6 +75,7 @@ pub(super) fn get(
     }
     // Serialize real creations so concurrent cache misses for the same root
     // cannot each call into the AMD driver. No pipeline-library lock is held.
+    let _create = phase(Phase::SignatureCreate);
     let sig = create(device, root, base, about)?;
     let entry = (root.clone(), sig);
     roots.insert(blob.to_vec(), entry.clone());

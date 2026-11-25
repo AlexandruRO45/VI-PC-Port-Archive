@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 mod mapped;
 use mapped::View;
+use super::telemetry as stats;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -211,17 +212,20 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 pub(super) fn pipeline(
     name: &str,
     bytes: usize,
-    compile: &mut super::make::Compile,
+    compile: &mut super::make::Compile<'_>,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<Option<ID3D12PipelineState>> {
     let wide = HSTRING::from(name);
     #[cfg(feature = "diagnostics")]
     LAST.set(None);
+    let lock_phase = stats::phase(stats::Phase::LibraryLock);
     let library = library();
     if let Some(library) = library {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+        let load_phase = stats::phase(stats::Phase::LibraryLoad);
         let loaded = load(&l.library, PCWSTR(wide.as_ptr()));
+        drop(load_phase);
         l.touch();
         if let Ok(pso) = loaded {
             #[cfg(feature = "diagnostics")]
@@ -230,12 +234,15 @@ pub(super) fn pipeline(
             return Ok(Some(pso));
         }
     }
+    drop(lock_phase);
+    stats::MISSES.fetch_add(1, Ordering::Relaxed);
     // Neither admission nor driver compilation holds the library mutex.
     let Some(pso) = compile.cold(name, bytes, create)? else { return Ok(None) };
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), false)));
     MADE.fetch_add(1, Ordering::Relaxed);
     if let Some(library) = library {
+        let _phase = stats::phase(stats::Phase::LibraryLock);
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a live PSO. StorePipeline refuses a name already stored.
         if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
@@ -290,6 +297,7 @@ pub(crate) fn trim_idle() {
 /// the AOT manifest tagged with the exact bytes successfully published.
 pub(crate) fn save(now: bool) {
     use std::sync::TryLockError;
+    let _phase = stats::phase(stats::Phase::Save);
     static SAVE: Mutex<Option<Instant>> = Mutex::new(None);
     let Some(dir) = DIR.get() else { return };
     // Hold across publication so multiple saves cannot race on the temp files.

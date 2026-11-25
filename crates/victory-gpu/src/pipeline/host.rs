@@ -366,7 +366,7 @@ impl HostPipeline {
     pub(super) fn build(
         shaders: &[Arc<Shader>],
         g: Option<&GraphicsState>,
-        compile: &mut super::make::Compile,
+        compile: &mut super::make::Compile<'_>,
     ) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
@@ -606,7 +606,7 @@ impl HostPipeline {
         root_blob: Vec<u8>,
         compute: bool,
         mesh: bool,
-        compile: &mut super::make::Compile,
+        compile: &mut super::make::Compile<'_>,
     ) -> Option<Self> {
         let host = host()?;
         let code = |i: usize| {
@@ -802,7 +802,7 @@ fn mesh_fallback(
     ps: Option<&Arc<Shader>>,
     g: &GraphicsState,
     shaders: &[Arc<Shader>],
-    compile: &mut super::make::Compile,
+    compile: &mut super::make::Compile<'_>,
 ) -> Option<HostPipeline> {
     let (cs, layout) = ms.mesh_fallback()?;
     let pixel = match ps {
@@ -1035,7 +1035,7 @@ fn mesh_pipeline(
     [ms, ps]: [D3D12_SHADER_BYTECODE; 2],
     g: &GraphicsState,
     name: &str,
-    compile: &mut super::make::Compile,
+    compile: &mut super::make::Compile<'_>,
 ) -> windows::core::Result<Option<ID3D12PipelineState>> {
     use windows::core::Interface;
     /// A stream subobject: its type, then its description, pointer-aligned.
@@ -1118,6 +1118,8 @@ fn root_signature(
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
 ) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
+    use super::telemetry::{Phase, phase};
+    let _phase = phase(Phase::Root);
     let input = if compute {
         D3D12_ROOT_SIGNATURE_FLAG_NONE
     } else {
