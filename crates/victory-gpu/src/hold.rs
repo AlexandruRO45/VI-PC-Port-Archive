@@ -41,13 +41,17 @@ const ALWAYS: u32 = 8;
 
 impl ValueWait {
     /// Whether it holds with `read` giving the memory's value: `None` for a
-    /// comparison we do not know (counted by the caller, taken as holding)
-    /// and for memory that cannot be read (taken as not holding).
+    /// comparison we do not know (counted by the caller, taken as holding).
+    /// Memory that cannot be read yet (a page not mapped, say) is not
+    /// holding: the queue waits until it reads.
     pub(crate) fn holds(&self, read: &dyn Fn(u64, u8) -> Option<u64>) -> Option<bool> {
         if !(NEVER..=ALWAYS).contains(&self.comparison) {
             return None;
         }
-        let value = read(self.address, self.bytes)? & self.mask;
+        let Some(value) = read(self.address, self.bytes) else {
+            return Some(false);
+        };
+        let value = value & self.mask;
         let reference = self.reference;
         Some(match self.comparison {
             NEVER => false,
@@ -295,7 +299,7 @@ mod tests {
         assert_eq!(w(GREATER, 4).holds(&read), Some(true));
         assert_eq!(w(0, 5).holds(&read), None, "unknown comparison");
         assert_eq!(w(9, 5).holds(&read), None);
-        assert_eq!(w(EQUAL, 5).holds(&|_, _| None), None, "unreadable memory");
+        assert_eq!(w(EQUAL, 5).holds(&|_, _| None), Some(false), "unreadable memory does not hold");
     }
 
     /// The compute queue's list waits for a value the graphics queue's list
@@ -426,6 +430,48 @@ mod tests {
         held.push(2, Item::Segment("odd", vec![odd]));
         let p = pump(&mut held, &fake);
         assert_eq!((p.segments, p.unknown), (1, 1));
+    }
+
+    /// Memory that is not mapped yet holds the segment until it reads, and
+    /// is not counted as an unknown comparison.
+    #[test]
+    fn unreadable_memory_holds_the_segment() {
+        use std::cell::Cell;
+        let mapped = Cell::new(false);
+        let read = |_, _| mapped.get().then_some(1);
+        let fence = |_: usize| 0;
+        let mut held = Held::default();
+        held.push(2, Item::Segment("wait", vec![ge(0x100, 1)]));
+        let mut ran = Vec::new();
+        {
+            let mut run = |_: usize, s: Vec<&'static str>| ran.push(s.join(" "));
+            let mut signal = |_: usize, _: u64| {};
+            let p = held.pump(&mut World {
+                read: &read,
+                fence: &fence,
+                run: &mut run,
+                signal: &mut signal,
+            });
+            assert_eq!(
+                (p.segments, p.unknown),
+                (0, 0),
+                "held, not an unknown comparison"
+            );
+        }
+        assert!(ran.is_empty());
+        assert_eq!(held.blocked(&read).len(), 1, "reported as not holding");
+        mapped.set(true);
+        {
+            let mut run = |_: usize, s: Vec<&'static str>| ran.push(s.join(" "));
+            let mut signal = |_: usize, _: u64| {};
+            held.pump(&mut World {
+                read: &read,
+                fence: &fence,
+                run: &mut run,
+                signal: &mut signal,
+            });
+        }
+        assert_eq!(ran, ["wait"]);
     }
 
     #[test]
