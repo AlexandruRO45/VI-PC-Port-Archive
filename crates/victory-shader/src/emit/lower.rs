@@ -3535,15 +3535,24 @@ impl<'a> Lower<'a> {
     }
 
     /// `VICTORY_NAN_GUARD` (on unless `0`): a float a pixel program exports to a colour
-    /// target, or a store writes to a typed image or buffer, with NaN made 0 and an infinity
+    /// target (and, with `stores`, a store writes to a typed image or buffer), with NaN made 0 and an infinity
     /// ±65504, so one bad pixel does not stay in a history the title blends into each frame.
-    /// `strict` (float targets): every NaN. Otherwise only the NaNs the GPU makes (0x7FC00000,
-    /// either sign) and infinities: a typed store may carry an integer's bits, and all-ones or
-    /// other NaN patterns are common integers.
+    /// `strict` (float targets): every NaN. Otherwise (typed stores, only with
+    /// `VICTORY_NAN_GUARD=stores`) only the NaNs the GPU makes (0x7FC00000, either sign) and
+    /// infinities. Typed stores go out as `.f32` whatever the view's format, so on that path
+    /// the integer words 0x7F800000, 0xFF800000, 0x7FC00000 and 0xFFC00000 change too
+    /// (0xFF800000 is an opaque blue as packed RGBA8): it stays opt-in until the view's
+    /// format is known here.
     // shortcut: raw buffer stores are left as they are (no type to go by).
     fn nan_guard(&mut self, f: V, strict: bool) -> V {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_NAN_GUARD").is_none_or(|v| v != "0")) {
+        // 0: off; unset: colour exports only; `stores`: typed stores as well.
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_NAN_GUARD").as_deref() {
+            Ok("0") => 0,
+            Ok("stores") => 2,
+            _ => 1,
+        });
+        if mode == 0 || (!strict && mode < 2) {
             return f;
         }
         let c = self.cur;
