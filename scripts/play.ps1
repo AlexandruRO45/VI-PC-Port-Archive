@@ -8,7 +8,12 @@ param(
 foreach ($v in "VICTORY_KEYS", "VICTORY_CAPTURE", "VICTORY_CAPTURE_FRAMES", "VICTORY_DUMP_TARGETS") {
     Remove-Item "Env:$v" -ErrorAction SilentlyContinue
 }
-New-Item -ItemType Directory -Force $Cache, $Data | Out-Null
+foreach ($directory in $Cache, $Data) {
+    New-Item -ItemType Directory -Path $directory -Force -ErrorAction Stop | Out-Null
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        throw "Cannot use '$directory' as a launcher directory."
+    }
+}
 $env:VICTORY_CACHE_DIR = $Cache
 $env:VICTORY_DATA_DIR = $Data
 & $Exe run $Game --execute 2>&1 | Out-File "$env:TEMP\ztrx.log" -Encoding utf8
