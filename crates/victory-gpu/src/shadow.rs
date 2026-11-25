@@ -1608,7 +1608,9 @@ mod relay_tests {
         for at in [8usize, 9, 20, 50] {
             title[at] = 0x77;
         }
-        for (at, n) in changed_runs(&title, &snap) {
+        let mut runs = Vec::new();
+        changed_runs(&title, &snap, &mut runs);
+        for (at, n) in runs {
             copy[at..at + n].copy_from_slice(&title[at..at + n]);
             snap[at..at + n].copy_from_slice(&title[at..at + n]);
         }
@@ -1642,7 +1644,9 @@ mod relay_tests {
         // The title's CPU writes 40 after B's shader did: found against
         // the snapshot at the next preparing, which is before B lands.
         title[40] = 0x55;
-        for (at, n) in changed_runs(&title[b.0..b.1], &snap[b.0..b.1]) {
+        let mut runs = Vec::new();
+        changed_runs(&title[b.0..b.1], &snap[b.0..b.1], &mut runs);
+        for (at, n) in runs {
             let at = at + b.0;
             copy[at..at + n].copy_from_slice(&title[at..at + n]);
             snap[at..at + n].copy_from_slice(&title[at..at + n]);
@@ -1692,7 +1696,9 @@ mod relay_tests {
         title[12] = 0x77;
         title[30] = 0x78;
         let mut noted = Vec::new();
-        for (at, n) in changed_runs(&title, &cpu) {
+        let mut runs = Vec::new();
+        changed_runs(&title, &cpu, &mut runs);
+        for (at, n) in runs {
             cpu[at..at + n].copy_from_slice(&title[at..at + n]);
             noted.push((at, at + n, 5u64));
         }
@@ -2281,28 +2287,49 @@ pub(crate) fn unmerged_stats() -> [u64; 6] {
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
-fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+fn changed_runs(now: &[u8], was: &[u8], runs: &mut Vec<(usize, usize)>) {
     let n = now.len().min(was.len());
-    let mut runs = Vec::new();
-    let mut i = 0;
-    while i < n {
-        // Equal bytes, eight at a time while they last.
-        while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
-            i += 8;
+    runs.clear();
+    let (now, tail) = now[..n].as_chunks::<16>();
+    let (was, previous_tail) = was[..n].as_chunks::<16>();
+    let mask_of_tail = tail.iter().zip(previous_tail).enumerate().fold(0u16, |mask, (i, (a, b))| {
+        mask | (u16::from(a != b) << i)
+    });
+    let masks = now.iter().zip(was).map(|(a, b)| mismatch_mask(a, b)).chain([mask_of_tail]);
+    let mut first = None;
+    for (block, mask) in masks.enumerate() {
+        // A transition starts or ends a run. Carry the previous block's
+        // last bit into the first comparison. The tail has a zero bit
+        // after its last byte, which also closes any final run.
+        let mut transitions = mask ^ (mask << 1) ^ u16::from(first.is_some());
+        while transitions != 0 {
+            let i = block * 16 + transitions.trailing_zeros() as usize;
+            if let Some(start) = first.take() {
+                runs.push((start, i - start));
+            } else {
+                first = Some(i);
+            }
+            transitions &= transitions - 1;
         }
-        while i < n && now[i] == was[i] {
-            i += 1;
-        }
-        if i >= n {
-            break;
-        }
-        let first = i;
-        while i < n && now[i] != was[i] {
-            i += 1;
-        }
-        runs.push((first, i - first));
     }
-    runs
+    debug_assert!(first.is_none());
+}
+
+#[cfg(target_arch = "x86_64")]
+fn mismatch_mask(a: &[u8; 16], b: &[u8; 16]) -> u16 {
+    use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    // SAFETY: both arrays hold 16 bytes. The loads accept unaligned addresses,
+    // and SSE2 is part of the x86-64 baseline.
+    unsafe {
+        let a = _mm_loadu_si128(a.as_ptr().cast());
+        let b = _mm_loadu_si128(b.as_ptr().cast());
+        !(_mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) as u16)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn mismatch_mask(a: &[u8; 16], b: &[u8; 16]) -> u16 {
+    a.iter().zip(b).enumerate().fold(0, |mask, (i, (a, b))| mask | (u16::from(a != b) << i))
 }
 
 #[cfg(test)]
@@ -2314,12 +2341,17 @@ mod merge_tests {
     #[test]
     fn changed_runs_are_exactly_the_bytes_that_differ() {
         let was: Vec<u8> = (0..300u32).map(|i| (i * 13 + 5) as u8).collect();
-        for changes in [vec![], vec![0], vec![299], vec![7, 8, 9], vec![7, 9], vec![15, 16, 17, 23, 24, 64, 65, 66, 67, 68, 69, 70, 71, 72, 298, 299]] {
+        let mut runs = Vec::new();
+        for changes in [
+            vec![], vec![0], vec![299], vec![7, 8, 9], vec![7, 9],
+            vec![15, 16, 17, 23, 24, 64, 65, 66, 67, 68, 69, 70, 71, 72, 298, 299],
+            (0..300).collect(), (0..300).step_by(2).collect(),
+        ] {
             let mut now = was.clone();
             for &at in &changes {
                 now[at] ^= 0x41;
             }
-            let runs = changed_runs(&now, &was);
+            changed_runs(&now, &was, &mut runs);
             let mut put = was.clone();
             let mut held = Vec::new();
             for &(at, n) in &runs {
@@ -2332,7 +2364,10 @@ mod merge_tests {
             // Runs do not touch: two that did would be one.
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
-        assert!(changed_runs(&[], &[]).is_empty());
+        changed_runs(&[1; 33], &[0; 32], &mut runs);
+        assert_eq!(runs, [(0, 32)]);
+        changed_runs(&[], &[], &mut runs);
+        assert!(runs.is_empty());
     }
 }
 
@@ -3206,6 +3241,7 @@ crate::host::copy_source_written(start + at, n);
         }
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
+        let mut runs = Vec::new();
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
@@ -3248,22 +3284,25 @@ crate::host::copy_source_written(start + at, n);
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
                 let at = lo - start;
+                let mut bytes = 0;
                 if let Some(card) = &self.card {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = changed_runs(title, held);
+                    changed_runs(title, held, &mut runs);
                     let patchable = crate::host::card_patchable(card.size);
                     if let Err(over) = room.take(runs.iter().map(|&(r, m)| (at + r, at + r + m)), patchable) {
                         UNMERGED[if over == Over::Copies { 2 } else { 5 }].fetch_add(1, Ordering::Relaxed);
                         UNMERGED[3].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         return true;
                     }
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    if !runs.is_empty() {
+                        let mut notes = card.notes.lock().unwrap_or_else(|e| e.into_inner());
+                        for &(r, m) in &runs {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            notes.changed(at + r, at + r + m);
+                            bytes += m;
+                        }
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
@@ -3274,15 +3313,19 @@ crate::host::copy_source_written(start + at, n);
                     // bytes at the copy's offsets (`writing`), and these
                     // are in a declared range.
                     let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
+                    changed_runs(title, held, &mut runs);
+                    for &(r, m) in &runs {
                         // SAFETY: inside the copy's mapping. The card may be
                         // writing the copy beside these bytes; they are
                         // written here and nothing around them.
                         unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        bytes += m;
                     }
+                }
+                if bytes != 0 {
+                    MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                    MERGED[2].fetch_add(bytes as u64, Ordering::Relaxed);
                 }
                 drop(before);
                 // Taken, if the range holds all of the page that is in the
