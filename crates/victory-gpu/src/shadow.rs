@@ -1544,13 +1544,83 @@ struct Tile {
 /// Address space a sparse copy stands for.
 const CHUNK: u64 = 2 << 30;
 
+/// Tiles given back, kept out of reuse until the host GPU fence past their
+/// unmap has completed.
+struct TileFreeList<T> {
+    free: Vec<T>,
+    pending: std::collections::VecDeque<(u64, Vec<T>)>,
+}
+
+impl<T> TileFreeList<T> {
+    const fn new() -> Self {
+        Self {
+            free: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Holds `tiles` until the host GPU fence reaches at least `fence`.
+    fn defer(&mut self, fence: u64, tiles: Vec<T>) {
+        if !tiles.is_empty() {
+            self.pending.push_back((fence, tiles));
+        }
+    }
+
+    /// Moves every batch whose fence has passed into `free`; returns how many
+    /// tiles became reusable.
+    fn reclaim(&mut self, completed_fence: u64) -> usize {
+        let mut reclaimed = 0;
+        while self
+            .pending
+            .front()
+            .is_some_and(|(fence, _)| *fence <= completed_fence)
+        {
+            if let Some((_, tiles)) = self.pending.pop_front() {
+                reclaimed += tiles.len();
+                self.free.extend(tiles);
+            }
+        }
+        reclaimed
+    }
+
+    /// Pops a tile whose unmap fence has passed, if any.
+    fn pop(&mut self, completed_fence: u64) -> Option<T> {
+        self.reclaim(completed_fence);
+        self.free.pop()
+    }
+}
+
+/// Swept tiles waiting on [`crate::host::retire`] and their unmap fence before
+/// returning to [`TILES`].
+struct RetiredTiles {
+    fence: u64,
+    tiles: Vec<Tile>,
+}
+
+impl Drop for RetiredTiles {
+    fn drop(&mut self) {
+        if self.tiles.is_empty() {
+            return;
+        }
+        let completed = host().map_or(0, crate::host::Host::completed_fence);
+        let reclaimed = {
+            let mut pool = TILES.lock().unwrap_or_else(|e| e.into_inner());
+            pool.free.defer(self.fence, std::mem::take(&mut self.tiles));
+            pool.free.reclaim(completed)
+        };
+        if reclaimed > 0 {
+            crate::memstat::sub(&crate::memstat::SHADOWS, (reclaimed * PAGE) as u64);
+        }
+    }
+}
+
 /// Memory for tiles, in heaps the CPU maps.
 struct TilePool {
     heaps: Vec<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, ID3D12Resource, usize)>,
     /// Tiles used of the last one.
     used: u32,
     /// Tiles given back.
-    free: Vec<Tile>,
+    free: TileFreeList<Tile>,
 }
 // SAFETY: free-threaded objects and a persistent mapping.
 unsafe impl Send for TilePool {}
@@ -1558,15 +1628,20 @@ unsafe impl Send for TilePool {}
 static TILES: Mutex<TilePool> = Mutex::new(TilePool {
     heaps: Vec::new(),
     used: 0,
-    free: Vec::new(),
+    free: TileFreeList::new(),
 });
 
 const POOL_TILES: u32 = 512;
 
 fn new_tile() -> Option<Tile> {
     use windows::Win32::Graphics::Direct3D12::*;
+    let completed = host().map_or(0, crate::host::Host::completed_fence);
     let mut pool = TILES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(tile) = pool.free.pop() {
+    let reclaimed = pool.free.reclaim(completed);
+    if reclaimed > 0 {
+        crate::memstat::sub(&crate::memstat::SHADOWS, (reclaimed * PAGE) as u64);
+    }
+    if let Some(tile) = pool.free.pop(completed) {
         crate::memstat::add(&crate::memstat::SHADOWS, PAGE as u64);
         return Some(tile);
     }
@@ -1643,6 +1718,38 @@ fn sweeps() -> u8 {
     })
 }
 
+/// Removes every candidate tile still at its observed `used` frame and not in
+/// `kept`, then runs `unmap` on the removed indices while `tiles` stays locked
+/// so a concurrent [`Shadow::tile`] cannot reinsert and map a tile before its
+/// unmap is queued.
+fn take_and_unmap<T>(
+    tiles: &Mutex<std::collections::HashMap<u32, T, Mix>>,
+    kept: &Mutex<std::collections::HashSet<u32, Mix>>,
+    candidates: &[(u32, u64)],
+    used_of: impl Fn(&T) -> u64,
+    unmap: impl FnOnce(&[u32]),
+) -> Vec<(u32, T)> {
+    let mut tiles = tiles.lock().unwrap_or_else(|e| e.into_inner());
+    let old: Vec<(u32, T)> = {
+        let kept = kept.lock().unwrap_or_else(|e| e.into_inner());
+        let mut old = Vec::new();
+        for &(at, used) in candidates {
+            if !kept.contains(&at)
+                && tiles.get(&at).is_some_and(|t| used_of(t) == used)
+                && let Some(t) = tiles.remove(&at)
+            {
+                old.push((at, t));
+            }
+        }
+        old
+    };
+    if !old.is_empty() {
+        let indices: Vec<u32> = old.iter().map(|&(at, _)| at).collect();
+        unmap(&indices);
+    }
+    old
+}
+
 /// Gives back the tiles nothing has asked about for some frames: what
 /// viewed them is gone. At the present of `frame`.
 pub(crate) fn sweep(frame: u64) {
@@ -1651,6 +1758,7 @@ pub(crate) fn sweep(frame: u64) {
     if !frame.is_multiple_of(EVERY) || mode == 0 {
         return;
     }
+    let Some(host) = host() else { return };
     // Once a frame, whoever asks.
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if LAST.swap(frame, Ordering::Relaxed) == frame {
@@ -1675,7 +1783,8 @@ pub(crate) fn sweep(frame: u64) {
         // Those old enough, taken under the lock; whether their title memory
         // is gone is asked of the system outside it, a region at a time (one
         // question answers for every tile of an unmapped region); then those
-        // still as they were are taken out.
+        // still as they were are taken out and unmapped under the submission
+        // lock once in-flight GPU work has drained.
         let mut candidates: Vec<(u32, u64)> = {
             let tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
             let kept = s.kept.lock().unwrap_or_else(|e| e.into_inner());
@@ -1705,59 +1814,62 @@ pub(crate) fn sweep(frame: u64) {
         if candidates.is_empty() {
             continue;
         }
-        let old: Vec<(u32, Tile)> = {
-            let mut tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
-            let kept = s.kept.lock().unwrap_or_else(|e| e.into_inner());
-            let mut old = Vec::new();
-            for (at, used) in candidates {
-                if !kept.contains(&at)
-                    && tiles.get(&at).is_some_and(|t| t.used == used)
-                    && let Some(t) = tiles.remove(&at)
-                {
-                    old.push((at, t));
+        let (old, unmap_fence) = host.drain_and_signal(|| {
+            if !shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                return (Vec::new(), false);
+            }
+            let old = take_and_unmap(
+                &s.tiles,
+                &s.kept,
+                &candidates,
+                |t| t.used,
+                |indices| {
+                    unmap_tiles(&shadow.buffer, indices.iter().copied());
+                    for alias in s.aliases.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                        let shift = ((alias.start - shadow.start) / PAGE as u64) as u32;
+                        unmap_tiles(
+                            &alias.buffer,
+                            indices.iter().copied().filter(|&at| at >= shift).map(|at| at - shift),
+                        );
+                    }
+                },
+            );
+            if old.is_empty() {
+                return (old, false);
+            }
+            {
+                let mut looks = s.looks.lock().unwrap_or_else(|e| e.into_inner());
+                for (at, _) in &old {
+                    looks.remove(at);
                 }
             }
-            old
-        };
+            {
+                let base = shadow.start as usize / PAGE;
+                let mut copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner());
+                for (at, _) in &old {
+                    let page = (shadow.start as usize / PAGE + *at as usize) - base;
+                    if let Some(c) = copied.get_mut(page) {
+                        *c = 0;
+                    }
+                }
+            }
+            shadow
+                .unwatched
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            (old, true)
+        });
         if old.is_empty() {
             continue;
         }
         given += old.len() as u64;
-        {
-            let mut looks = s.looks.lock().unwrap_or_else(|e| e.into_inner());
-            for (at, _) in &old {
-                looks.remove(at);
-            }
+        if let Some(fence) = unmap_fence {
+            crate::host::retire(RetiredTiles {
+                fence,
+                tiles: old.into_iter().map(|(_, t)| t).collect(),
+            });
         }
-        {
-            let base = shadow.start as usize / PAGE;
-            let mut copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner());
-            for (at, _) in &old {
-                let page = (shadow.start as usize / PAGE + *at as usize) - base;
-                if let Some(c) = copied.get_mut(page) {
-                    *c = 0;
-                }
-            }
-        }
-        shadow
-            .unwatched
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        unmap_tiles(&shadow.buffer, old.iter().map(|o| o.0));
-        for alias in s.aliases.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-            let shift = ((alias.start - shadow.start) / PAGE as u64) as u32;
-            unmap_tiles(
-                &alias.buffer,
-                old.iter().filter(|o| o.0 >= shift).map(|o| o.0 - shift),
-            );
-        }
-        crate::memstat::sub(&crate::memstat::SHADOWS, (old.len() * PAGE) as u64);
-        TILES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .free
-            .extend(old.into_iter().map(|o| o.1));
     }
     let took = started.elapsed();
     if given > 0 || took > std::time::Duration::from_millis(20) {
@@ -2015,15 +2127,14 @@ impl Shadow {
                 aliases.push(made.clone());
                 drop(aliases);
                 let shift = ((base - self.start) / page) as u32;
-                let known: Vec<(u32, Tile)> = s
-                    .tiles
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                let tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
+                let known: Vec<(u32, Tile)> = tiles
                     .iter()
                     .filter(|(at, _)| **at >= shift)
                     .map(|(at, t)| (at - shift, *t))
                     .collect();
                 map_tiles(&made.buffer, &known);
+                drop(tiles);
                 return Some(made);
             }
             base += page;
@@ -2658,6 +2769,86 @@ mod tests {
         assert_eq!(uncached, 6);
         assert_eq!(cached, uncached);
         assert_eq!(unchanged.pages, [false, false, true, false]);
+    }
+
+    #[test]
+    fn swept_tiles_wait_for_their_unmap_fence_before_reuse() {
+        let mut free = TileFreeList::new();
+        free.defer(10, vec![1u32, 2]);
+        free.defer(15, vec![3]);
+
+        assert_eq!(free.reclaim(0), 0);
+        assert_eq!(free.pop(0), None);
+        assert_eq!(free.pop(9), None);
+
+        assert_eq!(free.pop(10), Some(2));
+        assert_eq!(free.pop(10), Some(1));
+        assert_eq!(free.pop(10), None);
+        assert_eq!(free.pop(14), None);
+
+        assert_eq!(free.pop(15), Some(3));
+        assert_eq!(free.pop(15), None);
+    }
+
+    #[test]
+    fn reinserted_tile_is_not_unmapped_by_sweep() {
+        let tiles: Mutex<std::collections::HashMap<u32, u64, Mix>> = Mutex::default();
+        let kept: Mutex<std::collections::HashSet<u32, Mix>> = Mutex::default();
+        {
+            let mut map = tiles.lock().unwrap();
+            map.insert(1, 10);
+            map.insert(2, 10);
+            map.insert(3, 10);
+        }
+        let candidates = [(1, 10), (2, 10), (3, 10)];
+
+        // Between candidate discovery and sweep: tile 1 is reinserted/touched
+        // at a newer frame and tile 2 is marked kept.
+        tiles.lock().unwrap().insert(1, 700);
+        kept.lock().unwrap().insert(2);
+
+        let mut unmapped = Vec::new();
+        let old = take_and_unmap(&tiles, &kept, &candidates, |&used| used, |indices| {
+            unmapped.extend_from_slice(indices);
+        });
+
+        assert_eq!(old, vec![(3, 10)]);
+        assert_eq!(unmapped, vec![3]);
+        let map = tiles.lock().unwrap();
+        assert_eq!(map.get(&1), Some(&700));
+        assert_eq!(map.get(&2), Some(&10));
+        assert!(!map.contains_key(&3));
+    }
+
+    #[test]
+    fn concurrent_reinsert_waits_for_sweep_unmap_before_mapping() {
+        let tiles: Arc<Mutex<std::collections::HashMap<u32, u64, Mix>>> = Arc::default();
+        let kept: Arc<Mutex<std::collections::HashSet<u32, Mix>>> = Arc::default();
+        tiles.lock().unwrap().insert(7, 10);
+
+        let events: Arc<Mutex<Vec<(&'static str, u32)>>> = Arc::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let tiles_reinsert = tiles.clone();
+        let events_reinsert = events.clone();
+        let reinsert = std::thread::spawn(move || {
+            rx.recv().unwrap();
+            let mut map = tiles_reinsert.lock().unwrap();
+            map.insert(7, 700);
+            events_reinsert.lock().unwrap().push(("map", 7));
+        });
+
+        let old = take_and_unmap(&tiles, &kept, &[(7, 10)], |&used| used, |indices| {
+            assert_eq!(indices, &[7]);
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            events.lock().unwrap().push(("unmap", 7));
+        });
+
+        reinsert.join().unwrap();
+        assert_eq!(old, vec![(7, 10)]);
+        assert_eq!(*events.lock().unwrap(), vec![("unmap", 7), ("map", 7)]);
+        assert_eq!(tiles.lock().unwrap().get(&7), Some(&700));
     }
 
     // cargo test --release -p victory-gpu benchmark_overlapping_copy_back -- --ignored --nocapture
