@@ -5,8 +5,8 @@
 //!    a hash of all that its host description holds (the translated
 //!    shaders' code, which changes when a translation does, our root
 //!    signature, the graphics state). The library is saved under the cache
-//!    folder; the host refuses a library of another adapter or driver, and
-//!    an entry whose description differs, so neither is ever used.
+//!    folder for its adapter; the host refuses a library of another driver
+//!    and an entry whose description differs, so neither is ever used.
 //! 2. The title pipelines a run drew or dispatched with (made in time or
 //!    not) are listed by a key known when the title creates them (their
 //!    shader containers and graphics state); the next run hands those to
@@ -30,11 +30,12 @@
 //! must still be right when the bytes are written.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -117,17 +118,70 @@ const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
+fn device_adapter(device: &ID3D12Device) -> Option<DXGI_ADAPTER_DESC1> {
+    // SAFETY: these calls query the live device and DXGI adapter metadata.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(device.GetAdapterLuid()).ok()?;
+        adapter.GetDesc1().ok()
+    }
+}
+
+fn adapter_cache_dir(root: &Path, adapter: &DXGI_ADAPTER_DESC1) -> PathBuf {
+    // The LUID identifies the current DXGI adapter, but is not a disk key.
+    let kind = if adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+        "software"
+    } else {
+        "hardware"
+    };
+    root.join("adapters").join(format!(
+        "{kind}-{:04x}-{:04x}-{:08x}-{:02x}",
+        adapter.VendorId, adapter.DeviceId, adapter.SubSysId, adapter.Revision
+    ))
+}
+
+fn cache_dir(root: &Path) -> Option<PathBuf> {
+    static ADAPTER: OnceLock<Option<DXGI_ADAPTER_DESC1>> = OnceLock::new();
+    let adapter = ADAPTER.get_or_init(|| device_adapter(&crate::host::host()?.device));
+    Some(adapter_cache_dir(root, adapter.as_ref()?))
+}
+
+fn read_cache(root: &Path, adapter: Option<&Path>) -> (Vec<u8>, Option<Vec<u8>>) {
+    let read = |dir: &Path| {
+        std::fs::read(dir.join(LIBRARY_FILE))
+            .map(|blob| (blob, std::fs::read(dir.join(PREBUILT_FILE)).ok()))
+    };
+    // A compatible legacy library can be reused when there is no adapter
+    // library yet. The legacy files are never overwritten by the new layout.
+    match adapter.map(read) {
+        Some(Ok(cache)) => cache,
+        Some(Err(e)) if e.kind() != std::io::ErrorKind::NotFound => Default::default(),
+        _ => read(root).unwrap_or_default(),
+    }
+}
+
+fn write_cache(dir: &Path, blob: &[u8], prebuilt: Option<&str>) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    write_atomically(&dir.join(LIBRARY_FILE), blob)?;
+    if let Some(list) = prebuilt {
+        write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes())?;
+    }
+    Ok(())
+}
+
 fn library() -> Option<&'static Mutex<Library>> {
     static LIBRARY: OnceLock<Option<Mutex<Library>>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
-            let blob = read(LIBRARY_FILE).unwrap_or_default();
+            let (blob, prebuilt) = DIR
+                .get()
+                .map(|d| read_cache(d, cache_dir(d).as_deref()))
+                .unwrap_or_default();
             let tag = tag(&blob);
             let mut library = open(&device, blob);
             // The pre-build's list, if it was saved with these bytes.
-            if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
+            if let (Some(l), Some(list)) = (library.as_mut(), prebuilt)
                 && !l._blob.is_empty()
             {
                 l.prebuilt = listed(&list, &tag);
@@ -328,16 +382,17 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used = USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
+    let adapter = cache_dir(dir);
     let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
-        .and_then(|()| match &prebuilt {
-            Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
-            None => Ok(()),
-        });
+        .and_then(|()| {
+            let Some(adapter) = &adapter else { return Ok(()) };
+            write_cache(adapter, &blob, prebuilt.as_deref())
+        })
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     let (created, distinct) = created();
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
+        Ok(()) if adapter.is_none() => tracing::warn!("host pipeline library not saved: adapter unavailable"),
         Ok(()) => tracing::info!(
             bytes = blob.len(),
             early = used.len(),
@@ -444,6 +499,70 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_caches_keep_their_own_library_and_prebuilt_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let nvidia = adapter_cache_dir(
+            root,
+            &DXGI_ADAPTER_DESC1 { VendorId: 0x10de, DeviceId: 0x2c18, ..Default::default() },
+        );
+        let intel = adapter_cache_dir(
+            root,
+            &DXGI_ADAPTER_DESC1 { VendorId: 0x8086, DeviceId: 0x7d67, ..Default::default() },
+        );
+        let warp = adapter_cache_dir(
+            root,
+            &DXGI_ADAPTER_DESC1 {
+                VendorId: 0x1414,
+                DeviceId: 0x008c,
+                Flags: DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32,
+                ..Default::default()
+            },
+        );
+        write_cache(root, b"old library", Some("old list")).unwrap();
+        let legacy = (b"old library".to_vec(), Some(b"old list".to_vec()));
+        assert_eq!(read_cache(root, Some(&nvidia)), legacy);
+
+        write_cache(&nvidia, b"nvidia library", Some("nvidia list")).unwrap();
+        write_cache(&intel, b"intel library", None).unwrap();
+        write_cache(&warp, b"warp library", Some("warp list")).unwrap();
+        assert_eq!(
+            read_cache(root, Some(&nvidia)),
+            (b"nvidia library".to_vec(), Some(b"nvidia list".to_vec()))
+        );
+        assert_eq!(read_cache(root, Some(&intel)), (b"intel library".to_vec(), None));
+        assert_eq!(
+            read_cache(root, Some(&warp)),
+            (b"warp library".to_vec(), Some(b"warp list".to_vec()))
+        );
+        assert_eq!(read_cache(root, None), legacy);
+    }
+
+    #[test]
+    fn each_d3d12_device_uses_its_own_dxgi_adapter() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+
+        // SAFETY: the factory, adapters and devices stay live for all queries.
+        unsafe {
+            let Ok(factory): windows::core::Result<IDXGIFactory4> =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) else { return };
+            let hardware = (0..).map_while(|i| factory.EnumAdapters1(i).ok());
+            for adapter in hardware.chain(factory.EnumWarpAdapter::<IDXGIAdapter1>()) {
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                    continue;
+                }
+                let expected = adapter.GetDesc1().unwrap();
+                let actual = device_adapter(&device.unwrap()).expect("device adapter metadata");
+                assert_eq!(actual.AdapterLuid, expected.AdapterLuid);
+                let path = adapter_cache_dir(Path::new("cache"), &actual);
+                eprintln!("{}: {}", String::from_utf16_lossy(&actual.Description).trim_end_matches('\0'), path.display());
+                assert_eq!(path, adapter_cache_dir(Path::new("cache"), &expected));
+            }
+        }
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
