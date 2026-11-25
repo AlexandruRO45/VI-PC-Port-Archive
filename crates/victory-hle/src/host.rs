@@ -37,8 +37,11 @@ impl Default for HostPolicy {
             "cabinet.dll",
             "avrt.dll",
             // Window, message and shell APIs: the host's desktop window
-            // stands in for the console's single core window.
+            // stands in for the console's single core window. Titles import
+            // these under the API-set name or `user32.dll` itself, and the
+            // API set forwards to user32, so both must be allowed.
             "ext-ms-win-rtcore-ntuser-*",
+            "user32.dll",
             "api-ms-win-shcore-*",
             "msvcp_win.dll",
             "ole32.dll",
@@ -144,5 +147,42 @@ mod imp {
 mod imp {
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
         None
+    }
+}
+
+// `allows` is pure string matching, so the policy itself is checkable on any
+// host; only the pass-through behind it needs Windows.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_apis_are_allowed_under_both_names() {
+        let policy = HostPolicy::default();
+        // The API set a title may import, and the DLL it forwards to.
+        assert!(policy.allows("ext-ms-win-rtcore-ntuser-window-l1-1-0.dll"));
+        assert!(policy.allows("user32.dll"));
+        // Titles name it in either case.
+        assert!(policy.allows("USER32.dll"));
+    }
+
+    #[test]
+    fn launching_other_programs_is_not_passed_through() {
+        // `shell32!ShellExecuteW` would let a title start arbitrary host
+        // programs, which no console API offers. It stays unimplemented so
+        // bring-up reports it rather than silently gaining the capability.
+        assert!(!HostPolicy::default().allows("shell32.dll"));
+    }
+
+    #[test]
+    fn console_only_dlls_never_pass_through() {
+        let policy = HostPolicy::default();
+        assert!(!policy.allows("xmem.dll"));
+        assert!(!policy.allows("d3d12_xs.dll"));
+    }
+
+    #[test]
+    fn none_allows_nothing() {
+        assert!(!HostPolicy::none().allows("kernel32.dll"));
     }
 }
