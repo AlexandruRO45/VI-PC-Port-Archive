@@ -4300,19 +4300,8 @@ impl<'a> Lower<'a> {
         );
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
-        let flat = self.mesh_thread();
-        let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
-        let at = self.begin_guarded(guard);
-        let z = self.s.m.i32(0);
-        self.s.op(
-            self.cur,
-            "emitIndices",
-            Attr::NoUnwind,
-            void,
-            169,
-            &[flat, z, z, z],
-        );
-        self.end_guarded(at, &[]);
+        // The program's own `exp prim` exports emit the real indices; a
+        // degenerate emit here would race them (two emits per primitive).
         Ok(())
     }
 
@@ -12039,6 +12028,58 @@ impl<'a> Lower<'a> {
                 stores.push((id, col, value, None));
             }
         }
+        // Probe: a screen-covering triangle per lane triple, so a black world
+        // separates mesh data from mesh rasterization.
+        let pos_id = outputs.iter().position(|o| o.kind == 3);
+        let probe_pos: Option<[V; 4]> =
+            if mesh && std::env::var("VICTORY_MESH_PROBE").is_ok() && pos_id.is_some() {
+                let c = self.cur;
+                let flat = self.mesh_thread();
+                let three = self.s.m.i32(3);
+                let four = self.s.m.i32(4);
+                let l3 = self.s.m.bin(c, Bin::URem, flat, three);
+                let group = self.s.m.bin(c, Bin::UDiv, flat, three);
+                let tile = self.s.m.bin(c, Bin::URem, group, four);
+                // 2x2 grid of half-unit tiles, integer selects on float constants.
+                let zeroi = self.s.m.i32(0);
+                let _ = zeroi;
+                let onei = self.s.m.i32(1);
+                let twoi = self.s.m.i32(2);
+                let threei = self.s.m.i32(3);
+                let t1 = self.s.m.cmp(c, pred::EQ, tile, onei);
+                let t2 = self.s.m.cmp(c, pred::EQ, tile, twoi);
+                let t3 = self.s.m.cmp(c, pred::EQ, tile, threei);
+                let right = self.s.m.bin(c, Bin::Or, t1, t3);
+                let up = self.s.m.bin(c, Bin::Or, t2, t3);
+                let neg = self.s.m.f32((-1.0f32).to_bits());
+                let zerof = self.s.m.f32(0.0f32.to_bits());
+                let half = self.s.m.f32(0.5f32.to_bits());
+                let one = self.s.m.f32(1.0f32.to_bits());
+                let is1 = self.s.m.cmp(c, pred::EQ, l3, onei);
+                let is2 = self.s.m.cmp(c, pred::EQ, l3, twoi);
+                let dx = self.s.m.select(c, is1, half, zerof);
+                let dy = self.s.m.select(c, is2, half, zerof);
+                // Float adds via bit tricks are unsafe; select the corner constant
+                // per tile and lane instead.
+                let neghalf = self.s.m.f32((-0.5f32).to_bits());
+                let xr = self.s.m.select(c, right, half, neghalf);
+                let xl = self.s.m.select(c, right, zerof, neg);
+                let x = self.s.m.select(c, is1, xr, xl);
+                let yr = self.s.m.select(c, up, half, neghalf);
+                let yl = self.s.m.select(c, up, zerof, neg);
+                let y = self.s.m.select(c, is2, yr, yl);
+                let z = self.s.m.f32(0.5f32.to_bits());
+                let w = one;
+                let _ = (zeroi, threei);
+                Some([
+                    self.as_int(x),
+                    self.as_int(y),
+                    self.as_int(z),
+                    self.as_int(w),
+                ])
+            } else {
+                None
+            };
         fn elements<'l>(l: &'l mut Lower, primitive: bool) -> &'l mut Vec<SigElement> {
             if primitive {
                 &mut l.s.prims
@@ -12053,7 +12094,10 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit output the stage data does not mark");
         }
         // A mesh lane writes its own vertex or primitive, where it exports.
-        let at = if mesh {
+        let at = if mesh
+            && std::env::var("VICTORY_MESH_NOGUARD").is_err()
+            && std::env::var("VICTORY_MESH_PROBE").is_err()
+        {
             self.begin_guarded(guard)
         } else {
             None
@@ -12065,6 +12109,11 @@ impl<'a> Lower<'a> {
         };
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
+            if let (Some(p), Some(pid)) = (&probe_pos, pos_id) {
+                if id == pid {
+                    x = p[usize::from(col)];
+                }
+            }
             if let Some(high) = half {
                 // An f16 half, declared a 32-bit float on the host.
                 let c = self.cur;
@@ -12119,16 +12168,44 @@ impl<'a> Lower<'a> {
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
-        let at = self.begin_guarded(guard);
+        let at = if std::env::var("VICTORY_MESH_NOGUARD").is_ok()
+            || std::env::var("VICTORY_MESH_PROBE").is_ok()
+        {
+            None
+        } else {
+            self.begin_guarded(guard)
+        };
         let c = self.cur;
         let z = self.s.m.i32(0);
         let culled = self.s.m.cmp(c, pred::SLT, x, z);
+        let nocull = std::env::var("VICTORY_MESH_NOCULL").is_ok();
         let mut args = vec![self.mesh_thread()];
+        let probe = std::env::var("VICTORY_MESH_PROBE").is_ok();
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
-            args.push(self.s.m.select(c, culled, z, i));
+            let i = if probe {
+                // Lane triple's triangle: vertices 3*(lane%42)+k, every fourth
+                // triple culled so coverage is patchy, not a full-screen fill.
+                let flat = self.mesh_thread();
+                let n = self.s.m.i32(42);
+                let t = self.s.m.bin(c, Bin::URem, flat, n);
+                let three = self.s.m.i32(3);
+                let base = self.s.m.bin(c, Bin::Mul, t, three);
+                let kk = self.s.m.i32(k);
+                let idx = self.s.m.bin(c, Bin::Add, base, kk);
+                let four = self.s.m.i32(4);
+                let group = self.s.m.bin(c, Bin::UDiv, flat, three);
+                let slot = self.s.m.bin(c, Bin::URem, group, four);
+                let keep = self.s.m.cmp(c, pred::EQ, slot, z);
+                self.s.m.select(c, keep, idx, z)
+            } else if nocull {
+                i
+            } else {
+                self.s.m.select(c, culled, z, i)
+            };
+            args.push(i);
         }
         let void = self.s.t.void;
         self.s
@@ -12735,6 +12812,78 @@ impl<'a> Lower<'a> {
             return e;
         }
         let e = self.s.m.new_block();
+        if self.s.pixel && std::env::var("VICTORY_PIXEL_PROBE").is_ok() {
+            // Probe: magenta only inside the mesh probe's bottom-left tile
+            // (1080p screen rect), black elsewhere, so a fullscreen composite
+            // pass cannot fake mesh geometry coverage.
+            let c = e;
+            let pos = self.s.inputs.iter().position(|o| o.kind == 0);
+            let gate = if let Some(pid) = pos {
+                let args = [
+                    self.s.m.i32(pid as u32),
+                    self.s.m.i32(0),
+                    self.s.m.i8(0),
+                    self.s.m.undef(self.s.t.i32),
+                ];
+                let x = self
+                    .s
+                    .op(c, "loadInput.i32", Attr::ReadNone, self.s.t.i32, 4, &args);
+                let x = self.s.m.cast(c, Cast::Bitcast, x, self.s.t.f32);
+                let args = [
+                    self.s.m.i32(pid as u32),
+                    self.s.m.i32(0),
+                    self.s.m.i8(1),
+                    self.s.m.undef(self.s.t.i32),
+                ];
+                let y = self
+                    .s
+                    .op(c, "loadInput.i32", Attr::ReadNone, self.s.t.i32, 4, &args);
+                let y = self.s.m.cast(c, Cast::Bitcast, y, self.s.t.f32);
+                let xlim = self.s.m.f32(480.0f32.to_bits());
+                let ylim = self.s.m.f32(810.0f32.to_bits());
+                let lx = self.s.m.cmp(c, pred::OLT, x, xlim);
+                let gy = self.s.m.cmp(c, pred::OGT, y, ylim);
+                Some(self.s.m.bin(c, Bin::And, lx, gy))
+            } else {
+                None
+            };
+            let n = self.s.outputs.len();
+            for id in 0..n {
+                let comp = self.s.outputs[id].comp;
+                for col in 0..4u8 {
+                    let v = if col == 1 { 0.0f32 } else { 1.0f32 };
+                    let f = self.s.m.f32(v.to_bits());
+                    let f = if let Some(g) = gate {
+                        let bv = if col == 3 { 1.0f32 } else { 0.0f32 };
+                        let black = self.s.m.f32(bv.to_bits());
+                        self.s.m.select(c, g, f, black)
+                    } else {
+                        f
+                    };
+                    let (value, suffix) = if comp == 4 || comp == 5 {
+                        (self.s.m.cast(c, Cast::Bitcast, f, self.s.t.i32), ".i32")
+                    } else {
+                        (f, ".f32")
+                    };
+                    let args = [
+                        self.s.m.i32(id as u32),
+                        self.s.m.i32(0),
+                        self.s.m.i8(col),
+                        value,
+                    ];
+                    let void = self.s.t.void;
+                    self.s.op(
+                        e,
+                        &format!("storeOutput{suffix}"),
+                        Attr::NoUnwind,
+                        void,
+                        5,
+                        &args,
+                    );
+                    self.s.outputs[id].usage |= 1 << col;
+                }
+            }
+        }
         self.s.m.terminate(e, Term::Ret);
         self.end = Some(e);
         e
