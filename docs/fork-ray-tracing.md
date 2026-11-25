@@ -61,7 +61,7 @@ shaders and emulates the one instruction.
    partly working builder wrote garbage bounds into title memory and crashed
    the title.
 
-## Runs with the builder on (2026-11-25, RTX 4070)
+## Runs with the builder on (2026-11-25, Radeon RX 6800 XT)
 
 - **All 52 builder programs translate and get host pipelines** (`victory
   translate --pipelines` on `XboxBvhBuilder.dll`), and with
