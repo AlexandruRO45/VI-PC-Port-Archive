@@ -1922,18 +1922,38 @@ mod tests {
             };
             host_desc(&desc).is_some_and(|d| d.flags & UNORDERED != 0)
         };
-        // 86 B5G5R5A1_UNORM and 85 B5G6R5_UNORM: neither has a typeless
-        // family, so no typed view and no cast list reaches them on any
-        // host — the flag removes NVIDIA's device at
-        // GetResourceAllocationInfo and must drop everywhere.
-        assert!(!has(86) && !has(85), "the unviewable formats dropped it");
-        // 28 R8G8B8A8_UNORM stores wherever feature level 11.0 is met;
-        // then the typeless 27 its sRGB twin 29 is rewritten to, and the
-        // typeless R8 formats, keep the flag for typed views of them.
-        if typed_store(28) {
-            assert!(has(28), "the storing format keeps it");
-            assert!(has(27), "a typeless texture's typed view keeps it");
-            assert!(has(29), "sRGB folded to typeless keeps it");
+        use windows::Win32::Graphics::Direct3D12::ID3D12Device10;
+        use windows::core::Interface;
+        let device10 = crate::host::host()
+            .is_some_and(|h| h.device.cast::<ID3D12Device10>().is_ok());
+        // What `host_desc` should answer for `format`: a legal unordered
+        // view exists — the format itself stores typed, a member of its
+        // typeless family does (the committed fallback creates it typeless
+        // and views it typed), or a typeless texture's cast list names one
+        // that does (enhanced-barrier creation only). A standalone format
+        // has no cast path: it is created typed, and
+        // GetResourceAllocationInfo sees the bare description.
+        let keeps = |format: u32| {
+            let format = if SRGB.iter().any(|&(s, _)| s == format) {
+                family(format)
+            } else {
+                format
+            };
+            typed_store(format)
+                || family_members(format).any(typed_store)
+                || (family(format) == format
+                    && family(format + 1) == format
+                    && device10
+                    && castable(format).into_iter().any(typed_store))
+        };
+        // 86 B5G5R5A1_UNORM and 85 B5G6R5_UNORM have no typeless family —
+        // where the host does not store them typed the flag removes
+        // NVIDIA's device at GetResourceAllocationInfo and drops; where it
+        // reports one (the bit is the legality test itself) it stays.
+        assert_eq!(family(85), 85);
+        assert_eq!(family(86), 86);
+        for format in [85, 86, 27, 28, 29, 87, 90, 91, 60, 61] {
+            assert_eq!(has(format), keeps(format), "format {format}");
         }
     }
 
