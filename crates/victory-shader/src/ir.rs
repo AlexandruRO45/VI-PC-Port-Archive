@@ -1139,10 +1139,13 @@ fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
 }
 
 /// Scheduling hints, performance counters and tracing: no effect on results.
+/// (Not `s_waitcnt_vscnt`, the wait for a program's stores to land: in a
+/// program that orders memory across groups it is a device fence,
+/// `emit::lower` `device_fence`. Dropped here, it never reached that, and
+/// the structure builder published nodes to other groups unfenced.)
 const DROPPED: &[&str] = &[
     "s_nop",
     "s_waitcnt",
-    "s_waitcnt_vscnt",
     "s_waitcnt_vmcnt",
     "s_waitcnt_expcnt",
     "s_waitcnt_lgkmcnt",

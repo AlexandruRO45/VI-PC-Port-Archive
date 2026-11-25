@@ -11987,4 +11987,22 @@ mod tests {
         assert!(wants(&[0xF401_0202, 0xFA00_0000]));
         assert!(!wants(&[0xF400_0202, 0xFA00_0000]));
     }
+
+    /// The wait for a program's stores to land (`s_waitcnt_vscnt`) reaches
+    /// the lowering, which makes it a device fence in a program that orders
+    /// memory across groups (`device_fence`): the IR dropped it with the
+    /// other waits, and the structure builder's bottom-up build published
+    /// its nodes to other groups (an atomic after its stores) unfenced.
+    #[test]
+    fn the_wait_for_stores_to_land_is_kept_for_its_fence() {
+        // buffer_store_dword v1, v0, s[4:7], 0 offen glc; s_waitcnt_vscnt
+        // null, 0x0; buffer_atomic_add v1, v0, s[4:7], 0 offen; s_waitcnt
+        // vmcnt(0)
+        let words = [0xE070_5000u32, 0x8001_0100, 0xBBFD_0000, 0xE0C8_1000, 0x8001_0100, 0xBF8C_3F70, 0xBF81_0000];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 8).unwrap();
+        let names: Vec<&str> = p.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).collect();
+        assert!(names.contains(&"s_waitcnt_vscnt"), "{names:?}");
+        assert!(!names.contains(&"s_waitcnt"), "the other waits are still dropped: {names:?}");
+    }
 }
