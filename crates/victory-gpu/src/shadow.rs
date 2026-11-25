@@ -1300,7 +1300,6 @@ pub(crate) fn merge_touching_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, us
 pub(crate) mod tests {
     use super::*;
 
-<<<<<<< HEAD
     #[test]
     fn merge_touching_ranges_coalesces_overlapping_and_nested_spans() {
         assert_eq!(merge_touching_ranges(&[(5, 5), (10, 10)]), Vec::<(usize, usize)>::new());
@@ -1308,7 +1307,8 @@ pub(crate) mod tests {
             merge_touching_ranges(&[(100, 200), (50, 120), (60, 80), (200, 250), (300, 320), (300, 320)]),
             vec![(50, 250), (300, 320)]
         );
-=======
+    }
+
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.
     pub(crate) fn mark_read(memory: bool, slot: u32) {
@@ -1317,7 +1317,6 @@ pub(crate) mod tests {
         // SAFETY: a bit of the mapped bitmap; no submission runs (the caller
         // holds the submission lock).
         unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
->>>>>>> upstream/main
     }
 
     /// The title writes a constant under a range an earlier list of the

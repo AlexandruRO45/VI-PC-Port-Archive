@@ -15,15 +15,10 @@ use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_ST
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
-<<<<<<< HEAD
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, Usage, UsedResource,
 };
-=======
-use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
-use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
->>>>>>> upstream/main
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 

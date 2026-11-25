@@ -1347,11 +1347,9 @@ impl Host {
                 }
             }
         }
-<<<<<<< HEAD
         // Group the ranges that go back per host buffer so overlapping or
         // touching UAV writes across lists are copied back once.
         let mut grouped: Vec<ShadowRanges> = Vec::new();
-=======
         // A range overlapping a withheld one of the same copy is withheld
         // too: its copy-back would take the other's bytes along (pages a
         // program using title memory and another both wrote).
@@ -1364,7 +1362,6 @@ impl Host {
             let copy = std::sync::Arc::as_ptr(&b.0) as usize;
             b.3 = !held.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
         }
->>>>>>> upstream/main
         // Pages shaders marked first: the copy-backs below end what the
         // copies keep for them.
         let withheld: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = back

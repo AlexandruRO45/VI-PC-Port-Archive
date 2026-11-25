@@ -1432,7 +1432,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
     // In a heap of textures if it fits there (`crate::placement`).
     // SAFETY: the description has the host layout (checked size).
-    let plain = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+    let plain = unsafe { std::ptr::from_ref(&d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
     let mut placement = None;
     if clear_value.is_none()
         && crate::placement::fits(&host.device, &plain)
@@ -1477,26 +1477,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         && !castable_formats.is_empty()
         && let Ok(device) = host.device.cast::<ID3D12Device10>()
     {
-<<<<<<< HEAD
-        // SAFETY: the description has the host layout (checked size).
-        let p = unsafe { std::ptr::from_ref(&d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
-        // The plain description plus the sampler feedback region (none).
-        let desc1 = D3D12_RESOURCE_DESC1 {
-            Dimension: p.Dimension,
-            Alignment: p.Alignment,
-            Width: p.Width,
-            Height: p.Height,
-            DepthOrArraySize: p.DepthOrArraySize,
-            MipLevels: p.MipLevels,
-            Format: p.Format,
-            SampleDesc: p.SampleDesc,
-            Layout: p.Layout,
-            Flags: p.Flags,
-            SamplerFeedbackMipRegion: Default::default(),
-        };
-=======
         let desc1 = desc1_of(&plain);
->>>>>>> upstream/main
         let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
         // SAFETY: a host description and our out pointer; the list and the
         // clear value live through the call.
