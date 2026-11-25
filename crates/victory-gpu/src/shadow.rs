@@ -1565,16 +1565,21 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    const IDLE_MS: u64 = 10_000;
     const IDLE_FRAMES: u64 = 4;
+    // Asked once, and only when there are copies to look at.
+    let idle_ms = std::cell::OnceCell::new();
     // Held from the look to the removal: `loose` and `exact` hand a copy
     // out under the same lock, so none is handed out in between.
     let sweep = |map: &mut BTreeMap<(u64, u64), Arc<Shadow>>| -> Vec<Arc<Shadow>> {
+        if map.is_empty() {
+            return Vec::new();
+        }
+        let idle_ms = *idle_ms.get_or_init(|| crate::host::ram_idle_ms(crate::host::available_physical_ram()));
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)
