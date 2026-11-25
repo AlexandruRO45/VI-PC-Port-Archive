@@ -1603,4 +1603,92 @@ mod tests {
         }
         assert!(n > 0);
     }
+
+    /// More blocks than the history holds, every block referring to the
+    /// block 255 before it: the first 255 read the dictionary, block 255
+    /// reads block 0, and later blocks read slots the ring has wrapped
+    /// past. The first 255 blocks carry a per-block residual so the base
+    /// values differ; from block 255 the residual is zero, so each of
+    /// those blocks must come back exactly as the block it refers to. A
+    /// wrap bug (an unwritten slot, a stale entry, an off-by-one in the
+    /// distance) shows as an unequal block.
+    #[test]
+    fn references_survive_the_dictionary_transition_and_the_history_wrap() {
+        let t = Tables::parse(&tables()).unwrap();
+        let blocks = 600usize;
+
+        // BC4 (unpaired): distance and index reference in s[1] alone.
+        let records: Vec<Vec<u8>> = (0..blocks)
+            .map(|i| {
+                let mut r = vec![0u8; 12];
+                r[1] = 255;
+                if i < 255 {
+                    r[2] = 2 * (i & 127) as u8;
+                    r[3] = 2 * (i >> 7) as u8;
+                }
+                r
+            })
+            .collect();
+        let src = stream(&t, &BC4_LANES, 1, &records);
+        let mut dst = vec![0u8; blocks * 8];
+        decode(4, &src, &mut dst, &t).unwrap();
+        for i in 255..blocks {
+            assert_eq!(
+                &dst[8 * i..8 * i + 8],
+                &dst[8 * (i - 255)..8 * (i - 255) + 8],
+                "BC4 block {i}"
+            );
+        }
+
+        // BC6 (paired, mode 11): both references at distance 255 via the
+        // 4-bit interleave; endpoints 0 and 1 carry the base residual.
+        let records: Vec<Vec<u8>> = (0..blocks)
+            .map(|i| {
+                let mut r = vec![0u8; 32];
+                r[2] = 0x0f;
+                r[3] = 0x0f;
+                r[30] = 10;
+                if i < 255 {
+                    r[4] = (i & 63) as u8;
+                    r[6] = (i >> 6) as u8;
+                }
+                r
+            })
+            .collect();
+        let src = stream(&t, &[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2, &records);
+        let mut dst = vec![0u8; blocks * 16];
+        decode(6, &src, &mut dst, &t).unwrap();
+        for i in 255..blocks {
+            assert_eq!(
+                &dst[16 * i..16 * i + 16],
+                &dst[16 * (i - 255)..16 * (i - 255) + 16],
+                "BC6 block {i}"
+            );
+        }
+
+        // BC7 (paired, mode 6): both references at distance 255; endpoints
+        // R0 and R1 of subset 0 carry the base residual.
+        let records: Vec<Vec<u8>> = (0..blocks)
+            .map(|i| {
+                let mut r = vec![0u8; 32];
+                r[2] = 0x0f;
+                r[3] = 0x0f;
+                if i < 255 {
+                    r[4] = 2 * (i & 127) as u8;
+                    r[5] = 2 * (i >> 7) as u8;
+                }
+                r
+            })
+            .collect();
+        let src = stream(&t, &[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2, &records);
+        let mut dst = vec![0u8; blocks * 16];
+        decode(7, &src, &mut dst, &t).unwrap();
+        for i in 255..blocks {
+            assert_eq!(
+                &dst[16 * i..16 * i + 16],
+                &dst[16 * (i - 255)..16 * (i - 255) + 16],
+                "BC7 block {i}"
+            );
+        }
+    }
 }
