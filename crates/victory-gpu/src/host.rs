@@ -833,6 +833,11 @@ mod tests {
             // A guard page as the source: the copy ends, the process goes on.
             assert_ne!(VirtualProtect(p2.cast(), PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
             assert!(!super::direct_copy::try_copy(again.as_mut_ptr(), p2, PAGE));
+            // And the guard is set again for the title's own first touch.
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(p2.cast(), &mut info, size_of_val(&info)), 0);
+            assert_ne!(info.Protect & PAGE_GUARD, 0, "the guard flag is back");
+            assert_ne!(VirtualProtect(p2.cast(), PAGE, PAGE_READWRITE, &mut old), 0);
             // Eight threads faulting at once.
             let at = base as usize;
             std::thread::scope(|s| {
@@ -9581,8 +9586,33 @@ mod direct_copy {
         {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
+        // Raising the guard page fault cleared its guard flag. Set it again,
+        // or the title's own first touch there (a stack growing, say) finds
+        // no guard: the copy fails as the kernel's read would have, and the
+        // page stays as the title left it.
+        if code == EXCEPTION_GUARD_PAGE as NTSTATUS && record.NumberParameters >= 2 {
+            rearm_guard(record.ExceptionInformation[1]);
+        }
         ctx.Rip = (&raw const victory_try_copy_fault) as u64;
         EXCEPTION_CONTINUE_EXECUTION
+    }
+
+    /// Sets the guard flag again on the 4 KiB page holding `at`, over the
+    /// protection it has now.
+    fn rearm_guard(at: usize) {
+        use windows_sys::Win32::System::Memory::{
+            MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery,
+        };
+        let page = at & !0xfff;
+        // SAFETY: plain integers and pointers, all valid zeroed.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut old = 0;
+        // SAFETY: a query, then a protection change of one committed page.
+        unsafe {
+            if VirtualQuery(page as *const _, &mut info, size_of_val(&info)) != 0 {
+                VirtualProtect(page as *const _, 0x1000, info.Protect | PAGE_GUARD, &mut old);
+            }
+        }
     }
 
     fn install() {
