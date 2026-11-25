@@ -695,6 +695,25 @@ pub extern "system" fn XMemMapPhysicalPages(
     address
 }
 
+/// How many of `given` are consecutive slices of one section: the most one
+/// [`XMemMapPhysicalPages`] call maps, and so the most that sits inside one
+/// placeholder. An unknown first page gives 1 (the call reports it).
+fn section_run(given: &[usize]) -> usize {
+    let physical = physical();
+    let Some(first) = physical.pages.get(&given[0]).cloned() else {
+        return 1;
+    };
+    1 + given[1..]
+        .iter()
+        .zip(1..)
+        .take_while(|&(page, k)| {
+            physical.pages.get(page).is_some_and(|s| {
+                Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k
+            })
+        })
+        .count()
+}
+
 /// One page at each address; null `pages`, or a page number 0, unmaps
 /// (Grand Theft Auto VI passes 0 for addresses to clear).
 pub extern "system" fn XMemMapPhysicalPagesScatter(
@@ -719,10 +738,10 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     };
     // Addresses given in runs of consecutive pages map in one call, so a run
     // pays one unmap, one view and one commit (per section run) instead of
-    // three system calls per page (idea from ivall/xcl#254). Pages that are
-    // not consecutive slices of one section still map one by one inside the
-    // call, and a run that spans two placeholders falls back to the per-page
-    // calls below.
+    // three system calls per page (idea from ivall/xcl#254). A run is cut
+    // where its pages stop being consecutive slices of one section (`section_run`),
+    // so a batched call never spans two placeholders; a call that still fails
+    // for another reason falls back to the per-page calls below.
     let mut i = 0;
     while i < n {
         let (address, page) = entry(i);
@@ -735,6 +754,14 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
                 break;
             }
             run += 1;
+        }
+        // One call maps consecutive slices of one section only, and those live
+        // in one placeholder: batch no further, so a batched call never spans
+        // two reservations (which fails, and would have unmapped both).
+        if !zero && !pages.is_null() && run > 1 {
+            // SAFETY: `i < n` and the title passes `n` pages.
+            let given = unsafe { std::slice::from_raw_parts(pages.add(i), run) };
+            run = section_run(given);
         }
         let mapped = if zero || pages.is_null() {
             XMemMapPhysicalPages(address as *mut c_void, run, std::ptr::null())
@@ -1339,6 +1366,60 @@ mod tests {
         assert_eq!(XMemMapPhysicalPagesScatter([at(0)].as_ptr(), 1, std::ptr::null()), 1);
         assert_eq!(query(at(0)).host.State, MEM_RESERVE);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// Two reservations whose addresses are consecutive: the batched call
+    /// stops where the pages stop being consecutive slices of one section, so
+    /// one call never spans two placeholders (which fails with error 487 after
+    /// unmapping the whole range, while the old per-page path mapped every
+    /// page but the failing one).
+    #[test]
+    fn scatter_cuts_a_run_at_a_second_placeholder() {
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        // Release the second page in place: `at(0)` and `at(1)` are now two
+        // placeholders that happen to be adjacent.
+        assert_ne!(
+            // SAFETY: the reservation above; the range is inside it.
+            unsafe { VirtualFree(at(1), PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) },
+            0
+        );
+        assert_eq!(query(at(0)).host.State, MEM_RESERVE);
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+
+        let first = allocate(1);
+        let second = allocate(1);
+        assert!(write_physical(&first, 0, b"l"));
+        assert!(write_physical(&second, 0, b"r"));
+
+        let addresses = [at(0), at(1)];
+        let pages = [first[0], second[0]];
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, pages.as_ptr()),
+            1
+        );
+        for (k, want) in [(0usize, b'l'), (1, b'r')] {
+            assert_eq!(
+                // SAFETY: mapped read-write.
+                unsafe { at(k).cast::<u8>().read() },
+                want,
+                "page {k} at its own address"
+            );
+        }
+
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, std::ptr::null()),
+            1
+        );
+        assert_eq!(query(at(0)).host.State, MEM_RESERVE);
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
     }
 
     #[test]
