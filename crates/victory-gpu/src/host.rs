@@ -2005,14 +2005,19 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for &(from, to) in ranges.iter() {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    // Compact the sorted union in place, keeping the allocation for the
+    // next submission. The write cursor never overtakes the read cursor.
+    let mut used = 0;
+    for read in 0..ranges.len() {
+        let (from, to) = ranges[read];
+        if used > 0 && from <= ranges[used - 1].1 {
+            ranges[used - 1].1 = ranges[used - 1].1.max(to);
+        } else {
+            ranges[used] = (from, to);
+            used += 1;
         }
     }
-    *ranges = out;
+    ranges.truncate(used);
 }
 
 /// Whether anything is in the air.
@@ -2538,6 +2543,43 @@ mod late_tests {
         // They touch without overlapping.
         assert!(continues((1000, 1032, 16), (1016, 1048, 16)));
         assert!(!continues((usize::MAX - 8, 0, 8), (0, 8, 8)));
+    }
+
+    #[test]
+    fn range_union_reuses_capacity_and_handles_empty_updates() {
+        let mut ranges = Vec::with_capacity(32);
+        ranges.extend([(10, 20), (40, 50)]);
+        let storage = ranges.as_ptr();
+        let capacity = ranges.capacity();
+        join_ranges(&mut ranges, [(50, 60), (15, 45), (90, 90), (80, 70)]);
+        assert_eq!(ranges, [(10, 60)]);
+        join_ranges(&mut ranges, []);
+        assert_eq!(ranges, [(10, 60)]);
+        assert_eq!(ranges.as_ptr(), storage);
+        assert_eq!(ranges.capacity(), capacity);
+    }
+
+    #[test]
+    fn range_union_matches_byte_coverage() {
+        // Deterministic exhaustive pairs of intervals, including reversed
+        // and empty additions, across two consecutive updates.
+        for a in 0..8 {
+            for b in 0..8 {
+                for c in 0..8 {
+                    for d in 0..8 {
+                        let mut ranges = Vec::new();
+                        join_ranges(&mut ranges, [(a, b)]);
+                        join_ranges(&mut ranges, [(c, d)]);
+                        assert!(ranges.iter().all(|&(from, to)| from < to));
+                        assert!(ranges.windows(2).all(|w| w[0].1 < w[1].0));
+                        for byte in 0..8 {
+                            let expected = (a <= byte && byte < b) || (c <= byte && byte < d);
+                            assert_eq!(touches(&ranges, byte, byte + 1), expected);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Ranges are found by what they hold, not by where they start, and a
