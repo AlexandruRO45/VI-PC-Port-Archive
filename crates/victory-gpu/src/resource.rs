@@ -1004,12 +1004,13 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
-    // PC refuses depth targets that are also unordered-access (the console
-    // allows both; Grand Theft Auto VI's shadow maps and material depth ask
-    // for it): unordered views of such a texture write its twin
-    // (`crate::twin`).
+    // PC refuses depth targets that are also render targets or
+    // unordered-access (the console allows all three; Grand Theft Auto VI's
+    // shadow maps and material depth ask for them): unordered views of such a
+    // texture write its twin (`crate::twin`).
+    const RENDER_TARGET: u32 = 1;
     if d.flags & DEPTH != 0 {
-        d.flags &= !UNORDERED;
+        d.flags &= !(RENDER_TARGET | UNORDERED);
     }
     d.format = pc_format(d.format);
     const DENY_SHADER_RESOURCE: u32 = 8;
@@ -2182,6 +2183,335 @@ mod tests {
             assert_eq!(sizes, [64, 32, 64, 32, 16, 8, 16, 8], "format {format}");
             assert_eq!(total, 24_072, "format {format}");
             assert!(subresource(&desc, 8).is_none(), "format {format}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn depth_resources_drop_render_target_and_unordered_flags() {
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        for format in [40, 55, 20] {
+            for flags in [0x3, 0x7, 0xb] {
+                let hd = host_desc(&ResourceDesc {
+                    flags,
+                    ..texture(8, 8, format, 1)
+                })
+                .unwrap();
+                assert_eq!(hd.flags & 0x2, 0x2, "format {format} flags {flags:#x}");
+                assert_eq!(
+                    hd.flags & (0x1 | 0x4),
+                    0,
+                    "format {format} flags {flags:#x}"
+                );
+                assert_eq!(
+                    hd.flags & 0x8,
+                    flags & 0x8,
+                    "format {format} flags {flags:#x}"
+                );
+            }
+        }
+        assert_eq!(
+            host_desc(&ResourceDesc {
+                flags: 0x5,
+                ..texture(8, 8, 28, 1)
+            })
+            .unwrap()
+            .flags,
+            0x5
+        );
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        let check_flags = |r: This| {
+            let hr = host_resource(r).expect("host depth texture");
+            // SAFETY: a live host resource.
+            let flags = unsafe { hr.GetDesc() }.Flags;
+            assert!(flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+            assert!(!flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET));
+            assert!(!flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+        };
+
+        // Committed depth resources with ALLOW_DEPTH_STENCIL | ALLOW_RENDER_TARGET
+        // (and ALLOW_UNORDERED_ACCESS), including a RENDER_TARGET initial state
+        // and an optimized depth clear value.
+        let clear_d32: [u32; 5] = [40, 0.25f32.to_bits(), 0, 0, 0];
+        let mut committed_d32 = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &ResourceDesc {
+                    flags: 0x3,
+                    ..texture(4, 4, 40, 1)
+                },
+                0x4,
+                clear_d32.as_ptr().cast(),
+                iid,
+                &mut committed_d32,
+            ),
+            S_OK
+        );
+        check_flags(committed_d32);
+
+        let mut committed_d16 = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &ResourceDesc {
+                    flags: 0x7,
+                    ..texture(4, 4, 55, 1)
+                },
+                0,
+                null.cast(),
+                iid,
+                &mut committed_d16,
+            ),
+            S_OK
+        );
+        check_flags(committed_d16);
+
+        let mut committed_d32s8 = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &ResourceDesc {
+                    flags: 0x7,
+                    ..texture(4, 4, 20, 1)
+                },
+                0,
+                null.cast(),
+                iid,
+                &mut committed_d32s8,
+            ),
+            S_OK
+        );
+        check_flags(committed_d32s8);
+
+        // Address-backed depth resources (`create_at_address` and `texture_at`).
+        let backing = Memory::zeroed(KIB_64, KIB_64).unwrap();
+        let (mut at_rt, mut at_all) = (null, null);
+        assert_eq!(
+            create_at_address(
+                null,
+                backing.address(),
+                &ResourceDesc {
+                    flags: 0x3,
+                    ..texture(4, 4, 40, 1)
+                },
+                0,
+                clear_d32.as_ptr().cast(),
+                iid,
+                &mut at_rt,
+            ),
+            S_OK
+        );
+        check_flags(at_rt);
+        assert_eq!(
+            create_at_address(
+                null,
+                backing.address(),
+                &ResourceDesc {
+                    flags: 0x7,
+                    ..texture(4, 4, 40, 1)
+                },
+                0,
+                null.cast(),
+                iid,
+                &mut at_all,
+            ),
+            S_OK
+        );
+        check_flags(at_all);
+        assert!(std::sync::Arc::ptr_eq(
+            &host_copy(at_rt).unwrap(),
+            &host_copy(at_all).unwrap(),
+        ));
+
+        static PLACED_DEPTH_MEM: [u64; 8192] = [0; 8192];
+        let placed_desc = ResourceDesc {
+            flags: 0x7,
+            ..texture(4, 4, 55, 1)
+        };
+        // SAFETY: `ResourceDesc` is 56 bytes (`[u32; 14]`).
+        let placed_words: [u32; 14] = unsafe { std::mem::transmute(placed_desc) };
+        let placed = texture_at(PLACED_DEPTH_MEM.as_ptr() as u64, &placed_words)
+            .expect("placed depth texture");
+        check_flags(placed);
+
+        // Bind as DSV and clear depth on the GPU through our command list and queue.
+        let mut dsv_slots = [0u64; 32];
+        let dsv_a = dsv_slots.as_mut_ptr() as u64;
+        let dsv_b = dsv_a + 128;
+        crate::descriptor::create_dsv(null, committed_d32, std::ptr::null(), dsv_a);
+        crate::descriptor::create_dsv(null, at_all, std::ptr::null(), dsv_b);
+
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            S_OK
+        );
+
+        type Targets = extern "system" fn(This, u32, *const u64, i32, *const u64);
+        type ClearDsv = extern "system" fn(This, u64, u32, f32, u8, u32, *const crate::list::Rect);
+        slot::<ClearDsv>(list, 0x198)(list, dsv_a, 1, 0.75, 0, 0, std::ptr::null());
+        slot::<Targets>(list, 0x190)(list, 0, std::ptr::null(), 0, &dsv_a);
+        slot::<ClearDsv>(list, 0x198)(list, dsv_b, 1, 0.5, 0, 0, std::ptr::null());
+        slot::<Targets>(list, 0x190)(list, 0, std::ptr::null(), 0, &dsv_b);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+        // Read back the cleared D32_FLOAT texture to confirm the DSV clear landed.
+        let readback_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let readback_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 1024,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &readback_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &readback_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let host_depth = host_resource(committed_d32).unwrap();
+        let back = host.new_list().unwrap();
+        let (_, before) = host_transition(committed_d32, 0x800).unwrap();
+        let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::ManuallyDrop::new(Some(readback.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+                        Width: 4,
+                        Height: 4,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+        let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::ManuallyDrop::new(Some(host_depth.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        // SAFETY: open list, live resources, valid footprints.
+        unsafe {
+            back.list.ResourceBarrier(&[crate::host::transition(
+                host_depth,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            back.list
+                .CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+        }
+        back.close();
+        host.execute(&[&back]);
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: `host.execute` waited for completion; 1024-byte readback buffer.
+        let words = unsafe {
+            readback
+                .Map(
+                    0,
+                    Some(&D3D12_RANGE {
+                        Begin: 0,
+                        End: 1024,
+                    }),
+                    Some(&mut mapped),
+                )
+                .unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u32>(), 256)
+        };
+        for row in 0..4 {
+            let at = row * 64;
+            assert_eq!(words[at..at + 4], [0.75f32.to_bits(); 4], "row {row}");
+        }
+
+        assert_eq!(
+            host.log_messages(),
+            None,
+            "D3D12 debug layer error on depth + render target resource"
+        );
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        for handle in [
+            list,
+            allocator,
+            queue,
+            at_all,
+            at_rt,
+            committed_d32s8,
+            committed_d16,
+            committed_d32,
+        ] {
+            let _ = slot::<Release>(handle, 0x10)(handle);
         }
     }
 
