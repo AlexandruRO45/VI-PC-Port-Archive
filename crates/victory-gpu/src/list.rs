@@ -1796,6 +1796,16 @@ impl ValueWait {
         met
     }
 
+    /// A host that is not Windows has no title memory to read (the console
+    /// layer, and with it `host` and `texture`, is built there only): report
+    /// the wait met rather than spin on an address nothing writes.
+    #[cfg(not(windows))]
+    fn holds(&self) -> bool {
+        let _ = self;
+        true
+    }
+
+    #[cfg(windows)]
     fn holds(&self) -> bool {
         let bytes = if self.wide { 8 } else { 4 };
         if self.address == 0 {
