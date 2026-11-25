@@ -414,6 +414,26 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
+/// Instructions selecting vector lanes with an untracked scalar or non-trivial
+/// constant bitmask (`v_cndmask_b32`), needing the console wave's lane bits.
+fn selects_untracked_mask(st: &Structured, i: &Inst) -> bool {
+    if i.name() != "v_cndmask_b32" {
+        return false;
+    }
+    let Fields::Valu(v) = &i.fields else {
+        return false;
+    };
+    match v.src.get(2) {
+        Some(&Operand::Scalar { code: NULL, .. }) => false,
+        Some(&Operand::Scalar { code, .. }) => i
+            .read(Reg::S(code))
+            .is_none_or(|m| !st.masks.contains_key(&m)),
+        Some(&Operand::Const(c)) => !matches!(crate::resource::inline(c), Some(0 | u32::MAX)),
+        Some(&Operand::Literal(x)) => !matches!(x, 0 | u32::MAX),
+        _ => false,
+    }
+}
+
 /// Where half `h` (dword h / 2, the high half when odd) of the parameter
 /// whose first element is in row `a` comes from, when the console packs
 /// 16-bit values two per dword: a row and channel of `elements`, none for
@@ -516,6 +536,7 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
+                    || (select_untracked_mask_enabled() && selects_untracked_mask(x.st, i))
             }) || (mask_data_join_enabled()
                 && p.blocks.iter().any(|b| {
                     b.phis.iter().any(|phi| {
@@ -2557,6 +2578,53 @@ impl<'a> Lower<'a> {
         let at = self.s.m.bin(c, Bin::Add, a, o);
         let byte = self.s.m.bin(c, Bin::And, at, three);
         self.s.m.bin(c, Bin::Shl, byte, three)
+    }
+
+    /// Mask condition of `v_cndmask_b32`: a tracked lane mask, a trivial
+    /// all-zeros/all-ones constant, or per-lane bit tests of an untracked
+    /// console bitmask when `VICTORY_SELECT_UNTRACKED_MASK` is on.
+    fn select_mask(&mut self, inst: &Inst, mask_op: Option<&Operand>, c: usize) -> Result<V, Why> {
+        if let Some(&Operand::Scalar { code, .. }) = mask_op
+            && let Some(m) = inst
+                .read(Reg::S(code))
+                .and_then(|m| self.x.st.masks.get(&m).or_else(|| self.x.st.other.get(&m)).copied())
+        {
+            return self.boolean(m, c);
+        }
+        if !select_untracked_mask_enabled() {
+            return Err("a select on an untracked mask");
+        }
+        match mask_op {
+            Some(&Operand::Scalar { code: NULL, .. }) => Ok(self.s.m.bool(false)),
+            Some(&Operand::Const(k)) if crate::resource::inline(k) == Some(0) => {
+                Ok(self.s.m.bool(false))
+            }
+            Some(&Operand::Const(k)) if crate::resource::inline(k) == Some(u32::MAX) => {
+                Ok(self.s.m.bool(true))
+            }
+            Some(&Operand::Literal(0)) => Ok(self.s.m.bool(false)),
+            Some(&Operand::Literal(u32::MAX)) => Ok(self.s.m.bool(true)),
+            Some(op @ &Operand::Scalar { code, .. }) if self.console_lanes => {
+                let lo = self.operand(inst, op)?;
+                let hi = if self.x.native.wave64 {
+                    inst.read(Reg::S(code + 1))
+                        .map(|h| self.i32_of(h))
+                        .transpose()?
+                } else {
+                    None
+                };
+                Ok(self.lane_bit(c, lo, hi))
+            }
+            Some(op @ (Operand::Const(_) | Operand::Literal(_))) if self.console_lanes => {
+                let lo = self.operand(inst, op)?;
+                let hi = self.x.native.wave64.then(|| {
+                    let sign = self.s.m.i32(31);
+                    self.s.m.bin(c, Bin::AShr, lo, sign)
+                });
+                Ok(self.lane_bit(c, lo, hi))
+            }
+            _ => Err("a select on an untracked mask"),
+        }
     }
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
@@ -6102,38 +6170,7 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let cond = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => {
-                        let m = inst
-                            .read(Reg::S(code))
-                            .and_then(|m| {
-                                self.x
-                                    .st
-                                    .masks
-                                    .get(&m)
-                                    .or_else(|| self.x.st.other.get(&m))
-                                    .copied()
-                            })
-                            .ok_or("a select on an untracked mask")?;
-                        self.boolean(m, c)?
-                    }
-                    Some(&Operand::Const(k)) => {
-                        let x =
-                            crate::resource::inline(k).ok_or("a select on an untracked mask")?;
-                        if x == 0 {
-                            self.s.m.bool(false)
-                        } else if x == u32::MAX {
-                            self.s.m.bool(true)
-                        } else if self.console_lanes {
-                            let lo = self.s.m.i32(x);
-                            let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
-                            self.lane_bit(c, lo, Some(hi))
-                        } else {
-                            return Err("a constant lane mask");
-                        }
-                    }
-                    _ => return Err("a select on an untracked mask"),
-                };
+                let cond = self.select_mask(inst, v.src.get(2), c)?;
                 if v.abs != 0 || v.neg != 0 {
                     // Sign-bit moves on the bits a select passes through
                     // (a host `fabs`/`fneg` may flush a denormal).
@@ -11154,6 +11191,50 @@ mod tests {
         ];
         lowers(&words, 0).expect("mask+data join should lower");
     }
+
+    #[test]
+    fn a_select_on_an_untracked_mask_lowers() {
+        // Wave32 constant mask (0xaaaaaaaa) and uniform cselect (-1/0) mask,
+        // plus wave64 64-bit SGPR pair mask, on v_cndmask_b32.
+        let wave32_const = [
+            0xBE82_03FF,
+            0xAAAA_AAAA, // s_mov_b32 s2, 0xaaaaaaaa
+            0x7E02_0281, // v_mov_b32 v1, 1
+            0xD501_0000,
+            0x000A_0300, // v_cndmask_b32 v0, v0, v1, s2
+            S_ENDPGM,
+        ];
+        lowers(&wave32_const, 0).expect("wave32 constant select mask should lower");
+
+        let wave32_cselect = [
+            0xBF01_8000, // s_cmp_lg_i32 s0, 0
+            0x856A_80C1, // s_cselect_b32 vcc_lo, -1, 0
+            0x7E02_0281, // v_mov_b32 v1, 1
+            0x0200_0300, // v_cndmask_b32 v0, v0, v1, vcc_lo
+            S_ENDPGM,
+        ];
+        lowers(&wave32_cselect, 0).expect("s_cselect vcc_lo select mask should lower");
+
+        let wave64_pair = [
+            0xBE82_03FF,
+            0xAAAA_AAAA, // s_mov_b32 s2, 0xaaaaaaaa
+            0xBE83_03FF,
+            0x5555_5555, // s_mov_b32 s3, 0x55555555
+            0x7E02_0281, // v_mov_b32 v1, 1
+            0xD501_0000,
+            0x000A_0300, // v_cndmask_b32 v0, v0, v1, s[2:3]
+            S_ENDPGM,
+        ];
+        lower_wave(&wave64_pair, vec![], vec![], true)
+            .expect("wave64 pair select mask should lower");
+    }
+}
+
+/// Whether `v_cndmask_b32` with an untracked mask operand lowers as lane-bit
+/// selects (`VICTORY_SELECT_UNTRACKED_MASK`, on unless 0).
+fn select_untracked_mask_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SELECT_UNTRACKED_MASK").map_or(true, |v| v != "0"))
 }
 
 /// Whether registers joining a lane mask and data in compute shaders lower
