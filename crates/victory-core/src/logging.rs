@@ -31,18 +31,32 @@ const CAP: LevelFilter = if cfg!(feature = "diagnostics") {
 };
 
 pub fn init(default_level: &str) {
+    init_inner(default_level, true);
+}
+
+/// Initialises logging to stderr only without opening `VICTORY_LOG_FILE`, for
+/// helper child processes whose parent owns the per-run log file.
+pub fn init_stderr_only(default_level: &str) {
+    init_inner(default_level, false);
+}
+
+fn init_inner(default_level: &str, mirror_file: bool) {
     let env = |k: &str| std::env::var_os(k);
     let ansi = use_stderr_ansi(std::io::stderr().is_terminal(), env);
-    let file_writer = log_file_path(env).and_then(|path| match open_log_file(&path) {
-        Ok(file) => Some(SyncWriter(Arc::new(Mutex::new(file)))),
-        Err(e) => {
-            eprintln!(
-                "warning: could not open VICTORY_LOG_FILE {}: {e}",
-                path.display()
-            );
-            None
-        }
-    });
+    let file_writer = if mirror_file {
+        log_file_path(env).and_then(|path| match open_log_file(&path) {
+            Ok(file) => Some(SyncWriter(Arc::new(Mutex::new(file)))),
+            Err(e) => {
+                eprintln!(
+                    "warning: could not open VICTORY_LOG_FILE {}: {e}",
+                    path.display()
+                );
+                None
+            }
+        })
+    } else {
+        None
+    };
     let _ = build_subscriber(default_level, ansi, std::io::stderr, file_writer, env).try_init();
 }
 
@@ -289,6 +303,62 @@ mod tests {
                 line.contains("worker=") && line.ends_with(" ok"),
                 "{line:?}"
             );
+        }
+    }
+
+    #[test]
+    fn two_process_stderr_only_child_preserves_parent_log_file() {
+        const ROLE: &str = "VICTORY_LOG_TEST_ROLE";
+        const TEST: &str =
+            "logging::tests::two_process_stderr_only_child_preserves_parent_log_file";
+
+        match std::env::var(ROLE).as_deref() {
+            Ok("parent") => {
+                init("info");
+                tracing::info!("BEFORE");
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(ROLE, "child")
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                tracing::info!("AFTER");
+            }
+            Ok("child") => {
+                init_stderr_only("info");
+                tracing::info!("CHILD");
+            }
+            _ => {
+                let dir = tempfile::tempdir().unwrap();
+                let log_path = dir.path().join("parent.log");
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(ROLE, "parent")
+                    .env("VICTORY_LOG", "info")
+                    .env("VICTORY_LOG_FILE", &log_path)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{out:?}");
+
+                let stderr = String::from_utf8(out.stderr).unwrap();
+                assert!(!stderr.contains('\x1b'), "{stderr:?}");
+                assert!(stderr.contains("BEFORE"), "{stderr:?}");
+                assert!(stderr.contains("CHILD"), "{stderr:?}");
+                assert!(stderr.contains("AFTER"), "{stderr:?}");
+
+                let file_bytes = std::fs::read(&log_path).unwrap();
+                assert!(
+                    !file_bytes.contains(&0),
+                    "log file must not contain NUL gaps: {file_bytes:?}"
+                );
+                let file_text = String::from_utf8(file_bytes).unwrap();
+                let lines: Vec<_> = file_text.lines().collect();
+                assert_eq!(lines.len(), 2, "{file_text:?}");
+                assert!(lines[0].contains("BEFORE"), "{file_text:?}");
+                assert!(lines[1].contains("AFTER"), "{file_text:?}");
+                assert!(!file_text.contains("CHILD"), "{file_text:?}");
+            }
         }
     }
 }
