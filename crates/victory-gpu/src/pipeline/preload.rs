@@ -10,9 +10,12 @@
 //! create**, so a preload of pipelines this machine's library does not hold
 //! costs a counted miss rather than an hour of driver compiles.
 //!
-//! The pass is bounded: past [`BUDGET_MS`] the rest are left to the frames that
+//! The pass is bounded: past its budget the rest are left to the frames that
 //! ask for them and the line says how many were cut, so a slow startup is
-//! visible rather than mysterious.
+//! visible rather than mysterious. The budget is [`BUDGET_MS`] unless
+//! `VICTORY_PRELOAD_MS` sets another (clamped to [`BUDGET_MAX_MS`]): the number
+//! a boot needs depends on how many pipelines the manifest holds and how fast
+//! this machine makes them, and only a run can say which.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -27,6 +30,20 @@ const MANIFEST: &str = "preload.txt";
 const CONTAINERS: &str = "preload";
 /// What a startup pass may spend; the rest is left to the frames that ask.
 const BUDGET_MS: u128 = 5_000;
+/// The most `VICTORY_PRELOAD_MS` may ask for: a minute of startup is already
+/// more than a first frame should wait, and a typo must not make it endless.
+const BUDGET_MAX_MS: u128 = 60_000;
+
+/// [`BUDGET_MS`], or `VICTORY_PRELOAD_MS` clamped to [`BUDGET_MAX_MS`].
+fn budget_ms() -> u128 {
+    static ON: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_PRELOAD_MS")
+            .ok()
+            .and_then(|asked| asked.trim().parse::<u128>().ok())
+            .map_or(BUDGET_MS, |asked| asked.min(BUDGET_MAX_MS))
+    })
+}
 
 /// Whether runs preload at all: `VICTORY_PRELOAD=1`.
 pub(crate) fn enabled() -> bool {
@@ -92,7 +109,7 @@ pub(crate) fn run(dir: &Path) {
         if line.is_empty() {
             continue;
         }
-        if started.elapsed().as_millis() > BUDGET_MS {
+        if started.elapsed().as_millis() > budget_ms() {
             cut += 1;
             continue;
         }
