@@ -1417,6 +1417,44 @@ mod tests {
     }
 
     /// `n` pages of one new allocation.
+    /// A run above the tiny-reservation threshold still takes the whole
+    /// view; a mutation that disables `map_whole` must not pass the suite.
+    #[test]
+    fn a_large_run_of_pages_is_shown_whole() {
+        const N: usize = 65;
+        let pages = allocate(N);
+        let reservation = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            N * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!reservation.is_null());
+        assert_eq!(XMemMapPhysicalPages(reservation, N, pages.as_ptr()), reservation);
+
+        let physical = physical();
+        assert!(
+            physical
+                .whole
+                .iter()
+                .any(|&(at, len, _)| at == reservation as usize && len == N * PAGE),
+            "the large reservation is shown whole"
+        );
+        assert_eq!(
+            physical.views.get(&(reservation as usize)).map(|v| v.0),
+            Some(N * PAGE)
+        );
+        drop(physical);
+
+        // SAFETY: the whole reservation is mapped read-write.
+        unsafe {
+            reservation.cast::<u8>().write(5);
+            assert_eq!(reservation.cast::<u8>().read(), 5);
+        }
+        assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+    }
+
     fn allocate(n: usize) -> Vec<usize> {
         let (mut pages, mut given) = (vec![0; n], n);
         assert_eq!(
