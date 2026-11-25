@@ -621,6 +621,34 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+#[cfg(windows)]
+fn resolve_region(
+    dst: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    dst_sub: u32,
+    src: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    src_sub: u32,
+) -> Option<windows::Win32::Foundation::RECT> {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC;
+
+    let extent = |desc: &D3D12_RESOURCE_DESC, subresource: u32| {
+        // Array slices and format planes each start at mip zero.
+        let mip = subresource % u32::from(desc.MipLevels.max(1));
+        ((desc.Width >> mip).max(1), (desc.Height >> mip).max(1))
+    };
+    let to = extent(dst, dst_sub);
+    let from = extent(src, src_sub);
+    if (dst.Width, dst.Height) == (src.Width, src.Height) && to == from {
+        return None;
+    }
+    // The console clips a larger source to the selected destination mip.
+    Some(windows::Win32::Foundation::RECT {
+        left: 0,
+        top: 0,
+        right: to.0.min(from.0) as i32,
+        bottom: to.1.min(from.1) as i32,
+    })
+}
+
 extern "system" fn resolve(
     this: This,
     dst: This,
@@ -636,7 +664,6 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
-        use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
         };
@@ -651,30 +678,24 @@ extern "system" fn resolve(
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
-            let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = DXGI_FORMAT(format as i32);
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            if let Some(rect) = resolve_region(&to.GetDesc(), dst_sub, &from.GetDesc(), src_sub) {
+                if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+                    list1.ResolveSubresourceRegion(
+                        to,
+                        dst_sub,
+                        0,
+                        0,
+                        from,
+                        src_sub,
+                        Some(&rect),
+                        format,
+                        D3D12_RESOLVE_MODE_AVERAGE,
+                    );
+                }
+            } else {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
-            } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
-                // The console clips a larger source to the destination.
-                let rect = RECT {
-                    left: 0,
-                    top: 0,
-                    right: a.Width.min(b.Width) as i32,
-                    bottom: a.Height.min(b.Height) as i32,
-                };
-                list1.ResolveSubresourceRegion(
-                    to,
-                    dst_sub,
-                    0,
-                    0,
-                    from,
-                    src_sub,
-                    Some(&rect),
-                    format,
-                    D3D12_RESOLVE_MODE_AVERAGE,
-                );
             }
         }
     }
@@ -1702,6 +1723,34 @@ mod tests {
 
     /// An offset near `u64::MAX` must not overflow and write outside the
     /// query destination buffer.
+    #[cfg(windows)]
+    #[test]
+    fn msaa_resolve_region_uses_subresource_extents() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        };
+
+        let desc = |width, height, mips, slices| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: width,
+            Height: height,
+            MipLevels: mips,
+            DepthOrArraySize: slices,
+            ..Default::default()
+        };
+        let src = desc(16, 16, 1, 1);
+        let target = desc(16, 16, 2, 1);
+        let region = |dst: &D3D12_RESOURCE_DESC, sub| {
+            resolve_region(dst, sub, &src, 0).map(|r| (r.left, r.top, r.right, r.bottom))
+        };
+
+        assert_eq!(region(&target, 0), None);
+        assert_eq!(region(&target, 1), Some((0, 0, 8, 8)));
+        // In an array, subresource 5 is mip 2 of slice 1.
+        assert_eq!(region(&desc(32, 16, 3, 2), 5), Some((0, 0, 8, 4)));
+        assert_eq!(region(&desc(32, 32, 2, 1), 1), Some((0, 0, 16, 16)));
+    }
+
     #[test]
     fn resolve_queries_rejects_overflowing_offset() {
         let null = std::ptr::null();
