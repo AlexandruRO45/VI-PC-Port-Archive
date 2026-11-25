@@ -138,10 +138,22 @@ impl Lower<'_> {
                 match self.root_address(src) {
                     Some((root_lo, root_hi)) => {
                         self.s.flags |= super::flags::INT64;
+                        // The root descriptor carries the base directly (unlike the explicit
+                        // descriptor path below, which drops its low byte).
                         let base = wide64(self, root_lo, root_hi);
                         let zero = self.s.m.i32(0);
-                        let at = wide64(self, at, zero);
-                        Nodes::Raw(self.s.m.bin(c, Bin::Add, base, at))
+                        let ptr = wide64(self, lo, node_hi.unwrap_or(zero));
+                        let k3 = self.s.m.int_const(i64t, 3);
+                        let off = self.s.m.bin(c, Bin::Shl, ptr, k3);
+                        // Widen the 32-bit pieces before adding so carries and the wide node word
+                        // are not truncated.
+                        let k64 = self.s.m.cast(c, Cast::ZExt, k, i64t);
+                        let mut at64 = self.s.m.bin(c, Bin::Add, off, k64);
+                        if let Some(d) = dynamic {
+                            let d64 = self.s.m.cast(c, Cast::SExt, d, i64t);
+                            at64 = self.s.m.bin(c, Bin::Add, at64, d64);
+                        }
+                        Nodes::Raw(self.s.m.bin(c, Bin::Add, base, at64))
                     }
                     None => Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at),
                 }
@@ -532,4 +544,32 @@ fn wide64(l: &mut Lower<'_>, lo: V, hi: V) -> V {
     let k32 = l.s.m.int_const(i64t, 32);
     let hi = l.s.m.bin(c, Bin::Shl, hi, k32);
     l.s.m.bin(c, Bin::Or, lo, hi)
+}
+
+#[cfg(test)]
+mod tests {
+    // Mirrors the 64-bit arithmetic of the Source::Built root-address path.
+    fn built_root_node_address(root_lo: u32, root_hi: u32, node: u32, node_hi: Option<u32>,
+                               k: u32, dynamic: Option<i32>) -> u64 {
+        let base = (u64::from(root_hi) << 32) | u64::from(root_lo);
+        let ptr = (u64::from(node) & !7) | node_hi.map_or(0, |h| (h as u64) << 32);
+        let mut at = (ptr << 3) + u64::from(k);
+        if let Some(d) = dynamic {
+            at = (at as i64 + i64::from(d)) as u64;
+        }
+        base.wrapping_add(at)
+    }
+
+    #[test]
+    fn root_derived_node_address_keeps_high_pointer_bits() {
+        let b: u64 = 0x12_3450_0000;
+        // The root descriptor carries the base directly.
+        let base_lo = b as u32;
+        let base_hi = (b >> 32) as u32;
+        let base = b;
+        assert_eq!(built_root_node_address(base_lo, base_hi, 0x2000_0005, None, 0, None),
+                   base.wrapping_add(4 << 30));
+        assert_eq!(built_root_node_address(base_lo, base_hi, 5, Some(1), 0, None),
+                   base.wrapping_add(32 << 30));
+    }
 }
