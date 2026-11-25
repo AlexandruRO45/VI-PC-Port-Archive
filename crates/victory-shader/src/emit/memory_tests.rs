@@ -613,3 +613,478 @@ fn writes_through_views_mark_their_pages() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// All unique-LUID SM 6.6 D3D12 devices on the machine (hardware GPUs, UMA
+/// integrated GPUs, and WARP), or WARP alone when `VICTORY_WARP=1`.
+fn all_sm66_hosts() -> Vec<(String, Host)> {
+    use windows::Win32::Graphics::Direct3D::*;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::*;
+    let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+    // SAFETY: plain DXGI adapter enumeration and D3D12 feature queries.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return out;
+        };
+        let mut push = |a: IDXGIAdapter1, fallback: &str| {
+            let Ok(desc) = a.GetDesc1() else { return };
+            let luid = (desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart);
+            if seen.contains(&luid) {
+                return;
+            }
+            seen.push(luid);
+            let len = desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..len]);
+            let name = if name.is_empty() {
+                fallback.to_string()
+            } else {
+                name
+            };
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&a, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
+                return;
+            }
+            let Some(device) = dev else { return };
+            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                HighestShaderModel: D3D_SHADER_MODEL_6_6,
+            };
+            if device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    (&raw mut sm).cast(),
+                    size_of_val(&sm) as u32,
+                )
+                .is_ok()
+                && sm.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0
+            {
+                out.push((name, Host { device }));
+            }
+        };
+        if !warp_only {
+            let mut idx = 0;
+            while let Ok(a) = factory.EnumAdapters1(idx) {
+                idx += 1;
+                push(a, "adapter");
+            }
+        }
+        if let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter1>() {
+            push(warp, "WARP");
+        }
+    }
+    out
+}
+
+/// Buffer descriptors (`Source::Built`) assembled in SGPRs around 64-bit
+/// pointers passed in `RootType::Constants` lower through the title-memory
+/// page table (`Lower::memory`): scalar buffer loads (`s_buffer_load_dwordx4`
+/// with byte bounds and an unmapped-page OOB probe), structured `idxen`
+/// `buffer_load_dword` and `buffer_store_dword` (stride 12, carry-propagated
+/// 64-bit base addition, `NUM_RECORDS` bounds), `buffer_atomic_add` (`glc`),
+/// `tbuffer_load_format_xyzw` (`8_8_8_8_UNORM`), and 2-byte-aligned sub-dword
+/// `buffer_load_ushort` / `buffer_store_short`.
+#[test]
+fn buffer_descriptors_built_around_root_constant_addresses_read_and_write_title_memory() {
+    const fn s_mov_lit(sdst: u8, lit: u32) -> [u32; 2] {
+        [0xBE80_03FF | (sdst as u32) << 16, lit]
+    }
+    const fn s_or_lit(sdst: u8, ssrc0: u8, lit: u32) -> [u32; 2] {
+        [0x8800_FF00 | (sdst as u32) << 16 | ssrc0 as u32, lit]
+    }
+    const fn s_add_lit(sdst: u8, ssrc0: u8, lit: u32) -> [u32; 2] {
+        [0x8000_FF00 | (sdst as u32) << 16 | ssrc0 as u32, lit]
+    }
+    const fn s_addc_zero(sdst: u8, ssrc0: u8) -> u32 {
+        0x8200_8000 | (sdst as u32) << 16 | ssrc0 as u32
+    }
+    const fn s_buffer_load(op: u32, sdata: u8, srsrc: u8, offset: u32) -> [u32; 2] {
+        [
+            0x3D << 26 | op << 18 | (sdata as u32) << 6 | (srsrc as u32 >> 1),
+            125 << 25 | (offset & 0x1F_FFFF),
+        ]
+    }
+    const OFFEN: u32 = 1 << 12;
+    const IDXEN: u32 = 1 << 13;
+    const GLC: u32 = 1 << 14;
+    const fn mubuf_ex(
+        op: u32,
+        vdata: u8,
+        vaddr: u8,
+        srsrc: u8,
+        flags: u32,
+        offset: u16,
+    ) -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | flags | (offset as u32 & 0xFFF),
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    }
+    const fn tbuffer_load_xyzw(vdata: u8, vaddr: u8, srsrc: u8, fmt: u8, offset: u16) -> [u32; 2] {
+        [
+            0x3A << 26 | (fmt as u32) << 19 | 3 << 16 | (offset as u32 & 0xFFF),
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    }
+    const fn vop2(op: u32, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+        op << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | src0 as u32
+    }
+    const V_LSHLREV_B32: u32 = 0x1A;
+    const V_ADD_NC_U32: u32 = 0x25;
+
+    let mut w = vec![s_mov_b32(5, ZERO as u8)]; // s[4:5]: result UAV table at s4
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: result RawUav
+
+    // 1. Bounded raw V# s[12:15] around s[0:1] (`TITLE + 0x10`), `NUM_RECORDS = 24`, `OOB_SELECT = 3`.
+    w.push(s_mov_b32(12, 0));
+    w.push(s_mov_b32(13, 1));
+    w.extend(s_mov_lit(14, 24));
+    w.extend(s_mov_lit(15, 0x3101_4FAC));
+    w.extend(s_buffer_load(0x0A, 16, 12, 0x10)); // s[16:19]: 2 dwords inside, 2 dwords OOB
+    w.extend(s_buffer_load(0x08, 20, 12, 0x1_0000)); // s20: OOB into unmapped next page -> 0, no miss
+
+    // 2. Structured V# s[24:27] around `(s[0:1] + 0x40)` (`TITLE + 0x50`), stride 12, `NUM_RECORDS = 5`, `OOB_SELECT = 0`.
+    w.extend(s_add_lit(24, 0, 0x40));
+    w.push(s_addc_zero(25, 1));
+    w.extend(s_or_lit(25, 25, 12 << 16));
+    w.extend(s_mov_lit(26, 5));
+    w.extend(s_mov_lit(27, 0x0101_4FAC));
+    w.extend(mubuf_ex(0x0C, 2, 0, 24, IDXEN, 4)); // v2 = structured load at lane * 12 + 4 (4 < 12)
+    w.extend(mubuf_ex(0x0C, 13, 0, 24, IDXEN, 12)); // v13 = OOB_SELECT=0 offset 12 >= stride 12 -> 0
+    w.extend([v_mov_b32(3, 0xFF), 0x0000_2000]); // v_mov_b32 v3, 0x2000
+    w.push(vop2(V_ADD_NC_U32, 3, 256 + 3, 0)); // v3 = 0x2000 + lane
+    w.extend(mubuf_ex(0x1C, 3, 0, 24, IDXEN, 8)); // structured store at lane * 12 + 8
+
+    // 3. 2-byte-aligned V# s[28:31] around `s[2:3]` (`TITLE + 0x202`), unbounded (`-1`), `OOB_SELECT = 1`.
+    w.push(s_mov_b32(28, 2));
+    w.push(s_mov_b32(29, 3));
+    w.push(0xBE9E_03C1); // s_mov_b32 s30, -1
+    w.extend(s_mov_lit(31, 0x1101_4FAC));
+    w.push(v_mov_b32(1, ZERO));
+    w.extend(mubuf_ex(0x0A, 4, 1, 28, 0, 0)); // v4 = buffer_load_ushort at TITLE + 0x202
+    w.extend([v_mov_b32(5, 0xFF), 0x0000_BEEF]); // v_mov_b32 v5, 0xBEEF
+    // All lanes writing the same halfword 0xBEEF via atomic clear+set is idempotent.
+    w.extend(mubuf_ex(0x1A, 5, 1, 28, 0, 4)); // buffer_store_short 0xBEEF at TITLE + 0x206
+
+    // 4. Structured atomic & format V# s[32:35] around `(s[0:1] + 0x100)` (`TITLE + 0x110`), stride 4, `NUM_RECORDS = 4`, `OOB_SELECT = 1`.
+    w.extend(s_add_lit(32, 0, 0x100));
+    w.push(s_addc_zero(33, 1));
+    w.extend(s_or_lit(33, 33, 4 << 16));
+    w.extend(s_mov_lit(34, 4));
+    w.extend(s_mov_lit(35, 0x1101_4FAC));
+    w.push(v_mov_b32(6, 128 + 10)); // v6 = 10
+    w.extend(mubuf_ex(0x32, 6, 0, 32, IDXEN | GLC, 0)); // v6 = buffer_atomic_add(..., 10) glc
+
+    // Unbounded V# s[36:39] around `(s[0:1] + 0x100)` (`TITLE + 0x110`) for `tbuffer_load_format_xyzw` (`8_8_8_8_UNORM` = 56) at +0x30.
+    w.push(s_mov_b32(36, 32));
+    w.push(s_mov_b32(37, 33));
+    w.push(0xBEA6_03C1); // s_mov_b32 s38, -1
+    w.extend(s_mov_lit(39, 0x1101_4FAC));
+    w.extend(tbuffer_load_xyzw(8, 1, 36, 56, 0x30)); // v[8:11] = RGBA8_UNORM at TITLE + 0x140
+
+    w.push(S_WAITCNT_ALL);
+
+    // Write per-lane results into `out[0]` (`lane * 4` at base 0 and base 32) and scalar/format results from lane 0.
+    w.push(vop2(V_LSHLREV_B32, 7, 128 + 2, 0)); // v7 = lane * 4
+    w.extend(mubuf_ex(0x1C, 2, 7, 8, OFFEN, 0)); // out[lane] = structured load v2
+    w.extend(mubuf_ex(0x1C, 6, 7, 8, OFFEN, 32)); // out[8 + lane] = atomic old v6
+    // Scalar s[16:20], ushort v4, format v[8:11], and OOB_SELECT=0 v13 at byte 64..108.
+    for (k, sreg) in [16u16, 17, 18, 19, 20].into_iter().enumerate() {
+        w.push(v_mov_b32(12, sreg));
+        w.extend(buffer_store_dword(12, 8, 64 + 4 * k as u16));
+    }
+    w.extend(buffer_store_dword(4, 8, 84));
+    for ch in 0..4u8 {
+        w.extend(buffer_store_dword(8 + ch, 8, 88 + 4 * u16::from(ch)));
+    }
+    w.extend(buffer_store_dword(13, 8, 104));
+    w.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 16,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [8, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .expect("lower");
+    assert!(
+        l.memory && l.memory_writes,
+        "built computed descriptors bind title memory"
+    );
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut base_mem = vec![0u32; 256];
+    // Data for bounded s_buffer_load_dwordx4 at `TITLE + 0x10`: +0x10..+0x18 inside, +0x18..+0x20 OOB sentinel.
+    base_mem[0x20 / 4] = 0xAAAA_0001;
+    base_mem[0x24 / 4] = 0xAAAA_0002;
+    base_mem[0x28 / 4] = 0xDEAD_0003;
+    base_mem[0x2C / 4] = 0xDEAD_0004;
+    // Structured 12-byte records at `TITLE + 0x50` (`NUM_RECORDS = 5`, plus sentinel records 5..8).
+    for lane in 0..8usize {
+        let base = (0x50 + lane * 12) / 4;
+        base_mem[base + 1] = 0x1000 + lane as u32;
+        base_mem[base + 2] = 0xDEAD_BEEF;
+    }
+    // 2-byte-aligned halfwords at `TITLE + 0x202` and `TITLE + 0x206`.
+    base_mem[0x200 / 4] = 0xCAFE_5555;
+    base_mem[0x204 / 4] = 0x0000_1234;
+    // Atomic targets at `TITLE + 0x110` (`NUM_RECORDS = 4`, plus sentinels 4..8).
+    for k in 0..4usize {
+        base_mem[0x110 / 4 + k] = 100 * (k as u32 + 1);
+    }
+    for k in 4..8usize {
+        base_mem[0x110 / 4 + k] = 999;
+    }
+    // `8_8_8_8_UNORM` word at `TITLE + 0x140`: R=0, G=51 (0.2), B=153 (0.6), A=255 (1.0).
+    base_mem[0x140 / 4] = 0xFF99_3300;
+
+    let ptr0 = TITLE + 0x10;
+    let ptr1 = TITLE + 0x202;
+    let constants = [
+        ptr0 as u32,
+        (ptr0 >> 32) as u32,
+        ptr1 as u32,
+        (ptr1 >> 32) as u32,
+    ];
+    let hosts = all_sm66_hosts();
+    assert!(!hosts.is_empty(), "no SM 6.6 device available");
+    for (name, host) in &hosts {
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Constants => constants[u.dword as usize],
+                _ => 0,
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: page_table(1, 3),
+                            },
+                        ),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &[
+                        View::RawUav(27),
+                        View::Memory(&base_mem),
+                        View::Pair,
+                        View::NullPair,
+                        View::Pair,
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+
+        assert_eq!(
+            &out[0][0..8],
+            &[0x1000, 0x1001, 0x1002, 0x1003, 0x1004, 0, 0, 0],
+            "{name}: structured idxen loads with NUM_RECORDS=5"
+        );
+        assert_eq!(
+            &out[0][8..16],
+            &[100, 200, 300, 400, 0, 0, 0, 0],
+            "{name}: glc buffer_atomic_add with NUM_RECORDS=4"
+        );
+        assert_eq!(
+            &out[0][16..21],
+            &[0xAAAA_0001, 0xAAAA_0002, 0, 0, 0],
+            "{name}: bounded s_buffer_load_dwordx4 and OOB unmapped-page probe"
+        );
+        assert_eq!(
+            out[0][21], 0xCAFE,
+            "{name}: 2-byte-aligned buffer_load_ushort"
+        );
+        let rgba: Vec<f32> = out[0][22..26].iter().copied().map(f32::from_bits).collect();
+        for (got, want) in rgba.iter().zip([0.0f32, 0.2, 0.6, 1.0]) {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "{name}: tbuffer_load_format_xyzw got {rgba:?}"
+            );
+        }
+        assert_eq!(
+            out[0][26], 0,
+            "{name}: OOB_SELECT=0 rejects offset >= stride"
+        );
+
+        // Structured stores landed in lanes 0..5 and dropped in lanes 5..8.
+        for lane in 0..8usize {
+            let at = (0x50 + lane * 12) / 4 + 2;
+            let want = if lane < 5 {
+                0x2000 + lane as u32
+            } else {
+                0xDEAD_BEEF
+            };
+            assert_eq!(out[1][at], want, "{name}: structured store lane {lane}");
+        }
+        // Unaligned buffer_store_short updated the upper halfword only.
+        assert_eq!(
+            out[1][0x204 / 4],
+            0xBEEF_1234,
+            "{name}: 2-byte-aligned buffer_store_short"
+        );
+        // Atomic adds updated elements 0..4 (100+10, 200+10, ...) and left sentinels 4..8 alone.
+        assert_eq!(
+            &out[1][0x110 / 4..0x110 / 4 + 8],
+            &[110, 210, 310, 410, 999, 999, 999, 999],
+            "{name}: atomic memory results"
+        );
+        // Only the mapped written page is marked in the dirty bitmap (zero false misses).
+        let entry = 4096 + (TITLE as u32 >> 16 & 0xFFF) as usize;
+        let marked: Vec<usize> = (0..out[2].len() * 32)
+            .filter(|&b| out[2][b / 32] >> (b % 32) & 1 != 0)
+            .collect();
+        assert_eq!(marked, [entry], "{name}: dirty page bitmap");
+        eprintln!("{name}: built computed-address buffer descriptors verified");
+    }
+}
+
+/// Built descriptors around computed addresses with hardware swizzling
+/// (`SWIZZLE_ENABLE` / `CACHE_SWIZZLE`) or `ADD_TID_ENABLE` are refused.
+#[test]
+fn built_computed_address_descriptors_with_swizzling_or_tid_are_refused() {
+    let check = |bits_or: u32, word3: u32| {
+        let w = [
+            s_mov_b32(4, 0),
+            0x8805_FF01,
+            bits_or, // s_or_b32 s5, s1, bits_or
+            0xBE86_03C1,
+            0xBE87_03FF,
+            word3,
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | (4 >> 2) << 16, // buffer_store_dword v0, off, s[4:7], 0
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, 2).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, HwStage::Cs, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            view_marks: false,
+        })
+    };
+    for (bits_or, word3) in [(1 << 30, 0x1101_4FAC), (0, 0x1181_4FAC)] {
+        assert!(matches!(
+            check(bits_or, word3),
+            Err(crate::ShaderError::Unsupported {
+                what: "a buffer descriptor with swizzling or thread ids",
+                ..
+            })
+        ));
+    }
+}

@@ -168,6 +168,30 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// For a buffer descriptor built around computed title memory (including one
+/// whose address dwords came through uniform phis or selects): its `(bits, words)`.
+fn built_memory_desc(src: &Source) -> Option<(u32, [u32; 2])> {
+    let leaves = src.leaves();
+    let first = match leaves.first()? {
+        Source::Built {
+            address,
+            bits,
+            words,
+        } if address.param == MEMORY => (*bits, *words),
+        _ => return None,
+    };
+    leaves
+        .iter()
+        .all(|l| {
+            matches!(
+                l,
+                Source::Built { address, bits, words }
+                    if address.param == MEMORY && *bits == first.0 && *words == first.1
+            )
+        })
+        .then_some(first)
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -484,7 +508,18 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
-        let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
+        let built_memory = x.res.descriptors.iter().any(|d| {
+            d.source
+                .leaves()
+                .iter()
+                .any(|l| matches!(l, Source::Built { address, .. } if address.param == MEMORY))
+        });
+        let root_memory = x
+            .res
+            .scalar
+            .iter()
+            .any(|s| matches!(s.1.param, MEMORY | USER_DATA))
+            || built_memory
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1691,12 +1726,39 @@ impl<'a> Lower<'a> {
         Some((lo, self.s.m.bin(self.s.entry, Bin::And, hi, mask)))
     }
 
+    /// The 48-bit base address `(lo, hi)` in dwords 0-1 of the buffer
+    /// descriptor operand at `site` (`hi` masked to bits 32-47).
+    fn built_memory_base(&mut self, site: Site) -> Result<(V, V), Why> {
+        let inst = &self.x.p.blocks[site.0].insts[site.1];
+        let code = match inst.fields {
+            Fields::Buffer {
+                rsrc: Operand::Scalar { code, .. },
+                ..
+            }
+            | Fields::Smem {
+                base: Operand::Scalar { code, .. },
+                ..
+            } => code,
+            _ => return Err("a buffer descriptor not in SGPRs"),
+        };
+        let lo = inst
+            .read(Reg::S(code))
+            .ok_or("a buffer descriptor address")?;
+        let hi = inst
+            .read(Reg::S(code + 1))
+            .ok_or("a buffer descriptor address")?;
+        let (lo, hi) = (self.i32_of(lo)?, self.i32_of(hi)?);
+        let mask = self.s.m.i32(0xFFFF);
+        Ok((lo, self.s.m.bin(self.cur, Bin::And, hi, mask)))
+    }
+
     /// A raw view `src` at byte offset `off` (`props` as [`Self::handle`]
     /// takes them): its handle and the offset in it. A root view of a
-    /// program that uses title memory is title memory at the root address
-    /// plus the offset ([`Self::memory`]: `bytes` accessed, `write`, the
-    /// `active` lanes), so the access is bounds-checked (host root views
-    /// have no bounds) and sees the copies the program's other accesses see.
+    /// program that uses title memory, or a buffer descriptor built around a
+    /// computed address, is title memory at the base address plus the offset
+    /// ([`Self::memory`]: `bytes` accessed, `write`, the `active` lanes), so
+    /// the access is bounds-checked and sees the copies the program's other
+    /// accesses see.
     #[allow(clippy::too_many_arguments)]
     fn raw_view(
         &mut self,
@@ -1708,7 +1770,30 @@ impl<'a> Lower<'a> {
         write: bool,
         active: Option<V>,
     ) -> Result<(V, V), Why> {
-        let Some((lo, hi)) = self.root_address(src) else {
+        self.raw_view_bounded(site, src, off, bytes, props, write, active, None)
+    }
+
+    /// [`Self::raw_view`], gated by descriptor bounds `in_bounds` when a
+    /// built descriptor carries a record or byte limit: out-of-bounds lanes
+    /// address the null viewpair without marking title-memory misses or writes.
+    #[allow(clippy::too_many_arguments)]
+    fn raw_view_bounded(
+        &mut self,
+        site: Site,
+        src: &Source,
+        off: V,
+        bytes: u32,
+        props: (u32, u32),
+        write: bool,
+        active: Option<V>,
+        in_bounds: Option<V>,
+    ) -> Result<(V, V), Why> {
+        let base = if built_memory_desc(src).is_some() {
+            Some(self.built_memory_base(site)?)
+        } else {
+            self.root_address(src)
+        };
+        let Some((lo, hi)) = base else {
             let h = self.handle(site, src, false, props)?;
             let off = match self.root_view_offset(src) {
                 Some(at) => self.s.m.bin(self.cur, Bin::Add, off, at),
@@ -1717,10 +1802,20 @@ impl<'a> Lower<'a> {
             return Ok((h, off));
         };
         // The hardware adds the 32-bit offset to the 48-bit base.
-        let (lo, hi) = self.add64(lo, hi, off, false);
+        let (mut lo, hi) = self.add64(lo, hi, off, false);
         let mask = self.s.m.i32(0xFFFF);
-        let hi = self.s.m.bin(self.cur, Bin::And, hi, mask);
-        Ok(self.memory(lo, hi, bytes, write, active))
+        let mut hi = self.s.m.bin(self.cur, Bin::And, hi, mask);
+        let active = match (active, in_bounds) {
+            (Some(a), Some(b)) => Some(self.s.m.bin(self.cur, Bin::And, a, b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(ok) = in_bounds {
+            let c = self.cur;
+            let (zero, out_hi) = (self.s.m.i32(0), self.s.m.i32(256));
+            lo = self.s.m.select(c, ok, lo, zero);
+            hi = self.s.m.select(c, ok, hi, out_hi);
+        }
+        Ok(self.memory(lo, hi, bytes.max(1), write, active))
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
@@ -3898,6 +3993,53 @@ impl<'a> Lower<'a> {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
                 let x = self.code_dword(a)?;
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
+        if let Some((bits, [records, word3])) = built_memory_desc(src) {
+            if bits >> 30 != 0 || word3 >> 23 & 1 != 0 || word3 >> 30 != 0 {
+                return Err("a buffer descriptor with swizzling or thread ids");
+            }
+            let (stride, oob) = (bits >> 16 & 0x3FFF, word3 >> 28 & 3);
+            let limit = if records == 0 {
+                0
+            } else if oob == 2 {
+                u64::MAX
+            } else if stride == 0 || oob == 3 {
+                u64::from(records)
+            } else {
+                u64::from(records) * u64::from(stride)
+            };
+            let in_bounds = if limit < 4 {
+                Some(self.s.m.bool(false))
+            } else if limit >= u64::from(u32::MAX) {
+                None
+            } else {
+                let last = self.s.m.i32((limit - 4) as u32);
+                Some(self.s.m.cmp(c, pred::IULE, addr, last))
+            };
+            let span = if limit < u64::from(4 * count) {
+                (limit as u32 & !3).max(4)
+            } else {
+                4 * count
+            };
+            let (h, base_off) =
+                self.raw_view_bounded(site, src, addr, span, (11, 0), false, None, in_bounds)?;
+            let c = self.cur;
+            let zero = self.s.m.i32(0);
+            for k in 0..count {
+                let off = self.s.m.i32(4 * k);
+                let a = self.s.m.bin(c, Bin::Add, base_off, off);
+                let mut x = self.raw_dword(h, a);
+                let end = u64::from(4 * (k + 1));
+                if limit < end {
+                    x = zero;
+                } else if limit < u64::from(u32::MAX) {
+                    let last = self.s.m.i32((limit - end) as u32);
+                    let ok = self.s.m.cmp(c, pred::IULE, addr, last);
+                    x = self.s.m.select(c, ok, x, zero);
+                }
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -8728,10 +8870,71 @@ impl<'a> Lower<'a> {
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
+        let built_memory = built_memory_desc(src);
+        let format = match (*format, built_memory) {
+            (Some(f), _) => Some(f),
+            (None, Some((_, [_, word3]))) if typed && !store => {
+                if word3 & 0xFFF != 0xFAC {
+                    return Err("a buffer descriptor with channel swizzling");
+                }
+                Some(((word3 >> 12) & 0x7F) as u8)
+            }
+            (None, _) => None,
+        };
+        let mut built_bounds = None;
+        if let Some((bits, [records, word3])) = built_memory {
+            if typed && format.is_none() {
+                return Err("a typed buffer store around a computed address");
+            }
+            if bits >> 30 != 0 || word3 >> 23 & 1 != 0 || word3 >> 30 != 0 {
+                return Err("a buffer descriptor with swizzling or thread ids");
+            }
+            let (stride, oob) = (bits >> 16 & 0x3FFF, word3 >> 28 & 3);
+            let access_bytes = match (format, sub) {
+                (Some(f), _) => {
+                    buffer_format(f).map_or(4 * count, |(b, _)| b.iter().sum::<u32>() / 8)
+                }
+                (None, Some((width, _))) => width / 8,
+                (None, None) => 4 * count,
+            };
+            if records == 0 {
+                built_bounds = Some(self.s.m.bool(false));
+            } else if oob == 1 {
+                if let Some(ix) = index {
+                    let n = self.s.m.i32(records);
+                    built_bounds = Some(self.s.m.cmp(c, pred::IULT, ix, n));
+                }
+            } else if oob == 0 && stride != 0 {
+                let s = self.s.m.i32(stride);
+                let mut ok = self.s.m.cmp(c, pred::IULT, off, s);
+                if let Some(ix) = index {
+                    let n = self.s.m.i32(records);
+                    let ix_ok = self.s.m.cmp(c, pred::IULT, ix, n);
+                    ok = self.s.m.bin(c, Bin::And, ok, ix_ok);
+                }
+                built_bounds = Some(ok);
+            }
+            if let Some(ix) = index {
+                let s = self.s.m.i32(stride);
+                let byte = self.s.m.bin(c, Bin::Mul, ix, s);
+                off = self.s.m.bin(c, Bin::Add, off, byte);
+            }
+            if records != 0 && (oob == 3 || oob == 0 && stride == 0) {
+                built_bounds = match records.checked_sub(access_bytes) {
+                    None => Some(self.s.m.bool(false)),
+                    Some(u32::MAX) => None,
+                    Some(last) => {
+                        let last = self.s.m.i32(last);
+                        Some(self.s.m.cmp(c, pred::IULE, off, last))
+                    }
+                };
+            }
+        }
         // A descriptor built around a root view has the stride the code puts
         // in dword 1 (bits 16-29) and no record limit (dword 2 is -1): an
         // index is a byte offset into the raw root view.
         let index = match (src, index) {
+            (_, Some(_)) if built_memory.is_some() => None,
             (Source::Built { address, bits, words }, Some(ix))
                 if address.param < self.x.native.layout.len() && !typed =>
             {
@@ -8819,7 +9022,16 @@ impl<'a> Lower<'a> {
                     (h, [index, off, iu], byte)
                 }
                 None => {
-                    let (h, off) = self.raw_view(site, src, off, 4, (11 | u, 0), true, guard)?;
+                    let (h, off) = self.raw_view_bounded(
+                        site,
+                        src,
+                        off,
+                        4,
+                        (11 | u, 0),
+                        true,
+                        guard,
+                        built_bounds,
+                    )?;
                     (h, [off, iu, iu], off)
                 }
             };
@@ -8870,8 +9082,30 @@ impl<'a> Lower<'a> {
             let d = data.as_ref().ok_or("buffer store data")?;
             let x = self.vgprs(inst, d, 1)?[0];
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
-            let at = self.s.m.bin(c, Bin::And, off, not3);
-            let byte = self.s.m.bin(c, Bin::And, off, three);
+            let (h, at, byte) = if built_memory.is_some() {
+                let (h, raw) = self.raw_view_bounded(
+                    site,
+                    src,
+                    off,
+                    width / 8,
+                    (11 | 0x1000, 0),
+                    true,
+                    guard,
+                    built_bounds,
+                )?;
+                let c = self.cur;
+                (
+                    h,
+                    self.s.m.bin(c, Bin::And, raw, not3),
+                    self.s.m.bin(c, Bin::And, raw, three),
+                )
+            } else {
+                let at = self.s.m.bin(c, Bin::And, off, not3);
+                let byte = self.s.m.bin(c, Bin::And, off, three);
+                let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
+                (h, at, byte)
+            };
+            let c = self.cur;
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             let field = self.s.m.i32(if width == 8 { 0xFF } else { 0xFFFF });
             let x = self.s.m.bin(c, Bin::And, x, field);
@@ -8879,7 +9113,6 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.bin(c, Bin::Shl, field, sh);
             let all = self.s.m.i32(u32::MAX);
             let keep = self.s.m.bin(c, Bin::Xor, mask, all);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
             let begin = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
             for (op, v) in [(1, keep), (2, x)] {
@@ -8954,8 +9187,16 @@ impl<'a> Lower<'a> {
                     }
                     None => {
                         let n = 4 * count;
-                        let (h, off) =
-                            self.raw_view(site, src, off, n, (11 | u, 0), true, guard)?;
+                        let (h, off) = self.raw_view_bounded(
+                            site,
+                            src,
+                            off,
+                            n,
+                            (11 | u, 0),
+                            true,
+                            guard,
+                            built_bounds,
+                        )?;
                         args.extend([h, off, iu]);
                         (byte, bytes) = (off, n);
                     }
@@ -8975,15 +9216,29 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
-        if let Some(f) = *format {
+        if let Some(f) = format {
             if index.is_some() {
                 return Err("a typed-format load by index");
             }
-            let (h, off) = self.raw_view(site, src, off, 4 * count, (11 | u, 0), false, guard)?;
+            let fmt_bytes = buffer_format(f).map_or(4 * count, |(b, _)| b.iter().sum::<u32>() / 8);
+            let (h, off) = self.raw_view_bounded(
+                site,
+                src,
+                off,
+                fmt_bytes,
+                (11 | u, 0),
+                false,
+                guard,
+                built_bounds,
+            )?;
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            let mut xs = self.format_load(h, off, f, count)?;
+            let mut xs = if built_memory.is_some_and(|(_, [r, _])| r == 0) {
+                vec![self.s.m.i32(0); count as usize]
+            } else {
+                self.format_load(h, off, f, count)?
+            };
             if d16 {
                 xs = self.d16_channels(f, xs)?;
             }
@@ -8999,8 +9254,29 @@ impl<'a> Lower<'a> {
                 return Err("a byte or half buffer load by index");
             }
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
-            let at = self.s.m.bin(c, Bin::And, off, not3);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), false, guard)?;
+            let (h, at, byte) = if built_memory.is_some() {
+                let (h, raw) = self.raw_view_bounded(
+                    site,
+                    src,
+                    off,
+                    width / 8,
+                    (11 | u, 0),
+                    false,
+                    guard,
+                    built_bounds,
+                )?;
+                let c = self.cur;
+                (
+                    h,
+                    self.s.m.bin(c, Bin::And, raw, not3),
+                    self.s.m.bin(c, Bin::And, raw, three),
+                )
+            } else {
+                let at = self.s.m.bin(c, Bin::And, off, not3);
+                let byte = self.s.m.bin(c, Bin::And, off, three);
+                let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), false, guard)?;
+                (h, at, byte)
+            };
             let c = self.cur;
             let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
             let r = self.s.op(
@@ -9013,7 +9289,6 @@ impl<'a> Lower<'a> {
             );
             let w = self.s.m.extract(c, r, 0);
             let w = self.as_int(w);
-            let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             let x = self.s.m.bin(c, Bin::LShr, w, sh);
             let left = self.s.m.i32(32 - width);
@@ -9066,8 +9341,16 @@ impl<'a> Lower<'a> {
                 }
                 None => {
                     let bytes = 4 * count;
-                    let (h, off) =
-                        self.raw_view(site, src, off, bytes, (11 | u, 0), false, guard)?;
+                    let (h, off) = self.raw_view_bounded(
+                        site,
+                        src,
+                        off,
+                        bytes,
+                        (11 | u, 0),
+                        false,
+                        guard,
+                        built_bounds,
+                    )?;
                     self.s.op(
                         self.cur,
                         "rawBufferLoad.f32",
