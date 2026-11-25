@@ -592,6 +592,7 @@ fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
         0 => man * 2f32.powi(-24),
+        31 if man != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + man / 1024.0) * 2f32.powi(e - 15),
     };
@@ -604,6 +605,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
     let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
     match exp {
         0 => m / (1 << man) as f32 * 2f32.powi(-14),
+        31 if m != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + m / (1 << man) as f32) * 2f32.powi(e as i32 - 15),
     }
@@ -650,7 +652,10 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         }
         23..=25 | 89 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
-            [(v & 0x3ff) as f32, (v >> 10 & 0x3ff) as f32, (v >> 20 & 0x3ff) as f32]
+            [v, v >> 10, v >> 20].map(|bits| {
+                let channel = (bits & 0x3ff) as f32;
+                if format == 89 { (channel - 384.0) / 510.0 } else { channel }
+            })
         })),
         26 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
@@ -871,8 +876,8 @@ mod tests {
         // Red 0x8000 (a half-float -0), green 0x4000, blue 0.
         let unorm16 = [0x00, 0x80, 0x00, 0x40, 0, 0, 0xff, 0xff];
         assert_eq!(super::to_rgba(11, 1, 1, 8, &unorm16), Some(vec![255, 127, 0, 255]));
-        // Red 0x3ff, green 0x1ff, blue 0, alpha 3.
-        let xr = (0x3ffu32 | 0x1ff << 10 | 3 << 30).to_le_bytes();
+        // XR stores 1.0, 0.5 and 0.0 as 894, 639 and 384.
+        let xr = (894u32 | 639 << 10 | 384 << 20 | 3 << 30).to_le_bytes();
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
@@ -896,6 +901,17 @@ mod tests {
             let bytes: Vec<_> = [-scale, 0.0, scale].into_iter().flat_map(f32::to_le_bytes).collect();
             let rgba = super::to_rgba(41, 3, 1, 12, &bytes).unwrap();
             assert_eq!([rgba[0], rgba[4], rgba[8]], [0, 127, 255]);
+        }
+    }
+
+    #[test]
+    fn packed_float_special_values_keep_their_class() {
+        assert!(super::half(0x7e00).is_nan());
+        assert!(super::half(0xfc00).is_infinite());
+        for mantissa_bits in [5, 6] {
+            let infinity = 31 << mantissa_bits;
+            assert!(super::small_float(infinity, mantissa_bits).is_infinite());
+            assert!(super::small_float(infinity | 1, mantissa_bits).is_nan());
         }
     }
 
