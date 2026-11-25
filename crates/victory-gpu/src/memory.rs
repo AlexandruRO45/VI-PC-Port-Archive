@@ -632,7 +632,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     let dirty = pooled.gpu();
     list.defer_memory(key);
     if crate::switch::card_copies() {
-        list.defer_memory_bitmap(key, data as usize, words);
+        list.defer_memory_bitmap(key, pooled.data(), BITMAP_WORDS);
     }
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
@@ -736,10 +736,10 @@ pub(crate) fn marked_card_pages(
             let Some(&l1) = layout.blocks.get(block).filter(|_| block != 0) else {
                 continue;
             };
-            let Some(Some(owner)) = layout.owner.get(entry) else {
+            let Some(&owner) = layout.owner.get(entry).filter(|&&k| k != NO_OWNER) else {
                 continue;
             };
-            let Some(copy) = layout.copies.get(*owner) else {
+            let Some(copy) = layout.copies.get(owner as usize) else {
                 continue;
             };
             if copy.has_card() {
