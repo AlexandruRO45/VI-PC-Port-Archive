@@ -5737,7 +5737,7 @@ impl<'a> Lower<'a> {
                 let flag = self.s.m.bin(c, Bin::And, flag, not_special_or_zero);
 
                 let s_den_up = self.s.m.bin(c, Bin::And, is_den, case_overflow);
-                let s_num_up = self.s.m.bin(c, Bin::And, is_num, c3_or_c5);
+                let s_num_up = self.s.m.bin(c, Bin::And, is_num, c5);
                 let s_both_up = self.s.m.bin(c, Bin::Or, c2, c6);
                 let s_one_up = self.s.m.bin(c, Bin::Or, s_den_up, s_num_up);
                 let u = self.s.m.bin(c, Bin::Or, s_both_up, s_one_up);
@@ -5785,7 +5785,9 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_div_fmas_f32" => {
-                // RDNA2 ISA §12.12 opcode 367: if (VCC) D.f = 2^32 * (S0.f * S1.f + S2.f) else D.f = S0.f * S1.f + S2.f
+                // RDNA2 ISA §12.12 opcode 367: when VCC is set, scale
+                // `S0 * S1 + S2` by 2^64 (large quotient, `exp(S2) > 127`) or
+                // 2^-64 (tiny/denormal quotient, `exp(S2) <= 127`).
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let m = inst
                     .read(Reg::S(crate::ir::VCC))
@@ -5793,8 +5795,19 @@ impl<'a> Lower<'a> {
                     .ok_or("v_div_fmas_f32 without VCC")?;
                 let vcc = self.boolean(m, c)?;
                 let tmp = self.fmad(a, bb, cc);
-                let k_2_32 = self.s.m.f32(0x4F80_0000); // 2^32
-                let scaled = self.s.m.bin(c, Bin::Mul, tmp, k_2_32);
+                let ci = self.as_int(cc);
+                let (k23, k255, k127) = (
+                    self.s.m.i32(23),
+                    self.s.m.i32(0xFF),
+                    self.s.m.i32(127),
+                );
+                let exp_c = self.s.m.bin(c, Bin::LShr, ci, k23);
+                let exp_c = self.s.m.bin(c, Bin::And, exp_c, k255);
+                let big = self.s.m.cmp(c, pred::IUGT, exp_c, k127);
+                let k_up = self.s.m.f32(0x5F80_0000); // 2^64
+                let k_down = self.s.m.f32(0x1F80_0000); // 2^-64
+                let factor = self.s.m.select(c, big, k_up, k_down);
+                let scaled = self.s.m.bin(c, Bin::Mul, tmp, factor);
                 let r = self.s.m.select(c, vcc, scaled, tmp);
                 float(self, r)
             }
