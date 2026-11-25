@@ -324,6 +324,12 @@ with all of them, from about 120 ms in the morning. Still far from the console's
 - The frame rate is drawn into the top left corner of every frame shown
   (`fpsbox.rs`; `VICTORY_FPS_COUNTER=0`: not): the window's caption has
   it too, but a capture of the picture does not carry the caption.
+- The overlay reports FPS, average milliseconds per frame, process CPU
+  percentage, renderer GPU queue occupancy, process working-set RAM, and
+  current VRAM usage against the operating-system budget. GPU occupancy is
+  measured from this renderer's timed queue work, not total adapter usage.
+  Samples update once a second; unavailable readings stay marked `--` until
+  the first valid sample.
 - `VICTORY_COPY_CHANGED=1` (off by default): a refresh of a copy in the
   card's memory sends on only the 256-byte chunks that differ from the
   copy's CPU side. The layer's sync lists on the card fall from 12 to 8
@@ -676,6 +682,28 @@ title's window has focus:
 | Esc, Tab | Menu, View |
 
 ## Commands
+
+For a measured performance run after building release, use
+`powershell -File scripts/run-performance.ps1 -GameExe <path-to-your-exe>`.
+The launcher enables frame logs and the existing performance switches,
+keeps logs under `%LOCALAPPDATA%\victory\benchmarks`, and uses Series X
+unless `-Console series-s` is supplied. `-PrepareOnly` validates paths
+without starting the game. Compare the same scene after caches warm up.
+
+The overlay's `AVG MS` is the reciprocal of its rolling FPS rate. CPU is the
+process's share of available logical-processor capacity; GPU is timed work
+submitted by this renderer as a share of wall time, not whole-adapter usage.
+RAM is the process working set, and VRAM is current DXGI usage / its live OS
+budget. GPU and memory samples refresh once a second.
+
+The active host adapter's dedicated VRAM is detected through DXGI. New streamed
+texture copies and optional GPU buffer copies are admitted below 80% of
+physical VRAM, capped by Windows' live process budget. For integrated GPUs
+without dedicated VRAM, 80% of the local-memory budget is used. This soft
+allowance is allocated as needed; concurrent allocations, required render
+targets, in-flight allocations, and driver resources can take process usage
+above it. It does not reclaim memory when the budget falls. The startup log
+reports the detected capacity and allowance. FPS gains require measurement.
 
 ```
 victory inspect <exe|dll> [--imports] [--exports]
