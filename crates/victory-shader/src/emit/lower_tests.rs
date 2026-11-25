@@ -67,7 +67,7 @@ fn packed_elements_behind_another_take_the_first_free_dword() {
         usage: 0,
         half: true,
     };
-    // MS_VS_PedTransformPreSkinD_Packed 005fe88ec1bdc0c7 and its pixel
+    // The title's pre-skinned mesh program 005fe88ec1bdc0c7 and its pixel
     // shader 93667197d3d05e1c: TEXCOORD6 is one value at register 4
     // column 3; parameter 3 (rows 6 and 7) carries it in dword 3.
     let sig = vec![

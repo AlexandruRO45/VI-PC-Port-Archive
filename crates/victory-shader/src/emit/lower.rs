@@ -5690,10 +5690,10 @@ impl<'a> Lower<'a> {
         // raw bytes, as a table's SRV is below. Read as a constant buffer
         // (the host's validation: "Descriptor Type in Heap: SRV, Register
         // Type: CBV", heap index 17) the loads gave nothing:
-        // the title's meshlet culling (BatchCullMeshlets,
-        // BatchCullPreSkinnedMeshlets, BatchCullBatchCSMeshlets) reads its
-        // batch records, mesh headers and instance transforms this way, so
-        // it passed no meshlet and every indirect mesh draw ran empty.
+        // the title's meshlet culling programs (plain, pre-skinned and
+        // batched) read their batch records, mesh headers and instance
+        // transforms this way, so they passed no meshlet and every
+        // indirect mesh draw ran empty.
         // The host's table of strides by heap slot tells a buffer view
         // (not 0) from anything else, which is still read as a constant
         // buffer; only the load that fits the slot runs.
