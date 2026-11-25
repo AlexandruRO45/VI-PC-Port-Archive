@@ -2,7 +2,11 @@
 //! so fence signals complete at once, unless a wait holds the queue back
 //! (`timeline`).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+// Without a Windows host, the host submissions and the test helpers that
+// drive them have no callers.
+#![cfg_attr(not(windows), allow(dead_code))]
 
+#[cfg(windows)]
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -173,6 +177,9 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if !ONCE.swap(true, Ordering::Relaxed) {
         tracing::warn!(count, "command lists submitted; no host GPU runs them");
     }
+    // No host timeline to hand the queue to outside Windows.
+    #[cfg(not(windows))]
+    let _ = this;
 }
 
 /// The start of a present plane: frame token, then the plane's resources.
@@ -449,7 +456,7 @@ fn show(shown: Option<object::Ref>, over: Option<object::Ref>) {
         let _ = shown;
     }
     #[cfg(not(windows))]
-    let _ = shown;
+    let _ = (shown, over);
 }
 /// A presented resource's host texture and the host state it is in.
 #[cfg(windows)]

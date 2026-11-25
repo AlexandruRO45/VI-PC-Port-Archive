@@ -3,6 +3,9 @@
 //! which lists record their queries into (`list.rs`); other heaps only
 //! remember their description, and resolving them writes stand-in values.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+// Without a Windows host, the host query heaps below and their mapping have
+// no callers.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;

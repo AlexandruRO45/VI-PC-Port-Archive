@@ -25,6 +25,8 @@ fn mov(body: &mut Vec<u32>, reg: u32, value: u32) {
     body.extend([0x7E00_02FF | reg << 17, value]); // v_mov_b32 with a literal
 }
 
+// Only the programs a Windows host runs are built through it.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn shader(body: &[u32], threads: u32) -> Result<HostShader, ShaderError> {
     shader_with(body, threads, None, 0)
 }

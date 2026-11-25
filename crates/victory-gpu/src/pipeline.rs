@@ -18,13 +18,12 @@
 
 use std::collections::HashMap;
 use std::mem::offset_of;
-#[cfg(windows)]
-use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::object::{
-    self, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, PIPELINE, Table, This, guid,
-};
+use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
+// Only the Windows path refuses a pipeline it cannot make.
+#[cfg(windows)]
+use crate::object::E_NOTIMPL;
 use crate::resource::PAGEABLE_IIDS;
 
 const PIPELINE_IIDS: [Iid; 4] = [
