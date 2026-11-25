@@ -693,7 +693,7 @@ pub(crate) fn ensure_installed() {
 /// of the crash reporter's.
 fn install() {
     use windows_sys::Win32::Foundation::{
-        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_IN_PAGE_ERROR, NTSTATUS,
+        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP, NTSTATUS,
     };
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
@@ -702,9 +702,12 @@ fn install() {
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
+        // A fault inside the fast copy fails it, whatever it is (a guard page
+        // raises STATUS_GUARD_PAGE_VIOLATION): but a breakpoint or a step is
+        // the debugger's.
         #[cfg(target_arch = "x86_64")]
-        if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR as NTSTATUS)
+        if r.ExceptionCode != EXCEPTION_BREAKPOINT as NTSTATUS
+            && r.ExceptionCode != EXCEPTION_SINGLE_STEP as NTSTATUS
             // SAFETY: the exception context is valid for the duration of the handler.
             && crate::host::recover_copy(unsafe { &mut *(*info).ContextRecord })
         {

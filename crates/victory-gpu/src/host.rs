@@ -2089,23 +2089,26 @@ core::arch::global_asm!(
     ".globl victory_copy_start",
     ".globl victory_copy_end",
     ".globl victory_copy_fault",
+    // A leaf with no stack use, so that it needs no unwind information (a
+    // stack walker takes the return address at `rsp`): the callee-saved rdi
+    // and rsi wait in the volatile r10 and r11.
     "victory_copy_fast:",
-    "push rdi",
-    "push rsi",
+    "mov r10, rdi",
+    "mov r11, rsi",
     "mov rdi, rcx",
     "mov rsi, rdx",
     "mov rcx, r8",
     "victory_copy_start:",
     "rep movsb",
     "victory_copy_end:",
+    "mov rdi, r10",
+    "mov rsi, r11",
     "mov eax, 1",
-    "pop rsi",
-    "pop rdi",
     "ret",
     "victory_copy_fault:",
+    "mov rdi, r10",
+    "mov rsi, r11",
     "xor eax, eax",
-    "pop rsi",
-    "pop rdi",
     "ret",
 );
 
@@ -2119,7 +2122,9 @@ unsafe extern "C" {
 
 /// If a fault occurred inside `victory_copy_fast`, redirects `Rip` to its
 /// fault return path so [`read`] returns `false` without entering the kernel
-/// on the common mapped path.
+/// on the common mapped path. Whatever the fault is (an access violation, an
+/// in-page error, a guard page): the caller has the copy fail as the kernel's
+/// would.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn recover_copy(
     ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
@@ -2151,9 +2156,9 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
             || d.checked_add(len).is_some_and(|de| de <= s);
         crate::watch::ensure_installed();
         if disjoint {
-            // SAFETY: `victory_copy_fast` saves/restores `rdi`/`rsi` and any
-            // access violation or in-page error at `[victory_copy_start,
-            // victory_copy_end)` is redirected by `recover_copy` to return 0.
+            // SAFETY: `victory_copy_fast` restores `rdi`/`rsi` and a fault
+            // at `[victory_copy_start, victory_copy_end)` is redirected by
+            // `recover_copy` to return 0.
             return unsafe { victory_copy_fast(dst, src, len) != 0 };
         }
         let mut tmp = Vec::new();
@@ -2301,6 +2306,38 @@ mod title_copies {
         write_mapped(unsafe { to.add(2 * BLOCK) }, from.as_ptr(), BLOCK);
         assert!(block(to, 2).iter().all(|&b| b == 0xee));
         release(to);
+    }
+
+    /// A source page with PAGE_GUARD raises STATUS_GUARD_PAGE_VIOLATION in
+    /// the fast copy: it fails the copy like the kernel's would, it does not
+    /// end the process.
+    #[test]
+    fn a_guard_page_source_fails_the_copy() {
+        use windows_sys::Win32::System::Memory::PAGE_GUARD;
+        // SAFETY: a fresh allocation of two pages, freed below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!base.is_null());
+        let mut old = 0;
+        // SAFETY: the second page of our allocation.
+        assert_ne!(unsafe { VirtualProtect(base.add(4096).cast(), 4096, PAGE_READWRITE | PAGE_GUARD, &mut old) }, 0);
+        let mut buf = [0u8; 16];
+        // SAFETY: the guarded page.
+        assert!(!super::read_into(unsafe { base.add(4096) }, &mut buf), "the guard page fails the copy");
+        assert!(super::read_into(base, &mut buf), "the page before it reads");
+        release(base);
+    }
+
+    /// The fast copy is a leaf that touches no stack: it has no unwind
+    /// information, so a stack walker takes the return address at `rsp`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_fast_copy_uses_no_stack() {
+        // SAFETY: the function's own code, read up to its second `ret`
+        // (the fault path's): none of the opcodes below is in it.
+        let code = unsafe { std::slice::from_raw_parts(super::victory_copy_fast as *const u8, 64) };
+        let end = code.iter().enumerate().filter(|&(_, &b)| b == 0xc3).nth(1).map(|(i, _)| i).expect("two rets");
+        // push rdi, push rsi, pop rsi, pop rdi
+        assert!(code[..end].iter().all(|b| ![0x57, 0x56, 0x5e, 0x5f].contains(b)), "{:02x?}", &code[..=end]);
     }
 
     #[test]
