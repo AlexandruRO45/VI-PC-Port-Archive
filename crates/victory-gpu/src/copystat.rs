@@ -149,10 +149,20 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Host descriptors made per draw, by what they view: a constant
+    /// buffer, a shader resource, an unordered access, a sampler, and a
+    /// view of memory with no resource object; and their time, all of it
+    /// inside `descriptor::host::make`.
+    ViewsCbv,
+    ViewsSrv,
+    ViewsUav,
+    ViewsSampler,
+    ViewsOther,
+    ViewsNs,
 }
 /// One slot per [`C`], so a counter added to the enum cannot index past the
 /// array that holds it (it did: 80 slots for 82 variants aborted the title).
-const COUNTERS: usize = C::IndirectBounded as usize + 1;
+const COUNTERS: usize = C::ViewsNs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1118,8 +1128,10 @@ pub(crate) fn log(frames: f64) {
           threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
           refused, {:.1} ms searching; fresh tables: {:.0} asked, {:.0} already held with the \
           same contents, {:.0} made, {:.0} slots hashed in {:.2} ms and {:.0} slots copied in \
-          {:.2} ms; entries brought up to date: {:.0} in {:.2} ms; notes {:.1} ms; \
-          shader-written ranges: {:.0} steps in {:.1} submissions, snapshots {:.1} ms, {:.1} MB \
+          {:.2} ms; entries brought up to date: {:.0} in {:.2} ms; host views made: {:.0} of a \
+          constant buffer, {:.0} of a resource, {:.0} unordered, {:.0} samplers, {:.0} other, in \
+          {:.2} ms; notes {:.1} ms; shader-written ranges: {:.0} steps in {:.1} submissions, \
+          snapshots {:.1} ms, {:.1} MB \
           compared back; sparse reads {:.1} ms; guards {:.1} ms; {:.1} MB copied whole (memory \
           not watched); {:.1} frame waits sleeping {:.1} ms (all threads); ranges of shaders \
           that cannot store to buffers: {:.0} steps {:.1} MB left out",
@@ -1138,6 +1150,12 @@ pub(crate) fn log(frames: f64) {
         c[C::TableCopyNs as usize] / 1e6,
         c[C::TableEntries as usize],
         c[C::TableHeadNs as usize] / 1e6,
+        c[C::ViewsCbv as usize],
+        c[C::ViewsSrv as usize],
+        c[C::ViewsUav as usize],
+        c[C::ViewsSampler as usize],
+        c[C::ViewsOther as usize],
+        c[C::ViewsNs as usize] / 1e6,
         c[C::NoteNs as usize] / 1e6,
         c[C::GpuWrites as usize],
         c[C::BackSubmissions as usize],

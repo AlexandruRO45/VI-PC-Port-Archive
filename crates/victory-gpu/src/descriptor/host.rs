@@ -1844,9 +1844,34 @@ fn twin_uav(
     Some(desc)
 }
 
-/// Makes the host descriptor for `view` at `at`: the host resource it
-/// views, or `None` if it cannot.
+/// Makes the host descriptor for `view` at `at`, and says what that cost
+/// (`VICTORY_COPY_MODE`'s line, diagnostics builds): a descriptor the driver
+/// makes per call is the expensive half of a draw's table work, and which
+/// kind of view it is decides what can be cached.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let made = make_view(view, at);
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{add, C};
+        add(
+            match view {
+                View::Constant(..) => C::ViewsCbv,
+                View::Shader(..) => C::ViewsSrv,
+                View::Unordered(..) => C::ViewsUav,
+                View::Sampler(..) | View::ConsoleSampler(..) => C::ViewsSampler,
+                _ => C::ViewsOther,
+            },
+            1,
+        );
+        add(C::ViewsNs, started.elapsed().as_nanos() as u64);
+    }
+    made
+}
+
+/// The descriptor itself.
+fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
