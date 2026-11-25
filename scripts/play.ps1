@@ -1,15 +1,52 @@
-# ztrx launcher: runs the game for normal play (no scripted presses, no capture).
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [string]$Cache = "$env:LOCALAPPDATA\ztrx\cache",
     [string]$Data = "$env:LOCALAPPDATA\ztrx\data",
-    [string]$Exe = "$PSScriptRoot\..\target\release\victory.exe"
+    [string]$Exe = "$PSScriptRoot\..\target\release\victory.exe",
+    [string]$Log = "$env:TEMP\ztrx-$(Get-Date -Format 'yyyyMMdd-HHmmss-fffffff')-$PID.log"
 )
-foreach ($v in "VICTORY_KEYS", "VICTORY_CAPTURE", "VICTORY_CAPTURE_FRAMES", "VICTORY_DUMP_TARGETS") {
-    Remove-Item "Env:$v" -ErrorAction SilentlyContinue
+
+$ErrorActionPreference = 'Stop'
+foreach ($file in @($Exe, $Game)) {
+    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+        throw "File not found: $file"
+    }
 }
-New-Item -ItemType Directory -Force $Cache, $Data | Out-Null
-$env:VICTORY_CACHE_DIR = $Cache
-$env:VICTORY_DATA_DIR = $Data
-& $Exe run $Game --execute 2>&1 | Out-File "$env:TEMP\ztrx.log" -Encoding utf8
-Write-Host "Exited with $LASTEXITCODE; log: $env:TEMP\ztrx.log"
+$exePath = (Get-Item -LiteralPath $Exe).FullName
+$runtime = $exePath
+if ($PSVersionTable.PSVersion.Major -le 5) {
+    $runtime = Get-Command -Name ([WildcardPattern]::Escape($exePath)) -CommandType Application
+}
+$gamePath = (Get-Item -LiteralPath $Game).FullName
+$cachePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Cache)
+$dataPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Data)
+$logPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Log)
+[void][IO.Directory]::CreateDirectory($cachePath)
+[void][IO.Directory]::CreateDirectory($dataPath)
+[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($logPath))
+
+$settings = @{
+    VICTORY_CACHE_DIR = $cachePath
+    VICTORY_DATA_DIR = $dataPath
+    VICTORY_KEYS = $null
+    VICTORY_CAPTURE = $null
+    VICTORY_CAPTURE_FRAMES = $null
+    VICTORY_DUMP_TARGETS = $null
+}
+$saved = @{}
+try {
+    foreach ($key in $settings.Keys) {
+        $saved[$key] = [Environment]::GetEnvironmentVariable($key)
+        [Environment]::SetEnvironmentVariable($key, $settings[$key])
+    }
+    Write-Host "Log: $logPath"
+    $ErrorActionPreference = 'Continue'
+    & $runtime run $gamePath --execute 2>&1 | Out-File -LiteralPath $logPath -Encoding utf8 -NoClobber -ErrorAction Stop
+    $code = $LASTEXITCODE
+} finally {
+    foreach ($key in $saved.Keys) {
+        [Environment]::SetEnvironmentVariable($key, $saved[$key])
+    }
+}
+Write-Host "Exited with $code"
+exit $code

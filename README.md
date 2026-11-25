@@ -42,6 +42,9 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 (a DualShock/DualSense through DS4Windows works). With no pad connected the
 keyboard acts as one while the game window has focus.
 
+The launcher prints the log path before starting and returns the runtime exit code.
+Use `-Log <new file>` for a specific location. Existing logs are preserved.
+
 ## Faster settings (optional, off by default)
 
 `VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1` cut frame
