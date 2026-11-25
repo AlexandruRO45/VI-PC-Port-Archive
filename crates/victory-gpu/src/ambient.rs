@@ -44,7 +44,11 @@ pub(crate) fn level() -> Option<f32> {
         if set.trim() == "off" {
             return -1.0;
         }
-        set.trim().parse().ok().filter(|l: &f32| l.is_finite() && *l >= 0.0).unwrap_or(DEFAULT)
+        set.trim()
+            .parse()
+            .ok()
+            .filter(|l: &f32| l.is_finite() && *l >= 0.0)
+            .unwrap_or(DEFAULT)
     });
     (level >= 0.0).then_some(level)
 }
