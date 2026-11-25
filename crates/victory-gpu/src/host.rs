@@ -4217,7 +4217,15 @@ pub(crate) static BACK_WRITES: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// view, the runtime is remapping, or the write faulted); the caller
 /// writes as before.
 pub(crate) fn write_title_unseen(at: usize, src: *const u8, n: usize) -> Option<(u64, Vec<(usize, u64)>)> {
-    if !back_alias() || n == 0 || !direct_copy_enabled() {
+    if !back_alias() {
+        return None;
+    }
+    write_unseen(at, src, n)
+}
+
+/// [`write_title_unseen`] whatever [`back_alias`] says.
+pub(crate) fn write_unseen(at: usize, src: *const u8, n: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    if n == 0 || !direct_copy_enabled() {
         return None;
     }
     // The runtime does not move a physical page between finding where the
