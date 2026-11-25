@@ -572,23 +572,6 @@ pub fn XAsyncBegin(
     if block.is_null() {
         return E_INVALIDARG;
     }
-    if let Some(left) = call(block) {
-        // Calls are filed by block address, and one that succeeded stays
-        // filed until its result is taken. A title that never takes it and
-        // frees the block may get the same address for its next one, which
-        // it zeroes as every new block must be; the block of a result left
-        // behind never reads zero (it holds the result's size). So this is
-        // a new block, and the call left behind ends here. A call in flight
-        // keeps its address, and a block still holding a result is in use.
-        let over = *lock(&left.done);
-        if !(over && zeroed(block)) {
-            return E_INVALIDARG;
-        }
-        release(block);
-    }
-    let (status, size) = words(block);
-    status.store(E_PENDING as u32 as usize, Ordering::Release);
-    size.store(0, Ordering::Release);
     let call = Arc::new(Call {
         provider,
         context: context as usize,
@@ -596,7 +579,39 @@ pub fn XAsyncBegin(
         done: Mutex::new(false),
         finished: Condvar::new(),
     });
-    lock(&CALLS).insert(block as usize, call.clone());
+    let stale = {
+        let mut calls = lock(&CALLS);
+        let stale = if let Some(left) = calls.get(&(block as usize)) {
+            // Calls are filed by block address, and one that succeeded stays
+            // filed until its result is taken. A title that never takes it and
+            // frees the block may get the same address for its next one, which
+            // it zeroes as every new block must be; the block of a result left
+            // behind never reads zero (it holds the result's size). So this is
+            // a new block, and the call left behind ends here. A call in flight
+            // keeps its address, and a block still holding a result is in use.
+            // Use `try_lock` so we never invert lock order with `complete_call`
+            // (which holds `call.done` while calling `release`).
+            let over = match left.done.try_lock() {
+                Ok(done) => *done,
+                Err(std::sync::TryLockError::Poisoned(e)) => *e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => false,
+            };
+            if !(over && zeroed(block)) {
+                return E_INVALIDARG;
+            }
+            calls.remove(&(block as usize))
+        } else {
+            None
+        };
+        let (status, size) = words(block);
+        status.store(E_PENDING as u32 as usize, Ordering::Release);
+        size.store(0, Ordering::Release);
+        calls.insert(block as usize, call.clone());
+        stale
+    };
+    if let Some(stale) = stale {
+        stale.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
+    }
     // A failed begin fails the call, so the completion routine still runs.
     let hr = call.provider(OP_BEGIN, block, 0, std::ptr::null_mut());
     if hr < 0 {
@@ -753,21 +768,29 @@ pub fn XAsyncGetResult(
         }
         return hr;
     }
-    let Some(call) = call(block) else {
-        return E_ILLEGAL_METHOD_CALL;
+    let call = {
+        let mut calls = lock(&CALLS);
+        let Some(existing) = calls.get(&(block as usize)) else {
+            return E_ILLEGAL_METHOD_CALL;
+        };
+        if existing.identity != identity as usize {
+            return E_INVALIDARG;
+        }
+        if buffer_size < size || buffer.is_null() {
+            return E_NOT_SUFFICIENT_BUFFER;
+        }
+        // Take exclusive ownership before running `OP_GET_RESULT` + `OP_CLEANUP`
+        // so a concurrent `XAsyncGetResult` cannot dereference freed context.
+        calls
+            .remove(&(block as usize))
+            .expect("entry was just verified present")
     };
-    if call.identity != identity as usize {
-        return E_INVALIDARG;
-    }
-    if buffer_size < size || buffer.is_null() {
-        return E_NOT_SUFFICIENT_BUFFER;
-    }
     let hr = call.provider(OP_GET_RESULT, block, buffer_size, buffer);
     if !used.is_null() {
         // SAFETY: checked non-null.
         unsafe { used.write(size) };
     }
-    release(block);
+    call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
     hr
 }
 
@@ -1659,6 +1682,62 @@ mod tests {
         // Its delay passes without it running.
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(*lock(&EVENTS), ["canceled", "terminated"]);
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn concurrent_get_result_claims_result_and_runs_cleanup_once() {
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let mut block = AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let identity = 0x99 as *const c_void;
+        let payload = vec![0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        assert_eq!(finished_with(&mut block, identity, Ok(payload.clone())), S_OK);
+        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
+
+        // Buffer-too-small error leaves the result in place for retry.
+        let mut small = [0u8; 2];
+        assert_eq!(
+            XAsyncGetResult(
+                &mut block,
+                identity,
+                small.len(),
+                small.as_mut_ptr().cast(),
+                std::ptr::null_mut(),
+            ),
+            E_NOT_SUFFICIENT_BUFFER
+        );
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let block_addr = (&raw mut block) as usize;
+        let id_addr = identity as usize;
+        let run = |barrier: Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                let mut out = [0u8; 8];
+                barrier.wait();
+                let hr = XAsyncGetResult(
+                    block_addr as *mut AsyncBlock,
+                    id_addr as *const c_void,
+                    out.len(),
+                    out.as_mut_ptr().cast(),
+                    std::ptr::null_mut(),
+                );
+                (hr, out)
+            })
+        };
+        let t1 = run(barrier.clone());
+        let t2 = run(barrier);
+        let (r1, r2) = (t1.join().unwrap(), t2.join().unwrap());
+        let mut results = [r1, r2];
+        results.sort_by_key(|(hr, _)| *hr);
+        assert_eq!(results[0].0, E_ILLEGAL_METHOD_CALL);
+        assert_eq!(results[1].0, S_OK);
+        assert_eq!(results[1].1.as_slice(), payload.as_slice());
         XTaskQueueCloseHandle(q);
     }
 }
