@@ -21,6 +21,18 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+/// Diagnostics: the first call of each function the title makes, so a run
+/// shows which ones it uses.
+macro_rules! called {
+    ($name:literal) => {
+        #[cfg(feature = "diagnostics")]
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::info!(function = $name, "title calls gameinput"));
+        }
+    };
+}
+
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
@@ -60,6 +72,9 @@ const DEVICES: usize = PADS + 2;
 /// Readings kept per device for next/previous lookups.
 const HISTORY: usize = 32;
 const POLL: Duration = Duration::from_millis(8);
+/// Presses are latched (`Latch`) only on a device the title read the current
+/// state of within this many µs.
+const LATCH_IDLE: u64 = 2_000_000;
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
@@ -251,7 +266,7 @@ impl Device {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Value {
     Pad(PadState),
     Keys(Vec<KeyState>),
@@ -348,6 +363,98 @@ struct Slot {
     connected: bool,
     sequence: u64,
     history: VecDeque<Ref>,
+    latch: Latch,
+}
+
+/// Whether presses are latched: on unless `VICTORY_INPUT_LATCH=0`.
+fn latch_enabled() -> bool {
+    std::env::var_os("VICTORY_INPUT_LATCH").is_none_or(|v| v != "0")
+}
+
+/// A title that reads only the current state once per frame misses a tap
+/// that begins and ends between two frames: at one or two frames a second
+/// that is most taps. So a button or key pressed since the title last read
+/// this device's current state stays pressed in what we record until such a
+/// read has seen it; that read then records the host's own state, so a
+/// release follows in the next read. Only presses are held: a release of a
+/// press the title already saw is recorded at once, and sticks and triggers
+/// are always the latest value. Readers of the history see every press and
+/// release as before, a release of a held press only later (at the read).
+#[derive(Default)]
+struct Latch {
+    /// When a current-state read last handed out this device's reading.
+    read: Option<u64>,
+    /// The host's last state, without held presses.
+    raw: Option<Value>,
+    /// Buttons and keys pressed since that read.
+    buttons: u32,
+    keys: Vec<KeyState>,
+}
+
+fn same_key(a: &KeyState, b: &KeyState) -> bool {
+    a.virtual_key == b.virtual_key && a.scan_code == b.scan_code
+}
+
+impl Latch {
+    /// `value` from the host, with the presses since the last read held.
+    fn hold(&mut self, value: Value, now: u64, enabled: bool) -> Value {
+        let reader = self.read.is_some_and(|t| now.saturating_sub(t) < LATCH_IDLE);
+        if !enabled || !reader {
+            self.buttons = 0;
+            self.keys.clear();
+        } else {
+            match (&value, &self.raw) {
+                (Value::Pad(pad), raw) => {
+                    let before = match raw {
+                        Some(Value::Pad(raw)) => raw.buttons,
+                        _ => 0,
+                    };
+                    self.buttons |= pad.buttons & !before;
+                }
+                (Value::Keys(keys), raw) => {
+                    let before: &[KeyState] = match raw {
+                        Some(Value::Keys(raw)) => raw,
+                        _ => &[],
+                    };
+                    for key in keys {
+                        if !before.iter().any(|b| same_key(b, key))
+                            && !self.keys.iter().any(|k| same_key(k, key))
+                        {
+                            self.keys.push(*key);
+                        }
+                    }
+                }
+            }
+        }
+        self.raw = Some(value.clone());
+        self.apply(value)
+    }
+
+    fn apply(&self, value: Value) -> Value {
+        match value {
+            Value::Pad(mut pad) => {
+                pad.buttons |= self.buttons;
+                Value::Pad(pad)
+            }
+            Value::Keys(mut keys) => {
+                for key in &self.keys {
+                    if !keys.iter().any(|k| same_key(k, key)) {
+                        keys.push(*key);
+                    }
+                }
+                Value::Keys(keys)
+            }
+        }
+    }
+
+    /// A current-state read saw the device: drops the held presses and
+    /// returns the host's state when it differs from what was recorded.
+    fn seen(&mut self, now: u64, recorded: &Value) -> Option<Value> {
+        self.read = Some(now);
+        self.buttons = 0;
+        self.keys.clear();
+        self.raw.clone().filter(|raw| raw != recorded)
+    }
 }
 
 struct State {
@@ -357,6 +464,8 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// Presses are latched (`Latch`).
+    latch: bool,
 }
 
 pub struct Hub {
@@ -401,6 +510,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                latch: latch_enabled(),
             }),
             returned: Condvar::new(),
         }));
@@ -484,6 +594,35 @@ impl Hub {
     }
 }
 
+impl Slot {
+    fn record(&mut self, devices: &[Device; DEVICES], index: usize, value: Value, now: u64) {
+        self.sequence += 1;
+        if self.history.len() == HISTORY {
+            self.history.pop_front();
+        }
+        self.history.push_back(Ref::new(Reading {
+            vtable: &READING,
+            refs: AtomicU32::new(1),
+            device: &devices[index],
+            sequence: self.sequence,
+            timestamp: now,
+            value,
+        }));
+    }
+
+    /// A current-state read handed out this device's newest reading: a
+    /// press held for it is let go now.
+    fn seen(&mut self, devices: &[Device; DEVICES], index: usize) {
+        let now = now();
+        let Some(newest) = self.history.back() else {
+            return;
+        };
+        if let Some(raw) = self.latch.seen(now, &newest.value) {
+            self.record(devices, index, raw, now);
+        }
+    }
+}
+
 impl State {
     fn poll(
         &mut self,
@@ -513,24 +652,17 @@ impl State {
         now: u64,
         events: &mut Vec<Event>,
     ) {
+        let latch = self.latch;
         let slot = &mut self.slots[index];
         let was = slot.connected;
         slot.connected = value.is_some();
-        if let Some(value) = value
+        if !was {
+            slot.latch = Latch::default();
+        }
+        if let Some(value) = value.map(|v| slot.latch.hold(v, now, latch))
             && (!was || slot.history.back().is_none_or(|r| r.value != value))
         {
-            slot.sequence += 1;
-            if slot.history.len() == HISTORY {
-                slot.history.pop_front();
-            }
-            slot.history.push_back(Ref::new(Reading {
-                vtable: &READING,
-                refs: AtomicU32::new(1),
-                device: &devices[index],
-                sequence: slot.sequence,
-                timestamp: now,
-                value,
-            }));
+            slot.record(devices, index, value, now);
         }
         if was != slot.connected {
             tracing::info!(device = index, connected = !was, "input device");
@@ -613,6 +745,7 @@ fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
 }
 
 extern "system" fn no_interface(_: *const c_void, _iid: *const c_void, out: Out) -> HRESULT {
+    called!("QueryInterface");
     tracing::warn!("input QueryInterface not implemented");
     fail(out, E_NOINTERFACE)
 }
@@ -622,6 +755,7 @@ extern "system" fn add_ref(_: *const c_void) -> u32 {
 }
 
 extern "system" fn timestamp(_: This) -> u64 {
+    called!("GetCurrentTimestamp");
     now()
 }
 
@@ -631,33 +765,46 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    called!("GetCurrentReading");
     let hub = hub(this);
-    let state = hub.state();
-    let newest = |i: usize| {
+    let mut state = hub.state();
+    let newest = |state: &State, i: usize| {
         state.slots[i]
             .history
             .back()
-            .filter(|r| r.kind() & kind != 0)
+            .is_some_and(|r| r.kind() & kind != 0)
+            .then_some(i)
     };
     let found = if device.is_null() {
         (0..DEVICES)
             .filter(|&i| state.slots[i].connected)
-            .filter_map(newest)
-            .max_by_key(|r| r.timestamp)
+            .filter_map(|i| newest(&state, i))
+            .max_by_key(|&i| state.slots[i].history.back().map(|r| r.timestamp))
     } else {
         match hub.index(device) {
             None => return fail(out, E_INVALIDARG),
             Some(i) if !state.slots[i].connected => return fail(out, DEVICE_DISCONNECTED),
-            Some(i) => newest(i),
+            Some(i) => newest(&state, i),
         }
     };
+    let found = found.map(|i| (i, state.slots[i].history.back().map(Ref::share)));
     tracing::trace!(
         kind = format_args!("{kind:#x}"),
         device = ?hub.index(device),
-        sequence = found.map(|r| r.sequence),
+        sequence = found.and_then(|(_, r)| r).map(|r| reading(r).sequence),
         "current reading"
     );
-    hand(out, found)
+    let Some((index, Some(handed))) = found else {
+        return hand(out, None);
+    };
+    if out.is_null() {
+        reading_release(handed);
+        return E_INVALIDARG;
+    }
+    state.slots[index].seen(&hub.devices, index);
+    // SAFETY: checked non-null; the title passes room for a pointer.
+    unsafe { out.write(handed.cast()) };
+    S_OK
 }
 
 /// The reading after (`forward`) or before `reference`: on `device`, or with
@@ -723,6 +870,7 @@ extern "system" fn next_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    called!("GetNextReading");
     relative(this, reference, kind, device, out, true)
 }
 extern "system" fn previous_reading(
@@ -732,6 +880,7 @@ extern "system" fn previous_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    called!("GetPreviousReading");
     relative(this, reference, kind, device, out, false)
 }
 /// The device's reading at `time`, among those still kept.
@@ -741,6 +890,7 @@ extern "system" fn temporal_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    called!("GetTemporalReading");
     let hub = hub(this);
     let Some(index) = hub.index(device) else {
         return fail(out, E_INVALIDARG);
@@ -771,6 +921,7 @@ extern "system" fn register_reading(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
+    called!("RegisterReadingCallback");
     tracing::warn!("input reading callbacks are never called");
     token(out)
 }
@@ -789,6 +940,7 @@ extern "system" fn register_device(
     callback: Option<DeviceCallback>,
     out: *mut u64,
 ) -> HRESULT {
+    called!("RegisterDeviceCallback");
     let Some(callback) = callback else {
         return E_INVALIDARG;
     };
@@ -837,6 +989,7 @@ extern "system" fn register_other(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
+    called!("RegisterGuideButton/KeyboardLayoutCallback");
     token(out)
 }
 
@@ -846,12 +999,14 @@ fn forget(this: This, token: u64) {
     state.pending.retain(|e| e.registration.token != token);
 }
 extern "system" fn stop_callback(this: This, token: u64) {
+    called!("StopCallback");
     forget(this, token);
 }
 /// Stops the callback, then waits up to `timeout` µs for a call of it that
 /// is running; false on time-out, or from inside that callback (it cannot
 /// wait for itself), as documented. Either way it is never called again.
 extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> bool {
+    called!("UnregisterCallback");
     forget(this, token);
     let hub = hub(this);
     let me = std::thread::current().id();
@@ -880,14 +1035,17 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
 
 /// Dispatcher and aggregate device: no title of ours asks for them.
 extern "system" fn create_dispatcher(_: This, out: Out) -> HRESULT {
+    called!("CreateDispatcher");
     tracing::warn!("input dispatcher not implemented");
     fail(out, E_NOTIMPL)
 }
 extern "system" fn create_aggregate(_: This, _kind: u32, out: Out) -> HRESULT {
+    called!("CreateAggregateDevice");
     tracing::warn!("aggregate input device not implemented");
     fail(out, E_NOTIMPL)
 }
 extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRESULT {
+    called!("FindDeviceFromId");
     if id.is_null() || out.is_null() {
         return fail(out, E_INVALIDARG);
     }
@@ -905,6 +1063,7 @@ extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRES
 /// Lookup by object, platform handle or platform string: our devices have
 /// none of these.
 extern "system" fn find_device(_: This, _value: *const c_void, out: Out) -> HRESULT {
+    called!("FindDeviceFromObject/PlatformHandle/PlatformString");
     fail(out, DEVICE_NOT_FOUND)
 }
 extern "system" fn enable_oem_device(
@@ -914,9 +1073,12 @@ extern "system" fn enable_oem_device(
     _interface: u8,
     _collection: u8,
 ) -> HRESULT {
+    called!("EnableOemDeviceSupport");
     S_OK
 }
-extern "system" fn set_focus_policy(_: This, _policy: u32) {}
+extern "system" fn set_focus_policy(_: This, _policy: u32) {
+    called!("SetFocusPolicy");
+}
 
 static INPUT: Table<22> = Table([
     no_interface as *const (),        // 0x00
@@ -944,10 +1106,12 @@ static INPUT: Table<22> = Table([
 ]);
 
 extern "system" fn device_info(this: *const Device) -> *const DeviceInfo {
+    called!("IGameInputDevice::GetDeviceInfo");
     // SAFETY: one of our devices.
     unsafe { &(*this).info }
 }
 extern "system" fn device_status(this: *const Device) -> u32 {
+    called!("IGameInputDevice::GetDeviceStatus");
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.hub().state().slots[device.index].connected {
@@ -961,6 +1125,7 @@ extern "system" fn device_status(this: *const Device) -> u32 {
 // `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
 // diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
+    called!("IGameInputDevice::SetRumbleState");
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
@@ -1023,9 +1188,11 @@ extern "system" fn reading_release(this: *const Reading) -> u32 {
     left
 }
 extern "system" fn input_kind(this: *const Reading) -> u32 {
+    called!("IGameInputReading::GetInputKind");
     reading(this).kind()
 }
 extern "system" fn sequence_number(this: *const Reading, kind: u32) -> u64 {
+    called!("IGameInputReading::GetSequenceNumber");
     let reading = reading(this);
     if reading.kind() & kind != 0 {
         reading.sequence
@@ -1034,21 +1201,25 @@ extern "system" fn sequence_number(this: *const Reading, kind: u32) -> u64 {
     }
 }
 extern "system" fn reading_timestamp(this: *const Reading) -> u64 {
+    called!("IGameInputReading::GetTimestamp");
     reading(this).timestamp
 }
 extern "system" fn reading_device(this: *const Reading, out: *mut *const Device) {
+    called!("IGameInputReading::GetDevice");
     if !out.is_null() {
         // SAFETY: checked non-null; devices need no reference.
         unsafe { out.write(reading(this).device) };
     }
 }
 extern "system" fn key_count(this: *const Reading) -> u32 {
+    called!("IGameInputReading::GetKeyCount");
     match &reading(this).value {
         Value::Keys(keys) => keys.len() as u32,
         Value::Pad(_) => 0,
     }
 }
 extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
+    called!("IGameInputReading::GetKeyState");
     let Value::Keys(keys) = &reading(this).value else {
         return 0;
     };
@@ -1061,6 +1232,7 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
+    called!("IGameInputReading::GetGamepadState");
     match &reading(this).value {
         Value::Pad(state) if !out.is_null() => {
             // SAFETY: checked non-null.
@@ -1072,6 +1244,7 @@ extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bo
 }
 /// Kinds our devices do not have: no count, no state.
 extern "system" fn nothing(_: *const c_void) -> usize {
+    called!("IGameInputReading::(another input kind)");
     0
 }
 
@@ -1761,5 +1934,158 @@ mod tests {
         let r = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(pad(r), physical);
         release(r);
+    }
+
+    fn buttons(hub: &Hub, device: usize) -> (u32, *const Reading) {
+        let r = current(hub, GAMEPAD_KIND, device).unwrap();
+        let b = pad(r).buttons;
+        release(r);
+        (b, r)
+    }
+
+    fn held_keys(hub: &Hub) -> Vec<u8> {
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let mut got = [KeyState::default(); 8];
+        let state =
+            slot::<extern "system" fn(*const Reading, u32, *mut KeyState) -> u32, _>(r, 0x78);
+        let n = state(r, 8, got.as_mut_ptr()) as usize;
+        release(r);
+        got[..n].iter().map(|k| k.virtual_key).collect()
+    }
+
+    #[test]
+    fn a_tap_between_current_reads_is_pressed_in_one_read_and_released_in_the_next() {
+        let (hub, host) = fake();
+        // The title reads the stand-in pad every frame.
+        assert_eq!(buttons(hub, FALLBACK).0, 0);
+        host.lock().unwrap().keys = vec![key(0x0D)];
+        hub.poll();
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        let tap = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(tap).buttons, A);
+        // The title's edge check sees the press.
+        let before = walk(hub, 0x30, tap).unwrap();
+        assert_eq!(pad(before).buttons, 0);
+        release(before);
+        // The next read, with or without a poll between, has it released.
+        let next = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(next).buttons, 0);
+        assert!(stamp(next).1 > stamp(tap).1);
+        hub.poll();
+        let after = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(after, next);
+        for r in [tap, next, after] {
+            release(r);
+        }
+    }
+
+    #[test]
+    fn a_held_button_stays_pressed_and_its_release_is_not_delayed() {
+        let (hub, host) = fake();
+        assert_eq!(buttons(hub, FALLBACK).0, 0);
+        host.lock().unwrap().keys = vec![key(0x0D)];
+        for _ in 0..3 {
+            hub.poll();
+            assert_eq!(buttons(hub, FALLBACK).0, A);
+        }
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        assert_eq!(buttons(hub, FALLBACK).0, 0);
+    }
+
+    #[test]
+    fn sticks_and_triggers_stay_the_latest_value() {
+        let (hub, host) = fake();
+        assert_eq!(buttons(hub, FALLBACK).0, 0);
+        host.lock().unwrap().keys = vec![key(b'W'), key(b'C'), key(0x0D)];
+        hub.poll();
+        host.lock().unwrap().keys = vec![key(b'D')];
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(
+            pad(r),
+            PadState {
+                buttons: A,
+                left_x: 1.0,
+                ..Default::default()
+            }
+        );
+        release(r);
+    }
+
+    #[test]
+    fn a_host_pad_tap_is_latched_too() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(buttons(hub, 0).0, 0);
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: B | X,
+            left_x: 0.5,
+            ..Default::default()
+        });
+        hub.poll();
+        // B let go, X still held.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: X,
+            ..Default::default()
+        });
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(
+            pad(r),
+            PadState {
+                buttons: B | X,
+                ..Default::default()
+            }
+        );
+        release(r);
+        assert_eq!(buttons(hub, 0).0, X);
+    }
+
+    #[test]
+    fn a_key_tap_between_current_reads_is_latched_on_the_keyboard() {
+        let (hub, host) = fake();
+        host.lock().unwrap().keys = vec![key(b'Q')];
+        hub.poll();
+        assert_eq!(held_keys(hub), [b'Q']);
+        host.lock().unwrap().keys = vec![key(b'Q'), key(b'E')];
+        hub.poll();
+        host.lock().unwrap().keys = vec![key(b'Q')];
+        hub.poll();
+        assert_eq!(held_keys(hub), [b'Q', b'E']);
+        assert_eq!(held_keys(hub), [b'Q']);
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        assert_eq!(held_keys(hub), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn without_current_reads_or_with_the_latch_off_the_history_is_as_recorded() {
+        for off in [false, true] {
+            let (hub, host) = fake();
+            let first = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+            if off {
+                hub.state().latch = false;
+            } else {
+                // No current read for longer than the latch waits.
+                hub.state().slots[FALLBACK].latch.read = Some(0);
+                std::thread::sleep(Duration::from_micros(LATCH_IDLE.saturating_sub(now())));
+            }
+            host.lock().unwrap().keys = vec![key(0x0D)];
+            hub.poll();
+            host.lock().unwrap().keys.clear();
+            hub.poll();
+            let press = walk(hub, 0x28, first).unwrap();
+            assert_eq!(pad(press).buttons, A);
+            let up = walk(hub, 0x28, press).unwrap();
+            assert_eq!(pad(up).buttons, 0);
+            assert_eq!(walk(hub, 0x28, up), Err(READING_NOT_FOUND));
+            assert_eq!(buttons(hub, FALLBACK).0, 0);
+            for r in [first, press, up] {
+                release(r);
+            }
+        }
     }
 }
