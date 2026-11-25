@@ -552,6 +552,27 @@ impl Tracked {
     pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
         self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
     }
+
+    /// The copy took `bytes` at title address `from`: any saved bytes of pages
+    /// it covers take them too, so marked copy-back neither takes a partial
+    /// refresh for the GPU's nor drops a shader write back to the pre-fault byte.
+    pub(crate) fn refreshed(&self, from: usize, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        if saved.bytes.is_empty() {
+            return;
+        }
+        let to = from + bytes.len();
+        for page in from / PAGE..to.div_ceil(PAGE) {
+            if let Some(before) = saved.bytes.get_mut(&page) {
+                let (a, b) = (from.max(page * PAGE), to.min((page + 1) * PAGE));
+                before[a - page * PAGE..b - page * PAGE]
+                    .copy_from_slice(&bytes[a - from..b - from]);
+            }
+        }
+    }
 }
 
 /// Makes `pages` read-only where not already (in runs), and returns those
