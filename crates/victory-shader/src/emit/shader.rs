@@ -42,7 +42,8 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 ///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
 ///   reads zeros and drops writes;
 /// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
-///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
+///   found no copy ([`MEMORY_FAULTS`] dwords in records of [`FAULT_DWORDS`],
+///   record 0 a sink), which the
 ///   host reads afterwards to make those copies for the frames to come.
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
@@ -51,6 +52,10 @@ pub const SLOT_FAULTS: u8 = 253;
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// Dwords of each [`SLOT_FAULTS`] record: the page, the address's low
+/// dword, the instruction's byte offset, the program's number
+/// (`lower::program_id`); record 0 is a sink.
+pub const FAULT_DWORDS: u32 = 4;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

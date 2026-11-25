@@ -943,6 +943,18 @@ pub fn set_host_max_wave(lanes: u32) {
 }
 
 thread_local! {
+    /// The number of the program being lowered ([`program_id`]), recorded
+    /// with its title-memory faults.
+    pub(super) static PROGRAM: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A program's number in title-memory fault records: FNV-1a of its machine
+/// code, so the host can tell which program touched a page without a copy.
+pub fn program_id(code: &[u8]) -> u32 {
+    code.iter().fold(0x811c_9dc5_u32, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193))
+}
+
+thread_local! {
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     /// See [`with_local_waves`].
@@ -2794,8 +2806,8 @@ impl<'a> Lower<'a> {
     /// it and the byte in that view. A page without a copy reads zeros
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
-    fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+    fn memory(&mut self, lo: V, hi: V, guard: Option<V>, pc: usize) -> (V, V) {
+        use super::shader::{FAULT_DWORDS, MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -2832,23 +2844,28 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
-        let places = k(self, MEMORY_FAULTS - 1);
+        // A record of four dwords per place (`shader.rs` `SLOT_FAULTS`):
+        // the page, the address's low dword, the instruction's byte offset
+        // and the program's number ([`program_id`]).
+        let places = k(self, MEMORY_FAULTS / FAULT_DWORDS - 1);
         let place = self.s.m.bin(c, Bin::URem, page, places);
         let one = k(self, 1);
         let place = self.s.m.bin(c, Bin::Add, place, one);
-        let k2 = k(self, 2);
-        let place = self.s.m.bin(c, Bin::Shl, place, k2);
+        let k4 = k(self, 4);
+        let place = self.s.m.bin(c, Bin::Shl, place, k4);
         let place = self.s.m.select(c, missing, place, zero);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let void = self.s.t.void;
-        let mask = self.s.m.i8(1);
+        let mask = self.s.m.i8(0xF);
+        let pc = k(self, pc as u32);
+        let program = k(self, PROGRAM.with(std::cell::Cell::get));
         self.s.op(
             c,
             "rawBufferStore.i32",
             Attr::NoUnwind,
             void,
             140,
-            &[faults, place, iu, page, iu, iu, iu, mask, align],
+            &[faults, place, iu, page, lo, pc, program, mask, align],
         );
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
@@ -2905,7 +2922,7 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *dst else {
                 return Err("a global load result");
             };
-            let (h, byte) = self.memory(lo, hi, guard);
+            let (h, byte) = self.memory(lo, hi, guard, inst.machine.offset);
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
@@ -2926,7 +2943,7 @@ impl<'a> Lower<'a> {
             let n = count(rest)?;
             let d = data.as_ref().ok_or("global store data")?;
             let vals = self.vgprs(inst, d, n)?;
-            let (h, byte) = self.memory(lo, hi, guard);
+            let (h, byte) = self.memory(lo, hi, guard, inst.machine.offset);
             let mut args = vec![h, byte, iu];
             args.extend(&vals);
             args.resize(3 + 4, iu);
@@ -2953,7 +2970,7 @@ impl<'a> Lower<'a> {
             Some(x) => self.i32_of(x)?,
             None => self.s.m.i32(0),
         };
-        let (h, byte) = self.memory(lo, hi, guard);
+        let (h, byte) = self.memory(lo, hi, guard, inst.machine.offset);
         // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
         // minimum 4 and maximum 5, unsigned 6 and 7, exchange 8.
         let simple = match op {
@@ -3087,7 +3104,7 @@ impl<'a> Lower<'a> {
         for first in (0..count).step_by(4) {
             let n = (count - first).min(4);
             let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
-            let (h, byte) = self.memory(lo, hi, None);
+            let (h, byte) = self.memory(lo, hi, None, inst.machine.offset);
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,

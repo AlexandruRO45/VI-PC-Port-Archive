@@ -153,6 +153,8 @@ impl Shader {
                         let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
                     }
                 }
+                #[cfg(feature = "diagnostics")]
+                crate::bvhtrace::program_names(&self.hash, &self.container);
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -266,7 +268,8 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    is_builder(this)
+        && (*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1")) || in_warmup())
 }
 
 #[cfg(windows)]
@@ -396,7 +399,28 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    BUILDER_FROM.store(crate::frame::current(), std::sync::atomic::Ordering::Relaxed);
     true
+}
+
+/// The frame the builder first ran in (0: not yet).
+#[cfg(windows)]
+static BUILDER_FROM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_BVH_WARMUP=<frames>`: for that many frames after the builder
+/// first runs, it runs quarantined (nothing its lists write reaches title
+/// memory). Its first frames reach pages through pointers that have no copy
+/// yet (`memory`: those reads give 0 and those stores are dropped until the
+/// next frame makes the copies), so its results then are not the title's;
+/// this tells whether the title's corruption comes from those frames.
+#[cfg(windows)]
+fn in_warmup() -> bool {
+    static FRAMES: OnceLock<u64> = OnceLock::new();
+    let frames = *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_BVH_WARMUP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    });
+    let from = BUILDER_FROM.load(std::sync::atomic::Ordering::Relaxed);
+    frames > 0 && (from == 0 || crate::frame::current() < from + frames)
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,

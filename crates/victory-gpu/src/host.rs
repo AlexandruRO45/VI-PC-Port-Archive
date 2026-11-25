@@ -1923,6 +1923,12 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// `VICTORY_BVH_QUARANTINE`: the list records a stage of the structure
+    /// builder, so nothing its shaders write is copied back into title
+    /// memory. Copy-backs are declared per list, not per dispatch: another
+    /// shader's declaration in the same list covered the builder's stores
+    /// too, and quarantine leaked.
+    quarantined: bool,
 }
 
 impl Deferred {
@@ -3577,6 +3583,8 @@ fn read_backs(list: &HostList) {
                 for line in 0..*rows {
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
                 }
+                #[cfg(feature = "diagnostics")]
+                crate::bvhtrace::copied(*at, 0, rows.saturating_sub(1) * pitch + row);
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
                 if walls_trace() && *rows == 1 && *row <= 96 {
@@ -6428,9 +6436,22 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        if deferred.quarantined {
+            return;
+        }
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    /// The list records a quarantined stage of the structure builder: no
+    /// shader write of the whole list is copied back into title memory,
+    /// those declared before it included (see `Deferred::quarantined`).
+    pub(crate) fn quarantine(&self) {
+        let mut deferred = self.deferred();
+        if !deferred.quarantined {
+            deferred.quarantined = true;
+            deferred.copies.retain(|step| !matches!(step, Step::GpuWrite(..)));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -7082,6 +7103,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let whole = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+    #[cfg(feature = "diagnostics")]
+    if title_dst {
+        crate::bvhtrace::copied(dst as usize, src as usize, len);
+    }
     if whole {
         return;
     }
@@ -7205,6 +7230,8 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    #[cfg(feature = "diagnostics")]
+    crate::bvhtrace::landing(dst as usize, src, len);
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);

@@ -47,7 +47,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
+use victory_shader::emit::{FAULT_DWORDS, MEMORY_FAULTS, MEMORY_PAGES};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
@@ -162,6 +162,8 @@ impl Memory {
                 // shortcut: a page of a title buffer inside this one that
                 // has a copy of its own is given this copy too.
                 let (first, len) = shadow.span();
+                #[cfg(feature = "diagnostics")]
+                crate::bvhtrace::numbered(n + 1, first, len);
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
                     // SAFETY: inside the directory's mapping.
@@ -197,14 +199,23 @@ impl Memory {
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
         let mut pages = Vec::new();
-        for i in 1..MEMORY_FAULTS as usize {
+        // Records of `FAULT_DWORDS` (page, address's low dword, instruction
+        // offset, program number); record 0 is the sink.
+        let per = FAULT_DWORDS as usize;
+        for i in 1..(MEMORY_FAULTS / FAULT_DWORDS) as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
             // a number missed now is written again next frame.
-            let at = unsafe { self.faults.1.add(i) };
+            let at = unsafe { self.faults.1.add(i * per) };
             // SAFETY: as above.
             let page = unsafe { at.read_volatile() };
             if page != 0 {
                 pages.push(page);
+                #[cfg(feature = "diagnostics")]
+                {
+                    // SAFETY: as above, the record's other dwords.
+                    let [lo, pc, program] = unsafe { [1, 2, 3].map(|k| at.add(k).read_volatile()) };
+                    crate::bvhtrace::fault(page, lo, pc, program);
+                }
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
             }

@@ -61,11 +61,45 @@ shaders and emulates the one instruction.
    partly working builder wrote garbage bounds into title memory and crashed
    the title.
 
+## Runs with the builder on (2026-11-25, RTX 4070)
+
+- **All 52 builder programs translate and get host pipelines** (`victory
+  translate --pipelines` on `XboxBvhBuilder.dll`), and with
+  `VICTORY_BVH_BUILDER=1` the builder runs ("all of its programs have host
+  pipelines").
+- **The title then crashes within seconds** of the first builder frame, on
+  several threads at once, each following a pointer field of one of its own
+  objects (title heap, around `0xd3..` to `0xe1..`) that holds `+inf`, `-inf`
+  or a pair such as `0xff8000007f800000`.
+- **`VICTORY_BVH_QUARANTINE=1` leaked**: copy-backs are declared per list, so
+  another shader's declaration in the same list carried the builder's stores
+  back too. Fixed (`HostList::quarantine`: a list with a quarantined builder
+  stage copies nothing back). With the fixed quarantine the title ran 74 s with
+  the builder on and no such crash, then the card was lost (`0x887A0006`) with
+  frames at 1.1 s of GPU time.
+- **No path of ours writes those infinities into the title's objects**
+  (`VICTORY_BVH_TRACE=1`): shader copy-backs carry none before the builder
+  runs and many after (36 to 66 blocks of 4 MiB), none of them in the blocks
+  of the corrupted objects; title buffer copies and texture read-backs carry
+  none. The title's own code writes them, presumably from results of the
+  builder it reads (bounds, sizes) that are wrong.
+- **Not the first frames alone**: `VICTORY_BVH_WARMUP=10` (quarantined for
+  the builder's first 10 frames) crashes as soon as the results are let
+  through.
+- **Not the float atomics**: the builder folds bounds with 129
+  `global_atomic_fmin` and 129 `global_atomic_fmax`, which the translator
+  emulates with a compare-exchange loop; that loop, run by 65,536 threads on
+  one address in a custom write-back L0 buffer (as the 4 MiB windows are made)
+  and in a default buffer, gives the exact minimum, maximum and count.
+- **Faults come from the title's walkers, not the builder**: with fault
+  records naming the program and instruction, the lost accesses in a frame
+  were by three title compute programs that walk the structures (one of them
+  most), through real title addresses whose pages had no copy yet.
+
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
-  of its pipelines are refused by the host (they still ask for 64-lane waves on
-  a 32-lane GPU) or do not translate.
+- With the builder on, the title's own objects are corrupted (above); the
+  wrong result of the builder that causes it is not found yet.
 - Five shadow-mask trace programs do not translate yet.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
@@ -83,3 +117,7 @@ shaders and emulates the one instruction.
   and raw addresses.
 - `crates/victory-gpu/src/pipeline.rs`, `draw.rs`: the builder rule and the
   host side of root views and title memory.
+- `crates/victory-gpu/src/bvhtrace.rs` (diagnostics, `VICTORY_BVH_TRACE=1`):
+  where infinities land in title memory, the arguments of builder dispatches,
+  the copies reachable by address, and each lost access with its program
+  (`victory_shader::emit::program_id`) and instruction offset.

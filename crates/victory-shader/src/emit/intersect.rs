@@ -244,7 +244,9 @@ impl<'a> Lower<'a> {
             let at = self.s.m.select(c, inside, at, outside);
             return (handle, at);
         }
-        self.memory(low, high, guard)
+        // The node test reads for an instruction of its own: 0xFFFF0000
+        // marks such reads in fault records.
+        self.memory(low, high, guard, 0xFFFF_0000)
     }
 
     /// `count` dwords of the node from its byte `base` + `offset` (`base`
