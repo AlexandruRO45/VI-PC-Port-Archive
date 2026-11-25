@@ -252,14 +252,16 @@ fn jump_windows() -> bool {
 /// such records, in place of a pass of ours in front of its draw
 /// (`crate::indirect::gather`; `VICTORY_INDIRECT_GATHER=1`; `alt`: twenty
 /// seconds with, twenty without, in turn, each change said in the log).
-/// Off by default. Needs [`windows`].
+/// On by default (`=0`: off) since an RTX 4070 / Ryzen 5 7500F run with
+/// it, `VICTORY_BACK_OWN_VIEW` and `VICTORY_JOIN_PARTS`: 125-127 ms a frame
+/// against 134-137. Needs [`windows`].
 fn gathers() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     match *MODE.get_or_init(|| match std::env::var("VICTORY_INDIRECT_GATHER").as_deref() {
-        Ok("1") => 1,
+        Ok("0") => 0,
         Ok("alt") => 2,
-        _ => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,
