@@ -357,7 +357,18 @@ pub(crate) fn merged(shadow: &std::sync::Arc<crate::shadow::Shadow>, lo: usize, 
             shown,
         },
     );
-    CARD_COUNT[0].fetch_add(1, Relaxed);
+    let n = CARD_COUNT[0].fetch_add(1, Relaxed);
+    static MADE: AtomicU64 = AtomicU64::new(0);
+    if MADE.fetch_add(1, Relaxed) < 64 {
+        tracing::info!(
+            page = format_args!("{page:#x}"),
+            buffer = format_args!("{:#x}", shadow.title_start()),
+            views = views.len(),
+            frame,
+            this_line = n + 1,
+            "lazy copy-back: a page made card-only"
+        );
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -396,6 +407,23 @@ fn materialize(key: usize, why: Why) {
     }
     if let Some((bytes, false)) = &merged {
         page.shadow.card_materialize_kernel(page.lo, bytes);
+    }
+    static GIVEN: AtomicU64 = AtomicU64::new(0);
+    if GIVEN.fetch_add(1, Relaxed) < 64 {
+        tracing::info!(
+            page = format_args!("{key:#x}"),
+            why = match why {
+                Why::Cpu => "the title's CPU",
+                Why::Ours => "our own access",
+            },
+            way = match &merged {
+                Some((_, true)) => "own view",
+                Some((_, false)) => "kernel",
+                None => "NOT MERGED",
+            },
+            frame = crate::frame::current(),
+            "lazy copy-back: a card-only page given back"
+        );
     }
     GIVING.with(|g| g.set(was));
     drop(card);
