@@ -2643,6 +2643,87 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
+/// With `VICTORY_NULL_MAGENTA=1`, a 2D colour texture view that shows
+/// nothing yet shows magenta: on the screen, a texture that is not there is
+/// told from one whose contents are black. False if it is to be null.
+#[cfg(feature = "diagnostics")]
+fn magenta_on_from(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_some_and(|v| v == "1")
+}
+
+#[cfg(feature = "diagnostics")]
+fn magenta_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| magenta_on_from(std::env::var_os("VICTORY_NULL_MAGENTA").as_deref()))
+}
+
+#[cfg(feature = "diagnostics")]
+fn is_magenta_target(desc: &[u32; 16]) -> bool {
+    // Block-compressed colour (BC1 to BC3, BC7) and 8-bit RGBA and BGRA.
+    let colour = matches!(desc[0], 27..=29 | 70..=78 | 87..=91 | 97..=99);
+    desc[1] == D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 && colour
+}
+
+#[cfg(feature = "diagnostics")]
+fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+    if !magenta_on() || !is_magenta_target(desc) {
+        return false;
+    }
+    let (Some(host), Some(texture)) = (host(), magenta()) else {
+        return false;
+    };
+    // SAFETY: a slot of our heap and a live texture.
+    unsafe { host.device.CreateShaderResourceView(texture, None, at) };
+    true
+}
+
+/// One magenta texel, written by the processor.
+#[cfg(feature = "diagnostics")]
+fn magenta() -> Option<&'static ID3D12Resource> {
+    static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+    TEXTURE
+        .get_or_init(|| {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1,
+                Height: 1,
+                DepthOrArraySize: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: valid descriptions and an out pointer; the texel is
+            // written while nothing reads the texture.
+            unsafe {
+                host()?
+                    .device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut texture,
+                    )
+                    .ok()?;
+                let texture = texture?;
+                texture.Map(0, None, None).ok()?;
+                let texel = [255u8, 0, 255, 255];
+                texture.WriteToSubresource(0, None, texel.as_ptr().cast(), 4, 4).ok()?;
+                texture.Unmap(0, None);
+                Some(texture)
+            }
+        })
+        .as_ref()
+}
+
 /// A null view of the kind `view` is, for a slot whose view the host
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
 /// view. Writes to it are dropped, reads give zeros.
@@ -2668,6 +2749,10 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         // cubes), not always 2D.
         View::Shader(_, Some(desc)) => return null_like(desc, at),
         View::Placed(false, _, desc) => {
+            #[cfg(feature = "diagnostics")]
+            if magenta_for(desc, at) {
+                return;
+            }
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
         View::Constant(..) => {
@@ -3629,5 +3714,184 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Clean up `addr_b` too.
         crate::watch::title_memory_remapped(addr_b as usize, 64 << 10);
         assert!(!crate::resource::has_placed_texture(addr_b, &desc));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn null_magenta_colors_missing_2d_color_srvs_when_enabled() {
+        use std::ffi::OsStr;
+        assert!(!magenta_on_from(None));
+        assert!(!magenta_on_from(Some(OsStr::new("0"))));
+        assert!(magenta_on_from(Some(OsStr::new("1"))));
+
+        let srv_dim = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+        for fmt in [27u32, 28, 29, 70, 71, 78, 87, 91, 97, 99] {
+            let mut d = [0u32; 16];
+            d[0] = fmt;
+            d[1] = srv_dim;
+            assert!(is_magenta_target(&d), "format {fmt} should be magenta target");
+        }
+        for bad_fmt in [26u32, 30, 69, 79, 86, 92, 96, 100] {
+            let mut d = [0u32; 16];
+            d[0] = bad_fmt;
+            d[1] = srv_dim;
+            assert!(!is_magenta_target(&d), "format {bad_fmt} must stay null");
+        }
+        let mut non_2d = [0u32; 16];
+        non_2d[0] = 28;
+        non_2d[1] = D3D12_SRV_DIMENSION_TEXTURE3D.0 as u32;
+        assert!(!is_magenta_target(&non_2d));
+
+        let Some(host) = host() else { return };
+        let child = std::env::var_os("VICTORY_NULL_MAGENTA_CHILD").is_some();
+        if !child {
+            assert!(!magenta_on());
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .env("VICTORY_NULL_MAGENTA", "1")
+                .env("VICTORY_NULL_MAGENTA_CHILD", "1")
+                .args([
+                    "--exact",
+                    "descriptor::host::tests::null_magenta_colors_missing_2d_color_srvs_when_enabled",
+                    "--nocapture",
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        } else {
+            assert!(magenta_on());
+        }
+
+        // SAFETY: creating shader-visible descriptor heap on live host device.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 3,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap()
+        };
+        // SAFETY: live device query.
+        let step = unsafe {
+            host.device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        } as usize;
+        // SAFETY: live descriptor heap.
+        let cpu0 = unsafe { heap.GetCPUDescriptorHandleForHeapStart() }.ptr;
+        let at = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu0 + i * step };
+
+        let mut color_2d = [0u32; 16];
+        color_2d[0] = DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32;
+        color_2d[1] = srv_dim;
+        let mut non_color_2d = [0u32; 16];
+        non_color_2d[0] = 2; // R32G32B32A32_FLOAT (not 8-bit/BC colour list)
+        non_color_2d[1] = srv_dim;
+        null_for(&View::Placed(false, [3; 14], color_2d), at(0));
+        null_for(&View::Placed(false, [3; 14], non_color_2d), at(1));
+
+        let (out_res, out_ptr) = host.shared_buffer(64).unwrap();
+        let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    NumElements: 16,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: `out_res` is live and `at(2)` lies inside `heap`.
+        unsafe {
+            host.device
+                .CreateUnorderedAccessView(&out_res, None::<&ID3D12Resource>, Some(&uav_desc), at(2));
+        }
+
+        const HLSL: &str = r#"
+            #define ROOT "DescriptorTable(SRV(t0, numDescriptors = 2)), DescriptorTable(UAV(u0, numDescriptors = 1))"
+            Texture2D<float4> tex_col : register(t0);
+            Texture2D<float4> tex_null : register(t1);
+            RWByteAddressBuffer out_buf : register(u0);
+            [RootSignature(ROOT)]
+            [numthreads(1, 1, 1)]
+            void main() {
+                float4 a = tex_col.Load(int3(0, 0, 0));
+                float4 b = tex_null.Load(int3(0, 0, 0));
+                out_buf.Store4(0, asuint(a));
+                out_buf.Store4(16, asuint(b));
+            }
+        "#;
+        let mut blob: Option<windows::Win32::Graphics::Direct3D::ID3DBlob> = None;
+        // SAFETY: static HLSL source string; valid out pointer.
+        unsafe {
+            windows::Win32::Graphics::Direct3D::Fxc::D3DCompile(
+                HLSL.as_ptr().cast(),
+                HLSL.len(),
+                windows::core::s!("magenta_probe"),
+                None,
+                None,
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+                0,
+                0,
+                &mut blob,
+                None,
+            )
+        }
+        .unwrap();
+        let blob = blob.unwrap();
+        // SAFETY: compiled DXBC blob from `D3DCompile` above.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        };
+        // SAFETY: valid DXBC root signature and compute pipeline creation.
+        let (root_sig, pso) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        // SAFETY: `heap` is shader-visible with 3 descriptors.
+        let gpu_start = unsafe { heap.GetGPUDescriptorHandleForHeapStart() }.ptr;
+        let gpu_at = |i: u64| D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: gpu_start + i * step as u64,
+        };
+        let list = host.new_list().unwrap();
+        // SAFETY: open command list, shader-visible heap, and matching root/PSO.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            list.list.SetComputeRootSignature(&root_sig);
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootDescriptorTable(0, gpu_at(0));
+            list.list.SetComputeRootDescriptorTable(1, gpu_at(2));
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: GPU finished; `out_ptr` holds 64 readable bytes.
+        let (col, non) = unsafe {
+            (
+                out_ptr.cast::<[f32; 4]>().read(),
+                out_ptr.add(16).cast::<[f32; 4]>().read(),
+            )
+        };
+        assert_eq!(non, [0.0, 0.0, 0.0, 0.0]);
+        if child {
+            assert_eq!(col, [1.0, 0.0, 1.0, 1.0]);
+            // SAFETY: live 1x1 texture created by `magenta()`.
+            assert_eq!(unsafe { magenta().unwrap().GetDesc() }.MipLevels, 1);
+        } else {
+            assert_eq!(col, [0.0, 0.0, 0.0, 0.0]);
+        }
     }
 }

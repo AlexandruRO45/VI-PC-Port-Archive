@@ -440,8 +440,23 @@ impl Scheduler {
     }
 }
 
+#[cfg(windows)]
+fn disk_cores_slow_from(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_some_and(|v| v == "slow")
+}
+
+#[cfg(windows)]
+fn disk_cores_slow() -> bool {
+    static SLOW: OnceLock<bool> = OnceLock::new();
+    *SLOW.get_or_init(|| disk_cores_slow_from(std::env::var_os("VICTORY_DISK_CORES").as_deref()))
+}
+
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    #[cfg(windows)]
+    if disk_cores_slow() {
+        victory_gpu::keep_on_slow_cores("dstorage worker");
+    }
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -1557,5 +1572,31 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn disk_cores_slow_switch_requires_slow_value() {
+        use std::ffi::OsStr;
+        if std::env::var_os("VICTORY_DISK_CORES_CHILD").is_some() {
+            assert!(super::disk_cores_slow());
+            return;
+        }
+        assert!(!super::disk_cores_slow());
+        assert!(!super::disk_cores_slow_from(None));
+        assert!(!super::disk_cores_slow_from(Some(OsStr::new("fast"))));
+        assert!(super::disk_cores_slow_from(Some(OsStr::new("slow"))));
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .env("VICTORY_DISK_CORES", "slow")
+            .env("VICTORY_DISK_CORES_CHILD", "1")
+            .args([
+                "--exact",
+                "modules::dstorage::tests::disk_cores_slow_switch_requires_slow_value",
+                "--nocapture",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }

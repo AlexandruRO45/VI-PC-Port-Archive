@@ -22,6 +22,8 @@ mod card;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(windows)]
+mod cores;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod descriptor;
@@ -72,6 +74,8 @@ mod texture;
 #[cfg(windows)]
 mod watch;
 
+#[cfg(windows)]
+pub use cores::{keep_on_fast_cores, keep_on_slow_cores};
 #[cfg(windows)]
 pub use host::on_failure;
 pub use memstat::report as memory_report;

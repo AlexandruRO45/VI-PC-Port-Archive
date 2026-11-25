@@ -256,6 +256,7 @@ fn watch() {
     let started = std::thread::Builder::new()
         .name("victory-queues".into())
         .spawn(|| {
+            crate::cores::keep_on_fast_cores("victory-queues");
             loop {
                 if !held() {
                     std::thread::sleep(Duration::from_millis(2));
