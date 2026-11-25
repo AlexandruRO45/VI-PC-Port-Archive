@@ -788,6 +788,8 @@ impl HostHeap {
         // Hold `made` and `next` across the scan and clear so title slots
         // rewritten concurrently and dynamic slots newly taken are not nulled;
         // live dynamic slots belong to recorded lists and keep their views.
+        // (Such a slot keeps the texture until it is next made, not until its
+        // list is reset: the dynamic range comes round quickly.)
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let taken = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let slots: Vec<u32> = {
