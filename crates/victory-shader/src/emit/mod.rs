@@ -170,8 +170,9 @@
 //! * **The host's tables** (the page table, the view addresses, the view
 //!   marks, the view strides) are read once per entry (added 2026-11-25):
 //!   where a shader reads an entry it has read on every path there, it
-//!   takes the first read's value (`bitcode::reuse`). So the host does not
-//!   change a table under a list that runs and reads it.
+//!   takes the first read's value (`bitcode::reuse`). So the reads of one
+//!   entry inside an invocation agree, even where the host rewrites the
+//!   entry while the list runs.
 //! * **Read marks** (with [`Options::view_marks`]; added 2026-11-25):
 //!   every image instruction that reads a texture shader view the program
 //!   takes from the resource heap itself (not through a table, whose slots

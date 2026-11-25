@@ -22,10 +22,14 @@
 //! * Of what reads memory, only loads from the host's own tables take
 //!   part (the page table, the view addresses, the view marks and the
 //!   view strides: `emit` "Title memory", "Write marks", "Buffer views in
-//!   the heap"). No shader writes them and the host does not change them
-//!   under a list that runs, so one entry read twice is one value. Every
-//!   other load, sample or wave operation is asked again wherever the
-//!   lowering asked: a store or another thread may have come between.
+//!   the heap"). No shader writes them. The host does rewrite entries
+//!   while the GPU runs (the heap's `write_stride`, `set_mark` and
+//!   `note_address`), and the pass needs no promise about that: inside one
+//!   invocation, the reads of one entry it merges give one value, the
+//!   first read's, where the reads it left out could have seen a newer
+//!   one. Every other load, sample or wave operation is asked again
+//!   wherever the lowering asked: a store or another thread may have come
+//!   between.
 //!
 //! What it leaves out is always a copy of an instruction that stays, with
 //! the same operands. So no operation and no declaration loses its last
