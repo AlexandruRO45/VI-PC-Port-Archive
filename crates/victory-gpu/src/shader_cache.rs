@@ -36,6 +36,14 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+fn build_hash(mut exe: Vec<u8>, limit: u32, rays: bool, opt: u32) -> [u8; 32] {
+    exe.extend_from_slice(&limit.to_le_bytes());
+    exe.push(rays.into());
+    // And which clean-up passes ran over the translated code.
+    exe.extend_from_slice(&opt.to_le_bytes());
+    *blake3::hash(&exe).as_bytes()
+}
+
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit, which a
 /// diagnostics build can change at run time).
@@ -60,13 +68,12 @@ fn build() -> &'static [u8; 32] {
             );
         }
         match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                bytes.push(victory_shader::emit::rays().into());
-                // And which clean-up passes ran over the translated code.
-                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
-            }
+            Ok(bytes) => build_hash(
+                bytes,
+                limit,
+                victory_shader::emit::rays(),
+                victory_shader::emit::shader_opt(),
+            ),
             Err(e) => {
                 // Without it no entry can be trusted: a fresh key per run.
                 tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
@@ -391,6 +398,18 @@ mod tests {
         assert_eq!(key(&build, nvidia), key(&build, nvidia));
         assert_ne!(key(&build, nvidia), key(&build, rdna));
         assert_ne!(key(&build, nvidia), key(&[8; 32], nvidia));
+        assert_ne!(
+            build_hash(vec![1, 2], 10, false, 0x1F),
+            build_hash(vec![1, 2], 10, false, 0x1E)
+        );
+        assert_ne!(
+            build_hash(vec![1, 2], 10, false, 0x1F),
+            build_hash(vec![1, 2], 11, false, 0x1F)
+        );
+        assert_ne!(
+            build_hash(vec![1, 2], 10, false, 0x1F),
+            build_hash(vec![1, 2], 10, true, 0x1F)
+        );
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

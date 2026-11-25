@@ -120,11 +120,12 @@ pub use rectangle::rectangle_geometry;
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
 
-/// Which clean-up passes run over each translated DXIL module: every pass
-/// unless `VICTORY_SHADER_OPT` says otherwise (`0` turns them all off;
-/// bits: `1` dead code, `2` constants and identities, `4` one instruction
-/// for one value, `8` what a branch taken says about its condition, `16`
-/// one read for one place within a block).
+/// Which clean-up passes run over each translated DXIL module: off by
+/// default until each pass is verified on target hardware (`VICTORY_SHADER_OPT=on`,
+/// `all`, or a bitmask turns them on; bits: `1` dead code, `2` constants
+/// and identities, `4` one instruction for one value, `8` what a branch
+/// taken says about its condition, `16` one read for one place within a
+/// block).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
@@ -133,16 +134,19 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
-/// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
-/// unreadable. Pure, for testing.
+/// `VICTORY_SHADER_OPT`'s value; `0` when it is unset or unreadable,
+/// [`bitcode::opt::ALL`] for `on`/`all`, else parsed bitmask. Pure, for
+/// testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
-    let parsed = value
-        .map(str::trim)
-        .and_then(|v| match v.strip_prefix("0x") {
-            Some(hex) => u32::from_str_radix(hex, 16).ok(),
-            None => v.parse().ok(),
-        });
-    parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
+    let trimmed = value.map(str::trim);
+    if matches!(trimmed, Some("on" | "all")) {
+        return bitcode::opt::ALL;
+    }
+    let parsed = trimmed.and_then(|v| match v.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => v.parse().ok(),
+    });
+    parsed.map_or(0, |n| n & bitcode::opt::ALL)
 }
 
 /// The loop limit without an override: 2^20.
@@ -718,13 +722,36 @@ mod tests {
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
+        if std::env::var_os("VICTORY_SHADER_OPT").is_some() {
+            assert_eq!(super::shader_opt(), 0x1e);
+            return;
+        }
         let all = super::bitcode::opt::ALL;
-        assert_eq!(parse_shader_opt(None), all);
+        assert_eq!(all, 0x1f);
+        assert_eq!(super::shader_opt(), 0);
+        assert_eq!(parse_shader_opt(None), 0);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
+        assert_eq!(parse_shader_opt(Some(" 0x15 ")), 0x15);
+        assert_eq!(parse_shader_opt(Some("31")), all);
+        assert_eq!(parse_shader_opt(Some("0x20")), 0);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), all);
+        assert_eq!(parse_shader_opt(Some(" all ")), all);
+        assert_eq!(parse_shader_opt(Some("0X1")), 0);
+        assert_eq!(parse_shader_opt(Some("")), 0);
+        assert_eq!(parse_shader_opt(Some("bad")), 0);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .env("VICTORY_SHADER_OPT", "0x1e")
+            .args([
+                "--exact",
+                "emit::tests::the_clean_up_switch_parses_or_runs_every_pass",
+                "--nocapture",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]

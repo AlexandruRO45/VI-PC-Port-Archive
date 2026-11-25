@@ -388,8 +388,12 @@ impl Module {
     /// Notes what instruction `v` is for (see [`Tag`]); only when modules
     /// are counted.
     pub fn tag(&mut self, v: V, tag: Tag) {
+        self.tag_when(v, tag, census::enabled());
+    }
+
+    pub(super) fn tag_when(&mut self, v: V, tag: Tag, on: bool) {
         if let V::Inst(i) = v
-            && census::enabled()
+            && on
         {
             self.tags.insert(i, tag);
         }
@@ -1457,6 +1461,170 @@ mod tests {
         assert!(successors(Some(Term::Ret)).is_empty());
         assert_eq!(&*successors(Some(Term::Br(7))), &[7]);
         assert_eq!(&*successors(Some(Term::CondBr(V::Const(0), 3, 5))), &[3, 5]);
+    }
+
+    #[test]
+    fn layout_folds_only_single_empty_inner_latches() {
+        // Basic empty-latch fold vs non-empty body block. Two forward edges into
+        // `head` (`entry` and `pre`) must not count as back-edges (`latches[head] == 1`).
+        let mut m = Module::default();
+        let c = m.bool(true);
+        let one = m.i32(1);
+        let (entry, pre, head, body, latch, exit) = (
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+        );
+        m.terminate(entry, Term::CondBr(c, head, pre));
+        m.terminate(pre, Term::Br(head));
+        m.terminate(head, Term::CondBr(c, body, exit));
+        m.terminate(body, Term::CondBr(c, latch, exit));
+        m.terminate(latch, Term::Br(head));
+        m.terminate(exit, Term::Ret);
+        let (_, post) = m.reachable();
+        let (layout, fold) = m.layout(post);
+        assert_eq!(fold[latch], Some((body, head)));
+        assert!(!layout.contains(&latch));
+
+        // Non-empty latch stays un-folded.
+        let _ = m.bin(latch, Bin::Add, one, one);
+        let (_, post) = m.reachable();
+        let (layout, fold) = m.layout(post);
+        assert_eq!(fold[latch], None);
+        assert!(layout.contains(&latch));
+
+        // Nested loops sharing one exiting block: prefer the inner (later) header
+        // regardless of block visit order in RPO.
+        let mut m = Module::default();
+        let c = m.bool(true);
+        let (entry, h_outer, h_inner, p, latch_inner, latch_outer, exit) = (
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+        );
+        m.terminate(entry, Term::Br(h_outer));
+        m.terminate(h_outer, Term::Br(h_inner));
+        m.terminate(h_inner, Term::Br(p));
+        m.terminate(p, Term::CondBr(c, latch_outer, latch_inner));
+        m.terminate(latch_outer, Term::Br(h_outer));
+        m.terminate(latch_inner, Term::CondBr(c, h_inner, exit));
+        // Make `latch_inner` an unconditional latch to test inner preference;
+        // add another exit edge on `h_outer` so `exit` is reachable.
+        m.terminate(h_outer, Term::CondBr(c, h_inner, exit));
+        m.terminate(latch_inner, Term::Br(h_inner));
+        m.terminate(exit, Term::Ret);
+        let (_, post) = m.reachable();
+        let (_, fold) = m.layout(post);
+        assert_eq!(fold[latch_inner], Some((p, h_inner)));
+        assert_eq!(fold[latch_outer], None);
+
+        // Same pair with the reverse branch target order so `latch_outer` is seen first.
+        m.terminate(p, Term::CondBr(c, latch_inner, latch_outer));
+        let (_, post) = m.reachable();
+        let (_, fold) = m.layout(post);
+        assert_eq!(fold[latch_inner], Some((p, h_inner)));
+        assert_eq!(fold[latch_outer], None);
+    }
+
+    #[test]
+    fn one_back_edge_each_splits_multi_latches_and_preserves_equal_phis() {
+        // Two back-edges from one block `b` to two headers: `b` gets split.
+        let mut m = Module::default();
+        let c = m.bool(true);
+        let (entry, h1, h2, exit) = (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        m.terminate(entry, Term::Br(h1));
+        m.terminate(h1, Term::Br(h2));
+        m.terminate(h2, Term::CondBr(c, exit, h1));
+        // Replace exit with another back-edge from `h2` (`h2` -> h1 and `h2` -> h2):
+        m.terminate(h1, Term::CondBr(c, h2, exit));
+        m.terminate(h2, Term::CondBr(c, h1, h2));
+        m.terminate(exit, Term::Ret);
+        m.one_back_edge_each();
+        assert_eq!(m.blocks.len(), 5);
+        let (_, post) = m.reachable();
+        let mut pos = vec![usize::MAX; m.blocks.len()];
+        for (k, &b) in post.iter().enumerate() {
+            pos[b] = k;
+        }
+        assert!(post.iter().all(|&b| {
+            successors(m.blocks[b].term)
+                .iter()
+                .filter(|&&t| pos[t] <= pos[b])
+                .count()
+                <= 1
+        }));
+
+        // Two latches back to one header `h`, with an identical-value phi and
+        // a distinct-value phi.
+        let mut m = Module::default();
+        let c = m.bool(true);
+        let i32t = m.int(32);
+        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
+        let (entry, head, l1, l2, exit) = (
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+        );
+        m.terminate(entry, Term::Br(head));
+        let same_phi = m.phi(head, i32t);
+        let diff_phi = m.phi(head, i32t);
+        m.terminate(head, Term::CondBr(c, l1, l2));
+        m.terminate(l1, Term::CondBr(c, head, exit));
+        m.terminate(l2, Term::Br(head));
+        m.set_phi(same_phi, vec![(zero, entry), (one, l1), (one, l2)]);
+        m.set_phi(diff_phi, vec![(zero, entry), (one, l1), (two, l2)]);
+        m.terminate(exit, Term::Ret);
+        m.one_back_edge_each();
+        assert_eq!(m.blocks.len(), 6);
+
+        let Op::Phi(same_inc) = &m.insts[match same_phi { V::Inst(i) => i as usize, _ => unreachable!() }].op else {
+            unreachable!();
+        };
+        assert!(same_inc.iter().any(|&(v, _)| v == one));
+        let Op::Phi(diff_inc) = &m.insts[match diff_phi { V::Inst(i) => i as usize, _ => unreachable!() }].op else {
+            unreachable!();
+        };
+        let combined = diff_inc.iter().find(|&&(_, from)| from != entry).unwrap().0;
+        assert!(matches!(combined, V::Inst(_)));
+
+        // Three latches back to one header `head` (catches `ls.len() > 2`).
+        let mut m = Module::default();
+        let c = m.bool(true);
+        let (entry, head, split, l1, l2, l3, exit) = (
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+        );
+        m.terminate(entry, Term::Br(head));
+        m.terminate(head, Term::CondBr(c, l1, split));
+        m.terminate(split, Term::CondBr(c, l2, l3));
+        m.terminate(l1, Term::CondBr(c, head, exit));
+        m.terminate(l2, Term::Br(head));
+        m.terminate(l3, Term::Br(head));
+        m.terminate(exit, Term::Ret);
+        m.one_back_edge_each();
+        assert_eq!(m.blocks.len(), 8);
+        assert_eq!(
+            m.blocks
+                .iter()
+                .enumerate()
+                .filter(|&(i, blk)| i != entry && successors(blk.term).contains(&head))
+                .count(),
+            1
+        );
     }
 
     /// The written bytes are pinned to what the writer produced before the

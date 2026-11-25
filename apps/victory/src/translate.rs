@@ -503,9 +503,7 @@ fn translate(
 /// static count of the whole program, not of one thread's path), and the
 /// host module's instructions by kind (`emit::census::KINDS`).
 fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &emit::HostShader) {
-    use std::fmt::Write as _;
     use std::io::Write as _;
-    use victory_shader::gfx10::Fields;
     static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     let Some(out) = OUT.get_or_init(|| {
         let path = std::env::var_os("VICTORY_SHADER_CENSUS")?;
@@ -521,6 +519,12 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     let Some(census) = emit::census::take(&shader.dxil) else {
         return;
     };
+    let console = count_console_classes(p);
+    let _ = lock(out).write_all(format_census_line(label, native.wave64, &console, &census).as_bytes());
+}
+
+fn count_console_classes(p: &ir::Program) -> [u32; 9] {
+    use victory_shader::gfx10::Fields;
     // total, vector, scalar, descriptor loads, buffer and memory, image, LDS, control, other
     let mut console = [0u32; 9];
     for inst in p.blocks.iter().flat_map(|b| &b.insts) {
@@ -537,8 +541,18 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
         };
         console[k] += 1;
     }
-    let mut line = format!("{label}\twave64={}", u8::from(native.wave64));
-    for (name, n) in [
+    console
+}
+
+fn format_census_line(
+    label: &str,
+    wave64: bool,
+    console: &[u32; 9],
+    census: &emit::census::Census,
+) -> String {
+    use std::fmt::Write as _;
+    let mut line = format!("{label}\twave64={}", u8::from(wave64));
+    for (name, &n) in [
         "c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other",
     ]
     .iter()
@@ -550,7 +564,7 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
         let _ = write!(line, "\t{name}={n}");
     }
     line.push('\n');
-    let _ = lock(out).write_all(line.as_bytes());
+    line
 }
 
 /// Validates an emitted shader if asked to.
@@ -812,4 +826,121 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use victory_shader::gfx10::{Cache, Encoding, Fields, Instruction, Operand, Valu};
+
+    fn fake_inst(fields: Fields) -> ir::Inst {
+        ir::Inst {
+            machine: Instruction {
+                offset: 0,
+                encoding: Encoding::Sopp,
+                opcode: 0,
+                words: vec![],
+            },
+            fields,
+            reads: vec![],
+            writes: vec![],
+        }
+    }
+
+    #[test]
+    fn census_formatting_counts_every_instruction_class() {
+        let dummy_op = Operand::Const(0);
+        let cache = Cache {
+            glc: false,
+            slc: false,
+            dlc: false,
+        };
+        let p = ir::Program {
+            wave64: true,
+            vgprs: 0,
+            inputs: vec![],
+            blocks: vec![ir::Block {
+                offset: 0,
+                preds: vec![],
+                phis: vec![],
+                insts: vec![
+                    fake_inst(Fields::Valu(Valu::default())),
+                    fake_inst(Fields::Sop {
+                        dst: None,
+                        src: vec![],
+                        imm: None,
+                    }),
+                    fake_inst(Fields::Smem {
+                        data: None,
+                        base: dummy_op,
+                        offset: 0,
+                        soffset: dummy_op,
+                        cache,
+                    }),
+                    fake_inst(Fields::Buffer {
+                        data: None,
+                        addr: dummy_op,
+                        rsrc: dummy_op,
+                        soffset: dummy_op,
+                        offset: 0,
+                        offen: false,
+                        idxen: false,
+                        format: None,
+                        lds: false,
+                        tfe: false,
+                        cache,
+                    }),
+                    fake_inst(Fields::Flat {
+                        dst: None,
+                        addr: None,
+                        data: None,
+                        saddr: None,
+                        offset: 0,
+                        lds: false,
+                        cache,
+                    }),
+                    fake_inst(Fields::Image {
+                        data: dummy_op,
+                        addr: vec![],
+                        rsrc: dummy_op,
+                        sampler: None,
+                        dmask: 0,
+                        dim: 0,
+                        unorm: false,
+                        r128: false,
+                        a16: false,
+                        d16: false,
+                        tfe: false,
+                        lwe: false,
+                        cache,
+                    }),
+                    fake_inst(Fields::Ds {
+                        dst: None,
+                        addr: None,
+                        data: vec![],
+                        offset0: 0,
+                        offset1: 0,
+                        gds: false,
+                    }),
+                    fake_inst(Fields::Sopp { imm: 0 }),
+                    fake_inst(Fields::Exp {
+                        target: 0,
+                        src: [None; 4],
+                        compr: false,
+                        done: false,
+                        vm: false,
+                    }),
+                ],
+                exit: ir::Exit::End,
+            }],
+        };
+        let console = count_console_classes(&p);
+        assert_eq!(console, [9, 1, 1, 1, 2, 1, 1, 1, 1]);
+        let mut census = emit::census::Census::default();
+        census.counts[0] = 42;
+        census.counts[emit::census::KINDS.len() - 1] = 3;
+        let line = format_census_line("cs#0", true, &console, &census);
+        assert!(line.starts_with("cs#0\twave64=1\tc_total=9\tc_valu=1\tc_sop=1\tc_smem=1\tc_buffer=2\tc_image=1\tc_ds=1\tc_sopp=1\tc_other=1\ttotal=42\t"));
+        assert!(line.ends_with("\tblocks=3\n"), "{line}");
+    }
 }

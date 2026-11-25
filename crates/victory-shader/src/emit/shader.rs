@@ -991,7 +991,9 @@ mod tests {
     #[test]
     fn two_empty_latches_to_same_header_validate() {
         validate_and_create_cs_pso(build_two_empty_latches_shader().finish_with(0));
-        validate_and_create_cs_pso(build_two_empty_latches_shader().finish());
+        validate_and_create_cs_pso(
+            build_two_empty_latches_shader().finish_with(super::super::bitcode::opt::MODULE),
+        );
     }
 
     fn build_phi_unreachable_pred_shader() -> Shader {
@@ -1019,6 +1021,113 @@ mod tests {
     #[test]
     fn phi_with_unreachable_predecessor_validates() {
         validate_and_create_cs_pso(build_phi_unreachable_pred_shader().finish_with(0));
-        validate_and_create_cs_pso(build_phi_unreachable_pred_shader().finish());
+        validate_and_create_cs_pso(
+            build_phi_unreachable_pred_shader().finish_with(super::super::bitcode::opt::MODULE),
+        );
+    }
+
+    fn sfi0_bits(bytes: &[u8]) -> u64 {
+        let c = crate::dxbc::Container::parse(bytes).unwrap();
+        u64::from_le_bytes(
+            c.part(crate::dxbc::FourCC::SFI0)
+                .unwrap()
+                .data
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn finish_with_clears_unused_feature_flags_and_keeps_live_ones() {
+        let all_cleared_if_unused = flags::WAVE_OPS
+            | flags::INT64
+            | flags::TYPED_UAV_LOADS
+            | flags::RESOURCE_HEAP
+            | flags::SAMPLER_HEAP
+            | flags::ATOMIC_TYPED64
+            | flags::ATOMIC_HEAP64;
+
+        let make_unused = |extra: u64| {
+            let mut s = Shader::new(false);
+            s.threads = Some([1, 1, 1]);
+            s.flags |= all_cleared_if_unused | extra;
+            let entry = s.entry;
+            s.m.terminate(entry, Term::Ret);
+            s
+        };
+
+        // Without clean-up (and under default opt-in finish()), declared flags stay intact.
+        let expected_all =
+            0x800 | 0x4000 | 0x8000 | 0x40_0000 | 0x200_0000 | 0x400_0000 | 0x1000_0000;
+        assert_eq!(sfi0_bits(&make_unused(0).finish_with(0)), expected_all);
+        if std::env::var_os("VICTORY_SHADER_OPT").is_none() {
+            assert_eq!(sfi0_bits(&make_unused(0).finish()), expected_all);
+        }
+
+        // With clean-up enabled, unused feature flags are cleared while non-cleared flags stay.
+        let opt_bytes = make_unused(flags::STENCIL_REF).finish_with(super::super::bitcode::opt::MODULE);
+        assert_eq!(sfi0_bits(&opt_bytes), 0x200);
+        let clean_bytes = make_unused(0).finish_with(super::super::bitcode::opt::MODULE);
+        assert_eq!(sfi0_bits(&clean_bytes), 0);
+        validate_and_create_cs_pso(clean_bytes);
+
+        // Live instructions preserve their matching feature flags across clean-up.
+        let mut live = Shader::new(false);
+        live.threads = Some([1, 1, 1]);
+        live.flags |= all_cleared_if_unused;
+        let b = live.entry;
+        let idx0 = live.m.i32(0);
+        let h_srv = live.handle_at(b, idx0, false, false, (0x0000_000a, 0x0000_0209));
+        let h_uav_typed = live.handle_at(b, idx0, false, false, (0x0000_100a, 0x0000_0209));
+        let h_samp = live.handle_at(b, idx0, true, false, (0x0000_000e, 0));
+        let i64t = live.m.int(64);
+        let c1_64 = live.m.int_const(i64t, 1);
+        let op0 = live.op(
+            b,
+            "atomicBinOp.i64",
+            Attr::NoUnwind,
+            i64t,
+            78,
+            &[h_srv, idx0, idx0, c1_64],
+        );
+        let w = live.op(b, "waveActiveAllEqual.i32", Attr::ReadOnly, live.t.i1, 115, &[idx0]);
+        let ld = live.op(
+            b,
+            "bufferLoad.f32",
+            Attr::ReadOnly,
+            live.t.f32,
+            68,
+            &[h_uav_typed, op0, idx0],
+        );
+        let s = live.op(b, "sample.f32", Attr::ReadOnly, live.t.f32, 60, &[h_srv, h_samp, idx0]);
+        live.op(
+            b,
+            "textureStore.f32",
+            Attr::NoUnwind,
+            live.t.void,
+            67,
+            &[h_uav_typed, idx0, w, ld, s, op0],
+        );
+        live.m.terminate(b, Term::Ret);
+        let live_opt = sfi0_bits(&live.finish_with(super::super::bitcode::opt::MODULE));
+        assert_eq!(
+            live_opt,
+            0x800 | 0x4000 | 0x8000 | 0x40_0000 | 0x200_0000 | 0x400_0000 | 0x1000_0000
+        );
+    }
+
+    #[test]
+    fn heap_handle_marks_flags_and_nonuniform_count() {
+        let mut s = Shader::new(false);
+        s.threads = Some([1, 1, 1]);
+        let idx = s.m.i32(0);
+        let _ = s.heap_handle(s.entry, idx, false, true, (0, 0));
+        assert_ne!(s.flags & flags::RESOURCE_HEAP, 0);
+        assert_eq!(s.flags & flags::SAMPLER_HEAP, 0);
+        assert_eq!(s.nonuniform_handles, 1);
+
+        let _ = s.heap_handle(s.entry, idx, true, false, (0, 0));
+        assert_ne!(s.flags & flags::SAMPLER_HEAP, 0);
+        assert_eq!(s.nonuniform_handles, 1);
     }
 }
