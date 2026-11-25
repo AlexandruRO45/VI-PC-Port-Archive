@@ -1277,15 +1277,6 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
-/// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
-/// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
-/// hold one argument each: draw (stride 16), indexed draw (20), dispatch
-/// (12), mesh dispatch (12), and the console's single-pass dispatch, type
-/// 105 (stride 12: the three group counts; its flags live in the
-/// signature, the title passes none), run as a plain dispatch. They run
-/// through the host's indirect execution (`State::execute_indirect`).
-/// shortcut: signatures that change root arguments are dropped (logged
-/// once per signature).
 /// Checked byte address inside `buffer` at `offset` with at least `min_bytes`
 /// remaining, preventing `u64` address wrap and out-of-bounds aliasing.
 fn buffer_at(buffer: This, offset: u64, min_bytes: u64) -> Option<u64> {
@@ -1297,6 +1288,15 @@ fn buffer_at(buffer: This, offset: u64, min_bytes: u64) -> Option<u64> {
     (p as u64).checked_add(offset)
 }
 
+/// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
+/// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
+/// hold one argument each: draw (stride 16), indexed draw (20), dispatch
+/// (12), mesh dispatch (12), and the console's single-pass dispatch, type
+/// 105 (stride 12: the three group counts; its flags live in the
+/// signature, the title passes none), run as a plain dispatch. They run
+/// through the host's indirect execution (`State::execute_indirect`).
+/// shortcut: signatures that change root arguments are dropped (logged
+/// once per signature).
 extern "system" fn execute_indirect(
     this: This,
     signature: This,
@@ -1310,7 +1310,14 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = buffer_at(arguments, offset, 0);
+    let min_bytes = if count.is_null() {
+        (max as u64).saturating_mul(stride as u64)
+    } else if max > 0 {
+        stride as u64
+    } else {
+        0
+    };
+    let address = buffer_at(arguments, offset, min_bytes);
     let counter = buffer_at(count, count_offset, 4);
     let mut ran = false;
     #[cfg(windows)]
@@ -1754,9 +1761,10 @@ mod tests {
         let args = crate::resource::test_buffer(64);
         let count = crate::resource::test_buffer(64);
 
-        assert!(buffer_at(args, 0, 0).is_some());
-        assert_eq!(buffer_at(args, u64::MAX, 0), None);
+        assert!(buffer_at(args, 0, 12).is_some());
+        assert_eq!(buffer_at(args, u64::MAX, 12), None);
         assert_eq!(buffer_at(args, 65, 0), None);
+        assert_eq!(buffer_at(args, 53, 12), None);
         assert_eq!(buffer_at(count, 61, 4), None);
         assert_eq!(buffer_at(count, u64::MAX - 2, 4), None);
 
