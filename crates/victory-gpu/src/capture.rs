@@ -610,7 +610,7 @@ fn dump_one(
         if let Some(rgba) = to_rgba(format as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let mut name = format!(
                 "{prefix}-{i:02}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
+                f.Width, f.Height, d.Format.0
             );
             if target.mip != 0 {
                 name.push_str(&format!("-mip{}", target.mip));

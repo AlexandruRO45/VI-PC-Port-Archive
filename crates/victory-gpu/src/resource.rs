@@ -2386,6 +2386,8 @@ mod tests {
             let name = path.file_name().unwrap().to_str().unwrap();
             let png = std::fs::read(&path).unwrap();
             let word = |at| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+            let size_in_name = if word(16) == 2 { "-4x4-f28-mip1" } else { "-8x8-f28" };
+            assert!(name.contains(size_in_name), "target filename should include {size_in_name}");
             let rgb = miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + word(33) as usize]).unwrap();
             actual.push((name.starts_with("frame-1-s"), word(16), word(20), rgb));
         }
