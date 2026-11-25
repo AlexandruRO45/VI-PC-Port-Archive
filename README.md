@@ -38,7 +38,10 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 ```
 
 `scripts\play.ps1` keeps the shader cache and saves in folders you choose
-(`-Cache`, `-Data`) and presses no buttons for you. Controller: XInput pads
+(`-Cache`, `-Data`) and presses no buttons for you. Use `-LogPath <file>` to
+keep a separate log for each run. The default is `%TEMP%\ztrx.log`.
+
+Controller: XInput pads
 (a DualShock/DualSense through DS4Windows works). With no pad connected the
 keyboard acts as one while the game window has focus.
 
