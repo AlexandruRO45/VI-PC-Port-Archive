@@ -236,7 +236,9 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.strip_suffix(".new").and_then(version_number).is_some() {
-            remove_path(&entry.path())?;
+            // An unfinished version cannot prevent reading a committed one.
+            // Commit still requires its own staging path to be reusable.
+            let _ = remove_path(&entry.path());
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
             if entry.file_type()?.is_dir() {
@@ -1584,6 +1586,31 @@ mod tests {
         assert!(!staged.exists());
         let version = current(dir.path()).unwrap().unwrap();
         assert_eq!(std::fs::read(version.dir.join("0")).unwrap(), b"new a");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_staged_version_file_only_blocks_commit() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        let staged = slot.join("v2.new");
+        std::fs::write(&staged, b"unfinished").unwrap();
+        let locked = std::fs::OpenOptions::new().read(true).share_mode(0).open(&staged).unwrap();
+
+        assert_eq!(state(root), old_state());
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
+        assert_eq!(state(root), old_state());
+        assert!(!slot.join("v2").exists());
+
+        drop(locked);
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+        let after = Some(("two".into(), vec![("a".into(), "new a".into()), ("b".into(), "old b".into())]));
+        assert_eq!(state(root), after);
+        assert!(!staged.exists());
     }
 
     /// Only `v<N>` as `commit` writes it is a version: `v01` and the like
