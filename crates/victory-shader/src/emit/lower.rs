@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether it declares rasterizer-ordered views.
+    #[cfg(test)]
+    pub rovs: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -225,6 +228,9 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Pixel: an ordered section (POPS), whose UAVs the host makes
+    /// rasterizer-ordered views.
+    pops: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -1501,6 +1507,10 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            pops: matches!(
+                x.native.io,
+                StageIo::Ps { db_shader_control, .. } if db_shader_control & (1 << 16) != 0
+            ),
             split_lds,
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
@@ -2124,6 +2134,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            rovs: self.s.flags & flags::ROVS != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2164,6 +2176,20 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
+                    // The primitive mask (pixel), which console code only moves to M0
+                    // for its interpolation (spilled and reloaded on the way); the host
+                    // interpolates by itself, so the value goes unread.
+                    None if self.s.pixel && self.x.io.initialized_sgprs == Some(n + 2) => {
+                        Val::I32(self.s.m.i32(0))
+                    }
+                    // The ordered section's collision id (pixel POPS): overlap bit 31
+                    // clear (no wave waits) and wave id 1 != collision id 0 so the
+                    // wrap-around wait test (`wave_id + ~collision_id <u exiting + ~collision_id`)
+                    // also exits immediately if an inactive lane ever reaches the loop;
+                    // the host's rasterizer-ordered views order the accesses instead.
+                    None if self.pops && self.x.io.initialized_sgprs == Some(n + 1) => {
+                        Val::I32(self.s.m.i32(1 << 16))
+                    }
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -3016,6 +3042,8 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // `src_pops_exiting_wave_id` (see `inputs`).
+            Operand::Const(239) if self.pops => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -6007,6 +6035,12 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        let props = if self.pops && props.0 & 0x1000 != 0 && !matches!(src, Source::Built { .. }) {
+            self.s.flags |= flags::ROVS;
+            (props.0 | 0x2000, props.1)
+        } else {
+            props
+        };
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props);
@@ -11353,5 +11387,121 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn ordered_pixel_sections_use_rasterizer_ordered_views() {
+        // A pixel program's ordered section (POPS): user data ends at s8,
+        // s9 is the primitive mask, s10 is the POPS collision id, followed
+        // by the wrap-around wait loop on `src_pops_exiting_wave_id`, a
+        // read-modify-write of a UAV, and `MSG_ORDERED_PS_DONE`.
+        let code: Vec<u32> = vec![
+            0xBE86_0308, // s_mov_b32 s6, s8
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0303,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[6:7], 0x0
+            0x9382_FF0A,
+            0x000A_0000, // s_bfe_u32 s2, s10, lit(0x000a0000) (collision id)
+            0x9385_FF0A,
+            0x000A_0010, // s_bfe_u32 s5, s10, lit(0x000a0010) (wave id)
+            0xBE84_0702, // s_not_b32 s4, s2
+            0x9000_9F0A, // s_lshr_b32 s0, s10, 31 (overlap bit)
+            0x8105_0405, // s_add_i32 s5, s5, s4
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0x8580_807E, // s_cselect_b64 s[0:1], exec, 0
+            0x8102_04EF, // s_add_i32 s2, src_pops_exiting_wave_id, s4
+            0xBF08_0502, // s_cmp_gt_u32 s2, s5
+            0x8582_807E, // s_cselect_b64 s[2:3], exec, 0
+            0x8880_0200, // s_or_b64 s[0:1], s[0:1], s[2:3]
+            0x87EA_007E, // s_and_b64 vcc, exec, s[0:1]
+            0xBF87_0004, // s_cbranch_vccnz +4
+            0xBF8E_FFFF, // s_sleep 0xffff
+            0x8100_04EF, // s_add_i32 s0, src_pops_exiting_wave_id, s4
+            0xBF0A_0005, // s_cmp_lt_u32 s5, s0
+            0xBF84_FFFC, // s_cbranch_scc0 -4
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF000_3F88,
+            0x0003_0200, // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm dlc glc
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x0604_04F2, // v_add_f32 v2, 1.0, v2
+            0xF020_1F08,
+            0x0003_0200, // image_store v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
+            0xBF90_0007, // s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)
+            0xF800_1890,
+            0x0000_0000, // exp null, off, off, off, off done vm
+            S_ENDPGM,
+        ];
+        let lower_ps = |db_shader_control: u32| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: true,
+                vgprs: 8,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 8,
+                    slot: 0,
+                }],
+                used: vec![UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 8,
+                    user_data: 8,
+                    slot: 0,
+                }],
+                io: StageIo::Ps {
+                    inputs: Vec::new(),
+                    input_addr: 0,
+                    db_shader_control,
+                    patches: Vec::new(),
+                },
+                code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
+            let st = structure::structure(&p).expect("structure");
+            let res =
+                resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
+            let io = io::raise(&p, &native).expect("io");
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+        };
+        let l = lower_ps(1 << 16).expect("lower");
+        assert!(l.rovs);
+        let c = crate::Container::parse(&l.dxil).expect("container");
+        let sfi0 = u64::from_le_bytes(
+            c.part(crate::FourCC::SFI0)
+                .unwrap()
+                .data
+                .try_into()
+                .unwrap(),
+        );
+        assert_ne!(sfi0 & 0x1000, 0, "SFI0 missing ROVS bit: {sfi0:#x}");
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            let mut copy = l.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        // Without the ordered mode, the collision id stays refused as a hardware SGPR input.
+        let Err(crate::ShaderError::Unsupported { what, .. }) = lower_ps(0) else {
+            panic!("translated a collision id outside an ordered section");
+        };
+        assert_eq!(what, "a hardware SGPR input");
     }
 }
