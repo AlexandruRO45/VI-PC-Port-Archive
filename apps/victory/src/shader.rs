@@ -23,7 +23,14 @@ impl Source<'_> {
     pub(crate) fn bytes(&self) -> Option<Cow<'_, [u8]>> {
         match self {
             Source::Raw { data, .. } => Some(Cow::Borrowed(data)),
-            Source::Packed(r) => r.unpack().map(Cow::Owned),
+            Source::Packed(record) => {
+                let mut bytes = record.unpack()?;
+                // The unpacked record can extend past the DXBC container.
+                if let Ok(container) = Container::parse(&bytes) {
+                    bytes.truncate(container.as_bytes().len());
+                }
+                Some(Cow::Owned(bytes))
+            }
         }
     }
 

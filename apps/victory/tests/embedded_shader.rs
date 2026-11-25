@@ -53,3 +53,39 @@ fn warm_finds_each_embedded_shader_by_its_standalone_hash() {
         assert!(summary.contains("1 hashes asked, 1 found"), "{summary}");
     }
 }
+
+#[test]
+fn warm_finds_a_packed_shader_by_its_declared_container_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let pack = dir.path().join("wrapped.rpf");
+    let wanted = dir.path().join("wanted.txt");
+    let mut shader = container(1).to_vec();
+    shader[24..28].copy_from_slice(&44u32.to_le_bytes());
+    shader[28..32].copy_from_slice(&1u32.to_le_bytes());
+    shader.extend_from_slice(&36u32.to_le_bytes());
+    shader.extend_from_slice(b"PRIV\0\0\0\0");
+    let payload = [shader.as_slice(), &[0; 16]].concat();
+
+    // Split the DXBC magic across two stored DEFLATE blocks so the raw
+    // scanner cannot discover a second copy directly in the compressed bytes.
+    let mut packed = Vec::new();
+    for (final_block, block) in [(0, &payload[..2]), (1, &payload[2..])] {
+        let len = block.len() as u16;
+        packed.push(final_block);
+        packed.extend_from_slice(&len.to_le_bytes());
+        packed.extend_from_slice(&(!len).to_le_bytes());
+        packed.extend_from_slice(block);
+    }
+
+    let mut archive = b"prefixSGD5\x02A\x00\x32".to_vec();
+    let record_size = packed.len() as u32 + 12;
+    for field in [record_size, 0x000D_DCE7, record_size, payload.len() as u32] {
+        archive.extend_from_slice(&field.to_le_bytes());
+    }
+    archive.extend_from_slice(&packed);
+    fs::write(&pack, archive).unwrap();
+
+    fs::write(&wanted, &blake3::hash(&shader).to_hex()[..16]).unwrap();
+    let summary = warm(dir.path(), &pack, &wanted);
+    assert!(summary.contains("1 hashes asked, 1 found"), "{summary}");
+}
