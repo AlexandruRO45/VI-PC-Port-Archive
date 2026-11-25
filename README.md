@@ -85,6 +85,13 @@ son commentaire, là où il est lu.
 | `VICTORY_VIEW_KNOWN` | actif | un bloc déjà gardé reste connu comme mémoire de vue : 338 à 450 interrogations de write-watch ratées et 6,5 à 7,8 ms de `VirtualQuery` par image disparaissent |
 | `VICTORY_WIDE_THREADS` | 8 (un quart des processeurs, de 2 à 8) | threads gardés pour les rafraîchissements d'une soumission, les instantanés et comparaisons des plages déclarées, et la fusion de ce que les shaders ont écrit ; le plafond était 6 et il était le facteur limitant de l'image |
 | `VICTORY_FULL_CARD_PASS` | actif | quand la carte n'a plus de place pour de nouvelles textures, la passe de textures est sautée au lieu de parcourir ses 18 000 emplacements pour apprendre la même chose |
+| `VICTORY_LEVELS_ON_DEMAND` | actif | les copies hôtes des textures du titre prennent la mémoire de la carte niveau par niveau, donc les niveaux que le titre ne garde pas n'en prennent aucune (3,1 Go de la carte non alloués sur la machine de test). `=0` désactive, et c'est la première chose à essayer si une texture affiche de mauvais octets |
+
+**Mesuré sur une deuxième machine** (Windows 11, NVIDIA RTX 4070, dossier
+`victory-data` de test) : sans, 3 images/s et des images de 3 s dont 2 130 ms
+de préparation de textures ; avec les niveaux à la demande, **27 à 34 images/s
+dans les menus du titre** (30 images/s = la limite d'origine du titre, levée
+plus bas), préparation ramenée à 5-12 ms par image.
 
 Tout ce que ces commutateurs supposent est écrit là où chacun est lu ; quand
 l'un change ce que le titre observe, son commentaire le dit. Si une exécution
