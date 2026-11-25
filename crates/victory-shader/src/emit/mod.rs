@@ -143,8 +143,9 @@
 //! * **View addresses** ([`HostShader::view_addresses`]): a buffer
 //!   descriptor's dwords 0-1 read as numbers (the BVH SRV's base address)
 //!   come from the root SRV `t1` in [`MEMORY_SPACE`]: per resource-heap
-//!   index, two dwords, the buffer view's title address (high dword bits
-//!   0-15; stride bits 0), zeros for no buffer view.
+//!   index, dwords 0 and 1 hold the buffer view's title address (zero for
+//!   other views). Dword 2 holds native descriptor word zero: the low
+//!   byte-address dword for a buffer or bits 39 through 8 for an image.
 //! * **Write marks** ([`HostShader::view_marks`], with
 //!   [`Options::view_marks`]; added 2026-11-25): every store or atomic
 //!   through an unordered buffer view from the heap (tables, the heap
@@ -222,6 +223,9 @@ pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
     USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
 };
+
+/// Byte stride of the host's per-slot view-address record at t1 in memory space.
+pub const VIEW_ADDRESS_BYTES: u32 = 12;
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;

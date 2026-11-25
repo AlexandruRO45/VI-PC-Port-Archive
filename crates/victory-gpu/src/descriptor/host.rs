@@ -50,10 +50,8 @@ pub(crate) struct HostHeap {
     /// view there, `VIEW_MARK_NONE` for none. Mapped at the address kept
     /// beside it.
     marks: Option<(ID3D12Resource, usize)>,
-    /// Per title slot, the title address of the buffer view it holds, as a
-    /// buffer descriptor's dwords 0 and 1 (shaders reading a descriptor's
-    /// address as data, `crate::memory`): the buffer, its mapping and host
-    /// address, made on first use.
+    /// Per-slot guest buffer addresses and native descriptor base words.
+    /// Buffer, mapping and host GPU address, allocated on first use.
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
@@ -540,13 +538,22 @@ impl HostHeap {
     /// The host address of the slots' view addresses (see the field), made
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
+        if let Some(made) = self.addresses.get() {
+            return made.as_ref().map(|m| m.2);
+        }
+        // Mirror updates hold the same lock. Publish the initial snapshot
+        // before a writer can update a slot and miss the new mapping.
+        let slots = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let made = self.addresses.get_or_init(|| {
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 8)?;
+            let (buffer, data) = host()?.upload_buffer(
+                u64::from(self.count) * u64::from(victory_shader::emit::VIEW_ADDRESS_BYTES),
+            )?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            for (i, &key) in made.iter().enumerate() {
-                let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
+            for (i, &key) in slots.iter().enumerate() {
+                let view = (key != 0)
+                    .then(|| view_at(key as u32, (key >> 32) as u32))
+                    .flatten();
                 write_address(data, i, view.as_ref());
             }
             // SAFETY: a live buffer.
@@ -803,14 +810,40 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// Writes slot `index`'s view address into the view addresses at `data`:
-/// a buffer view's title address (dword 0 low, dword 1 bits 0-15 high);
-/// zeros for anything else.
+/// Guest buffer-address pair followed by native resource descriptor word
+/// zero. GFX10 image bases are expressed in units of 256 bytes.
+fn address_words(view: Option<&View>) -> [u32; 3] {
+    let buffer = view.and_then(buffer_range).map(|(address, _)| address);
+    let base = match (buffer, view) {
+        (Some(address), _) => address as u32,
+        (_, Some(View::Constant(address, _))) => *address as u32,
+        (_, Some(View::Shader(r, _) | View::Unordered(r, _, _))) => {
+            let resource = *r as crate::object::This;
+            if let Some((address, _)) = crate::resource::texture_memory(resource) {
+                ((address as u64) >> 8) as u32
+            } else {
+                crate::resource::buffer_bytes(resource)
+                    .map_or(0, |(address, _)| address as usize as u32)
+            }
+        }
+        (_, Some(View::Placed(_, resource, desc))) if resource[0] != 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            (address >> 8) as u32
+        }
+        _ => 0,
+    };
+    let address = buffer.unwrap_or(0);
+    [address as u32, (address >> 32) as u32 & 0xFFFF, base]
+}
+
 fn write_address(data: usize, index: usize, view: Option<&View>) {
-    let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
-    let words = [address as u32, (address >> 32) as u32 & 0xFFFF];
-    // SAFETY: the mapped view addresses hold 8 bytes per title slot.
-    unsafe { ((data + 8 * index) as *mut [u32; 2]).write_unaligned(words) };
+    const { assert!(size_of::<[u32; 3]>() == victory_shader::emit::VIEW_ADDRESS_BYTES as usize) };
+    // SAFETY: the mapped table holds one three-dword record per title slot.
+    unsafe {
+        (data as *mut [u32; 3])
+            .add(index)
+            .write_unaligned(address_words(view))
+    };
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
@@ -1427,6 +1460,34 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_base_word_tracks_the_guest_view_address() {
+        let address = 0x12_3456_7800u64;
+        let mut resource = [0; 14];
+        let mut desc = [0; 16];
+        desc[10] = address as u32;
+        desc[11] = (address >> 32) as u32;
+        resource[0] = 3; // 2D texture
+        let image = View::Placed(false, resource, desc);
+        assert_eq!(address_words(Some(&image)), [0, 0, 0x1234_5678]);
+        resource[0] = 1; // Buffer SRV with a nonzero FirstElement
+        desc[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+        desc[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        desc[4] = 5;
+        desc[6] = 16;
+        desc[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+        let buffer = View::Placed(false, resource, desc);
+        assert_eq!(
+            address_words(Some(&buffer)),
+            [0x3456_7814, 0x12, 0x3456_7814]
+        );
+        let mut table = [[u32::MAX; 3]; 2];
+        write_address(table.as_mut_ptr() as usize, 1, Some(&image));
+        assert_eq!(table, [[u32::MAX; 3], [0, 0, 0x1234_5678]]);
+        write_address(table.as_mut_ptr() as usize, 1, None);
+        assert_eq!(table[1], [0; 3]);
+    }
 
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]
