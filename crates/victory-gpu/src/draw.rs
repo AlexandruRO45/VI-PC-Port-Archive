@@ -86,10 +86,10 @@ pub(crate) struct State {
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
     root_run: (usize, u32, u32),
+    /// Dynamic descriptor ranges kept alive until this list resets (`(heap, first, count)`).
+    dynamic: Vec<(usize, u32, u32)>,
 }
 
-<<<<<<< HEAD
-=======
 impl Drop for State {
     fn drop(&mut self) {
         for &(heap, first, n) in &self.dynamic {
@@ -113,8 +113,6 @@ pub(crate) fn take_root_view_slots() -> u64 {
     ROOT_VIEW_SLOTS.swap(0, Ordering::Relaxed)
 }
 static ROOT_VIEW_SLOTS: AtomicU64 = AtomicU64::new(0);
-
->>>>>>> upstream/main
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
@@ -1874,7 +1872,6 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     unsafe { list.list.OMSetStencilRef(reference) };
 }
 
-<<<<<<< HEAD
 /// Dynamic table entry `(slot_count, descriptor_words, first_dynamic_slot)`.
 type FreshTable = (u32, Vec<[u32; 3]>, u32);
 
@@ -1891,7 +1888,11 @@ fn find_matching_prefix(prior: &[FreshTable], words: &[[u32; 3]]) -> Option<u32>
 
 #[cfg(test)]
 mod tests {
-    use super::find_matching_prefix;
+    use super::*;
+    use crate::object::{HRESULT, S_OK};
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::core::s;
 
     #[test]
     fn prefix_matching_reuses_larger_table_only_when_prefix_matches() {
@@ -1915,14 +1916,7 @@ mod tests {
             ),
             None
         );
-=======
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::object::{HRESULT, S_OK};
-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-    use windows::Win32::Graphics::Direct3D::ID3DBlob;
-    use windows::core::s;
+    }
 
     /// Reads 16 dwords 64 bytes apart from `offset` past the root view
     /// (heap index in the table) as the translated shaders do: the root
@@ -2544,6 +2538,5 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
->>>>>>> upstream/main
     }
 }

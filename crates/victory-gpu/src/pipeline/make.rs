@@ -238,7 +238,6 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-<<<<<<< HEAD
 /// Bounds parallel shader/PSO worker threads on <= 16 GiB RAM hosts so
 /// concurrent `victory-shader` structurisation and DXIL compiles stay within
 /// Windows commit and physical memory limits.
@@ -259,53 +258,17 @@ fn worker_count() -> usize {
     }
 }
 
-/// Hands `p` to the workers (bounded by physical RAM and logical cores),
-/// started on first use.
-fn queue(p: Arc<Pending>) {
-    static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
-    let sender = SENDER.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
-        let receiver = Arc::new(Mutex::new(receiver));
-        let workers = worker_count();
-        for i in 0..workers {
-            let receiver = receiver.clone();
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
-                    loop {
-                        let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(p) = next else { return };
-                        p.make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
-            }
-        }
-        sender
-=======
 /// Pipelines for the workers: those draws wait for, then those started
 /// early.
 static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
     (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// Hands `p` to the workers (bounded by physical RAM and logical cores),
+/// started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let n = worker_count();
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
@@ -317,7 +280,6 @@ fn queue(p: Arc<Pending>, now: bool) {
                 spawned.is_ok()
             })
             .count()
->>>>>>> upstream/main
     });
     if workers == 0 {
         // No worker: made here instead.

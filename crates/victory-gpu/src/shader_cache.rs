@@ -49,19 +49,12 @@ pub fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-<<<<<<< HEAD
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit and host max wave
-/// size).
-fn build(max_wave: u32) -> &'static [u8; 32] {
-=======
 /// What a translation depends on besides its container: the translator
 /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
 /// the compiler), the entry's encoding (this file's text) and the
 /// translation settings (the loop limit, which a diagnostics build can
 /// change at run time).
 fn build() -> &'static [u8; 32] {
->>>>>>> upstream/main
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
@@ -71,25 +64,7 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-<<<<<<< HEAD
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                bytes.extend_from_slice(&max_wave.to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
-            }
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
-            }
-        }
-=======
         key(victory_shader::SOURCE_HASH, ENCODING, limit)
->>>>>>> upstream/main
     })
 }
 
@@ -105,27 +80,18 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
 }
 
 /// The translation of a console shader container, from the cache when
-<<<<<<< HEAD
-/// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let max_wave = crate::host::host().map_or(64, crate::host::Host::max_wave_size);
-    let translate = move |c: &[u8]| {
-        victory_shader::emit::translate_for_wave(c, max_wave).map_err(|e| e.to_string())
-    };
-    match CACHE.get() {
-        Some(cache) => cached(cache, build(max_wave), container, translate),
-        None => translate(container),
-=======
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options { view_marks: true };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let max_wave = crate::host::host().map_or(64, crate::host::Host::max_wave_size);
+    let translate = move |c: &[u8]| {
+        victory_shader::emit::translate_with_wave(c, options, max_wave).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => (translate(container), false),
->>>>>>> upstream/main
     }
 }
 

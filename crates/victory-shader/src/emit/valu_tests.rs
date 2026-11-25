@@ -140,14 +140,9 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-<<<<<<< HEAD
         max_wave: 64,
-    })
-    .expect("lower");
-=======
         view_marks: false,
     })?;
->>>>>>> upstream/main
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -1231,6 +1226,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        max_wave: 64,
         view_marks: false,
     })
     .expect("lower");
@@ -1579,7 +1575,6 @@ fn v_cmp_class_f16_matches_rdna2() {
     });
 }
 
-<<<<<<< HEAD
 #[test]
 fn wave64_single_wave_lds_lowers_for_wave32_hosts() {
     const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
@@ -1651,6 +1646,7 @@ fn wave64_single_wave_lds_lowers_for_wave32_hosts() {
         prims: Vec::new(),
         mesh_stride: 0,
         max_wave: 64,
+        view_marks: false,
     })
     .expect("lower");
     let mut shader = HostShader {
@@ -1661,6 +1657,13 @@ fn wave64_single_wave_lds_lowers_for_wave32_hosts() {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil).expect("DXIL validation failed");
@@ -1760,6 +1763,7 @@ fn run_wave64_on_wave32(
         prims: Vec::new(),
         mesh_stride: 0,
         max_wave: 32,
+        view_marks: false,
     })
     .expect("lower with max_wave=32");
     assert!(lowered.wave_ops, "expected WAVE_OPS feature flag");
@@ -1771,6 +1775,13 @@ fn run_wave64_on_wave32(
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil).expect("DXIL validation failed");
@@ -2087,6 +2098,7 @@ fn s_buffer_load_descriptor_reads_num_records_as_data() {
         prims: Vec::new(),
         mesh_stride: 0,
         max_wave: 32,
+        view_marks: false,
     })
     .expect("lower");
     let mut shader = HostShader {
@@ -2097,6 +2109,13 @@ fn s_buffer_load_descriptor_reads_num_records_as_data() {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil).expect("DXIL validation failed");
@@ -2226,6 +2245,7 @@ fn indexed_load_uses_stride_from_built_root_descriptor() {
         prims: Vec::new(),
         mesh_stride: 0,
         max_wave: 32,
+        view_marks: false,
     })
     .expect("lower");
     let mut shader = HostShader {
@@ -2236,6 +2256,13 @@ fn indexed_load_uses_stride_from_built_root_descriptor() {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil).expect("DXIL validation failed");
@@ -2380,7 +2407,8 @@ fn non_active_bitwise_mask_combining_branch_masks_lowers_and_runs() {
     for (i, &val) in out.iter().enumerate() {
         assert_eq!(val, 0x0020_5555, "lane {i}");
     }
-=======
+}
+
 /// A compute program in an `ACCC` part, as the AMD upscaler's are: `body`
 /// leaves its result in v0, stored to the raw UAV of the table at user data
 /// 4 (root parameter 1). Translated from the container's bytes.
@@ -2554,5 +2582,4 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         "{:?}",
         refused.err()
     );
->>>>>>> upstream/main
 }

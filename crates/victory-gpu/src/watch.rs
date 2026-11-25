@@ -34,36 +34,14 @@
 //! ones (file reads, DirectStorage) open their blocks first. Memory freed
 //! and allocated again while a tracker holds it is not seen.
 
-<<<<<<< HEAD
-use std::collections::BTreeMap;
-use std::sync::Mutex;
-=======
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
->>>>>>> upstream/main
 
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
 /// made the checks of the world's big buffers cost more than the copies
 /// they saved.
 pub(crate) const PAGE: usize = 64 << 10;
 
-<<<<<<< HEAD
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Kind {
-    Watched,
-    Guarded,
-}
-
-pub(crate) type PageWrites = (u64, Vec<(usize, u64)>);
-
-struct Journal {
-    /// Numbers the askings; 0 is "never".
-    asked: u64,
-    /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
-    /// Room for the kernel's answer.
-    found: Vec<usize>,
-=======
 /// The pages a tracker has not taken since they changed, and what it saves
 /// of pages it armed.
 struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>);
@@ -76,7 +54,6 @@ struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>);
 struct Saved {
     armed: BTreeSet<usize>,
     bytes: std::collections::HashMap<usize, Box<[u8]>>,
->>>>>>> upstream/main
 }
 
 impl Changed {
@@ -85,82 +62,6 @@ impl Changed {
         self.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page);
     }
 
-<<<<<<< HEAD
-/// The pages of `[start, end)` (whole pages) as last written, for pages
-/// written since tracking began: `(page number, asking)` in page order, and
-/// this asking's number, which is higher than any in the list but those the
-/// kernel just reported. `None` if the memory is not write-watched (nor,
-/// with `guarded`, view memory, which is then guarded).
-#[allow(dead_code)]
-pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    let known = (!guarded).then_some(Kind::Watched);
-    let (_, (now, pages)) = writes_kind(start, end, known)?;
-    Some((now, pages))
-}
-
-/// Like [`writes`], optionally skipping `GetWriteWatch` / `VirtualQuery` once
-/// the caller knows the buffer's [`Kind`].
-pub(crate) fn writes_kind(
-    start: usize,
-    end: usize,
-    known: Option<Kind>,
-) -> Option<(Kind, PageWrites)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    let (kind, kernel_pages, guard_pages) = if known == Some(Kind::Guarded) {
-        (Kind::Guarded, Vec::new(), guard_known(first * PAGE, last * PAGE))
-    } else {
-        let watched = {
-            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-            let j = &mut *j;
-            let mut count = (last - first) * PAGE / KERNEL_PAGE;
-            j.found.resize(count.max(j.found.len()), 0);
-            let mut granularity = 0;
-            // SAFETY: the answer buffer holds `count` entries.
-            let failed = unsafe {
-                GetWriteWatch(
-                    WRITE_WATCH_FLAG_RESET,
-                    (first * PAGE) as *const _,
-                    (last - first) * PAGE,
-                    j.found.as_mut_ptr().cast(),
-                    &mut count,
-                    &mut granularity,
-                )
-            } != 0;
-            (!failed).then(|| j.found[..count].iter().map(|&at| at / PAGE).collect::<Vec<_>>())
-        };
-        if let Some(pages) = watched {
-            (Kind::Watched, pages, Vec::new())
-        } else {
-            if known == Some(Kind::Watched) {
-                return None;
-            }
-            let guarded = guard(first * PAGE, last * PAGE)?;
-            (Kind::Guarded, Vec::new(), guarded)
-        }
-    };
-    #[cfg(feature = "diagnostics")]
-    {
-        use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
-    }
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.asked += 1;
-    let now = j.asked;
-    for page in kernel_pages.into_iter().chain(guard_pages) {
-        j.written.insert(page, now);
-    }
-    let writes = j
-        .written
-        .range(first..last)
-        .map(|(&p, &w)| (p, w))
-        .collect();
-    Some((kind, (now, writes)))
-=======
     /// Page `page` is about to change for the first time since it was
     /// taken: its bytes now, if armed for it.
     fn save(&self, page: usize) {
@@ -175,7 +76,6 @@ pub(crate) fn writes_kind(
             crate::copystat::add(crate::copystat::C::SavedPages, 1);
         }
     }
->>>>>>> upstream/main
 }
 
 /// Title memory a host copy or texture staging takes: bytes `[start, end)`.
@@ -186,89 +86,6 @@ pub(crate) struct Tracked {
 }
 
 struct Guards {
-<<<<<<< HEAD
-    /// Disjoint, non-adjacent `PAGE_READONLY` runs `[from_block, to_block)`.
-    guarded: BTreeMap<usize, usize>,
-}
-
-impl Guards {
-    fn insert_run(&mut self, mut from: usize, mut to: usize) {
-        if from >= to {
-            return;
-        }
-        if let Some((&prev_start, &prev_end)) = self.guarded.range(..=from).next_back()
-            && prev_end >= from
-        {
-            from = prev_start;
-            to = to.max(prev_end);
-            self.guarded.remove(&prev_start);
-        }
-        while let Some((&next_start, &next_end)) = self.guarded.range(from..=to).next() {
-            to = to.max(next_end);
-            self.guarded.remove(&next_start);
-        }
-        self.guarded.insert(from, to);
-    }
-
-    fn uncovered_gaps(&self, first: usize, last: usize) -> Vec<(usize, usize)> {
-        if first >= last {
-            return Vec::new();
-        }
-        let mut cursor = first;
-        if let Some((_, &prev_end)) = self.guarded.range(..=first).next_back()
-            && prev_end > cursor
-        {
-            cursor = prev_end;
-            if cursor >= last {
-                return Vec::new();
-            }
-        }
-        let mut gaps = Vec::new();
-        for (&s, &e) in self.guarded.range(first..last) {
-            if s > cursor {
-                gaps.push((cursor, s));
-            }
-            cursor = cursor.max(e);
-            if cursor >= last {
-                break;
-            }
-        }
-        if cursor < last {
-            gaps.push((cursor, last));
-        }
-        gaps
-    }
-
-    fn remove_range(&mut self, first: usize, last: usize) -> Vec<(usize, usize)> {
-        if first >= last {
-            return Vec::new();
-        }
-        let mut removed = Vec::new();
-        if let Some((&prev_start, &prev_end)) = self.guarded.range(..first).next_back()
-            && prev_end > first
-        {
-            let cut = prev_end.min(last);
-            removed.push((first, cut));
-            self.guarded.insert(prev_start, first);
-            if prev_end > last {
-                self.guarded.insert(last, prev_end);
-            }
-        }
-        while let Some((&s, &e)) = self.guarded.range(first..last).next() {
-            self.guarded.remove(&s);
-            let cut = e.min(last);
-            removed.push((s, cut));
-            if e > last {
-                self.guarded.insert(last, e);
-            }
-        }
-        removed
-    }
-}
-
-static GUARDS: Mutex<Guards> = Mutex::new(Guards {
-    guarded: BTreeMap::new(),
-=======
     /// Blocks (pages) we made read-only.
     protected: BTreeSet<usize>,
     /// The trackers holding each page.
@@ -297,7 +114,6 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
     written_before: BTreeSet::new(),
->>>>>>> upstream/main
 });
 
 #[cfg(not(feature = "diagnostics"))]
@@ -395,32 +211,6 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     if len == 0 || !runtime_memory(start, views) {
         return None;
     }
-<<<<<<< HEAD
-    Some(guard_known(start, end))
-}
-
-/// Guards uncovered blocks of `[start, end)` on memory already known to be
-/// view memory and returns their page numbers.
-fn guard_known(start: usize, end: usize) -> Vec<usize> {
-    install();
-    let mut g = guards();
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    let gaps = g.uncovered_gaps(first, last);
-    let mut written = Vec::new();
-    for (from, to) in gaps {
-        for block in from..to {
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-        }
-        protect(&mut g, from, to);
-    }
-    written
-}
-
-/// Makes blocks `[from, to)` read-only and notes them guarded;
-/// block by block if they span views, leaving out any that fail (unmapped).
-fn protect(g: &mut Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-=======
     install();
     let end = start + len;
     let pages = start / PAGE..end.div_ceil(PAGE);
@@ -617,7 +407,6 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     };
     #[cfg(feature = "diagnostics")]
     let _timed = Timed(std::time::Instant::now(), crate::copystat::C::ProtectUs);
->>>>>>> upstream/main
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title memory; only its protection changes.
@@ -640,16 +429,6 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
             i += 1;
             continue;
         }
-<<<<<<< HEAD
-    };
-    if set(from, to) {
-        g.insert_run(from, to);
-        return;
-    }
-    for block in from..to {
-        if set(block, block + 1) {
-            g.insert_run(block, block + 1);
-=======
         // A run of consecutive pages not guarded yet.
         let first = i;
         while i + 1 < pages.len() && pages[i + 1] == pages[i] + 1 && !g.protected.contains(&pages[i + 1]) {
@@ -671,44 +450,11 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
             } else if unmapped(page) {
                 taken.push(page);
             }
->>>>>>> upstream/main
         }
     }
     taken
 }
 
-<<<<<<< HEAD
-/// Gives write access back to the guarded blocks of `[start, end)` and
-/// notes them written; true if any was guarded.
-fn open(g: &mut Guards, start: usize, end: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    if start >= end {
-        return false;
-    }
-    let removed = g.remove_range(start / BLOCK, end.div_ceil(BLOCK));
-    for &(from, to) in &removed {
-        let mut old = 0;
-        // SAFETY: runs we made read-only.
-        let ok = unsafe {
-            VirtualProtect(
-                (from * BLOCK) as *const _,
-                (to - from) * BLOCK,
-                PAGE_READWRITE,
-                &mut old,
-            ) != 0
-        };
-        if !ok {
-            for block in from..to {
-                let mut old = 0;
-                // SAFETY: a block we made read-only.
-                unsafe {
-                    VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old)
-                };
-            }
-        }
-    }
-    !removed.is_empty()
-=======
 /// Pages `[first, last)` changed, and so the pages showing the same memory
 /// elsewhere: gives write access back where we guarded them and marks them
 /// in every tracker holding them. True if one of `[first, last)` was
@@ -777,7 +523,6 @@ impl Drop for Writing {
         }
         changed(&mut g, self.first, self.last, false);
     }
->>>>>>> upstream/main
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -798,21 +543,6 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
-<<<<<<< HEAD
-    if len == 0 {
-        return;
-    }
-    let end = at.saturating_add(len);
-    guards().remove_range(at / BLOCK, end.div_ceil(BLOCK));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let keys: Vec<usize> = j
-        .written
-        .range(at / PAGE..end.div_ceil(PAGE))
-        .map(|(&p, _)| p)
-        .collect();
-    for page in keys {
-        j.written.remove(&page);
-=======
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
@@ -848,7 +578,6 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     }
     if others.iter().any(|&o| g.protected.contains(&(o / PAGE))) {
         protect(&mut g, &[page]);
->>>>>>> upstream/main
     }
 }
 
@@ -877,11 +606,7 @@ fn install() {
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
-<<<<<<< HEAD
-        if open(&mut g, at, at.saturating_add(1)) {
-=======
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
->>>>>>> upstream/main
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -1128,95 +853,5 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
-    }
-
-    #[test]
-    fn guard_intervals_merge_split_and_report_uncovered_gaps() {
-        let mut g = Guards {
-            guarded: BTreeMap::new(),
-        };
-        g.insert_run(10, 20);
-        g.insert_run(30, 40);
-        assert_eq!(g.uncovered_gaps(0, 50), vec![(0, 10), (20, 30), (40, 50)]);
-        assert!(g.uncovered_gaps(12, 18).is_empty());
-
-        // Merging adjacent and bridging runs collapses intervals.
-        g.insert_run(20, 25);
-        g.insert_run(25, 30);
-        assert_eq!(g.guarded.iter().map(|(&s, &e)| (s, e)).collect::<Vec<_>>(), vec![(10, 40)]);
-        assert!(g.uncovered_gaps(10, 40).is_empty());
-
-        // Splitting an interior range leaves both halves guarded.
-        assert_eq!(g.remove_range(15, 25), vec![(15, 25)]);
-        assert_eq!(g.uncovered_gaps(10, 40), vec![(15, 25)]);
-        assert_eq!(
-            g.guarded.iter().map(|(&s, &e)| (s, e)).collect::<Vec<_>>(),
-            vec![(10, 15), (25, 40)]
-        );
-
-        // Removing across multiple runs trims both ends cleanly.
-        assert_eq!(g.remove_range(12, 30), vec![(12, 15), (25, 30)]);
-        assert_eq!(
-            g.guarded.iter().map(|(&s, &e)| (s, e)).collect::<Vec<_>>(),
-            vec![(10, 12), (30, 40)]
-        );
-    }
-
-    #[test]
-    fn guarded_view_writes_kind_skips_clean_and_catches_fault_writes() {
-        use windows_sys::Win32::System::Memory::{
-            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
-        };
-        // SAFETY: a pagefile section of three blocks, mapped read-write.
-        let view = unsafe {
-            let section = CreateFileMappingW(
-                -1isize as _,
-                std::ptr::null(),
-                PAGE_READWRITE,
-                0,
-                (3 * BLOCK) as u32,
-                std::ptr::null(),
-            );
-            assert!(!section.is_null());
-            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 3 * BLOCK).Value as usize
-        };
-        assert_ne!(view, 0);
-        let (kind, (t0, first)) = writes_kind(view, view + 3 * BLOCK, None).expect("guarded");
-        assert_eq!(kind, Kind::Guarded);
-        assert_eq!(
-            first,
-            (0..3).map(|i| (view / PAGE + i, t0)).collect::<Vec<_>>()
-        );
-
-        // Second check using Kind::Guarded finds no uncovered gaps.
-        let (kind2, (t1, second)) =
-            writes_kind(view, view + 3 * BLOCK, Some(Kind::Guarded)).expect("guarded");
-        assert_eq!(kind2, Kind::Guarded);
-        assert!(t1 > t0);
-        assert_eq!(second, first);
-
-        // Fault on the middle block via normal CPU write; VEH opens it and re-check detects it.
-        // SAFETY: committed mapped view memory; our VEH handles the write fault.
-        unsafe { ((view + BLOCK + 16) as *mut u8).write(0x77) };
-        let (_, (t2, third)) =
-            writes_kind(view, view + 3 * BLOCK, Some(Kind::Guarded)).expect("guarded");
-        assert_eq!(
-            third,
-            vec![
-                (view / PAGE, t0),
-                (view / PAGE + 1, t2),
-                (view / PAGE + 2, t0),
-            ]
-        );
-
-        // SAFETY: our view.
-        unsafe {
-            UnmapViewOfFile(
-                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: view as *mut _,
-                },
-            )
-        };
-        title_memory_remapped(view, 3 * BLOCK);
     }
 }

@@ -241,7 +241,7 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// when the host adapter rejects RTV or UAV creation on `title_format`.
 #[cfg(windows)]
 pub(crate) fn promoted_format(title_format: u32, host_format: u32) -> bool {
-    matches!((title_format, host_format), (67, 26) | (115, 87) | (86, 87))
+    matches!((title_format, host_format), (29, 27) | (67, 26) | (115, 87) | (86, 87))
 }
 
 /// Host render-target format matching [`host_texture`] promotion when
@@ -1032,18 +1032,12 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     d.alignment = 0;
     d.flags &= PC_FLAGS;
     // PC refuses depth targets that are also unordered-access (the console
-<<<<<<< HEAD
-    // allows both; Grand Theft Auto VI's shadow maps ask for it).
-    // shortcut: the host copy loses UAV use; give it a second view-only
-    // copy if draws write it as a UAV.
-    const RENDER_TARGET: u32 = 1;
-    const DEPTH: u32 = 2;
-    const UNORDERED: u32 = 4;
-=======
     // allows both; Grand Theft Auto VI's shadow maps and material depth ask
     // for it): unordered views of such a texture write its twin
     // (`crate::twin`).
->>>>>>> upstream/main
+    const RENDER_TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    const UNORDERED: u32 = 4;
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
@@ -1218,7 +1212,10 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         value[0] = pc_format(value[0]);
         value
     });
-<<<<<<< HEAD
+    let mut d = *d;
+    const RENDER_TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    const UNORDERED: u32 = 4;
     let typeless = family(d.format) == d.format && family(d.format + 1) == d.format;
     if !typeless {
         let (mut s1, _) = host.format_support(d.format);
@@ -1227,6 +1224,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         let need_uav = d.flags & UNORDERED != 0
             && s1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 == 0;
         let promoted = match d.format {
+            29 if need_uav => Some(27),
             67 if need_rtv || need_uav => Some(26),
             115 if need_rtv || need_uav => Some(87),
             86 if need_rtv => Some(87),
@@ -1237,7 +1235,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
             if let Some(v) = clear_value.as_mut() {
                 v[0] = target;
             }
-            s1 = host.format_support(target).0;
+            s1 = host.format_support(if target == 27 { 28 } else { target }).0;
         }
         if d.flags & UNORDERED != 0
             && s1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 == 0
@@ -1253,9 +1251,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
             clear_value = None;
         }
     }
-=======
     let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
->>>>>>> upstream/main
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -1267,7 +1263,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         && let Ok(device) = host.device.cast::<ID3D12Device10>()
     {
         // SAFETY: the description has the host layout (checked size).
-        let p = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+        let p = unsafe { std::ptr::from_ref(&d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
         // The plain description plus the sampler feedback region (none).
         let desc1 = D3D12_RESOURCE_DESC1 {
             Dimension: p.Dimension,
@@ -1316,7 +1312,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
             host.device.CreateCommittedResource(
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
-                std::ptr::from_ref(d).cast(),
+                std::ptr::from_ref(&d).cast(),
                 D3D12_RESOURCE_STATES(initial as i32),
                 clear_value,
                 &mut texture,
@@ -2536,7 +2532,7 @@ mod tests {
         };
         for (format, flags) in [(67, 5), (67, 4), (86, 5), (115, 1)] {
             let clear = [format, 0, 0, 0, 0];
-            let res = host_texture(&tex(format, flags), 0, clear.as_ptr().cast());
+            let res = make_texture(&tex(format, flags), 0, clear.as_ptr().cast());
             assert!(res.is_some(), "format {format} flags {flags} failed");
         }
         {
@@ -2544,9 +2540,9 @@ mod tests {
                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             };
-            let srgb_uav = host_texture(&tex(29, 5), 0, std::ptr::null()).expect("format 29 flags 5");
+            let srgb_uav = make_texture(&tex(29, 5), 0, std::ptr::null()).expect("format 29 flags 5");
             // SAFETY: a live D3D12 resource.
-            let d = unsafe { srgb_uav.GetDesc() };
+            let d = unsafe { srgb_uav.texture.GetDesc() };
             assert_eq!(d.Format.0, 27);
             let expected = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
                 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;

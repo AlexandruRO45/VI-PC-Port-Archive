@@ -17,54 +17,6 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
         .as_ref()
 }
 
-<<<<<<< HEAD
-/// First frame of the 3-frame auto-capture window triggered by
-/// `VICTORY_CAPTURE_MIN_DRAWS` (`0` = not triggered yet).
-static WORLD_START: AtomicU64 = AtomicU64::new(0);
-
-fn min_world_draws() -> u64 {
-    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MIN.get_or_init(|| {
-        std::env::var("VICTORY_CAPTURE_MIN_DRAWS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
-    })
-}
-
-fn auto_listed(n: u64, start: u64) -> bool {
-    start > 0 && (start..start + 3).contains(&n)
-}
-
-/// Arms a 3-frame auto-capture starting at `frame + 1` once a presented frame
-/// executes at least `VICTORY_CAPTURE_MIN_DRAWS` host draws.
-pub(crate) fn on_present(frame: u64, draws: u64) {
-    let min = min_world_draws();
-    if min > 0
-        && draws >= min
-        && WORLD_START
-            .compare_exchange(0, frame + 1, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
-        tracing::info!(frame = frame + 1, draws, "auto-capturing world frames");
-    }
-}
-
-/// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated) or in the
-/// `VICTORY_CAPTURE_MIN_DRAWS` auto-capture window: saved too, and their draws
-/// traced at debug level.
-pub(crate) fn listed(n: u64) -> bool {
-    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    let in_list = LIST
-        .get_or_init(|| {
-            let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
-            list.split(',')
-                .filter_map(|f| f.trim().parse().ok())
-                .collect()
-        })
-        .contains(&n);
-    in_list || auto_listed(n, WORLD_START.load(Ordering::Relaxed))
-=======
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level. `VICTORY_CAPTURE_WORLD`
 /// lists frames counted from the first one that ran 500 draws (the world's
@@ -102,7 +54,6 @@ pub(crate) fn presented(n: u64) {
         let _ = WORLD.set(n);
         tracing::info!(frame = n, draws, "the world's first frame (VICTORY_CAPTURE_WORLD counts from it)");
     }
->>>>>>> upstream/main
 }
 
 /// Whether frame `n` is saved.

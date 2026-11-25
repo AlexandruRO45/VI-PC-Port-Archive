@@ -273,16 +273,8 @@ extern "system" fn present(
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
-<<<<<<< HEAD
-        static LAST_DRAWN: AtomicU64 = AtomicU64::new(0);
-        let now_drawn = crate::draw::drawn();
-        let frame_draws = now_drawn.saturating_sub(LAST_DRAWN.swap(now_drawn, Ordering::Relaxed));
-        crate::capture::on_present(frame, frame_draws);
-        if crate::capture::listed(frame) {
-=======
         crate::capture::presented(frame);
         if crate::capture::listed(frame) || crate::capture::has_targets() {
->>>>>>> upstream/main
             crate::capture::dump_targets(frame);
         }
     }

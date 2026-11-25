@@ -53,19 +53,11 @@ pub(crate) struct Staging {
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-<<<<<<< HEAD
-/// (memory not watched), or the write-watch asking it was detiled after.
-#[derive(Default)]
-struct Last {
-    hash: Option<blake3::Hash>,
-    asked: u64,
-=======
 /// (memory not tracked), with room to read tracked memory into.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
     read: Vec<u8>,
->>>>>>> upstream/main
 }
 
 const MAX_READ_SCRATCH: usize = 4 << 20;

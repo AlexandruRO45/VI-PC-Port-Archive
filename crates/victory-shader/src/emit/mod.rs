@@ -362,21 +362,27 @@ pub struct Options {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, without write marks.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-<<<<<<< HEAD
-    translate_for_wave(container, 64)
+    translate_with(container, Options::default())
+}
+
+/// [`translate`] made as `options` say.
+pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    translate_with_wave(container, options, 64)
 }
 
 /// Translates a console shader container targeting a host with maximum
 /// supported wave lane count `max_wave` (emulating wave64 compute shaders
 /// when `max_wave < 64` where possible).
 pub fn translate_for_wave(container: &[u8], max_wave: u32) -> Result<HostShader, ShaderError> {
-=======
-    translate_with(container, Options::default())
+    translate_with_wave(container, Options::default(), max_wave)
 }
 
-/// [`translate`] made as `options` say.
-pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
->>>>>>> upstream/main
+/// [`translate_with`] targeting `max_wave` lanes.
+pub fn translate_with_wave(
+    container: &[u8],
+    options: Options,
+    max_wave: u32,
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -400,11 +406,7 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-<<<<<<< HEAD
-    emit_for_wave(&c, &native, &p, &st, &io, &res, max_wave)
-=======
-    emit_with(&c, &native, &p, &st, &io, &res, options)
->>>>>>> upstream/main
+    emit_with_wave(&c, &native, &p, &st, &io, &res, options, max_wave)
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.
@@ -416,30 +418,45 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-<<<<<<< HEAD
-    emit_for_wave(c, native, p, st, io, res, 64)
-}
-
-/// Emits a program whose earlier stages already ran, targeting `max_wave`.
-pub fn emit_for_wave(
-=======
     emit_with(c, native, p, st, io, res, Options::default())
 }
 
 /// [`emit`] made as `options` say.
 pub fn emit_with(
->>>>>>> upstream/main
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
-<<<<<<< HEAD
-    max_wave: u32,
-=======
     options: Options,
->>>>>>> upstream/main
+) -> Result<HostShader, ShaderError> {
+    emit_with_wave(c, native, p, st, io, res, options, 64)
+}
+
+/// Emits a program whose earlier stages already ran, targeting `max_wave`.
+pub fn emit_for_wave(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    max_wave: u32,
+) -> Result<HostShader, ShaderError> {
+    emit_with_wave(c, native, p, st, io, res, Options::default(), max_wave)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_with_wave(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+    max_wave: u32,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -506,10 +523,7 @@ pub fn emit_with(
         outputs: outputs.clone(),
         prims: prims.clone(),
         mesh_stride,
-<<<<<<< HEAD
         max_wave,
-    })?;
-=======
         view_marks: options.view_marks,
     };
     let l = match lower::lower(&parts(st, res)) {
@@ -523,7 +537,6 @@ pub fn emit_with(
         }
         l => l?,
     };
->>>>>>> upstream/main
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,

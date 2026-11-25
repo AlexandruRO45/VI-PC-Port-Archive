@@ -144,7 +144,6 @@ impl Hasher for Fx {
 
 const TERMINAL: u32 = u32::MAX;
 const MAX_NODES: usize = 1 << 19;
-const MAX_MEMO: usize = 1 << 18;
 /// Case splits [`Bools::meet`] makes before it gives up.
 const MAX_MEET: usize = 1 << 16;
 /// Cap the `ite` memo table so complex shaders cannot trigger multi-tens-of-MB
@@ -791,7 +790,6 @@ impl<'a> Lanes<'a> {
                 }
             }
             exec_out[b] = now;
-            if let Exit::Branch { .. } = p.blocks[b].exit
             if let Exit::Branch { taken, not_taken } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {

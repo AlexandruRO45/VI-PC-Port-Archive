@@ -150,15 +150,11 @@ impl HostHeap {
             })
             .flatten();
         // The larger dynamic range only where the host takes it on top of
-<<<<<<< HEAD
         // every title slot; else use remaining headroom up to PORTABLE_VIEWS
         // while preserving at least MIN_DYNAMIC dynamic slots.
-=======
-        // every title slot; else the smaller one, and the cap after that.
         // Translated shaders clamp their indices below `HEAP_VIEWS` or
         // `HEAP_SAMPLERS`: slots up to there exist and stay null.
         let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
->>>>>>> upstream/main
         let (heap, count, extra) = if sampler {
             match make(count.max(samplers)) {
                 Ok(heap) => (heap, count, 0),
@@ -169,8 +165,11 @@ impl HostHeap {
             }
         } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
             (heap, count, DYNAMIC)
+        } else if count + DYNAMIC <= PORTABLE_VIEWS
+            && let Ok(heap) = make((count + DYNAMIC).max(views.min(PORTABLE_VIEWS)))
+        {
+            (heap, count, DYNAMIC)
         } else {
-<<<<<<< HEAD
             let (mirrored, extra) = capped_layout(count);
             match make(mirrored + extra) {
                 Ok(heap) => {
@@ -191,17 +190,6 @@ impl HostHeap {
                         );
                     }
                     (heap, mirrored, extra)
-=======
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
->>>>>>> upstream/main
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -1083,18 +1071,14 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     if view == 0 {
         return !typeless;
     }
-<<<<<<< HEAD
-    if family(view) != family(own) {
+    let cast = castable.contains(&view);
+    if family(view) != family(own) && !cast {
         if crate::resource::promoted_format(view, own) {
             if let Some(format) = format {
                 *format = d.Format;
             }
             return true;
         }
-=======
-    let cast = castable.contains(&view);
-    if family(view) != family(own) && !cast {
->>>>>>> upstream/main
         once!(view, own, "view format of another family");
         return false;
     }
@@ -1535,7 +1519,7 @@ mod tests {
         // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
         // SAFETY: plain queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            assert!(heap.heap.GetDesc().NumDescriptors >= DYNAMIC);
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }
@@ -1590,7 +1574,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn capped_layout_preserves_dynamic_headroom() {
         assert_eq!(capped_layout(100_000), (100_000, MIN_DYNAMIC));
         assert_eq!(capped_layout(800_000), (800_000, PORTABLE_VIEWS - 800_000));
@@ -1604,7 +1587,9 @@ mod tests {
             capped_layout(1_245_184),
             (PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
         );
-=======
+    }
+
+    #[test]
     fn dynamic_search_can_find_a_run_across_the_cursor() {
         let Some(heap) = HostHeap::new(false, 4) else {
             eprintln!("no host descriptor heap; skipped");
@@ -1629,6 +1614,5 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
->>>>>>> upstream/main
     }
 }

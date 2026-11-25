@@ -113,30 +113,9 @@ impl Host {
             let adapter: IDXGIAdapter1 = if warp {
                 factory.EnumWarpAdapter().map_err(err)?
             } else {
-<<<<<<< HEAD
-                let high_perf = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0))
-                    .ok()
-                    .and_then(|f| {
-                        f.EnumAdapterByGpuPreference::<IDXGIAdapter>(
-                            0,
-                            DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-                        )
-                        .ok()
-                    });
-                match high_perf {
-                    Some(adapter) => {
-                        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
-                            .map_err(err)?
-                    }
-                    None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
-                        .map_err(err)?,
-                }
-            }
-=======
                 hardware_adapter(&factory).map_err(err)?
             };
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
->>>>>>> upstream/main
             let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
@@ -821,6 +800,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        max_wave: 64,
         view_marks: false,
     })?;
     Ok(HostShader {
