@@ -1,8 +1,9 @@
 //! Branches no lane takes one way of, left out before lowering
 //! (`emit_without_dead_branches`): the programs below, emitted with and
 //! without, give the same results on the default adapter (skipped without
-//! one), and what is left as it is stays as it was.
+//! one, and off Windows), and what is left as it is stays as it was.
 
+#[cfg(windows)]
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, Target};
 use crate::native::{ComputeIo, RootParam, RootType, StageIo};
@@ -85,7 +86,27 @@ fn both(native: &crate::NativeProgram, target: Target) -> (HostShader, HostShade
     (pruned, plain)
 }
 
+/// What each lane stored, as it is and pruned; `None` without an SM 6.6
+/// device, and off Windows (no D3D12 host there).
+fn runs(plain: &HostShader, pruned: &HostShader) -> Option<(Vec<u32>, Vec<u32>)> {
+    #[cfg(windows)]
+    {
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return None;
+        };
+        Some((run(&host, plain), run(&host, pruned)))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (plain, pruned);
+        eprintln!("no D3D12 host off Windows; skipped");
+        None
+    }
+}
+
 /// What each lane stored.
+#[cfg(windows)]
 fn run(host: &Host, cs: &HostShader) -> Vec<u32> {
     let (root, pso) = host.compute_pipeline(cs).unwrap();
     let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
@@ -103,7 +124,11 @@ fn run(host: &Host, cs: &HostShader) -> Vec<u32> {
     .remove(0)
 }
 
+/// Checks `cs` with the DXIL validator where there is one (Windows).
 fn validate(cs: &HostShader) {
+    #[cfg(not(windows))]
+    let _ = cs;
+    #[cfg(windows)]
     if let Ok(mut v) =
         super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
     {
@@ -135,13 +160,12 @@ fn a_branch_no_lane_takes_one_way_of_is_left_out() {
         plain.dxil.len()
     );
     validate(&pruned);
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
+    let Some((a, b)) = runs(&plain, &pruned) else {
         return;
     };
     let want: Vec<u32> = (1..=32).collect();
-    assert_eq!(run(&host, &plain), want);
-    assert_eq!(run(&host, &pruned), want);
+    assert_eq!(a, want);
+    assert_eq!(b, want);
 }
 
 /// A loop no lane leaves, whose latch is a branch every lane takes back:
@@ -173,11 +197,9 @@ fn a_loop_stopped_at_the_iteration_limit_leaves_through_its_exit() {
     let (pruned, plain) = both(&native, ALL_WAVES);
     assert!(pruned.dxil != plain.dxil, "not pruned");
     validate(&pruned);
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
+    let Some((a, b)) = runs(&plain, &pruned) else {
         return;
     };
-    let (a, b) = (run(&host, &plain), run(&host, &pruned));
     assert_eq!(a, b);
     // Every lane counted the same number of iterations from its id + 1.
     let n = a[0] - 1;

@@ -98,7 +98,7 @@ mod rectangle;
 mod opcode_audit;
 #[cfg(all(test, windows))]
 mod opcode_tests;
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod prune_tests;
 mod sampler;
 #[cfg(all(test, windows))]
