@@ -1349,7 +1349,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         let need_uav = d.flags & UNORDERED != 0
             && support & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 == 0;
         let promoted = match d.format {
-            67 if need_rtv || need_uav => 26,
+            67 if need_rtv || (need_uav && d.flags & !UNORDERED != 0) => 26,
             115 if need_rtv || need_uav => 87,
             86 if need_rtv => 87,
             _ => 0,
