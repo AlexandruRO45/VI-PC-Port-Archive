@@ -1747,3 +1747,45 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+/// `v_mad_i64_i32`'s addend is a signed 64-bit operand although the name ends
+/// in `_i32`: a 32-bit literal there is sign-extended. The unsigned form
+/// keeps zero-extending.
+#[test]
+fn mad_64_bit_addend_sign_extends_its_literal() {
+    const MINUS_100: u32 = -100_i32 as u32;
+    let program = |opcode: u16| {
+        // v_mad_{i64_i32,u64_u32} v[8:9], vcc, v1, v2, -100 (literal src2),
+        // then v_mov_b32 v0, v9 to store the high dword.
+        let [a, b] = vop3(opcode, 8, vgpr(1), vgpr(2), 255);
+        [a, b, MINUS_100, vop1(0x001, 0, vgpr(9))]
+    };
+    let signed = build_valu_cs(&program(0x577));
+    run_cases(&signed, &[[0, 0, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, u32::MAX, "{backend}: -100 sign-extends");
+    });
+    run_cases(&signed, &[[10, 10, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, 0, "{backend}: 10 * 10 - 100 leaves no carry");
+    });
+    let unsigned = build_valu_cs(&program(0x576));
+    run_cases(&unsigned, &[[0, 0, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, 0, "{backend}: the unsigned addend zero-extends");
+    });
+}
+
+/// The same without a GPU, in the emitted DXIL.
+#[cfg(windows)]
+#[test]
+fn mad_64_bit_addend_lowers_to_the_signed_literal() {
+    const MINUS_100: u32 = -100_i32 as u32;
+    let [a, b] = vop3(0x577, 8, vgpr(1), vgpr(2), 255);
+    let body = [a, b, MINUS_100, vop1(0x001, 0, vgpr(9))];
+    let Some(text) = super::tests::dump_dxil(&build_valu_cs(&body).dxil) else {
+        eprintln!("no dxc.exe; DXIL check skipped");
+        return;
+    };
+    assert!(
+        text.contains(", -100"),
+        "the addend is the sign-extended literal"
+    );
+}
