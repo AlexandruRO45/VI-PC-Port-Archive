@@ -630,7 +630,7 @@ fn check(
                     t.lines.push(format!("{}  pipeline created", label()));
                 }
             }
-            Err(e) => t.fail(format!("pipeline: {e}"), &label),
+            Err(e) => t.fail(pipeline_failure(&e), &label),
         }
     }
     let Some(v) = checks.validator.as_mut() else {
@@ -672,6 +672,16 @@ fn check(
             }
             t.fail(format!("validator: {first}"), label);
         }
+    }
+}
+
+/// Names a root-signature failure under its own heading so `0x80070057` from
+/// root-signature serialization or creation is not lumped with PSO rejections.
+fn pipeline_failure(error: &str) -> String {
+    if error.starts_with("root signature:") {
+        error.to_owned()
+    } else {
+        format!("pipeline: {error}")
     }
 }
 
@@ -870,5 +880,61 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn pipeline_failure_keeps_root_signature_errors_distinct() {
+        let mut t = super::Tally {
+            list: true,
+            ..Default::default()
+        };
+        t.fail(
+            super::pipeline_failure("root signature: exceeds maximum size of 64 DWORDs"),
+            || "a.dxbc Cs".into(),
+        );
+        t.fail(
+            super::pipeline_failure("The parameter is incorrect. (0x80070057)"),
+            || "b.dxbc Cs".into(),
+        );
+        assert!(
+            t.failed
+                .contains_key("root signature: exceeds maximum size of 64 DWORDs")
+        );
+        assert!(
+            t.failed
+                .contains_key("pipeline: The parameter is incorrect. (0x80070057)")
+        );
+        assert_eq!(
+            t.lines,
+            vec![
+                "a.dxbc Cs  root signature: exceeds maximum size of 64 DWORDs",
+                "b.dxbc Cs  pipeline: The parameter is incorrect. (0x80070057)",
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn offline_pipeline_checks_bucket_over_budget_root_signature_errors() {
+        use super::*;
+        use victory_shader::emit::UserData;
+
+        let host = Host::new(true).expect("WARP host");
+
+        // Over-budget root constants (> 64 DWORDs) fail under `root signature:`
+        // instead of the `pipeline:` bucket.
+        let mut oversized = host::stub_ps();
+        oversized.stage = HwStage::Cs;
+        oversized.user_data.push(UserData {
+            index: 64,
+            slot: 0,
+            root: RootType::Constants,
+            dword: 0,
+        });
+        let err = host
+            .compute_pipeline(&oversized)
+            .expect_err("68-dword root constants exceed the 64-dword budget");
+        let bucket = pipeline_failure(&err);
+        assert!(bucket.starts_with("root signature:"), "{bucket}");
     }
 }

@@ -125,6 +125,32 @@ fn on_software_adapter(device: &ID3D12Device) -> bool {
     }
 }
 
+fn blob_err(error: Option<ID3DBlob>, fallback: windows::core::Error) -> String {
+    if let Some(b) = error {
+        // SAFETY: D3D12 hands back a buffer of `GetBufferSize` bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
+        };
+        let text = String::from_utf8_lossy(bytes);
+        if let Some(line) = text
+            .lines()
+            .map(|l| l.trim().trim_end_matches('\0').trim())
+            .find(|l| !l.is_empty())
+        {
+            return line.to_owned();
+        }
+    }
+    err(fallback)
+}
+
+fn root_signature_serialize_error(dwords: u32, reason: &str) -> String {
+    if dwords > 64 {
+        format!("root signature: {dwords} dwords exceeds the 64-dword limit ({reason})")
+    } else {
+        format!("root signature: {reason}")
+    }
+}
+
 /// The first adapter that is a GPU: not flagged software, and with video
 /// memory of its own. A machine without one (GitHub's Windows runner has only
 /// `Microsoft Basic Render Driver`) has nothing to run the hardware-only
@@ -260,6 +286,11 @@ impl Host {
             views.push((super::VIEW_MARKS, super::MEMORY_SPACE, 1));
             views.push((super::VIEW_WRITES, super::MEMORY_SPACE, 2));
         }
+        let dwords: u32 = stages
+            .iter()
+            .map(|(s, _)| s.user_data_dwords().max(1))
+            .sum::<u32>()
+            + 2 * views.len() as u32;
         for (register, space, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
@@ -329,14 +360,15 @@ impl Host {
             let mut blob = None;
             let mut error = None;
             D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error))
-                .map_err(err)?;
-            blob.ok_or("no root signature blob")?
+                .map_err(|e| root_signature_serialize_error(dwords, &blob_err(error, e)))?;
+            blob.ok_or("root signature: no blob")?
         };
         // SAFETY: `blob` stays alive for the lifetime of `bytes`.
         let bytes = unsafe {
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
         };
         self.root_signature_bytes(bytes)
+            .map_err(|e| format!("root signature: {e}"))
     }
 
     /// Creates a root signature from serialized root signature bytes (or a
@@ -2027,6 +2059,8 @@ mod tests {
     use std::sync::Barrier;
 
     use super::*;
+    use crate::emit::UserData;
+    use crate::native::RootType;
 
     /// Regression test for concurrent WARP device creation, pipeline
     /// compilation, and draws across threads (issue #181).
@@ -2070,5 +2104,31 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn root_signature_for_reports_over_budget_error() {
+        assert_eq!(
+            root_signature_serialize_error(65, "exceeds 64 DWORDs"),
+            "root signature: 65 dwords exceeds the 64-dword limit (exceeds 64 DWORDs)"
+        );
+        assert_eq!(
+            root_signature_serialize_error(16, "bad flag"),
+            "root signature: bad flag"
+        );
+
+        let host = Host::new(true).expect("WARP host");
+        let mut oversized = stub_ps();
+        oversized.user_data.push(UserData {
+            index: 62,
+            slot: 0,
+            root: RootType::Constants,
+            dword: 0,
+        });
+        oversized.root_cbvs.push(0); // 64 + 2 = 66 dwords
+        let err = host
+            .root_signature_for(&[(&oversized, D3D12_SHADER_VISIBILITY_ALL)])
+            .expect_err("66-dword root signature exceeds the 64-dword budget");
+        assert!(err.starts_with("root signature:"), "{err}");
     }
 }
