@@ -10874,6 +10874,7 @@ mod tests {
             outputs: vec![target],
             prims: vec![],
             mesh_stride: 0,
+            view_marks: false,
         })
         .unwrap();
         validate(&l.dxil);
