@@ -5,8 +5,8 @@
 //! host resets the display driver. So active records are copied and clamped
 //! on the GPU into a device-local scratch buffer, just before execution, by a
 //! compute shader of ours (HLSL compiled by the system's compiler; a 5.1
-//! shader with its root signature inside), leaving the title's argument and
-//! count buffers untouched.
+//! shader with its root signature built in code), leaving the title's
+//! argument and count buffers untouched.
 //!
 //! When a count buffer is given, threads at or past `min(max, count)` return
 //! immediately without charging the list's budget or reading uninitialized
@@ -27,8 +27,11 @@ use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
+// Written for both compilers `D3DCompile` may be: Microsoft's and, under
+// Wine, vkd3d-shader's, which has no `ByteAddressBuffer` methods and does
+// not embed a `[RootSignature]` in the blob. The buffers are therefore
+// structured buffers of words, and the root signature is built in code.
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -41,34 +44,35 @@ cbuffer Record : register(b0) {
     uint has_count;
     uint count_offset;
 };
-ByteAddressBuffer src_args : register(t0);
-ByteAddressBuffer count_buf : register(t1);
-RWByteAddressBuffer dst_args : register(u0);
+StructuredBuffer<uint> src_args : register(t0);
+StructuredBuffer<uint> count_buf : register(t1);
+RWStructuredBuffer<uint> dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
-RWByteAddressBuffer budget : register(u1);
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 static const uint SPLIT = 2;
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     bool split = (has_count & 4u) != 0;
     if ((has_count & 1u) != 0) {
-        eff_count = min(eff_count, count_buf.Load(count_offset));
+        eff_count = min(eff_count, count_buf[count_offset >> 2]);
     }
     if (id.x >= eff_count) return;
     uint src_at = args_offset + id.x * stride;
     uint dst_at = id.x * stride;
+    uint src_word = src_at >> 2;
+    uint dst_word = dst_at >> 2;
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint2 asked = src_args.Load2(src_at);
+        uint2 asked = uint2(src_args[src_word], src_args[src_word + 1]);
         if (ahead && (asked.x > (1u << 24) || asked.y > (1u << 24))) {
             asked = uint2(0, 0);
         }
@@ -77,7 +81,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = count * instances;
         draw_counts = uint2(count, instances);
     } else if (kind == 2) {
-        uint3 asked = src_args.Load3(src_at);
+        uint3 asked = uint3(src_args[src_word], src_args[src_word + 1], src_args[src_word + 2]);
         uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
         // In parts: one dimension, and not the garbage of an argument
         // nothing wrote.
@@ -92,7 +96,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         groups = g;
     } else {
         // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = src_args.Load3(src_at);
+        uint3 g = uint3(src_args[src_word], src_args[src_word + 1], src_args[src_word + 2]);
         // Ahead of its draw, a record over the most a dispatch runs is a
         // slot the title has not filled (the title leaves all
         // ones there): empty, and not counted below either.
@@ -102,8 +106,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Diagnostics, in the budget buffer's next words: the largest
         // group count a mesh record asked for, and the groups asked in all.
         uint was;
-        budget.InterlockedMax(4, g.x, was);
-        budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+        InterlockedMax(budget[1], g.x, was);
+        InterlockedAdd(budget[2], min(g.x, 1u << 24), was);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         groups = g;
@@ -111,12 +115,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     bool over = false;
     if (cost > 0) {
         uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
+        InterlockedOr(budget[0], 0, before);
         while (before < BUDGET) {
             uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
             uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
+            InterlockedCompareExchange(budget[0], before, next, prev);
             if (prev == before) break;
             before = prev;
         }
@@ -126,9 +129,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (over) {
             draw_counts = uint2(0, 0);
         }
-        dst_args.Store2(dst_at, draw_counts);
+        dst_args[dst_word] = draw_counts.x;
+        dst_args[dst_word + 1] = draw_counts.y;
         for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args[(dst_at + off) >> 2] = src_args[(src_at + off) >> 2];
         }
     } else {
         if (over) {
@@ -138,13 +142,17 @@ void main(uint3 id : SV_DispatchThreadID) {
             for (uint part = 0; part < SPLIT; part++) {
                 uint before = part * 65535u;
                 uint x = groups.x > before ? min(groups.x - before, 65535u) : 0u;
-                dst_args.Store3(dst_at + part * 12u, uint3(x, groups.yz));
+                dst_args[dst_word + part * 3u] = x;
+                dst_args[dst_word + part * 3u + 1u] = groups.y;
+                dst_args[dst_word + part * 3u + 2u] = groups.z;
             }
             return;
         }
-        dst_args.Store3(dst_at, groups);
+        dst_args[dst_word] = groups.x;
+        dst_args[dst_word + 1] = groups.y;
+        dst_args[dst_word + 2] = groups.z;
         for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args[(dst_at + off) >> 2] = src_args[(src_at + off) >> 2];
         }
     }
 }
@@ -206,16 +214,17 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
                     errors.GetBufferSize(),
                 )
             };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
+            let text = String::from_utf8_lossy(text);
+            tracing::warn!("argument clamp: {}", text);
         }
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    let root = root_signature(device)?;
+    // SAFETY: the blob's own bytes.
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -225,6 +234,72 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
             ..Default::default()
         })?;
         Ok(Clamp { root, pso })
+    }
+}
+
+/// Constants b0 (six words), source and count SRVs t0/t1, then the
+/// destination and budget UAVs u0/u1.
+fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    let srvs = |register| D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR {
+                ShaderRegister: register,
+                RegisterSpace: 0,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    let uavs = |register| D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR {
+                ShaderRegister: register,
+                RegisterSpace: 0,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    let params = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 6,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        srvs(0),
+        srvs(1),
+        uavs(0),
+        uavs(1),
+    ];
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        NumStaticSamplers: 0,
+        pStaticSamplers: std::ptr::null(),
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    };
+    // SAFETY: the description points at a live array; the blob is read in
+    // full before it is released.
+    unsafe {
+        let mut blob: Option<ID3DBlob> = None;
+        D3D12SerializeRootSignature(
+            &desc,
+            D3D_ROOT_SIGNATURE_VERSION_1,
+            &mut blob,
+            None,
+        )?;
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes = std::slice::from_raw_parts(
+            blob.GetBufferPointer().cast::<u8>(),
+            blob.GetBufferSize(),
+        );
+        device.CreateRootSignature(0, bytes)
     }
 }
 
