@@ -56,7 +56,23 @@ time on the test machines. Set them in PowerShell before running the script.
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, report the commands in flight |
 | `VICTORY_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built |
 
-Diagnostics build: `cargo build --profile diag -p victory --features diagnostics`
+`scripts\play.ps1` clears `VICTORY_CAPTURE`, `VICTORY_CAPTURE_FRAMES`,
+`VICTORY_KEYS` and `VICTORY_DUMP_TARGETS` before launching, even with `-Exe`.
+For captures or scripted input, run the diagnostics build directly from
+the repository root in PowerShell. Replace the game path with your own.
+
+```powershell
+cargo build --profile diag -p victory --features diagnostics
+$env:VICTORY_CAPTURE = Join-Path $env:TEMP 'ztrx-captures'
+$env:VICTORY_CAPTURE_FRAMES = '60,120'
+# Optional scripted input
+# $env:VICTORY_KEYS = '30:Enter,35:X'
+& .\target\diag\victory.exe run 'C:\Games\My Game\game.exe' --execute
+```
+
+To reuse your launcher's cache and saves, set `$env:VICTORY_CACHE_DIR` and
+`$env:VICTORY_DATA_DIR` in the same session to the paths you use for
+`-Cache` and `-Data` before starting the executable.
 
 ## License
 
