@@ -47,6 +47,11 @@ keyboard acts as one while the game window has focus.
 `VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1` cut frame
 time on the test machines. Set them in PowerShell before running the script.
 
+`VICTORY_NARROW_WAITS=1` makes the per-call indirect argument clamp wait with
+enhanced barriers (compute and copy writes only) instead of draining the whole
+GPU; on an RTX 3090 it took the card's wait from 286 to 79 ms a frame in the
+prison yard (with `VICTORY_RELAY=2 VICTORY_WIDE_MERGE=1 VICTORY_WIDE_BACK=1`).
+
 ## Debugging switches
 
 | Switch | Effect |
