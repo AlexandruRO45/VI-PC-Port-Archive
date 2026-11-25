@@ -2,6 +2,9 @@
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
 //! size. Only in builds with diagnostics.
+//! `VICTORY_CAPTURE_AT=3,10,25.5`: seconds since the first presented frame,
+//! saved as `frame-at-<seconds>.png` (one decimal), in the current directory
+//! unless `VICTORY_CAPTURE` specifies a folder. No image buffers are reserved.
 
 use std::path::PathBuf;
 
@@ -9,6 +12,53 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 static DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct TimedCapture {
+    times: Vec<std::time::Duration>,
+    start: Option<std::time::Instant>,
+    frame: Option<u64>,
+    due: std::ops::Range<usize>,
+}
+
+impl TimedCapture {
+    fn wanted(&mut self, frame: u64, now: std::time::Instant) -> bool {
+        // The presenter asks twice: keep the same decision for both calls.
+        if self.frame != Some(frame) {
+            let elapsed = now.saturating_duration_since(*self.start.get_or_insert(now));
+            self.due = self.due.end..self.times.partition_point(|&t| t <= elapsed);
+            self.frame = Some(frame);
+        }
+        !self.due.is_empty()
+    }
+}
+
+fn parse_times(value: &str) -> Option<Vec<std::time::Duration>> {
+    let mut times = Vec::new();
+    for part in value.split(',') {
+        let seconds: f64 = part.trim().parse().ok()?;
+        times.push(std::time::Duration::try_from_secs_f64(seconds).ok()?);
+    }
+    times.sort_unstable();
+    times.dedup();
+    Some(times)
+}
+
+fn timed() -> Option<&'static std::sync::Mutex<TimedCapture>> {
+    static AT: std::sync::OnceLock<Option<std::sync::Mutex<TimedCapture>>> = std::sync::OnceLock::new();
+    AT.get_or_init(|| {
+        let value = std::env::var_os("VICTORY_CAPTURE_AT")?;
+        let Some(times) = value.to_str().and_then(parse_times) else {
+            tracing::warn!("ignoring VICTORY_CAPTURE_AT: expected comma-separated finite, nonnegative seconds in Duration range");
+            return None;
+        };
+        Some(std::sync::Mutex::new(TimedCapture { times, start: None, frame: None, due: 0..0 }))
+    }).as_ref()
+}
+
+fn explicit_folder() -> Option<&'static PathBuf> {
+    static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    FOLDER.get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from)).as_ref()
+}
 
 // Called only after capture is enabled. Bound each allocation to 512 MiB.
 fn within_limit(width: u64, height: u64, estimated_bytes: Option<u64>, valid: bool) -> bool {
@@ -27,7 +77,7 @@ fn within_limit(width: u64, height: u64, estimated_bytes: Option<u64>, valid: bo
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     let folder = FOLDER
-        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
+        .get_or_init(|| explicit_folder().cloned().or_else(|| timed().map(|_| PathBuf::from("."))))
         .as_ref()?;
     // The unset path returns above, without even loading the new state.
     if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return None; }
@@ -178,6 +228,14 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
+    if folder().is_none() { return false; }
+    let at = timed().is_some_and(|at| {
+        at.lock().unwrap_or_else(|e| e.into_inner()).wanted(n, std::time::Instant::now())
+    });
+    at || numbered(n)
+}
+
+fn numbered(n: u64) -> bool {
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
     let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
@@ -186,12 +244,22 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    (explicit_folder().is_some() && n.is_power_of_two()) || listed(n) || before_world || in_world
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
 pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    if numbered(n) {
+        save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    }
+    if let Some(at) = timed() {
+        let at = at.lock().unwrap_or_else(|e| e.into_inner());
+        if at.frame == Some(n) {
+            for time in &at.times[at.due.clone()] {
+                save_as(&format!("frame-at-{:.1}", time.as_secs_f64()), width, height, pitch, bgra, rows);
+            }
+        }
+    }
 }
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
@@ -886,6 +954,35 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capture_times_reject_the_entire_invalid_list() {
+        for value in ["", "5,", "5,no", "-1", "NaN", "inf", "1e300"] {
+            assert!(super::parse_times(value).is_none(), "{value}");
+        }
+        let times = super::parse_times(" 12, 5, 5, 25.5, 0 ").unwrap();
+        assert_eq!(times.iter().map(|t| t.as_secs_f64()).collect::<Vec<_>>(), [0.0, 5.0, 12.0, 25.5]);
+    }
+
+    #[test]
+    fn capture_times_use_elapsed_time_and_keep_each_frames_decision() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut at = super::TimedCapture {
+            times: super::parse_times("5,12,25.5").unwrap(),
+            start: None, frame: None, due: 0..0,
+        };
+        assert!(!at.wanted(1, start));
+        assert!(!at.wanted(1000, start + Duration::from_secs(4)));
+        assert!(!at.wanted(1000, start + Duration::from_secs(5)));
+        assert!(at.wanted(1001, start + Duration::from_secs(5)));
+        assert_eq!(at.due, 0..1);
+        assert!(at.wanted(1001, start + Duration::from_secs(6)));
+        assert!(!at.wanted(1002, start + Duration::from_secs(6)));
+        assert!(at.wanted(1003, start + Duration::from_secs(26)));
+        assert_eq!(at.due, 1..3);
+        assert!(!at.wanted(1004, start + Duration::from_secs(27)));
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
