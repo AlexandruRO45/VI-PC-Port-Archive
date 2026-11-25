@@ -31,6 +31,10 @@ To start the same RT configuration from PowerShell:
 
 Chapter 1 City produced in-range ray and triangle intersections on an RX 7900 XTX. The game builds and traverses its acceleration structures through translated Direct3D 12 compute shaders. Frame times can still reach several seconds. Interior lighting, shadows and performance vary by scene. [Ray-tracing implementation](docs/fork-ray-tracing.md) · [City testing](BENCHMARK.md)
 
+## Community gameplay results
+
+- Ryzen 7 5700X3D + Radeon RX 7800 XT 16 GB (driver 32.0.32029.2010), Windows 11, Series X profile, default renderer (no ray tracing): about 10 FPS in the world (2026-11-26, one machine).
+
 ## Changes in this snapshot
 
 - Pixel shaders that read neighboring pixels in a 2×2 group now preserve the values at triangle edges. On an RX 7900 XTX, this reduced incorrect edge pixels from 32 to zero in each of two adjoining-triangle tests. Cube-map sampling also selects the correct mip level for explicit gradients and honors the shader's minimum mip level.
