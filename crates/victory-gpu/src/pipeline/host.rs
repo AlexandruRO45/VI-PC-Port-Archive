@@ -19,6 +19,9 @@ use windows::core::PCSTR;
 use super::{Shader, Translated};
 use crate::host::host;
 
+#[path = "mesh_signature.rs"]
+mod mesh_signature;
+
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
@@ -896,37 +899,13 @@ fn mesh_fallback(
             };
             #[cfg(feature = "diagnostics")]
             super::make::log_built(&super::make::key(shaders, Some(g)));
-            let args = [
-                D3D12_INDIRECT_ARGUMENT_DESC {
-                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
-                    Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
-                        Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
-                            RootParameterIndex: base,
-                            DestOffsetIn32BitValues: 0,
-                            Num32BitValuesToSet: 1,
-                        },
-                    },
+            // Bind the very root object used to create the command signature.
+            // Its serialized description is identical to that of the CS PSO.
+            let (cs_root, dispatch) = mesh_signature::get(
+                device, &cs_root, &cs_blob, &params, base, || {
+                    tracing::info!(?ms, ?ps, %key, base, "about to create mesh indirect command signature");
                 },
-                D3D12_INDIRECT_ARGUMENT_DESC {
-                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
-                    ..Default::default()
-                },
-            ];
-            let mut dispatch = None;
-            // SAFETY: the signature's constant belongs to this live compute root.
-            unsafe {
-                device.CreateCommandSignature(
-                    &D3D12_COMMAND_SIGNATURE_DESC {
-                        ByteStride: 16,
-                        NumArgumentDescs: args.len() as u32,
-                        pArgumentDescs: args.as_ptr(),
-                        NodeMask: 0,
-                    },
-                    &cs_root,
-                    &mut dispatch,
-                )?
-            };
-            let dispatch = dispatch.ok_or_else(windows::core::Error::empty)?;
+            )?;
             let compute = Box::new(HostPipeline {
                 compute: true,
                 mesh: false,
