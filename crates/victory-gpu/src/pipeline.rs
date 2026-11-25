@@ -140,7 +140,11 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = if wave_wide_only().contains(&self.hash) {
+                    victory_shader::emit::with_wave_wide(|| translate(&self.container))
+                } else {
+                    translate(&self.container)
+                };
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -441,6 +445,28 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// `VICTORY_WAVE_WIDE_ONLY=<hash>,...`: the shaders (16-digit hashes, as
+/// the log names them) whose translation may run a console wave as two
+/// host waves in step at group barriers, the wave-wide form that
+/// `VICTORY_WAVE_WIDE=1` allows for all and that is off by default (runs
+/// 121-124 lost the card with it on for every program). For the WaveSize 64
+/// programs a 32-lane card refuses, where that form is exact.
+fn wave_wide_only() -> &'static [String] {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let value = std::env::var("VICTORY_WAVE_WIDE_ONLY").unwrap_or_default();
+        let list: Vec<String> = value
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect();
+        if !list.is_empty() {
+            tracing::info!(shaders = list.len(), "VICTORY_WAVE_WIDE_ONLY: the wave-wide form for the shaders named");
+        }
+        list
+    })
 }
 
 /// Host pipelines queued and not made yet.
