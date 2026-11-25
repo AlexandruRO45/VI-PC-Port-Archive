@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
-use super::bitcode::{Attr, Bin, Cast, Rmw, Term, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Module, Rmw, Term, Ty, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
@@ -6648,142 +6648,10 @@ impl<'a> Lower<'a> {
         Ok(out)
     }
 
-    /// The bits of the float nearest to `a / d`, `d = 2^w - 1`, for codes
-    /// `0 <= a < d` and `w <= 16`: what the console's buffer unit gives for
-    /// a normalized code. The host's division is not exact (the RX 6700 XT
-    /// returns 8-bit codes one ulp high and some 16-bit codes one ulp low),
-    /// and titles truncate `x * d` back to the code (a material index in a
-    /// vertex colour's alpha), which a quotient one ulp low turns into the
-    /// code below.
-    ///
-    /// `Q = floor(a * 2^32 / d) = a * K + floor(a * r / d)` with `K =
-    /// floor(2^32 / d)` and `r = 2^32 mod d` (no division when `r` is 1:
-    /// widths dividing 32). `a / d` is never exact for `0 < a < d` (`d`
-    /// odd, `r` coprime to it), so `Q` rounds to 24 bits up exactly when
-    /// its highest dropped bit is set, and the result is that integer (at
-    /// most 2^24, so its conversion is exact on any host) scaled by a power
-    /// of two; `Q` itself when it fits, the quotient's further bits then
-    /// lying below half an ulp. That holds for every code of every width but
-    /// 11 and 12 (checked for all codes of widths 2 to 16), which take
-    /// [`Self::exact_norm`]. The host's conversion of a larger integer is
-    /// not relied on: WARP rounds those above 2^31 otherwise.
+    /// [`norm_quotient`] in this block.
     fn norm_quotient(&mut self, a: V, w: u32) -> V {
-        if matches!(w, 11 | 12) {
-            return self.exact_norm(a, w);
-        }
-        let c = self.cur;
-        let d = (1u64 << w) - 1;
-        let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
-        let k = |l: &mut Self, v: u64| l.s.m.i32(v as u32);
-        let (one, kv) = (k(self, 1), k(self, kk));
-        let mut q = self.s.m.bin(c, Bin::Mul, a, kv);
-        if r != 1 {
-            let (rv, dv) = (k(self, r), k(self, d));
-            let t = self.s.m.bin(c, Bin::Mul, a, rv);
-            let more = self.s.m.bin(c, Bin::UDiv, t, dv);
-            q = self.s.m.bin(c, Bin::Add, q, more);
-        }
-        // The bits to drop (1 to 8) from the exponent of `q >> 8`, which
-        // converts exactly (fewer than 25 bits); none when `q` fits.
-        let k8 = k(self, 8);
-        let top = self.s.m.bin(c, Bin::LShr, q, k8);
-        let top = self.s.m.cast(c, Cast::UiToFp, top, self.s.t.f32);
-        let top = self.as_int(top);
-        let k23 = k(self, 23);
-        let e = self.s.m.bin(c, Bin::LShr, top, k23);
-        let bias = k(self, 127 + 15);
-        let shift = self.s.m.bin(c, Bin::Sub, e, bias);
-        let (zero, b24) = (k(self, 0), k(self, 1 << 24));
-        let fits = self.s.m.cmp(c, pred::IULT, q, b24);
-        let shift = self.s.m.select(c, fits, zero, shift);
-        // Rounded up when the highest dropped bit is set: `a / d` is never
-        // exact, so a dropped half is more than half, never a tie.
-        let up = self.s.m.bin(c, Bin::Shl, q, one);
-        let up = self.s.m.bin(c, Bin::LShr, up, shift);
-        let up = self.s.m.bin(c, Bin::And, up, one);
-        let m = self.s.m.bin(c, Bin::LShr, q, shift);
-        let m = self.s.m.bin(c, Bin::Add, m, up);
-        // At most 2^24: exact as a float, and so its scale by 2^(shift - 32).
-        let f = self.s.m.cast(c, Cast::UiToFp, m, self.s.t.f32);
-        let b95 = k(self, 127 - 32);
-        let scale = self.s.m.bin(c, Bin::Add, shift, b95);
-        let scale = self.s.m.bin(c, Bin::Shl, scale, k23);
-        let scale = self.as_float(scale);
-        let f = self.s.m.bin(c, Bin::Mul, f, scale);
-        self.as_int(f)
-    }
-
-    /// [`Self::norm_quotient`] in integers only, for any width up to 16: `Q`
-    /// as there, 8 more bits when that leaves fewer than 25 (codes of wide
-    /// formats near 0), then rounded to 24 bits to nearest even with the
-    /// remainder as sticky bit, and assembled as float bits.
-    fn exact_norm(&mut self, a: V, w: u32) -> V {
-        let c = self.cur;
-        let d = (1u64 << w) - 1;
-        let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
-        let k = |l: &mut Self, v: u64| l.s.m.i32(v as u32);
-        let (one, zero, dv, k8) = (k(self, 1), k(self, 0), k(self, d), k(self, 8));
-        let kv = k(self, kk);
-        let mut q = self.s.m.bin(c, Bin::Mul, a, kv);
-        let mut rem = a;
-        if r != 1 {
-            let rv = k(self, r);
-            let t = self.s.m.bin(c, Bin::Mul, a, rv);
-            let more = self.s.m.bin(c, Bin::UDiv, t, dv);
-            q = self.s.m.bin(c, Bin::Add, q, more);
-            rem = self.s.m.bin(c, Bin::URem, t, dv);
-        }
-        // The exponent's bias less the 32 (or 40) fraction bits of `q`; the
-        // shift below is added.
-        let mut bias = k(self, 127 + 23 - 32);
-        if kk < 1 << 24 {
-            // Fewer than 25 bits for the smallest codes: 8 more.
-            let t = self.s.m.bin(c, Bin::Shl, rem, k8);
-            let more = self.s.m.bin(c, Bin::UDiv, t, dv);
-            let rest = self.s.m.bin(c, Bin::URem, t, dv);
-            let wide = self.s.m.bin(c, Bin::Shl, q, k8);
-            let wide = self.s.m.bin(c, Bin::Or, wide, more);
-            let limit = k(self, 1 << 24);
-            let small = self.s.m.cmp(c, pred::IULT, q, limit);
-            q = self.s.m.select(c, small, wide, q);
-            rem = self.s.m.select(c, small, rest, rem);
-            let b40 = k(self, 127 + 23 - 40);
-            bias = self.s.m.select(c, small, b40, bias);
-        }
-        // Bits to drop: the bit length less 24, 1 to 8.
-        let mut shift = one;
-        for bit in 25..32 {
-            let at = k(self, 1 << bit);
-            let ge = self.s.m.cmp(c, pred::IUGE, q, at);
-            let add = self.s.m.select(c, ge, one, zero);
-            shift = self.s.m.bin(c, Bin::Add, shift, add);
-        }
-        let mant = self.s.m.bin(c, Bin::LShr, q, shift);
-        let below = self.s.m.bin(c, Bin::Sub, shift, one);
-        let half = self.s.m.bin(c, Bin::LShr, q, below);
-        let half = self.s.m.bin(c, Bin::And, half, one);
-        let low = self.s.m.bin(c, Bin::Shl, one, below);
-        let low = self.s.m.bin(c, Bin::Sub, low, one);
-        let low = self.s.m.bin(c, Bin::And, q, low);
-        let rest = self.s.m.bin(c, Bin::Or, low, rem);
-        let sticky = self.s.m.cmp(c, pred::NE, rest, zero);
-        let odd = self.s.m.bin(c, Bin::And, mant, one);
-        let tie = self.s.m.select(c, sticky, one, odd);
-        let up = self.s.m.bin(c, Bin::And, half, tie);
-        let mant = self.s.m.bin(c, Bin::Add, mant, up);
-        // Rounding up to 2^24 moves to the next exponent.
-        let k24 = k(self, 24);
-        let carry = self.s.m.bin(c, Bin::LShr, mant, k24);
-        let mant = self.s.m.bin(c, Bin::LShr, mant, carry);
-        let e = self.s.m.bin(c, Bin::Add, bias, shift);
-        let e = self.s.m.bin(c, Bin::Add, e, carry);
-        let k23 = k(self, 23);
-        let e = self.s.m.bin(c, Bin::Shl, e, k23);
-        let fraction = k(self, 0x7F_FFFF);
-        let m = self.s.m.bin(c, Bin::And, mant, fraction);
-        let bits = self.s.m.bin(c, Bin::Or, e, m);
-        let is_zero = self.s.m.cmp(c, pred::EQ, a, zero);
-        self.s.m.select(c, is_zero, zero, bits)
+        let types = (self.s.t.i32, self.s.t.f32);
+        norm_quotient(&mut self.s.m, self.cur, types, a, w)
     }
 
     /// Channels of buffer format `format`, as [`Self::format_load`] gives
@@ -13183,6 +13051,142 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
     })
 }
 
+/// The bits of the float nearest to `a / d`, `d = 2^w - 1`, for codes
+/// `0 <= a < d` and `w <= 16`: what the console's buffer unit gives for
+/// a normalized code. The host's division is not exact (the RX 6700 XT
+/// returns 8-bit codes one ulp high and some 16-bit codes one ulp low),
+/// and titles truncate `x * d` back to the code (a material index in a
+/// vertex colour's alpha), which a quotient one ulp low turns into the
+/// code below.
+///
+/// `Q = floor(a * 2^32 / d) = a * K + floor(a * r / d)` with `K =
+/// floor(2^32 / d)` and `r = 2^32 mod d` (no division when `r` is 1:
+/// widths dividing 32). `a / d` is never exact for `0 < a < d` (`d`
+/// odd, `r` coprime to it), so `Q` rounds to 24 bits up exactly when
+/// its highest dropped bit is set, and the result is that integer (at
+/// most 2^24, so its conversion is exact on any host) scaled by a power
+/// of two; `Q` itself when it fits, the quotient's further bits then
+/// lying below half an ulp. That holds for every code of every width but
+/// 11 and 12 (checked for all codes of widths 2 to 16), which take
+/// [`exact_norm`]. The host's conversion of a larger integer is
+/// not relied on: WARP rounds those above 2^31 otherwise.
+fn norm_quotient(m: &mut Module, c: usize, (i32t, f32t): (Ty, Ty), a: V, w: u32) -> V {
+    if matches!(w, 11 | 12) {
+        return exact_norm(m, c, a, w);
+    }
+    let d = (1u64 << w) - 1;
+    let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
+    let k = |m: &mut Module, v: u64| m.i32(v as u32);
+    let (one, kv) = (k(m, 1), k(m, kk));
+    let mut q = m.bin(c, Bin::Mul, a, kv);
+    if r != 1 {
+        let (rv, dv) = (k(m, r), k(m, d));
+        let t = m.bin(c, Bin::Mul, a, rv);
+        let more = m.bin(c, Bin::UDiv, t, dv);
+        q = m.bin(c, Bin::Add, q, more);
+    }
+    // The bits to drop (1 to 8) from the exponent of `q >> 8`, which
+    // converts exactly (fewer than 25 bits); none when `q` fits.
+    let k8 = k(m, 8);
+    let top = m.bin(c, Bin::LShr, q, k8);
+    let top = m.cast(c, Cast::UiToFp, top, f32t);
+    let top = m.cast(c, Cast::Bitcast, top, i32t);
+    let k23 = k(m, 23);
+    let e = m.bin(c, Bin::LShr, top, k23);
+    let bias = k(m, 127 + 15);
+    let shift = m.bin(c, Bin::Sub, e, bias);
+    let (zero, b24) = (k(m, 0), k(m, 1 << 24));
+    let fits = m.cmp(c, pred::IULT, q, b24);
+    let shift = m.select(c, fits, zero, shift);
+    // Rounded up when the highest dropped bit is set: `a / d` is never
+    // exact, so a dropped half is more than half, never a tie.
+    let up = m.bin(c, Bin::Shl, q, one);
+    let up = m.bin(c, Bin::LShr, up, shift);
+    let up = m.bin(c, Bin::And, up, one);
+    let kept = m.bin(c, Bin::LShr, q, shift);
+    let kept = m.bin(c, Bin::Add, kept, up);
+    // At most 2^24: exact as a float, and so its scale by 2^(shift - 32).
+    let f = m.cast(c, Cast::UiToFp, kept, f32t);
+    let b95 = k(m, 127 - 32);
+    let scale = m.bin(c, Bin::Add, shift, b95);
+    let scale = m.bin(c, Bin::Shl, scale, k23);
+    let scale = m.cast(c, Cast::Bitcast, scale, f32t);
+    let f = m.bin(c, Bin::Mul, f, scale);
+    m.cast(c, Cast::Bitcast, f, i32t)
+}
+
+/// [`norm_quotient`] in integers only, for any width up to 16: `Q`
+/// as there, 8 more bits when that leaves fewer than 25 (codes of wide
+/// formats near 0), then rounded to 24 bits to nearest even with the
+/// remainder as sticky bit, and assembled as float bits.
+fn exact_norm(m: &mut Module, c: usize, a: V, w: u32) -> V {
+    let d = (1u64 << w) - 1;
+    let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
+    let k = |m: &mut Module, v: u64| m.i32(v as u32);
+    let (one, zero, dv, k8) = (k(m, 1), k(m, 0), k(m, d), k(m, 8));
+    let kv = k(m, kk);
+    let mut q = m.bin(c, Bin::Mul, a, kv);
+    let mut rem = a;
+    if r != 1 {
+        let rv = k(m, r);
+        let t = m.bin(c, Bin::Mul, a, rv);
+        let more = m.bin(c, Bin::UDiv, t, dv);
+        q = m.bin(c, Bin::Add, q, more);
+        rem = m.bin(c, Bin::URem, t, dv);
+    }
+    // The exponent's bias less the 32 (or 40) fraction bits of `q`; the
+    // shift below is added.
+    let mut bias = k(m, 127 + 23 - 32);
+    if kk < 1 << 24 {
+        // Fewer than 25 bits for the smallest codes: 8 more.
+        let t = m.bin(c, Bin::Shl, rem, k8);
+        let more = m.bin(c, Bin::UDiv, t, dv);
+        let rest = m.bin(c, Bin::URem, t, dv);
+        let wide = m.bin(c, Bin::Shl, q, k8);
+        let wide = m.bin(c, Bin::Or, wide, more);
+        let limit = k(m, 1 << 24);
+        let small = m.cmp(c, pred::IULT, q, limit);
+        q = m.select(c, small, wide, q);
+        rem = m.select(c, small, rest, rem);
+        let b40 = k(m, 127 + 23 - 40);
+        bias = m.select(c, small, b40, bias);
+    }
+    // Bits to drop: the bit length less 24, 1 to 8.
+    let mut shift = one;
+    for bit in 25..32 {
+        let at = k(m, 1 << bit);
+        let ge = m.cmp(c, pred::IUGE, q, at);
+        let add = m.select(c, ge, one, zero);
+        shift = m.bin(c, Bin::Add, shift, add);
+    }
+    let mant = m.bin(c, Bin::LShr, q, shift);
+    let below = m.bin(c, Bin::Sub, shift, one);
+    let half = m.bin(c, Bin::LShr, q, below);
+    let half = m.bin(c, Bin::And, half, one);
+    let low = m.bin(c, Bin::Shl, one, below);
+    let low = m.bin(c, Bin::Sub, low, one);
+    let low = m.bin(c, Bin::And, q, low);
+    let rest = m.bin(c, Bin::Or, low, rem);
+    let sticky = m.cmp(c, pred::NE, rest, zero);
+    let odd = m.bin(c, Bin::And, mant, one);
+    let tie = m.select(c, sticky, one, odd);
+    let up = m.bin(c, Bin::And, half, tie);
+    let mant = m.bin(c, Bin::Add, mant, up);
+    // Rounding up to 2^24 moves to the next exponent.
+    let k24 = k(m, 24);
+    let carry = m.bin(c, Bin::LShr, mant, k24);
+    let mant = m.bin(c, Bin::LShr, mant, carry);
+    let e = m.bin(c, Bin::Add, bias, shift);
+    let e = m.bin(c, Bin::Add, e, carry);
+    let k23 = k(m, 23);
+    let e = m.bin(c, Bin::Shl, e, k23);
+    let fraction = k(m, 0x7F_FFFF);
+    let fraction = m.bin(c, Bin::And, mant, fraction);
+    let bits = m.bin(c, Bin::Or, e, fraction);
+    let is_zero = m.cmp(c, pred::EQ, a, zero);
+    m.select(c, is_zero, zero, bits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::container::SigElement;
@@ -13193,6 +13197,28 @@ mod tests {
     use crate::{ShaderError, io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// The integer arithmetic a normalized code's quotient is emitted as,
+    /// run here on every code of every width the loads take it for (1 to
+    /// 16 bits: a signed format's magnitude has one bit less): the float
+    /// nearest `a / (2^w - 1)`, whatever the host's division would round
+    /// to. The reference is the host's own `f32` division, correctly
+    /// rounded as IEEE 754 asks (both operands are exact).
+    #[test]
+    fn normalized_quotients_as_emitted_are_the_nearest_floats() {
+        for w in 1..=16u32 {
+            let mut s = super::Shader::new(false);
+            let a = s.m.undef(s.t.i32);
+            let (c, types) = (s.entry, (s.t.i32, s.t.f32));
+            let q = super::norm_quotient(&mut s.m, c, types, a, w);
+            let d = (1u32 << w) - 1;
+            for code in 0..d {
+                let got = s.m.eval(q, &|v| (v == a).then_some(code));
+                let want = (code as f32 / d as f32).to_bits();
+                assert_eq!(got, want, "{code} / {d}: {got:#010x}, want {want:#010x}");
+            }
+        }
+    }
 
     /// Mesh output size as the validator counts it (53 programs were over
     /// the limit; they now fail as unsupported).

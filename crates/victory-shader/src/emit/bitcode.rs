@@ -227,6 +227,80 @@ impl Module {
         Ty(t)
     }
 
+    /// Test builds: the bits of `v` worked out from the instructions that
+    /// make it: 32-bit integer arithmetic and compares, `float` products,
+    /// selects, bitcasts and unsigned conversions to `float` (the host's
+    /// round to nearest even). `input` gives the value of anything else.
+    #[cfg(test)]
+    pub(crate) fn eval(&self, v: V, input: &dyn Fn(V) -> Option<u32>) -> u32 {
+        if let Some(x) = input(v) {
+            return x;
+        }
+        let inst = match v {
+            V::Const(c) => match self.consts[c as usize].1 {
+                Const::Int(x) => return x as u32,
+                Const::Float(bits) => return bits,
+                _ => panic!("an undefined constant"),
+            },
+            V::Inst(i) => &self.insts[i as usize],
+            _ => panic!("a global or function as a value"),
+        };
+        let float = matches!(self.types[inst.ty.0 as usize], TypeDef::Float);
+        let ev = |x: V| self.eval(x, input);
+        match inst.op {
+            Op::Bin(op, a, b) if float => {
+                let (x, y) = (f32::from_bits(ev(a)), f32::from_bits(ev(b)));
+                match op {
+                    Bin::Mul => (x * y).to_bits(),
+                    _ => panic!("float {op:?}"),
+                }
+            }
+            Op::Bin(op, a, b) => {
+                let (x, y) = (ev(a), ev(b));
+                match op {
+                    Bin::Add => x.wrapping_add(y),
+                    Bin::Sub => x.wrapping_sub(y),
+                    Bin::Mul => x.wrapping_mul(y),
+                    Bin::UDiv => x / y,
+                    Bin::URem => x % y,
+                    Bin::Shl => x.checked_shl(y).expect("a shift by less than 32"),
+                    Bin::LShr => x.checked_shr(y).expect("a shift by less than 32"),
+                    Bin::And => x & y,
+                    Bin::Or => x | y,
+                    Bin::Xor => x ^ y,
+                    _ => panic!("integer {op:?}"),
+                }
+            }
+            Op::Cmp(p, a, b) => {
+                let (x, y) = (ev(a), ev(b));
+                let (sx, sy) = (x as i32, y as i32);
+                u32::from(match p {
+                    pred::EQ => x == y,
+                    pred::NE => x != y,
+                    pred::IUGT => x > y,
+                    pred::IUGE => x >= y,
+                    pred::IULT => x < y,
+                    pred::IULE => x <= y,
+                    pred::SGT => sx > sy,
+                    pred::SGE => sx >= sy,
+                    pred::SLT => sx < sy,
+                    pred::SLE => sx <= sy,
+                    _ => panic!("compare {p}"),
+                })
+            }
+            Op::Select(c, t, f) => {
+                if ev(c) != 0 {
+                    ev(t)
+                } else {
+                    ev(f)
+                }
+            }
+            Op::Cast(Cast::Bitcast, x) => ev(x),
+            Op::Cast(Cast::UiToFp, x) => (ev(x) as f32).to_bits(),
+            ref op => panic!("{op:?}"),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn uses_of(&self, target: V) -> usize {
         let mut n = 0;
