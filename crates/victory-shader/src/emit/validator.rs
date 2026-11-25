@@ -192,6 +192,17 @@ fn file_version(path: &std::path::Path) -> Option<(u16, u16)> {
         ))
     }
 }
+/// The engine version a `VS_FIXEDFILEINFO` pair names. SDK builds prefix the
+/// series with 100 — `101.7` is the 1.7 engine — so a `major >= 1` or
+/// `>= 1.8` gate accepts a validator that rejects what 1.8 accepts (#1945).
+fn engine_version((major, minor): (u16, u16)) -> (u16, u16) {
+    if major >= 100 {
+        (major - 100, minor)
+    } else {
+        (major, minor)
+    }
+}
+
 impl Validator {
     /// The file version of the DLL the validator was loaded from, as its
     /// own resource states it: `(major, minor)`. DXC's `dxil.dll` from the
@@ -208,7 +219,7 @@ impl Validator {
     /// less than the line it prints.
     pub fn version(&self) -> Option<(u16, u16)> {
         let path = self.path.as_ref()?;
-        file_version(path)
+        file_version(path).map(engine_version)
     }
 
     /// Where `dxil.dll` is looked for.
@@ -318,6 +329,16 @@ impl Drop for Validator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Windows SDK stamps the engine series with 100: `101.7` is the 1.7
+    /// engine, and a plain `>= 1` (or `>= 1.8`) gate accepts it (#1945).
+    #[test]
+    fn a_prefixed_series_names_the_same_engine() {
+        assert_eq!(engine_version((101, 7)), (1, 7));
+        assert_eq!(engine_version((101, 6)), (1, 6));
+        assert_eq!(engine_version((1, 8)), (1, 8));
+        assert_eq!(engine_version((2, 0)), (2, 0));
+    }
 
     /// The version printed next to the path is the DLL's own, through its
     /// version resource: `VS_FIXEDFILEINFO` and not the string Windows shows
