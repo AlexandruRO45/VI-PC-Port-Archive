@@ -1,0 +1,68 @@
+name: Build (manual)
+
+# Compile-only CI. It never runs on pushes or pull requests: start it from the
+# Actions tab (or `gh workflow run build.yml`) when you want a binary.
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Cargo build profile
+        required: true
+        default: release
+        type: choice
+        options:
+          - release
+          - diag
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Windows x64 (${{ inputs.profile }})
+    # The game is a Windows/Direct3D 12 application (README: Windows 10/11 x64,
+    # MSVC target). Compiling on windows-latest gives the native MSVC toolchain
+    # and the x86_64-pc-windows-msvc target pinned in rust-toolchain.toml.
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      # Reads rust-toolchain.toml: Rust 1.98.1, x86_64-pc-windows-msvc,
+      # rustfmt and clippy.
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build victory.exe
+        shell: pwsh
+        env:
+          BUILD_PROFILE: ${{ inputs.profile }}
+        run: |
+          if ($env:BUILD_PROFILE -eq 'diag') {
+            cargo build --locked --profile diag -p victory --features diagnostics
+          } else {
+            cargo build --locked --profile release -p victory
+          }
+
+      # Keep the layout that scripts/play.ps1 expects:
+      #   target/<profile>/victory.exe
+      #   scripts/play.ps1
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ztrx-windows-x64-${{ inputs.profile }}
+          path: |
+            target/${{ inputs.profile }}/victory.exe
+            scripts/play.ps1
+            README.md
+          if-no-files-found: error
+          retention-days: 14
