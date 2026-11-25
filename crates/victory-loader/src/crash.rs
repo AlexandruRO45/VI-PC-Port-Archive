@@ -379,6 +379,25 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
+    // Opt-in (`VICTORY_SKIP_TITLE_INT3=1`, for Wine/Proton): a title `int3`
+    // that only guards a non-fatal assert is stepped over. Unset (the
+    // default, and always on Windows unless set) nothing changes.
+    static SKIP_TITLE_INT3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // SAFETY: as above.
+    if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_BREAKPOINT
+        && *SKIP_TITLE_INT3
+            .get_or_init(|| std::env::var("VICTORY_SKIP_TITLE_INT3").is_ok_and(|v| v == "1"))
+    {
+        // SAFETY: the faulting thread's context, for the exception being dispatched.
+        let context = unsafe { &mut *(*info).ContextRecord };
+        let at = context.Rip as usize;
+        // SAFETY: Rip points at the breakpoint instruction just executed.
+        if unsafe { *(at as *const u8) } == 0xcc && locate(at).starts_with("victory-image-") {
+            tracing::warn!(at = %locate(at), "skipping title int3 breakpoint");
+            context.Rip += 1;
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
+    }
     // SAFETY: as above.
     if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
         // SAFETY: as above.
