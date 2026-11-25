@@ -8,7 +8,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -223,13 +223,19 @@ impl GraphicsState {
             .map(|e| {
                 let slot = e.InputSlot.min(31) as usize;
                 let format = e.Format.0 as u32;
+                let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
+                // An appended element starts at the next multiple of
+                // min(4, its size) after the previous one, where D3D12 (and
+                // vkd3d) place it; the host pipeline gets the title's
+                // descriptions, so the offsets read here must match.
                 let offset = if e.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT {
                     next[slot]
+                        .checked_next_multiple_of(bytes.clamp(1, 4))
+                        .unwrap_or(u32::MAX)
                 } else {
                     e.AlignedByteOffset
                 };
-                let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
-                next[slot] = offset + bytes;
+                next[slot] = offset.saturating_add(bytes);
                 Input {
                     slot: slot as u32,
                     offset,
@@ -276,6 +282,13 @@ pub(crate) struct Stage {
     /// Root UAVs: one-view tables like the SRVs (or root descriptors with
     /// `VICTORY_ROOT_SRV_DIRECT=1`).
     pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// Our root parameters of the title-memory page table and of the
+    /// written-pages bitmap (`crate::memory`), if it reads or writes there.
+    /// Title memory is `t0`/`u0` in [`MEMORY_SPACE`], not [`victory_shader::emit::SLOT_MEMORY`].
+    pub(crate) memory: Option<u32>,
+    pub(crate) memory_dirty: Option<u32>,
+    /// Our root parameter of the heap's view addresses (`crate::memory`).
+    pub(crate) view_addresses: Option<u32>,
 }
 
 impl Stage {
@@ -295,6 +308,10 @@ pub(crate) struct HostPipeline {
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
+    /// A graphics pipeline of the console's rectangle lists whose geometry
+    /// shader completes each rectangle (`victory_shader::emit::rectangle_gs`):
+    /// it draws them as triangles, one per rectangle.
+    pub(crate) rectangles: bool,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
@@ -363,6 +380,28 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        // `SFI0`: 64-bit atomics on typed resources and on heap resources.
+        let atomics64 = stages.iter().any(|(s, _)| {
+            let Some(t) = s.translated() else {
+                return false;
+            };
+            victory_shader::Container::parse(&t.host.dxil)
+                .ok()
+                .and_then(|c| {
+                    c.part(victory_shader::FourCC::SFI0)?
+                        .data
+                        .get(..4)?
+                        .try_into()
+                        .ok()
+                })
+                .is_some_and(|b: [u8; 4]| u32::from_le_bytes(b) & 0x1040_0000 != 0)
+        });
+        if atomics64 && !host.heap_atomics64() {
+            return refuse(
+                "the host GPU has no 64-bit atomics on typed heap resources",
+                shaders,
+            );
+        }
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -379,6 +418,9 @@ impl HostPipeline {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                memory: None,
+                memory_dirty: None,
+                view_addresses: None,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -469,6 +511,26 @@ impl HostPipeline {
                     });
                 }
             }
+            for (used, kind, register, out) in [
+                (t.memory, D3D12_ROOT_PARAMETER_TYPE_SRV, 0, &mut stage.memory),
+                (t.memory_writes, D3D12_ROOT_PARAMETER_TYPE_UAV, 0, &mut stage.memory_dirty),
+                (t.view_addresses, D3D12_ROOT_PARAMETER_TYPE_SRV, 1, &mut stage.view_addresses),
+            ] {
+                if used {
+                    *out = Some(params.len() as u32);
+                    params.push(D3D12_ROOT_PARAMETER1 {
+                        ParameterType: kind,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                                ShaderRegister: register,
+                                RegisterSpace: MEMORY_SPACE,
+                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                            },
+                        },
+                        ShaderVisibility: visibility,
+                    });
+                }
+            }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
                     Filter: D3D12_FILTER(s.filter as i32),
@@ -536,6 +598,7 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
+                rectangles: false,
                 slots: 0,
                 inputs: Vec::new(),
                 rects: false,
@@ -574,6 +637,7 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
+                rectangles: false,
                 slots: 0,
                 inputs: Vec::new(),
                 rects: false,
@@ -583,8 +647,9 @@ impl HostPipeline {
 
         // A pipeline the title makes for rectangles gets a geometry stage
         // that completes each one from the three vertices the vertex
-        // shader made. Without it (refused here or by the host) the draws
-        // fall back on what `draw` does for rectangles.
+        // shader made (`rect_list_gs`). Without it, the upstream geometry
+        // shader adds the fourth corner (`rectangle_gs`). If neither is
+        // accepted, draws fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
         if g.topology.0 == RECTANGLES {
             let ps = stages.get(1).and_then(|(s, _)| s.translated());
@@ -594,17 +659,36 @@ impl HostPipeline {
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
         }
+        let gs = if rect_gs.is_some() {
+            Vec::new()
+        } else {
+            match (g.topology.0, stages.first().and_then(|(s, _)| s.translated())) {
+                (RECTANGLES, Some(vs)) => match victory_shader::emit::rectangle_gs(&vs.host.dxil) {
+                    Ok(gs) => gs,
+                    Err(e) => {
+                        tracing::warn!(error = %e, ?shaders, "no rectangle geometry shader");
+                        Vec::new()
+                    }
+                },
+                _ => Vec::new(),
+            }
+        };
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
             PS: code(1),
-            GS: rect_gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+            GS: {
+                let bytes = rect_gs.as_deref().unwrap_or(gs.as_slice());
                 D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: gs.as_ptr().cast(),
-                    BytecodeLength: gs.len(),
+                    pShaderBytecode: if bytes.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        bytes.as_ptr().cast()
+                    },
+                    BytecodeLength: bytes.len(),
                 }
-            }),
+            },
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -614,33 +698,23 @@ impl HostPipeline {
                 NumElements: g.inputs.len() as u32,
             },
             IBStripCutValue: g.strip_cut,
-            // The console's rectangle and quad types draw as triangles on
-            // the host (see `draw`).
-            PrimitiveTopologyType: match g.topology.0 {
-                RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-                _ => g.topology,
-            },
+            PrimitiveTopologyType: host_topology(g),
             NumRenderTargets: g.targets.NumRenderTargets,
             RTVFormats: g.targets.RTFormats,
             DSVFormat: g.depth_format,
             SampleDesc: g.samples,
             ..Default::default()
         };
-        // A pipeline with the geometry stage has a name of its own in the
-        // library; the others keep theirs.
-        let name = |gs: Option<&Vec<u8>>| match gs {
-            Some(gs) => super::library::name(
-                "graphics rectangles",
+        // A pipeline with a geometry stage has a name of its own in the
+        // library (the stage's bytes are part of the key); the others keep
+        // the plain graphics name.
+        let name_for = |bytes: &[u8]| {
+            super::library::name(
+                if bytes.is_empty() { "graphics" } else { "graphics rectangles" },
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
+                &[&code_bytes(&code(0)), &code_bytes(&code(1)), bytes],
                 &state,
-            ),
-            None => super::library::name(
-                "graphics",
-                &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                &state,
-            ),
+            )
         };
         let make = |desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, name: &str| {
             super::library::pipeline(
@@ -651,14 +725,16 @@ impl HostPipeline {
                 || unsafe { host.device.CreateGraphicsPipelineState(desc) },
             )
         };
-        let mut made = make(&desc, &name(rect_gs.as_ref()));
+        let started = std::time::Instant::now();
+        let active = rect_gs.as_deref().unwrap_or(gs.as_slice());
+        let mut made = make(&desc, &name_for(active));
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
             host.log_messages();
             desc.GS = D3D12_SHADER_BYTECODE::default();
             rect_gs = None;
-            made = make(&desc, &name(None));
+            made = make(&desc, &name_for(&[]));
         }
         let pso = match made {
             Ok(pso) => pso,
@@ -668,7 +744,7 @@ impl HostPipeline {
                 return None;
             }
         };
-        tracing::info!(?shaders, "host pipeline");
+        tracing::info!(?shaders, ms = started.elapsed().as_millis(), rectangles = !gs.is_empty(), "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -686,6 +762,7 @@ impl HostPipeline {
             root,
             stages: bound,
             name: format!("{shaders:?}"),
+            rectangles: !gs.is_empty(),
             slots: g.slots(),
             inputs: g.elements(),
             rects: rect_gs.is_some(),
@@ -717,6 +794,15 @@ impl HostPipeline {
                 )
             },
         })
+    }
+}
+
+/// The host's topology type: the console's rectangle and quad types draw
+/// as triangles on the host (see `draw`).
+fn host_topology(g: &GraphicsState) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
+    match g.topology.0 {
+        RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        _ => g.topology,
     }
 }
 
@@ -768,6 +854,11 @@ fn mesh_pipeline(
         targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
         dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
+        // Triangle, which is what the translation emits. The host derives
+        // that type from the mesh shader; a pipeline library compares
+        // descriptions with it and loads none made from a stream without
+        // it. Naming the title's topology instead fails that compare when
+        // the shader is triangle (debug layer 1323).
         topology: Sub(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
             D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
@@ -927,5 +1018,64 @@ mod tests {
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
         );
+    }
+
+    fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(c"TEXCOORD".as_ptr().cast()),
+            SemanticIndex: 0,
+            Format: format,
+            InputSlot: 0,
+            AlignedByteOffset: offset,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            InstanceDataStepRate: 0,
+        }
+    }
+
+    fn offsets(inputs: &[D3D12_INPUT_ELEMENT_DESC]) -> Vec<u32> {
+        let state = GraphicsState {
+            inputs: inputs.to_vec(),
+            ..GraphicsState::default()
+        };
+        state.elements().iter().map(|e| e.offset).collect()
+    }
+
+    /// An appended element after one of 1 or 2 bytes started right after
+    /// it; D3D12 aligns it to min(4, its size), so the rectangle expansion
+    /// read its vertices from the wrong bytes.
+    #[test]
+    fn appended_elements_are_aligned() {
+        const APPEND: u32 = D3D12_APPEND_ALIGNED_ELEMENT;
+        // RG8 (2 bytes) then RG32 float: 4, not 2.
+        let a = [
+            element(DXGI_FORMAT_R8G8_UNORM, 0),
+            element(DXGI_FORMAT_R32G32_FLOAT, APPEND),
+        ];
+        assert_eq!(offsets(&a), [0, 4]);
+        // R8 then R16 float: 2, not 1; then R8 packs right after it.
+        let b = [
+            element(DXGI_FORMAT_R8_UNORM, 0),
+            element(DXGI_FORMAT_R16_FLOAT, APPEND),
+            element(DXGI_FORMAT_R8_UNORM, APPEND),
+        ];
+        assert_eq!(offsets(&b), [0, 2, 4]);
+        // Already aligned layouts are unchanged.
+        let c = [
+            element(DXGI_FORMAT_R8G8B8A8_UNORM, 0),
+            element(DXGI_FORMAT_R32G32_FLOAT, APPEND),
+            element(DXGI_FORMAT_R32G32B32_FLOAT, APPEND),
+        ];
+        assert_eq!(offsets(&c), [0, 4, 12]);
+    }
+
+    /// An explicit offset near 4 GiB overflowed the next appended offset
+    /// (a panic in debug builds).
+    #[test]
+    fn a_huge_explicit_offset_does_not_overflow() {
+        let inputs = [
+            element(DXGI_FORMAT_R32G32B32A32_FLOAT, u32::MAX - 8),
+            element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
+        ];
+        let _ = offsets(&inputs);
     }
 }
